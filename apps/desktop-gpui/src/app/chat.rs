@@ -1523,7 +1523,11 @@ struct FoldedMessage {
 /// "Open thread" on an agent's message, "Open automation" on a scheduled task's.
 enum FoldLink {
     Thread(SharedString),
-    Automation,
+    /// The task, on the open thread's environment (`?environmentId&taskId`).
+    Automation {
+        environment: Option<SharedString>,
+        task_id: String,
+    },
 }
 
 /// `UserTimelineRow`'s "agent" fold and `AutomationMessageRow`, for the attributions that fold.
@@ -1566,7 +1570,10 @@ fn folded_message(
                 icon: IconName::CalendarClock,
                 label: "Automation".into(),
                 summary: title.unwrap_or_else(|| text.trim().lines().next().unwrap_or_default().to_owned().into()),
-                link: scheduled_task_id.as_ref().map(|_| FoldLink::Automation),
+                link: scheduled_task_id.as_ref().map(|task| FoldLink::Automation {
+                    environment: workspace.and_then(|workspace| workspace.active_environment().cloned()),
+                    task_id: task.to_string(),
+                }),
                 actions_when_folded: false,
             })
         }
@@ -1735,7 +1742,7 @@ fn folded_row(
         let this = this.clone();
         let label = match link {
             FoldLink::Thread(_) => "Open thread",
-            FoldLink::Automation => "Open automation",
+            FoldLink::Automation { .. } => "Open automation",
         };
         div()
             .id(ElementId::Name(format!("agent-open-thread:{id}").into()))
@@ -1748,7 +1755,10 @@ fn folded_row(
             .on_click(move |_, window, cx| {
                 let _ = this.update(cx, |workspace, cx| match &link {
                     FoldLink::Thread(sender) => workspace.select_thread(sender.to_string(), window, cx),
-                    FoldLink::Automation => workspace.open_settings("scheduled-tasks", cx),
+                    FoldLink::Automation { environment: Some(environment), task_id } => {
+                        workspace.open_scheduled_task(environment.clone(), task_id.clone(), cx);
+                    }
+                    FoldLink::Automation { environment: None, .. } => workspace.open_settings("scheduled-tasks", cx),
                 });
             })
     });
