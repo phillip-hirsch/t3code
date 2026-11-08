@@ -681,6 +681,7 @@ impl Workspace {
                     .pl(px(6.))
                     .pr(px(8.))
                     .rounded(px(6.))
+                    .occlude()
                     .cursor_pointer()
                     .text_xs()
                     .map(|el| {
