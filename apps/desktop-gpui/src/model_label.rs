@@ -174,8 +174,11 @@ pub fn effort_label(descriptors: &[OptionDescriptor], selection: &ModelSelection
         let on = value.and_then(|v| v.as_bool())?;
         return Some(format!("{} {}", descriptor.label, if on { "On" } else { "Off" }));
     }
-    let value = value?;
-    descriptor.options.iter().find(|o| Some(o.id.as_str()) == value.as_str()).map(|o| o.label.clone())
+    value
+        .and_then(|value| descriptor.options.iter().find(|o| Some(o.id.as_str()) == value.as_str()))
+        .map(|o| o.label.clone())
+        // Pi's thinking control has no default level: it names itself until one is picked.
+        .or_else(|| (descriptor.id == "thinking").then(|| descriptor.label.clone()))
 }
 
 /// `withLegacyUltracodeEffort`: Ultracode was a Claude effort level before it became its own
@@ -481,5 +484,11 @@ mod tests {
         let picked = with_option(&selection, "effort", json!("max"));
         assert_eq!(effort_label(&descriptors, &picked).as_deref(), Some("Max"));
         assert_eq!(effort_label(&descriptors[..1], &selection), None, "no reasoning control, no suffix");
+        let mut unset = descriptors;
+        unset[1].options.iter_mut().for_each(|o| o.is_default = false);
+        assert_eq!(effort_label(&unset, &selection), None, "an unset effort has no label");
+        unset[1].id = "thinking".into();
+        unset[1].label = "Thinking".into();
+        assert_eq!(effort_label(&unset, &selection).as_deref(), Some("Thinking"), "Pi's thinking names itself");
     }
 }
