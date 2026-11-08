@@ -480,6 +480,7 @@ impl Workspace {
                             panel.detail = Some(Rc::new(merged));
                             cx.notify();
                         }
+                        panel.checks_read = Some(read);
                         true
                     });
                     if !matches!(keep, Ok(true)) {

@@ -129,6 +129,8 @@ pub(in crate::app) struct Panel {
     stack_failed: bool,
     /// The checks poll while the pull request is open (`usePullRequestChecksRefresh`).
     _checks_poll: Option<Task<()>>,
+    /// The poll's last answer, kept over each later detail read it is newer than.
+    checks_read: Option<logic::ChecksRead>,
     linked: Option<Vec<crate::app::palette::LinkedThread>>,
     checks_all: bool,
     maintainer_saving: bool,
@@ -197,6 +199,7 @@ impl Panel {
             stack_fresh: false,
             stack_failed: false,
             _checks_poll: None,
+            checks_read: None,
             linked: None,
             checks_all: false,
             maintainer_saving: false,
@@ -488,6 +491,7 @@ impl Workspace {
                         Ok(Ok(detail)) => {
                             first = panel.detail.is_none();
                             landed = true;
+                            let detail = logic::keep_newer_checks(detail, panel.checks_read.as_ref());
                             panel.detail = Some(Rc::new(if writable { detail } else { logic::read_only(detail) }));
                             panel.detail_error = None;
                             panel.maintainer_choice = None;
