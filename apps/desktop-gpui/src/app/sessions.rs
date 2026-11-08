@@ -264,6 +264,8 @@ impl Workspace {
                     this.show_reload_toast(window, cx);
                     this.check_chatgpt_welcome(window, cx);
                 }
+                // Its thread tag filter may have changed.
+                this.retract_hidden_alerts(window, cx);
                 // Each environment's browser gets this client's profiles.
                 this.report_browser_profiles(cx);
                 this.notify_sidebar(cx);
@@ -425,6 +427,7 @@ impl Workspace {
             self.start_session(id, window, cx);
         }
         if !removed.is_empty() {
+            self.retract_hidden_alerts(window, cx);
             self.notify_sidebar(cx);
         }
         cx.notify();

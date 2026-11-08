@@ -3,10 +3,14 @@
 
 use std::collections::HashMap;
 
+use gpui_kit::SharedString;
 use serde_json::Value;
 
 use crate::inbox::{self, Facts, Status};
 use crate::model::ThreadShell;
+
+/// `(environment id, thread id)`: thread ids are only unique within their environment.
+pub type ThreadKey = (SharedString, String);
 
 /// The `notificationMode` client setting.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -73,23 +77,23 @@ impl Observation {
 #[derive(Default)]
 struct Gate {
     /// The newest completion already notified, or deliberately skipped.
-    handled: HashMap<String, i64>,
+    handled: HashMap<ThreadKey, i64>,
 }
 
 impl Gate {
-    fn skip(&mut self, key: &str, at: Option<i64>) {
+    fn skip(&mut self, key: &ThreadKey, at: Option<i64>) {
         let Some(at) = at else { return };
         match self.handled.get_mut(key) {
             Some(handled) => *handled = (*handled).max(at),
             None => {
-                self.handled.insert(key.to_owned(), at);
+                self.handled.insert(key.clone(), at);
             }
         }
     }
 
     fn observe(
         &mut self,
-        key: &str,
+        key: &ThreadKey,
         prior: Option<&Observation>,
         next: &Observation,
         archived: bool,
@@ -115,6 +119,7 @@ impl Gate {
 /// A transition to present.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Alert {
+    pub environment_id: SharedString,
     pub thread_id: String,
     pub kind: Kind,
     pub status: Status,
@@ -133,10 +138,10 @@ impl Alert {
     }
 }
 
-/// Watches one environment's shell for alerts while notifications are on.
+/// Watches every environment's shell for alerts while notifications are on.
 #[derive(Default)]
 pub struct ThreadAlerts {
-    previous: HashMap<String, Observation>,
+    previous: HashMap<ThreadKey, Observation>,
     gate: Gate,
 }
 
@@ -145,30 +150,22 @@ impl ThreadAlerts {
     pub fn observe(&mut self, threads: &[ThreadShell]) -> Vec<Alert> {
         let requests = inbox::child_requests(threads);
         let mut alerts = Vec::new();
-        let mut seen = 0;
+        let mut previous = HashMap::with_capacity(self.previous.len());
         for thread in threads.iter().filter(|t| t.is_listed()) {
-            seen += 1;
+            let key = (thread.environment_id.clone(), thread.id.clone());
             let (next, status) = Observation::of(Facts::new(thread, &requests));
-            let prior = self.previous.get(&thread.id);
+            let prior = self.previous.remove(&key);
             let quiet = thread.latest_run_stop_requested == Some(true);
-            let kind = self.gate.observe(&thread.id, prior, &next, thread.archived_at.is_some(), quiet);
-            if let Some(kind) = kind {
-                alerts.push(Alert { thread_id: thread.id.clone(), kind, status });
+            if let Some(kind) = self.gate.observe(&key, prior.as_ref(), &next, thread.archived_at.is_some(), quiet) {
+                alerts.push(Alert { environment_id: key.0.clone(), thread_id: key.1.clone(), kind, status });
             }
-            match self.previous.get_mut(&thread.id) {
-                Some(prior) => *prior = next,
-                None => {
-                    self.previous.insert(thread.id.clone(), next);
-                }
-            }
+            previous.insert(key, next);
         }
-        // Every listed thread is in `previous` now, so a longer map holds threads that left.
-        if seen < self.previous.len() {
-            let listed: std::collections::HashSet<&str> =
-                threads.iter().filter(|t| t.is_listed()).map(|t| t.id.as_str()).collect();
-            self.previous.retain(|id, _| listed.contains(id.as_str()));
-            self.gate.handled.retain(|id, _| listed.contains(id.as_str()));
+        // What is left in the old map are threads that left.
+        if !self.previous.is_empty() {
+            self.gate.handled.retain(|key, _| previous.contains_key(key));
         }
+        self.previous = previous;
         alerts
     }
 }
@@ -180,6 +177,10 @@ mod tests {
     use super::*;
 
     fn thread(id: &str, fields: Value) -> ThreadShell {
+        thread_on("env", id, fields)
+    }
+
+    fn thread_on(env: &str, id: &str, fields: Value) -> ThreadShell {
         let mut value = json!({
             "id": id,
             "projectId": "p",
@@ -190,7 +191,9 @@ mod tests {
             "lineage": {"rootThreadId": id},
         });
         value.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
-        serde_json::from_value(value).unwrap()
+        let mut thread: ThreadShell = serde_json::from_value(value).unwrap();
+        thread.environment_id = env.to_owned().into();
+        thread
     }
 
     fn running(id: &str) -> ThreadShell {
@@ -266,6 +269,27 @@ mod tests {
         alerts.observe(&[running("a")]);
         alerts.observe(&[]);
         assert!(alerts.observe(&[completed("a", "r1", "2026-01-01T00:00:05.000Z")]).is_empty());
+    }
+
+    #[test]
+    fn equal_thread_ids_on_two_environments_alert_apart() {
+        let mut alerts = ThreadAlerts::default();
+        let running_on =
+            |env: &str| thread_on(env, "a", json!({"status": "running", "latestRunId": "r1", "activeRunId": "r1"}));
+        let done_on = |env: &str| {
+            thread_on(env, "a", json!({"latestRunId": "r1", "latestRunCompletedAt": "2026-01-01T00:00:05.000Z"}))
+        };
+        assert!(alerts.observe(&[running_on("x"), running_on("y")]).is_empty());
+        let done = alerts.observe(&[done_on("x"), running_on("y")]);
+        assert_eq!(
+            done.iter().map(|a| (a.environment_id.as_ref(), a.kind)).collect::<Vec<_>>(),
+            [("x", Kind::Completion)]
+        );
+        let done = alerts.observe(&[done_on("x"), done_on("y")]);
+        assert_eq!(
+            done.iter().map(|a| (a.environment_id.as_ref(), a.kind)).collect::<Vec<_>>(),
+            [("y", Kind::Completion)]
+        );
     }
 
     #[test]
