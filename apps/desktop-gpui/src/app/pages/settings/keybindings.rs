@@ -1187,7 +1187,7 @@ impl KeybindingsPanel {
                     .small()
                     .h(px(28.))
                     .label(if saving { "Saving" } else { "Save" })
-                    .disabled(saving || key.trim().is_empty() || !when_valid)
+                    .disabled(saving || key.trim().is_empty() || !when_valid || !self.editable())
                     .on_click(cx.listener(move |this, _, window, cx| this.save(&id, window, cx)))
             }))
             .child(self.render_key_control(&row.id, key, &row.key, dirty, t, cx));
@@ -1218,7 +1218,7 @@ impl KeybindingsPanel {
                         .size(px(28.))
                         .text_color(t.muted_foreground)
                         .icon(Icon::new(IconName::Ellipsis).size(px(14.)))
-                        .disabled(saving)
+                        .disabled(saving || !self.editable())
                         .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |mut menu, window, _| {
                             if can_reset {
                                 let id = id.clone();
@@ -1614,8 +1614,9 @@ impl KeybindingsPanel {
             .truncate()
             .text_color(if current.is_some() { t.foreground } else { t.muted_foreground })
             .child(current.as_deref().map_or_else(|| "Command".to_owned(), command_label));
-        let command_select = select_trigger(&"kb-new-command".into(), command_label_el, 224., t).dropdown_menu(
-            move |mut menu, window, _| {
+        let command_select = select_trigger(&"kb-new-command".into(), command_label_el, 224., t)
+            .disabled(!self.editable())
+            .dropdown_menu(move |mut menu, window, _| {
                 for command in &commands {
                     let picked = command.clone();
                     menu = menu.item(
@@ -1630,8 +1631,7 @@ impl KeybindingsPanel {
                     );
                 }
                 menu.max_h(px(288.)).scrollable(true)
-            },
-        );
+            });
         let description = self.render_when_line(NEW_ROW, &expression, draft.when.as_ref(), t, cx);
         let row = RowFrame::new("New keybinding").description(description).control(
             h_flex()
@@ -1646,7 +1646,7 @@ impl KeybindingsPanel {
                         .small()
                         .h(px(28.))
                         .label(if saving { "Saving" } else { "Save" })
-                        .disabled(saving || !can_save)
+                        .disabled(saving || !can_save || !self.editable())
                         .on_click(cx.listener(|this, _, window, cx| this.save(NEW_ROW, window, cx))),
                 )
                 .child(
@@ -1855,6 +1855,11 @@ impl Workspace {
             panel.update(cx, |panel, cx| {
                 panel.targets = targets;
                 panel.can_write = can_write;
+                // Inert without write access: no shortcut capture and no condition builder.
+                if !panel.editable() {
+                    panel.stop_recording(cx);
+                    panel.close_when(cx);
+                }
                 panel.follow_jump(jump, window, cx);
             });
         }
