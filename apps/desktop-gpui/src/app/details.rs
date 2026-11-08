@@ -663,10 +663,15 @@ impl Workspace {
 
     /// Scripts run in the thread's terminal; the terminal drawer owns `RunInTerminal`.
     fn run_project_script(&mut self, run: &ScriptRun, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(cwd) = self.git_cwd() else { return };
+        let Some(cwd) = self.git_cwd().filter(|_| self.can_run_scripts()) else { return };
         self.remember_script(&run.project_id, &run.id);
         let (command, stop_on_settle) = (run.command.to_string(), run.stop_on_settle);
         window.dispatch_action(Box::new(super::RunInTerminal { cwd, command, stop_on_settle }), cx);
+    }
+
+    /// `hasTerminalWriteAccess`: scripts run only with `terminal:operate` on the thread's environment.
+    pub(super) fn can_run_scripts(&self) -> bool {
+        self.active_environment().is_some_and(|environment| self.env_grants(environment, "terminal:operate"))
     }
 
     /// `lastInvokedScriptByProjectId[projectId]`: the script last run in the project on this device.

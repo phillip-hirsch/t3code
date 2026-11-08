@@ -275,7 +275,7 @@ impl Workspace {
 
     /// `script.<id>.run`: runs the open project's script with that id in the thread's terminal.
     fn run_script_shortcut(&mut self, script_id: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(project) = self.target_project() else { return false };
+        let Some(project) = self.target_project().filter(|_| self.can_run_scripts()) else { return false };
         let project_id = project.id.clone();
         let scripts = super::pages::settings::code::projects::scripts::resolve_project_scripts(
             &self.server_info().settings,

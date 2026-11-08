@@ -18,6 +18,7 @@ use super::scripts::{
     script_icon, shortcut_label_for_command,
 };
 use crate::app::Workspace;
+use crate::app::pages::settings::connections::logic::SETTINGS_WRITE;
 use crate::app::pages::settings::widgets::{RowFrame, reset_button, settings_section};
 use crate::model::{ProjectScript, T3ProjectFile};
 use crate::theme::{self, Tokens};
@@ -201,8 +202,14 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let task = self.save_project_script(project_id, None, input, cx);
-        let (project_id, input) = (project_id.to_owned(), input.clone());
+        let mut input = input.clone();
+        // `keybinding: null` only with `settings:write`; otherwise the save leaves shortcuts alone.
+        let environment = self.shell.projects.iter().find(|p| p.id == project_id).map(|p| p.environment_id.clone());
+        if !environment.is_some_and(|env| self.env_grants(&env, SETTINGS_WRITE)) {
+            input.keybinding = None;
+        }
+        let task = self.save_project_script(project_id, None, &input, cx);
+        let project_id = project_id.to_owned();
         cx.spawn_in(window, async move |this, cx| {
             if let Err(error) = task.await {
                 let _ = this.update_in(cx, |this, window, cx| {

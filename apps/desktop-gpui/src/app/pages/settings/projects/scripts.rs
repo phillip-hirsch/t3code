@@ -8,6 +8,7 @@ use serde::Deserialize as _;
 use serde_json::{Map, Value, json};
 
 use crate::app::Workspace;
+use crate::app::pages::settings::connections::logic::SETTINGS_WRITE;
 use crate::model::{ProjectScript, ProjectShell, ServerInfo, T3ProjectFile, T3ProjectFileScript};
 
 const MAX_SCRIPT_ID_LENGTH: usize = 24;
@@ -420,6 +421,19 @@ pub(super) fn plan_scripts_write(
     Ok(ScriptsWrite { patch, bindings })
 }
 
+/// `persistProjectScripts` without `settings:write`: setting a shortcut fails before anything
+/// is written, while a script that is removed just keeps its rule.
+pub(super) fn gate_bindings(write: &mut ScriptsWrite, can_write_settings: bool) -> Result<(), String> {
+    if can_write_settings {
+        return Ok(());
+    }
+    if write.bindings.iter().any(|(method, _)| *method == "server.upsertKeybinding") {
+        return Err("This connection cannot change keyboard shortcuts.".into());
+    }
+    write.bindings.clear();
+    Ok(())
+}
+
 /// Every script id the environment knows, so a new one never collides (`submit`).
 fn known_script_ids(settings: &Value, projects: &[ProjectShell], project: &ProjectShell) -> Vec<String> {
     let mut ids: Vec<String> = projects.iter().flat_map(|p| p.scripts.iter().map(|s| s.id.clone())).collect();
@@ -523,7 +537,10 @@ impl Workspace {
             return Task::ready(Err("Not connected.".into()));
         };
         let next = next(&info.settings, project);
-        let write = match plan_scripts_write(info, &self.shell.projects, project, next, script_id, keybinding) {
+        let can_write_settings = self.env_grants(&environment, SETTINGS_WRITE);
+        let write = plan_scripts_write(info, &self.shell.projects, project, next, script_id, keybinding)
+            .and_then(|mut write| gate_bindings(&mut write, can_write_settings).map(|()| write));
+        let write = match write {
             Ok(write) => write,
             Err(error) => return Task::ready(Err(error)),
         };
@@ -539,6 +556,10 @@ impl Workspace {
                 }
                 cx.notify();
             });
+            let still_granted = this.read_with(cx, |this, _| this.env_grants(&environment, SETTINGS_WRITE));
+            if !write.bindings.is_empty() && !still_granted.unwrap_or(false) {
+                return Err("The script was saved, but this connection can no longer change keyboard shortcuts.".into());
+            }
             for (method, input) in write.bindings {
                 let result = client.request(method, input).await.map_err(|e| e.message())?;
                 // A reply without the list keeps the keymap; `keybindingsUpdated` still arrives.
@@ -909,6 +930,26 @@ mod tests {
             plan_scripts_write(&info(settings, keys), &projects, &alone, Some(vec![]), Some("lint"), Some(None))
                 .unwrap();
         assert!(write.bindings.is_empty());
+    }
+
+    #[test]
+    fn without_settings_write_shortcuts_are_refused_or_left_alone() {
+        let upsert = || ScriptsWrite {
+            patch: json!({}),
+            bindings: vec![("server.upsertKeybinding", json!({"key": "mod+l", "command": "script.lint.run"}))],
+        };
+        let remove = || ScriptsWrite {
+            patch: json!({}),
+            bindings: vec![("server.removeKeybinding", json!({"key": "mod+l", "command": "script.lint.run"}))],
+        };
+        assert_eq!(gate_bindings(&mut upsert(), true), Ok(()));
+        assert_eq!(
+            gate_bindings(&mut upsert(), false),
+            Err("This connection cannot change keyboard shortcuts.".into())
+        );
+        let mut write = remove();
+        assert_eq!(gate_bindings(&mut write, false), Ok(()));
+        assert!(write.bindings.is_empty(), "deleting keeps the shortcut it may not remove");
     }
 
     #[test]
