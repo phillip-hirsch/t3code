@@ -3,6 +3,7 @@
 //! apps that track the mouse, and the wheel.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use alacritty_terminal::Term;
 use alacritty_terminal::grid::{Dimensions as _, Scroll};
@@ -22,6 +23,28 @@ use super::{Listener, SessionEvent, TerminalSession};
 
 /// `TERMINAL_LINK_DRAG_THRESHOLD_PX`: a press on a link that moves further selects instead.
 const LINK_DRAG_THRESHOLD: f32 = 4.;
+/// `SELECTION_AUTOSCROLL_RAMP_PX` and `SELECTION_AUTOSCROLL_MAX_ROWS`.
+const AUTOSCROLL_RAMP: f32 = 50.;
+const AUTOSCROLL_MAX_ROWS: f32 = 15.;
+const AUTOSCROLL_TICK: Duration = Duration::from_millis(80);
+
+/// `terminalSelectionAutoscrollRows`: the rows each tick scrolls while a selection drag is past
+/// an edge, negative above it, ramping up to the maximum over the first 50px.
+fn autoscroll_rows(y: Pixels, top: Pixels, bottom: Pixels) -> i32 {
+    let distance = if y < top {
+        y - top
+    } else if y > bottom {
+        y - bottom
+    } else {
+        return 0;
+    };
+    let ramp = (f32::from(distance) / AUTOSCROLL_RAMP).clamp(-1., 1.);
+    // JavaScript's `Math.round`: halves go up.
+    let rows = ramp.signum() + (ramp * (AUTOSCROLL_MAX_ROWS - 1.) + 0.5).floor();
+    #[expect(clippy::cast_possible_truncation, reason = "at most the maximum row count")]
+    let rows = rows as i32;
+    rows
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub(in crate::app::terminal) struct HoveredLink {
@@ -45,6 +68,10 @@ pub(in crate::app::terminal) struct PointerState {
     /// The button a tracking app saw go down, for its drag and release reports.
     reporting: Option<u8>,
     last_motion: Option<(usize, usize)>,
+    /// A selection drag past an edge: rows per tick, where the pointer is, and the ticking task.
+    autoscroll: i32,
+    drag_position: Option<Point<Pixels>>,
+    autoscroll_task: Option<Task<()>>,
     pub(super) selection_menu: Option<super::menu::SelectionMenu>,
     pub(super) menu_timer: Option<Task<()>>,
 }
@@ -308,11 +335,10 @@ impl TerminalSession {
             if !self.selecting {
                 return;
             }
-            let (point, right) = self.grid_point(event.position);
-            if let Some(selection) = &mut self.term.selection {
-                selection.update(point, if right { Side::Right } else { Side::Left });
-                cx.notify();
-            }
+            self.pointer.drag_position = Some(event.position);
+            let (top, bottom) = self.geometry.get().scroll_edges;
+            self.set_autoscroll(autoscroll_rows(event.position.y, top, bottom), cx);
+            self.extend_selection(event.position, cx);
             return;
         }
         if inside && !tracking {
@@ -324,7 +350,44 @@ impl TerminalSession {
         }
     }
 
+    fn extend_selection(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let (point, right) = self.grid_point(position);
+        if let Some(selection) = &mut self.term.selection {
+            selection.update(point, if right { Side::Right } else { Side::Left });
+            cx.notify();
+        }
+    }
+
+    /// `setSelectionAutoscroll`: scrolls every tick while the drag stays past an edge.
+    fn set_autoscroll(&mut self, rows: i32, cx: &mut Context<Self>) {
+        self.pointer.autoscroll = rows;
+        if rows == 0 {
+            self.pointer.autoscroll_task = None;
+            return;
+        }
+        if self.pointer.autoscroll_task.is_some() {
+            return;
+        }
+        self.pointer.autoscroll_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(AUTOSCROLL_TICK).await;
+                let ticked = this.update(cx, |this, cx| {
+                    // Alacritty scrolls up into the history for a positive delta.
+                    this.term.scroll_display(Scroll::Delta(-this.pointer.autoscroll));
+                    if let Some(position) = this.pointer.drag_position {
+                        this.extend_selection(position, cx);
+                    }
+                });
+                if ticked.is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
     pub fn mouse_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.pointer.autoscroll_task = None;
+        self.pointer.drag_position = None;
         if let Some(button) = self.pointer.reporting.take() {
             let mode = *self.term.mode();
             let (column, row) = self.screen_cell(event.position);
@@ -389,5 +452,26 @@ impl TerminalSession {
             self.pointer.forget_hover();
             cx.notify();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit::px;
+
+    use super::autoscroll_rows;
+
+    #[test]
+    fn selection_drags_past_an_edge_scroll_faster_further_out() {
+        let rows = |y: f32| autoscroll_rows(px(y), px(100.), px(300.));
+        assert_eq!(rows(200.), 0);
+        assert_eq!(rows(100.), 0);
+        assert_eq!(rows(99.), -1);
+        assert_eq!(rows(75.), -8);
+        assert_eq!(rows(50.), -15);
+        assert_eq!(rows(-500.), -15);
+        assert_eq!(rows(301.), 1);
+        assert_eq!(rows(325.), 8);
+        assert_eq!(rows(900.), 15);
     }
 }

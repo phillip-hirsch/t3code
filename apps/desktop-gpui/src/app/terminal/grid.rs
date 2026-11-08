@@ -266,6 +266,8 @@ pub(super) struct Geometry {
     pub line_height: Pixels,
     pub columns: usize,
     pub rows: usize,
+    /// Where a selection drag starts scrolling: the pane's padded top and bottom, kept inside the window.
+    pub scroll_edges: (Pixels, Pixels),
 }
 
 impl Geometry {
@@ -420,7 +422,9 @@ impl Element for TerminalGrid {
         let slack = bounds.size.height - PADDING * 2. - line_height * rows as f32;
         let top = if term.grid().history_size() > 0 { PADDING + slack.max(px(0.)) } else { PADDING };
         let origin = bounds.origin + point(PADDING, top);
-        let geometry = Geometry { origin, cell_width, line_height, columns, rows };
+        let scroll_edges =
+            (bounds.top().max(px(0.)) + PADDING, bounds.bottom().min(window.viewport_size().height) - PADDING);
+        let geometry = Geometry { origin, cell_width, line_height, columns, rows, scroll_edges };
         let content = term.renderable_content();
         let cursor_point = content.cursor.point;
         let cursor_shape = content.cursor.shape;
