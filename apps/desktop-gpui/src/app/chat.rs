@@ -456,6 +456,9 @@ impl Workspace {
         // Tailwind's `sm` and `lg` breakpoints, in CSS px.
         let title_size = if viewport >= 640. { rems(1.875) } else { rems(1.5) };
         let lg = viewport >= 1024.;
+        if is_scratch && self.composer_triage {
+            return self.render_triage_hero(title_size, &t, cx);
+        }
         // `[@media(max-height:28rem)]`: very short windows keep only the project name.
         let terse = f32::from(window.viewport_size().height) <= 448.;
         let open = self.draft_picker_open();
@@ -562,6 +565,71 @@ impl Workspace {
                 .children(action)
         });
         v_flex().w_full().items_center().child(heading).children(subline).into_any_element()
+    }
+
+    /// `TriageDraftHero`: "What went wrong?" over the machine and server version, and the
+    /// terminal command to copy.
+    fn render_triage_hero(&self, title_size: gpui_kit::Rems, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+        const COPY_ID: &str = "triage-command";
+        const ABOUT: &str =
+            "The agent reads T3 Code's logs and source here, and asks before it applies a fix or posts anything.";
+        let info = self.server_info();
+        let machine: SharedString =
+            info.environment_label.clone().map_or_else(|| "This machine".into(), SharedString::from);
+        let version = info.config.pointer("/environment/serverVersion").and_then(|v| v.as_str()).map(str::to_owned);
+        let copied = self.copy_feedback.id.as_deref() == Some(COPY_ID);
+        let machine = h_flex()
+            .id("triage-machine")
+            .min_w_0()
+            .child(div().truncate().font_weight(FontWeight::MEDIUM).text_color(t.foreground).child(machine))
+            .children(version.map(|version| {
+                div().flex_none().ml(rems(0.375)).text_color(t.muted_foreground).child(format!("v{version}"))
+            }))
+            .tooltip(headline_tooltip(ABOUT.into()));
+        let label: SharedString = if copied { "Copied".into() } else { "or run".into() };
+        let command = inline_button("triage-copy", label, t.muted_foreground, t.foreground)
+            .flex_none()
+            .when(!copied, |el| {
+                el.child(
+                    div()
+                        .ml(rems(0.25))
+                        .font_family(t.fonts.mono)
+                        .text_size(rems(0.75))
+                        .child(super::palette_actions::TRIAGE_CLI),
+                )
+            })
+            .tooltip(headline_tooltip("Copy command, for a terminal".into()))
+            .on_click(cx.listener(|this, _, _, cx| {
+                let command = super::palette_actions::TRIAGE_CLI.to_owned();
+                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(command));
+                this.copied(COPY_ID.into(), Duration::from_millis(1500), cx);
+            }));
+        v_flex()
+            .w_full()
+            .items_center()
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_center()
+                    .text_size(title_size)
+                    .line_height(rems(2.25))
+                    .text_color(t.foreground)
+                    .child("What went wrong?"),
+            )
+            .child(
+                h_flex()
+                    .mt(rems(0.5))
+                    .h(rems(1.5))
+                    .w_full()
+                    .justify_center()
+                    .gap(rems(0.375))
+                    .text_size(rems(0.875))
+                    .line_height(rems(1.25))
+                    .child(machine)
+                    .child(div().flex_none().text_color(t.muted_foreground).child("·"))
+                    .child(command),
+            )
+            .into_any_element()
     }
 
     /// `startScratch`: an empty draft opens the "No project" draft; one with content moves there.

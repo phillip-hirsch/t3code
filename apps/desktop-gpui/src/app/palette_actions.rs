@@ -11,6 +11,15 @@ use super::{Target, Workspace, new_id};
 use crate::model::RepositoryIdentity;
 use crate::thread_pull_requests::ReferenceCopy;
 
+/// `TRIAGE_CLI_COMMAND`: triage from a terminal on the machine.
+pub(super) const TRIAGE_CLI: &str = "npx t3 triage";
+
+/// `isTriagePrompt`: a draft is a triage draft while its message still links the playbook file
+/// (`TRIAGE_PROMPT_FILE_NAME`).
+pub(super) fn is_triage_prompt(prompt: &str) -> bool {
+    prompt.contains("[triage-playbook.md](")
+}
+
 /// What `thread.copyReference` copies.
 pub(super) enum CopyTarget {
     PullRequest(String),
@@ -95,8 +104,7 @@ impl Workspace {
     /// `useStartTriage`: the server prepares a triage session, then a No project draft opens
     /// with its playbook linked.
     pub(super) fn start_triage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        const CLI: &str = "npx t3 triage";
-        let fail = |message: &str| format!("{message} Run {CLI} in a terminal on that machine instead.");
+        let fail = |message: &str| format!("{message} Run {TRIAGE_CLI} in a terminal on that machine instead.");
         if self.server_info().scratch_workspace_root.is_none() {
             toast_error(
                 "Could not start triage",
@@ -254,6 +262,13 @@ mod tests {
 
     fn identity(key: &str) -> RepositoryIdentity {
         serde_json::from_value(json!({"canonicalKey": key})).unwrap()
+    }
+
+    #[test]
+    fn a_draft_is_triage_while_it_links_the_playbook() {
+        assert!(is_triage_prompt("Read [triage-playbook.md](/tmp/t3/triage-playbook.md) first."));
+        assert!(!is_triage_prompt("Read triage-playbook.md first."), "a bare name is not the link");
+        assert!(!is_triage_prompt(""));
     }
 
     #[test]
