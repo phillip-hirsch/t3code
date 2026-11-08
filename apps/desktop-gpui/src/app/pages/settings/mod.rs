@@ -41,7 +41,7 @@ use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _, 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, AppContext as _, BoxShadow, Context, Entity, FocusHandle, Focusable as _, FontWeight,
-    InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, ScrollHandle, SharedString,
+    InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Pixels, ScrollHandle, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
 };
 use serde_json::{Map, Value};
@@ -146,6 +146,40 @@ fn section_nav_step<'a>(key: &str, sections: &[&'a str], focused: &str) -> Optio
     Some(sections[next])
 }
 
+/// The vertical scroll offset that brings a row spanning `row` (top, bottom) into a viewport
+/// spanning `viewport` with the least movement (`scrollIntoView({ block: "nearest" })`).
+fn nearest_scroll_offset(offset: Pixels, viewport: (Pixels, Pixels), row: (Pixels, Pixels)) -> Pixels {
+    if row.0 < viewport.0 {
+        (offset + viewport.0 - row.0).min(px(0.))
+    } else if row.1 > viewport.1 {
+        offset - (row.1 - viewport.1)
+    } else {
+        offset
+    }
+}
+
+/// Scrolls the nav row `id` into view on its first paint after the arrow keys move to it.
+fn reveal_nav_row(id: &'static str, pending: Rc<Cell<Option<&'static str>>>, scroll: ScrollHandle) -> impl IntoElement {
+    gpui_kit::canvas(
+        move |bounds, window, _| {
+            if pending.take() != Some(id) {
+                return;
+            }
+            let viewport = scroll.bounds();
+            let offset = scroll.offset();
+            let y =
+                nearest_scroll_offset(offset.y, (viewport.top(), viewport.bottom()), (bounds.top(), bounds.bottom()));
+            if y != offset.y {
+                scroll.set_offset(gpui_kit::point(offset.x, y));
+                window.request_animation_frame();
+            }
+        },
+        |_, (), _, _| {},
+    )
+    .absolute()
+    .size_full()
+}
+
 fn nav_section(id: &str) -> &str {
     DETAIL_PAGES.iter().find(|(page, ..)| *page == id).map_or(id, |(.., parent)| parent)
 }
@@ -222,6 +256,9 @@ pub(in crate::app) struct SettingsUi {
     /// The section the arrow keys last moved to and the page that was open then: the nav's one
     /// Tab stop while that page stays open (`useSettingsSectionNavigation`).
     nav_tab_stop: Option<(&'static str, SharedString)>,
+    nav_scroll: ScrollHandle,
+    /// The row the arrow keys just moved to, scrolled into view on its next paint.
+    nav_reveal: Rc<Cell<Option<&'static str>>>,
     _search_subscription: Subscription,
 }
 
@@ -273,6 +310,8 @@ impl SettingsUi {
             focus_on_render: false,
             nav_focus: HashMap::new(),
             nav_tab_stop: None,
+            nav_scroll: ScrollHandle::new(),
+            nav_reveal: Rc::default(),
             _search_subscription: subscription,
         }
     }
@@ -605,6 +644,7 @@ impl Workspace {
                 let Some(next) = section_nav_step(key, &nav_sections(), focused) else { return };
                 let page = self.settings.clone().unwrap_or_default();
                 self.settings_ui.nav_tab_stop = Some((next, page));
+                self.settings_ui.nav_reveal.set(Some(next));
                 if let Some(handle) = self.settings_ui.nav_focus.get(next) {
                     window.focus(handle, cx);
                 }
@@ -789,6 +829,8 @@ impl Workspace {
                 self.settings_ui.nav_focus.entry(id).or_insert_with(|| cx.focus_handle());
             }
             let nav_focus = &self.settings_ui.nav_focus;
+            let nav_scroll = &self.settings_ui.nav_scroll;
+            let nav_reveal = &self.settings_ui.nav_reveal;
             let keyboard = window.last_input_was_keyboard();
             let groups =
                 v_flex().gap(px(16.)).children(SETTINGS.iter().enumerate().map(|(index, (heading, items))| {
@@ -813,8 +855,12 @@ impl Workspace {
                             // `focus-visible:ring-2 focus-visible:ring-inset ring-ring`
                             let ring = (keyboard && focus.is_focused(window))
                                 .then(|| vec![BoxShadow::new(px(0.), px(0.), t.ring).spread_radius(px(2.)).inset()]);
+                            let reveal = (nav_reveal.get() == Some(id))
+                                .then(|| reveal_nav_row(id, nav_reveal.clone(), nav_scroll.clone()));
                             h_flex()
                                 .id(SharedString::from(format!("settings-nav-{id}")))
+                                .relative()
+                                .children(reveal)
                                 .track_focus(&focus)
                                 .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                                     this.on_settings_nav_key(id, event, window, cx);
@@ -865,6 +911,7 @@ impl Workspace {
             .bg(sb.sheet)
             .text_color(sb.foreground)
             .overflow_y_scroll()
+            .track_scroll(&self.settings_ui.nav_scroll)
             .p(px(8.))
             .gap(px(8.))
             .children(search_row)
@@ -1101,6 +1148,15 @@ mod tests {
         assert_eq!(section_nav_step("home", &sections, "chat"), Some("general"));
         assert_eq!(section_nav_step("right", &sections, "general"), None, "sections are leaves");
         assert!(nav_sections().starts_with(&["general", "appearance"]));
+    }
+
+    #[test]
+    fn a_nav_row_scrolls_into_view_by_the_nearest_edge() {
+        let viewport = (px(100.), px(300.));
+        assert_eq!(nearest_scroll_offset(px(-40.), viewport, (px(120.), px(152.))), px(-40.), "already in view");
+        assert_eq!(nearest_scroll_offset(px(-40.), viewport, (px(290.), px(322.))), px(-62.), "below: bottom edge");
+        assert_eq!(nearest_scroll_offset(px(-40.), viewport, (px(80.), px(112.))), px(-20.), "above: top edge");
+        assert_eq!(nearest_scroll_offset(px(-10.), viewport, (px(60.), px(92.))), px(0.), "never past the top");
     }
 
     #[test]
