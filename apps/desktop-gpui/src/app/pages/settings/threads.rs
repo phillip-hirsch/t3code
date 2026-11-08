@@ -49,7 +49,11 @@ fn runtime_mode_denial(policy: &Value, mode: &str) -> Option<String> {
     let (_, label, ..) = RUNTIME_MODES[rank(ceiling)?];
     (rank(mode)? > rank(ceiling)?).then(|| format!("{organization} limits threads to {label}."))
 }
-const AUTO_SETTLE_DEFAULT_DAYS: i64 = 3;
+
+/// The days the inactivity switch turns back on with (`AUTO_SETTLE_DEFAULT_DAYS`).
+fn auto_settle_default_days() -> i64 {
+    crate::settings::contract().default_value("sidebarAutoSettleAfterDays").as_i64().unwrap_or(7)
+}
 
 /// The snooze editor's draft. Rows keep a key across edits and sorts so a row's own fields
 /// stay with it; edits build on the draft so a second edit before the first echoes back
@@ -392,7 +396,7 @@ impl Workspace {
         let days = view.value("sidebarAutoSettleAfterDays").as_i64();
         let toggle = switch(&"auto-settle-inactive-threads".into(), days.is_some(), false).on_click(cx.listener(
             move |this, _, window, cx| {
-                let days = days.is_none().then_some(AUTO_SETTLE_DEFAULT_DAYS);
+                let days = days.is_none().then(auto_settle_default_days);
                 this.update_settings(json!({ "sidebarAutoSettleAfterDays": days }), window, cx);
             },
         ));
