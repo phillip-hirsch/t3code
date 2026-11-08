@@ -1259,7 +1259,7 @@ impl Workspace {
                         .id(SharedString::from(format!("{id}-inert")))
                         .absolute()
                         .inset_0()
-                        .occlude()
+                        .block_mouse_except_scroll()
                         .when(!message.is_empty(), |el| {
                             el.tooltip(move |window, cx| Tooltip::new(message.clone()).build(window, cx))
                         }),
