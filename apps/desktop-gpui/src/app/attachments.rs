@@ -318,7 +318,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> bool {
         if !self.can_attach() {
-            return false;
+            return item.text().is_some_and(|text| self.paste_chips(&text, window, cx));
         }
         let mut handled = false;
         for entry in item.entries() {
@@ -346,7 +346,8 @@ impl Workspace {
                     handled = true;
                 }
                 gpui_kit::ClipboardEntry::String(text) if !handled => {
-                    handled = self.fold_pasted_text(text.text(), window, cx);
+                    handled =
+                        self.fold_pasted_text(text.text(), window, cx) || self.paste_chips(text.text(), window, cx);
                 }
                 gpui_kit::ClipboardEntry::String(_) => {}
             }

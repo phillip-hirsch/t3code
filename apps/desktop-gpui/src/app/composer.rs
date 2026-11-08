@@ -208,6 +208,36 @@ impl Workspace {
         self.sync_composer_marks(cx);
     }
 
+    /// Pasted file links, known skills and context links arrive as chips (`handlePaste`);
+    /// `false` leaves a paste without any, or one into code, to the editor.
+    pub(super) fn paste_chips(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let state = self.composer.read(cx);
+        let (value, selection) = (state.value(), state.selected_range());
+        let rich = self.client_settings.values.bool("composerRichTextEnabled");
+        if rich && crate::composer_edit::in_code_block(&value, selection.clone()) {
+            return false;
+        }
+        let after_space = value[..selection.start].chars().next_back().is_none_or(char::is_whitespace);
+        let skills = self.skill_names();
+        let Some((text, found)) =
+            composer_text::pasted_chips(text, after_space, |name| skills.iter().any(|s| s == name))
+        else {
+            return false;
+        };
+        let at = selection.start;
+        self.composer.update(cx, |state, cx| {
+            state.replace(text.clone(), window, cx);
+            // Same-length swaps, back to front, so every range stays put.
+            for (range, chip) in found.into_iter().rev() {
+                let token = InlineToken::new(chip.id(), &text[range.clone()]).with_label(chip.label().to_owned());
+                let _ = state.replace_range_with_token(at + range.start..at + range.end, token, window, cx);
+            }
+            let end = at + text.len();
+            state.set_selected_range(end..end, cx);
+        });
+        true
+    }
+
     /// The user-invocable skills of the composer's provider, by name.
     fn skill_names(&self) -> Vec<String> {
         let Some(provider) = self.composer_provider() else {

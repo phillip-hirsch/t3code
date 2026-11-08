@@ -217,6 +217,37 @@ pub fn chips(text: &str, is_skill: impl Fn(&str) -> bool) -> Vec<(Range<usize>, 
     found
 }
 
+/// Chips with their byte ranges in the text they came from.
+pub type ChipSpans = Vec<(Range<usize>, Chip)>;
+
+/// `handlePaste`: the chips in pasted `text`, with a space after a mention or skill that ends it
+/// and before one that starts it unless the caret follows whitespace; `None` when it has none.
+pub fn pasted_chips(text: &str, after_space: bool, is_skill: impl Fn(&str) -> bool) -> Option<(String, ChipSpans)> {
+    // A trailing line break lets a mention that ends the paste parse, as the web's does.
+    let mut found: Vec<_> = chips(
+        &format!(
+            "{text}
+"
+        ),
+        is_skill,
+    )
+    .into_iter()
+    .filter(|(range, _)| range.end <= text.len())
+    .collect();
+    let spaced = |chip: &Chip| matches!(chip, Chip::File { .. } | Chip::Skill { .. });
+    let mut padded = text.to_owned();
+    if found.last().is_some_and(|(range, chip)| range.end == text.len() && spaced(chip)) {
+        padded.push(' ');
+    }
+    if found.first().is_some_and(|(range, chip)| range.start == 0 && spaced(chip)) && !after_space {
+        padded.insert(0, ' ');
+        for (range, _) in &mut found {
+            *range = range.start + 1..range.end + 1;
+        }
+    }
+    (!found.is_empty()).then_some((padded, found))
+}
+
 /// `[label](dest)` whose label is the destination's basename and whose
 /// destination has no URI scheme; returns its length and decoded path.
 fn parse_file_link(text: &str) -> Option<(usize, String)> {
@@ -440,6 +471,18 @@ mod tests {
         assert_eq!(kind("$1e9"), None);
         let t = detect("a\n@x y", 4).unwrap();
         assert_eq!((t.range, t.query), (2..4, "x".into()));
+    }
+
+    #[test]
+    fn pasted_mentions_and_skills_become_chips_kept_apart_from_their_neighbours() {
+        let skill = |name: &str| name == "review";
+        assert_eq!(pasted_chips("plain words", false, skill), None);
+        let (text, found) = pasted_chips("[a.rs](src/a.rs)", false, skill).unwrap();
+        assert_eq!(text, " [a.rs](src/a.rs) ");
+        assert_eq!(found, [(1..17, Chip::File { path: "src/a.rs".into() })]);
+        let (text, found) = pasted_chips("see $review", true, skill).unwrap();
+        assert_eq!((text.as_str(), found), ("see $review ", vec![(4..11, Chip::Skill { name: "review".into() })]));
+        assert_eq!(pasted_chips("$unknown", true, skill), None, "only a skill the provider offers");
     }
 
     #[test]
