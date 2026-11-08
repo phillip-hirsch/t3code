@@ -4,7 +4,7 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AnyElement, App, DefiniteLength, Edges, ElementId, Entity, Global, Hsla,
     InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Rems, RenderOnce, Role,
-    SharedString, StyleRefinement, Styled, TextAlign, TouchPhase, Window, div, px, relative,
+    SharedString, StyleRefinement, Styled, TextAlign, TouchPhase, Window, div, px, relative, rems,
 };
 
 use crate::button::{Button, ButtonRounded, ButtonVariants as _};
@@ -791,10 +791,10 @@ impl RenderOnce for Input {
             })
             .input_h(self.size)
             .input_text_size(self.size)
-            // t3code: below the web's `sm` breakpoint (640px) a field is 4px taller with 16px text
+            // t3code: below the web's `sm` breakpoint (640px) a field is 0.25rem taller with 1rem text
             // (`h-9 sm:h-8`, `text-base sm:text-sm`); the caller's own sizes still win.
             .when(window.viewport_size().width < px(640.), |this| {
-                this.h(self.size.input_height() + px(4.)).text_base()
+                this.h(rems(self.size.input_height_rems() + 0.25)).text_base()
             })
             .items_center()
             .when(presentation.is_multi_line(), |this| {
