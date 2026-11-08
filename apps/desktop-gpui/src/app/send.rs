@@ -173,6 +173,12 @@ impl Workspace {
         let message_text = if text.is_empty() { ATTACHMENT_ONLY_PROMPT.to_owned() } else { text.clone() };
         let origin = target.clone();
         let (declines, text_is_feedback) = self.approval_declines(&text);
+        // Feedback answers the approval as text alone; nothing else may ride along.
+        if text_is_feedback && (!attachments.is_empty() || context.is_some()) {
+            self.error = Some("Send approval feedback without attachments or added context.".into());
+            cx.notify();
+            return;
+        }
         let mut background = false;
         // Thread settings the message runs with, applied right before it.
         let mut settings_commands = Vec::new();
