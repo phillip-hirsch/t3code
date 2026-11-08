@@ -8,20 +8,24 @@
 use std::collections::{HashMap, HashSet};
 
 use gpui_kit::assets::IconName;
+use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{Icon, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{
+    Disableable as _, Icon, Selectable as _, Side, Sizable as _, WindowExt as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    Anchor, AnyElement, App, AppContext as _, ClickEvent, Context, Div, Entity, Focusable as _, FontWeight,
-    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Pixels, Point, SharedString, Stateful,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, anchored, deferred, div, point, px,
+    Anchor, AnyElement, App, AppContext as _, ClickEvent, Context, Entity, FocusHandle, Focusable as _,
+    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, div, px,
 };
 use gpui_webview::WebView;
 use serde_json::{Value, json};
 
 use super::right_panel::Surface;
-use super::titlebar::{RIGHT_RESIZE_INSET, TITLEBAR_HEIGHT};
+use super::titlebar::TITLEBAR_HEIGHT;
 use super::{Target, Workspace};
 use crate::preview::{self, Appearance, Applied, NavStatus, Session, ThreadPreviews};
 use crate::rpc::RpcClient;
@@ -104,6 +108,8 @@ pub(super) struct PreviewState {
     /// The tab whose URL the address bar shows.
     address_tab: Option<String>,
     pub(super) menu_open: bool,
+    /// The address bar's "Open in system browser" button, shown while it has focus.
+    external_focus: FocusHandle,
     /// Threads whose session list must be (re)fetched.
     stale: HashSet<String>,
     reported_profiles: profiles::ReportedProfiles,
@@ -144,6 +150,7 @@ impl PreviewState {
             address,
             address_tab: None,
             menu_open: false,
+            external_focus: cx.focus_handle().tab_stop(true),
             stale: HashSet::new(),
             reported_profiles: profiles::ReportedProfiles::default(),
             server: Default::default(),
@@ -182,24 +189,55 @@ impl PreviewState {
     }
 }
 
-fn tooltip(text: &'static str) -> impl Fn(&mut Window, &mut App) -> gpui_kit::AnyView {
-    move |window, cx| Tooltip::new(text).build(window, cx)
-}
-
-/// A 24px ghost icon button (`Button variant=ghost size=icon-xs`).
-fn icon_button(id: impl Into<gpui_kit::ElementId>, icon: IconName, enabled: bool, tokens: &Tokens) -> Stateful<Div> {
-    let accent = tokens.accent;
-    div()
-        .id(id.into())
-        .flex_none()
+/// A 24px `Button variant=ghost size=icon-xs`: a Tab stop that Enter and Space press, ringed while
+/// focused. A disabled one leaves the Tab order, like a disabled `<button>`.
+fn icon_button(id: impl Into<gpui_kit::ElementId>, icon: IconName, enabled: bool, tokens: &Tokens, cx: &App) -> Button {
+    Button::new(id)
+        .custom(
+            ButtonCustomVariant::new(cx).foreground(tokens.muted_foreground).hover(tokens.accent).active(tokens.accent),
+        )
+        .xsmall()
         .size(px(24.))
         .rounded(px(6.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .text_color(if enabled { tokens.muted_foreground } else { tokens.muted_foreground.opacity(0.5) })
-        .when(enabled, |el| el.cursor_pointer().hover(move |style| style.bg(accent)))
-        .child(Icon::new(icon).size(px(14.)))
+        .icon(Icon::new(icon).size(px(14.)))
+        .disabled(!enabled)
+}
+
+/// The menu's Zoom row (`closeOnClick={false}`): its buttons step the active tab's zoom, read
+/// live so the label follows, without closing the menu.
+fn zoom_row(view: &Entity<Workspace>, window: &mut Window, cx: &mut App) -> AnyElement {
+    let tokens = *theme::tokens(cx);
+    let zoom = view.read(cx).active_zoom();
+    let set_zoom = |zoom: fn(f64) -> f64| {
+        window.listener_for(view, move |this: &mut Workspace, _: &ClickEvent, _, cx| {
+            let zoom = zoom(this.active_zoom());
+            this.adjust_preview("preview.adjust", json!({"zoomFactor": zoom}), cx);
+        })
+    };
+    let step = |id: &'static str, icon: IconName, label: &'static str, zoom: fn(f64) -> f64| {
+        icon_button(id, icon, true, &tokens, cx).tab_stop(false).tooltip(label).on_click(set_zoom(zoom))
+    };
+    h_flex()
+        .id("menu-zoom")
+        .flex_1()
+        .gap_1()
+        .on_click(|_, _, cx| cx.stop_propagation())
+        .child(div().flex_1().child("Zoom"))
+        .child(step("menu-zoom-out", IconName::Minus, "Zoom out", |zoom| preview::step_zoom(zoom, -1)))
+        .child(
+            div()
+                .id("menu-zoom-reset")
+                .w(px(44.))
+                .text_center()
+                .text_xs()
+                .cursor_pointer()
+                .text_color(tokens.muted_foreground)
+                .child(format!("{}%", (zoom * 100.).round()))
+                .tooltip(|window, cx| Tooltip::new("Reset zoom").build(window, cx))
+                .on_click(set_zoom(|_| 1.)),
+        )
+        .child(step("menu-zoom-in", IconName::Plus, "Zoom in", |zoom| preview::step_zoom(zoom, 1)))
+        .into_any_element()
 }
 
 impl Workspace {
@@ -1043,8 +1081,8 @@ impl Workspace {
         let server_tab = server_tab.map(|s| s.tab_id.clone());
         let (back_tab, forward_tab) = (server_tab.clone(), server_tab);
         let address_focused = self.preview.address.read(cx).focus_handle(cx).is_focused(window);
-        // The menu's top-right corner: under the trigger at the chrome row's right end.
-        let menu_corner = point(window.viewport_size().width - RIGHT_RESIZE_INSET - px(8.), TITLEBAR_HEIGHT + px(32.));
+        // `opacity-0` until the address bar is hovered or the button has focus, but still a Tab stop.
+        let external_focused = self.preview.external_focus.is_focused(window);
         h_flex()
             .relative()
             .h(px(28.))
@@ -1056,23 +1094,22 @@ impl Workspace {
             .child(
                 h_flex()
                     .gap(px(2.))
+                    .child(icon_button("preview-back", IconName::ArrowLeft, can_back, tokens, cx).tooltip("Back").when(
+                        can_back,
+                        |el| {
+                            el.on_click(cx.listener(move |this, _, _, cx| match &back_tab {
+                                Some(tab) => {
+                                    this.send_server_input(tab, json!({"type": "history", "delta": -1}));
+                                }
+                                None => this.with_active_view(cx, |view| {
+                                    let _ = view.evaluate_script("history.back()");
+                                }),
+                            }))
+                        },
+                    ))
                     .child(
-                        icon_button("preview-back", IconName::ArrowLeft, can_back, tokens)
-                            .tooltip(tooltip("Back"))
-                            .when(can_back, |el| {
-                                el.on_click(cx.listener(move |this, _, _, cx| match &back_tab {
-                                    Some(tab) => {
-                                        this.send_server_input(tab, json!({"type": "history", "delta": -1}));
-                                    }
-                                    None => this.with_active_view(cx, |view| {
-                                        let _ = view.evaluate_script("history.back()");
-                                    }),
-                                }))
-                            }),
-                    )
-                    .child(
-                        icon_button("preview-forward", IconName::ArrowRight, can_forward, tokens)
-                            .tooltip(tooltip("Forward"))
+                        icon_button("preview-forward", IconName::ArrowRight, can_forward, tokens, cx)
+                            .tooltip("Forward")
                             .when(can_forward, |el| {
                                 el.on_click(cx.listener(move |this, _, _, cx| match &forward_tab {
                                     Some(tab) => {
@@ -1085,8 +1122,8 @@ impl Workspace {
                             }),
                     )
                     .child(
-                        icon_button("preview-reload", IconName::RotateCw, has_page, tokens)
-                            .tooltip(tooltip(if loading { "Loading…" } else { "Refresh" }))
+                        icon_button("preview-reload", IconName::RotateCw, has_page, tokens, cx)
+                            .tooltip(if loading { "Loading…" } else { "Refresh" })
                             .when(has_page, |el| {
                                 el.on_click(cx.listener(move |this, _, _, cx| {
                                     if let Some(tab) = &reload_tab {
@@ -1114,25 +1151,40 @@ impl Workspace {
                     )
                     .when(!url.is_empty() && !address_focused, |el| {
                         el.child(
-                            icon_button("preview-open-external", IconName::ExternalLink, true, tokens)
-                                .invisible()
-                                .group_hover("preview-address", gpui_kit::Styled::visible)
-                                .tooltip(tooltip("Open in system browser"))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    let url = this.active_url();
-                                    if !url.is_empty() {
-                                        cx.open_url(&url);
-                                    }
-                                })),
+                            div()
+                                .flex_none()
+                                .when(!external_focused, |el| {
+                                    el.opacity(0.).group_hover("preview-address", |style| style.opacity(1.))
+                                })
+                                .child(
+                                    icon_button("preview-open-external", IconName::ExternalLink, true, tokens, cx)
+                                        .track_focus(&self.preview.external_focus)
+                                        .tooltip("Open in system browser")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            let url = this.active_url();
+                                            if !url.is_empty() {
+                                                cx.open_url(&url);
+                                            }
+                                        })),
+                                ),
                         )
                     }),
             )
             .children(float.map(|(tab, floating, enabled)| {
                 let label = if floating { "Close floating preview" } else { "Float preview over chat" };
                 let thread = thread_id.to_owned();
-                icon_button("preview-float", IconName::PictureInPicture2, enabled, tokens)
-                    .when(floating, |el| el.bg(tokens.secondary).text_color(tokens.primary))
-                    .tooltip(tooltip(label))
+                icon_button("preview-float", IconName::PictureInPicture2, enabled, tokens, cx)
+                    // `variant="secondary"` with a primary icon while floating.
+                    .when(floating, |el| {
+                        el.custom(
+                            ButtonCustomVariant::new(cx)
+                                .color(tokens.secondary)
+                                .foreground(tokens.primary)
+                                .hover(tokens.secondary)
+                                .active(tokens.secondary),
+                        )
+                    })
+                    .tooltip(label)
                     .when(enabled, |el| {
                         el.on_click(cx.listener(move |this, _, _, cx| {
                             if floating {
@@ -1145,215 +1197,132 @@ impl Workspace {
                         }))
                     })
             }))
-            .child(self.render_preview_menu(session, has_page, menu_corner, tokens, cx))
+            .child(self.render_preview_menu(session, has_page, tokens, cx))
             .when(loading, |el| {
                 el.child(div().absolute().left_0().right_0().bottom(px(-1.)).h(px(2.)).bg(tokens.primary))
             })
     }
 
-    /// `PreviewMoreMenu`.
+    /// `PreviewMoreMenu`: a `Menu` that arrow keys move through, Enter picks from and Escape
+    /// closes, handing focus back to where it was.
     fn render_preview_menu(
         &self,
         session: Option<&Session>,
         has_page: bool,
-        corner: Point<Pixels>,
         tokens: &Tokens,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let open = self.preview.menu_open;
-        let trigger = icon_button("preview-more", IconName::Ellipsis, session.is_some(), tokens)
-            .when(self.preview.menu_open, |el| el.bg(tokens.accent))
-            .tooltip(tooltip("More"))
-            // Acts on press: the menu's outside-press dismissal runs first, so a press that
-            // already closed it must not reopen it.
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    if this.preview.menu_open == open {
-                        this.preview.menu_open = !open;
-                        cx.notify();
-                    }
-                }),
-            );
-        let Some(session) = session.filter(|_| self.preview.menu_open) else { return div().child(trigger) };
+    ) -> AnyElement {
+        let trigger = icon_button("preview-more", IconName::Ellipsis, session.is_some(), tokens, cx)
+            .tooltip("More")
+            .selected(self.preview.menu_open);
+        let Some(session) = session else { return trigger.into_any_element() };
         let server = session.server_hosted();
         let move_label = self.move_tab_label(session);
         let moving = session.clone();
-        let (zoom, appearance) = self.tab_look(session);
+        let (_, appearance) = self.tab_look(session);
         let preset = session.viewport.preset_id().map(str::to_owned);
         let fill = session.viewport.size().is_none();
-
-        let item = |id: SharedString, label: SharedString, checked: bool, enabled: bool| {
-            let accent = tokens.accent;
-            h_flex()
-                .id(id)
-                .h(px(28.))
-                .px_2()
-                .gap_2()
-                .rounded(px(6.))
-                .text_sm()
-                .text_color(if enabled { tokens.foreground } else { tokens.muted_foreground })
-                .when(enabled, |el| el.cursor_pointer().hover(move |style| style.bg(accent)))
-                .child(div().flex_1().truncate().child(label))
-                .when(checked, |el| el.child(Icon::new(IconName::Check).size(px(14.))))
-        };
-        let heading = |label: &'static str| {
-            div()
-                .px_2()
-                .pt_2()
-                .pb_1()
-                .text_xs()
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(tokens.muted_foreground)
-                .child(label)
-        };
-        let separator = || div().my_1().h(px(1.)).bg(tokens.border);
-        let close = |this: &mut Self, cx: &mut Context<Self>| {
-            this.preview.menu_open = false;
-            cx.notify();
-        };
-
-        let mut menu = v_flex()
-            .id("preview-menu")
-            .w(px(240.))
-            .max_h(px(520.))
-            .overflow_y_scroll()
-            .p_1()
-            .rounded(px(10.))
-            .border_1()
-            .border_color(tokens.border)
-            .bg(tokens.popover)
-            .shadow_lg()
-            .occlude()
-            .on_mouse_down_out(cx.listener(move |this, _, _, cx| close(this, cx)))
-            .child(item("menu-hard-reload".into(), "Hard reload".into(), false, has_page).when(has_page, |el| {
-                el.on_click(cx.listener(move |this, _, _, cx| {
-                    if server {
-                        this.adjust_preview("preview.adjust", json!({"hardReload": true}), cx);
-                    } else {
-                        this.with_active_view(cx, hard_reload);
-                    }
-                    close(this, cx);
-                }))
-            }))
-            .when(!server, |menu| {
-                menu.child(item("menu-devtools".into(), "Open DevTools".into(), false, has_page).when(has_page, |el| {
-                    el.on_click(cx.listener(move |this, _, _, cx| {
-                        this.with_active_view(cx, wry::WebView::open_devtools);
-                        close(this, cx);
-                    }))
-                }))
-            })
-            .children(move_label.map(|label| {
-                item("menu-move-tab".into(), label, false, true).on_click(cx.listener(move |this, _, window, cx| {
-                    close(this, cx);
-                    this.move_preview_tab(moving.clone(), window, cx);
-                }))
-            }))
-            .child(separator())
-            .child(heading("Appearance"));
-        for option in Appearance::ALL {
-            menu = menu.child(
-                item(
-                    format!("menu-appearance-{}", option.as_str()).into(),
-                    option.label().into(),
-                    appearance == option,
-                    true,
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.adjust_preview("preview.adjust", json!({"colorScheme": option.as_str()}), cx);
-                    close(this, cx);
-                })),
-            );
-        }
-        let zoom_step = |id: &'static str, icon: IconName, direction: i32, label: &'static str| {
-            icon_button(id, icon, true, tokens).tooltip(tooltip(label)).on_click(cx.listener(move |this, _, _, cx| {
-                this.adjust_preview("preview.adjust", json!({"zoomFactor": preview::step_zoom(zoom, direction)}), cx);
-            }))
-        };
-        menu = menu
-            .child(separator())
-            .child(
-                h_flex()
-                    .h(px(28.))
-                    .px_2()
-                    .gap_1()
-                    .text_sm()
-                    .child(div().flex_1().child("Zoom"))
-                    .child(zoom_step("menu-zoom-out", IconName::Minus, -1, "Zoom out"))
-                    .child(
-                        div()
-                            .id("menu-zoom-reset")
-                            .w(px(44.))
-                            .text_center()
-                            .text_xs()
-                            .cursor_pointer()
-                            .text_color(tokens.muted_foreground)
-                            .child(format!("{}%", (zoom * 100.).round()))
-                            .tooltip(tooltip("Reset zoom"))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.adjust_preview("preview.adjust", json!({"zoomFactor": 1.0}), cx);
-                            })),
-                    )
-                    .child(zoom_step("menu-zoom-in", IconName::Plus, 1, "Zoom in")),
-            )
-            .child(separator())
-            .child(heading("Viewport"))
-            .child(item("menu-viewport-fill".into(), "Fill panel".into(), fill, true).on_click(cx.listener(
-                move |this, _, _, cx| {
-                    this.adjust_preview("preview.resize", json!({"viewport": {"_tag": "fill"}}), cx);
-                    close(this, cx);
-                },
-            )));
-        for preset_option in &preview::PRESETS {
-            let checked = preset.as_deref() == Some(preset_option.id);
-            let label: SharedString =
-                format!("{} · {} × {}", preset_option.label, preset_option.width, preset_option.height).into();
-            menu =
-                menu.child(item(format!("menu-viewport-{}", preset_option.id).into(), label, checked, true).on_click(
-                    cx.listener(move |this, _, _, cx| {
-                        this.adjust_preview(
-                            "preview.resize",
-                            json!({"viewport": preview::Viewport::preset(preset_option)}),
-                            cx,
+        let view = cx.entity();
+        trigger
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu: PopupMenu, window, _| {
+                let adjust = |method: &'static str, change: Value| {
+                    window.listener_for(&view, move |this: &mut Self, _: &ClickEvent, _, cx| {
+                        this.adjust_preview(method, change.clone(), cx);
+                    })
+                };
+                let mut menu = menu.min_w(px(240.)).max_h(px(520.)).scrollable(true).check_side(Side::Right).item(
+                    PopupMenuItem::new("Hard reload").disabled(!has_page).on_click(window.listener_for(
+                        &view,
+                        move |this, _: &ClickEvent, _, cx| {
+                            if server {
+                                this.adjust_preview("preview.adjust", json!({"hardReload": true}), cx);
+                            } else {
+                                this.with_active_view(cx, hard_reload);
+                            }
+                        },
+                    )),
+                );
+                if !server {
+                    menu = menu.item(PopupMenuItem::new("Open DevTools").disabled(!has_page).on_click(
+                        window.listener_for(&view, |this, _: &ClickEvent, _, cx| {
+                            this.with_active_view(cx, wry::WebView::open_devtools);
+                        }),
+                    ));
+                }
+                if let Some(label) = move_label.clone() {
+                    let moving = moving.clone();
+                    menu = menu.item(PopupMenuItem::new(label).on_click(window.listener_for(
+                        &view,
+                        move |this, _: &ClickEvent, window, cx| {
+                            this.move_preview_tab(moving.clone(), window, cx);
+                        },
+                    )));
+                }
+                menu = menu.separator().label("Appearance");
+                for option in Appearance::ALL {
+                    menu = menu.item(
+                        PopupMenuItem::new(option.label())
+                            .checked(appearance == option)
+                            .on_click(adjust("preview.adjust", json!({"colorScheme": option.as_str()}))),
+                    );
+                }
+                let zoom_view = view.clone();
+                menu = menu
+                    .separator()
+                    .item(PopupMenuItem::element(move |window, cx| zoom_row(&zoom_view, window, cx)))
+                    .separator()
+                    .label("Viewport")
+                    .item(
+                        PopupMenuItem::new("Fill panel")
+                            .checked(fill)
+                            .on_click(adjust("preview.resize", json!({"viewport": {"_tag": "fill"}}))),
+                    );
+                for option in &preview::PRESETS {
+                    let label = format!("{} · {} × {}", option.label, option.width, option.height);
+                    menu =
+                        menu.item(PopupMenuItem::new(label).checked(preset.as_deref() == Some(option.id)).on_click(
+                            adjust("preview.resize", json!({"viewport": preview::Viewport::preset(option)})),
+                        ));
+                }
+                // The server's browser clears the tab's profile itself. wry clears a profile's cache
+                // only with all its other data, so this computer's tabs offer cookies alone.
+                if server {
+                    menu = menu
+                        .separator()
+                        .item(
+                            PopupMenuItem::new("Clear cookies")
+                                .on_click(adjust("preview.adjust", json!({"clear": "cookies"}))),
+                        )
+                        .item(
+                            PopupMenuItem::new("Clear cache")
+                                .on_click(adjust("preview.adjust", json!({"clear": "cache"}))),
                         );
-                        close(this, cx);
-                    }),
-                ));
-        }
-        // The server's browser clears the tab's profile itself. wry clears a profile's cache only
-        // with all its other data, so this computer's tabs offer cookies alone.
-        if server {
-            let clear = |id: &'static str, label: &'static str, what: &'static str| {
-                item(id.into(), label.into(), false, true).on_click(cx.listener(move |this, _, _, cx| {
-                    this.adjust_preview("preview.adjust", json!({"clear": what}), cx);
-                    close(this, cx);
-                }))
-            };
-            menu = menu.child(separator()).child(clear("menu-clear-cookies", "Clear cookies", "cookies")).child(clear(
-                "menu-clear-cache",
-                "Clear cache",
-                "cache",
-            ));
-        }
-        #[cfg(windows)]
-        if !server {
-            menu = menu.child(separator()).child(
-                item("menu-clear-cookies".into(), "Clear cookies".into(), false, has_page).when(has_page, |el| {
-                    el.on_click(cx.listener(move |this, _, window, cx| {
-                        // Reading the cookies runs WebView2's message loop: a task, as `build_view` needs.
-                        cx.spawn_in(window, async move |this, cx| {
-                            let _ = this.update(cx, |this, cx| this.with_active_view(cx, clear_cookies));
-                        })
-                        .detach();
-                        close(this, cx);
-                    }))
-                }),
-            );
-        }
-        div()
-            .child(trigger)
-            .child(deferred(anchored().anchor(Anchor::TopRight).position(corner).child(menu)).with_priority(2))
+                }
+                #[cfg(windows)]
+                if !server {
+                    menu = menu.separator().item(PopupMenuItem::new("Clear cookies").disabled(!has_page).on_click(
+                        window.listener_for(&view, |_, _: &ClickEvent, window, cx| {
+                            // Reading the cookies runs WebView2's message loop: a task, as `build_view` needs.
+                            cx.spawn_in(window, async move |this, cx| {
+                                let _ = this.update(cx, |this, cx| this.with_active_view(cx, clear_cookies));
+                            })
+                            .detach();
+                        }),
+                    ));
+                }
+                menu
+            })
+            .open(self.preview.menu_open)
+            .on_open_change(cx.listener(|this, open: &bool, _, cx| {
+                this.preview.menu_open = *open;
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    /// The active tab's zoom factor.
+    fn active_zoom(&self) -> f64 {
+        self.preview_thread_id().and_then(|thread_id| self.active_session(thread_id)).map_or(1., |s| self.tab_look(s).0)
     }
 
     /// `ThreadPreviewMiniPlayer`: the floated tab over the chat's bottom-right corner, unless the
@@ -1410,16 +1379,16 @@ impl Workspace {
                         .child(Icon::new(IconName::Globe).size(px(12.)).text_color(tokens.muted_foreground))
                         .child(div().flex_1().min_w_0().truncate().child(title))
                         .child(
-                            icon_button("mini-expand", IconName::PanelRight, true, &tokens)
-                                .tooltip(tooltip("Open in panel"))
+                            icon_button("mini-expand", IconName::PanelRight, true, &tokens, cx)
+                                .tooltip("Open in panel")
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.preview.floating.remove(&expand_thread);
                                     this.open_surface(Surface::Browser(expand_tab.clone()), window, cx);
                                 })),
                         )
                         .child(
-                            icon_button("mini-close", IconName::X, true, &tokens)
-                                .tooltip(tooltip("Close floating preview"))
+                            icon_button("mini-close", IconName::X, true, &tokens, cx)
+                                .tooltip("Close floating preview")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.preview.floating.remove(&close_thread);
                                     cx.notify();
