@@ -88,7 +88,7 @@ impl Workspace {
         let connected = self.settings_client().is_some();
         let background = self.render_background_row(view, cx);
         // `StorageCleanupSections` renders nothing for a project or checkout.
-        let storage = if view.scope.is_project() { Vec::new() } else { self.render_storage_sections(window, cx) };
+        let storage = if view.scope.is_project() { Vec::new() } else { self.render_storage_sections(view, window, cx) };
         let mut row = |this: &mut Self, row: SettingRow| this.setting_row(view, row, window, cx);
         let updates = [
             row(
