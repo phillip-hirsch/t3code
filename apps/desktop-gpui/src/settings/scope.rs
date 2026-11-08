@@ -151,6 +151,30 @@ pub fn single_environment(search: &ScopeSearch, groups: &[Group], environments: 
     selected.map_or_else(|| search.clone(), |e| search.with_machine(Some(e.id.to_owned())))
 }
 
+/// An environment as scope labels name it: `(id, label, address url)`.
+pub type Labeled<'a> = (&'a str, &'a str, Option<&'a str>);
+
+/// `settingsScopeEnvironmentAddress`: the address's host, else the id.
+pub fn environment_address(id: &str, url: Option<&str>) -> String {
+    match url {
+        Some(url) => url.split_once("://").map_or(url, |(_, rest)| rest.split('/').next().unwrap_or(rest)).to_owned(),
+        None => id.to_owned(),
+    }
+}
+
+/// `settingsScopeEnvironmentLabels`' secondary line: what tells `id` apart from another
+/// environment with its label, `None` when no other shares it.
+pub fn environment_secondary(id: &str, environments: &[Labeled]) -> Option<String> {
+    let &(_, label, url) = environments.iter().find(|e| e.0 == id)?;
+    let mine = environment_address(id, url);
+    let duplicates: Vec<_> = environments.iter().filter(|e| e.0 != id && e.1 == label).collect();
+    if duplicates.is_empty() {
+        return None;
+    }
+    let collides = duplicates.iter().any(|e| environment_address(e.0, e.2) == mine);
+    Some(if collides { url.unwrap_or(id).to_owned() } else { mine })
+}
+
 /// The environment a page reads and its environment-wide controls act on
 /// (`selectScopedSettingsEnvironments().environment`): the primary while it is selected and
 /// connected, else the first connected selected one, else the first selected (so a page on an

@@ -297,21 +297,13 @@ fn group_pages<'a>(
 }
 
 /// `settingsScopeEnvironmentLabels` as the archive joins them: `label (secondary)` when another
-/// environment shares the label. Each entry is `(id, label, address url)`.
-fn environment_label(id: &str, environments: &[(&str, &str, Option<&str>)]) -> String {
-    let Some(&(_, label, url)) = environments.iter().find(|e| e.0 == id) else { return id.to_owned() };
-    let address = |id: &str, url: Option<&str>| match url {
-        Some(url) => url.split_once("://").map_or(url, |(_, rest)| rest.split('/').next().unwrap_or(rest)).to_owned(),
-        None => id.to_owned(),
-    };
-    let mine = address(id, url);
-    let duplicates: Vec<_> = environments.iter().filter(|e| e.0 != id && e.1 == label).collect();
-    if duplicates.is_empty() {
-        return label.to_owned();
+/// environment shares the label.
+fn environment_label(id: &str, environments: &[scope::Labeled]) -> String {
+    let Some(&(_, label, _)) = environments.iter().find(|e| e.0 == id) else { return id.to_owned() };
+    match scope::environment_secondary(id, environments) {
+        Some(secondary) => format!("{label} ({secondary})"),
+        None => label.to_owned(),
     }
-    let secondary =
-        if duplicates.iter().any(|e| address(e.0, e.2) == mine) { url.unwrap_or(id).to_owned() } else { mine };
-    format!("{label} ({secondary})")
 }
 
 /// What Delete does (`confirmAndDeleteThread`): refuse without `orchestration:operate`, else ask
@@ -390,7 +382,7 @@ impl Workspace {
             );
         }
         let labels: HashMap<&str, String> = if multiple {
-            let environments: Vec<(&str, &str, Option<&str>)> = self
+            let environments: Vec<scope::Labeled> = self
                 .sessions
                 .iter()
                 .filter_map(|s| {

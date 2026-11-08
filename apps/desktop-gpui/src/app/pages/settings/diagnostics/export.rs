@@ -6,17 +6,17 @@ use gpui_kit::component::{Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, AppContext as _, Context, ElementId, Entity, FontWeight, Hsla, InteractiveElement as _, IntoElement,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
+    ParentElement as _, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px, svg,
 };
 use serde_json::{Map, Value, json};
 
-use super::super::connections::logic::SETTINGS_WRITE;
-use super::super::connections::ui::{Variant, WebButton};
+use super::super::connections::logic::{SETTINGS_WRITE, machine_icon};
+use super::super::connections::ui::{Variant, WebButton, tooltip};
 use super::super::widgets::{SettingsView, section_with_action};
 use super::{DiagnosticsState, success};
 use crate::app::Workspace;
 use crate::rpc::RpcClient;
-use crate::settings::scope::ScopeKind;
+use crate::settings::scope::{self, ScopeKind};
 use crate::theme::{self, Tokens};
 
 /// `SIGNALS`: settings key, running source/variable keys, label, OTLP signal.
@@ -125,7 +125,7 @@ impl Workspace {
     ) -> AnyElement {
         let t = *theme::tokens(cx);
         let Some(client) = self.settings_client().filter(|_| view.scope.kind == ScopeKind::Environment) else {
-            return self.export_scope_notice(view, &t, cx);
+            return self.export_scope_notice(&t, cx);
         };
         let saved_values = self.settings_info().settings.get("observability");
         let saved: [String; 3] =
@@ -368,27 +368,62 @@ impl Workspace {
         )
     }
 
-    /// `SettingsScopeNotice target="environment"` inside the section.
-    fn export_scope_notice(&mut self, view: &SettingsView, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
-        let Some(environment) = view.environment() else { return div().into_any_element() };
-        let (id, label) = (environment.id.to_owned(), SharedString::from(environment.label.to_owned()));
-        let choice = h_flex()
-            .id("telemetry-export-environment")
-            .px(px(16.))
-            .py(px(12.))
-            .gap(px(12.))
-            .cursor_pointer()
-            .hover(|s| s.bg(t.accent.opacity(0.5)))
-            .child(div().flex_1().min_w_0().truncate().text_sm().font_weight(FontWeight::MEDIUM).child(label))
-            .child(
-                gpui_kit::component::Icon::new(gpui_kit::assets::IconName::ChevronRight)
-                    .size(px(16.))
-                    .text_color(t.muted_foreground),
-            )
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.settings_ui.scope = this.settings_ui.scope.with_machine(Some(id.clone()));
-                cx.notify();
-            }));
+    /// `SettingsScopeNotice target="environment"` inside the section: a row per environment,
+    /// each choosing that environment alone.
+    fn export_scope_notice(&mut self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+        let environments: Vec<(scope::Labeled, &str)> = self
+            .sessions
+            .iter()
+            .filter_map(|s| {
+                let id = s.id.as_deref()?;
+                let label = s.server_info.environment_label.as_deref().unwrap_or(id);
+                let url = s.endpoint.as_ref().map(|e| e.http_base.as_str());
+                Some(((id, label, url), s.server_info.machine_kind()))
+            })
+            .collect();
+        let labeled: Vec<scope::Labeled> = environments.iter().map(|(labeled, _)| *labeled).collect();
+        let choices: Vec<AnyElement> = environments
+            .iter()
+            .map(|&((id, label, url), machine)| {
+                let secondary =
+                    scope::environment_secondary(id, &labeled).unwrap_or_else(|| scope::environment_address(id, url));
+                let search = scope::ScopeSearch { project: None, machine: Some(id.to_owned()) };
+                h_flex()
+                    .id(ElementId::Name(format!("telemetry-export-environment-{id}").into()))
+                    .px(px(16.))
+                    .py(px(12.))
+                    .gap(px(12.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(t.accent.opacity(0.5)))
+                    .child(svg().path(machine_icon(machine)).size(px(16.)).flex_none().text_color(t.muted_foreground))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().truncate().text_sm().font_weight(FontWeight::MEDIUM).child(label.to_owned()))
+                            .child(
+                                div()
+                                    .id(ElementId::Name(format!("telemetry-export-environment-{id}-secondary").into()))
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(t.muted_foreground)
+                                    .tooltip(tooltip(secondary.clone()))
+                                    .child(secondary),
+                            ),
+                    )
+                    .child(
+                        gpui_kit::component::Icon::new(gpui_kit::assets::IconName::ChevronRight)
+                            .size(px(16.))
+                            .text_color(t.muted_foreground),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.settings_ui.scope = search.clone();
+                        this.settings_ui.target = None;
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            })
+            .collect();
         let notice = v_flex()
             .child(
                 div()
@@ -398,7 +433,9 @@ impl Workspace {
                     .text_color(t.muted_foreground)
                     .child("Choose one environment to configure its telemetry exports."),
             )
-            .child(div().border_t_1().border_color(t.border.opacity(0.5)).child(choice))
+            .children(
+                choices.into_iter().map(|choice| div().border_t_1().border_color(t.border.opacity(0.5)).child(choice)),
+            )
             .into_any_element();
         section_with_action("telemetry-export", "OpenTelemetry export", None, [notice], t)
     }
