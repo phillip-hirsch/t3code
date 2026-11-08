@@ -317,6 +317,15 @@ pub struct ThreadPreviews {
     server_epoch: Option<String>,
     revision: u64,
     pub list_loaded: bool,
+    /// Tabs whose close is in flight (`suppressedTabIds`): their snapshots stay out until it settles.
+    closing: std::collections::HashSet<String>,
+}
+
+/// A tab taken out by [`ThreadPreviews::begin_close`], to put back if the close fails.
+#[derive(Debug)]
+pub struct ClosingTab {
+    tab_id: String,
+    restore: Option<(usize, Session)>,
 }
 
 /// What an applied event asks of the caller.
@@ -362,6 +371,9 @@ impl ThreadPreviews {
 
     /// Keeps a newer local copy when the incoming one is older (`updatedAt` is ISO-8601).
     fn upsert(&mut self, session: Session) {
+        if self.closing.contains(&session.tab_id) {
+            return;
+        }
         match self.sessions.iter_mut().find(|s| s.tab_id == session.tab_id) {
             Some(existing) if existing.updated_at > session.updated_at => {}
             Some(existing) => *existing = session,
@@ -384,7 +396,11 @@ impl ThreadPreviews {
             return Ok(());
         }
         let previous = std::mem::take(&mut self.sessions);
-        for session in list.sessions {
+        if !same_server {
+            self.closing.clear();
+        }
+        self.closing.retain(|tab| list.sessions.iter().any(|s| &s.tab_id == tab));
+        for session in list.sessions.into_iter().filter(|s| !self.closing.contains(&s.tab_id)) {
             let newer = previous
                 .iter()
                 .find(|s| same_server && s.tab_id == session.tab_id && s.updated_at > session.updated_at);
@@ -436,6 +452,9 @@ impl ThreadPreviews {
         match event.kind.as_str() {
             "opened" | "navigated" | "resized" => {
                 let Some(snapshot) = event.snapshot else { return Ok(Applied::Ignored) };
+                if self.closing.contains(&snapshot.tab_id) {
+                    return Ok(Applied::Ignored);
+                }
                 if event.kind == "opened" || self.active_tab.is_none() {
                     self.active_tab = Some(snapshot.tab_id.clone());
                 }
@@ -453,7 +472,10 @@ impl ThreadPreviews {
                 };
                 session.updated_at = event.created_at;
             }
-            "closed" => self.remove(&event.tab_id),
+            "closed" => {
+                self.remove(&event.tab_id);
+                self.closing.remove(&event.tab_id);
+            }
             _ => return Ok(Applied::Ignored),
         }
         self.server_epoch = Some(event.server_epoch);
@@ -463,10 +485,33 @@ impl ThreadPreviews {
 
     /// A snapshot a request returned (`applyPreviewServerSnapshot`); `focus` makes it the active tab.
     pub fn apply_snapshot(&mut self, snapshot: Session, focus: bool) {
+        if self.closing.contains(&snapshot.tab_id) {
+            return;
+        }
         if focus || self.active().is_none() {
             self.active_tab = Some(snapshot.tab_id.clone());
         }
         self.upsert(snapshot);
+    }
+
+    /// `beginPreviewSessionClose`: the tab leaves the list while `preview.close` runs.
+    pub fn begin_close(&mut self, tab_id: &str) -> ClosingTab {
+        let restore = self.sessions.iter().position(|s| s.tab_id == tab_id).map(|i| (i, self.sessions[i].clone()));
+        self.remove(tab_id);
+        self.closing.insert(tab_id.to_owned());
+        ClosingTab { tab_id: tab_id.to_owned(), restore }
+    }
+
+    /// `cancelPreviewSessionClose`: a failed close puts the tab back in its place, focused.
+    pub fn cancel_close(&mut self, closing: ClosingTab) {
+        if !self.closing.remove(&closing.tab_id) {
+            return;
+        }
+        let Some((index, session)) = closing.restore else { return };
+        self.active_tab = Some(session.tab_id.clone());
+        if self.get(&session.tab_id).is_none() {
+            self.sessions.insert(index.min(self.sessions.len()), session);
+        }
     }
 
     pub fn remove(&mut self, tab_id: &str) {
@@ -1216,6 +1261,36 @@ mod tests {
         let restarted = json!({"type": "closed", "threadId": "t1", "tabId": "b", "createdAt": "6", "serverEpoch": "e2",
             "revision": 1});
         assert_eq!(previews.apply_event(&restarted).unwrap(), Applied::Relist);
+    }
+
+    #[test]
+    fn a_failed_close_restores_the_tab_and_a_closing_tab_ignores_updates() {
+        let mut previews = ThreadPreviews::default();
+        let list = |revision: u64| json!({"sessions": [session("a", "1"), session("b", "2"), session("c", "3")], "serverEpoch": "e1", "revision": revision});
+        previews.apply_list(&list(1)).unwrap();
+        let closing = previews.begin_close("b");
+        assert!(previews.get("b").is_none());
+        let navigated = json!({"type": "navigated", "threadId": "t1", "tabId": "b", "createdAt": "4", "serverEpoch": "e1",
+            "revision": 2, "snapshot": session("b", "4")});
+        assert_eq!(previews.apply_event(&navigated).unwrap(), Applied::Ignored, "a closing tab stays out");
+        previews.apply_list(&list(3)).unwrap();
+        assert!(previews.get("b").is_none(), "and out of a list");
+        previews.active_tab = Some("a".into());
+        previews.cancel_close(closing);
+        let order: Vec<&str> = previews.sessions.iter().map(|s| s.tab_id.as_str()).collect();
+        assert_eq!(order, ["a", "b", "c"], "it returns to its place");
+        assert_eq!(previews.active_tab.as_deref(), Some("b"));
+
+        let closing = previews.begin_close("c");
+        let closed = json!({"type": "closed", "threadId": "t1", "tabId": "c", "createdAt": "5", "serverEpoch": "e1",
+            "revision": 4});
+        previews.apply_event(&closed).unwrap();
+        previews.cancel_close(closing);
+        assert!(previews.get("c").is_none(), "a close the server confirmed stays closed");
+        let reopened = json!({"type": "opened", "threadId": "t1", "tabId": "c", "createdAt": "6",
+            "serverEpoch": "e1", "revision": 5, "snapshot": session("c", "6")});
+        previews.apply_event(&reopened).unwrap();
+        assert!(previews.get("c").is_some(), "the id is usable again");
     }
 
     #[test]

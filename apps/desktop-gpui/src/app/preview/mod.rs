@@ -614,20 +614,29 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(previews) = self.preview.threads.get_mut(&thread_id) {
-            previews.remove(&tab_id);
+        let closing = self.preview.threads.entry(thread_id.clone()).or_default().begin_close(&tab_id);
+        // The page stays alive, hidden, until the server confirms the close.
+        let mut hosted = self.preview.tabs.remove(&tab_id);
+        if let Some(tab) = hosted.as_mut().filter(|tab| tab.shown) {
+            tab.shown = false;
+            let _ = tab.view.read(cx).set_visible(false);
         }
-        self.preview.tabs.remove(&tab_id);
         if let Some(client) = self.thread_client(&thread_id) {
-            cx.spawn(async move |this, cx| {
-                if let Err(error) =
-                    client.request("preview.close", json!({"threadId": thread_id, "tabId": tab_id})).await
-                {
-                    let _ = this.update(cx, |this, cx| {
-                        this.error = Some(format!("Unable to close the browser tab: {error}").into());
-                        cx.notify();
-                    });
-                }
+            cx.spawn_in(window, async move |this, cx| {
+                let result = client.request("preview.close", json!({"threadId": thread_id, "tabId": tab_id})).await;
+                let Err(error) = result else { return };
+                let _ = this.update_in(cx, |this, window, cx| {
+                    if let Some(previews) = this.preview.threads.get_mut(&thread_id) {
+                        previews.cancel_close(closing);
+                        if previews.get(&tab_id).is_some()
+                            && let Some(tab) = hosted
+                        {
+                            this.preview.tabs.insert(tab_id, tab);
+                        }
+                    }
+                    this.error = Some(format!("Unable to close the browser tab: {error}").into());
+                    this.after_preview_change(window, cx);
+                });
             })
             .detach();
         }
