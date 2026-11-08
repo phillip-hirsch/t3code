@@ -11,8 +11,8 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, ClipboardItem, Context, Entity, FontWeight, Hsla, InteractiveElement as _, IntoElement,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px, svg,
+    AnyElement, BoxShadow, ClipboardItem, Context, Entity, FontWeight, Hsla, InteractiveElement as _, IntoElement,
+    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px, relative, svg,
 };
 use serde_json::{Value, json};
 
@@ -589,6 +589,18 @@ pub(super) fn is_variable_name(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// `blur-xs` on a redacted value, which GPUI cannot blur: laid over the placeholder, whose text
+/// keeps its room unseen, a soft smear of `color`.
+pub(super) fn blur_smear(color: Hsla) -> gpui_kit::Div {
+    div()
+        .absolute()
+        .left(px(1.))
+        .right(px(1.))
+        .top(relative(0.4))
+        .bottom(relative(0.32))
+        .shadow(vec![BoxShadow::new(px(0.), px(0.), color.opacity(0.45)).blur_radius(px(4.))])
+}
+
 /// `redactedPlaceholder`: a stable stand-in of the same shape, for hidden account emails.
 pub(super) fn redacted_placeholder(value: &str) -> String {
     const ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
@@ -971,6 +983,8 @@ impl Workspace {
                                         div()
                                             .truncate()
                                             .text_sm()
+                                            // `text-sm`'s 20px line.
+                                            .line_height(px(20.))
                                             .font_weight(FontWeight::MEDIUM)
                                             .text_color(t.foreground)
                                             .child(facts.name.clone()),
@@ -996,6 +1010,8 @@ impl Workspace {
                                     .items_start()
                                     .gap(px(6.))
                                     .text_xs()
+                                    // `leading-normal`
+                                    .line_height(px(18.))
                                     .text_color(t.muted_foreground.opacity(0.8))
                                     .when(facts.status.needs_attention() && facts.update_progress.is_none(), |el| {
                                         el.child(
@@ -1331,11 +1347,14 @@ impl Workspace {
                 parts.push(
                     div()
                         .id("provider-auth-email")
+                        .relative()
                         .cursor_pointer()
                         .font_family(t.fonts.mono)
                         .text_size(px(11.))
-                        .when(!revealed, |el| el.opacity(0.6))
-                        .hover(|s| s.text_color(t.foreground))
+                        .when(revealed, |el| el.hover(|s| s.text_color(t.foreground)))
+                        .when(!revealed, |el| {
+                            el.text_color(gpui_kit::transparent_black()).child(blur_smear(t.muted_foreground))
+                        })
                         .child(if revealed { email } else { redacted_placeholder(&email) })
                         .tooltip(move |window, cx| {
                             Tooltip::new(if revealed { "Click to hide email" } else { "Click to reveal email" })

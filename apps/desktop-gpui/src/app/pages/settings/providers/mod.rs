@@ -1109,8 +1109,9 @@ fn switch(id: impl Into<gpui_kit::ElementId>, checked: bool) -> Switch {
     Switch::new(id).checked(checked)
 }
 
+/// `Input size="sm"`: 26px inside its 1px border on desktop.
 fn text_input(state: &Entity<InputState>, width: Option<f32>) -> Input {
-    let input = Input::new(state).small();
+    let input = Input::new(state).small().h(px(28.));
     match width {
         Some(width) => input.w(px(width)),
         None => input,
