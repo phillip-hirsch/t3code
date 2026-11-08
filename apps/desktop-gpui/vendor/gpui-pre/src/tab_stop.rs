@@ -22,8 +22,10 @@ pub(crate) struct TabStopMap {
 #[derive(Debug, Clone)]
 pub enum TabStopOperation {
     Insert(FocusHandle),
-    /// t3code: the handle inserted just before lies inside an inert subtree.
-    Inert(FocusId),
+    /// t3code: brackets an inert subtree, so a replayed cached view recomputes inertness from
+    /// its own subtrees plus whatever it is replayed inside.
+    InertBegin,
+    InertEnd,
     Group(TabIndex),
     GroupEnd,
 }
@@ -84,19 +86,17 @@ impl Default for TabStopMap {
 
 impl TabStopMap {
     pub fn insert(&mut self, focus_handle: &FocusHandle) {
-        let mut focus_handle = focus_handle.clone();
-        focus_handle.tab_stop &= self.inert == 0;
         self.insertion_history
             .push(TabStopOperation::Insert(focus_handle.clone()));
-        let insertion_index = self.insertion_history.len() - 1;
-        if self.inert > 0 {
-            self.mark_inert(focus_handle.id);
+        let inert = self.inert > 0;
+        if inert {
+            self.inert_ids.insert(focus_handle.id);
         }
         let mut path = self.current_path.clone();
         path.0.push(focus_handle.tab_index);
         let order = TabStopNode {
-            node_insertion_index: insertion_index,
-            tab_stop: focus_handle.tab_stop,
+            node_insertion_index: self.insertion_history.len() - 1,
+            tab_stop: focus_handle.tab_stop && !inert,
             path,
         };
         self.by_id.insert(focus_handle.id, order.clone());
@@ -116,16 +116,13 @@ impl TabStopMap {
 
     /// t3code: handles inserted until the matching [`Self::end_inert`] are not tab stops.
     pub(crate) fn begin_inert(&mut self) {
+        self.insertion_history.push(TabStopOperation::InertBegin);
         self.inert += 1;
     }
 
     pub(crate) fn end_inert(&mut self) {
+        self.insertion_history.push(TabStopOperation::InertEnd);
         self.inert -= 1;
-    }
-
-    fn mark_inert(&mut self, id: FocusId) {
-        self.insertion_history.push(TabStopOperation::Inert(id));
-        self.inert_ids.insert(id);
     }
 
     /// t3code: whether `id` was painted inside an inert subtree this frame.
@@ -219,12 +216,8 @@ impl TabStopMap {
         for node in nodes {
             match node {
                 TabStopOperation::Insert(focus_handle) => self.insert(focus_handle),
-                TabStopOperation::Inert(id) => {
-                    // A replayed handle keeps its cleared tab stop; record the mark once.
-                    if self.inert == 0 {
-                        self.mark_inert(*id);
-                    }
-                }
+                TabStopOperation::InertBegin => self.begin_inert(),
+                TabStopOperation::InertEnd => self.end_inert(),
                 TabStopOperation::Group(tab_index) => self.begin_group(*tab_index),
                 TabStopOperation::GroupEnd => self.end_group(),
             }
