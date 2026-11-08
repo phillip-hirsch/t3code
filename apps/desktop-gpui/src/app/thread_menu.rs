@@ -109,7 +109,6 @@ impl Workspace {
                 self.title.pending = None;
                 let view = cx.weak_entity();
                 let menu = PopupMenu::build(window, cx, move |menu, _, _| {
-                    let view = view.clone();
                     menu.min_w(px(200.)).item(
                         PopupMenuItem::new("Project settings").icon(Icon::new(IconName::Settings)).on_click(
                             move |_, _, cx| {
