@@ -1284,8 +1284,23 @@ impl Workspace {
                     }),
                 ));
         }
+        // The server's browser clears the tab's profile itself. wry clears a profile's cache only
+        // with all its other data, so this computer's tabs offer cookies alone.
+        if server {
+            let clear = |id: &'static str, label: &'static str, what: &'static str| {
+                item(id.into(), label.into(), false, true).on_click(cx.listener(move |this, _, _, cx| {
+                    this.adjust_preview("preview.adjust", json!({"clear": what}), cx);
+                    close(this, cx);
+                }))
+            };
+            menu = menu.child(separator()).child(clear("menu-clear-cookies", "Clear cookies", "cookies")).child(clear(
+                "menu-clear-cache",
+                "Clear cache",
+                "cache",
+            ));
+        }
         #[cfg(windows)]
-        {
+        if !server {
             menu = menu.child(separator()).child(
                 item("menu-clear-cookies".into(), "Clear cookies".into(), false, has_page).when(has_page, |el| {
                     el.on_click(cx.listener(move |this, _, window, cx| {
