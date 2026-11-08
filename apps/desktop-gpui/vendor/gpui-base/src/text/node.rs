@@ -2709,6 +2709,7 @@ pub(crate) struct NodeContext {
     pub(crate) table_actions: Option<Arc<TableActionsFn>>,
     pub(crate) image_source: Option<Arc<super::text_view::ImageSourceFn>>,
     pub(crate) link_click_handler: Option<Arc<LinkClickHandlerFn>>,
+    pub(crate) task_toggle_handler: Option<Arc<super::text_view::TaskToggleFn>>,
     pub(crate) markdown_extensions: Arc<MarkdownExtensions>,
     /// This frame's streamed fade-in, when any text is still fading.
     pub(crate) stream_fade: Option<Arc<StreamFadeFrame>>,
@@ -3713,11 +3714,13 @@ impl BlockNode {
 }
 
 impl BlockNode {
+    #[allow(clippy::too_many_arguments)]
     fn render_list_item_row(
         content: AnyElement,
         ix: usize,
         options: NodeRenderOptions,
         checked: Option<bool>,
+        toggle: Option<(Arc<super::text_view::TaskToggleFn>, usize)>,
         style: &TextViewStyle,
         line_height: Pixels,
         indent: Pixels,
@@ -3769,6 +3772,16 @@ impl BlockNode {
                         .justify_center()
                         .child(
                             div()
+                                .id(ElementId::NamedInteger(
+                                    "markdown-task".into(),
+                                    toggle.as_ref().map_or(ix, |(_, offset)| *offset) as u64,
+                                ))
+                                .when_some(toggle, |this, (toggle, offset)| {
+                                    this.cursor_pointer().on_click(move |_, window, cx| {
+                                        cx.stop_propagation();
+                                        toggle(offset, !checked, window, cx);
+                                    })
+                                })
                                 .flex()
                                 .size(rems(0.9375))
                                 .items_center()
@@ -3823,8 +3836,13 @@ impl BlockNode {
                 children,
                 spread,
                 checked,
-                ..
+                span,
             } => {
+                let toggle = node_cx
+                    .task_toggle_handler
+                    .clone()
+                    .zip(span.as_ref().map(|span| span.start))
+                    .filter(|_| checked.is_some());
                 let body = body_font_size(node_cx, window);
                 let indent = body * 1.4;
                 // The paragraph gap a nested list keeps from its neighbours, and
@@ -3902,6 +3920,7 @@ impl BlockNode {
                                         ix,
                                         options,
                                         *checked,
+                                        toggle.clone(),
                                         &node_cx.style,
                                         window.line_height(),
                                         indent,
@@ -3945,6 +3964,7 @@ impl BlockNode {
                                             ix,
                                             options,
                                             *checked,
+                                            toggle.clone(),
                                             &node_cx.style,
                                             window.line_height(),
                                             indent,

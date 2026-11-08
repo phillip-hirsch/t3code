@@ -182,6 +182,18 @@ chips inside it. Files:
 - `src/text/node.rs`: `InlineNode::covered`, `Paragraph::to_markdown`, `selected_markdown`; one
   test, `selected_object_copies_the_label_it_keeps_as_prose_once`.
 
+**Task checkboxes can toggle.** The web's rendered Markdown file checks a task off by editing its
+`[ ]` (`onTaskListChange`). 0.9.0's checkboxes only show their state. The patch adds
+`TextView::on_task_toggle`: with a handler, a task's checkbox takes clicks and passes the list
+item's source offset and the state it asks for; the app edits the source. Files:
+
+- `src/text/text_view.rs`: `TaskToggleFn`, the `task_toggle_handler` field and builder.
+- `src/text/state.rs`: the handler, passed into each frame's `NodeContext`.
+- `src/text/node.rs`: `NodeContext::task_toggle_handler`; `render_list_item` and
+  `render_list_item_row` make the checkbox clickable.
+
+gpui-component's `src/text/compat.rs` forwards `on_task_toggle` from its `TextView`.
+
 The crate's own tests need `--features test-support` and `include_str!` a `README.md` four levels
 above `src/text`, which this folder lacks: run them from a scratch copy laid out as
 `<dir>/crates/gpui-base` with a `<dir>/README.md`.
