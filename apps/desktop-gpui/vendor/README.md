@@ -87,8 +87,10 @@ paints with the change. No test: only the macOS text system dilates.
 `inert`; 0.3.11 has no way to take a subtree out of keyboard focus. The patch:
 `InteractiveElement::inert` (`src/elements/div.rs`) brackets the element's paint with
 `TabStopMap::begin_inert`/`end_inert` (`src/tab_stop.rs`), and `TabStopMap::insert` records a
-handle inserted inside as no tab stop, so replayed cached views keep that. Pointer events are
-untouched. Test: `focus_next_skips_an_inert_subtree`.
+handle inserted inside as no tab stop, so replayed cached views keep that. It also marks such a
+handle (`TabStopOperation::Inert`, replayed too), and `Window::draw` drops focus held by a marked
+handle, so a control locked while focused stops taking keys. Pointer events are untouched. Test:
+`focus_next_skips_an_inert_subtree`.
 
 The crate's tests need `--features test-support`; run them from a scratch copy outside this
 repository (`cargo test --features test-support --lib`). The copy needs the published crate's

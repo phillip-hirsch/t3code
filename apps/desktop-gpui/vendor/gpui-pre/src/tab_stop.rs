@@ -1,7 +1,7 @@
 use std::fmt::Debug;
 
 use ::sum_tree::SumTree;
-use collections::FxHashMap;
+use collections::{FxHashMap, FxHashSet};
 use sum_tree::Bias;
 
 use crate::{FocusHandle, FocusId};
@@ -15,11 +15,15 @@ pub(crate) struct TabStopMap {
     order: SumTree<TabStopNode>,
     /// t3code: how many inert subtrees are being painted; nothing inside one is a tab stop.
     inert: usize,
+    /// t3code: the handles painted inside an inert subtree, which can't keep focus.
+    inert_ids: FxHashSet<FocusId>,
 }
 
 #[derive(Debug, Clone)]
 pub enum TabStopOperation {
     Insert(FocusHandle),
+    /// t3code: the handle inserted just before lies inside an inert subtree.
+    Inert(FocusId),
     Group(TabIndex),
     GroupEnd,
 }
@@ -73,6 +77,7 @@ impl Default for TabStopMap {
             by_id: FxHashMap::default(),
             order: SumTree::new(()),
             inert: 0,
+            inert_ids: FxHashSet::default(),
         }
     }
 }
@@ -83,10 +88,14 @@ impl TabStopMap {
         focus_handle.tab_stop &= self.inert == 0;
         self.insertion_history
             .push(TabStopOperation::Insert(focus_handle.clone()));
+        let insertion_index = self.insertion_history.len() - 1;
+        if self.inert > 0 {
+            self.mark_inert(focus_handle.id);
+        }
         let mut path = self.current_path.clone();
         path.0.push(focus_handle.tab_index);
         let order = TabStopNode {
-            node_insertion_index: self.insertion_history.len() - 1,
+            node_insertion_index: insertion_index,
             tab_stop: focus_handle.tab_stop,
             path,
         };
@@ -112,6 +121,16 @@ impl TabStopMap {
 
     pub(crate) fn end_inert(&mut self) {
         self.inert -= 1;
+    }
+
+    fn mark_inert(&mut self, id: FocusId) {
+        self.insertion_history.push(TabStopOperation::Inert(id));
+        self.inert_ids.insert(id);
+    }
+
+    /// t3code: whether `id` was painted inside an inert subtree this frame.
+    pub(crate) fn is_inert(&self, id: FocusId) -> bool {
+        self.inert_ids.contains(&id)
     }
 
     pub fn clear(&mut self) {
@@ -200,6 +219,12 @@ impl TabStopMap {
         for node in nodes {
             match node {
                 TabStopOperation::Insert(focus_handle) => self.insert(focus_handle),
+                TabStopOperation::Inert(id) => {
+                    // A replayed handle keeps its cleared tab stop; record the mark once.
+                    if self.inert == 0 {
+                        self.mark_inert(*id);
+                    }
+                }
                 TabStopOperation::Group(tab_index) => self.begin_group(*tab_index),
                 TabStopOperation::GroupEnd => self.end_group(),
             }

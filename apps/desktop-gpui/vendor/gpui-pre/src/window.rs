@@ -3754,6 +3754,17 @@ impl Window {
         self.text_system().finish_frame();
         self.next_frame.finish(&mut self.rendered_frame);
 
+        // t3code: like HTML `inert`, a subtree that turns inert drops the focus inside it, so
+        // keys stop reaching a control that was locked while focused.
+        if self
+            .focus
+            .is_some_and(|focus| self.next_frame.tab_stops.is_inert(focus))
+        {
+            self.focus = None;
+            self.next_frame.focus = None;
+            self.focus_generation = self.focus_generation.wrapping_add(1);
+        }
+
         self.invalidator.set_phase(DrawPhase::Focus);
         let previous_focus_path = self.rendered_frame.focus_path();
         let previous_window_active = self.rendered_frame.window_active;

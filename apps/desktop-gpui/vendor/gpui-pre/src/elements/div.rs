@@ -6301,6 +6301,17 @@ mod tests {
 
         assert_eq!(focused, Some(after.id));
         assert_ne!(focused, Some(inside.id));
+
+        // Focus already inside a subtree when it is drawn inert is dropped, so keys stop
+        // reaching a control that was locked while focused.
+        let focused = cx
+            .update_window(window, |_, window, cx| {
+                window.focus(&inside, cx);
+                window.draw(cx).clear(cx);
+                window.focused(cx).map(|handle| handle.id)
+            })
+            .unwrap();
+        assert_eq!(focused, None);
     }
 
     #[gpui::test]
