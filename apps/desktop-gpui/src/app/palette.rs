@@ -18,9 +18,10 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, AppContext as _, ClickEvent, Context, Entity, FocusHandle, FontWeight, InteractiveElement as _,
+    AnyElement, AppContext as _, ClickEvent, Context, Entity, FocusHandle, FontWeight, Hsla, InteractiveElement as _,
     IntoElement, KeyDownEvent, Keystroke, ParentElement as _, PathPromptOptions, ScrollHandle, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, div, prelude::FluentBuilder as _, px,
+    relative, svg,
 };
 use serde_json::{Value, json};
 
@@ -180,6 +181,19 @@ enum Description {
     Snippet(bool, Vec<(String, bool)>),
     /// `ProjectLocationDescription`: a remote machine's icon, where the project lives, and its path.
     Location(Option<IconName>, SharedString, SharedString),
+    Thread(ThreadSubtitle),
+}
+
+/// `ThreadCommandSubtitle`: the project with its favicon and machine, the checkout, the provider,
+/// and whether it is the open thread.
+#[derive(Clone)]
+struct ThreadSubtitle {
+    project: Option<(String, SharedString)>,
+    location: SharedString,
+    branch: Option<SharedString>,
+    worktree: bool,
+    provider: Option<(&'static str, Option<Hsla>)>,
+    current: bool,
 }
 
 #[derive(Clone)]
@@ -189,6 +203,8 @@ struct Row {
     title: SharedString,
     /// Drawn after `title` at weight 600 ("New thread in **X**").
     strong: Option<SharedString>,
+    /// `ThreadRowContext`: the project beside a thread's title when a snippet takes its line.
+    context: Option<SharedString>,
     description: Option<Description>,
     time: Option<String>,
     shortcut: Option<SharedString>,
@@ -217,6 +233,7 @@ impl Row {
             icon,
             title: title.into(),
             strong: None,
+            context: None,
             description: None,
             time: None,
             shortcut: None,
@@ -238,10 +255,19 @@ struct Group {
     rows: Vec<Row>,
 }
 
+/// What a folder listing answers: the machine, the folder relative paths start from, and the
+/// directory. A listing for another key is stale.
+#[derive(Clone, Default, PartialEq, Eq)]
+struct BrowseKey {
+    environment: Option<SharedString>,
+    cwd: Option<String>,
+    directory: String,
+}
+
 /// The folder listing behind the browse view (`filesystem.browse`).
 #[derive(Default)]
 struct Browse {
-    directory: String,
+    key: BrowseKey,
     parent: Option<String>,
     entries: Vec<(String, String)>,
     loading: bool,
@@ -457,6 +483,27 @@ pub(super) fn project_title_from_path(path: &str) -> String {
 }
 
 /// `filterFilesystemBrowseEntries`: prefix match on the leaf; dot folders only for a dot leaf.
+impl Browse {
+    /// The listing, when it answers `key`.
+    fn of(&self, key: &BrowseKey) -> Option<&Self> {
+        (self.key == *key).then_some(self)
+    }
+}
+
+/// What Enter adds for `query`: the folder the listing resolved it to, else the typed path. Pass
+/// only the listing of `query`'s own directory on the browse machine and cwd.
+fn submit_path(browse: Option<&Browse>, query: &str) -> Option<String> {
+    let leaf = split_browse(query).1;
+    let resolved = browse.and_then(|browse| {
+        if leaf.is_empty() {
+            browse.parent.clone()
+        } else {
+            browse.entries.iter().find(|(name, _)| name == leaf).map(|(_, full)| full.clone())
+        }
+    });
+    resolved.or_else(|| (!query.trim().is_empty()).then(|| query.trim().to_owned()))
+}
+
 pub(super) fn filter_entries<'a>(entries: &'a [(String, String)], leaf: &str) -> Vec<&'a (String, String)> {
     let lower = leaf.to_lowercase();
     entries
@@ -594,6 +641,15 @@ impl Workspace {
         Some(project.workspace_root.clone())
     }
 
+    fn browse_key(&self, directory: &str) -> BrowseKey {
+        BrowseKey { environment: self.browse_environment(), cwd: self.browse_cwd(), directory: directory.to_owned() }
+    }
+
+    /// The listing of `directory` on the current browse machine and cwd, once it was asked for.
+    fn current_browse(&self, directory: &str) -> Option<&Browse> {
+        self.palette.as_ref()?.browse.of(&self.browse_key(directory))
+    }
+
     /// `relativePathNeedsActiveProject`.
     fn relative_needs_project(&self, query: &str) -> bool {
         is_explicit_relative(query.trim()) && self.browse_cwd().is_none()
@@ -708,30 +764,29 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Lists `directory` through `filesystem.browse`, once per directory.
+    /// Lists `directory` through `filesystem.browse`, once per machine, cwd and directory.
     fn browse_folder(&mut self, directory: String, cx: &mut Context<Self>) {
-        let cwd = self.browse_cwd();
-        let Some(client) = self.browse_environment().and_then(|environment| self.env_client(&environment)) else {
+        let key = self.browse_key(&directory);
+        let Some(client) = key.environment.as_ref().and_then(|environment| self.env_client(environment)) else {
             return;
         };
         let Some(palette) = &mut self.palette else { return };
-        if palette.browse.directory == directory && (palette.browse.loading || palette.browse.error.is_none()) {
+        if palette.browse.key == key && (palette.browse.loading || palette.browse.error.is_none()) {
             return;
         }
-        palette.browse = Browse { directory: directory.clone(), loading: true, ..Browse::default() };
+        palette.browse = Browse { key: key.clone(), loading: true, ..Browse::default() };
         if directory.is_empty() {
             palette.browse.loading = false;
             return;
         }
         let mut input = json!({"partialPath": directory});
-        if let Some(cwd) = cwd {
-            input["cwd"] = cwd.into();
+        if let Some(cwd) = &key.cwd {
+            input["cwd"] = cwd.clone().into();
         }
         palette.browse._task = Some(cx.spawn(async move |this, cx| {
             let result = client.request("filesystem.browse", input).await;
             let _ = this.update(cx, |this, cx| {
-                let Some(browse) = this.palette.as_mut().map(|p| &mut p.browse).filter(|b| b.directory == directory)
-                else {
+                let Some(browse) = this.palette.as_mut().map(|p| &mut p.browse).filter(|b| b.key == key) else {
                     return;
                 };
                 browse.loading = false;
@@ -1181,20 +1236,38 @@ impl Workspace {
     fn thread_row(&self, thread: &crate::model::ThreadShell, now: i64) -> Row {
         let mut row = Row::new(
             format!("thread-{}", thread.id),
-            RowIcon::Project(thread.project_id.clone()),
+            RowIcon::Lucide(IconName::MessageSquare),
             thread.title.clone(),
             Run::Thread(thread.id.clone()),
         );
         let project = self.shell.projects.iter().find(|p| p.id == thread.project_id);
-        let mut parts: Vec<String> = project.map(|p| p.title.clone()).into_iter().collect();
-        parts.extend(thread.branch.clone());
-        if self.open_thread_id() == Some(&*thread.id) {
-            parts.push("Current thread".into());
-        }
-        row.description = Some(Description::Text(parts.join(" · ").into()));
+        let project = project.map(|p| p.title.trim()).filter(|title| !title.is_empty());
+        // `runtime?.providerInstanceId ?? modelSelection.instanceId`.
+        let instance = thread
+            .provider_instance_id
+            .as_deref()
+            .or_else(|| thread.model_selection.as_ref().map(|m| m.instance_id.as_str()));
+        let driver = instance.and_then(|i| self.env_info(&thread.environment_id)?.provider(i)).map(|p| &p.driver);
+        row.description = Some(Description::Thread(ThreadSubtitle {
+            project: project.map(|title| (thread.project_id.clone(), title.to_owned().into())),
+            location: self.location_label(&thread.environment_id),
+            branch: thread.branch.as_deref().map(str::trim).filter(|b| !b.is_empty()).map(|b| b.to_owned().into()),
+            worktree: thread.worktree_path.as_deref().is_some_and(|path| !path.trim().is_empty()),
+            provider: driver.and_then(|driver| crate::assets::provider_icon(driver)),
+            current: self.open_thread_id() == Some(&*thread.id),
+        }));
         row.time = crate::timestamp::parse_ms(thread.latest_user_message_at.as_deref().unwrap_or(&thread.updated_at))
             .map(|at| ago(now - at));
         row
+    }
+
+    /// `ThreadRowContext`: the project, and the machine when there are several, for a row whose
+    /// second line shows a message snippet instead.
+    fn thread_context(&self, thread: &crate::model::ThreadShell) -> Option<SharedString> {
+        let project = self.shell.projects.iter().find(|p| p.id == thread.project_id).map(|p| p.title.trim());
+        let environment = (self.sessions().len() > 1).then(|| self.location_label(&thread.environment_id));
+        let parts: Vec<&str> = project.into_iter().chain(environment.as_deref()).filter(|p| !p.is_empty()).collect();
+        (!parts.is_empty()).then(|| parts.join(" · ").into())
     }
 
     fn thread_use(&self, thread: &crate::model::ThreadShell) -> search::ThreadUse {
@@ -1346,6 +1419,7 @@ impl Workspace {
                     query: super::find::query_for_message(&m.snippet, query),
                     message_id: m.message_id.clone(),
                 };
+                row.context = self.thread_context(thread);
                 let ranges = search::token_ranges(&m.snippet, query);
                 row.description = Some(Description::Snippet(m.user, search::split_ranges(&m.snippet, &ranges)));
                 row.time = m.at.as_deref().and_then(crate::timestamp::parse_ms).map(|at| ago(now - at));
@@ -1502,20 +1576,18 @@ impl Workspace {
     }
 
     fn browse_groups(&self, query: &str) -> Vec<Group> {
-        let Some(palette) = &self.palette else { return Vec::new() };
         // A relative path lists nothing until there is a project to start from.
-        if self.relative_needs_project(query) {
+        if self.palette.is_none() || self.relative_needs_project(query) {
             return Vec::new();
         }
         let (directory, leaf) = split_browse(query);
-        let browse = &palette.browse;
         let mut rows = Vec::new();
         if leaf.is_empty()
             && let Some(parent) = up_path(directory)
         {
             rows.push(Row::new("browse-up", RowIcon::Lucide(IconName::CornerLeftUp), "..", Run::BrowseTo(parent)));
         }
-        if browse.directory == directory {
+        if let Some(browse) = self.current_browse(directory) {
             for (name, _) in filter_entries(&browse.entries, leaf) {
                 rows.push(Row::new(
                     format!("dir-{name}"),
@@ -1534,16 +1606,18 @@ impl Workspace {
         let connected = self.browse_environment().is_some_and(|environment| self.env_client(&environment).is_some());
         let can_submit = connected && !self.relative_needs_project(query);
         let Some(palette) = &self.palette else { return BrowseSubmit::default() };
-        let browse = &palette.browse;
         let (directory, leaf) = split_browse(query);
-        let settled = browse.directory == directory && !browse.loading;
+        let browse = self.current_browse(directory);
+        let settled = browse.is_some_and(|browse| !browse.loading);
         // A folder that could not be read is one Enter creates.
-        let found = browse.error.is_none()
-            && if leaf.is_empty() {
-                browse.parent.is_some()
-            } else {
-                browse.entries.iter().any(|(name, _)| name == leaf)
-            };
+        let found = browse.is_some_and(|browse| {
+            browse.error.is_none()
+                && if leaf.is_empty() {
+                    browse.parent.is_some()
+                } else {
+                    browse.entries.iter().any(|(name, _)| name == leaf)
+                }
+        });
         let will_create = can_submit && settled && !query.trim().is_empty() && palette.highlight.is_none() && !found;
         BrowseSubmit { can_submit, will_create }
     }
@@ -1564,12 +1638,12 @@ impl Workspace {
             self.browse_groups(&query).into_iter().flat_map(|group| group.rows).nth(index).map(|row| row.run)
         });
         let (directory, leaf) = split_browse(&query);
-        let next = match highlighted {
-            Some(Run::BrowseTo(path)) => Some(path),
-            _ if palette.browse.directory != directory => None,
-            _ => {
+        let next = match (highlighted, self.current_browse(directory)) {
+            (Some(Run::BrowseTo(path)), _) => Some(path),
+            (_, None) => None,
+            (_, Some(browse)) => {
                 let names: Vec<&str> =
-                    filter_entries(&palette.browse.entries, leaf).into_iter().map(|(name, _)| name.as_str()).collect();
+                    filter_entries(&browse.entries, leaf).into_iter().map(|(name, _)| name.as_str()).collect();
                 tab_completion(&names, leaf).map(|(name, complete)| {
                     if complete { browse_into(directory, &name) } else { format!("{directory}{name}") }
                 })
@@ -1583,23 +1657,8 @@ impl Workspace {
 
     /// The path Enter adds while browsing (`CommandPalette.tsx` submit).
     fn browse_submit_path(&self, query: &str) -> Option<String> {
-        let palette = self.palette.as_ref()?;
-        let (directory, leaf) = split_browse(query);
-        if leaf.is_empty() {
-            return palette
-                .browse
-                .parent
-                .clone()
-                .filter(|_| palette.browse.directory == directory)
-                .or_else(|| (!query.trim().is_empty()).then(|| query.trim().to_owned()));
-        }
-        palette
-            .browse
-            .entries
-            .iter()
-            .find(|(name, _)| name == leaf)
-            .map(|(_, full)| full.clone())
-            .or_else(|| Some(query.trim().to_owned()))
+        self.palette.as_ref()?;
+        submit_path(self.current_browse(split_browse(query).0), query)
     }
 
     /// Adds the typed path as a project on the browse environment.
@@ -2141,7 +2200,9 @@ impl Workspace {
                         .rounded(px(16.))
                         .border_1()
                         .border_color(fg.opacity(0.08))
-                        .bg(tokens.popover)
+                        // `dialog-glass`: the background at the glass opacity over the dimmed,
+                        // blurred page, which reads as the background itself.
+                        .bg(tokens.background)
                         .shadow_2xl()
                         .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .capture_key_down(
@@ -2188,6 +2249,60 @@ impl Workspace {
                 None => div().size(px(16.)).into_any_element(),
             },
         }
+    }
+
+    /// `ThreadCommandSubtitle`'s line, its parts split by muted dots.
+    fn render_thread_subtitle(&self, subtitle: &ThreadSubtitle, tokens: &Tokens) -> AnyElement {
+        let muted = tokens.muted_foreground;
+        let dot = || div().flex_none().text_color(muted.opacity(0.5)).child("·");
+        let mut parts: Vec<AnyElement> = Vec::new();
+        if let Some((project_id, title)) = &subtitle.project {
+            let project = self.shell.projects.iter().find(|p| &p.id == project_id);
+            let favicon = project.map(|p| super::sidebar::project_icon(p, tokens, false, 12., self.favicon(p)));
+            parts.push(
+                h_flex()
+                    .min_w_0()
+                    .gap(px(4.))
+                    .children(favicon)
+                    .child(div().min_w_0().truncate().child(title.clone()))
+                    .child(dot())
+                    .child(div().flex_none().child(subtitle.location.clone()))
+                    .into_any_element(),
+            );
+        }
+        if let Some(branch) = &subtitle.branch {
+            let icon = if subtitle.worktree { IconName::FolderGit2 } else { IconName::Folder };
+            parts.push(
+                h_flex()
+                    .min_w_0()
+                    .gap(px(4.))
+                    .child(Icon::new(icon).size(px(12.)).flex_none().text_color(muted.opacity(0.7)))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis_middle()
+                            .child(branch.clone()),
+                    )
+                    .into_any_element(),
+            );
+        }
+        if let Some((path, tint)) = subtitle.provider {
+            let color = tint.unwrap_or(tokens.foreground);
+            parts.push(svg().path(path).size(px(12.)).flex_none().text_color(color).opacity(0.7).into_any_element());
+        }
+        if subtitle.current {
+            parts.push(div().flex_none().child("Current thread").into_any_element());
+        }
+        let mut line = h_flex().min_w_0().max_w_full().gap(px(4.));
+        for (index, part) in parts.into_iter().enumerate() {
+            if index > 0 {
+                line = line.child(dot());
+            }
+            line = line.child(part);
+        }
+        line.into_any_element()
     }
 
     /// `DisabledCommandPaletteResultRow`: the icon, title and description at 64% opacity.
@@ -2266,6 +2381,7 @@ impl Workspace {
                         .child(text.clone())
                 }))
                 .into_any_element(),
+            Description::Thread(subtitle) => self.render_thread_subtitle(subtitle, tokens),
         });
         let run = row.run.clone();
         let pin_shortcut = self.shortcut_label("thread.pin");
@@ -2309,9 +2425,20 @@ impl Workspace {
                                 .text_color(tokens.foreground)
                                 .child(
                                     div()
-                                        .when(row.strong.is_none(), |el| el.flex_1().min_w_0().truncate())
+                                        .when(row.strong.is_none(), |el| el.min_w_0().truncate())
+                                        .when(row.strong.is_none() && row.context.is_none(), gpui_kit::Styled::flex_1)
                                         .child(row.title.clone()),
                                 )
+                                .children(row.context.clone().map(|context| {
+                                    div()
+                                        .flex_none()
+                                        .max_w(relative(0.45))
+                                        .ml(px(6.))
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(muted.opacity(0.7))
+                                        .child(context)
+                                }))
                                 .children(row.strong.clone().map(|strong| {
                                     div()
                                         .min_w_0()
@@ -3018,6 +3145,27 @@ mod tests {
         assert_eq!(tab_completion(&[], "x"), None);
         assert_eq!(browse_into("C:\\dev\\", "app"), "C:\\dev\\app\\");
         assert_eq!(browse_into("~/code/", "app"), "~/code/app/");
+    }
+
+    #[test]
+    fn a_folder_listing_resolves_paths_only_for_its_own_machine_cwd_and_directory() {
+        let key = |environment: &str, cwd: Option<&str>| BrowseKey {
+            environment: Some(environment.to_owned().into()),
+            cwd: cwd.map(str::to_owned),
+            directory: "~/".into(),
+        };
+        let browse = Browse {
+            key: key("a", None),
+            parent: Some("/home/a".into()),
+            entries: vec![("code".into(), "/home/a/code".into())],
+            ..Browse::default()
+        };
+        assert_eq!(submit_path(browse.of(&key("a", None)), "~/code").as_deref(), Some("/home/a/code"));
+        assert_eq!(submit_path(browse.of(&key("a", None)), "~/").as_deref(), Some("/home/a"));
+        // Machine B's add never takes machine A's folders, nor a listing from another cwd.
+        assert_eq!(submit_path(browse.of(&key("b", None)), "~/code").as_deref(), Some("~/code"));
+        assert_eq!(submit_path(browse.of(&key("b", None)), "~/").as_deref(), Some("~/"));
+        assert_eq!(submit_path(browse.of(&key("a", Some("/repo"))), "~/code").as_deref(), Some("~/code"));
     }
 
     #[test]

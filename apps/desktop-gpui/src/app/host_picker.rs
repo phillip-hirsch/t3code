@@ -62,6 +62,17 @@ fn sampling_for(sample: Option<&Sample>, target: &Target, candidates: &[SharedSt
     sample.filter(|s| s.target == *target && s.candidates == candidates).map_or(Sampling::Idle, |s| s.state)
 }
 
+/// Records a sample that picked no machine. One whose draft is no longer open is dropped
+/// instead, so coming back to the draft samples again: only the open draft can fail.
+fn sample_unused(sample: &mut Option<Sample>, origin: &Target, still_open: bool) {
+    if sample.as_ref().is_some_and(|s| s.target == *origin) {
+        match sample.as_mut() {
+            Some(sample) if still_open => sample.state = Sampling::Failed,
+            _ => *sample = None,
+        }
+    }
+}
+
 pub(super) struct HostUi {
     open: bool,
     /// By draft, as the web keeps them on each draft session: they follow it from machine to
@@ -392,17 +403,14 @@ impl Workspace {
             let _ = this.update(cx, |this, cx| {
                 let picked = load_balancing::choose(&sampled, super::sidebar::now_ms()).map(SharedString::from);
                 let target = picked.as_ref().and_then(|id| options.iter().find(|o| o.environment_id == *id));
+                let still_open = this.target.as_ref() == Some(&origin);
                 match target.and_then(|o| Some((o.environment_id.clone(), o.project_id.clone()?))) {
-                    Some((env, project_id)) if this.target.as_ref() == Some(&origin) => {
+                    Some((env, project_id)) if still_open => {
                         this.host.sample = None;
                         this.host.selections.insert(origin, Selection::Auto { picked: Some(env.clone()) });
                         this.retarget_draft(env, project_id, cx);
                     }
-                    _ => {
-                        if let Some(sample) = this.host.sample.as_mut().filter(|s| s.target == origin) {
-                            sample.state = Sampling::Failed;
-                        }
-                    }
+                    _ => sample_unused(&mut this.host.sample, &origin, still_open),
                 }
                 cx.notify();
             });
@@ -686,6 +694,23 @@ mod tests {
         assert_eq!(sampling_for(Some(&failed), &b, &candidates), Sampling::Idle, "another draft samples");
         assert_eq!(sampling_for(Some(&failed), &a, &candidates[..1]), Sampling::Idle, "the candidates changed");
         assert_eq!(sampling_for(None, &a, &candidates), Sampling::Idle);
+    }
+
+    #[test]
+    fn a_sample_that_finishes_after_its_draft_was_left_samples_again_on_return() {
+        let (a, b) = (draft("local", "web"), draft("local", "api"));
+        let candidates: Vec<SharedString> = vec!["local".into(), "remote".into()];
+        let pending = || Some(Sample { target: a.clone(), candidates: candidates.clone(), state: Sampling::Pending });
+        let mut left = pending();
+        sample_unused(&mut left, &a, false);
+        assert_eq!(sampling_for(left.as_ref(), &a, &candidates), Sampling::Idle);
+        let mut open = pending();
+        sample_unused(&mut open, &a, true);
+        assert_eq!(sampling_for(open.as_ref(), &a, &candidates), Sampling::Failed);
+        // Another draft's sample is not this one's to settle.
+        let mut other = pending();
+        sample_unused(&mut other, &b, false);
+        assert_eq!(other, pending());
     }
 
     #[test]

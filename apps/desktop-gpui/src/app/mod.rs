@@ -55,7 +55,6 @@ mod inspector;
 mod keep_alive;
 mod keymap;
 mod layout;
-mod link_pull_request;
 pub mod main_window;
 mod markdown_images;
 mod markdown_ui;
