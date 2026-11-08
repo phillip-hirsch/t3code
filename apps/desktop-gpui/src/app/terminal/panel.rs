@@ -77,7 +77,7 @@ impl Workspace {
     /// `addTerminalSurface`: a new terminal in a tab of its own.
     pub(in crate::app) fn add_terminal_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(thread_id), Some(launch)) = (self.terminal_thread(true), self.terminal_launch()) else { return };
-        if self.thread_client(&thread_id).is_none() {
+        if self.thread_client(&thread_id).is_none() || !self.terminal_operable(&thread_id) {
             return;
         }
         let terminal_id = self.next_terminal_id(&thread_id);
@@ -97,7 +97,9 @@ impl Workspace {
     pub(super) fn split_panel_terminal(&mut self, surface: &str, split: Split, _: &mut Window, cx: &mut Context<Self>) {
         let Some(launch) = self.terminal_launch() else { return };
         let Some(thread_id) = self.terminals.panel.get(surface).map(|g| g.thread_id.clone()) else { return };
-        if self.terminals.panel.get(surface).is_some_and(|g| g.terminal_ids.len() >= layout::MAX_PER_GROUP) {
+        if !self.terminal_operable(&thread_id)
+            || self.terminals.panel.get(surface).is_some_and(|g| g.terminal_ids.len() >= layout::MAX_PER_GROUP)
+        {
             return;
         }
         let terminal_id = self.next_terminal_id(&thread_id);

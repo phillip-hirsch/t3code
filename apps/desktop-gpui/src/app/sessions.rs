@@ -38,7 +38,9 @@ pub(super) struct EnvironmentSession {
     /// See `OpenThread::snapshot_failed` / `OpenThread::retried`.
     shell_snapshot_failed: bool,
     shell_retried: bool,
-    /// Config, terminal, preview and device streams.
+    /// The session answered without `terminal:operate`: its terminals only show output.
+    pub terminal_read_only: bool,
+    /// Config, terminal, preview and device streams, and the session's grants.
     _streams: Vec<Task<()>>,
     _shell: Option<Task<()>>,
 }
@@ -257,12 +259,20 @@ impl Workspace {
                 this.refresh_menu_items(cx);
             },
         );
-        let streams = vec![
+        let mut streams = vec![
             config_task,
             self.subscribe_terminal_metadata(environment_id.clone(), &client, window, cx),
             self.subscribe_previews(&environment_id, &client, window, cx),
             self.subscribe_device_state(environment_id.clone(), &client, window, cx),
         ];
+        if let Some(endpoint) = self.session(&environment_id).and_then(|s| s.endpoint.clone()) {
+            let id = environment_id.clone();
+            streams.push(super::pages::settings::check_terminal_operate(endpoint, cx, move |this, operable| {
+                if let Some(session) = this.session_mut(&id) {
+                    session.terminal_read_only = !operable;
+                }
+            }));
+        }
         let Some(session) = self.session_mut(&environment_id) else { return };
         session._streams = streams;
         session.device_state = None;

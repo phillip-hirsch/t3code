@@ -83,6 +83,20 @@ pub(super) fn check_session<T: 'static>(
     })
 }
 
+/// Follows whether `endpoint`'s session may operate terminals (`terminal:operate`). Only a
+/// session that answered without the grant says no; the server still checks every write.
+pub(in crate::app) fn check_terminal_operate(
+    endpoint: Endpoint,
+    cx: &mut Context<Workspace>,
+    apply: impl Fn(&mut Workspace, bool) + 'static,
+) -> Task<()> {
+    check_session(endpoint, cx, move |this, load, _| apply(this, operates_terminals(&load)))
+}
+
+fn operates_terminals(load: &SessionLoad) -> bool {
+    load.session().is_none_or(|session| session.grants(logic::TERMINAL_OPERATE))
+}
+
 impl Workspace {
     pub(super) fn render_settings_connections(
         &mut self,
@@ -176,4 +190,19 @@ fn success_toast(
     description: impl Into<SharedString>,
 ) {
     window.push_notification(Notification::success(description).title(title), cx);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_session_without_the_grant_stops_terminal_operation() {
+        let session =
+            |scopes: Value| SessionLoad::Ready(Session::from_json(&json!({"authenticated": true, "scopes": scopes})));
+        assert!(operates_terminals(&session(json!(["terminal:operate", "terminal:read"]))));
+        assert!(!operates_terminals(&session(json!(["terminal:read"]))));
+        assert!(operates_terminals(&SessionLoad::Pending), "the server still checks every write");
+        assert!(operates_terminals(&SessionLoad::Failed));
+    }
 }

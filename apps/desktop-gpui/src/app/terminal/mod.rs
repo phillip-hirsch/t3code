@@ -18,7 +18,7 @@ use gpui_kit::component::button::Button;
 use gpui_kit::component::button::ButtonVariant;
 use gpui_kit::component::input::InlineToken;
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{Sizable as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{Disableable as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, AnyView, App, AppContext as _, Context, Div, DragMoveEvent, EmptyView, Entity, InteractiveElement as _,
@@ -261,6 +261,13 @@ impl Workspace {
         })
     }
 
+    /// `canOperateTerminal`: the thread's environment lets this client start, type into, resize
+    /// and close its terminals.
+    pub(super) fn terminal_operable(&self, thread_id: &str) -> bool {
+        let session = self.thread_environment(thread_id).and_then(|env| self.session(&env));
+        session.is_none_or(|session| !session.terminal_read_only)
+    }
+
     /// `terminalAvailable`: the chat has a project to start a shell in.
     pub(super) fn terminal_available(&self) -> bool {
         self.terminal_launch().is_some()
@@ -342,6 +349,10 @@ impl Workspace {
                     self.terminals.drawers.entry(thread_id).or_default().ensure(&id);
                     self.terminals.focus_pending = Some(id);
                 }
+                // Without the grant the drawer opens on its empty state.
+                None if !self.terminal_operable(&thread_id) => {
+                    self.terminals.drawers.entry(thread_id).or_default().open = true;
+                }
                 None => self.launch_terminal(thread_id, Place::New, cx),
             }
         } else {
@@ -409,7 +420,7 @@ impl Workspace {
         then_write: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        if self.thread_client(&thread_id).is_none() {
+        if self.thread_client(&thread_id).is_none() || !self.terminal_operable(&thread_id) {
             return;
         }
         let terminal_id = self.next_terminal_id(&thread_id);
@@ -439,7 +450,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         // A terminal runs on its thread's environment (a draft's is the open one).
-        let Some(client) = self.thread_client(&thread_id) else { return };
+        let Some(client) = self.thread_client(&thread_id).filter(|_| self.terminal_operable(&thread_id)) else {
+            return;
+        };
         self.terminals.focus_pending = Some(terminal_id.clone());
         let payload = launch.payload(&thread_id, &terminal_id);
         cx.spawn(async move |this, cx| {
@@ -470,6 +483,9 @@ impl Workspace {
     /// `confirmTerminalClose`, then [`Self::close_terminal`].
     fn request_close_terminal(&mut self, terminal_id: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(thread_id) = self.shown_terminal_thread().map(str::to_owned) else { return };
+        if !self.terminal_operable(&thread_id) {
+            return;
+        }
         let label = self.terminals.label(&thread_id, &terminal_id);
         let workspace = cx.weak_entity();
         window.open_alert_dialog(cx, move |alert, _, _| {
@@ -487,7 +503,12 @@ impl Workspace {
                     let (workspace, thread_id, terminal_id) =
                         (workspace.clone(), thread_id.clone(), terminal_id.clone());
                     window.defer(cx, move |_, cx| {
-                        let _ = workspace.update(cx, |this, cx| this.close_terminal(&thread_id, &terminal_id, cx));
+                        // The grant is read again: it may have changed while the dialog was open.
+                        let _ = workspace.update(cx, |this, cx| {
+                            if this.terminal_operable(&thread_id) {
+                                this.close_terminal(&thread_id, &terminal_id, cx);
+                            }
+                        });
                     });
                     true
                 })
@@ -561,6 +582,10 @@ impl Workspace {
             });
             self.terminals.panes.insert(terminal_id.clone(), Pane { session, _events });
         }
+        let read_only = !self.terminal_operable(&thread_id);
+        for pane in self.terminals.panes.values() {
+            pane.session.update(cx, |session, cx| session.set_read_only(read_only, cx));
+        }
         if let Some(pending) = self.terminals.focus_pending.take() {
             match self.terminals.panes.get(&pending) {
                 Some(pane) => {
@@ -593,7 +618,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         match event {
-            SessionEvent::Exited => self.close_terminal(thread_id, terminal_id, cx),
+            // `handleSessionExited`: only a client that may operate the terminal cleans it up.
+            SessionEvent::Exited if self.terminal_operable(thread_id) => {
+                self.close_terminal(thread_id, terminal_id, cx)
+            }
+            SessionEvent::Exited => {}
             SessionEvent::Activated => {
                 self.activate_panel_terminal(thread_id, terminal_id, cx);
                 if let Some(drawer) = self.terminals.drawers.get_mut(thread_id)
@@ -736,6 +765,7 @@ impl Workspace {
                         .outline()
                         .xsmall()
                         .label(self.with_terminal_shortcut("New Terminal", "terminal.new"))
+                        .disabled(!self.terminal_operable(&thread_id))
                         .on_click(cx.listener(|this, _, _, cx| this.new_terminal(cx))),
                 )
                 .into_any_element()
@@ -825,8 +855,11 @@ impl Workspace {
     ) -> impl IntoElement {
         let border = tokens.border.opacity(0.8);
         let separator = || div().h(px(16.)).w(px(1.)).bg(border);
+        let operable = self.shown_terminal_operable();
         let button = |id: &'static str, path: &'static str, disabled: bool| {
-            action_button(id, path, disabled, tokens).p(px(4.)).when(!disabled, |el| el.hover(|s| s.bg(tokens.accent)))
+            action_button(id, path, disabled || !operable, tokens)
+                .p(px(4.))
+                .when(!disabled && operable, |el| el.hover(|s| s.bg(tokens.accent)))
         };
         div().absolute().top(px(8.)).right(px(8.)).child(
             h_flex()
@@ -843,6 +876,7 @@ impl Workspace {
                     button("terminal-split", "icons/square-split-horizontal.svg", limit),
                     Split::Horizontal,
                     limit,
+                    operable,
                     panel.clone(),
                     cx,
                 ))
@@ -851,13 +885,14 @@ impl Workspace {
                     button("terminal-split-vertical", "icons/square-split-vertical.svg", limit),
                     Split::Vertical,
                     limit,
+                    operable,
                     panel.clone(),
                     cx,
                 ))
                 .child(separator())
-                .child(self.wire_new(button("terminal-new", "icons/plus.svg", false), panel, cx))
+                .child(self.wire_new(button("terminal-new", "icons/plus.svg", false), panel, operable, cx))
                 .child(separator())
-                .child(self.wire_close(button("terminal-close", "icons/trash-2.svg", false), active, cx)),
+                .child(self.wire_close(button("terminal-close", "icons/trash-2.svg", false), active, operable, cx)),
         )
     }
 
@@ -866,6 +901,7 @@ impl Workspace {
         button: Stateful<Div>,
         split: Split,
         limit: bool,
+        operable: bool,
         panel: Option<String>,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
@@ -878,7 +914,7 @@ impl Workspace {
         } else {
             self.with_terminal_shortcut(name, command)
         };
-        button.tooltip(tooltip(label.into())).when(!limit, |el| {
+        button.tooltip(tooltip(label.into())).when(!limit && operable, |el| {
             el.on_click(cx.listener(move |this, _, window, cx| match &panel {
                 Some(surface) => this.split_panel_terminal(surface, split, window, cx),
                 None => this.split_terminal(split, cx),
@@ -886,19 +922,43 @@ impl Workspace {
         })
     }
 
-    fn wire_new(&self, button: Stateful<Div>, panel: Option<String>, cx: &mut Context<Self>) -> Stateful<Div> {
-        button.tooltip(tooltip(self.with_terminal_shortcut("New Terminal", "terminal.new").into())).on_click(
-            cx.listener(move |this, _, window, cx| match panel {
-                Some(_) => this.add_terminal_surface(window, cx),
-                None => this.new_terminal(cx),
-            }),
+    fn wire_new(
+        &self,
+        button: Stateful<Div>,
+        panel: Option<String>,
+        operable: bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        button.tooltip(tooltip(self.with_terminal_shortcut("New Terminal", "terminal.new").into())).when(
+            operable,
+            |el| {
+                el.on_click(cx.listener(move |this, _, window, cx| match panel {
+                    Some(_) => this.add_terminal_surface(window, cx),
+                    None => this.new_terminal(cx),
+                }))
+            },
         )
     }
 
-    fn wire_close(&self, button: Stateful<Div>, active: String, cx: &mut Context<Self>) -> Stateful<Div> {
-        button
-            .tooltip(tooltip(self.with_terminal_shortcut("Close Terminal", "terminal.close").into()))
-            .on_click(cx.listener(move |this, _, window, cx| this.request_close_terminal(active.clone(), window, cx)))
+    fn wire_close(
+        &self,
+        button: Stateful<Div>,
+        active: String,
+        operable: bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        button.tooltip(tooltip(self.with_terminal_shortcut("Close Terminal", "terminal.close").into())).when(
+            operable,
+            |el| {
+                el.on_click(
+                    cx.listener(move |this, _, window, cx| this.request_close_terminal(active.clone(), window, cx)),
+                )
+            },
+        )
+    }
+
+    fn shown_terminal_operable(&self) -> bool {
+        self.shown_terminal_thread().is_none_or(|thread_id| self.terminal_operable(thread_id))
     }
 
     /// The session list beside split panes once a thread has several terminals.
@@ -911,12 +971,13 @@ impl Workspace {
     ) -> impl IntoElement {
         let border = tokens.border.opacity(0.7);
         let limit = drawer.split_limit_reached();
+        let operable = self.terminal_operable(thread_id);
         let header_button = |id: &'static str, path: &'static str, disabled: bool, first: bool| {
-            action_button(id, path, disabled, tokens)
+            action_button(id, path, disabled || !operable, tokens)
                 .h_full()
                 .px(px(4.))
                 .when(!first, |el| el.border_l_1().border_color(border))
-                .when(!disabled, |el| el.hover(|s| s.bg(tokens.accent.opacity(0.7))))
+                .when(!disabled && operable, |el| el.hover(|s| s.bg(tokens.accent.opacity(0.7))))
         };
         let active = drawer.active_id.clone();
         let header = h_flex().h(px(22.)).flex_none().justify_end().border_b_1().border_color(border).child(
@@ -926,6 +987,7 @@ impl Workspace {
                     header_button("terminal-split", "icons/square-split-horizontal.svg", limit, true),
                     Split::Horizontal,
                     limit,
+                    operable,
                     None,
                     cx,
                 ))
@@ -933,11 +995,17 @@ impl Workspace {
                     header_button("terminal-split-vertical", "icons/square-split-vertical.svg", limit, false),
                     Split::Vertical,
                     limit,
+                    operable,
                     None,
                     cx,
                 ))
-                .child(self.wire_new(header_button("terminal-new", "icons/plus.svg", false, false), None, cx))
-                .child(self.wire_close(header_button("terminal-close", "icons/trash-2.svg", false, false), active, cx)),
+                .child(self.wire_new(header_button("terminal-new", "icons/plus.svg", false, false), None, operable, cx))
+                .child(self.wire_close(
+                    header_button("terminal-close", "icons/trash-2.svg", false, false),
+                    active,
+                    operable,
+                    cx,
+                )),
         );
         let groups = drawer.sorted_groups();
         let show_headers = groups.len() > 1 || groups.iter().any(|g| g.terminal_ids.len() > 1);
@@ -1019,6 +1087,7 @@ impl Workspace {
         .into();
         let group = SharedString::from(format!("terminal-row-{terminal_id}"));
         let (close_id, activate_id) = (terminal_id.to_owned(), terminal_id.to_owned());
+        let operable = self.terminal_operable(thread_id);
         let glyph = |path: &'static str| {
             div().absolute().inset_0().flex().items_center().justify_center().child(icon(path).with_size(px(12.)))
         };
@@ -1050,15 +1119,24 @@ impl Workspace {
                     .items_center()
                     .justify_center()
                     .rounded(px(4.))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(tokens.muted))
-                    .tooltip(tooltip(close_label))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.request_close_terminal(close_id.clone(), window, cx);
-                    }))
-                    .child(glyph("icons/square-terminal.svg").group_hover(group.clone(), gpui_kit::Styled::invisible))
-                    .child(glyph("icons/x.svg").invisible().group_hover(group, gpui_kit::Styled::visible)),
+                    .map(|el| {
+                        // Without the grant the row shows only its terminal icon.
+                        if !operable {
+                            return el.child(glyph("icons/square-terminal.svg"));
+                        }
+                        el.cursor_pointer()
+                            .hover(|s| s.bg(tokens.muted))
+                            .tooltip(tooltip(close_label))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.request_close_terminal(close_id.clone(), window, cx);
+                            }))
+                            .child(
+                                glyph("icons/square-terminal.svg")
+                                    .group_hover(group.clone(), gpui_kit::Styled::invisible),
+                            )
+                            .child(glyph("icons/x.svg").invisible().group_hover(group, gpui_kit::Styled::visible))
+                    }),
             )
             .child(
                 div()

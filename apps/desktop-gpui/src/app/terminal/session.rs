@@ -158,6 +158,8 @@ pub(super) struct TerminalSession {
     size: Option<GridSize>,
     sent_size: Option<GridSize>,
     running: bool,
+    /// Without `terminal:operate` nothing is written to the PTY, and it is never resized.
+    read_only: bool,
     exited: bool,
     /// The attach stream replied once; later attaches resume instead of opening a shell.
     attached: bool,
@@ -226,6 +228,7 @@ impl TerminalSession {
             size: None,
             sent_size: None,
             running: false,
+            read_only: false,
             exited: false,
             attached: false,
             client: None,
@@ -391,7 +394,7 @@ impl TerminalSession {
     /// Queues `data` for the PTY; writes go out one at a time, in order.
     /// Without a connection the input is dropped: queued keystrokes would run on reconnect.
     fn send_input(&mut self, data: &str, cx: &mut Context<Self>) {
-        let Some(client) = self.client.clone() else { return };
+        let Some(client) = self.client.clone().filter(|_| !self.read_only) else { return };
         self.outbox.push_str(data);
         if self.writing {
             return;
@@ -442,9 +445,16 @@ impl TerminalSession {
         }));
     }
 
+    /// Follows the environment's `terminal:operate` grant; a granted terminal sends its size.
+    pub fn set_read_only(&mut self, read_only: bool, cx: &mut Context<Self>) {
+        if std::mem::replace(&mut self.read_only, read_only) && !read_only {
+            self.send_size(cx);
+        }
+    }
+
     fn send_size(&mut self, cx: &mut Context<Self>) {
         let (Some(size), Some(client)) = (self.size, self.client.clone()) else { return };
-        if !self.running || self.sent_size == Some(size) {
+        if !self.running || self.read_only || self.sent_size == Some(size) {
             return;
         }
         self.sent_size = Some(size);
