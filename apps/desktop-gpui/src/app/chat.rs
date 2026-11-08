@@ -17,7 +17,7 @@ use gpui_kit::{
     AnyElement, App, AppContext as _, ClickEvent, Context, ElementId, Entity, Font, FontWeight, HighlightStyle, Hsla,
     InteractiveElement as _, IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _,
     StyleRefinement, Styled as _, Subscription, TextRun, WeakEntity, Window, div, linear_color_stop, linear_gradient,
-    prelude::FluentBuilder as _, px, relative, rems,
+    prelude::FluentBuilder as _, px, relative, rems, rgb,
 };
 
 use gpui_kit::assets::IconName;
@@ -30,6 +30,8 @@ use crate::work_log::{self, Activity, Entry, Status, WorkIcon};
 /// Prose: `text-sm` at `leading-relaxed`.
 const TEXT: f32 = 14.;
 const LINE: f32 = 22.75;
+/// `--guest`: fuchsia-500.
+const GUEST: u32 = 0xe12afb;
 /// A user message longer than this collapses (`shouldCollapseUserMessage`).
 const COLLAPSE_CHARS: usize = 600;
 const COLLAPSE_LINES: usize = 8;
@@ -619,20 +621,11 @@ pub(super) fn render_row(
             continues_steer,
             created_at,
             revert,
-            sent_by_t3code,
-            from_agent,
+            attribution,
         } => {
             let expanded =
                 this.upgrade().is_some_and(|workspace| workspace.read(cx).expanded.contains(&timeline::entry_key(id)));
-            // `senderShell?.title || "Agent"`.
-            let agent = from_agent.as_ref().map(|from| {
-                let title = from.sender_thread.as_ref().and_then(|sender| {
-                    let workspace = this.upgrade()?;
-                    let title = workspace.read(cx).shell_thread(sender)?.title.trim().to_owned();
-                    (!title.is_empty()).then_some(title)
-                });
-                AgentFold { label: title.unwrap_or_else(|| "Agent".into()).into(), sender: from.sender_thread.clone() }
-            });
+            let fold = folded_message(attribution.as_ref(), text, this, cx);
             let actions = message_actions::user_actions(this, id, text, created_at, revert.as_ref(), &t, cx);
             let body = markdown_with(this, id.clone(), text, MarkdownKind::User, None, &t, cx);
             user_row(
@@ -645,8 +638,8 @@ pub(super) fn render_row(
                     grouped_with_previous: *grouped_with_previous,
                     grouped_with_next: *grouped_with_next,
                     expanded,
-                    sent_by_t3code: *sent_by_t3code,
-                    agent,
+                    attribution: attribution.as_ref(),
+                    fold,
                 },
                 this,
                 &t,
@@ -1208,18 +1201,77 @@ fn working_duration(ms: i64) -> String {
 // Messages
 
 /// How a user message bubble sits among its neighbours, and how much of it shows.
-struct UserRowLook {
+struct UserRowLook<'a> {
     grouped_with_previous: bool,
     grouped_with_next: bool,
     expanded: bool,
-    sent_by_t3code: bool,
-    agent: Option<AgentFold>,
+    attribution: Option<&'a timeline::Attribution>,
+    fold: Option<FoldedMessage>,
 }
 
-/// An agent's message folds to one line: who sent it, then its first line (`FoldedMessageHeader`).
-struct AgentFold {
+/// An agent's or an automation's message folds to one line: who sent it, then a summary
+/// (`FoldedMessageHeader`).
+struct FoldedMessage {
+    icon: IconName,
     label: SharedString,
-    sender: Option<SharedString>,
+    summary: SharedString,
+    link: Option<FoldLink>,
+    /// An agent's message keeps its actions while folded; an automation's show once it opens.
+    actions_when_folded: bool,
+}
+
+/// "Open thread" on an agent's message, "Open automation" on a scheduled task's.
+enum FoldLink {
+    Thread(SharedString),
+    Automation,
+}
+
+/// `UserTimelineRow`'s "agent" fold and `AutomationMessageRow`, for the attributions that fold.
+fn folded_message(
+    attribution: Option<&timeline::Attribution>,
+    text: &str,
+    this: &WeakEntity<Workspace>,
+    cx: &App,
+) -> Option<FoldedMessage> {
+    let workspace = this.upgrade();
+    let workspace = workspace.as_ref().map(|workspace| workspace.read(cx));
+    match attribution? {
+        timeline::Attribution::Agent { sender_thread } => {
+            // `senderShell?.title || "Agent"`.
+            let title = sender_thread.as_ref().and_then(|sender| {
+                let title = workspace?.shell_thread(sender)?.title.trim().to_owned();
+                (!title.is_empty()).then_some(title)
+            });
+            Some(FoldedMessage {
+                icon: IconName::MessagesSquare,
+                label: title.unwrap_or_else(|| "Agent".into()).into(),
+                summary: text
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .unwrap_or_default()
+                    .to_owned()
+                    .into(),
+                link: sender_thread.clone().map(FoldLink::Thread),
+                actions_when_folded: true,
+            })
+        }
+        timeline::Attribution::Automation { scheduled_task_id } => {
+            // The task's title, else the prompt's first line (`useScheduledTaskTitle`).
+            let title = scheduled_task_id
+                .as_ref()
+                .and_then(|task| workspace?.scheduled_task_title(task))
+                .map(SharedString::from);
+            Some(FoldedMessage {
+                icon: IconName::CalendarClock,
+                label: "Automation".into(),
+                summary: title.unwrap_or_else(|| text.trim().lines().next().unwrap_or_default().to_owned().into()),
+                link: scheduled_task_id.as_ref().map(|_| FoldLink::Automation),
+                actions_when_folded: false,
+            })
+        }
+        timeline::Attribution::T3Code | timeline::Attribution::Guest { .. } => None,
+    }
 }
 
 fn user_row(
@@ -1232,31 +1284,7 @@ fn user_row(
     this: &WeakEntity<Workspace>,
     t: &Tokens,
 ) -> AnyElement {
-    let UserRowLook { grouped_with_previous, grouped_with_next, expanded, sent_by_t3code, agent } = look;
-    if let Some(agent) = agent {
-        return agent_row(id, text, body, actions, agent, expanded, this, t);
-    }
-    let collapsible = should_collapse(text);
-    let collapsed = collapsible && !expanded;
-    let mut bubble = div()
-        .relative()
-        .max_w(relative(0.8))
-        .p(px(12.))
-        .rounded(px(16.))
-        .bg(t.message_surface)
-        .text_color(t.foreground)
-        .text_size(px(TEXT))
-        .line_height(px(LINE))
-        .when(grouped_with_previous, |this| this.rounded_tr(px(6.)))
-        .when(grouped_with_next, |this| this.rounded_br(px(6.)))
-        .child(div().when(collapsed, |this| this.max_h(px(176.)).overflow_hidden()).child(body));
-    if collapsed {
-        bubble = bubble.child(div().absolute().left_0().right_0().bottom(px(12.)).h(px(28.)).bg(linear_gradient(
-            180.,
-            linear_color_stop(alpha(t.message_surface, 0.), 0.),
-            linear_color_stop(t.message_surface, 1.),
-        )));
-    }
+    let UserRowLook { grouped_with_previous, grouped_with_next, expanded, attribution, fold } = look;
     let steer_label = steer.map(|_| {
         h_flex()
             .mr(px(4.))
@@ -1267,6 +1295,37 @@ fn user_row(
             .child(Icon::new(IconName::Redo2).size(px(12.)))
             .child("Steer")
     });
+    if let Some(fold) = fold {
+        return folded_row(id, body, actions, steer_label, fold, expanded, this, t);
+    }
+    let guest = match attribution {
+        Some(timeline::Attribution::Guest { name }) => Some(name.clone()),
+        _ => None,
+    };
+    // `bg-guest-surface`: `color-mix(in srgb, var(--guest) 14%, var(--message-surface))`.
+    let surface =
+        if guest.is_some() { theme::mix_srgb(t.message_surface, rgb(GUEST).into(), 0.14) } else { t.message_surface };
+    let collapsible = should_collapse(text);
+    let collapsed = collapsible && !expanded;
+    let mut bubble = div()
+        .relative()
+        .max_w(relative(0.8))
+        .p(px(12.))
+        .rounded(px(16.))
+        .bg(surface)
+        .text_color(t.foreground)
+        .text_size(px(TEXT))
+        .line_height(px(LINE))
+        .when(grouped_with_previous, |this| this.rounded_tr(px(6.)))
+        .when(grouped_with_next, |this| this.rounded_br(px(6.)))
+        .child(div().when(collapsed, |this| this.max_h(px(176.)).overflow_hidden()).child(body));
+    if collapsed {
+        bubble = bubble.child(div().absolute().left_0().right_0().bottom(px(12.)).h(px(28.)).bg(linear_gradient(
+            180.,
+            linear_color_stop(alpha(surface, 0.), 0.),
+            linear_color_stop(surface, 1.),
+        )));
+    }
     let toggle_button = collapsible.then(|| {
         h_flex()
             .id(ElementId::Name(format!("user-collapse:{id}").into()))
@@ -1291,9 +1350,20 @@ fn user_row(
         .group_hover("timeline-row", |style| style.opacity(1.))
         .child(actions);
     // `text-2xs`: 0.6875rem.
-    let attribution = sent_by_t3code.then(|| {
-        div().mr(px(4.)).text_size(rems(0.6875)).text_color(alpha(t.muted_foreground, 0.7)).child("Sent by T3 Code")
-    });
+    let attribution = match (attribution, guest) {
+        (Some(timeline::Attribution::T3Code), _) => Some(
+            div()
+                .mr(px(4.))
+                .text_size(rems(0.6875))
+                .text_color(alpha(t.muted_foreground, 0.7))
+                .child("Sent by T3 Code"),
+        ),
+        // `GuestMessageName`.
+        (_, Some(name)) => {
+            Some(div().mr(px(4.)).text_size(rems(0.6875)).text_color(super::sidebar::guest_foreground(t)).child(name))
+        }
+        _ => None,
+    };
     let column = v_flex()
         .group("timeline-row")
         .items_end()
@@ -1306,20 +1376,20 @@ fn user_row(
     lane(if grouped_with_next { 4. } else { 16. }, column).into_any_element()
 }
 
-/// `UserTimelineRow` with `attribution === "agent"`: a one-line header (`FoldedMessageHeader`)
-/// that opens to the message, capped at `max-h-96`, plus "Open thread" when a thread sent it.
-fn agent_row(
+/// `UserTimelineRow` with `attribution === "agent"`, and `AutomationMessageRow`: a one-line header
+/// (`FoldedMessageHeader`) that opens to the message, capped at `max-h-96`, plus "Open thread" when
+/// a thread sent it or "Open automation" for a scheduled task.
+fn folded_row(
     id: &SharedString,
-    text: &SharedString,
     body: AnyElement,
     actions: gpui_kit::Div,
-    agent: AgentFold,
+    steer_label: Option<gpui_kit::Div>,
+    fold: FoldedMessage,
     expanded: bool,
     this: &WeakEntity<Workspace>,
     t: &Tokens,
 ) -> AnyElement {
     let muted = t.muted_foreground;
-    let summary = text.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or_default().to_owned();
     let header = h_flex()
         .id(ElementId::Name(format!("agent-fold:{id}").into()))
         .w_full()
@@ -1330,9 +1400,9 @@ fn agent_row(
         .rounded(px(16.))
         .line_height(px(20.))
         .cursor_pointer()
-        .child(Icon::new(IconName::MessagesSquare).size(px(16.)).flex_none().text_color(muted))
-        .child(div().flex_none().max_w(relative(0.5)).truncate().text_color(muted).child(agent.label))
-        .child(div().flex_1().min_w_0().truncate().child(summary))
+        .child(Icon::new(fold.icon).size(px(16.)).flex_none().text_color(muted))
+        .child(div().flex_none().max_w(relative(0.5)).truncate().text_color(muted).child(fold.label))
+        .child(div().flex_1().min_w_0().truncate().child(fold.summary))
         .child(
             Icon::new(if expanded { IconName::ChevronUp } else { IconName::ChevronDown })
                 .size(px(14.))
@@ -1361,8 +1431,12 @@ fn agent_row(
                     .child(body),
             )
         });
-    let open_thread = agent.sender.map(|sender| {
+    let link = fold.link.map(|link| {
         let this = this.clone();
+        let label = match link {
+            FoldLink::Thread(_) => "Open thread",
+            FoldLink::Automation => "Open automation",
+        };
         div()
             .id(ElementId::Name(format!("agent-open-thread:{id}").into()))
             .text_xs()
@@ -1370,22 +1444,28 @@ fn agent_row(
             .text_color(muted)
             .cursor_pointer()
             .hover(|s| s.text_color(t.foreground).underline())
-            .child("Open thread")
+            .child(label)
             .on_click(move |_, window, cx| {
-                let _ = this.update(cx, |workspace, cx| workspace.select_thread(sender.to_string(), window, cx));
+                let _ = this.update(cx, |workspace, cx| match &link {
+                    FoldLink::Thread(sender) => workspace.select_thread(sender.to_string(), window, cx),
+                    FoldLink::Automation => workspace.open_settings("scheduled-tasks", cx),
+                });
             })
     });
-    let actions = h_flex()
-        .w_full()
-        .max_w(relative(0.8))
-        .justify_end()
-        .gap(px(8.))
-        .pr(px(4.))
-        .opacity(0.)
-        .group_hover("timeline-row", |style| style.opacity(1.))
-        .children(open_thread)
-        .child(actions);
-    let column = v_flex().group("timeline-row").items_end().gap(px(4.)).child(bubble).child(actions);
+    let actions = (fold.actions_when_folded || expanded).then(|| {
+        h_flex()
+            .w_full()
+            .max_w(relative(0.8))
+            .justify_end()
+            .gap(px(8.))
+            .pr(px(4.))
+            .opacity(0.)
+            .group_hover("timeline-row", |style| style.opacity(1.))
+            .children(link)
+            .child(actions)
+    });
+    let column =
+        v_flex().group("timeline-row").items_end().gap(px(4.)).children(steer_label).child(bubble).children(actions);
     lane(16., column).into_any_element()
 }
 

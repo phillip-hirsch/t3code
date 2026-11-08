@@ -13,6 +13,7 @@ use gpui_kit::SharedString;
 use serde_json::Value;
 
 use crate::model::{self, Run, ThreadProjection, TurnItem, is_active_run_status};
+pub use crate::queue::Attribution;
 use crate::work_log::{self, Activity, Entry, Status, Tone, WorkIcon};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -28,11 +29,9 @@ pub enum Row {
         created_at: SharedString,
         /// The checkpoint "Edit from here" rewinds to.
         revert: Option<Checkpoint>,
-        /// "Sent by T3 Code" above the bubble; not the user's own words, so it never groups.
-        sent_by_t3code: bool,
-        /// Another agent sent it (`attribution === "agent"`): it folds to one line, and names the
-        /// thread it came from when it has one.
-        from_agent: Option<FromAgent>,
+        /// Who sent it when not the user (`resolveUserMessagePresentation`); such a message is
+        /// not the user's own words, so it never groups.
+        attribution: Option<Attribution>,
     },
     Assistant {
         id: SharedString,
@@ -582,7 +581,7 @@ impl Row {
     }
 
     fn is_own_user_message(&self) -> bool {
-        matches!(self, Row::User { sent_by_t3code: false, from_agent: None, .. })
+        matches!(self, Row::User { attribution: None, .. })
     }
 }
 
@@ -630,12 +629,6 @@ fn compacting_label(reason: Option<&str>) -> &'static str {
     }
 }
 
-/// The thread an agent-sent message came from (`senderThreadId`), if it names one.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FromAgent {
-    pub sender_thread: Option<SharedString>,
-}
-
 enum Kind {
     /// `revertible`: a turn start or queued turn, which "Edit from here" can rewind.
     User {
@@ -644,8 +637,7 @@ enum Kind {
         revertible: bool,
         /// A bare `/compact` turn, which its compaction row stands in for.
         compaction: Option<Option<&'static str>>,
-        sent_by_t3code: bool,
-        from_agent: Option<FromAgent>,
+        attribution: Option<Attribution>,
         /// `/clear` or an automation started a new provider session with this message.
         fresh_context: bool,
     },
@@ -803,13 +795,12 @@ fn timeline_entry(item: &Rc<TurnItem>, inherited: bool) -> Option<TimelineEntry>
                 _ => None,
             };
             let revertible = matches!(intent, Some("turn_start" | "queued_turn"));
+            let (shown, attribution) = crate::queue::user_message_presentation(item);
             Kind::User {
-                text: text("text"),
+                text: shown.into(),
                 steer,
                 revertible,
-                sent_by_t3code: crate::queue::sent_by_t3code(item),
-                from_agent: crate::queue::sent_by_agent(item)
-                    .then(|| FromAgent { sender_thread: item.str("senderThreadId").map(SharedString::from) }),
+                attribution,
                 compaction: compaction_command(item),
                 fresh_context: item.bool("freshContext"),
             }
@@ -1955,7 +1946,7 @@ pub fn rows(
                     });
                 }
             }
-            Kind::User { text, steer, sent_by_t3code, from_agent, fresh_context, .. } => {
+            Kind::User { text, steer, attribution, fresh_context, .. } => {
                 if *fresh_context {
                     rows.push(Row::System(Rc::new(SystemDivider {
                         id: format!("fresh-session:{}", entry.id).into(),
@@ -1974,8 +1965,7 @@ pub fn rows(
                     continues_steer: false,
                     created_at: entry.created_at.clone(),
                     revert: reverts.get(&entry.id).cloned(),
-                    sent_by_t3code: *sent_by_t3code,
-                    from_agent: from_agent.clone(),
+                    attribution: attribution.clone(),
                 });
             }
             Kind::Assistant { text, streaming } => rows.push(Row::Assistant {
@@ -2025,16 +2015,8 @@ pub fn rows(
         let previous = index.checked_sub(1).and_then(|i| flags.get(i)).copied().unwrap_or_default();
         match row {
             Row::Work(work) => work.continues = next.0,
-            Row::User {
-                steer,
-                grouped_with_previous,
-                grouped_with_next,
-                continues_steer,
-                sent_by_t3code,
-                from_agent,
-                ..
-            } => {
-                let own = !*sent_by_t3code && from_agent.is_none();
+            Row::User { steer, grouped_with_previous, grouped_with_next, continues_steer, attribution, .. } => {
+                let own = attribution.is_none();
                 *grouped_with_previous = own && previous.1;
                 *grouped_with_next = own && next.1;
                 *continues_steer = previous.2 && steer.is_some();
@@ -2242,8 +2224,7 @@ mod tests {
             continues_steer: false,
             created_at: SharedString::default(),
             revert: None,
-            sent_by_t3code: false,
-            from_agent: None,
+            attribution: None,
         }
     }
 
@@ -2921,8 +2902,11 @@ mod tests {
         items.insert(0, item("u0", "user_message", "r2", "2026-11-04T10:00:00.500Z", json!({"text": "z"})));
         let p = projection(items, json!([]));
         let rows = super::rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default());
-        assert!(matches!(rows[0], Row::User { grouped_with_next: false, sent_by_t3code: false, .. }));
-        assert!(matches!(rows[1], Row::User { grouped_with_previous: false, sent_by_t3code: true, .. }));
+        assert!(matches!(rows[0], Row::User { grouped_with_next: false, attribution: None, .. }));
+        assert!(matches!(
+            rows[1],
+            Row::User { grouped_with_previous: false, attribution: Some(Attribution::T3Code), .. }
+        ));
 
         // Another agent's message (a subagent's task) folds and names the thread that sent it.
         let task = json!({"text": "e", "inputIntent": "turn_start", "createdBy": "agent", "senderThreadId": "parent"});
@@ -2932,11 +2916,48 @@ mod tests {
         ];
         let p = projection(items, json!([]));
         let rows = super::rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default());
-        let Row::User { from_agent: Some(from), grouped_with_next: false, .. } = &rows[0] else {
+        let Row::User { attribution: Some(Attribution::Agent { sender_thread }), grouped_with_next: false, .. } =
+            &rows[0]
+        else {
             panic!("an agent's message folds: {:?}", describe(&rows))
         };
-        assert_eq!(from.sender_thread.as_deref(), Some("parent"));
-        assert!(matches!(rows[1], Row::User { from_agent: None, grouped_with_previous: false, .. }));
+        assert_eq!(sender_thread.as_deref(), Some("parent"));
+        assert!(matches!(rows[1], Row::User { attribution: None, grouped_with_previous: false, .. }));
+
+        // An automation names its task; a legacy one loses its trigger line. A guest's message
+        // shows the guest's own words and name. Neither groups with the user's own.
+        let automation = json!({"text": "run it", "createdBy": "agent", "scheduledTaskId": "task-1"});
+        let legacy = json!({"text": "[Triggered by schedule task: Nightly [v2]]\n\nrun it",
+            "messageId": "scheduled-task-message:task-2:3:manual"});
+        let guest = json!({"text": "Guest Ann says: hi", "context": {"version": 1, "records": [],
+            "guest": {"guestMessageId": "g", "name": "Ann", "text": "hi"}}});
+        let items = vec![
+            item("u7", "user_message", "r4", "2026-11-04T10:00:00.000Z", automation),
+            item("u8", "user_message", "r4", "2026-11-04T10:00:01.000Z", legacy),
+            item("u9", "user_message", "r4", "2026-11-04T10:00:02.000Z", guest),
+            item("u10", "user_message", "r4", "2026-11-04T10:00:03.000Z", json!({"text": "mine"})),
+        ];
+        let p = projection(items, json!([]));
+        let rows = super::rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default());
+        let shown: Vec<_> = rows
+            .iter()
+            .map(|row| match row {
+                Row::User { text, attribution, grouped_with_previous, .. } => {
+                    (text.to_string(), attribution.clone(), *grouped_with_previous)
+                }
+                _ => panic!("only messages: {:?}", describe(&rows)),
+            })
+            .collect();
+        let automation = |task: &str| Some(Attribution::Automation { scheduled_task_id: Some(task.into()) });
+        assert_eq!(
+            shown,
+            [
+                ("run it".into(), automation("task-1"), false),
+                ("run it".into(), automation("task-2"), false),
+                ("hi".into(), Some(Attribution::Guest { name: "Ann".into() }), false),
+                ("mine".into(), None, false),
+            ]
+        );
     }
 
     #[test]

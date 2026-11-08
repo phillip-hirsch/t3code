@@ -53,11 +53,22 @@ fn schedule_line(task: &ScheduledTask, now_ms: i64) -> String {
 }
 
 impl Workspace {
-    /// The connected environment whose tasks the section shows, while it can show.
+    /// The connected environment whose tasks the section, or an automation's message, shows.
     fn automations_wanted(&self, window: &Window) -> Option<SharedString> {
+        // An automation's message in the timeline is titled by its task, too.
+        let names_task = || {
+            self.rows.iter().any(|row| {
+                matches!(
+                    row,
+                    crate::timeline::Row::User {
+                        attribution: Some(crate::timeline::Attribution::Automation { scheduled_task_id: Some(_) }),
+                        ..
+                    }
+                )
+            })
+        };
         let shown = matches!(self.target, Some(Target::Thread { .. }))
-            && self.details_shown(window)
-            && self.details_item_shown("automations");
+            && ((self.details_shown(window) && self.details_item_shown("automations")) || names_task());
         let environment = self.active_environment().filter(|_| shown)?;
         self.env_client(environment).is_some().then(|| environment.clone())
     }
@@ -96,6 +107,11 @@ impl Workspace {
             }
             super::resubscribe_after_backoff(&this, cx, |this| this.automations.task = None).await;
         }));
+    }
+
+    /// A scheduled task's title, once the environment's tasks have loaded.
+    pub(in crate::app) fn scheduled_task_title(&self, task_id: &str) -> Option<String> {
+        self.automations.tasks.iter().find(|task| task.id == task_id).map(|task| task.title.clone())
     }
 
     fn automation_action(&mut self, id: String, enabled: Option<bool>, window: &mut Window, cx: &mut Context<Self>) {

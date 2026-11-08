@@ -471,7 +471,7 @@ impl Tokens {
 }
 
 /// CSS `color-mix(in srgb, from, to t)`, with premultiplied alpha.
-fn mix_srgb(from: Hsla, to: Hsla, t: f32) -> Hsla {
+pub(crate) fn mix_srgb(from: Hsla, to: Hsla, t: f32) -> Hsla {
     let (a, b) = (from.to_rgb(), to.to_rgb());
     let alpha = a.a * (1. - t) + b.a * t;
     if alpha <= 0. {

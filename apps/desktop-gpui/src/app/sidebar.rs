@@ -2555,7 +2555,8 @@ impl Workspace {
     }
 }
 
-fn guest_foreground(tokens: &Tokens) -> Hsla {
+/// `--guest-foreground`: fuchsia-600, fuchsia-300 in the dark.
+pub(super) fn guest_foreground(tokens: &Tokens) -> Hsla {
     rgb(if tokens.dark { 0xf4a8ff } else { 0xc800de }).into()
 }
 

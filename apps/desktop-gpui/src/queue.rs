@@ -139,21 +139,76 @@ pub fn derive(projection: &ThreadProjection, archived: bool) -> QueueState {
     }
 }
 
-/// `resolveUserMessagePresentation`'s "t3code" attribution: T3 Code itself sent it.
-pub fn sent_by_t3code(item: &TurnItem) -> bool {
-    item.raw.get("scheduledTaskId").is_none_or(Value::is_null)
-        && item.str("createdBy") == Some("agent")
-        && item.str("creationSource") == Some("server")
+/// Who a user message reads as sent by, when not the user (`resolveUserMessagePresentation`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Attribution {
+    /// T3 Code itself sent it: "Sent by T3 Code" above the bubble.
+    T3Code,
+    /// Another agent sent it (a subagent's task, say), from `sender_thread` when it names one.
+    Agent { sender_thread: Option<SharedString> },
+    /// A scheduled task's prompt.
+    Automation { scheduled_task_id: Option<SharedString> },
+    /// A guest's message, which the owner sent on.
+    Guest { name: SharedString },
 }
 
-/// `resolveUserMessagePresentation`'s "agent" attribution: another agent sent it (a subagent's
-/// task, say), so it folds to one line. Guests, automations and T3 Code itself are not agents.
-pub fn sent_by_agent(item: &TurnItem) -> bool {
-    item.raw.get("scheduledTaskId").is_none_or(Value::is_null)
-        && item.raw.pointer("/context/guest").is_none_or(Value::is_null)
-        && item.str("createdBy") == Some("agent")
-        && item.str("creationSource") != Some("server")
-        && !item.str("text").is_some_and(|text| text.starts_with("[Triggered by schedule task: "))
+const LEGACY_AUTOMATION_PREFIX: &str = "[Triggered by schedule task: ";
+
+/// `LEGACY_AUTOMATION_PREFIX`: the prefix's length when `text` starts with
+/// `[Triggered by schedule task: <name>]` and a blank line.
+fn legacy_automation_prefix(text: &str) -> Option<usize> {
+    let rest = text.strip_prefix(LEGACY_AUTOMATION_PREFIX)?;
+    let line = rest.find(['\r', '\n']).unwrap_or(rest.len());
+    // A name of at least one character, which may hold `]` itself.
+    if line < 2 || !rest[..line].ends_with(']') {
+        return None;
+    }
+    let after = &rest[line..];
+    let blank = ["\r\n\r\n", "\r\n\n", "\n\r\n", "\n\n"].into_iter().find(|blank| after.starts_with(blank))?;
+    Some(LEGACY_AUTOMATION_PREFIX.len() + line + blank.len())
+}
+
+/// `LEGACY_AUTOMATION_MESSAGE_ID`: the task id in `scheduled-task-message:<id>:<n>:scheduled|manual`.
+fn legacy_automation_task(message_id: &str) -> Option<&str> {
+    let rest = message_id.strip_prefix("scheduled-task-message:")?;
+    let (rest, trigger) = rest.rsplit_once(':')?;
+    let (task, count) = rest.rsplit_once(':')?;
+    let counted = !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit());
+    (matches!(trigger, "scheduled" | "manual") && counted && !task.is_empty()).then_some(task)
+}
+
+/// `resolveUserMessagePresentation`: the words people see and who sent them.
+pub fn user_message_presentation(item: &TurnItem) -> (String, Option<Attribution>) {
+    let text = item.str("text").unwrap_or_default();
+    // The stored text names the guest for the agent; people see the guest's own words.
+    if let Some(guest) = item.raw.pointer("/context/guest").filter(|guest| guest.is_object()) {
+        let field = |key: &str| guest.get(key).and_then(Value::as_str).unwrap_or_default().to_owned();
+        return (field("text"), Some(Attribution::Guest { name: field("name").into() }));
+    }
+    if let Some(task) = item.str("scheduledTaskId") {
+        let attribution = Attribution::Automation { scheduled_task_id: Some(task.to_owned().into()) };
+        return (text.to_owned(), Some(attribution));
+    }
+    if let Some(prefix) = legacy_automation_prefix(text) {
+        let task = item.str("messageId").and_then(legacy_automation_task);
+        if task.is_some() || item.str("createdBy") == Some("agent") {
+            let attribution = Attribution::Automation { scheduled_task_id: task.map(|t| t.to_owned().into()) };
+            return (text[prefix..].to_owned(), Some(attribution));
+        }
+    }
+    let attribution = (item.str("createdBy") == Some("agent")).then(|| {
+        if item.str("creationSource") == Some("server") {
+            Attribution::T3Code
+        } else {
+            Attribution::Agent { sender_thread: item.str("senderThreadId").map(|t| t.to_owned().into()) }
+        }
+    });
+    (text.to_owned(), attribution)
+}
+
+/// `resolveUserMessagePresentation`'s "t3code" attribution: T3 Code itself sent it.
+pub fn sent_by_t3code(item: &TurnItem) -> bool {
+    user_message_presentation(item).1 == Some(Attribution::T3Code)
 }
 
 /// `isCompactionCommandMessage`.
