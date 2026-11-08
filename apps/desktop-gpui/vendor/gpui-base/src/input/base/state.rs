@@ -4273,6 +4273,18 @@ impl<M: InputModeKind> InputBaseState<M> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.replace_text_in_ranges_selecting(edits, None, window, cx);
+    }
+
+    /// [`Self::replace_text_in_ranges`], then `select` (a UTF-8 byte range in the
+    /// edited text) replaces the per-edit cursors, and redo restores it.
+    pub(crate) fn replace_text_in_ranges_selecting(
+        &mut self,
+        edits: &[(Range<usize>, String)],
+        select: Option<Range<usize>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.is_editable() || edits.is_empty() {
             return;
         }
@@ -4462,6 +4474,9 @@ impl<M: InputModeKind> InputBaseState<M> {
         }
         self.selections.replace_all(new_selections);
         self.selections.merge_overlapping();
+        if let Some(select) = select {
+            self.set_selected_range(select, cx);
+        }
 
         // Record the cursor snapshots for undo/redo restore.
         let selections_after: Vec<CursorSelection> = self.selections.iter().copied().collect();
@@ -12002,6 +12017,47 @@ mod tests {
             });
         });
         assert_cursors(&mut cx, &input, "a|1\na|2\na|3");
+    }
+
+    /// A batch that picks its own final selection keeps that one cursor on redo.
+    #[gpui::test]
+    fn test_replace_ranges_redo_restores_chosen_selection(cx: &mut TestAppContext) {
+        let view = multi_line(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("1. a
+2. b
+3. c", window, cx);
+                state.set_selected_range(4..4, cx);
+                let edits = [
+                    (4..4, "
+2. ".to_string()),
+                    (5..6, "3".to_string()),
+                    (10..11, "4".to_string()),
+                ];
+                state.replace_ranges(&edits, 8..8, window, cx);
+                assert_eq!(state.value(), "1. a
+2. 
+3. b
+4. c");
+                assert_eq!(state.selections.iter().count(), 1);
+
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "1. a
+2. b
+3. c");
+                state.redo(&Redo, window, cx);
+                assert_eq!(state.value(), "1. a
+2. 
+3. b
+4. c");
+                assert_eq!(state.selections.iter().count(), 1);
+                assert_eq!(state.selected_range(), 8..8);
+            });
+        });
     }
 
     #[gpui::test]
