@@ -3026,7 +3026,7 @@ mod tests {
     #[test]
     fn showing_the_diff_reads_it_again_only_after_the_floor() {
         let now = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        let read = |ago: u64| Some(now - std::time::Duration::from_secs(ago));
+        let read = |ago: u64| now.checked_sub(std::time::Duration::from_secs(ago));
         assert!(should_revalidate(read(11), false, now));
         assert!(should_revalidate(read(10), false, now));
         assert!(!should_revalidate(read(3), false, now), "a mutation's refetch counts as the revalidation");
