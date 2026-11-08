@@ -15,7 +15,7 @@ use gpui_kit::component::popover::Popover;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Disableable as _, Icon, Selectable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    Anchor, AnyElement, AppContext as _, Context, ElementId, Entity, Focusable as _, FontWeight, Hsla,
+    Anchor, AnyElement, AppContext as _, Context, ElementId, Entity, FocusHandle, Focusable as _, FontWeight, Hsla,
     InteractiveElement as _, IntoElement, Keystroke, ParentElement as _, SharedString, StatefulInteractiveElement as _,
     Styled as _, Subscription, Window, div, prelude::FluentBuilder as _, px, svg,
 };
@@ -140,6 +140,9 @@ pub(super) struct PickerState {
     query: String,
     /// `autoHighlight`: nothing until a filter or the arrows highlight a row.
     highlighted: Option<usize>,
+    /// The effort column's focused stop (`effort_stops`); `None` while the search has the keys.
+    effort_focus: Option<usize>,
+    effort_handle: Option<FocusHandle>,
     show_legacy: bool,
     /// Options last picked per `(instance, model)`, restored when switching back.
     remembered: HashMap<(String, String), Vec<Value>>,
@@ -193,7 +196,10 @@ impl Workspace {
                             this.picker.query = search.read(cx).value().trim().to_owned();
                             this.picker.highlighted = (!this.picker.query.is_empty()).then_some(0);
                         }
-                        InputEvent::Focus => this.picker.search_focused = true,
+                        InputEvent::Focus => {
+                            this.picker.search_focused = true;
+                            this.picker.effort_focus = None;
+                        }
                         InputEvent::Blur => this.picker.search_focused = false,
                         InputEvent::PressEnter { .. } => return,
                     }
@@ -209,6 +215,8 @@ impl Workspace {
         });
         self.picker.query.clear();
         self.picker.highlighted = None;
+        self.picker.effort_focus = None;
+        self.picker.effort_handle.get_or_insert_with(|| cx.focus_handle());
         self.picker.tab = None;
         // Focused above before it renders, which its own focus event can miss.
         self.picker.search_focused = true;
@@ -221,6 +229,7 @@ impl Workspace {
         let Some(id) = self.picker.open.take() else { return };
         self.picker.host = None;
         self.picker.search_focused = false;
+        self.picker.effort_focus = None;
         if id.as_ref() == COMPOSER {
             self.focus_composer(window, cx);
         }
@@ -272,10 +281,14 @@ impl Workspace {
         ProviderLock::of(self.open_projection()?, &self.server_info().providers)
     }
 
-    /// The docked picker keeps its popup open; any other closes and hands the model to its host.
+    /// The docked picker keeps its popup open and moves to the new model's levels; any other
+    /// closes and hands the model to its host.
     fn pick_row(&mut self, selection: ModelSelection, window: &mut Window, cx: &mut Context<Self>) {
         match self.picker.host.as_ref().map(|host| host.on_pick.clone()) {
-            None => self.pick_model(selection, cx),
+            None => {
+                self.pick_model(selection, cx);
+                self.focus_effort(false, window, cx);
+            }
             Some(on_pick) => {
                 self.close_model_picker(window, cx);
                 on_pick(self, selection, window, cx);
@@ -291,6 +304,85 @@ impl Workspace {
         self.sticky_model.clone_from(&self.model_override);
         self.refresh_menu_items(cx);
         cx.notify();
+    }
+
+    /// The composer model's effort-column stops.
+    fn picker_effort_stops(&self) -> Vec<EffortStop> {
+        let Some(current) = self.composer_model() else { return Vec::new() };
+        let descriptors = self
+            .server_info()
+            .model(&current)
+            .and_then(|m| m.capabilities.as_ref())
+            .map(|c| c.option_descriptors.as_slice())
+            .unwrap_or_default();
+        let controls = effort_controls(descriptors, self.picker_driver(Some(&current)), self.composer_ultrathink);
+        effort_stops(&controls, &current)
+    }
+
+    /// `focusEffort`: hands the keys to the effort column; `false` when it has nowhere to land.
+    fn focus_effort(&mut self, any: bool, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(index) = effort_entry(&self.picker_effort_stops(), any) else { return false };
+        self.picker.effort_focus = Some(index);
+        if let Some(handle) = &self.picker.effort_handle {
+            handle.focus(window, cx);
+        }
+        cx.notify();
+        true
+    }
+
+    /// `ArrowLeft` out of the effort column: back to the search.
+    fn focus_picker_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker.effort_focus = None;
+        if let Some(search) = self.picker.search.clone() {
+            search.update(cx, |search, cx| search.focus(window, cx));
+        }
+        cx.notify();
+    }
+
+    /// Picks a level; one replaces the prompt's `Ultrathink:` (`getTraitSelectChange`).
+    fn pick_effort_stop(&mut self, stop: EffortStop, window: &mut Window, cx: &mut Context<Self>) {
+        match stop {
+            EffortStop::Level { id, value, owned, .. } => {
+                if owned {
+                    self.strip_ultrathink_prefix(window, cx);
+                }
+                self.set_model_option(&id, value, cx);
+            }
+            EffortStop::Toggle { id, on } => self.set_model_option(&id, Value::Bool(!on), cx),
+        }
+    }
+
+    /// Keys while the effort column has focus: Up and Down move, Enter and Space pick, Left leaves.
+    fn effort_key(&mut self, index: usize, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let stops = self.picker_effort_stops();
+        let Some(last) = stops.len().checked_sub(1) else {
+            self.focus_picker_search(window, cx);
+            return keystroke.key == "left";
+        };
+        let index = index.min(last);
+        match keystroke.key.as_str() {
+            "escape" => self.close_model_picker(window, cx),
+            "down" => self.picker.effort_focus = Some((index + 1).min(last)),
+            "up" => self.picker.effort_focus = Some(index.saturating_sub(1)),
+            "left" => self.focus_picker_search(window, cx),
+            "enter" | "space" => {
+                if let Some(stop) = stops.into_iter().nth(index) {
+                    self.pick_effort_stop(stop, window, cx);
+                }
+            }
+            _ => return false,
+        }
+        cx.notify();
+        true
+    }
+
+    /// The search's caret sits after its last character, where `ArrowRight` leaves for the column.
+    fn picker_search_caret_at_end(&self, cx: &Context<Self>) -> bool {
+        self.picker.search.as_ref().is_some_and(|search| {
+            let search = search.read(cx);
+            let range = search.selected_range();
+            range.is_empty() && range.start == search.value().len()
+        })
     }
 
     fn set_model_option(&mut self, id: &str, value: Value, cx: &mut Context<Self>) {
@@ -427,10 +519,14 @@ impl Workspace {
         }
     }
 
-    /// Up/Down/Enter/Escape while the picker is open; Ctrl+1-9 are `modelPicker.jump.N`.
+    /// Up/Down/Enter/Escape while the picker is open, Right into the docked effort column;
+    /// Ctrl+1-9 are `modelPicker.jump.N`.
     pub(super) fn picker_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if keystroke.modifiers.modified() {
             return false;
+        }
+        if let Some(index) = self.picker.effort_focus {
+            return self.effort_key(index, keystroke, window, cx);
         }
         let current = self.picker_current();
         let (rows, _) = self.picker_rows(current.as_ref());
@@ -449,6 +545,16 @@ impl Workspace {
             "enter" => {
                 if let Some(row) = self.picker.highlighted.and_then(|i| rows.into_iter().nth(i)) {
                     self.pick_row(row.selection, window, cx);
+                }
+            }
+            // The column shows the selected model's levels, so a highlighted model is picked first.
+            "right" if self.picker.host.is_none() && self.picker_search_caret_at_end(cx) => {
+                let highlighted = self.picker.highlighted.and_then(|i| rows.into_iter().nth(i));
+                match highlighted.filter(|row| !row.selected) {
+                    Some(row) => self.pick_row(row.selection, window, cx),
+                    None => {
+                        self.focus_effort(true, window, cx);
+                    }
                 }
             }
             _ => return false,
@@ -1064,43 +1170,24 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let rule = t.foreground.opacity(0.056);
-        let speed = model_label::speed_select(descriptors, self.picker_driver(current));
-        let effort = model_label::reasoning(descriptors).filter(|d| d.id != "fastMode");
-        let others: Vec<&OptionDescriptor> = descriptors
-            .iter()
-            .filter(|d| {
-                Some(d.id.as_str()) != effort.map(|e| e.id.as_str())
-                    && Some(d.id.as_str()) != speed.map(|s| s.id.as_str())
-                    && !matches!(d.id.as_str(), "fastMode" | "ultracode")
-            })
-            .collect();
+        let EffortControls { effort, others, owned, locked } =
+            effort_controls(descriptors, self.picker_driver(current), self.composer_ultrathink);
+        let focus = self.picker.effort_focus;
+        let focused_bg = t.foreground.opacity(0.09);
+        // Stops count the levels first, then the switches (`effort_stops`).
+        let mut next_stop = 0;
         let heading = match (effort, others.is_empty()) {
             (Some(effort), _) => effort.label.clone(),
             (None, false) => "Options".into(),
             (None, true) => "Effort".into(),
         };
-        // An Ultrathink prompt owns the levels; one in the text locks them until it goes.
-        let ultrathink = self.composer_ultrathink;
-        let owned = model_label::ultrathink_select(descriptors, ultrathink)
-            .is_some_and(|primary| effort.is_some_and(|effort| effort.id == primary.id));
-        let locked = owned && ultrathink == model_label::Ultrathink::Body;
         let rows: Vec<AnyElement> = match (effort, current) {
             (Some(descriptor), Some(selection)) => {
-                let value = if owned {
-                    Some(Value::String("ultrathink".into()))
-                } else {
-                    model_label::current_value(descriptor, selection)
-                };
-                let choices: Vec<(Value, String, bool)> = if descriptor.kind == "boolean" {
-                    vec![(Value::Bool(true), "On".into(), false), (Value::Bool(false), "Off".into(), false)]
-                } else {
-                    descriptor
-                        .options
-                        .iter()
-                        .filter(|o| !descriptor.prompt_injected_values.contains(&o.id))
-                        .map(|o| (Value::String(o.id.clone()), o.label.clone(), o.is_default))
-                        .collect()
-                };
+                let value = level_value(descriptor, selection, owned);
+                let choices = level_choices(descriptor);
+                if !locked {
+                    next_stop = choices.len();
+                }
                 let note = locked.then(|| {
                     div()
                         .px(px(8.))
@@ -1111,10 +1198,11 @@ impl Workspace {
                         .into_any_element()
                 });
                 note.into_iter()
-                    .chain(choices.into_iter().map(|(choice, label, default)| {
+                    .chain(choices.into_iter().enumerate().map(|(index, (choice, label, default))| {
                         let selected = value.as_ref() == Some(&choice);
                         let id = descriptor.id.clone();
                         option_row(ElementId::Name(format!("effort-{id}-{label}").into()), t)
+                            .when(!locked && focus == Some(index), |el| el.bg(focused_bg))
                             .child(div().flex_1().min_w_0().truncate().child(label))
                             .when(selected, |el| el.child(Icon::new(Lucide::Check).with_size(px(14.))))
                             .when(!selected && default, |el| {
@@ -1125,11 +1213,9 @@ impl Workspace {
                                     return el.opacity(0.64).cursor_not_allowed();
                                 }
                                 el.on_click(cx.listener(move |this, _, window, cx| {
-                                    // `getTraitSelectChange`: a level replaces the prompt's `Ultrathink:`.
-                                    if owned {
-                                        this.strip_ultrathink_prefix(window, cx);
-                                    }
-                                    this.set_model_option(&id, choice.clone(), cx);
+                                    let stop =
+                                        EffortStop::Level { id: id.clone(), value: choice.clone(), selected, owned };
+                                    this.pick_effort_stop(stop, window, cx);
                                 }))
                             })
                             .into_any_element()
@@ -1160,12 +1246,15 @@ impl Workspace {
                     let caption = div().text_xs().text_color(t.muted_foreground).child(descriptor.label.clone());
                     if descriptor.kind == "boolean" {
                         let on = value == Some(Value::Bool(true));
+                        let stop = next_stop;
+                        next_stop += 1;
                         v_flex()
                             .id(ElementId::Name(format!("option-{id}").into()))
                             .py(px(4.))
                             .px(px(8.))
                             .rounded(px(4.))
                             .cursor_pointer()
+                            .when(focus == Some(stop), |el| el.bg(focused_bg))
                             .hover(|s| s.bg(t.foreground.opacity(0.09)))
                             .child(caption)
                             .child(
@@ -1230,6 +1319,7 @@ impl Workspace {
             .w(px(EFFORT))
             .h_full()
             .flex_none()
+            .when_some(self.picker.effort_handle.as_ref(), gpui_kit::InteractiveElement::track_focus)
             .border_l_1()
             .border_color(rule)
             .bg(t.foreground.opacity(0.012))
@@ -1411,6 +1501,89 @@ fn offers_setup(provider: &Provider) -> bool {
             || provider.models.iter().all(|m| m.is_unavailable))
 }
 
+/// One keyboard stop of the effort column (`[data-effort-row]:not(:disabled)`). An option's
+/// menu row is left out: its menu opens by pointer only.
+#[derive(Clone, Debug, PartialEq)]
+enum EffortStop {
+    /// A level (`[data-effort-level]`); `owned` while an `Ultrathink:` prefix holds the levels.
+    Level { id: String, value: Value, selected: bool, owned: bool },
+    /// An option's switch.
+    Toggle { id: String, on: bool },
+}
+
+/// `columnControls`: the reasoning control, the other options, and an Ultrathink prompt's hold.
+struct EffortControls<'a> {
+    effort: Option<&'a OptionDescriptor>,
+    others: Vec<&'a OptionDescriptor>,
+    /// An Ultrathink prompt owns the levels.
+    owned: bool,
+    /// One in the text locks them until it goes.
+    locked: bool,
+}
+
+fn effort_controls<'a>(
+    descriptors: &'a [OptionDescriptor],
+    driver: &str,
+    ultrathink: model_label::Ultrathink,
+) -> EffortControls<'a> {
+    let speed = model_label::speed_select(descriptors, driver);
+    let effort = model_label::reasoning(descriptors).filter(|d| d.id != "fastMode");
+    let others = descriptors
+        .iter()
+        .filter(|d| {
+            Some(d.id.as_str()) != effort.map(|e| e.id.as_str())
+                && Some(d.id.as_str()) != speed.map(|s| s.id.as_str())
+                && !matches!(d.id.as_str(), "fastMode" | "ultracode")
+        })
+        .collect();
+    let owned = model_label::ultrathink_select(descriptors, ultrathink)
+        .is_some_and(|primary| effort.is_some_and(|effort| effort.id == primary.id));
+    EffortControls { effort, others, owned, locked: owned && ultrathink == model_label::Ultrathink::Body }
+}
+
+/// A level control's choices: value, label, and whether it is the default.
+fn level_choices(descriptor: &OptionDescriptor) -> Vec<(Value, String, bool)> {
+    if descriptor.kind == "boolean" {
+        return vec![(Value::Bool(true), "On".into(), false), (Value::Bool(false), "Off".into(), false)];
+    }
+    descriptor
+        .options
+        .iter()
+        .filter(|o| !descriptor.prompt_injected_values.contains(&o.id))
+        .map(|o| (Value::String(o.id.clone()), o.label.clone(), o.is_default))
+        .collect()
+}
+
+fn level_value(descriptor: &OptionDescriptor, selection: &ModelSelection, owned: bool) -> Option<Value> {
+    if owned { Some(Value::String("ultrathink".into())) } else { model_label::current_value(descriptor, selection) }
+}
+
+/// The column's stops in order: its levels (none while locked), then the switches among its options.
+fn effort_stops(controls: &EffortControls, selection: &ModelSelection) -> Vec<EffortStop> {
+    let levels = controls.effort.filter(|_| !controls.locked).into_iter().flat_map(|descriptor| {
+        let value = level_value(descriptor, selection, controls.owned);
+        level_choices(descriptor).into_iter().map(move |(choice, _, _)| EffortStop::Level {
+            id: descriptor.id.clone(),
+            selected: value.as_ref() == Some(&choice),
+            value: choice,
+            owned: controls.owned,
+        })
+    });
+    let toggles = controls.others.iter().filter(|d| d.kind == "boolean").map(|descriptor| EffortStop::Toggle {
+        id: descriptor.id.clone(),
+        on: model_label::current_value(descriptor, selection) == Some(Value::Bool(true)),
+    });
+    levels.chain(toggles).collect()
+}
+
+/// `focusEffort`: the selected level, else the first level; with `any`, else the first stop.
+fn effort_entry(stops: &[EffortStop], any: bool) -> Option<usize> {
+    let level = |selected_only: bool| {
+        stops.iter().position(|stop| matches!(stop, EffortStop::Level { selected, .. } if *selected || !selected_only))
+    };
+    level(true).or_else(|| level(false)).or_else(|| (any && !stops.is_empty()).then_some(0))
+}
+
 fn option_row(id: ElementId, t: &Tokens) -> gpui_kit::Stateful<gpui_kit::Div> {
     h_flex()
         .id(id)
@@ -1524,6 +1697,29 @@ mod tests {
         assert!(offers_setup(&provider(json!({"models": [{"slug": "m", "isUnavailable": true}]}))));
         assert!(!offers_setup(&provider(json!({"status": "error", "setup": null}))), "nothing to set up");
         assert!(!offers_setup(&provider(json!({"enabled": false, "status": "error"}))));
+    }
+
+    #[test]
+    fn the_effort_column_focuses_the_selected_level_then_the_first_stop() {
+        let descriptors: Vec<OptionDescriptor> = serde_json::from_value(json!([
+            {"id": "effort", "label": "Effort", "type": "select", "options": [
+                {"id": "low", "label": "Low"}, {"id": "high", "label": "High", "isDefault": true}]},
+            {"id": "plan", "label": "Plan", "type": "boolean", "currentValue": true},
+            {"id": "mode", "label": "Mode", "type": "select", "options": [{"id": "a", "label": "A"}]},
+        ]))
+        .unwrap();
+        let selection = ModelSelection { instance_id: "c".into(), model: "m".into(), options: None };
+        let stops = |descriptors: &[OptionDescriptor]| {
+            effort_stops(&effort_controls(descriptors, "claudeAgent", model_label::Ultrathink::None), &selection)
+        };
+        let all = stops(&descriptors);
+        assert_eq!(all.len(), 3, "two levels and the switch; the menu row opens by pointer");
+        assert_eq!(all[2], EffortStop::Toggle { id: "plan".into(), on: true });
+        assert_eq!(effort_entry(&all, false), Some(1), "the default level shows as selected");
+        let switches = stops(&descriptors[1..]);
+        assert_eq!(effort_entry(&switches, false), None, "a pick lands only on levels");
+        assert_eq!(effort_entry(&switches, true), Some(0), "ArrowRight takes any stop");
+        assert_eq!(effort_entry(&[], true), None);
     }
 
     #[test]
