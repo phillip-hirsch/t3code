@@ -73,6 +73,11 @@ impl Workspace {
         cx.notify();
     }
 
+    /// The Pull requests page's panel is on screen.
+    pub(in crate::app) fn pull_requests_panel_shown(&self) -> bool {
+        self.pull_requests.panel.is_some() && !self.pull_requests.panel_hidden
+    }
+
     /// The Pull requests page's panel shortcuts (`PullRequestsPage`'s keydown listener). Returns
     /// whether the key was claimed; a held key is claimed without acting.
     pub(in crate::app) fn pull_requests_page_command(
@@ -313,6 +318,7 @@ impl Workspace {
         let maximized = self.pull_requests.panel_maximized;
         v_flex()
             .id("pr-panel")
+            .track_focus(&self.areas.panel)
             .relative()
             .map(|panel| if maximized { panel.flex_1().min_w_0() } else { panel.flex_none().w(px(width)) })
             .h_full()

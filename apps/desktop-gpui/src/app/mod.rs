@@ -281,6 +281,8 @@ pub struct Workspace {
     files: files::FilesState,
     /// Holds focus when nothing inside does, so window shortcuts still reach the workspace.
     focus: gpui_kit::FocusHandle,
+    /// The F6 stops that are regions rather than controls.
+    areas: commands::WorkspaceAreas,
     /// Settings > Scheduled tasks, kept while the window lives; it unsubscribes while hidden.
     scheduled_tasks_view: Option<gpui_kit::AnyView>,
     preview: preview::PreviewState,
@@ -454,6 +456,7 @@ impl Workspace {
             find: None,
             files: files::FilesState::default(),
             focus: cx.focus_handle(),
+            areas: commands::WorkspaceAreas::new(cx),
             scheduled_tasks_view: None,
             preview: preview::PreviewState::new(window, cx),
             t3_project_files: HashMap::new(),

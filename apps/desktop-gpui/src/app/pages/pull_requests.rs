@@ -606,6 +606,7 @@ impl Workspace {
             self.render_pull_request_list(&tokens, cx)
         };
         let column = v_flex()
+            .track_focus(&self.areas.content)
             .flex_1()
             .min_w_0()
             .h_full()

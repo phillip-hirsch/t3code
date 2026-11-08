@@ -258,6 +258,7 @@ impl Workspace {
         });
         let card = v_flex()
             .id("thread-details")
+            .track_focus(&self.areas.details)
             .w_full()
             .overflow_y_scroll()
             .occlude()
