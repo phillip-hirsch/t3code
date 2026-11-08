@@ -24,7 +24,10 @@ impl Workspace {
         if keymap::focus_in(&event.context_stack, CAPTURE_CONTEXT) || self.recording_shortcut(cx) {
             return false;
         }
-        if self.composer_menu_key(keystroke, window, cx) || self.pr_completion_key(keystroke, window, cx) {
+        if self.composer_menu_key(keystroke, window, cx)
+            || self.pr_completion_key(keystroke, window, cx)
+            || self.palette_tab(keystroke, window, cx)
+        {
             return true;
         }
         let held = self.held_key.as_ref() == Some(keystroke);
@@ -62,6 +65,10 @@ impl Workspace {
     ) -> bool {
         let chat = self.page.is_none() && self.settings.is_none();
         let palette_open = self.palette.is_some();
+        // `useChatShortcuts` stands down while the palette is open (`isCommandPaletteOpen`).
+        if palette_open && is_chat_shortcut(command) {
+            return false;
+        }
         if let Some(index) = keymap::jump_index(command, "modelPicker") {
             return self.model_picker_jump(index, window, cx);
         }
@@ -303,6 +310,42 @@ impl Workspace {
     }
 }
 
+/// The commands `useChatShortcuts` runs for the open chat (its terminal, right panel, thread
+/// lifecycle and composer groups, and project scripts), besides `chat.find`, which the palette
+/// takes over.
+fn is_chat_shortcut(command: &str) -> bool {
+    keymap::script_id(command).is_some()
+        || matches!(
+            command,
+            "terminal.toggle"
+                | "terminal.split"
+                | "terminal.splitVertical"
+                | "terminal.close"
+                | "terminal.new"
+                | "rightPanel.toggle"
+                | "rightPanel.toggleMaximized"
+                | "rightPanel.close"
+                | "threadPanel.toggle"
+                | "diff.toggle"
+                | "thread.settle"
+                | "thread.pin"
+                | "thread.copyReference"
+                | "thread.stop"
+                | "thread.steerQueuedMessage"
+                | "thread.editQueuedMessage"
+                | "composer.cycleHost"
+                | "modelPicker.toggle"
+                | "composer.increaseEffort"
+                | "composer.decreaseEffort"
+                | "composer.host"
+                | "composer.effort"
+                | "composer.mode"
+                | "composer.workspace"
+                | "composer.branch"
+                | "composer.previousWorktree"
+        )
+}
+
 /// A stop of the F6 cycle (`workspaceAreaProps` orders), skipping details, which take no focus here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Area {
@@ -401,6 +444,15 @@ mod tests {
             "a hidden area counts as outside"
         );
         assert_eq!(next_area(&[], None, true), None);
+    }
+
+    #[test]
+    fn the_palette_suspends_the_chat_shortcuts_but_not_the_app_ones() {
+        assert!(is_chat_shortcut("thread.settle") && is_chat_shortcut("terminal.toggle"));
+        assert!(is_chat_shortcut("modelPicker.toggle") && is_chat_shortcut("script.build.run"));
+        assert!(!is_chat_shortcut("chat.find"), "the palette runs find itself");
+        assert!(!is_chat_shortcut("sidebar.toggle") && !is_chat_shortcut("commandPalette.toggle"));
+        assert!(!is_chat_shortcut("chat.new"), "the palette runs its own new-thread rows");
     }
 
     #[test]

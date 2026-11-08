@@ -12,16 +12,19 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use gpui_kit::assets::IconName;
+use gpui_kit::base::FocusTrapElement as _;
+use gpui_kit::component::button::Button;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::{Icon, h_flex, v_flex};
+use gpui_kit::component::{Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, AppContext as _, ClickEvent, Context, Entity, FontWeight, InteractiveElement as _, IntoElement,
-    KeyDownEvent, ParentElement as _, PathPromptOptions, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Subscription, Task, Window, div, prelude::FluentBuilder as _, px,
+    AnyElement, AppContext as _, ClickEvent, Context, Entity, FocusHandle, FontWeight, InteractiveElement as _,
+    IntoElement, KeyDownEvent, Keystroke, ParentElement as _, PathPromptOptions, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, div, prelude::FluentBuilder as _, px,
 };
 use serde_json::{Value, json};
 
+use super::keymap;
 use super::pages::Page;
 use super::palette_actions::github_repository;
 use super::{Target, Workspace, new_id, project_name};
@@ -83,7 +86,10 @@ pub(super) struct MessageSearch {
 pub(super) enum View {
     Root,
     NewThreadIn,
+    /// "Add project" (`addProjectEntryGroups`): the machines to add on, or one machine's sources.
     AddProject,
+    /// The sources of [`Palette::add_environment`].
+    AddProjectSources,
     Browse,
     /// "Change theme" (`theme.select`).
     Themes,
@@ -98,7 +104,14 @@ enum Run {
     Thread(String),
     /// A thread on this environment, which the shell may not list (an archived linked thread).
     ThreadIn(SharedString, String),
-    Project(String),
+    /// A project group's members and the checkout to start a thread in when none has one.
+    Project(Vec<String>, String),
+    /// "Add project" (`openAddProjectFlow`).
+    AddProject,
+    /// An environment's sources (`startAddProjectSourceSelection`).
+    AddProjectIn(SharedString),
+    /// "Local folder": browse a folder on this environment (`startAddProjectBrowse`).
+    BrowseIn(SharedString),
     Settings(&'static str),
     /// One setting: its section, scrolled to its row.
     Setting(&'static crate::settings::SearchItem),
@@ -164,6 +177,8 @@ struct Row {
     description: Option<Description>,
     time: Option<String>,
     shortcut: Option<SharedString>,
+    /// The command `shortcut` shows (`shortcutCommand`), which runs this row inside the palette.
+    command: Option<SharedString>,
     chevron: bool,
     /// `ProjectPinButton`: the group's project ids and whether it is pinned.
     pin: Option<(Vec<String>, bool)>,
@@ -190,6 +205,7 @@ impl Row {
             description: None,
             time: None,
             shortcut: None,
+            command: None,
             chevron: false,
             pin: None,
             run,
@@ -240,6 +256,10 @@ pub(super) struct Palette {
     /// a pin from a row must not move rows under the pointer or the jump numbers.
     project_order: RefCell<Option<Vec<String>>>,
     new_thread_order: RefCell<Option<Vec<String>>>,
+    /// The environment "Add project" adds on (`addProjectEnvironmentId`), once one is picked.
+    add_environment: Option<SharedString>,
+    /// Tab stays inside the palette while it is open (the web's modal dialog).
+    trap: FocusHandle,
     _subscription: Subscription,
 }
 
@@ -418,15 +438,6 @@ pub(super) fn project_title_from_path(path: &str) -> String {
     path.split(['/', '\\']).rfind(|s| !s.is_empty()).unwrap_or(path).to_owned()
 }
 
-/// Paths compare without a trailing separator and, for drive paths, without case.
-pub(super) fn same_path(a: &str, b: &str) -> bool {
-    let norm = |p: &str| {
-        let p = p.trim_end_matches(['/', '\\']).replace('\\', "/");
-        if p.as_bytes().get(1) == Some(&b':') { p.to_lowercase() } else { p }
-    };
-    norm(a) == norm(b)
-}
-
 /// `filterFilesystemBrowseEntries`: prefix match on the leaf; dot folders only for a dot leaf.
 pub(super) fn filter_entries<'a>(entries: &'a [(String, String)], leaf: &str) -> Vec<&'a (String, String)> {
     let lower = leaf.to_lowercase();
@@ -466,6 +477,8 @@ impl Workspace {
             linked: None,
             project_order: RefCell::default(),
             new_thread_order: RefCell::default(),
+            add_environment: None,
+            trap: cx.focus_handle(),
             _subscription: subscription,
         });
         self.palette_query_changed(window, cx);
@@ -525,24 +538,112 @@ impl Workspace {
     /// Pushes a submenu; its query starts empty, or at the base folder when browsing.
     fn push_palette_view(&mut self, view: View, window: &mut Window, cx: &mut Context<Self>) {
         let query = self.palette_query(cx);
-        let Some(palette) = &mut self.palette else { return };
-        palette.stack.push((palette.view, query));
-        palette.view = view;
-        palette.highlight = None;
         let start = match view {
+            // `getAddProjectInitialQueryForEnvironment`: the browse environment's base folder.
             View::Browse => {
-                let base = self
-                    .server_info()
-                    .settings
-                    .get("addProjectBaseDirectory")
-                    .as_str()
+                let environment = self.browse_environment();
+                let info = environment.as_deref().and_then(|environment| self.env_info(environment));
+                let base = info
+                    .and_then(|info| info.settings.get("addProjectBaseDirectory").as_str())
                     .unwrap_or_default()
+                    .trim()
                     .trim_end_matches(['/', '\\']);
                 if base.is_empty() { "~/".to_owned() } else { format!("{base}/") }
             }
             _ => String::new(),
         };
+        let Some(palette) = &mut self.palette else { return };
+        palette.stack.push((palette.view, query));
+        palette.view = view;
+        palette.highlight = None;
         self.set_palette_query(&start, window, cx);
+    }
+
+    /// The environment the add-project flow browses and adds on: the one picked, else the first
+    /// that can add projects (`browseEnvironmentId`).
+    fn browse_environment(&self) -> Option<SharedString> {
+        let picked = self.palette.as_ref().and_then(|palette| palette.add_environment.clone());
+        picked.or_else(|| self.add_project_environments().into_iter().next().map(|option| option.id))
+    }
+
+    /// The open project's folder when it lives on the browse environment, which relative paths
+    /// start from (`currentProjectCwdForBrowse`).
+    fn browse_cwd(&self) -> Option<String> {
+        let environment = self.browse_environment()?;
+        let project = self.current_project().filter(|project| project.environment_id == environment)?;
+        Some(project.workspace_root.clone())
+    }
+
+    /// `relativePathNeedsActiveProject`.
+    fn relative_needs_project(&self, query: &str) -> bool {
+        is_explicit_relative(query.trim()) && self.browse_cwd().is_none()
+    }
+
+    /// `addProjectEnvironmentOptions`: the connected environments, this device's first, then by name.
+    fn add_project_environments(&self) -> Vec<AddEnvironment> {
+        let primary = self.primary_environment();
+        let mut options: Vec<AddEnvironment> = self
+            .sessions()
+            .iter()
+            .filter(|session| session.is_connected())
+            .filter_map(|session| {
+                let id = session.id.clone()?;
+                let is_primary = primary == Some(&id);
+                let info = &session.server_info;
+                Some(AddEnvironment {
+                    label: environment_option_label(is_primary, &id, info.environment_label.as_deref()),
+                    machine: super::host_picker::machine_icon(info.machine_kind()),
+                    primary: is_primary,
+                    id,
+                })
+            })
+            .collect();
+        options.sort_by_cached_key(|option| (!option.primary, option.label.to_lowercase()));
+        options
+    }
+
+    fn add_project_entry(&self) -> AddProjectEntry {
+        let ids: Vec<SharedString> = self.add_project_environments().into_iter().map(|option| option.id).collect();
+        add_project_entry(&ids)
+    }
+
+    /// `addProjectEnvironmentItems`: each environment, opening its sources.
+    fn add_project_environment_rows(&self) -> Vec<Row> {
+        self.add_project_environments()
+            .into_iter()
+            .map(|option| {
+                let key = format!("add-project-environment:{}", option.id);
+                let run = Run::AddProjectIn(option.id.clone());
+                let mut row = Row::new(key, RowIcon::Lucide(option.machine), option.label.clone(), run);
+                let description = if option.primary { "This device".into() } else { option.id.clone() };
+                row.description = Some(Description::Text(description));
+                row.data_terms = vec![option.label.into(), option.id];
+                if option.primary {
+                    row.terms = &["this device"];
+                }
+                row
+            })
+            .collect()
+    }
+
+    /// `openAddProjectFlow`: no environment opens Connections, several ask which, one shows its sources.
+    fn start_add_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.add_project_entry() {
+            AddProjectEntry::Connect => {
+                self.close_palette(window, cx);
+                self.open_settings("connections", cx);
+            }
+            AddProjectEntry::Choose => self.push_palette_view(View::AddProject, window, cx),
+            AddProjectEntry::Sources(environment) => self.open_add_project_sources(environment, window, cx),
+        }
+    }
+
+    /// `startAddProjectSourceSelection`.
+    fn open_add_project_sources(&mut self, environment: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(palette) = &mut self.palette {
+            palette.add_environment = Some(environment);
+        }
+        self.push_palette_view(View::AddProjectSources, window, cx);
     }
 
     fn pop_palette_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -577,7 +678,9 @@ impl Workspace {
         // After a keystroke no row paints until the arrows move (`CommandPalette.tsx`).
         palette.highlight = None;
         if browsing {
-            self.browse_folder(split_browse(&query).0.to_owned(), cx);
+            if !self.relative_needs_project(&query) {
+                self.browse_folder(split_browse(&query).0.to_owned(), cx);
+            }
         } else if palette.view == View::Root {
             let query = if actions_filter(&query).0 { String::new() } else { query };
             self.search_messages(query, |this| this.palette.as_mut().map(|p| &mut p.messages), cx);
@@ -587,8 +690,10 @@ impl Workspace {
 
     /// Lists `directory` through `filesystem.browse`, once per directory.
     fn browse_folder(&mut self, directory: String, cx: &mut Context<Self>) {
-        let cwd = self.current_project().map(|p| p.workspace_root.clone());
-        let Some(client) = self.client() else { return };
+        let cwd = self.browse_cwd();
+        let Some(client) = self.browse_environment().and_then(|environment| self.env_client(&environment)) else {
+            return;
+        };
         let Some(palette) = &mut self.palette else { return };
         if palette.browse.directory == directory && (palette.browse.loading || palette.browse.error.is_none()) {
             return;
@@ -703,29 +808,32 @@ impl Workspace {
     /// "New thread in...": each project group by its name, with "No project" among them.
     fn new_thread_rows(&self) -> Vec<Row> {
         let groups = self.project_groups();
-        let current = self.current_project().map(|p| p.id.clone());
-        let pickable = crate::project_groups::picker(&groups, current.as_deref());
+        let contextual = self.contextual_project();
+        let pickable = crate::project_groups::picker(&groups, contextual.map(|p| p.id.as_str()));
         let entries: Vec<NoProjectEntry> = pickable
             .iter()
             .map(|g| NoProjectEntry {
                 scratch: g.members[0].is_scratch,
                 pinned: g.pinned,
-                preferred: current.as_ref().is_some_and(|id| g.project_ids.contains(id)),
+                preferred: contextual.is_some_and(|p| g.contains(&p.id)),
             })
             .collect();
         let mut rows: Vec<(String, Row)> = pickable
             .iter()
             .filter(|g| !g.members[0].is_scratch)
             .map(|g| {
-                let p = g.representative();
-                let mut row = self.project_row(format!("new-in-{}", p.id), g, Run::NewThread(p.id.clone()));
+                let target = g.target_for(contextual);
+                // `runProject`: the contextual checkout when it is one of the group's, else the target.
+                let start = contextual.filter(|p| g.contains(&p.id)).unwrap_or(target);
+                let run = Run::NewThread(start.id.clone());
+                let mut row = self.project_row(format!("new-in-{}", target.id), g, target, run);
                 // `buildNewThreadInProjectItems`: every member's name and path, and the machine.
                 row.data_terms.extend(
                     g.members
                         .iter()
                         .flat_map(|m| [m.project.title.clone().into(), m.project.workspace_root.clone().into()]),
                 );
-                row.data_terms.push(self.location_label(&p.environment_id));
+                row.data_terms.push(self.location_label(&target.environment_id));
                 (g.key.clone(), row)
             })
             .collect();
@@ -737,7 +845,7 @@ impl Workspace {
                 Run::ScratchThread(environment),
             );
             row.terms = &["no project", "without project", "none"];
-            row.shortcut = self.shortcut("chat.newWithoutProject");
+            self.bind_shortcut(&mut row, "chat.newWithoutProject");
             rows.insert(no_project_index(&entries), (NO_PROJECT_KEY.to_owned(), row));
         }
         let Some(palette) = &self.palette else { return Vec::new() };
@@ -748,16 +856,29 @@ impl Workspace {
             .map(|(key, mut row)| {
                 if key != NO_PROJECT_KEY {
                     jump += 1;
-                    row.shortcut = (jump <= 9).then(|| self.shortcut(&format!("thread.jump.{jump}"))).flatten();
+                    if jump <= 9 {
+                        self.bind_shortcut(&mut row, &format!("thread.jump.{jump}"));
+                    }
                 }
                 row
             })
             .collect()
     }
 
-    /// `buildProjectActionItems`: a project group's row, matched by its names and path.
-    fn project_row(&self, key: String, group: &crate::project_groups::ProjectGroup, run: Run) -> Row {
-        let p = group.representative();
+    /// The row shows `command`'s shortcut, which runs it while the palette is open.
+    fn bind_shortcut(&self, row: &mut Row, command: &str) {
+        row.shortcut = self.shortcut(command);
+        row.command = Some(SharedString::from(command.to_owned()));
+    }
+
+    /// `resolveThreadActionProjectRef`: the open thread's or draft's project, else the most recent.
+    fn contextual_project(&self) -> Option<&ProjectShell> {
+        self.current_project().or_else(|| inbox::most_recent_project(&self.shell.projects, &self.shell.threads))
+    }
+
+    /// `buildProjectActionItems`: a project group's row at its `target` checkout, matched by its
+    /// names and path.
+    fn project_row(&self, key: String, group: &crate::project_groups::ProjectGroup, p: &ProjectShell, run: Run) -> Row {
         let mut row = Row::new(key, RowIcon::Project(p.id.clone()), group.display_name.clone(), run);
         let machine = self.location_machine(&p.environment_id);
         let location = self.location_label(&p.environment_id);
@@ -771,12 +892,13 @@ impl Workspace {
     /// every member's name, path and machine, and lists the machines it lives on.
     fn project_search_rows(&self) -> Vec<Row> {
         let groups = self.project_groups();
-        let current = self.current_project().map(|p| p.id.clone());
-        let rows = crate::project_groups::picker(&groups, current.as_deref())
+        let contextual = self.contextual_project();
+        let rows = crate::project_groups::picker(&groups, contextual.map(|p| p.id.as_str()))
             .into_iter()
             .map(|g| {
-                let p = g.representative();
-                let mut row = self.project_row(format!("project-{}", p.id), g, Run::Project(p.id.clone()));
+                let p = g.target_for(contextual);
+                let run = Run::Project(g.project_ids.clone(), p.id.clone());
+                let mut row = self.project_row(format!("project-{}", p.id), g, p, run);
                 let mut labels: Vec<SharedString> = Vec::new();
                 for member in &g.members {
                     let label = self.location_label(&member.project.environment_id);
@@ -807,8 +929,7 @@ impl Workspace {
     /// Actions in `CommandPalette.tsx` order.
     fn action_rows(&self) -> Vec<Row> {
         let mut rows = Vec::new();
-        let current =
-            self.current_project().or_else(|| inbox::most_recent_project(&self.shell.projects, &self.shell.threads));
+        let current = self.contextual_project();
         let lucide = |key: &'static str, icon: IconName, title: &'static str, run: Run| {
             Row::new(key, RowIcon::Lucide(icon), title, run)
         };
@@ -817,7 +938,7 @@ impl Workspace {
                 lucide("new-thread-here", IconName::SquarePen, "New thread in", Run::NewThread(project.id.clone()));
             row.strong = Some(self.group_name(project));
             row.terms = &["new thread", "chat", "create", "draft"];
-            row.shortcut = self.shortcut("chat.newLocal");
+            self.bind_shortcut(&mut row, "chat.newLocal");
             rows.push(row);
         }
         if !self.shell.projects.is_empty() {
@@ -835,7 +956,7 @@ impl Workspace {
                 Run::ScratchThread(environment),
             );
             row.terms = &["new thread", "no project", "without project", "none", "chat"];
-            row.shortcut = self.shortcut("chat.newWithoutProject");
+            self.bind_shortcut(&mut row, "chat.newWithoutProject");
             rows.push(row);
         }
         if self.server_info().capability("triage") {
@@ -924,9 +1045,7 @@ impl Workspace {
         row.terms = &["search project", "find in files", "grep", "content search", "text search"];
         row.shortcut = self.shortcut("projectSearch.toggle");
         rows.push(row);
-        let mut row = lucide("add-project", IconName::FolderPlus, "Add project", Run::Open(View::AddProject));
-        row.terms = &["add project", "folder", "directory", "browse", "environment"];
-        rows.push(row);
+        rows.push(add_project_row());
         let mut row = lucide("change-theme", IconName::Palette, "Change theme", Run::Open(View::Themes));
         row.chevron = true;
         row.terms = &["change theme", "appearance", "colors", "palette"];
@@ -1076,18 +1195,28 @@ impl Workspace {
         // A `>` query matches no submenu row, so it searches the root's actions.
         let scope = |rows| if actions_only { Vec::new() } else { rank_rows(rows, &tokens) };
         let scoped = match palette.view {
-            View::NewThreadIn => vec![Group { label: "Projects", rows: scope(self.new_thread_rows()) }],
+            View::NewThreadIn => {
+                let mut rows = self.new_thread_rows();
+                // Every project archived and no "No project" home leaves only adding one.
+                if rows.is_empty() {
+                    rows.push(add_project_row());
+                }
+                vec![Group { label: "Projects", rows: scope(rows) }]
+            }
             View::Themes => vec![Group { label: "Change theme", rows: scope(self.theme_rows(palette.dark)) }],
             View::Appearance => vec![Group { label: "Change appearance", rows: scope(self.appearance_rows()) }],
-            View::AddProject => {
-                let mut row = Row::new(
-                    "local-folder",
-                    RowIcon::Lucide(IconName::FolderPlus),
-                    "Local folder",
-                    Run::Open(View::Browse),
-                );
-                row.description = Some(Description::Text("Browse a folder on disk".into()));
-                vec![Group { label: "", rows: scope(vec![row]) }]
+            View::AddProject => match self.add_project_entry() {
+                AddProjectEntry::Connect => vec![Group { label: "", rows: scope(vec![connect_environment_row()]) }],
+                AddProjectEntry::Choose => {
+                    vec![Group { label: "Environments", rows: scope(self.add_project_environment_rows()) }]
+                }
+                AddProjectEntry::Sources(environment) => {
+                    vec![Group { label: "Sources", rows: scope(vec![local_folder_row(environment)]) }]
+                }
+            },
+            View::AddProjectSources => {
+                let rows = palette.add_environment.clone().map(local_folder_row).into_iter().collect();
+                vec![Group { label: "Sources", rows: scope(rows) }]
             }
             View::Root | View::Browse => return self.search_groups(query, true),
         };
@@ -1353,6 +1482,10 @@ impl Workspace {
 
     fn browse_groups(&self, query: &str) -> Vec<Group> {
         let Some(palette) = &self.palette else { return Vec::new() };
+        // A relative path lists nothing until there is a project to start from.
+        if self.relative_needs_project(query) {
+            return Vec::new();
+        }
         let (directory, leaf) = split_browse(query);
         let browse = &palette.browse;
         let mut rows = Vec::new();
@@ -1363,16 +1496,68 @@ impl Workspace {
         }
         if browse.directory == directory {
             for (name, _) in filter_entries(&browse.entries, leaf) {
-                let sep = if directory.ends_with('\\') { "\\" } else { "/" };
                 rows.push(Row::new(
                     format!("dir-{name}"),
                     RowIcon::Lucide(IconName::Folder),
                     name.clone(),
-                    Run::BrowseTo(format!("{directory}{name}{sep}")),
+                    Run::BrowseTo(browse_into(directory, name)),
                 ));
             }
         }
         vec![Group { label: "Directories", rows }]
+    }
+
+    /// Whether Enter can add the typed path and whether that creates its folder
+    /// (`canSubmitBrowsePath`, `willCreateProjectPath`).
+    fn browse_submit(&self, query: &str) -> BrowseSubmit {
+        let connected = self.browse_environment().is_some_and(|environment| self.env_client(&environment).is_some());
+        let can_submit = connected && !self.relative_needs_project(query);
+        let Some(palette) = &self.palette else { return BrowseSubmit::default() };
+        let browse = &palette.browse;
+        let (directory, leaf) = split_browse(query);
+        let settled = browse.directory == directory && !browse.loading;
+        // A folder that could not be read is one Enter creates.
+        let found = browse.error.is_none()
+            && if leaf.is_empty() {
+                browse.parent.is_some()
+            } else {
+                browse.entries.iter().any(|(name, _)| name == leaf)
+            };
+        let will_create = can_submit && settled && !query.trim().is_empty() && palette.highlight.is_none() && !found;
+        BrowseSubmit { can_submit, will_create }
+    }
+
+    /// Tab while browsing (`handleKeyDown`): enters the highlighted folder or "..", else completes
+    /// the typed name as far as the folders it matches agree. Returns whether it took the key.
+    pub(super) fn palette_tab(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if keystroke.key != "tab" || keystroke.modifiers.modified() {
+            return false;
+        }
+        let Some(palette) = &self.palette else { return false };
+        let query = palette.input.read(cx).value().to_string();
+        let browsing = palette.view == View::Browse || (palette.view == View::Root && is_browse_query(&query));
+        if !browsing || self.relative_needs_project(&query) {
+            return false;
+        }
+        let highlighted = palette.highlight.and_then(|index| {
+            self.browse_groups(&query).into_iter().flat_map(|group| group.rows).nth(index).map(|row| row.run)
+        });
+        let (directory, leaf) = split_browse(&query);
+        let next = match highlighted {
+            Some(Run::BrowseTo(path)) => Some(path),
+            _ if palette.browse.directory != directory => None,
+            _ => {
+                let names: Vec<&str> =
+                    filter_entries(&palette.browse.entries, leaf).into_iter().map(|(name, _)| name.as_str()).collect();
+                tab_completion(&names, leaf).map(|(name, complete)| {
+                    if complete { browse_into(directory, &name) } else { format!("{directory}{name}") }
+                })
+            }
+        };
+        if let Some(next) = next {
+            self.set_palette_query(&next, window, cx);
+        }
+        true
     }
 
     /// The path Enter adds while browsing (`CommandPalette.tsx` submit).
@@ -1396,6 +1581,19 @@ impl Workspace {
             .or_else(|| Some(query.trim().to_owned()))
     }
 
+    /// Adds the typed path as a project on the browse environment.
+    fn submit_browse_path(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let (Some(environment), Some(path)) = (self.browse_environment(), self.browse_submit_path(query)) {
+            self.add_project(environment, &path, window, cx);
+        }
+    }
+
+    /// The command `keystroke` runs from the palette's search field (`resolveShortcutCommand`).
+    fn palette_command(&self, keystroke: &Keystroke) -> Option<String> {
+        let context = keymap::ShortcutContext { editable_focus: true, ..keymap::ShortcutContext::default() };
+        keymap::resolve(&self.keymap, keystroke, &context).map(str::to_owned)
+    }
+
     fn run_palette_row(&mut self, run: Run, window: &mut Window, cx: &mut Context<Self>) {
         match run {
             Run::Open(view) => return self.push_palette_view(view, window, cx),
@@ -1404,6 +1602,14 @@ impl Workspace {
                 let query = self.palette_query(cx);
                 return self.open_file_overlay(mode, Some(query), window, cx);
             }
+            Run::AddProject => return self.start_add_project(window, cx),
+            Run::AddProjectIn(environment) => return self.open_add_project_sources(environment, window, cx),
+            Run::BrowseIn(environment) => {
+                if let Some(palette) = &mut self.palette {
+                    palette.add_environment = Some(environment);
+                }
+                return self.push_palette_view(View::Browse, window, cx);
+            }
             _ => {}
         }
         self.close_palette(window, cx);
@@ -1411,7 +1617,7 @@ impl Workspace {
             Run::NewThread(project_id) => self.start_draft(project_id, window, cx),
             Run::Thread(thread_id) => self.select_thread(thread_id, window, cx),
             Run::ThreadIn(environment, thread_id) => self.select_thread_in(environment, thread_id, window, cx),
-            Run::Project(project_id) => self.open_project(&project_id, window, cx),
+            Run::Project(members, project_id) => self.open_project_group(&members, project_id, window, cx),
             Run::Settings(section) => self.open_settings(section, cx),
             Run::Setting(item) => self.open_settings_search_result(item, window, cx),
             Run::ProjectSettings(project_id) => self.open_project_settings(&project_id, cx),
@@ -1440,45 +1646,97 @@ impl Workspace {
                 self.select_thread(thread_id, window, cx);
                 self.open_thread_find_on(&query, message_id, window, cx);
             }
-            Run::Open(_) | Run::BrowseTo(_) | Run::FileSearch(_) => {}
+            Run::Open(_)
+            | Run::BrowseTo(_)
+            | Run::FileSearch(_)
+            | Run::AddProject
+            | Run::AddProjectIn(_)
+            | Run::BrowseIn(_) => {}
         }
     }
 
-    /// A project's latest unsettled thread, else a new draft in it.
-    fn open_project(&mut self, project_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let latest = self
-            .shell
-            .threads
-            .iter()
-            .filter(|t| {
-                t.project_id == project_id
-                    && t.is_listed()
-                    && t.archived_at.is_none()
-                    && t.settled_override.as_deref() != Some("settled")
-            })
-            .max_by_key(|t| used_at(t))
-            .map(|t| t.id.clone());
-        match latest {
+    /// `openProjectFromSearch`: the group's latest thread by the sidebar's order, settled or not,
+    /// else a new draft in `project_id`.
+    fn open_project_group(
+        &mut self,
+        members: &[String],
+        project_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let sort_order = self.thread_sort_order();
+        match latest_thread(&self.shell.threads, members, &sort_order).map(|t| t.id.clone()) {
             Some(thread_id) => self.select_thread(thread_id, window, cx),
-            None => self.start_draft(project_id.to_owned(), window, cx),
+            None => self.start_draft(project_id, window, cx),
         }
     }
 
-    /// `handleAddProjectForEnvironment`: reuse a project already at `path`
-    /// (unarchiving it), else `projects.mutate` a new one; then open it.
-    pub(super) fn add_project(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(environment) = self.active_environment().cloned() else { return };
-        let Some(client) = self.env_client(&environment) else { return };
+    /// `sidebarThreadSortOrder`.
+    fn thread_sort_order(&self) -> String {
+        self.client_settings.values.get("sidebarThreadSortOrder").as_str().unwrap_or_default().to_owned()
+    }
+
+    /// `handleAddProjectForEnvironment`: resolve `raw` against the open project, reuse a project
+    /// already there (unarchiving it), else `projects.mutate` a new one; then open it.
+    pub(super) fn add_project(
+        &mut self,
+        environment: SharedString,
+        raw: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let raw = raw.trim();
+        let info = self.env_info(&environment);
+        let platform = info.and_then(|info| info.platform_os.as_deref());
+        let cwd = self
+            .current_project()
+            .filter(|project| project.environment_id == environment)
+            .map(|project| project.workspace_root.clone());
+        let failure = match self.env_client(&environment) {
+            None => Err(format!(
+                "Environment unavailable: {} is not connected.",
+                info.and_then(|info| info.environment_label.as_deref()).unwrap_or("The selected environment")
+            )),
+            Some(_) if is_windows_absolute(raw) && platform.is_some_and(|os| !is_windows_platform(os)) => {
+                Err("Failed to add project: Windows-style paths are only supported on Windows.".to_owned())
+            }
+            Some(_) if is_explicit_relative(raw) && cwd.is_none() => {
+                Err("Failed to add project: Relative paths require an active project.".to_owned())
+            }
+            Some(client) => Ok(client),
+        };
+        let client = match failure {
+            Ok(client) => client,
+            Err(message) => {
+                self.error = Some(message.into());
+                cx.notify();
+                return;
+            }
+        };
+        let path = resolve_project_path(raw, cwd.as_deref());
+        if path.is_empty() {
+            return;
+        }
         self.close_palette(window, cx);
-        let existing =
-            self.shell.projects.iter().find(|p| p.environment_id == environment && same_path(&p.workspace_root, &path));
+        let key = crate::project_groups::normalize_path(&path);
+        let existing = self.shell.projects.iter().find(|p| {
+            p.environment_id == environment && crate::project_groups::normalize_path(&p.workspace_root) == key
+        });
         if let Some(existing) = existing {
             let project_id = existing.id.clone();
             if existing.archived_at.is_some() {
                 let mutation = json!({"type": "project.update", "commandId": new_id(), "projectId": project_id, "archived": false});
                 self.mutate_project(mutation, cx);
             }
-            self.open_project(&project_id, window, cx);
+            // A settled latest thread is left for a new draft.
+            let sort_order = self.thread_sort_order();
+            let latest = latest_thread(&self.shell.threads, std::slice::from_ref(&project_id), &sort_order)
+                .filter(|thread| thread.settled_override.as_deref() != Some("settled"))
+                .map(|thread| thread.id.clone());
+            match latest {
+                Some(thread_id) => self.select_thread(thread_id, window, cx),
+                None => self.start_draft(project_id, window, cx),
+            }
             return;
         }
         let project_id = new_id();
@@ -1520,6 +1778,7 @@ impl Workspace {
 
     /// The native folder dialog in place of the web's desktop bridge `pickFolder`.
     fn pick_project_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(environment) = self.browse_environment() else { return };
         let picked = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -1531,14 +1790,18 @@ impl Workspace {
             let Some(path) = paths.into_iter().next().map(|p: PathBuf| p.to_string_lossy().into_owned()) else {
                 return;
             };
-            let _ = this.update_in(cx, |this, window, cx| this.add_project(path, window, cx));
+            let _ = this.update_in(cx, |this, window, cx| this.add_project(environment, &path, window, cx));
         })
         .detach();
     }
 
-    /// The server runs on this machine, so its paths are this machine's.
-    fn server_is_local(&self) -> bool {
-        self.http_base().is_some_and(|base| base.contains("://127.0.0.1") || base.contains("://localhost"))
+    /// The native folder dialog picks on this machine, so it is offered while browsing the
+    /// primary environment with its server here (`canOpenProjectFromFileManager`).
+    fn browse_is_local(&self) -> bool {
+        let Some(environment) = self.browse_environment() else { return false };
+        let local = |base: &str| base.contains("://127.0.0.1") || base.contains("://localhost");
+        self.primary_environment() == Some(&environment)
+            && self.env_endpoint(&environment).is_some_and(|endpoint| local(&endpoint.http_base))
     }
 
     fn palette_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1561,6 +1824,35 @@ impl Workspace {
             cx.stop_propagation();
             return;
         }
+        // The app's own handlers leave these to the palette while it is open.
+        if let Some(command) = self.palette_command(&event.keystroke) {
+            let shown: Vec<&Row> = groups.iter().flat_map(|g| g.rows.iter()).collect();
+            let shortcut = match palette_shortcut(&shown, &command) {
+                // Copying the reference closes the palette first; with none to copy it does nothing.
+                PaletteShortcut::Pass if command == "thread.copyReference" => match self.reference_copy_target() {
+                    Some(_) => PaletteShortcut::Run(Run::CopyThread),
+                    None => PaletteShortcut::Swallow,
+                },
+                shortcut => shortcut,
+            };
+            match shortcut {
+                PaletteShortcut::Pass => {}
+                PaletteShortcut::Swallow => {
+                    cx.stop_propagation();
+                    return;
+                }
+                PaletteShortcut::Run(run) => {
+                    self.run_palette_row(run, window, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+            }
+        }
+        let primary_modifier = if keymap::MAC {
+            modifiers.platform && !modifiers.control
+        } else {
+            modifiers.control && !modifiers.platform
+        };
         match event.keystroke.key.as_str() {
             "escape" => self.close_palette(window, cx),
             "up" | "down" if !rows.is_empty() => {
@@ -1582,39 +1874,24 @@ impl Workspace {
                 }
                 cx.notify();
             }
+            // Enter adds the typed path unless a row is highlighted; Mod+Enter adds it regardless.
+            "enter"
+                if browsing && self.browse_submit(&query).can_submit && (highlight.is_none() || primary_modifier) =>
+            {
+                self.submit_browse_path(&query, window, cx);
+            }
             "enter" => {
                 let row = match highlight {
                     Some(i) => rows.get(i).map(|r| r.run.clone()),
                     None if browsing => None,
                     None => rows.first().map(|r| r.run.clone()),
                 };
-                match row {
-                    Some(Run::BrowseTo(_)) if modifiers.control => {
-                        if let Some(path) = self.browse_submit_path(&query) {
-                            self.add_project(path, window, cx);
-                        }
-                    }
-                    Some(run) => self.run_palette_row(run, window, cx),
-                    None if browsing => {
-                        if let Some(path) = self.browse_submit_path(&query) {
-                            self.add_project(path, window, cx);
-                        }
-                    }
-                    None => {}
+                if let Some(run) = row {
+                    self.run_palette_row(run, window, cx);
                 }
             }
             "backspace" if query.is_empty() && !self.palette.as_ref().is_some_and(|p| p.stack.is_empty()) => {
                 self.pop_palette_view(window, cx);
-            }
-            key if modifiers.secondary(cx)
-                && view == View::NewThreadIn
-                && key.len() == 1
-                && key.as_bytes()[0].is_ascii_digit() =>
-            {
-                let label = self.shortcut(&format!("thread.jump.{key}"));
-                if let Some(run) = rows.iter().find(|r| label.is_some() && r.shortcut == label).map(|r| r.run.clone()) {
-                    self.run_palette_row(run, window, cx);
-                }
             }
             _ => return,
         }
@@ -1635,6 +1912,7 @@ impl Workspace {
         let items = groups.iter().flat_map(|g| g.rows.iter()).filter(|r| !r.disabled).count();
         let marked = marked_row(highlight, browsing, items);
         let input = palette.input.clone();
+        let trap = palette.trap.clone();
         let fg = tokens.foreground;
         let muted = tokens.muted_foreground;
         let lead_icon = if in_submenu {
@@ -1651,12 +1929,43 @@ impl Workspace {
         } else {
             Icon::new(IconName::Search).size(px(16.)).text_color(muted.opacity(0.8)).into_any_element()
         };
+        let submit = browsing.then(|| self.browse_submit(&query));
+        // `CommandPaletteSubmitButton`: the trailing Add / Create & Add button while browsing.
+        let accessory = submit.map(|submit| {
+            let (label, shortcut) = browse_submit_labels(submit.will_create, highlight.is_some(), keymap::MAC);
+            let tooltip = format!("{label} ({shortcut})");
+            let query = query.clone();
+            let button = Button::new("palette-browse-submit")
+                .outline()
+                .xsmall()
+                .tab_stop(false)
+                .label(label)
+                .child(super::model_picker::kbd(&shortcut, &tokens))
+                .disabled(!submit.can_submit)
+                .tooltip(tooltip)
+                .on_click(cx.listener(move |this, _, window, cx| this.submit_browse_path(&query, window, cx)));
+            div().absolute().right(px(2.)).top_0().bottom_0().flex().items_center().child(button)
+        });
+        // `browseInputEndPaddingClass`: room for the button's widest label.
+        let input_end = match submit {
+            Some(submit) if submit.will_create => px(144.),
+            Some(_) if highlight.is_some() => px(112.),
+            Some(_) => px(88.),
+            None => px(0.),
+        };
         let input_row = h_flex().flex_none().h(px(46.)).px(px(8.)).py(px(6.)).child(
             h_flex()
                 .size_full()
                 .relative()
                 .child(div().absolute().left(px(11.)).child(lead_icon))
-                .child(div().flex_1().pl(px(32.)).child(Input::new(&input).appearance(false).text_sm().h(px(34.)))),
+                .child(
+                    div()
+                        .flex_1()
+                        .pl(px(32.))
+                        .pr(input_end)
+                        .child(Input::new(&input).appearance(false).text_sm().h(px(34.))),
+                )
+                .children(accessory),
         );
         let mut index = 0usize;
         let mut list = v_flex().p(px(8.));
@@ -1702,10 +2011,12 @@ impl Workspace {
             None
         };
         let empty = (total_rows == 0).then(|| {
-            let text = if !browsing && view == View::Root && palette.messages.pending {
+            let text = if browsing && self.relative_needs_project(&query) {
+                "Relative paths require an active project."
+            } else if submit.is_some_and(|submit| submit.will_create) {
+                "Press Enter to create this folder and add it as a project."
+            } else if !browsing && view == View::Root && palette.messages.pending {
                 "Searching thread messages…"
-            } else if browsing {
-                "Press Enter to add this folder as a project."
             } else if actions_filter(&query).0 {
                 "No matching actions."
             } else {
@@ -1731,9 +2042,9 @@ impl Workspace {
         let hint = |keys: Vec<SharedString>, label: &'static str| {
             h_flex().gap(px(4.)).children(keys.into_iter().map(kbd)).child(label)
         };
-        // While browsing with nothing highlighted, Enter adds the typed path.
-        let footer_action = if browsing && highlight.is_none() { "Add" } else { "Select" };
-        let file_manager = browsing && self.server_is_local();
+        // While Enter adds the typed path, the input's button says so instead.
+        let adds = submit.is_some_and(|submit| submit.can_submit) && highlight.is_none();
+        let file_manager = browsing && self.browse_is_local();
         let footer = h_flex()
             .flex_none()
             .justify_between()
@@ -1749,7 +2060,7 @@ impl Workspace {
                 h_flex()
                     .gap(px(12.))
                     .child(hint(vec!["↑".into(), "↓".into()], "Navigate"))
-                    .child(hint(vec!["Enter".into()], footer_action))
+                    .when(!adds, |el| el.child(hint(vec!["Enter".into()], "Select")))
                     .when(in_submenu, |el| el.child(hint(vec!["Backspace".into()], "Back")))
                     .child(hint(vec!["Esc".into()], "Close")),
             )
@@ -1818,7 +2129,8 @@ impl Workspace {
                                 .child(list)
                                 .children(empty),
                         )
-                        .child(footer),
+                        .child(footer)
+                        .focus_trap("palette-trap", &trap),
                 )
                 .into_any_element(),
         )
@@ -2045,18 +2357,6 @@ fn listed_in_palette(thread: &crate::model::ThreadShell) -> bool {
     thread.is_listed() && thread.archived_at.is_none() && thread.deleted_at.is_none()
 }
 
-/// When a thread was last used: its latest user-authored message.
-fn used_at(thread: &crate::model::ThreadShell) -> i64 {
-    thread
-        .latest_user_authored_message_at
-        .as_ref()
-        .and_then(Option::as_deref)
-        .or(thread.latest_user_message_at.as_deref())
-        .and_then(crate::timestamp::parse_ms)
-        .or_else(|| crate::timestamp::parse_ms(&thread.updated_at))
-        .unwrap_or(0)
-}
-
 /// `formatRelativeTimeLabel`: "just now", "5m ago", "3h ago", "2d ago".
 fn ago(elapsed_ms: i64) -> String {
     match inbox::format_relative(elapsed_ms) {
@@ -2098,6 +2398,211 @@ fn score_rows(rows: Vec<Row>, tokens: &[Vec<char>], typos: bool) -> Vec<(Row, bo
             .then(b.0.quality.total_cmp(&a.0.quality))
     });
     scored
+}
+
+/// `appendBrowsePathSegment`: the folder `name` inside `directory`, with its separator.
+fn browse_into(directory: &str, name: &str) -> String {
+    let separator = if directory.ends_with('\\') { "\\" } else { "/" };
+    format!("{directory}{name}{separator}")
+}
+
+/// `getFilesystemBrowseTabCompletion`: the one folder matching `leaf` (complete), or the longest
+/// prefix the matching folders share, ignoring case, when it adds to `leaf`.
+fn tab_completion(names: &[&str], leaf: &str) -> Option<(String, bool)> {
+    let (first, rest) = names.split_first()?;
+    if rest.is_empty() {
+        return Some(((*first).to_owned(), true));
+    }
+    let mut prefix: Vec<char> = first.chars().collect();
+    for name in rest {
+        let shared = prefix.iter().zip(name.chars()).take_while(|(a, b)| a.to_lowercase().eq(b.to_lowercase())).count();
+        prefix.truncate(shared);
+    }
+    let name: String = prefix.into_iter().collect();
+    let lower = name.to_lowercase();
+    let extends = lower.chars().count() > leaf.to_lowercase().chars().count();
+    (extends && names.iter().all(|n| n.to_lowercase().starts_with(&lower))).then_some((name, false))
+}
+
+/// Whether Enter can add the typed path, and whether adding it creates its folder.
+#[derive(Clone, Copy, Default)]
+struct BrowseSubmit {
+    can_submit: bool,
+    will_create: bool,
+}
+
+/// `submitActionLabel` and `addShortcutLabel`: a highlighted folder leaves Enter to it, so adding
+/// takes the primary modifier.
+fn browse_submit_labels(will_create: bool, highlighted: bool, mac: bool) -> (&'static str, String) {
+    let label = if will_create { "Create & Add" } else { "Add" };
+    let shortcut =
+        if highlighted { format!("{} Enter", if mac { "\u{2318}" } else { "Ctrl" }) } else { "Enter".to_owned() };
+    (label, shortcut)
+}
+
+/// What a shortcut pressed in the palette does (`handleKeyDown`).
+#[derive(Clone)]
+enum PaletteShortcut {
+    /// Not the palette's: it goes on to the search field.
+    Pass,
+    /// Taken, doing nothing.
+    Swallow,
+    Run(Run),
+}
+
+/// A jump or new-thread shortcut runs the shown row bound to it; a jump with none is still taken.
+fn palette_shortcut(rows: &[&Row], command: &str) -> PaletteShortcut {
+    let jump = command.starts_with("thread.jump.");
+    if !jump && !matches!(command, "chat.new" | "chat.newLocal" | "chat.newWithoutProject") {
+        return PaletteShortcut::Pass;
+    }
+    match rows.iter().find(|row| row.command.as_deref() == Some(command)) {
+        Some(row) if row.disabled => PaletteShortcut::Swallow,
+        Some(row) => PaletteShortcut::Run(row.run.clone()),
+        None if jump => PaletteShortcut::Swallow,
+        None => PaletteShortcut::Pass,
+    }
+}
+
+/// `isExplicitRelativePath`.
+fn is_explicit_relative(path: &str) -> bool {
+    matches!(path, "." | "..") || ["./", "../", ".\\", "..\\"].iter().any(|prefix| path.starts_with(prefix))
+}
+
+/// `isWindowsAbsolutePath`: a drive or UNC path.
+fn is_windows_absolute(path: &str) -> bool {
+    path.starts_with("\\\\") || crate::project_groups::is_drive_path(path)
+}
+
+/// `isWindowsPlatform`.
+fn is_windows_platform(os: &str) -> bool {
+    os.get(..3).is_some_and(|start| start.eq_ignore_ascii_case("win"))
+}
+
+/// An absolute path's root, separator and segments (`splitAbsolutePath`).
+fn split_absolute(path: &str) -> Option<(String, &'static str, Vec<&str>)> {
+    fn segments<'p>(rest: &'p str, separators: &[char]) -> Vec<&'p str> {
+        rest.split(separators).filter(|segment| !segment.is_empty()).collect()
+    }
+    if crate::project_groups::is_drive_path(path) {
+        let rest = path.get(3..).unwrap_or_default();
+        return Some((format!("{}\\", &path[..2]), "\\", segments(rest, &['\\', '/'])));
+    }
+    if path.starts_with("\\\\") {
+        let mut parts = segments(path, &['\\', '/']).into_iter();
+        let (server, share) = (parts.next()?, parts.next()?);
+        return Some((format!("\\\\{server}\\{share}\\"), "\\", parts.collect()));
+    }
+    let rest = path.strip_prefix('/')?;
+    Some(("/".to_owned(), "/", segments(rest, &['/'])))
+}
+
+/// `resolveProjectPathForDispatch`: an explicit relative path joins `cwd`; any path loses its
+/// trailing separators.
+fn resolve_project_path(value: &str, cwd: Option<&str>) -> String {
+    use crate::project_groups::trim_trailing_separators;
+    let value = value.trim();
+    let base = cwd.filter(|_| is_explicit_relative(value)).map(|cwd| trim_trailing_separators(cwd.trim()));
+    let Some((root, separator, mut segments)) = base.as_deref().and_then(split_absolute) else {
+        return trim_trailing_separators(value);
+    };
+    for segment in value.split(['/', '\\']) {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            segment => segments.push(segment),
+        }
+    }
+    trim_trailing_separators(&format!("{root}{}", segments.join(separator)))
+}
+
+/// `sortThreads(..)[0]`: the newest unarchived thread of `project_ids` by the sidebar's thread
+/// order, settled ones included; a tie goes to the larger id.
+fn latest_thread<'a>(
+    threads: &'a [crate::model::ThreadShell],
+    project_ids: &[String],
+    sort_order: &str,
+) -> Option<&'a crate::model::ThreadShell> {
+    let parse = crate::timestamp::parse_ms;
+    let sorted_at = |t: &crate::model::ThreadShell| match sort_order {
+        "created_at" => parse(&t.created_at).or_else(|| parse(&t.updated_at)),
+        _ => t
+            .latest_user_message_at
+            .as_deref()
+            .and_then(parse)
+            .or_else(|| parse(&t.updated_at))
+            .or_else(|| parse(&t.created_at)),
+    };
+    threads
+        .iter()
+        .filter(|t| listed_in_palette(t) && project_ids.contains(&t.project_id))
+        .max_by(|a, b| sorted_at(a).cmp(&sorted_at(b)).then_with(|| a.id.cmp(&b.id)))
+}
+
+/// The "Add project" action (`addProjectAction`).
+fn add_project_row() -> Row {
+    let mut row = Row::new("add-project", RowIcon::Lucide(IconName::FolderPlus), "Add project", Run::AddProject);
+    row.terms = &["add project", "folder", "directory", "browse", "environment"];
+    row
+}
+
+/// The "Add project" entry when no environment can add one.
+fn connect_environment_row() -> Row {
+    let run = Run::Settings("connections");
+    let mut row = Row::new("add-project-connect", RowIcon::Lucide(IconName::Settings), "Connect an environment", run);
+    row.description = Some(Description::Text("No connected environment can add a project".into()));
+    row.terms = &["connect", "environment", "connection", "settings"];
+    row
+}
+
+/// The "Local folder" source of `environment`.
+fn local_folder_row(environment: SharedString) -> Row {
+    let key = format!("add-project-local:{environment}");
+    let mut row = Row::new(key, RowIcon::Lucide(IconName::FolderPlus), "Local folder", Run::BrowseIn(environment));
+    row.description = Some(Description::Text("Browse a folder on disk".into()));
+    row.terms = &["local", "folder", "directory", "browse"];
+    row
+}
+
+/// An environment a project can be added on (`AddProjectEnvironmentOption`).
+struct AddEnvironment {
+    id: SharedString,
+    label: String,
+    primary: bool,
+    machine: IconName,
+}
+
+/// `AddProjectEntry`: where "Add project" starts.
+#[derive(Debug, PartialEq)]
+enum AddProjectEntry {
+    /// No connected environment: Connections.
+    Connect,
+    /// Several environments to choose from.
+    Choose,
+    /// The one environment's sources.
+    Sources(SharedString),
+}
+
+/// `resolveAddProjectEntry` over the connected environments, in their listed order.
+fn add_project_entry(environments: &[SharedString]) -> AddProjectEntry {
+    match environments {
+        [] => AddProjectEntry::Connect,
+        [only] => AddProjectEntry::Sources(only.clone()),
+        _ => AddProjectEntry::Choose,
+    }
+}
+
+/// `resolveEnvironmentOptionLabel`: this device keeps its own name unless it is a generic
+/// "Local", else reads "This device"; another environment its name, else its id.
+fn environment_option_label(primary: bool, id: &str, label: Option<&str>) -> String {
+    let label = label.map(str::trim).filter(|label| !label.is_empty());
+    if primary {
+        let generic = |label: &&str| matches!(label.to_lowercase().as_str(), "local" | "local environment");
+        return label.filter(|label| !generic(label)).unwrap_or("This device").to_owned();
+    }
+    label.unwrap_or(id).to_owned()
 }
 
 /// The "No project" row's key, which holds its place among the projects.
@@ -2438,9 +2943,99 @@ mod tests {
     fn project_paths_name_and_compare_like_the_web() {
         assert_eq!(project_title_from_path("H:\\Developer\\t3code\\"), "t3code");
         assert_eq!(project_title_from_path("/home/me/app"), "app");
-        assert!(same_path("H:\\Dev\\App\\", "h:/dev/app"));
-        assert!(!same_path("/home/App", "/home/app"));
+        let norm = crate::project_groups::normalize_path;
+        assert_eq!(norm("H:\\Dev\\App\\"), norm("h:/dev/app"));
+        assert_ne!(norm("/home/App"), norm("/home/app"));
         assert_eq!(ago(30_000), "just now");
         assert_eq!(ago(5 * 60_000), "5m ago");
+    }
+
+    #[test]
+    fn relative_project_paths_resolve_against_the_open_project() {
+        assert!(is_explicit_relative("..") && is_explicit_relative(".\\src") && !is_explicit_relative(".git"));
+        assert_eq!(resolve_project_path("../api", Some("/home/me/app")), "/home/me/api");
+        assert_eq!(resolve_project_path("./web/", Some("/home/me/app/")), "/home/me/app/web");
+        assert_eq!(resolve_project_path(".\\docs\\..\\site", Some("H:\\Dev\\app")), "H:\\Dev\\app\\site");
+        assert_eq!(resolve_project_path("../..", Some("C:\\dev")), "C:\\");
+        assert_eq!(resolve_project_path("./x", Some("\\\\box\\share\\repo")), "\\\\box\\share\\repo\\x");
+        assert_eq!(
+            resolve_project_path(" ~/code/app/ ", None),
+            "~/code/app",
+            "absolute paths only lose the trailing slash"
+        );
+        assert_eq!(resolve_project_path("./x", None), "./x");
+        assert!(is_windows_absolute("D:\\x") && is_windows_absolute("\\\\box\\s") && !is_windows_absolute("/d"));
+        assert!(is_windows_platform("windows") && is_windows_platform("Win32") && !is_windows_platform("darwin"));
+    }
+
+    #[test]
+    fn tab_completes_one_folder_or_the_prefix_the_matches_share() {
+        assert_eq!(tab_completion(&["apps"], "a"), Some(("apps".into(), true)));
+        assert_eq!(tab_completion(&["packages", "Pages"], "p"), Some(("pa".into(), false)), "case is ignored");
+        assert_eq!(tab_completion(&["docs", "dist"], "d"), None, "nothing to add");
+        assert_eq!(tab_completion(&[], "x"), None);
+        assert_eq!(browse_into("C:\\dev\\", "app"), "C:\\dev\\app\\");
+        assert_eq!(browse_into("~/code/", "app"), "~/code/app/");
+    }
+
+    #[test]
+    fn the_browse_button_says_whether_adding_creates_the_folder() {
+        assert_eq!(browse_submit_labels(true, false, false), ("Create & Add", "Enter".to_owned()));
+        assert_eq!(browse_submit_labels(false, true, false), ("Add", "Ctrl Enter".to_owned()));
+        assert_eq!(browse_submit_labels(false, true, true), ("Add", "\u{2318} Enter".to_owned()));
+    }
+
+    #[test]
+    fn new_thread_and_jump_shortcuts_run_the_row_they_label() {
+        let row = |key: &str, command: &str, run: Run| {
+            let mut row = Row::new(key.to_owned(), RowIcon::Lucide(IconName::SquarePen), key.to_owned(), run);
+            row.command = Some(command.to_owned().into());
+            row
+        };
+        let here = row("here", "chat.newLocal", Run::NewThread("p1".into()));
+        let jump = row("p2", "thread.jump.2", Run::NewThread("p2".into()));
+        let rows = [&here, &jump];
+        assert!(
+            matches!(palette_shortcut(&rows, "chat.newLocal"), PaletteShortcut::Run(Run::NewThread(id)) if id == "p1")
+        );
+        assert!(
+            matches!(palette_shortcut(&rows, "thread.jump.2"), PaletteShortcut::Run(Run::NewThread(id)) if id == "p2")
+        );
+        assert!(matches!(palette_shortcut(&rows, "thread.jump.3"), PaletteShortcut::Swallow), "a jump never leaves");
+        assert!(matches!(palette_shortcut(&rows, "chat.new"), PaletteShortcut::Pass));
+        assert!(matches!(palette_shortcut(&rows, "sidebar.toggle"), PaletteShortcut::Pass));
+    }
+
+    #[test]
+    fn add_project_starts_from_connections_one_machine_or_a_choice() {
+        let ids = |ids: &[&str]| ids.iter().map(|id| SharedString::from((*id).to_owned())).collect::<Vec<_>>();
+        assert_eq!(add_project_entry(&[]), AddProjectEntry::Connect);
+        assert_eq!(add_project_entry(&ids(&["local"])), AddProjectEntry::Sources("local".into()));
+        assert_eq!(add_project_entry(&ids(&["local", "box"])), AddProjectEntry::Choose);
+        assert_eq!(environment_option_label(true, "env-1", Some("Local")), "This device");
+        assert_eq!(environment_option_label(true, "env-1", Some("Studio")), "Studio");
+        assert_eq!(environment_option_label(false, "env-2", Some(" ")), "env-2");
+    }
+
+    #[test]
+    fn opening_a_project_lands_on_its_groups_latest_thread_settled_or_not() {
+        let at = |id: &str, project: &str, at: &str, extra: Value| {
+            let mut fields = json!({"id": id, "projectId": project, "latestUserMessageAt": at, "createdAt": at});
+            if let (Some(base), Value::Object(extra)) = (fields.as_object_mut(), extra) {
+                base.extend(extra);
+            }
+            thread(fields)
+        };
+        let threads = [
+            at("old", "p1", "2026-01-01T00:00:00Z", json!({})),
+            at("other-checkout", "p2", "2026-01-03T00:00:00Z", json!({"settledOverride": "settled"})),
+            at("archived", "p1", "2026-01-05T00:00:00Z", json!({"archivedAt": "2026-01-06T00:00:00Z"})),
+            at("elsewhere", "p3", "2026-01-09T00:00:00Z", json!({})),
+        ];
+        let group = ["p1".to_owned(), "p2".to_owned()];
+        let latest = |order: &str| latest_thread(&threads, &group, order).map(|t| t.id.as_str());
+        assert_eq!(latest("updated_at"), Some("other-checkout"));
+        assert_eq!(latest_thread(&threads, &group[..1], "updated_at").map(|t| t.id.as_str()), Some("old"));
+        assert_eq!(latest_thread(&threads, &["p4".to_owned()], "updated_at").map(|t| t.id.as_str()), None);
     }
 }

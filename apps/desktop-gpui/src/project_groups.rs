@@ -134,7 +134,7 @@ pub fn normalize_path(path: &str) -> String {
 }
 
 /// `isWindowsDrivePath`: `C:` followed by a separator or nothing.
-fn is_drive_path(path: &str) -> bool {
+pub fn is_drive_path(path: &str) -> bool {
     match path.as_bytes() {
         [drive, b':', rest @ ..] => drive.is_ascii_alphabetic() && matches!(rest.first(), None | Some(b'/' | b'\\')),
         _ => false,
@@ -143,7 +143,7 @@ fn is_drive_path(path: &str) -> bool {
 
 /// `trimTrailingPathSeparators`: roots (`/`, `\`, `C:\`) stay, a bare drive gains its
 /// separator, and a POSIX path only sheds forward slashes.
-fn trim_trailing_separators(path: &str) -> String {
+pub fn trim_trailing_separators(path: &str) -> String {
     let is_root = |p: &str| matches!(p, "/" | "\\") || (p.len() == 3 && is_drive_path(p));
     if path.is_empty() || is_root(path) {
         return path.to_owned();
@@ -275,6 +275,15 @@ impl ProjectGroup {
         environment_id
             .and_then(|env| self.members.iter().find(|m| m.project.environment_id == env))
             .map_or_else(|| self.representative(), |m| &m.project)
+    }
+
+    /// `targetProject` for the contextual project: that checkout when it is a member, else
+    /// [`Self::target`] on its environment.
+    pub fn target_for(&self, preferred: Option<&ProjectShell>) -> &ProjectShell {
+        let exact = preferred.and_then(|p| {
+            self.members.iter().find(|m| m.project.id == p.id && m.project.environment_id == p.environment_id)
+        });
+        exact.map_or_else(|| self.target(preferred.map(|p| p.environment_id.as_ref())), |m| &m.project)
     }
 
     /// `ProjectEnvironmentBadge`: for a group with checkouts off `primary`, its tooltip ("On …",
@@ -525,6 +534,14 @@ mod tests {
         assert_eq!(groups[0].target(Some("remote")).id, "b");
         assert_eq!(groups[0].target(Some("elsewhere")).id, "a");
         assert_eq!(groups[0].target(None).id, "a");
+        // The palette keeps the open checkout, else one on its machine.
+        let (a, b) = (&groups[0].members[0].project, &groups[0].members[1].project);
+        assert_eq!(groups[0].target_for(Some(b)).id, "b");
+        assert_eq!(groups[0].target_for(Some(a)).id, "a");
+        let mut elsewhere = project("c", "/other", repo("x", "/other"));
+        elsewhere.environment_id = "remote".into();
+        assert_eq!(groups[0].target_for(Some(&elsewhere)).id, "b");
+        assert_eq!(groups[0].target_for(None).id, "a");
     }
 
     #[test]
