@@ -614,7 +614,7 @@ impl Workspace {
                 })
             };
             let open_files = {
-                let (ids, panel, images) = (ids.clone(), panel.clone(), images.clone());
+                let (ids, panel, images) = (ids, panel.clone(), images.clone());
                 let cwd = representative.project.workspace_root.clone();
                 let representative_id = representative.project.id.clone();
                 let project_name: SharedString = group.display_name.clone().into();
