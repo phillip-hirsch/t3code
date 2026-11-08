@@ -463,8 +463,7 @@ impl Workspace {
     ) -> bool {
         self.composer.update(cx, |state, cx| {
             if !edit.is_noop() {
-                state.set_selected_range(edit.range, cx);
-                state.replace(edit.text, window, cx);
+                state.replace_ranges(&edit.changes, window, cx);
             }
             state.set_selected_range(edit.select, cx);
         });
