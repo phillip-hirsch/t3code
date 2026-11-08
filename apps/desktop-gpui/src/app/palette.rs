@@ -150,6 +150,8 @@ enum Description {
     Text(SharedString),
     /// "You:" / "Agent:" and the snippet in highlighted runs.
     Snippet(bool, Vec<(String, bool)>),
+    /// `ProjectLocationDescription`: a remote machine's icon, where the project lives, and its path.
+    Location(Option<IconName>, SharedString, SharedString),
 }
 
 #[derive(Clone)]
@@ -757,8 +759,9 @@ impl Workspace {
     fn project_row(&self, key: String, group: &crate::project_groups::ProjectGroup, run: Run) -> Row {
         let p = group.representative();
         let mut row = Row::new(key, RowIcon::Project(p.id.clone()), group.display_name.clone(), run);
+        let machine = self.location_machine(&p.environment_id);
         let location = self.location_label(&p.environment_id);
-        row.description = Some(Description::Text(format!("{location} · {}", p.workspace_root).into()));
+        row.description = Some(Description::Location(machine, location, p.workspace_root.clone().into()));
         row.data_terms = vec![p.title.clone().into(), p.workspace_root.clone().into()];
         row.pin = Some((group.project_ids.clone(), group.pinned));
         row
@@ -1267,6 +1270,14 @@ impl Workspace {
         self.env_info(environment_id)
             .and_then(|info| info.environment_label.clone())
             .map_or_else(|| "Remote".into(), SharedString::from)
+    }
+
+    /// `EnvironmentMachineIcon` before a remote location; this machine's server shows none.
+    fn location_machine(&self, environment_id: &str) -> Option<IconName> {
+        if self.primary_environment().is_some_and(|primary| primary == environment_id) {
+            return None;
+        }
+        Some(super::host_picker::machine_icon(self.env_info(environment_id).map_or("server", |i| i.machine_kind())))
     }
 
     /// Ranks the root view's threads for `query` unless the last ranking still holds.
@@ -1875,6 +1886,14 @@ impl Workspace {
         let icon = self.palette_row_icon(row, tokens);
         let description: Option<AnyElement> = row.description.as_ref().map(|d| match d {
             Description::Text(text) => div().truncate().child(text.clone()).into_any_element(),
+            Description::Location(machine, label, path) => h_flex()
+                .min_w_0()
+                .gap(px(4.))
+                .children(machine.map(|icon| Icon::new(icon).size(px(12.)).flex_none().text_color(muted.opacity(0.7))))
+                .child(div().min_w_0().truncate().child(label.clone()))
+                .child(div().flex_none().text_color(muted.opacity(0.5)).child("·"))
+                .child(div().min_w_0().truncate().child(path.clone()))
+                .into_any_element(),
             Description::Snippet(user, parts) => h_flex()
                 .min_w_0()
                 .overflow_hidden()
