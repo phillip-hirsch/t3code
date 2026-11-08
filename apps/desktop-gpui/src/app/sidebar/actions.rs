@@ -89,6 +89,36 @@ pub(super) struct Leave {
     project_id: Option<String>,
 }
 
+/// `getFallbackThreadIdAfterDelete`: the newest thread still in the inbox of the deleted
+/// thread's project, by the sidebar's thread sort order.
+fn fallback_after_delete<'a>(
+    threads: &'a [crate::model::ThreadShell],
+    deleted: &str,
+    sort_order: &str,
+    now: i64,
+) -> Option<&'a str> {
+    let project = &threads.iter().find(|t| t.id == deleted)?.project_id;
+    let requests = inbox::child_requests(threads);
+    let parse = crate::timestamp::parse_ms;
+    let sorted_at = |t: &crate::model::ThreadShell| match sort_order {
+        "created_at" => parse(&t.created_at).or_else(|| parse(&t.updated_at)),
+        _ => t.latest_user_message_at.as_deref().and_then(parse).or_else(|| parse(&t.updated_at)),
+    };
+    threads
+        .iter()
+        .filter(|t| {
+            &t.project_id == project
+                && t.id != deleted
+                && t.is_listed()
+                && t.archived_at.is_none()
+                && t.deleted_at.is_none()
+                && t.settled_override.as_deref() != Some("settled")
+                && !Facts::new(t, &requests).is_snoozed(now)
+        })
+        .max_by(|a, b| sorted_at(a).cmp(&sorted_at(b)).then_with(|| a.id.cmp(&b.id)))
+        .map(|t| t.id.as_str())
+}
+
 /// What undo restores for one thread.
 pub(super) struct UndoEntry {
     thread_id: String,
@@ -523,11 +553,33 @@ impl Workspace {
             detail: Some("This permanently clears conversation history for this thread."),
             destructive: true,
         };
-        self.confirm_then(question, window, cx, move |this, _, cx| {
-            if this.thread_client(&thread_id).is_some() {
-                this.expire_undo(&thread_id);
-                this.thread_command("thread.delete", &thread_id, json!({}), cx);
+        self.confirm_then(question, window, cx, move |this, window, cx| {
+            if this.thread_client(&thread_id).is_none() {
+                return;
             }
+            this.expire_undo(&thread_id);
+            let was_open = this.open_thread_id() == Some(&*thread_id);
+            let sort_order =
+                this.client_settings.values.get("sidebarThreadSortOrder").as_str().unwrap_or_default().to_owned();
+            let fallback =
+                fallback_after_delete(&this.shell.threads, &thread_id, &sort_order, now_ms()).map(str::to_owned);
+            let id = thread_id.clone();
+            this.thread_command_then("thread.delete", &thread_id, json!({}), window, cx, move |this, window, cx| {
+                // The deletion event may already have closed it; another thread opened since stays.
+                if !was_open || !(this.target.is_none() || this.open_thread_id() == Some(&*id)) {
+                    return;
+                }
+                match fallback.filter(|next| this.thread(next).is_some()) {
+                    Some(next) => this.select_thread(next, window, cx),
+                    // The index route lands on a draft in the most recently active project.
+                    None => {
+                        let landing = inbox::most_recent_project(&this.shell.projects, &this.shell.threads);
+                        if let Some(project_id) = landing.map(|p| p.id.clone()) {
+                            this.start_draft(project_id, window, cx);
+                        }
+                    }
+                }
+            });
         });
     }
 
@@ -973,5 +1025,57 @@ impl ThreadMenu {
         let delete =
             if cfg!(target_os = "macos") { item("Delete").icon(Icon::new(Lucide::Trash)) } else { item("Delete") };
         menu.item(act!(delete, |this, window, cx, id| this.delete_thread(&id, window, cx)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::fallback_after_delete;
+    use crate::model::ThreadShell;
+
+    fn thread(id: &str, project: &str, extra: serde_json::Value) -> ThreadShell {
+        let mut value = json!({
+            "id": id, "projectId": project, "title": id, "status": "idle",
+            "createdAt": "2026-11-01T00:00:00.000Z", "updatedAt": "2026-11-01T00:00:00.000Z",
+            "lineage": {"rootThreadId": id},
+        });
+        value.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn deleting_falls_back_to_the_newest_open_thread_in_its_project() {
+        let now = crate::timestamp::parse_ms("2026-11-04T00:00:00.000Z").unwrap();
+        let threads = [
+            thread("gone", "p", json!({})),
+            thread("old", "p", json!({"latestUserMessageAt": "2026-11-02T00:00:00.000Z"})),
+            thread(
+                "new",
+                "p",
+                json!({"latestUserMessageAt": "2026-11-03T00:00:00.000Z", "createdAt": "2026-10-01T00:00:00.000Z"}),
+            ),
+            thread(
+                "settled",
+                "p",
+                json!({"latestUserMessageAt": "2026-11-03T12:00:00.000Z", "settledOverride": "settled"}),
+            ),
+            thread(
+                "snoozed",
+                "p",
+                json!({"latestUserMessageAt": "2026-11-03T12:00:00.000Z", "snoozedUntil": "2026-11-05T00:00:00.000Z"}),
+            ),
+            thread(
+                "archived",
+                "p",
+                json!({"latestUserMessageAt": "2026-11-03T12:00:00.000Z", "archivedAt": "2026-11-03T00:00:00.000Z"}),
+            ),
+            thread("elsewhere", "q", json!({"latestUserMessageAt": "2026-11-03T12:00:00.000Z"})),
+        ];
+        assert_eq!(fallback_after_delete(&threads, "gone", "updated_at", now), Some("new"));
+        assert_eq!(fallback_after_delete(&threads, "gone", "created_at", now), Some("old"));
+        assert_eq!(fallback_after_delete(&threads, "elsewhere", "updated_at", now), None);
+        assert_eq!(fallback_after_delete(&threads, "missing", "updated_at", now), None);
     }
 }
