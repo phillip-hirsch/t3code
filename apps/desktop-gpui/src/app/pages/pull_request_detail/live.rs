@@ -514,7 +514,7 @@ impl Workspace {
                 this.pull_requests.panel_width = Some(clamp_panel_width(width, available));
                 cx.notify();
             }))
-            .child(self.render_pr_tab_strip(&t, cx))
+            .child(self.render_pr_tab_strip(&t, window, cx))
             .child(div().flex_1().min_h_0().child(self.render_pull_request_panel(None, window, cx)))
             .when(!maximized, |el| el.child(deferred(handle).with_priority(1)))
             .children(self.pull_requests.tab_menu.as_ref().map(|(menu, position, _)| {
@@ -526,8 +526,24 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// The open pull requests, each a tab whose glyph turns into its close button on hover.
-    fn render_pr_tab_strip(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+    /// The open pull requests, each a tab whose glyph turns into its close button on hover or
+    /// keyboard focus.
+    fn render_pr_tab_strip(&mut self, t: &Tokens, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let keys: HashSet<String> = self.pull_requests.tabs.iter().map(Reference::key).collect();
+        let focus = &mut self.pull_requests.tab_focus;
+        focus.retain(|key, _| keys.contains(key));
+        for key in keys {
+            focus.entry(key).or_insert_with(|| [cx.focus_handle().tab_stop(true), cx.focus_handle().tab_stop(true)]);
+        }
+        let keyboard = window.last_input_was_keyboard();
+        // `focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring`
+        let ring = |focus: &gpui_kit::FocusHandle| {
+            (keyboard && focus.is_focused(window))
+                .then(|| vec![gpui_kit::BoxShadow::new(px(0.), px(0.), t.ring).spread_radius(px(1.)).inset()])
+        };
+        let pressed = |event: &gpui_kit::KeyDownEvent| {
+            matches!(event.keystroke.key.as_str(), "enter" | "space") && !event.keystroke.modifiers.modified()
+        };
         let active = self.pull_requests.panel.as_ref().map(|p| p.reference.clone());
         let tabs: Vec<AnyElement> = self
             .pull_requests
@@ -553,6 +569,9 @@ impl Workspace {
                 let group: SharedString = format!("pr-tab:{key}").into();
                 let (close, middle, activate) = (reference.clone(), reference.clone(), reference.clone());
                 let (menu, dragged, onto) = (reference.clone(), reference.clone(), reference.clone());
+                let (close_key, activate_key) = (reference.clone(), reference.clone());
+                let [close_focus, title_focus] = self.pull_requests.tab_focus[&key].clone();
+                let close_visible = keyboard && close_focus.is_focused(window);
                 let (accent, foreground, muted) = (t.accent, t.foreground, t.muted);
                 h_flex()
                     .id(ElementId::Name(group.clone()))
@@ -585,15 +604,24 @@ impl Workspace {
                             .justify_center()
                             .rounded(px(4.))
                             .hover(move |s| s.bg(muted))
+                            .track_focus(&close_focus)
+                            .when_some(ring(&close_focus), gpui_kit::Styled::shadow)
+                            .on_key_down(cx.listener(move |this, event: &gpui_kit::KeyDownEvent, _, cx| {
+                                if pressed(event) {
+                                    cx.stop_propagation();
+                                    this.close_pr_tab(&close_key, cx);
+                                }
+                            }))
                             .child(
                                 div()
+                                    .when(close_visible, gpui_kit::Styled::invisible)
                                     .group_hover(group.clone(), gpui_kit::Styled::invisible)
                                     .child(Icon::new(icon).with_size(px(12.)).text_color(color)),
                             )
                             .child(
                                 div()
                                     .absolute()
-                                    .invisible()
+                                    .when(!close_visible, gpui_kit::Styled::invisible)
                                     .group_hover(group, gpui_kit::Styled::visible)
                                     .child(Icon::new(Lucide::X).with_size(px(12.))),
                             )
@@ -603,7 +631,23 @@ impl Workspace {
                                 this.close_pr_tab(&close, cx);
                             })),
                     )
-                    .child(div().min_w_0().truncate().child(label))
+                    .child(
+                        div()
+                            .id(ElementId::Name(format!("pr-tab-title:{key}").into()))
+                            .min_w_0()
+                            .truncate()
+                            .rounded(px(2.))
+                            .track_focus(&title_focus)
+                            .when_some(ring(&title_focus), gpui_kit::Styled::shadow)
+                            .on_key_down(cx.listener(move |this, event: &gpui_kit::KeyDownEvent, _, cx| {
+                                if pressed(event) {
+                                    cx.stop_propagation();
+                                    let seed = this.pull_requests.entry_for(&activate_key);
+                                    this.open_pull_request_panel(activate_key.clone(), seed, cx);
+                                }
+                            }))
+                            .child(label),
+                    )
                     .on_mouse_down(
                         MouseButton::Middle,
                         cx.listener(move |this, _, _, cx| this.close_pr_tab(&middle, cx)),
