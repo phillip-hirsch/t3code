@@ -32,6 +32,8 @@ pub(super) struct ComposerUi {
     implementing: bool,
     /// Why the last send was refused for length; it follows edits until it clears.
     pub(super) length_error: Option<String>,
+    /// The context meter's popover.
+    pub(super) meter: super::composer_meter::MeterPopup,
     /// The footer controls row's laid-out width, and how its mode block fit there last.
     pub(super) footer_host: Option<f32>,
     pub(super) mode_fit: super::composer_fit::ModeFit,

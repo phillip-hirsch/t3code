@@ -350,7 +350,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> bool {
         // The permissions popover nests in the model picker's footer, so it takes the keys first.
-        if self.permissions_key(keystroke, window, cx) {
+        if self.permissions_key(keystroke, window, cx) || self.context_meter_key(keystroke, cx) {
             return true;
         }
         if self.model_picker_open() {
@@ -1908,6 +1908,7 @@ pub(super) fn control_button(id: &'static str, t: &Tokens) -> Button {
 const ATTACH: usize = 0;
 const STOP: usize = 1;
 pub(super) const PRIMARY: usize = 2;
+pub(super) const METER: usize = 3;
 
 /// A `<button>`: a tab stop that Enter and Space press, ringed while keyboard-focused, which a
 /// click leaves the composer focused past (`preventPointerFocus`).
