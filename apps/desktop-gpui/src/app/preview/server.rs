@@ -11,13 +11,14 @@ use std::time::Duration;
 
 use futures::{SinkExt as _, StreamExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::{Disableable as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, Bounds, ClickEvent, Context, FocusHandle, InteractiveElement as _, IntoElement, KeyDownEvent,
-    KeyUpEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
-    ParentElement as _, Pixels, Point, RenderImage, ScrollDelta, ScrollEvent, SharedString, Styled as _,
-    StyledImage as _, Task, Window, canvas, div, img, px,
+    AnyElement, App, AppContext as _, Bounds, ClickEvent, Context, Entity, FocusHandle, InteractiveElement as _,
+    IntoElement, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ObjectFit, ParentElement as _, Pixels, Point, RenderImage, ScrollDelta, ScrollEvent, SharedString,
+    Styled as _, StyledImage as _, Task, Window, canvas, div, img, px,
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -49,6 +50,13 @@ struct Dialog {
     kind: String,
     message: String,
     default_value: String,
+}
+
+/// The text a prompt's response field resets to when the page's dialog changes
+/// (`setPromptText(next.dialog?.defaultValue ?? "")`), else `None` to keep the user's edit.
+fn prompt_reset(previous: Option<&Dialog>, next: Option<&Dialog>) -> Option<String> {
+    let key = |dialog: Option<&Dialog>| dialog.map(|d| (d.message.clone(), d.default_value.clone()));
+    (key(previous) != key(next)).then(|| next.map(|d| d.default_value.clone()).unwrap_or_default())
 }
 
 impl Control {
@@ -138,6 +146,8 @@ pub(super) struct ServerStream {
     sent_size: Option<(u32, u32)>,
     buttons: u8,
     focus: FocusHandle,
+    /// A `prompt` dialog's response.
+    prompt: Entity<InputState>,
     _task: Task<()>,
 }
 
@@ -247,6 +257,7 @@ impl Workspace {
             sent_size: None,
             buttons: 0,
             focus: cx.focus_handle(),
+            prompt: cx.new(|cx| InputState::new(window, cx)),
             _task: task,
         };
         self.preview.server.streams.insert(tab_id.to_owned(), stream);
@@ -275,6 +286,10 @@ impl Workspace {
             Incoming::Message(message) => match message["type"].as_str() {
                 Some("control") => {
                     let Some(control) = Control::parse(&message) else { return };
+                    let previous = stream.control.as_ref().and_then(|c| c.dialog.as_ref());
+                    if let Some(text) = prompt_reset(previous, control.dialog.as_ref()) {
+                        stream.prompt.update(cx, |input, cx| input.set_value(text, window, cx));
+                    }
                     let gained = control.mine() && !stream.control.as_ref().is_some_and(Control::mine);
                     stream.control = Some(control);
                     if gained {
@@ -442,13 +457,13 @@ impl Workspace {
                     cx.stop_propagation();
                 }
             }))
-            .on_key_down(cx.listener(move |this, e: &KeyDownEvent, _, cx| {
-                if this.server_key(&key_tab, "down", &e.keystroke, cx) {
+            .on_key_down(cx.listener(move |this, e: &KeyDownEvent, window, cx| {
+                if this.server_key(&key_tab, "down", &e.keystroke, window, cx) {
                     cx.stop_propagation();
                 }
             }))
-            .on_key_up(cx.listener(move |this, e: &KeyUpEvent, _, cx| {
-                if this.server_key(&key_up_tab, "up", &e.keystroke, cx) {
+            .on_key_up(cx.listener(move |this, e: &KeyUpEvent, window, cx| {
+                if this.server_key(&key_up_tab, "up", &e.keystroke, window, cx) {
                     cx.stop_propagation();
                 }
             }));
@@ -474,6 +489,8 @@ impl Workspace {
                 .border_color(tokens.border)
                 .bg(tokens.background)
                 .shadow_lg()
+                // Presses on the dialog reach its controls, not the page under it.
+                .occlude()
         };
         let cover = || {
             v_flex()
@@ -538,15 +555,15 @@ impl Workspace {
         }
         let control = stream.control.as_ref()?;
         let dialog = control.dialog.as_ref()?;
+        let is_prompt = dialog.kind == "prompt";
         let respond = |id: &'static str, label: &'static str, accept: bool, cx: &mut Context<Self>| {
-            let (tab, prompt) = (tab.clone(), dialog.default_value.clone());
-            let is_prompt = dialog.kind == "prompt";
+            let (tab, prompt) = (tab.clone(), stream.prompt.clone());
             let button = Button::new(id).small().label(label);
             let button = if accept { button.primary() } else { button.outline() };
-            button.on_click(cx.listener(move |this, _: &ClickEvent, _, _| {
+            button.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 let mut input = json!({"type": "dialog", "accept": accept});
                 if accept && is_prompt {
-                    input["promptText"] = prompt.clone().into();
+                    input["promptText"] = prompt.read(cx).value().to_string().into();
                 }
                 this.send_server_input(&tab, input);
             }))
@@ -556,7 +573,7 @@ impl Workspace {
                 .child(div().text_sm().child(SharedString::from(dialog.message.clone())))
                 .map(|el| {
                     if control.mine() {
-                        el.child(
+                        el.when(is_prompt, |el| el.child(Input::new(&stream.prompt))).child(
                             h_flex()
                                 .justify_end()
                                 .gap_2()
@@ -649,9 +666,17 @@ impl Workspace {
         )
     }
 
-    fn server_key(&mut self, tab_id: &str, action: &str, keystroke: &Keystroke, cx: &mut Context<Self>) -> bool {
+    fn server_key(
+        &mut self,
+        tab_id: &str,
+        action: &str,
+        keystroke: &Keystroke,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Some(stream) = self.preview.server.streams.get(tab_id) else { return false };
-        if !stream.control.as_ref().is_some_and(Control::mine) {
+        // Keys typed into the page's own overlays, such as a prompt's response, stay there.
+        if !stream.control.as_ref().is_some_and(Control::mine) || !stream.focus.is_focused(window) {
             return false;
         }
         let m = &keystroke.modifiers;
@@ -1002,7 +1027,13 @@ mod tests {
         let dialog = Control::parse(&json!({"canOperate": true, "controller": "you", "generation": 2,
             "dialog": {"type": "prompt", "message": "Name?", "defaultValue": "x"}}))
         .unwrap();
-        assert_eq!(dialog.dialog.unwrap().default_value, "x");
+        let prompt = dialog.dialog.unwrap();
+        assert_eq!(prompt.default_value, "x");
+        assert_eq!(prompt_reset(None, Some(&prompt)).as_deref(), Some("x"), "a new prompt shows its default");
+        assert_eq!(prompt_reset(Some(&prompt), Some(&prompt.clone())), None, "a repeated control keeps the edit");
+        let next = Dialog { message: "Age?".into(), ..prompt.clone() };
+        assert_eq!(prompt_reset(Some(&prompt), Some(&next)).as_deref(), Some("x"), "another prompt resets");
+        assert_eq!(prompt_reset(Some(&prompt), None).as_deref(), Some(""), "a closed dialog clears it");
     }
 
     #[test]
