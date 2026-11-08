@@ -6,6 +6,7 @@ use gpui_kit::component::button::ButtonVariants as _;
 use gpui_kit::component::dialog::DialogEntrance;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{Disableable as _, IconName, Sizable as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, FontWeight, IntoElement, ParentElement as _, SharedString,
     Styled as _, Subscription, WeakEntity, Window, div, px,
@@ -54,6 +55,7 @@ fn source_id_from_url(url: &str, sources: &Map<String, Value>) -> String {
 impl Workspace {
     pub(in crate::app) fn render_usage_limit_sources(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme::tokens(cx);
+        let read_only = self.providers_read_only();
         let sources = self.settings_info().settings["usageLimitSources"].as_object().cloned().unwrap_or_default();
         let mut rows = v_flex();
         if sources.is_empty() {
@@ -74,15 +76,15 @@ impl Workspace {
                 &t,
                 label,
                 Some(div().child(description).into_any_element()),
-                Some(
+                (!read_only).then(|| {
                     button(SharedString::from(format!("remove-hub-{id}")), "Remove")
                         .ghost()
                         .xsmall()
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.confirm_remove_hub(id.clone(), remove_label.clone(), window, cx);
                         }))
-                        .into_any_element(),
-                ),
+                        .into_any_element()
+                }),
             ));
         }
         v_flex()
@@ -99,13 +101,15 @@ impl Workspace {
                             .text_color(t.foreground)
                             .child("Usage providers"),
                     )
-                    .child(
-                        button("add-usage-hub", "Add hub")
-                            .outline()
-                            .xsmall()
-                            .icon(IconName::Plus)
-                            .on_click(cx.listener(|this, _, window, cx| this.open_add_hub_dialog(window, cx))),
-                    ),
+                    .when(!read_only, |el| {
+                        el.child(
+                            button("add-usage-hub", "Add hub")
+                                .outline()
+                                .xsmall()
+                                .icon(IconName::Plus)
+                                .on_click(cx.listener(|this, _, window, cx| this.open_add_hub_dialog(window, cx))),
+                        )
+                    }),
             )
             .child(super::group(rows, true, &t))
             .into_any_element()
@@ -129,7 +133,11 @@ impl Workspace {
                 .on_ok(move |_, _, cx| {
                     let patch = json!({ "usageLimitSources": { id.clone(): null } });
                     let scope = scope.clone();
-                    let _ = workspace.update(cx, |this, cx| this.update_settings_on(scope, patch, cx, |_, _, _| {}));
+                    let _ = workspace.update(cx, |this, cx| {
+                        if !this.providers_read_only_on(scope.as_deref()) {
+                            this.update_settings_on(scope, patch, cx, |_, _, _| {});
+                        }
+                    });
                     true
                 })
         });
@@ -211,7 +219,11 @@ impl AddHub {
         }
         let patch = json!({ "usageLimitSources": { id: source } });
         let scope = self.scope.clone();
-        let _ = self.workspace.update(cx, |this, cx| this.update_settings_on(scope, patch, cx, |_, _, _| {}));
+        let _ = self.workspace.update(cx, |this, cx| {
+            if !this.providers_read_only_on(scope.as_deref()) {
+                this.update_settings_on(scope, patch, cx, |_, _, _| {});
+            }
+        });
         window.close_dialog(cx);
     }
 

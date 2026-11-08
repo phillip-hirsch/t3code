@@ -66,7 +66,9 @@ impl Workspace {
 impl AccountSection {
     /// `runCommand`: one setup request at a time, labelled while it runs.
     fn run_setup(&mut self, label: &'static str, tag: &'static str, payload: Value, cx: &mut Context<Self>) {
-        let Some(client) = self.client(cx).filter(|_| self.setup_pending.is_none()) else { return };
+        let read_only =
+            self.workspace.upgrade().is_none_or(|w| w.read(cx).providers_read_only_on(self.scope.as_deref()));
+        let Some(client) = self.client(cx).filter(|_| self.setup_pending.is_none() && !read_only) else { return };
         self.setup_pending = Some(label);
         self.setup_error = None;
         cx.notify();
@@ -111,7 +113,7 @@ impl AccountSection {
         let Some((workspace, scope)) = self.workspace.upgrade().zip(self.scope.clone()) else {
             return div().into_any_element();
         };
-        let (instance, provider, environment, client) = {
+        let (instance, provider, environment, client, read_only) = {
             let workspace = workspace.read(cx);
             let Some(info) = workspace.env_info(&scope) else { return div().into_any_element() };
             (
@@ -123,6 +125,7 @@ impl AccountSection {
                 info.provider(&self.instance_id).cloned(),
                 info.environment_label.clone().unwrap_or_else(|| "this environment".into()),
                 workspace.env_client(&scope),
+                workspace.providers_read_only_on(Some(&scope)),
             )
         };
         let enabled = crate::settings::scope::instance_enabled(&instance);
@@ -135,7 +138,7 @@ impl AccountSection {
             .gap_2()
             .text_xs()
             .child(div().text_color(t.muted_foreground).child(environment.clone()))
-            .when(!enabled, |el| {
+            .when(!enabled && !read_only, |el| {
                 el.child(button("antigravity-enable", "Enable Antigravity").outline().on_click(cx.listener(
                     move |this, _, window, cx| {
                         let mut next = enable_instance.clone();
@@ -153,6 +156,17 @@ impl AccountSection {
             Some(text("Device that runs this provider.")),
             Some(environment_control.into_any_element()),
         );
+        if read_only {
+            return v_flex()
+                .child(environment_row)
+                .child(rule().child(settings_row(
+                    &t,
+                    "Setup unavailable",
+                    Some(text("Provider setup is read-only.")),
+                    None,
+                )))
+                .into_any_element();
+        }
         let Some(provider) = provider.filter(|provider| provider.setup.is_some()) else {
             return v_flex()
                 .child(environment_row)

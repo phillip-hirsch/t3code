@@ -758,6 +758,11 @@ impl Workspace {
         self.provider_access() != ProviderAccess::Editable
     }
 
+    /// [`Self::providers_read_only`] for the environment a dialog or section opened on.
+    pub(super) fn providers_read_only_on(&self, environment: Option<&str>) -> bool {
+        environment.is_none_or(|environment| !self.environment_grants(environment, PROVIDERS_MANAGE))
+    }
+
     fn providers_request(
         &mut self,
         method: &'static str,

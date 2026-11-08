@@ -1128,6 +1128,7 @@ impl Workspace {
 
         // Header: badge, version, update advisory, reset or delete.
         let advisory = self.render_version_advisory(page, row, &facts, false, &t, cx);
+        let read_only = self.providers_read_only();
         let header_action = h_flex()
             .gap(px(6.))
             .when_some(driver.and_then(|d| d.badge_label), |el, badge| {
@@ -1146,25 +1147,38 @@ impl Workspace {
                 el.child(div().font_family(t.fonts.mono).text_xs().text_color(t.muted_foreground).child(version))
             })
             .children(advisory)
-            .when(row.is_default && row.is_dirty, |el| {
-                let reset = row.clone();
+            // `inert={readOnly}` with `opacity-50` around the reset and delete; `empty:hidden`.
+            .when(!row.is_default || row.is_dirty, |el| {
                 el.child(
-                    ghost_icon_button("provider-reset", gpui_kit::assets::IconName::Undo2, &t)
-                        .size(px(20.))
-                        .tooltip(format!("Reset {} provider settings", driver.map_or(row.driver.as_str(), |d| d.label)))
-                        .on_click(
-                            cx.listener(move |this, _, window, cx| this.confirm_reset_instance(&reset, window, cx)),
-                        ),
-                )
-            })
-            .when(!row.is_default, |el| {
-                let remove = row.clone();
-                el.child(
-                    ghost_icon_button("provider-delete", Icon::empty().path("icons/trash-2.svg"), &t)
-                        .tooltip(format!("Delete instance {}", row.id))
-                        .on_click(
-                            cx.listener(move |this, _, window, cx| this.confirm_delete_instance(&remove, window, cx)),
-                        ),
+                    h_flex()
+                        .gap_1()
+                        .when(read_only, |el| el.opacity(0.5))
+                        .when(row.is_default && row.is_dirty, |el| {
+                            let reset = row.clone();
+                            el.child(
+                                ghost_icon_button("provider-reset", gpui_kit::assets::IconName::Undo2, &t)
+                                    .size(px(20.))
+                                    .disabled(read_only)
+                                    .tooltip(format!(
+                                        "Reset {} provider settings",
+                                        driver.map_or(row.driver.as_str(), |d| d.label)
+                                    ))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.confirm_reset_instance(&reset, window, cx);
+                                    })),
+                            )
+                        })
+                        .when(!row.is_default, |el| {
+                            let remove = row.clone();
+                            el.child(
+                                ghost_icon_button("provider-delete", Icon::empty().path("icons/trash-2.svg"), &t)
+                                    .disabled(read_only)
+                                    .tooltip(format!("Delete instance {}", row.id))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.confirm_delete_instance(&remove, window, cx);
+                                    })),
+                            )
+                        }),
                 )
             });
 
@@ -1345,7 +1359,11 @@ impl Workspace {
             parts.push(div().min_w_0().child(format!("· {detail}")).into_any_element());
         }
         let diagnostic = facts.diagnostic.clone();
-        let url_auth = live.and_then(|p| p.pointer("/auth/action")).filter(|a| a.is_object()).cloned();
+        // `onAcceptUrlAuth` is unset while read-only.
+        let url_auth = live
+            .and_then(|p| p.pointer("/auth/action"))
+            .filter(|a| a.is_object() && !self.providers_read_only())
+            .cloned();
         v_flex()
             .pt(px(2.))
             .text_xs()
@@ -1922,6 +1940,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.providers_read_only() {
+            return;
+        }
         let view = cx.entity().downgrade();
         window.open_alert_dialog(cx, move |alert, _, _| {
             let alert = alert.entrance(DialogEntrance::None);
@@ -1935,6 +1956,9 @@ impl Workspace {
                 .on_ok(move |_, window, cx| {
                     let (instance_id, uninstall_agent) = (instance_id.clone(), uninstall_agent.clone());
                     let _ = view.update(cx, |this, cx| {
+                        if this.providers_read_only() {
+                            return;
+                        }
                         let payload = json!({
                             "patch": {},
                             "providerInstanceMutation": {"operation": "remove", "instanceId": instance_id},
