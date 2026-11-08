@@ -100,7 +100,8 @@ impl Workspace {
         };
         let cwd = self.composer_cwd();
         if trigger.kind == TriggerKind::Path {
-            self.search_files(trigger.query.trim().to_owned(), cwd, cx);
+            let machines = self.machine_items(&trigger.query);
+            self.search_files(trigger.query.trim().to_owned(), cwd, machines, cx);
             return;
         }
         self.menu._search = None;
@@ -159,11 +160,28 @@ impl Workspace {
         .detach();
     }
 
-    fn search_files(&mut self, query: String, cwd: Option<String>, cx: &mut Context<Self>) {
+    /// `@` lists other machines first while this one offers links (`offersLinkedEnvironments`).
+    fn machine_items(&self, query: &str) -> Vec<MenuItem> {
+        let info = self.server_info();
+        let Some(here) = self.active_environment() else { return Vec::new() };
+        if !info.capability("peerLinks") || !info.settings.bool("linkedEnvironmentsEnabled") {
+            return Vec::new();
+        }
+        let machines: Vec<(&str, &str, &str)> = (self.sessions().iter())
+            .filter_map(|session| {
+                let id = session.id.as_deref()?;
+                let label = session.server_info.environment_label.as_deref().unwrap_or(id);
+                Some((id, label, session.server_info.machine_kind()))
+            })
+            .collect();
+        composer_search::environment_items(machines, here, query)
+    }
+
+    fn search_files(&mut self, query: String, cwd: Option<String>, machines: Vec<MenuItem>, cx: &mut Context<Self>) {
         let (Some(cwd), Some(client), false) = (cwd, self.client(), query.is_empty()) else {
             self.menu._search = None;
             self.menu.loading = false;
-            self.menu.items = Rc::default();
+            self.menu.items = Rc::from(machines);
             return;
         };
         self.menu.loading = true;
@@ -177,13 +195,14 @@ impl Workspace {
                     return;
                 }
                 this.menu.loading = false;
-                this.menu.items = Rc::from(match result {
+                let files = match result {
                     Ok(value) => composer_search::file_items(&value),
                     Err(error) => {
                         log::warn!("file search failed: {error}");
                         Vec::new()
                     }
-                });
+                };
+                this.menu.items = machines.into_iter().chain(files).collect();
                 this.menu.highlighted = 0;
                 cx.notify();
             });
@@ -237,6 +256,12 @@ impl Workspace {
             MenuAction::SideChat(_) if self.side_chat_disabled_reason().is_some() => return,
             MenuAction::SideChat(command) => (format!("/{command} "), None),
             MenuAction::Model | MenuAction::Mode(_) | MenuAction::Clear => (String::new(), None),
+            // `environmentContextRecord`: the record rebuilds from the reference at send.
+            MenuAction::Environment { environment_id, .. } => {
+                let id = format!("environment_{environment_id}");
+                let link = composer_text::context_link("environment", &id, &item.label);
+                (link, Some(Chip::Context { kind: "environment".into(), id, label: item.label.clone() }))
+            }
         };
         self.menu.trigger = None;
         self.composer.update(cx, |state, cx| {
@@ -357,6 +382,9 @@ fn edge_fade(surface: Hsla, top: bool) -> gpui_kit::Div {
 fn menu_row(item: &MenuItem, kind: TriggerKind, active: bool, t: &Tokens) -> gpui_kit::Stateful<gpui_kit::Div> {
     let icon = match &item.action {
         MenuAction::File { directory: true, .. } => Some(Icon::new(Lucide::Folder).text_color(t.muted_foreground)),
+        MenuAction::Environment { machine, .. } => {
+            Some(Icon::new(super::host_picker::machine_icon(machine)).text_color(t.muted_foreground))
+        }
         // `PierreEntryIcon`: the file tree's per-type glyph.
         MenuAction::File { path, .. } => {
             let (asset, color) = crate::file_icons::file_icon(path, t.dark);

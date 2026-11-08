@@ -819,6 +819,11 @@ impl Workspace {
         let outline = if t.dark { white(0.05) } else { black(0.08) };
         let view = cx.weak_entity();
         let chip_view = view.clone();
+        let machines: Rc<[(String, Lucide)]> = (self.sessions().iter())
+            .filter_map(|s| {
+                Some((s.id.as_ref()?.to_string(), super::host_picker::machine_icon(s.server_info.machine_kind())))
+            })
+            .collect();
         let editor = Textarea::new(&self.composer)
             .appearance(false)
             .xsmall()
@@ -827,7 +832,7 @@ impl Workspace {
             .line_height(px(t.fonts.prompt_size * PROMPT_LEADING))
             .mx(px(-4.))
             .disabled(self.target.is_none())
-            .token(move |token, _, _| render_chip(token, &t))
+            .token(move |token, _, _| render_chip(token, &machines, &t))
             // A file chip opens its preview: an uploaded file's (`composerContextActions.openFile`), or
             // the workspace file a mention names in the panel (`openMention`).
             .on_token_click(move |event, window, cx| match Chip::from_id(event.token().id()) {
@@ -1788,7 +1793,7 @@ fn mark_style(style: u8, t: &Tokens) -> HighlightStyle {
     }
 }
 
-fn render_chip(token: &InlineTokenContext, t: &Tokens) -> AnyElement {
+fn render_chip(token: &InlineTokenContext, machines: &[(String, Lucide)], t: &Tokens) -> AnyElement {
     let id = token.token().id();
     let chip = Chip::from_id(id);
     // `WorkspaceEntryTooltip`: a mention names its workspace path.
@@ -1800,6 +1805,12 @@ fn render_chip(token: &InlineTokenContext, t: &Tokens) -> AnyElement {
         Some(Chip::Skill { .. }) => (rgb(0xb261be), Lucide::Box),
         Some(Chip::Context { kind, .. }) if kind == "image" => (rgb(0x0090cd), Lucide::Image),
         Some(Chip::Context { kind, .. }) if kind == "terminal" => (rgb(0x0090cd), Lucide::Terminal),
+        // `EnvironmentContextChip`: the machine's own icon.
+        Some(Chip::Context { kind, id, .. }) if kind == "environment" => {
+            let environment = id.strip_prefix("environment_").unwrap_or_default();
+            let icon = machines.iter().find(|(id, _)| id == environment).map_or(Lucide::Server, |(_, icon)| *icon);
+            (rgb(0x0090cd), icon)
+        }
         Some(Chip::Context { .. }) => (rgb(0x0090cd), Lucide::File),
         _ => (rgb(0x0096af), Lucide::File),
     };

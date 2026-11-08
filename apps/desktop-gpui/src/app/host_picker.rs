@@ -477,7 +477,7 @@ impl Workspace {
 }
 
 /// `EnvironmentMachineIcon`.
-fn machine_icon(machine: &str) -> Lucide {
+pub(super) fn machine_icon(machine: &str) -> Lucide {
     match machine {
         "desktop" | "mac-studio" | "mac-mini" => Lucide::Monitor,
         "laptop" => Lucide::Laptop,

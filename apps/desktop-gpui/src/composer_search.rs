@@ -37,6 +37,11 @@ pub enum MenuAction {
     Clear,
     /// `/side` or `/btw` puts its command at the prompt start, ready to send as a side chat.
     SideChat(&'static str),
+    /// `@` another machine: a context reference its agents can work on.
+    Environment {
+        environment_id: String,
+        machine: String,
+    },
 }
 
 /// The skills and commands a provider offers from `cwd`, falling back to its global lists.
@@ -303,6 +308,7 @@ pub fn slash_items(
             MenuAction::Command { name } => format!("1\0{name}"),
             MenuAction::Skill { name, .. } => format!("2\0{name}"),
             MenuAction::File { path, .. } => path.clone(),
+            MenuAction::Environment { environment_id, .. } => environment_id.clone(),
         },
     )
 }
@@ -326,10 +332,44 @@ pub fn file_items(result: &serde_json::Value) -> Vec<MenuItem> {
         .collect()
 }
 
+/// `matchComposerEnvironmentItems`: the other machines, as (id, label, machine kind), whose name
+/// holds the query.
+pub fn environment_items<'a>(
+    environments: impl IntoIterator<Item = (&'a str, &'a str, &'a str)>,
+    current: &str,
+    query: &str,
+) -> Vec<MenuItem> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    environments
+        .into_iter()
+        .filter(|(id, label, _)| *id != current && label.to_lowercase().contains(&query))
+        .map(|(id, label, machine)| MenuItem {
+            id: format!("environment:{id}"),
+            label: label.to_owned(),
+            description: "Machine".to_owned(),
+            action: MenuAction::Environment { environment_id: id.to_owned(), machine: machine.to_owned() },
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn machines_match_by_name_and_leave_out_this_one() {
+        let machines = [("here", "Studio", "desktop"), ("e2", "Build box", "server"), ("e3", "Laptop", "laptop")];
+        let ids = |query| environment_items(machines, "here", query).into_iter().map(|i| i.id).collect::<Vec<_>>();
+        assert_eq!(ids(" BO "), ["environment:e2"]);
+        assert_eq!(ids("studio"), Vec::<String>::new());
+        assert_eq!(ids(""), Vec::<String>::new());
+        let item = &environment_items(machines, "here", "lap")[0];
+        assert_eq!((item.label.as_str(), item.description.as_str()), ("Laptop", "Machine"));
+    }
 
     fn skills() -> Vec<ProviderSkill> {
         serde_json::from_value(json!([

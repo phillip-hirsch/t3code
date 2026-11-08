@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 use super::composer::ComposerDraft;
 use super::snap_shot::SnapShotSource;
 use super::{Target, Workspace, new_id};
-use crate::composer_text;
+use crate::composer_text::{self, Chip};
 use crate::theme::Tokens;
 
 pub(super) const MAX_ATTACHMENTS: usize = 100;
@@ -719,6 +719,7 @@ impl Workspace {
         }
         let mut attachments = Vec::new();
         let mut records = self.terminal_context_records(text);
+        records.extend(environment_context_records(text));
         for attachment in &self.attachments {
             let Upload::Ready(id) = &attachment.upload else { continue };
             let (sent, record) = attachment.wire(id, text);
@@ -943,9 +944,37 @@ fn ghost_icon(id: ElementId, icon: Lucide, t: &Tokens) -> gpui_kit::Stateful<gpu
         .child(Icon::new(icon).with_size(px(14.)))
 }
 
+/// `environmentContextRecord` for each machine the prompt mentions, once.
+fn environment_context_records(text: &str) -> Vec<Value> {
+    let mut records: Vec<Value> = Vec::new();
+    for (_, chip) in composer_text::chips(text, |_| false) {
+        let Chip::Context { kind, id, label } = chip else { continue };
+        let Some(environment_id) = id.strip_prefix("environment_").filter(|_| kind == "environment") else { continue };
+        if records.iter().all(|record| record["contextId"] != id.as_str()) {
+            let record = json!({"version": 1, "kind": "environment", "contextId": id, "label": label, "environmentId": environment_id});
+            records.push(record);
+        }
+    }
+    records
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_machine_mention_sends_its_environment_record_once() {
+        let link = composer_text::context_link("environment", "environment_e2", "Build box");
+        let records = environment_context_records(&format!("run on {link} and {link}"));
+        assert_eq!(
+            records,
+            [
+                json!({"version": 1, "kind": "environment", "contextId": "environment_e2", "label": "Build box", "environmentId": "e2"})
+            ]
+        );
+        let terminal = composer_text::context_link("terminal", "terminal_t1", "Shell");
+        assert!(environment_context_records(&format!("see {terminal}")).is_empty());
+    }
 
     #[test]
     fn files_classify_by_extension() {
