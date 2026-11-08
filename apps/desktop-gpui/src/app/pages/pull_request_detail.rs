@@ -904,6 +904,15 @@ impl Workspace {
         panel.description_draft.as_ref().and_then(|d| d.body.clone()).unwrap_or_else(|| detail.body.clone())
     }
 
+    /// A description save begins (`startDescriptionSave`); the key its settle needs.
+    fn start_pr_description_save(&mut self, body: String) -> Option<String> {
+        let panel = self.pull_requests.panel.as_mut()?;
+        let detail = panel.detail.clone()?;
+        let draft = panel.description_draft.take();
+        panel.description_draft = Some(logic::DescriptionDraft::start(draft, &detail.url, detail.observed_at, body));
+        Some(detail.url.clone())
+    }
+
     /// A ticked task saves the description with its marker set (`toggleTask`).
     fn toggle_pr_task(&mut self, item_start: usize, checked: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(detail) = self.pull_requests.panel.as_ref().and_then(|p| p.detail.clone()) else { return };
@@ -914,12 +923,7 @@ impl Workspace {
         };
         let Some(mut payload) = self.pull_requests.panel.as_ref().map(|p| p.reference.to_json()) else { return };
         payload["body"] = json!(next);
-        if let Some(panel) = self.pull_requests.panel.as_mut() {
-            let draft = panel.description_draft.take();
-            panel.description_draft =
-                Some(logic::DescriptionDraft::start(draft, &detail.url, detail.observed_at, next));
-        }
-        let url = detail.url.clone();
+        let Some(url) = self.start_pr_description_save(next) else { return };
         self.run_pr_write(
             "pullRequests.update",
             payload,

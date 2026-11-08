@@ -1249,11 +1249,15 @@ impl Workspace {
             ("pullRequests.updateComment", "Could not save the comment")
         };
         write.saving = true;
-        self.run_pr_write(method, payload, failure.into(), None, window, cx, |this, key, ok, _, _| {
-            if let Some(write) = this.pr_write_of(key) {
-                write.saving = false;
+        let draft_key = if description { self.start_pr_description_save(body) } else { None };
+        self.run_pr_write(method, payload, failure.into(), None, window, cx, move |this, key, ok, _, _| {
+            if let Some(panel) = this.pr_panel(key) {
+                panel.write.saving = false;
                 if ok {
-                    write.editing = None;
+                    panel.write.editing = None;
+                }
+                if let Some(url) = &draft_key {
+                    panel.description_draft = logic::DescriptionDraft::settle(panel.description_draft.take(), url, ok);
                 }
             }
         });
