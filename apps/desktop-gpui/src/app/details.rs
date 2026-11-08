@@ -1005,6 +1005,10 @@ impl Workspace {
         let repository =
             cx.new(|cx| InputState::new(window, cx).default_value(prefill).placeholder("owner/repository"));
         let public = std::rc::Rc::new(std::cell::Cell::new(false));
+        // Advanced: the remote to add (`origin`) and its protocol (SSH unless HTTPS is picked).
+        let remote = cx.new(|cx| InputState::new(window, cx).default_value("origin").placeholder("origin"));
+        let https = std::rc::Rc::new(std::cell::Cell::new(false));
+        let advanced = std::rc::Rc::new(std::cell::Cell::new(false));
         let view = cx.entity();
         let focus = std::cell::Cell::new(true);
         let title: SharedString = format!("Publish to {label}").into();
@@ -1012,55 +1016,118 @@ impl Workspace {
             if focus.replace(false) {
                 repository.focus_handle(cx).focus(window, cx);
             }
-            let visibility = |id: &'static str, text: &'static str, value: bool| {
-                let public = public.clone();
+            let tokens = theme::tokens(cx);
+            let choice = |id: &'static str, text: &'static str, cell: &std::rc::Rc<std::cell::Cell<bool>>, value| {
+                let cell = cell.clone();
                 Button::new(id)
                     .label(text)
                     .small()
-                    .map(|b| if public.get() == value { b.primary() } else { b.outline() })
+                    .map(|b| if cell.get() == value { b.primary() } else { b.outline() })
                     .on_click(move |_, window, _| {
-                        public.set(value);
+                        cell.set(value);
                         window.refresh();
                     })
             };
-            let (repository, public, view, provider) =
-                (repository.clone(), public.clone(), view.clone(), provider.clone());
+            let small_field = |label: &'static str, input: AnyElement| {
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(6.))
+                    .child(div().text_xs().font_weight(gpui_kit::FontWeight::MEDIUM).child(label))
+                    .child(input)
+            };
+            let open = advanced.get();
+            let toggle = {
+                let advanced = advanced.clone();
+                let hover = tokens.foreground;
+                h_flex()
+                    .id("publish-advanced")
+                    .gap(px(4.))
+                    .text_xs()
+                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                    .text_color(tokens.muted_foreground)
+                    .cursor_pointer()
+                    .hover(move |style| style.text_color(hover))
+                    .child(
+                        icon(if open { "icons/chevron-down.svg" } else { "icons/chevron-right.svg" })
+                            .with_size(px(14.)),
+                    )
+                    .child("Advanced")
+                    .on_click(move |_, window, _| {
+                        advanced.set(!advanced.get());
+                        window.refresh();
+                    })
+            };
+            let options = open.then(|| {
+                h_flex()
+                    .mt_3()
+                    .gap_3()
+                    .items_start()
+                    .child(small_field("Remote", Input::new(&remote).into_any_element()))
+                    .child(small_field(
+                        "Protocol",
+                        h_flex()
+                            .gap_2()
+                            .child(choice("publish-ssh", "SSH", &https, false))
+                            .child(choice("publish-https", "HTTPS", &https, true))
+                            .into_any_element(),
+                    ))
+            });
+            let visibility = h_flex()
+                .gap_2()
+                .child(choice("publish-private", "Private", &public, false))
+                .child(choice("publish-public", "Public", &public, true));
+            let (repository, remote, public, https, view, provider) =
+                (repository.clone(), remote.clone(), public.clone(), https.clone(), view.clone(), provider.clone());
             dialog
                 .title(title.clone())
                 .w(px(448.))
-                .child(v_flex().gap_3().child(field("Repository", Input::new(&repository))).child(field(
-                    "Visibility",
-                    h_flex().gap_2().child(visibility("publish-private", "Private", false)).child(visibility(
-                        "publish-public",
-                        "Public",
-                        true,
-                    )),
-                )))
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .child(field("Repository", Input::new(&repository)))
+                        .child(field("Visibility", visibility))
+                        .child(v_flex().child(toggle).children(options)),
+                )
                 .footer(dialog_footer("publish-confirm", "Publish"))
                 .on_ok(move |_, _, cx: &mut App| {
                     let repository = repository.read(cx).value().trim().to_owned();
                     if repository.is_empty() || repository.ends_with('/') {
                         return false;
                     }
-                    let visibility = if public.get() { "public" } else { "private" };
+                    let options = PublishOptions {
+                        visibility: if public.get() { "public" } else { "private" },
+                        remote_name: remote.read(cx).value().trim().to_owned(),
+                        protocol: if https.get() { "https" } else { "ssh" },
+                    };
                     let provider = provider.clone();
-                    view.update(cx, |this, cx| this.publish_repository(provider, repository, visibility, cx));
+                    view.update(cx, |this, cx| this.publish_repository(provider, repository, options, cx));
                     true
                 })
         });
     }
 
-    /// `sourceControl.publishRepository` with the web's defaults: `origin` over SSH.
-    fn publish_repository(&mut self, provider: String, repository: String, visibility: &str, cx: &mut Context<Self>) {
+    /// `sourceControl.publishRepository`; a blank remote name is `origin`, as on the web.
+    fn publish_repository(
+        &mut self,
+        provider: String,
+        repository: String,
+        options: PublishOptions,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_write_source_control() {
+            return;
+        }
         let Some(client) = self.vcs_client() else { return };
         let Some(checkout) = self.vcs.start("Publishing repository...") else { return };
+        let remote_name = if options.remote_name.is_empty() { "origin".to_owned() } else { options.remote_name };
         let input = json!({
             "cwd": checkout.1,
             "provider": provider,
             "repository": repository,
-            "visibility": visibility,
-            "remoteName": "origin",
-            "protocol": "ssh",
+            "visibility": options.visibility,
+            "remoteName": remote_name,
+            "protocol": options.protocol,
         });
         cx.spawn(async move |this, cx| {
             let result = client.request("sourceControl.publishRepository", input).await;
@@ -1417,6 +1484,13 @@ fn publish_provider(discovery: &Value) -> Option<(String, String, Option<String>
         let account = auth["account"]["value"].as_str().map(str::to_owned);
         Some((provider["kind"].as_str()?.to_owned(), provider["label"].as_str()?.to_owned(), account))
     })
+}
+
+/// The publish dialog's visibility and its Advanced remote and protocol.
+struct PublishOptions {
+    visibility: &'static str,
+    remote_name: String,
+    protocol: &'static str,
 }
 
 /// Cancel and the confirming action; the action runs the dialog's `on_ok`.
