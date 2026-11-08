@@ -117,16 +117,8 @@ impl Workspace {
                         pull_requests,
                     };
                     let found = search::match_thread(&tokens, &subject, typos)?;
-                    let used = crate::timestamp::parse_ms(
-                        thread
-                            .latest_user_authored_message_at
-                            .as_ref()
-                            .and_then(Option::as_deref)
-                            .or(thread.latest_user_message_at.as_deref())
-                            .unwrap_or(&thread.updated_at),
-                    )
-                    .unwrap_or(0);
-                    Some((*at, found.quality * search::usage_boost(now - used), found.strong))
+                    let used = search::ThreadUse::of(thread, self.local_opened_at(&thread.id));
+                    Some((*at, found.quality * used.boost(now), found.strong))
                 })
                 .collect();
             found.sort_by(|a, b| {

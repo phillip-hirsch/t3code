@@ -775,6 +775,10 @@ impl Workspace {
         row
     }
 
+    fn thread_use(&self, thread: &crate::model::ThreadShell) -> search::ThreadUse {
+        search::ThreadUse::of(thread, self.local_opened_at(&thread.id))
+    }
+
     /// Threads the palette lists.
     fn palette_threads(&self) -> impl Iterator<Item = &crate::model::ThreadShell> {
         self.shell.threads.iter().filter(|t| listed_in_palette(t))
@@ -969,7 +973,8 @@ impl Workspace {
         let (strict, typos) = if tokens.is_empty() {
             let mut recent: Vec<_> =
                 self.palette_threads().filter(|t| key.current.as_deref() != Some(t.id.as_str())).collect();
-            recent.sort_by_cached_key(|t| std::cmp::Reverse(used_at(t)));
+            // Recent means used recently: written in or opened, whichever is later.
+            recent.sort_by_cached_key(|t| std::cmp::Reverse(self.thread_use(t).recent()));
             let rows = recent.into_iter().take(RECENT_LIMIT).map(|t| (self.thread_row(t, now), false)).collect();
             (RankedThreads { rows, strong: false }, None)
         } else {
@@ -997,9 +1002,11 @@ impl Workspace {
                     pull_requests: &pull_requests,
                 };
                 let found = search::match_thread(tokens, &subject, typos)?;
-                let age = now - used_at(thread);
-                let rank =
-                    if current == Some(thread.id.as_str()) { -1. } else { found.quality * search::usage_boost(age) };
+                let rank = if current == Some(thread.id.as_str()) {
+                    -1.
+                } else {
+                    found.quality * self.thread_use(thread).boost(now)
+                };
                 Some((thread, found.quality, found.strong, rank))
             })
             .collect();

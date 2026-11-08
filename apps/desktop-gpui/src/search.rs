@@ -288,12 +288,82 @@ pub fn class(quality: f32) -> u8 {
     }
 }
 
-/// `threadUsageBoost` without open history: recency of the last user message.
-#[expect(clippy::cast_possible_truncation, reason = "a boost clamped to 1..=2.5")]
-pub fn usage_boost(age_ms: i64) -> f32 {
-    const HALF_LIFE: f64 = 14. * 86_400_000.;
-    let recency = 2f64.powf(-(age_ms.max(0) as f64) / HALF_LIFE);
-    (1. + recency).min(2.5) as f32
+const DAY_MS: f64 = 86_400_000.;
+/// `SEARCH_RECENCY_HALF_LIFE_MS`: activity recency and open counts halve every two weeks.
+const HALF_LIFE_MS: f64 = 14. * DAY_MS;
+/// `PICK_WINDOW_MS`: a pick counts for three weeks from when it was made.
+const PICK_WINDOW_MS: f64 = 21. * DAY_MS;
+
+fn decay(age_ms: f64) -> f64 {
+    2f64.powf(-age_ms.max(0.) / HALF_LIFE_MS)
+}
+
+/// How a thread was used, as `threadSearchSubject` reads it: the user's latest activity and the
+/// thread's opens, this client's own latest open merged in.
+#[derive(Clone, Debug, Default)]
+pub struct ThreadUse {
+    /// Epoch ms.
+    pub activity_at: Option<i64>,
+    pub opens: Option<crate::model::ThreadOpens>,
+}
+
+impl ThreadUse {
+    /// What the user wrote, not agent wakes; a thread the user never wrote in counts from its
+    /// creation, and an older server's missing field falls back to the latest user message.
+    pub fn of(thread: &crate::model::ThreadShell, local_opened_at: Option<i64>) -> Self {
+        let parse = crate::timestamp::parse_ms;
+        let activity_at = match &thread.latest_user_authored_message_at {
+            Some(authored) => parse(authored.as_deref().unwrap_or(&thread.created_at)),
+            None => thread.latest_user_message_at.as_deref().and_then(parse).or_else(|| parse(&thread.updated_at)),
+        };
+        #[expect(clippy::cast_precision_loss, reason = "epoch ms are far below 2^52")]
+        let local = local_opened_at.map(|at| at as f64).filter(|at| *at > 0.);
+        let server = thread.opens.as_ref();
+        let opens = match local {
+            Some(at) if at > server.map_or(0., |o| o.opened_at) => Some(crate::model::ThreadOpens {
+                opened_at: at,
+                ..server.cloned().unwrap_or(crate::model::ThreadOpens { score: 1., ..Default::default() })
+            }),
+            _ => server.cloned(),
+        };
+        Self { activity_at, opens }
+    }
+
+    /// `threadUsageBoost`: 1 for a stale, never-opened thread, about 2 for one active today, and
+    /// up to 2.5 for one opened often.
+    #[expect(clippy::cast_possible_truncation, clippy::cast_precision_loss, reason = "a boost clamped to 1..=2.5")]
+    pub fn boost(&self, now: i64) -> f32 {
+        let now = now as f64;
+        let recency = self.activity_at.map_or(0., |at| decay(now - at as f64));
+        let opens = self.opens.as_ref().map_or(0., |o| o.score * decay(now - o.opened_at));
+        (1. + recency + 0.5 * (1. + opens).log2()).min(2.5) as f32
+    }
+
+    /// `threadRecentUse`: the later of the user's last message and last open.
+    #[expect(clippy::cast_possible_truncation, reason = "epoch ms")]
+    pub fn recent(&self) -> i64 {
+        self.activity_at.unwrap_or(0).max(self.opens.as_ref().map_or(0, |o| o.opened_at as i64))
+    }
+
+    /// `activePick`: when the thread was last picked for this query (exactly, else as a prefix
+    /// of three letters or more), while that pick lasts.
+    #[expect(clippy::cast_precision_loss, reason = "epoch ms")]
+    pub fn picked_at(&self, tokens: &[Vec<char>], now: i64) -> Option<f64> {
+        let query = picked_query(tokens);
+        let prefix = query.chars().count() >= 3;
+        let live = self.opens.iter().flat_map(|o| &o.picks).filter(|pick| now as f64 - pick.at <= PICK_WINDOW_MS);
+        let latest = |picks: &mut dyn Iterator<Item = &crate::model::ThreadPick>| {
+            picks.map(|pick| pick.at).max_by(f64::total_cmp)
+        };
+        latest(&mut live.clone().filter(|pick| pick.query == query))
+            .or_else(|| latest(&mut live.filter(|pick| prefix && pick.query.starts_with(&query))))
+    }
+}
+
+/// `pickedQuery`: the folded query cut to the 32 chars the server stores.
+fn picked_query(tokens: &[Vec<char>]) -> String {
+    let folded: String = tokens.iter().map(|t| t.iter().collect::<String>()).collect::<Vec<_>>().join(" ");
+    folded.chars().take(32).collect::<String>().trim().to_owned()
 }
 
 /// `messageSearchTokens(..).long` is non-empty: the server message search runs.
@@ -466,6 +536,44 @@ pub fn split_ranges(text: &str, ranges: &[Range<usize>]) -> Vec<(String, bool)> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DAY: i64 = 86_400_000;
+
+    fn shell(fields: serde_json::Value) -> crate::model::ThreadShell {
+        let mut value = serde_json::json!({"id": "t", "projectId": "p", "title": "T", "status": "idle",
+            "createdAt": "1970-01-01T00:00:00Z", "updatedAt": "1970-01-02T00:00:00Z"});
+        if let (Some(base), serde_json::Value::Object(fields)) = (value.as_object_mut(), fields) {
+            base.extend(fields);
+        }
+        serde_json::from_value(value).expect("a thread shell")
+    }
+
+    #[test]
+    #[expect(clippy::cast_precision_loss, reason = "test epoch ms")]
+    fn a_thread_is_used_when_written_in_or_opened_here_or_anywhere() {
+        let written = shell(serde_json::json!({"latestUserAuthoredMessageAt": "1970-01-03T00:00:00Z"}));
+        assert_eq!(ThreadUse::of(&written, None).recent(), 2 * DAY);
+        assert_eq!(ThreadUse::of(&shell(serde_json::json!({"latestUserAuthoredMessageAt": null})), None).recent(), 0);
+        let opened = serde_json::json!({"latestUserAuthoredMessageAt": "1970-01-03T00:00:00Z",
+            "opens": {"openedAt": (5 * DAY) as f64, "score": 3, "picks": [{"query": "sidebar", "at": (4 * DAY) as f64}]}});
+        let opened = shell(opened);
+        assert_eq!(ThreadUse::of(&opened, None).recent(), 5 * DAY, "an open later than the last message");
+        let here = ThreadUse::of(&opened, Some(9 * DAY));
+        assert_eq!(
+            (here.recent(), here.opens.as_ref().map(|o| o.score)),
+            (9 * DAY, Some(3.)),
+            "a local open keeps the stats"
+        );
+        assert_eq!(ThreadUse::of(&written, Some(9 * DAY)).opens.map(|o| o.score), Some(1.));
+        assert!(ThreadUse::of(&opened, None).boost(5 * DAY) > ThreadUse::of(&written, None).boost(5 * DAY));
+        let unreadable = shell(serde_json::json!({"opens": {"openedAt": "soon"}}));
+        assert!(unreadable.opens.is_none(), "an unreadable value is no opens, not a lost thread");
+        let used = ThreadUse::of(&opened, None);
+        assert_eq!(used.picked_at(&fold_query("Sidebar"), 5 * DAY), Some((4 * DAY) as f64));
+        assert_eq!(used.picked_at(&fold_query("sid"), 5 * DAY), Some((4 * DAY) as f64), "a prefix of three letters");
+        assert_eq!(used.picked_at(&fold_query("si"), 5 * DAY), None);
+        assert_eq!(used.picked_at(&fold_query("sidebar"), 30 * DAY), None, "picks last three weeks");
+    }
 
     fn quality(query: &str, title: &str) -> Option<f32> {
         let field = Field::new(title);
