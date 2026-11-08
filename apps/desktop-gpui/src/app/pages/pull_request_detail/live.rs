@@ -96,6 +96,7 @@ impl Workspace {
                     let alive = this.update(cx, |this, cx| {
                         if cx.active_window().is_some() && this.page == Some(super::super::Page::PullRequests) {
                             this.refresh_pr_in_place(None, cx);
+                            this.live_refresh_pull_requests(cx);
                         }
                     });
                     if alive.is_err() {
@@ -138,7 +139,10 @@ impl Workspace {
                     // The first value is the current count, not a refresh.
                     StreamEvent::Item(_) if first => first = false,
                     StreamEvent::Item(_) => {
-                        let _ = this.update(cx, |this, cx| this.refresh_pr_in_place(Some(&environment), cx));
+                        let _ = this.update(cx, |this, cx| {
+                            this.refresh_pr_in_place(Some(&environment), cx);
+                            this.refresh_pull_requests_after_turn(cx);
+                        });
                     }
                     // A dropped socket restarts when its environment reconnects (`start_session`);
                     // anything else the server ended is asked for again after a pause.

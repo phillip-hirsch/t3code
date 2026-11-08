@@ -53,6 +53,13 @@ const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
 const PAGE_MAX_WIDTH: f32 = 1152.;
 const PAGE_GUTTER: f32 = 24.;
 
+/// `authoredQuery` and `reviewingQuery`'s answers, for the scope `key` names.
+struct Partitions {
+    key: Value,
+    authored: Vec<Rc<Entry>>,
+    reviewing: Vec<Rc<Entry>>,
+}
+
 /// One line of the virtualized list.
 enum Row {
     Header {
@@ -85,6 +92,8 @@ pub(in crate::app) struct PullRequestsState {
     state: &'static str,
     sort: &'static str,
     host: Option<String>,
+    /// The server the list is narrowed to (`environmentId`).
+    environment: Option<SharedString>,
     project: Option<String>,
     /// Draft, review, checks, author and labels picked from the menus.
     menu: Filters,
@@ -93,6 +102,11 @@ pub(in crate::app) struct PullRequestsState {
     typed: String,
     sent: String,
     list: Option<ListResult>,
+    /// The dedicated authored and review-requested reads, and the scope they answer.
+    partitions: Option<Partitions>,
+    partition_generation: u64,
+    /// A host refreshed while the page was closed: opening it reads the list again.
+    stale: bool,
     page_size: u32,
     /// Bumped per read, so an answer to an older question is dropped.
     generation: u64,
@@ -146,12 +160,16 @@ impl PullRequestsState {
             state: "open",
             sort: "ready",
             host: None,
+            environment: None,
             project: None,
             menu: Filters::default(),
             search,
             typed: String::new(),
             sent: String::new(),
             list: None,
+            partitions: None,
+            partition_generation: 0,
+            stale: false,
             page_size: PAGE_SIZE,
             generation: 0,
             loading: false,
@@ -179,16 +197,28 @@ impl PullRequestsState {
 
     /// The listed row for a pull request, which the panel shows while its detail loads.
     pub(super) fn entry_for(&self, reference: &Reference) -> Option<Rc<Entry>> {
-        self.list.as_ref()?.entries.iter().find(|e| reference_of(e) == *reference).cloned()
+        self.held_entries().find(|e| reference_of(e) == *reference).cloned()
+    }
+
+    /// The main list's rows, then the partitions' (which may reach past its page).
+    fn held_entries(&self) -> impl Iterator<Item = &Rc<Entry>> {
+        let partitions = self.partitions.iter().flat_map(|p| p.authored.iter().chain(&p.reviewing));
+        self.list.iter().flat_map(|l| &l.entries).chain(partitions)
     }
 
     fn filter_count(&self) -> usize {
         let menu = &self.menu;
-        [self.state != "open", self.involvement != "all", self.host.is_some(), self.project.is_some()]
-            .into_iter()
-            .chain([menu.draft.is_some(), menu.review.is_some(), menu.checks.is_some(), menu.author.is_some()])
-            .filter(|on| *on)
-            .count()
+        [
+            self.state != "open",
+            self.involvement != "all",
+            self.host.is_some(),
+            self.environment.is_some(),
+            self.project.is_some(),
+        ]
+        .into_iter()
+        .chain([menu.draft.is_some(), menu.review.is_some(), menu.checks.is_some(), menu.author.is_some()])
+        .filter(|on| *on)
+        .count()
             + menu.labels.iter().map(Vec::len).sum::<usize>()
     }
 
@@ -198,6 +228,7 @@ impl PullRequestsState {
             || self.involvement != "all"
             || self.project.is_some()
             || self.host.is_some()
+            || self.environment.is_some()
     }
 
     fn searching(&self) -> bool {
@@ -218,6 +249,8 @@ impl Workspace {
     pub(in crate::app) fn pull_requests_opened(&mut self, cx: &mut Context<Self>) {
         if self.pull_requests.list.is_none() && !self.pull_requests.loading {
             self.read_pull_requests(false, cx);
+        } else if std::mem::take(&mut self.pull_requests.stale) {
+            self.live_refresh_pull_requests(cx);
         }
         self.follow_pull_requests(cx);
     }
@@ -301,6 +334,9 @@ impl Workspace {
         let mut connected: Vec<(&SharedString, RpcClient)> =
             self.sessions().iter().filter_map(|s| Some((s.id.as_ref()?, s.client.clone()?))).collect();
         connected.sort_by(|a, b| a.0.cmp(b.0));
+        if let Some(environment) = &self.pull_requests.environment {
+            connected.retain(|(id, _)| *id == environment);
+        }
         if let Some(project) = &self.pull_requests.project {
             let environment = self.shell.project_environment(project);
             connected.retain(|(id, _)| Some(*id) == environment);
@@ -414,6 +450,9 @@ impl Workspace {
                                 state.list = Some(answer);
                             }
                         }
+                        if !more {
+                            this.read_pull_request_partitions(cx);
+                        }
                         this.read_pull_request_stats(cx);
                     }
                     Err(failure) => state.error = Some(failure.into()),
@@ -424,6 +463,99 @@ impl Workspace {
         })
         .detach();
         cx.notify();
+    }
+
+    /// `PullRequestListInput` for one involvement partition: the menu's filters, no search text.
+    fn partition_input(&self, involvement: &str) -> Value {
+        let state = &self.pull_requests;
+        let mut input = json!({"state": state.state, "involvement": involvement, "limit": PAGE_SIZE});
+        if let Some(host) = &state.host {
+            input["host"] = json!(host);
+        }
+        if let Some(project) = &state.project {
+            input["projectId"] = json!(project);
+        }
+        if !state.menu.is_empty() {
+            input["filters"] = state.menu.to_json();
+        }
+        input
+    }
+
+    fn partition_key(&self) -> Value {
+        json!([self.partition_input("all"), self.pull_requests.environment.as_deref()])
+    }
+
+    /// The authored and review-requested partitions, read once the main list has answered with
+    /// rows (it proves which repositories the host search indexes); an empty list has none.
+    fn read_pull_request_partitions(&mut self, cx: &mut Context<Self>) {
+        let state = &self.pull_requests;
+        if state.involvement != "all" || !state.sent.is_empty() {
+            return;
+        }
+        let key = self.partition_key();
+        if state.list.as_ref().is_none_or(|l| l.entries.is_empty()) {
+            self.pull_requests.partitions = Some(Partitions { key, authored: Vec::new(), reviewing: Vec::new() });
+            return;
+        }
+        let targets = self.pull_request_targets();
+        let request = |involvement: &str| -> Vec<(String, RpcClient, Value)> {
+            targets
+                .iter()
+                .map(|(environment, client, project_ids)| {
+                    let mut input = self.partition_input(involvement);
+                    if let Some(project_ids) = project_ids {
+                        input["projectIds"] = json!(project_ids);
+                    }
+                    (environment.to_string(), client.clone(), input)
+                })
+                .collect()
+        };
+        let (authored, reviewing) = (request("authored"), request("reviewing"));
+        self.pull_requests.partition_generation += 1;
+        let generation = self.pull_requests.partition_generation;
+        cx.spawn(async move |this, cx| {
+            let read = |requests: Vec<(String, RpcClient, Value)>| async move {
+                let reads = requests.into_iter().map(|(environment, client, input)| async move {
+                    let answer = client.request("pullRequests.list", input).await.ok()?;
+                    Some((environment, serde_json::from_value::<ListResult>(answer).ok()?))
+                });
+                let answers: Option<Vec<_>> = futures::future::join_all(reads).await.into_iter().collect();
+                answers.map(|answers| logic::merge_lists(answers).entries)
+            };
+            let (authored, reviewing) = futures::future::join(read(authored), read(reviewing)).await;
+            let _ = this.update(cx, |this, cx| {
+                // A failed partition leaves the held one, or the main list's own grouping.
+                let (Some(authored), Some(reviewing)) = (authored, reviewing) else { return };
+                if this.pull_requests.partition_generation != generation {
+                    return;
+                }
+                this.pull_requests.partitions = Some(Partitions { key, authored, reviewing });
+                this.read_pull_request_stats(cx);
+                this.rebuild_pull_request_rows();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// `useLiveRefresh` and a host's refresh: every row already loaded is read again in place.
+    pub(super) fn live_refresh_pull_requests(&mut self, cx: &mut Context<Self>) {
+        let state = &mut self.pull_requests;
+        let Some(list) = state.list.as_ref() else { return };
+        if state.loading {
+            return;
+        }
+        state.page_size = logic::collapsed_page_size(state.page_size, list.entries.len());
+        self.read_pull_requests(false, cx);
+    }
+
+    /// A turn ended on a host: the list reads again now when shown, else when next opened.
+    pub(super) fn refresh_pull_requests_after_turn(&mut self, cx: &mut Context<Self>) {
+        if self.page == Some(super::Page::PullRequests) {
+            self.live_refresh_pull_requests(cx);
+        } else {
+            self.pull_requests.stale = true;
+        }
     }
 
     /// An action's reply applied to its row; a reply that adds the pull request reads the list.
@@ -494,11 +626,12 @@ impl Workspace {
 
     /// Asks each pull request's own machine for the diff sizes the listing left at zero.
     fn read_pull_request_stats(&mut self, cx: &mut Context<Self>) {
-        let Some(list) = self.pull_requests.list.as_ref() else { return };
         let stats = &self.pull_requests.stats;
         let mut by_environment: Vec<(&SharedString, Vec<Value>)> = Vec::new();
-        let missing =
-            list.entries.iter().filter(|e| e.additions + e.deletions == 0 && !stats.contains_key(&e.stat_key()));
+        let mut asked = std::collections::HashSet::new();
+        let missing = self.pull_requests.held_entries().filter(|e| {
+            e.additions + e.deletions == 0 && !stats.contains_key(&e.stat_key()) && asked.insert(e.stat_key())
+        });
         for entry in missing.take(500) {
             let Some(environment) = self.shell.project_environment(&entry.project_id) else { continue };
             match by_environment.iter_mut().find(|(held, _)| *held == environment) {
@@ -554,7 +687,9 @@ impl Workspace {
     }
 
     fn rebuild_pull_request_rows(&mut self) {
+        let key = self.partition_key();
         let state = &mut self.pull_requests;
+        let partitions = state.partitions.as_ref().filter(|p| p.key == key && state.typed.is_empty());
         let mut rows = Vec::new();
         if let Some(list) = &state.list {
             let (text, typed_filters) = logic::parse_query(&state.typed);
@@ -563,11 +698,13 @@ impl Workspace {
                 state: state.state,
                 project: state.project.as_deref(),
                 host: state.host.as_deref(),
+                environment: state.environment.as_deref(),
                 involvement: state.involvement,
                 sort: state.sort,
                 local_filters: &local_filters,
                 text: &text,
                 answered_locally: state.typed == state.sent && !state.loading,
+                partitions: partitions.map(|p| logic::PartitionRows { authored: &p.authored, reviewing: &p.reviewing }),
             };
             for (index, group) in logic::display_groups(list, &view, &state.stats).into_iter().enumerate() {
                 if !group.label.is_empty() {
@@ -762,15 +899,18 @@ impl Workspace {
         let labels: Rc<Vec<String>> = Rc::new(labels.into_iter().take(30).map(|l| l.name).collect());
         let unreadable: Vec<String> =
             state.list.as_ref().map(|l| l.errors.iter().map(|e| e.project_id.clone()).collect()).unwrap_or_default();
-        let mut projects: Vec<(String, String, bool)> = self
+        let environment = state.environment.clone();
+        let mut projects: Vec<(String, String, bool, SharedString)> = self
             .shell
             .projects
             .iter()
             .filter(|p| p.archived_at.is_none())
-            .map(|p| (p.id.clone(), p.title.clone(), unreadable.contains(&p.id)))
+            .filter(|p| environment.as_ref().is_none_or(|e| *e == p.environment_id))
+            .map(|p| (p.id.clone(), p.title.clone(), unreadable.contains(&p.id), p.environment_id.clone()))
             .collect();
         projects.sort_by_key(|p| p.2);
         let projects = Rc::new(projects);
+        let servers = Rc::new(self.pull_request_servers());
         let menu = state.menu.clone();
         let (current_state, involvement, project) = (state.state, state.involvement, state.project.clone());
         move |menu_root, window, cx| {
@@ -907,6 +1047,44 @@ impl Workspace {
             root = submenu(root, "Checks", CHECKS, as_static(menu.checks.as_ref(), CHECKS), window, cx, |s, v| {
                 s.menu.checks = (v != "all").then(|| v.to_owned());
             });
+            if servers.len() > 1 {
+                let server_view = view.clone();
+                let servers = servers.clone();
+                let picked = environment.clone();
+                let summary = picked
+                    .as_ref()
+                    .and_then(|id| servers.iter().find(|s| &s.0 == id))
+                    .map_or_else(|| "All servers".into(), |s| s.1.clone());
+                root =
+                    root.separator().submenu(format!("Server  {summary}"), window, cx, move |mut menu, window, _| {
+                        menu = menu.item(
+                            PopupMenuItem::new("All servers").icon(Lucide::Layers).checked(picked.is_none()).on_click(
+                                window.listener_for(&server_view, |this, _, _, cx| {
+                                    this.set_pull_request_scope(cx, |state| {
+                                        state.environment = None;
+                                        state.project = None;
+                                    });
+                                }),
+                            ),
+                        );
+                        for (id, label, machine) in servers.iter() {
+                            let value = id.clone();
+                            menu = menu.item(
+                                PopupMenuItem::new(label.clone())
+                                    .icon(Icon::default().path(super::settings::machine_icon(machine)))
+                                    .checked(picked.as_ref() == Some(id))
+                                    .on_click(window.listener_for(&server_view, move |this, _, _, cx| {
+                                        let environment = value.clone();
+                                        this.set_pull_request_scope(cx, |state| {
+                                            state.environment = Some(environment);
+                                            state.project = None;
+                                        });
+                                    })),
+                            );
+                        }
+                        menu
+                    });
+            }
             root = root.separator();
             let project_view = view.clone();
             let project_choices = projects.clone();
@@ -921,8 +1099,9 @@ impl Workspace {
                         this.set_pull_request_scope(cx, |state| state.project = None);
                     }),
                 ));
-                for (id, title, unavailable) in project_choices.iter() {
+                for (id, title, unavailable, environment) in project_choices.iter() {
                     let value = id.clone();
+                    let environment = environment.clone();
                     let label = if *unavailable { format!("{title} · Unavailable") } else { title.clone() };
                     menu = menu.item(
                         PopupMenuItem::new(label)
@@ -931,13 +1110,33 @@ impl Workspace {
                             .checked(picked_project.as_ref() == Some(id))
                             .on_click(window.listener_for(&project_view, move |this, _, _, cx| {
                                 let project = value.clone();
-                                this.set_pull_request_scope(cx, |state| state.project = Some(project));
+                                let environment = environment.clone();
+                                this.set_pull_request_scope(cx, |state| {
+                                    state.project = Some(project);
+                                    state.environment = Some(environment);
+                                });
                             })),
                     );
                 }
                 menu.max_h(px(360.)).scrollable(true)
             })
         }
+    }
+
+    /// `capableEnvironments`: each connected server, with its label and machine kind.
+    fn pull_request_servers(&self) -> Vec<(SharedString, SharedString, String)> {
+        let mut servers: Vec<_> = self
+            .sessions()
+            .iter()
+            .filter(|s| s.is_connected())
+            .filter_map(|s| {
+                let id = s.id.clone()?;
+                let label = s.server_info.environment_label.clone().map_or_else(|| id.clone(), SharedString::from);
+                Some((id, label, s.server_info.machine_kind().to_owned()))
+            })
+            .collect();
+        servers.sort_by(|a, b| a.0.cmp(&b.0));
+        servers
     }
 
     /// `applyPullRequestDraftFilterChange`: a typed `draft:` qualifier leaves the query when the
