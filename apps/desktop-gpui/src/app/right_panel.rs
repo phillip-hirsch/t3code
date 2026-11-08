@@ -37,6 +37,8 @@ use crate::rpc::RpcClient;
 use crate::theme::{self, Tokens};
 
 const DEFAULT_WIDTH: f32 = 540.;
+/// A diff read this recently counts as fresh when the panel shows (`LIVE_REFRESH_MIN_INTERVAL_MS`).
+const REVALIDATE_FLOOR: std::time::Duration = std::time::Duration::from_secs(10);
 const MIN_WIDTH: f32 = 360.;
 const MAX_WIDTH_FRACTION: f32 = 0.7;
 /// The chat column keeps at least this much beside the panel.
@@ -375,6 +377,11 @@ pub(super) struct RightPanel {
     /// The selection whose files `diff` holds.
     shown: Option<(Target, DiffScope)>,
     refresh: u64,
+    /// When the last diff read landed, and whether one is on its way (`dataUpdatedAt`, `isPending`).
+    diff_read_at: Option<std::time::Instant>,
+    diff_reading: bool,
+    /// The git diff showed at the last render, to revalidate it when it shows again.
+    git_diff_shown: bool,
     commits: Vec<Commit>,
     /// The tab strip, and the tab it last scrolled into view.
     tabs_scroll: ScrollHandle,
@@ -436,6 +443,9 @@ impl RightPanel {
             collapsed: HashMap::new(),
             shown: None,
             refresh: 0,
+            diff_read_at: None,
+            diff_reading: false,
+            git_diff_shown: false,
             commits: Vec::new(),
             tabs_scroll: ScrollHandle::new(),
             diff_refs: ScrollHandle::new(),
@@ -1188,9 +1198,11 @@ impl Workspace {
             (self.right_panel.patches, self.right_panel.patch_states) = (None, std::rc::Rc::default());
         }
         let diff = self.right_panel.diff.clone();
+        self.right_panel.diff_reading = true;
         self.right_panel._task = Some(cx.spawn_in(window, async move |this, cx| {
             let (method, input) = request;
             let result = client.request(method, input).await;
+            let read = result.is_ok();
             let parsed =
                 cx.background_executor()
                     .spawn(async move {
@@ -1211,6 +1223,10 @@ impl Workspace {
                 ignore_whitespace,
             });
             let _ = this.update(cx, |this, cx| {
+                this.right_panel.diff_reading = false;
+                if read {
+                    this.right_panel.diff_read_at = Some(std::time::Instant::now());
+                }
                 let previous = this.right_panel.patches.take().filter(|_| retain);
                 this.right_panel.load = match parsed {
                     Err(error) => DiffLoad::Failed(error.into()),
@@ -1443,7 +1459,34 @@ impl Workspace {
     }
 
     /// The inline panel beside the main column, or `None` while closed.
+    /// The panel shows a git diff (not a turn's), which edits outside T3 Code can change.
+    fn git_diff_shown(&self) -> bool {
+        self.right_panel_open()
+            && self.active_surface() == Some(&Surface::Diff)
+            && self.diff_available()
+            && self.panel_state().is_some_and(|panel| !matches!(panel.scope, DiffScope::Turn(_)))
+    }
+
+    /// `useLiveRefresh(…, { refreshOnShow })` for the git diff: showing it, or the window
+    /// regaining focus while it shows, reads it again unless a read landed within the floor.
+    /// Edits made outside T3 Code bump no mutation id, so nothing else would. Returns whether
+    /// a read was asked for.
+    pub(super) fn revalidate_diff(&mut self) -> bool {
+        let stale =
+            should_revalidate(self.right_panel.diff_read_at, self.right_panel.diff_reading, std::time::Instant::now());
+        if !stale || !self.git_diff_shown() {
+            return false;
+        }
+        self.right_panel.refresh += 1;
+        true
+    }
+
     pub(super) fn render_right_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let git_diff_shown = self.git_diff_shown();
+        if git_diff_shown && !self.right_panel.git_diff_shown {
+            self.revalidate_diff();
+        }
+        self.right_panel.git_diff_shown = git_diff_shown;
         let mount = self.target.clone().filter(|_| self.active_surface() == Some(&Surface::Diff));
         if self.right_panel.diff_mount != mount {
             self.right_panel.diff_mount = mount;
@@ -2808,6 +2851,12 @@ fn parse_diff(value: &Value, source_kind: Option<&str>) -> Option<ParsedDiff> {
     Some(ParsedDiff { files, deferred, totals, head: text("headRef"), base: text("baseRef"), truncated })
 }
 
+/// Whether showing the diff reads it again: only a diff already read, with no read on its way,
+/// whose last read is older than [`REVALIDATE_FLOOR`].
+fn should_revalidate(read_at: Option<std::time::Instant>, reading: bool, now: std::time::Instant) -> bool {
+    !reading && read_at.is_some_and(|at| now.saturating_duration_since(at) >= REVALIDATE_FLOOR)
+}
+
 /// `HH:MM` from an ISO timestamp, as the turn menu labels completion.
 fn short_time(iso: &str) -> SharedString {
     iso.get(11..16).unwrap_or(iso).to_owned().into()
@@ -2970,6 +3019,17 @@ fn launcher_step(keystroke: &gpui_kit::Keystroke, highlight: Option<usize>, len:
 mod tests {
     use super::*;
     use crate::model::ThreadState;
+
+    #[test]
+    fn showing_the_diff_reads_it_again_only_after_the_floor() {
+        let now = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let read = |ago: u64| Some(now - std::time::Duration::from_secs(ago));
+        assert!(should_revalidate(read(11), false, now));
+        assert!(should_revalidate(read(10), false, now));
+        assert!(!should_revalidate(read(3), false, now), "a mutation's refetch counts as the revalidation");
+        assert!(!should_revalidate(read(60), true, now), "a read on its way is about to land");
+        assert!(!should_revalidate(None, false, now), "the first read is the mount's own");
+    }
 
     #[test]
     fn a_dragged_tab_takes_the_place_of_the_tab_it_drops_on() {

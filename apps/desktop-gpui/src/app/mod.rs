@@ -360,6 +360,9 @@ impl Workspace {
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
                     this.clear_system_alerts(window, cx);
+                    if this.revalidate_diff() {
+                        cx.notify();
+                    }
                 }
             }),
         ];
