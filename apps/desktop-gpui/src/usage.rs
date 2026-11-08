@@ -589,6 +589,15 @@ impl Window {
         input
     }
 
+    /// `usageSummaryInput`: one environment's request carries its configured `usageModelFilter`.
+    pub fn summary_input(&self, model_filter: &Value) -> Value {
+        let mut input = self.to_json();
+        if !model_filter.is_null() {
+            input["modelFilter"] = model_filter.clone();
+        }
+        input
+    }
+
     /// `enumerateDays` / `enumerateHourStarts`: every period the chart has a column for.
     pub fn periods(&self) -> Vec<PeriodKey> {
         match self.hours {
@@ -1825,6 +1834,9 @@ mod tests {
         );
         assert_eq!(month.periods().len(), 30);
         assert_eq!(month.to_json()["resolution"], "day");
+        assert_eq!(month.summary_input(&Value::Null), month.to_json());
+        let filter = json!({"exclude": [{"model": "gpt-5-mini"}]});
+        assert_eq!(month.summary_input(&filter)["modelFilter"], filter, "each environment's filter rides along");
         let day = Window::new(1, now, &tz, "America/Los_Angeles".into());
         let input = day.to_json();
         assert_eq!(

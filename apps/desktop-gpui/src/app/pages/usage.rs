@@ -191,9 +191,11 @@ impl UsageState {
     }
 }
 
-/// What a usage read is priced with on one environment (`usageScanSettingsAtom`).
+/// What a usage read is priced and filtered with on one environment (`usageScanSettingsAtom`
+/// and `usageModelFilterAtom`).
 fn scan_settings(info: &crate::model::ServerInfo) -> Value {
-    json!([info.settings.get("usagePriceOverrides"), info.settings.get("usageModelAliases")])
+    let settings = &info.settings;
+    json!([settings.get("usagePriceOverrides"), settings.get("usageModelAliases"), settings.get("usageModelFilter")])
 }
 
 impl Workspace {
@@ -290,9 +292,14 @@ impl Workspace {
         });
     }
 
-    /// The environments the page reads: every connected one.
-    fn usage_machines(&self) -> Vec<(SharedString, crate::rpc::RpcClient)> {
-        self.sessions().iter().filter_map(|s| Some((s.id.clone()?, s.client.clone()?))).collect()
+    /// The environments the page reads: every connected one, with its `usageModelFilter`.
+    fn usage_machines(&self) -> Vec<(SharedString, crate::rpc::RpcClient, Value)> {
+        self.sessions()
+            .iter()
+            .filter_map(|s| {
+                Some((s.id.clone()?, s.client.clone()?, s.server_info.settings.get("usageModelFilter").clone()))
+            })
+            .collect()
     }
 
     /// The selected environments' provider and limit-source reads, with their labels.
@@ -313,8 +320,12 @@ impl Workspace {
     /// (`server.refreshUsageRates`); answers with slow sources still scanning are shown, then
     /// asked again with `awaitRefresh`.
     fn read_usage(&mut self, refresh_rates: bool, cx: &mut Context<Self>) {
-        let machines: Vec<(String, crate::rpc::RpcClient)> =
-            self.usage_machines().into_iter().map(|(id, client)| (id.to_string(), client)).collect();
+        let window = self.usage.window.clone();
+        let machines: Vec<(String, crate::rpc::RpcClient, Value)> = self
+            .usage_machines()
+            .into_iter()
+            .map(|(id, client, filter)| (id.to_string(), client, window.summary_input(&filter)))
+            .collect();
         if machines.is_empty() {
             return;
         }
@@ -325,17 +336,15 @@ impl Workspace {
         usage.generation += 1;
         let generation = usage.generation;
         usage.loading = true;
-        let window = usage.window.clone();
-        let input = window.to_json();
         cx.spawn(async move |this, cx| {
             if refresh_rates {
                 let refreshes =
-                    machines.iter().map(|(_, client)| client.request("server.refreshUsageRates", json!({})));
+                    machines.iter().map(|(_, client, _)| client.request("server.refreshUsageRates", json!({})));
                 futures::future::join_all(refreshes).await;
             }
-            let mut input = input;
+            let mut machines = machines;
             for attempt in 0..2 {
-                let reads = machines.iter().map(|(id, client)| {
+                let reads = machines.iter().map(|(id, client, input)| {
                     let input = input.clone();
                     async move { (id.clone(), client.request("server.getUsageSummary", input).await) }
                 });
@@ -384,7 +393,9 @@ impl Workspace {
                 if applied.is_err() || !again {
                     return;
                 }
-                input["awaitRefresh"] = json!(true);
+                for (_, _, input) in &mut machines {
+                    input["awaitRefresh"] = json!(true);
+                }
             }
         })
         .detach();
@@ -407,7 +418,7 @@ impl Workspace {
             self.usage.refreshing = true;
         }
         cx.spawn(async move |this, cx| {
-            let probes = machines.iter().map(|(id, client)| async move {
+            let probes = machines.iter().map(|(id, client, _)| async move {
                 (id, client.request("server.refreshProviders", json!({"workspaceSnapshotsOnDemand": true})).await)
             });
             let results = futures::future::join_all(probes).await;
