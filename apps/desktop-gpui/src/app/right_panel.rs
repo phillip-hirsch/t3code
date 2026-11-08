@@ -1843,19 +1843,21 @@ impl Workspace {
                     // `ghost-muted`: the open menu keeps its trigger's accent fill (`data-pressed`).
                     .selected(add_menu_open)
                     .dropdown_menu(move |menu: PopupMenu, window, cx| {
-                        let menu = menu.min_w(px(200.));
+                        // `MenuItem`'s `sm:min-h-7 sm:text-sm`.
+                        let rem = window.rem_size();
+                        let menu = menu.min_w(px(200.)).item_text(None, rem * 0.875, rem * 1.75);
                         // An available Browser lists the profiles to open it in (`MenuSub`).
                         let menu = if browser {
                             let (view, profiles) = (view.clone(), profiles.clone());
                             menu.submenu_with_icon(
-                                Some(menu_icon(Icon::new(IconName::Globe))),
+                                Some(menu_icon(Icon::new(IconName::Earth))),
                                 "Browser",
                                 window,
                                 cx,
                                 move |menu, window, _| profile_items(menu.max_w(px(224.)), &profiles, &view, window),
                             )
                         } else {
-                            menu.item(surface_item(Icon::new(IconName::Globe), "Browser", "B").disabled(true))
+                            menu.item(surface_item(Icon::new(IconName::Earth), "Browser", "B").disabled(true))
                         };
                         let menu = menu
                             .item(
@@ -1883,7 +1885,7 @@ impl Workspace {
                                     })),
                             )
                             .item(
-                                surface_item(Icon::new(IconName::Link), "Linked pull requests", "L")
+                                surface_item(Icon::new(IconName::Link2), "Linked pull requests", "L")
                                     .disabled(!linked)
                                     .on_click(window.listener_for(&view, |this, _, window, cx| {
                                         this.open_surface(Surface::PullRequests, window, cx);
@@ -1926,7 +1928,7 @@ impl Workspace {
             Surface::Browser(tab) => (
                 format!("browser:{tab}").into(),
                 self.browser_tab_title(tab),
-                Icon::new(IconName::Globe).size(px(12.)).into_any_element(),
+                Icon::new(IconName::Earth).size(px(12.)).into_any_element(),
             ),
             Surface::Files => {
                 ("files".into(), "Files".into(), Icon::new(IconName::Files).size(px(12.)).into_any_element())
@@ -1962,7 +1964,7 @@ impl Workspace {
             Surface::PullRequests => (
                 "pull-requests".into(),
                 "Pull requests".into(),
-                Icon::new(IconName::Link).size(px(12.)).into_any_element(),
+                Icon::new(IconName::Link2).size(px(12.)).into_any_element(),
             ),
             Surface::Terminal(id) => (
                 format!("terminal:{id}").into(),
@@ -2126,7 +2128,7 @@ impl Workspace {
         let browser_available = self.browser_available();
         let browser = row(
             "right-panel-open-browser",
-            Icon::new(IconName::Globe).size(px(16.)).into_any_element(),
+            Icon::new(IconName::Earth).size(px(16.)).into_any_element(),
             "Browser",
             "B",
             browser_available,
@@ -2221,7 +2223,7 @@ impl Workspace {
         let linked = self.thread_links_pull_requests();
         let linked_pull_requests = row(
             "right-panel-open-pull-requests",
-            Icon::new(IconName::Link).size(px(16.)).into_any_element(),
+            Icon::new(IconName::Link2).size(px(16.)).into_any_element(),
             "Linked pull requests",
             "L",
             linked,

@@ -521,9 +521,12 @@ impl Workspace {
 
     /// An environment's socket is back: its grants are asked again, and its files' unsaved
     /// edits write again once it may write, like the web's `subscribeWritable` recovery.
-    pub(in crate::app) fn resume_file_saves(&mut self, env: &str, cx: &mut Context<Self>) {
+    pub(in crate::app) fn resume_file_saves(&mut self, env: &SharedString, cx: &mut Context<Self>) {
         self.files.writable.remove(env);
-        self.resume_pending_saves(env, cx);
+        let pending = self.files.previews.iter().any(|(key, state)| key.checkout.env == *env && state.save.pending());
+        if pending {
+            self.can_write_files(env, cx);
+        }
     }
 
     /// `useEnvironmentScope(environmentId, AuthFilesystemWriteScope)`: whether files on `env`

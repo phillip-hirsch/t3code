@@ -9,7 +9,7 @@ use gpui_kit::component::{Icon, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, Context, FontWeight, Hsla, Image, ImageFormat, IntoElement, ObjectFit, ParentElement as _, Pixels,
-    SharedString, Styled as _, StyledImage as _, div, img, px, rgb,
+    SharedString, Styled as _, StyledImage as _, Task, div, img, px, rgb,
 };
 use serde_json::Value;
 
@@ -286,7 +286,10 @@ pub(super) fn describe(icon: Option<&Value>, favicon_path: Option<&str>) -> Stri
 }
 
 enum Slot {
-    Loading,
+    /// Dropping the fetch (`forget`) cancels it, so it cannot overwrite a newer one.
+    Loading {
+        _fetch: Task<()>,
+    },
     Ready(Arc<Image>),
     Missing,
 }
@@ -316,18 +319,20 @@ impl Images {
             None => {}
         }
         let (Some(client), Some(endpoint)) = (client, endpoint) else { return None };
-        self.slots.insert(key.clone(), Slot::Loading);
-        cx.spawn(async move |this, cx| {
-            let image = fetch(&client, endpoint, resource).await;
-            if let Err(error) = &image {
-                log::debug!("project image unavailable: {error:#}");
+        let task = cx.spawn({
+            let key = key.clone();
+            async move |this, cx| {
+                let image = fetch(&client, endpoint, resource).await;
+                if let Err(error) = &image {
+                    log::debug!("project image unavailable: {error:#}");
+                }
+                let _ = this.update(cx, |this, cx| {
+                    this.slots.insert(key, image.map_or(Slot::Missing, Slot::Ready));
+                    cx.notify();
+                });
             }
-            let _ = this.update(cx, |this, cx| {
-                this.slots.insert(key, image.map_or(Slot::Missing, Slot::Ready));
-                cx.notify();
-            });
-        })
-        .detach();
+        });
+        self.slots.insert(key, Slot::Loading { _fetch: task });
         None
     }
 

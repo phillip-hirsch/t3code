@@ -180,8 +180,9 @@ pub(super) struct ServerStreams {
 
 impl Workspace {
     /// Keeps the streams of the agent tabs on screen and closes the others; shows their PDFs
-    /// unless GPUI draws over them (`covered`).
-    pub(super) fn retain_server_streams(&mut self, covered: bool, cx: &mut App) {
+    /// unless GPUI draws over them (`covered`). Frames replaced since the last paint are freed
+    /// here too, since a stream kept under a failure or download page never paints them.
+    pub(super) fn retain_server_streams(&mut self, covered: bool, window: &mut Window, cx: &mut App) {
         let drawn = std::mem::take(&mut self.preview.server.drawn);
         let pdf_drawn = std::mem::take(&mut self.preview.server.pdf_drawn);
         self.preview.server.pdfs.retain(|tab, _| pdf_drawn.contains(tab));
@@ -195,10 +196,9 @@ impl Workspace {
         }
         self.preview.server.streams.retain(|tab, stream| {
             let keep = drawn.contains(tab);
-            if !keep {
-                for image in stream.stale.drain(..).chain(stream.frame.take()) {
-                    cx.drop_image(image, None);
-                }
+            let frame = if keep { None } else { stream.frame.take() };
+            for image in stream.stale.drain(..).chain(frame) {
+                cx.drop_image(image, Some(window));
             }
             keep
         });
