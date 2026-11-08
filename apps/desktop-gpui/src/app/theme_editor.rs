@@ -312,10 +312,13 @@ impl ThemeEditor {
         let name = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder).default_value(name_value));
         let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter colors"));
         let mut subscriptions = vec![
-            cx.subscribe_in(&name, window, |this, _, event: &InputEvent, _, cx| {
+            cx.subscribe_in(&name, window, |this, _, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::Change) {
                     this.error = None;
-                    this.follow_merge_target(cx);
+                    if this.follow_merge_target(cx) {
+                        this.sync_fields(window, cx);
+                        this.preview(window, cx);
+                    }
                     cx.notify();
                 }
             }),
@@ -369,7 +372,9 @@ impl ThemeEditor {
             bounds: Rc::default(),
             _subscriptions: subscriptions,
         };
-        editor.follow_merge_target(cx);
+        if editor.follow_merge_target(cx) {
+            editor.sync_fields(window, cx);
+        }
         editor.preview(window, cx);
         editor
     }
@@ -392,18 +397,20 @@ impl ThemeEditor {
         })
     }
 
-    /// Moves the draft off an appearance the merge target already has.
-    fn follow_merge_target(&mut self, cx: &mut Context<Self>) {
+    /// Moves the draft off an appearance the merge target already has; true when it moved, so
+    /// the fields and preview show the other palette.
+    fn follow_merge_target(&mut self, cx: &mut Context<Self>) -> bool {
         let target = self.merge_target(cx).filter(|_| self.editing.is_none());
         let key = target.map(|t| format!("{}:{:?}", t.id, t.modes()));
         let only_this_mode = target.is_some_and(|t| t.modes() == [self.dark]);
         if key == self.merge_key {
-            return;
+            return false;
         }
         self.merge_key = key;
         if only_this_mode {
             self.dark = !self.dark;
         }
+        only_this_mode
     }
 
     /// Why an appearance cannot be edited, if it cannot.
