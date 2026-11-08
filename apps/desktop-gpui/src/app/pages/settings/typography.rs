@@ -192,8 +192,7 @@ impl Workspace {
                 theme::set_appearance(theme::Appearance::from_settings(&this.client_settings.values), window, cx);
                 cx.notify();
             }));
-        // `FontSmoothingRow` is macOS-only, and GPUI has no grayscale smoothing to switch to.
-        let advanced = [self.setting_row(
+        let mut advanced = vec![self.setting_row(
             view,
             SettingRow::new("separate-fonts")
                 .description("Set the prompt, code, and terminal fonts separately instead of one monospace font.")
@@ -201,6 +200,17 @@ impl Workspace {
             window,
             cx,
         )];
+        if cfg!(target_os = "macos") {
+            advanced.push(self.setting_row(
+                view,
+                SettingRow::new("font-smoothing")
+                    .description("Use thinner grayscale text smoothing instead of the macOS default.")
+                    .setting("fontSmoothing")
+                    .switch(),
+                window,
+                cx,
+            ));
+        }
         items.push(self.advanced_fold("typography", advanced, cx));
         settings_section("typography", "Typography", items, &t)
     }
