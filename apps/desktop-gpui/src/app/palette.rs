@@ -102,6 +102,21 @@ enum Run {
     FileSearch(super::files::OverlayMode),
 }
 
+impl Run {
+    /// Lands on a thread or a draft, now or once the server answers.
+    fn opens_chat(&self) -> bool {
+        matches!(
+            self,
+            Self::NewThread(_)
+                | Self::Thread(_)
+                | Self::Project(_)
+                | Self::FindIn { .. }
+                | Self::ScratchThread(_)
+                | Self::Triage
+        )
+    }
+}
+
 #[derive(Clone)]
 enum RowIcon {
     Lucide(IconName),
@@ -1060,6 +1075,10 @@ impl Workspace {
             _ => {}
         }
         self.close_palette(window, cx);
+        if run.opens_chat() {
+            // Settings covers the chat; going to a thread leaves it, as the web's route change does.
+            self.settings = None;
+        }
         match run {
             Run::NewThread(project_id) => self.start_draft(project_id, window, cx),
             Run::Thread(thread_id) => self.select_thread(thread_id, window, cx),
@@ -1117,6 +1136,7 @@ impl Workspace {
         let Some(environment) = self.active_environment().cloned() else { return };
         let Some(client) = self.env_client(&environment) else { return };
         self.close_palette(window, cx);
+        self.settings = None;
         let existing =
             self.shell.projects.iter().find(|p| p.environment_id == environment && same_path(&p.workspace_root, &path));
         if let Some(existing) = existing {
