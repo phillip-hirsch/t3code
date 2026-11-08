@@ -64,7 +64,7 @@ impl Workspace {
     pub(super) fn chat_layout(&self, window: &Window) -> (Lane, Option<f32>) {
         let canvas = self.canvas_width(window);
         let gutter = gutter(f32::from(window.viewport_size().width));
-        let card = (self.details_open && self.target.is_some()).then(|| inline_card_left(canvas, gutter)).flatten();
+        let card = self.details_visibility().inline_open.then(|| inline_card_left(canvas, gutter)).flatten();
         let chat_width = self.client_settings.values.get("chatWidth").as_str().unwrap_or_default();
         (resolve_lane(canvas, card, max_lane(chat_width), gutter), card)
     }

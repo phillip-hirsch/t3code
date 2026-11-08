@@ -238,9 +238,8 @@ pub struct Workspace {
     sheet_focus: sidebar_sheet::SheetFocus<gpui_kit::FocusHandle>,
     /// The sheet's focus trap: Tab cycles inside it while it shows.
     sheet_trap: gpui_kit::FocusHandle,
-    details_open: bool,
-    /// The details card as a popover, while the canvas is too narrow for it inline.
-    details_popover: bool,
+    /// Each thread's details card, inline or as the popover while the canvas is too narrow.
+    details_visibility: details::DetailsVisibility,
     /// The thread whose "Previous agents" group is expanded in the details card.
     lineage_expanded: Option<String>,
     /// The git status of the open target's workspace.
@@ -435,8 +434,9 @@ impl Workspace {
             sidebar_open: sidebar_sheet::SidebarOpen::default(),
             sheet_focus: sidebar_sheet::SheetFocus::default(),
             sheet_trap: cx.focus_handle(),
-            details_open: true,
-            details_popover: false,
+            details_visibility: details::DetailsVisibility::from_stored(
+                client_settings.values.get(details::DETAILS_VISIBILITY_KEY),
+            ),
             lineage_expanded: None,
             vcs: git::VcsWatch::default(),
             servers: Default::default(),
@@ -1096,7 +1096,7 @@ impl Render for Workspace {
         self.sidebar.fit_window(window);
         // Widening to the inline layout closes the popover, as the web does.
         if self.details_inline(window) {
-            self.details_popover = false;
+            self.set_details_popover(false);
         }
         // A modal page covers the composer, so the editor behind it must not keep the keys.
         if window.focused(cx).is_none()

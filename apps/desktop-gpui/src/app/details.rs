@@ -175,25 +175,106 @@ pub(super) async fn resubscribe_after_backoff(
     });
 }
 
-impl Workspace {
-    /// Whether the card is on screen, inline or as the popover.
-    pub(super) fn details_shown(&self, window: &Window) -> bool {
-        self.target.is_some() && if self.details_inline(window) { self.details_open } else { self.details_popover }
+/// `t3code:right-panel` `threadPanelVisibilityByThreadKey`, kept with this device's client settings.
+pub(super) const DETAILS_VISIBILITY_KEY: &str = "threadPanelVisibilityByThreadKey";
+
+/// One thread's card: shown inline, and shown as the popover.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Visibility {
+    pub inline_open: bool,
+    pub popover_open: bool,
+}
+
+/// `DEFAULT_THREAD_PANEL_VISIBILITY`.
+const DEFAULT_VISIBILITY: Visibility = Visibility { inline_open: true, popover_open: false };
+
+/// The card's visibility per thread (`threadPanelVisibilityByThreadKey`). A thread at the
+/// default keeps no entry, and only a collapsed inline card outlives the app.
+#[derive(Debug, Default, PartialEq)]
+pub(super) struct DetailsVisibility(std::collections::HashMap<String, Visibility>);
+
+impl DetailsVisibility {
+    /// `migratePersistedRightPanelState`: only `inlineOpen: false` entries come back.
+    pub(super) fn from_stored(stored: &Value) -> Self {
+        let collapsed = stored.as_object().into_iter().flatten().filter(|(_, v)| v["inlineOpen"] == false);
+        Self(collapsed.map(|(key, _)| (key.clone(), Visibility { inline_open: false, popover_open: false })).collect())
     }
 
-    /// The toggle drives whichever presentation the canvas allows.
+    pub(super) fn get(&self, key: &str) -> Visibility {
+        self.0.get(key).copied().unwrap_or(DEFAULT_VISIBILITY)
+    }
+
+    /// `updateThreadPanelVisibilityMap`; returns whether the stored subset changed.
+    fn update(&mut self, key: &str, change: impl FnOnce(&mut Visibility)) -> bool {
+        let before = self.get(key);
+        let mut next = before;
+        change(&mut next);
+        if next == DEFAULT_VISIBILITY {
+            self.0.remove(key);
+        } else {
+            self.0.insert(key.to_owned(), next);
+        }
+        before.inline_open != next.inline_open
+    }
+
+    /// `partialize`: the collapsed inline cards.
+    fn stored(&self) -> Value {
+        let collapsed = self.0.iter().filter(|(_, visibility)| !visibility.inline_open);
+        Value::Object(
+            collapsed.map(|(key, _)| (key.clone(), json!({"inlineOpen": false, "popoverOpen": false}))).collect(),
+        )
+    }
+}
+
+impl Workspace {
+    /// The open target's key in [`DetailsVisibility`] (`scopedThreadKey`).
+    fn details_key(&self) -> Option<String> {
+        match self.target.as_ref()? {
+            Target::Thread { env, id } => Some(format!("{env}:{id}")),
+            Target::Draft { env, project_id } => Some(format!("{env}:draft:{project_id}")),
+        }
+    }
+
+    /// The open target's card; nothing open shows no card.
+    pub(super) fn details_visibility(&self) -> Visibility {
+        self.details_key()
+            .map_or(Visibility { inline_open: false, popover_open: false }, |key| self.details_visibility.get(&key))
+    }
+
+    fn update_details(&mut self, change: impl FnOnce(&mut Visibility)) {
+        let Some(key) = self.details_key() else { return };
+        if self.details_visibility.update(&key, change) {
+            let stored = self.details_visibility.stored();
+            self.client_settings.apply(&serde_json::Map::from_iter([(DETAILS_VISIBILITY_KEY.to_owned(), stored)]));
+        }
+    }
+
+    /// Closes or opens the open thread's popover, without touching an unchanged entry.
+    pub(super) fn set_details_popover(&mut self, open: bool) {
+        if self.details_visibility().popover_open != open {
+            self.update_details(|visibility| visibility.popover_open = open);
+        }
+    }
+
+    /// Whether the card is on screen, inline or as the popover.
+    pub(super) fn details_shown(&self, window: &Window) -> bool {
+        let visibility = self.details_visibility();
+        if self.details_inline(window) { visibility.inline_open } else { visibility.popover_open }
+    }
+
+    /// The toggle drives whichever presentation the canvas allows, for the open thread only.
     pub(super) fn toggle_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.details_inline(window) {
-            self.details_open = !self.details_open;
+            self.update_details(|visibility| visibility.inline_open = !visibility.inline_open);
         } else {
-            self.details_popover = !self.details_popover;
+            self.update_details(|visibility| visibility.popover_open = !visibility.popover_open);
         }
         cx.notify();
     }
 
     pub(super) fn escape_details_popover(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.details_popover && event.keystroke.key == "escape" {
-            self.details_popover = false;
+        if self.details_visibility().popover_open && event.keystroke.key == "escape" {
+            self.set_details_popover(false);
             cx.stop_propagation();
             cx.notify();
         }
@@ -295,7 +376,7 @@ impl Workspace {
                     div()
                         .w(px(CARD_WIDTH))
                         .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                            this.details_popover = false;
+                            this.set_details_popover(false);
                             cx.notify();
                         }))
                         .child(card.max_h(viewport.height - px(104.))),
@@ -2019,6 +2100,24 @@ mod tests {
         assert_eq!(run(&dev).preview_url.as_deref(), Some("http://localhost:5173"));
         dev.preview_url = Some("  ".into());
         assert_eq!(run(&dev).preview_url, None);
+    }
+
+    #[test]
+    fn details_visibility_is_per_thread_and_keeps_only_collapsed_cards() {
+        let mut visibility = DetailsVisibility::default();
+        assert!(visibility.update("e:a", |v| v.inline_open = false), "collapsing is stored");
+        assert!(!visibility.update("e:b", |v| v.popover_open = true), "a popover is not stored");
+        assert_eq!(visibility.get("e:a"), Visibility { inline_open: false, popover_open: false });
+        assert_eq!(visibility.get("e:b"), Visibility { inline_open: true, popover_open: true });
+        assert_eq!(visibility.get("e:c"), DEFAULT_VISIBILITY, "other threads keep the default");
+        assert_eq!(visibility.stored(), json!({"e:a": {"inlineOpen": false, "popoverOpen": false}}));
+
+        assert!(!DetailsVisibility::from_stored(&visibility.stored()).get("e:a").inline_open, "it survives a restart");
+        assert_eq!(DetailsVisibility::from_stored(&json!({"e:b": {"inlineOpen": true}})), DetailsVisibility::default());
+
+        assert!(visibility.update("e:a", |v| v.inline_open = true));
+        assert!(!visibility.update("e:b", |v| v.popover_open = false));
+        assert_eq!(visibility, DetailsVisibility::default(), "back at the default, no entries remain");
     }
 
     #[test]
