@@ -202,10 +202,15 @@ impl Workspace {
                                     .child(line),
                             ),
                     )
-                    .child(
-                        icon_button(format!("automation-edit-{}", task.id), Lucide::Pencil, "Edit automation")
-                            .on_click(cx.listener(|this, _, _, cx| this.open_settings(SECTION, cx))),
-                    )
+                    .child({
+                        let link = self.automations.environment.clone().map(|env| (env, task.id.clone()));
+                        icon_button(format!("automation-edit-{}", task.id), Lucide::Pencil, "Edit automation").on_click(
+                            cx.listener(move |this, _, _, cx| match link.clone() {
+                                Some((environment, task_id)) => this.open_scheduled_task(environment, task_id, cx),
+                                None => this.open_settings(SECTION, cx),
+                            }),
+                        )
+                    })
                     .when(!matches!(task.schedule(), Schedule::Webhook), |el| {
                         el.child(
                             icon_button(format!("automation-run-{}", task.id), Lucide::Play, "Run now")

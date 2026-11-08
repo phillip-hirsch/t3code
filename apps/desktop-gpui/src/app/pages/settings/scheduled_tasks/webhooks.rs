@@ -90,6 +90,12 @@ pub(super) fn render_webhook_fields(fields: &Entity<WebhookFields>) -> impl Into
 }
 
 impl WebhookFields {
+    /// The editor moved a new task to another environment, whose address the URL uses.
+    pub(super) fn set_context(&mut self, context: WebhookContext, cx: &mut Context<Self>) {
+        self.context = context;
+        cx.notify();
+    }
+
     pub(super) fn new(
         context: WebhookContext,
         task: Option<Value>,

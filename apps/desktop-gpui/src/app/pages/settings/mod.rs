@@ -224,6 +224,9 @@ pub(in crate::app) struct SettingsUi {
     /// The environment and provider instance a navigation asked Providers to open
     /// (`/settings/providers?environmentId&instanceId`), until the page takes it.
     pub(in crate::app) provider_target: Option<(SharedString, String)>,
+    /// The environment and scheduled task a link asked Scheduled tasks to open
+    /// (`/settings/scheduled-tasks?environmentId&taskId`), until its editor closes.
+    pub(in crate::app) scheduled_task_link: Option<(SharedString, String)>,
     search: Entity<InputState>,
     /// Below `md` the nav is an icon rail; searching expands it over the page (`compactSearchOpen`).
     compact_search_open: bool,
@@ -296,6 +299,7 @@ impl SettingsUi {
         Self {
             scope: ScopeSearch::default(),
             provider_target: None,
+            scheduled_task_link: None,
             search,
             compact_search_open: false,
             active_result: 0,

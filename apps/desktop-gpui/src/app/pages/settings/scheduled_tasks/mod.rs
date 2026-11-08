@@ -1,9 +1,10 @@
 //! Settings > Scheduled tasks (`apps/web/src/components/settings/ScheduledTasksSettings.tsx`).
 //!
-//! The native client is connected to one environment, so this is the web's single-environment
-//! path (`ScheduledTaskEnvironmentSection`); the web's multi-environment list, scope filtering
-//! (`matchesScheduledTaskScope`, everything matches the global scope) and `?taskId=` deep links
-//! do not apply yet. The section has no plain setting rows: every control is RPC-backed.
+//! The list is the web's single-environment section (`ScheduledTaskEnvironmentSection`) for the
+//! environment Settings reads, filtered to the scope (`matchesScheduledTaskScope`); the web's
+//! multi-environment list is not ported. A link to one task (`?taskId=`) opens its editor once
+//! it loads, from its own environment's list when that's another one. The section has no plain
+//! setting rows: every control is RPC-backed.
 
 mod editor;
 pub(in crate::app) mod logic;
@@ -29,11 +30,13 @@ use gpui_kit::{
 };
 use serde_json::json;
 
-use self::logic::{ScheduledTask, decode_tasks, relative_label, schedule_label};
+use self::logic::{ScheduledTask, decode_tasks, matches_scope, relative_label, schedule_label};
 use super::super::widgets::{RowFrame, section_with_action};
 use crate::app::Workspace;
+use crate::app::pages::settings::connections::logic::ORCHESTRATION_OPERATE;
 use crate::app::pages::settings::widgets::SettingsView;
 use crate::rpc::{RpcClient, RpcError, StreamEvent};
+use crate::settings::scope::Scope;
 use crate::theme::{self, Tokens};
 
 const SECTION: &str = "scheduled-tasks";
@@ -60,6 +63,19 @@ pub(super) fn render(
         return workspace.settings_page("scheduled-tasks", settings, [section], cx);
     }
     workspace.settings_page("scheduled-tasks", settings, [view.into_any_element()], cx)
+}
+
+impl Workspace {
+    /// Opens Settings › Scheduled tasks on one task's editor (`?environmentId&taskId`).
+    pub(in crate::app) fn open_scheduled_task(
+        &mut self,
+        environment: SharedString,
+        task_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_settings(SECTION, cx);
+        self.settings_ui.scheduled_task_link = Some((environment, task_id));
+    }
 }
 
 /// The task list, shared so a row or the editor holds a task without copying it.
@@ -90,17 +106,34 @@ pub(super) struct ScheduledTasksView {
     _minute: Option<Task<()>>,
     /// Tasks with a toggle, run or delete in flight.
     busy: HashSet<String>,
+    /// The linked task whose editor already opened, so a link opens it once.
+    opened_link: Option<String>,
+    /// An editor dialog is open; closing it spends the link (`closeEditor`).
+    editor_open: bool,
+    /// The linked task's environment, read while the link is open when the list reads another.
+    linked: Option<Linked>,
     _observe: Subscription,
+}
+
+struct Linked {
+    environment: SharedString,
+    tasks: Option<Tasks>,
+    _stream: Task<()>,
 }
 
 impl ScheduledTasksView {
     fn new(workspace: Entity<Workspace>, cx: &mut Context<Self>) -> Self {
         // Unsubscribe when Settings leaves this section or the socket drops.
         let observe = cx.observe(&workspace, |this, workspace, cx| {
-            let workspace = workspace.read(cx);
-            let shown = workspace.settings.as_deref() == Some(SECTION) && workspace.settings_client().is_some();
+            let on_section = workspace.read(cx).settings.as_deref() == Some(SECTION);
+            let shown = on_section && workspace.read(cx).settings_client().is_some();
             if !shown && (this.subscribed || this.stream.is_some()) {
                 this.stop();
+            }
+            // Leaving the section drops its link, as navigating away drops `taskId`.
+            if !on_section && workspace.read(cx).settings_ui.scheduled_task_link.is_some() {
+                workspace.update(cx, |workspace, _| workspace.settings_ui.scheduled_task_link = None);
+                this.opened_link = None;
             }
         });
         Self {
@@ -111,6 +144,9 @@ impl ScheduledTasksView {
             following: None,
             _minute: None,
             busy: HashSet::new(),
+            opened_link: None,
+            editor_open: false,
+            linked: None,
             _observe: observe,
         }
     }
@@ -121,6 +157,27 @@ impl ScheduledTasksView {
         self.subscribed = false;
         self.following = None;
         self.tasks = Load::Loading;
+        self.linked = None;
+    }
+
+    /// Reads the linked task's environment (`linkedTasksQuery`) when the list reads another.
+    fn subscribe_linked(&mut self, environment: SharedString, client: &RpcClient, cx: &mut Context<Self>) {
+        let stream = client.stream("scheduledTasks.subscribe", json!({}));
+        let task = cx.spawn(async move |this, cx| {
+            while let Some(StreamEvent::Item(value)) = stream.next().await {
+                let tasks: Tasks = decode_tasks(&value).into_iter().map(Rc::new).collect();
+                let applied = this.update(cx, |this, cx| {
+                    if let Some(linked) = &mut this.linked {
+                        linked.tasks = Some(tasks);
+                    }
+                    cx.notify();
+                });
+                if applied.is_err() {
+                    return;
+                }
+            }
+        });
+        self.linked = Some(Linked { environment, tasks: None, _stream: task });
     }
 
     fn subscribe(&mut self, environment: SharedString, client: RpcClient, cx: &mut Context<Self>) {
@@ -163,9 +220,14 @@ impl ScheduledTasksView {
         }));
     }
 
+    /// `upsertScheduledTask.permissionAtom`: this connection may operate on `environment`.
+    fn can_operate(&self, environment: &str, cx: &App) -> bool {
+        self.workspace.upgrade().is_some_and(|w| w.read(cx).environment_grants(environment, ORCHESTRATION_OPERATE))
+    }
+
     fn act(&mut self, task: &ScheduledTask, action: Action, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((_, client)) = self.following.clone() else { return };
-        if !self.busy.insert(task.id.clone()) {
+        let Some((environment, client)) = self.following.clone() else { return };
+        if !self.can_operate(&environment, cx) || !self.busy.insert(task.id.clone()) {
             return;
         }
         let id = task.id.clone();
@@ -188,10 +250,25 @@ impl ScheduledTasksView {
         .detach();
     }
 
-    fn open_editor(&mut self, task: Option<ScheduledTask>, window: &mut Window, cx: &mut Context<Self>) {
+    /// Edits one of the list's tasks.
+    fn open_editor(&mut self, task: ScheduledTask, window: &mut Window, cx: &mut Context<Self>) {
         let Some((environment, client)) = self.following.clone() else { return };
+        self.open_editor_on(environment, client, Some(task), window, cx);
+    }
+
+    fn open_editor_on(
+        &mut self,
+        environment: SharedString,
+        client: RpcClient,
+        task: Option<ScheduledTask>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else { return };
+        let scope = workspace.read(cx).settings_view().scope;
         let list = cx.entity().downgrade();
-        editor::open(self.workspace.clone(), list, environment, client, task, window, cx);
+        editor::open(self.workspace.clone(), list, (environment, client), task, scope, window, cx);
+        self.editor_open = true;
     }
 
     /// The loaded list, for the editor's "task no longer exists" check and live webhook state.
@@ -200,6 +277,54 @@ impl ScheduledTasksView {
             Load::Loaded(tasks) => Some(tasks.clone()),
             _ => None,
         }
+    }
+
+    /// `environment`'s tasks when this view reads it (`None` while they load), else `None`.
+    pub(super) fn tasks_on(&self, environment: &str) -> Option<Option<Tasks>> {
+        if self.following.as_ref().is_some_and(|(id, _)| id == environment) {
+            return Some(self.loaded_tasks());
+        }
+        self.linked.as_ref().filter(|linked| linked.environment == environment).map(|linked| linked.tasks.clone())
+    }
+
+    /// A `taskId` link: opens its editor once the task loads within the scope, unless an editor
+    /// the user opened is already up. True when the loaded list has no such task.
+    fn follow_link(
+        &mut self,
+        link: Option<&(SharedString, String)>,
+        scope: &Scope,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some((environment, task_id)) = link else {
+            self.opened_link = None;
+            self.linked = None;
+            return false;
+        };
+        let reads_link = |this: &Self| {
+            this.following.as_ref().is_some_and(|(id, _)| id == environment)
+                || this.linked.as_ref().is_some_and(|linked| &linked.environment == environment)
+        };
+        if !reads_link(self) && scope.environment_ids.iter().any(|id| id == environment.as_ref()) {
+            let client = self.workspace.upgrade().and_then(|w| w.read(cx).env_client(environment));
+            if let Some(client) = client {
+                self.subscribe_linked(environment.clone(), &client, cx);
+            }
+        }
+        let Some(Some(tasks)) = self.tasks_on(environment) else { return false };
+        let linked = tasks.iter().find(|t| &t.id == task_id && matches_scope(scope, environment, &t.project_id));
+        let Some(task) = linked.cloned() else { return true };
+        if self.opened_link.as_ref() != Some(task_id) {
+            self.opened_link = Some(task_id.clone());
+            let client = self.workspace.upgrade().and_then(|w| w.read(cx).env_client(environment));
+            if let (false, Some(client)) = (self.editor_open, client) {
+                let environment = environment.clone();
+                cx.defer_in(window, move |this, window, cx| {
+                    this.open_editor_on(environment, client, Some((*task).clone()), window, cx);
+                });
+            }
+        }
+        false
     }
 
     /// `ScheduledTaskThreadLink`: a one-thread task's thread, by its title.
@@ -236,7 +361,14 @@ impl ScheduledTasksView {
         )
     }
 
-    fn render_row(&self, task: &Rc<ScheduledTask>, client: &RpcClient, t: &Tokens, cx: &mut Context<Self>) -> RowFrame {
+    fn render_row(
+        &self,
+        task: &Rc<ScheduledTask>,
+        client: &RpcClient,
+        can_operate: bool,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> RowFrame {
         let busy = self.busy.contains(&task.id);
         let schedule = task.schedule();
         let webhook = schedule == logic::Schedule::Webhook;
@@ -275,7 +407,7 @@ impl ScheduledTasksView {
             .ghost()
             .small()
             .icon(Icon::new(Lucide::Ellipsis))
-            .disabled(busy)
+            .disabled(busy || !can_operate)
             .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |menu, _, _| {
                 let task = menu_task.clone();
                 let edit = {
@@ -284,7 +416,7 @@ impl ScheduledTasksView {
                     move |_: &gpui_kit::ClickEvent, window: &mut Window, cx: &mut App| {
                         let (view, task) = (view.clone(), task.clone());
                         window.defer(cx, move |window, cx| {
-                            view.update(cx, |this, cx| this.open_editor(Some((*task).clone()), window, cx));
+                            view.update(cx, |this, cx| this.open_editor((*task).clone(), window, cx));
                         });
                     }
                 };
@@ -319,7 +451,7 @@ impl ScheduledTasksView {
             .child(
                 Switch::new(SharedString::from(format!("scheduled-task-enabled-{id}")))
                     .checked(enabled)
-                    .disabled(busy)
+                    .disabled(busy || !can_operate)
                     .accessibility_label(format!("Enable {}", task.title))
                     .on_change(cx.listener(move |this, _: &bool, window, cx| {
                         this.act(&toggle_task, Action::SetEnabled(!enabled), window, cx);
@@ -335,15 +467,33 @@ impl ScheduledTasksView {
 }
 
 impl Render for ScheduledTasksView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *theme::tokens(cx);
         let Some(workspace) = self.workspace.upgrade() else { return div().into_any_element() };
-        let (target, label) = {
+        // The editor closed: its link is spent (`closeEditor`).
+        if self.editor_open && !window.has_active_dialog(cx) {
+            self.editor_open = false;
+            workspace.update(cx, |workspace, _| workspace.settings_ui.scheduled_task_link = None);
+        }
+        let (target, label, scope, link, creation) = {
             let workspace = workspace.read(cx);
             let label =
                 workspace.settings_info().environment_label.clone().unwrap_or_else(|| "this environment".into());
-            let target = workspace.settings_environment().and_then(|id| Some((workspace.env_client(&id)?, id)));
-            (target, label)
+            let default = workspace.settings_environment();
+            let target = default.clone().and_then(|id| Some((workspace.env_client(&id)?, id)));
+            let view = workspace.settings_view();
+            // `creationEnvironment`: the default when it may create tasks, else the first that may.
+            let permitted: Vec<SharedString> = view
+                .connected_environment_ids()
+                .into_iter()
+                .filter(|id| workspace.environment_grants(id, ORCHESTRATION_OPERATE))
+                .collect();
+            let creation = permitted
+                .iter()
+                .find(|id| Some(*id) == default.as_ref())
+                .or(permitted.first())
+                .and_then(|id| Some((id.clone(), workspace.env_client(id)?)));
+            (target, label, view.scope, workspace.settings_ui.scheduled_task_link.clone(), creation)
         };
         // Another environment, or the same one on a new socket, starts the list over.
         let moved = |(id, socket): &(SharedString, RpcClient)| {
@@ -353,12 +503,14 @@ impl Render for ScheduledTasksView {
             self.stop();
         }
         let client = target.as_ref().map(|(client, _)| client.clone());
-        if let Some((client, environment)) = target
+        if let Some((client, environment)) = target.clone()
             && !self.subscribed
             && !matches!(self.tasks, Load::Failed(_))
         {
             self.subscribe(environment, client, cx);
         }
+        let link_unavailable = self.follow_link(link.as_ref(), &scope, window, cx);
+        let can_operate = target.as_ref().is_some_and(|(_, environment)| self.can_operate(environment, cx));
 
         let body: Vec<RowFrame> = match (&client, &self.tasks) {
             (None, _) => vec![
@@ -369,13 +521,27 @@ impl Render for ScheduledTasksView {
                 vec![RowFrame::new("Could not load scheduled tasks").description(error.clone())]
             }
             (Some(_), Load::Loading) => vec![RowFrame::new("Loading scheduled tasks…")],
-            (Some(_), Load::Loaded(tasks)) if tasks.is_empty() => vec![
-                RowFrame::new("No scheduled tasks")
-                    .description("No tasks match this environment and project selection."),
-            ],
             (Some(client), Load::Loaded(tasks)) => {
-                let tasks = tasks.clone();
-                tasks.iter().map(|task| self.render_row(task, client, &t, cx)).collect()
+                let environment = target.as_ref().map(|(_, id)| id.clone()).unwrap_or_default();
+                let tasks: Vec<Rc<ScheduledTask>> = tasks
+                    .iter()
+                    .filter(|task| matches_scope(&scope, &environment, &task.project_id))
+                    .cloned()
+                    .collect();
+                let mut rows: Vec<RowFrame> = Vec::new();
+                if link_unavailable {
+                    rows.push(RowFrame::new("Task unavailable").description(
+                        "This task was deleted or belongs to a different project. Check your project filter.",
+                    ));
+                }
+                if tasks.is_empty() {
+                    rows.push(
+                        RowFrame::new("No scheduled tasks")
+                            .description("No tasks match this environment and project selection."),
+                    );
+                }
+                rows.extend(tasks.iter().map(|task| self.render_row(task, client, can_operate, &t, cx)));
+                rows
             }
         };
 
@@ -385,8 +551,12 @@ impl Render for ScheduledTasksView {
             .text_color(t.muted_foreground)
             .icon(Icon::new(Lucide::Plus).with_size(px(12.)))
             .label("New task")
-            .disabled(client.is_none())
-            .on_click(cx.listener(|this, _, window, cx| this.open_editor(None, window, cx)));
+            .disabled(creation.is_none())
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if let Some((environment, client)) = creation.clone() {
+                    this.open_editor_on(environment, client, None, window, cx);
+                }
+            }));
 
         let rows = body.into_iter().map(|row| row.render(&t).into_any_element());
         section_with_action("scheduled-tasks", "Scheduled tasks", Some(new_task.into_any_element()), rows, &t)
