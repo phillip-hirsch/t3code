@@ -362,7 +362,8 @@ impl Workspace {
                             .child(div().flex_none().text_xs().text_color(t.muted_foreground).child(project.clone()))
                             .on_click(move |_, window, cx| {
                                 window.close_dialog(cx);
-                                let _ = view.update(cx, |this, cx| this.link_pr_to_thread(id.clone(), window, cx));
+                                let _ = view
+                                    .update(cx, |this, cx| this.change_pr_thread_link(id.clone(), true, window, cx));
                             })
                             .into_any_element()
                     })
@@ -377,21 +378,52 @@ impl Workspace {
         });
     }
 
-    /// `thread.pull-request.link`, then the linked threads are read again.
-    fn link_pr_to_thread(&mut self, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
+    /// The thread showing the pull request, when it lives on the pull request's environment, and
+    /// whether it links it (`usePullRequestLinking().isLinked`).
+    pub(super) fn pr_current_thread(&self, project_id: &str, thread_id: &str, url: &str) -> Option<(String, bool)> {
+        let thread = self.shell.threads.iter().find(|t| t.id == thread_id)?;
+        if self.project_environment(&thread.project_id) != self.project_environment(project_id) {
+            return None;
+        }
+        Some((thread.id.clone(), crate::thread_pull_requests::links_url(&thread.pull_requests, url)))
+    }
+
+    /// `thread.pull-request.link` or `.unlink`, then the linked threads are read again.
+    pub(super) fn change_pr_thread_link(
+        &mut self,
+        thread_id: String,
+        link: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(client) = self.thread_client(&thread_id) else { return };
         let Some(detail) = self.pull_requests.panel.as_ref().and_then(|p| p.detail.clone()) else { return };
         let Some((host, repository, number)) = thread_key(&detail) else { return };
         let term = logic::terminology(&detail.provider).0;
-        let command = json!({
-            "type": "thread.pull-request.link", "commandId": super::super::super::new_id(), "threadId": thread_id,
-            "host": host, "repository": repository, "number": number, "url": detail.url, "source": "manual",
-        });
+        let id = super::super::super::new_id();
+        let command = if link {
+            json!({
+                "type": "thread.pull-request.link", "commandId": id, "threadId": thread_id,
+                "host": host, "repository": repository, "number": number, "url": detail.url, "source": "manual",
+            })
+        } else {
+            json!({
+                "type": "thread.pull-request.unlink", "commandId": id, "threadId": thread_id,
+                "host": host, "repository": repository, "number": number,
+            })
+        };
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("orchestration.dispatchCommand", command).await;
             let _ = this.update_in(cx, |this, window, cx| match result {
                 Ok(_) => this.read_pr_extras(cx),
-                Err(error) => toast_error(window, cx, format!("Could not link the {term}"), error.to_string()),
+                Err(error) => {
+                    let title = if link {
+                        format!("Could not link the {term}")
+                    } else {
+                        format!("Could not unlink the {term}")
+                    };
+                    toast_error(window, cx, title, error.to_string());
+                }
             });
         })
         .detach();

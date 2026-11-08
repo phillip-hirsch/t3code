@@ -53,6 +53,14 @@ const COPIED_WINDOW: Duration = Duration::from_millis(1600);
 /// A guide run takes minutes; its answer is read again at this pace while it runs.
 const GUIDE_POLL: Duration = Duration::from_secs(15);
 
+/// The thread whose right panel shows the pull request (`threadRef` beside `PullRequestDetailPanel`).
+#[derive(Clone, Debug)]
+pub(in crate::app) struct PanelThread {
+    pub id: String,
+    /// The thread links several pull requests, so the crumbs lead back to its list (`onBack`).
+    pub back: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Tab {
     Summary,
@@ -831,7 +839,12 @@ impl Workspace {
         )
     }
 
-    pub(super) fn render_pull_request_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_pull_request_panel(
+        &mut self,
+        thread: Option<&PanelThread>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = *theme::tokens(cx);
         let Some(panel) = self.pull_requests.panel.as_ref() else { return div().into_any_element() };
         let frame = v_flex().size_full().min_h_0().bg(t.background);
@@ -842,7 +855,7 @@ impl Workspace {
                 }
                 _ => detail_ghost(&t),
             };
-            return frame.child(self.render_pr_seed_header(&t, cx)).child(body).into_any_element();
+            return frame.child(self.render_pr_seed_header(thread, &t, cx)).child(body).into_any_element();
         };
         let guides = self.review_guides_enabled(&detail.project_id);
         let panel = self.pull_requests.panel.as_ref().expect("checked above");
@@ -851,7 +864,7 @@ impl Workspace {
             Tab::Code if !detail.capabilities.diff => Tab::Summary,
             tab => tab,
         };
-        let header = self.render_pr_header(&detail, tab, guides, &t, window, cx);
+        let header = self.render_pr_header(&detail, tab, guides, thread, &t, window, cx);
         let body = match tab {
             Tab::Summary => self.render_pr_summary(&detail, &t, window, cx),
             Tab::Timeline => self.render_pr_timeline(&detail, &t, cx),
@@ -872,7 +885,7 @@ impl Workspace {
     }
 
     /// The crumbs and collapse button while the detail is not in yet (`PullRequestDetailGhost`).
-    fn render_pr_seed_header(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+    fn render_pr_seed_header(&self, thread: Option<&PanelThread>, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let panel = self.pull_requests.panel.as_ref().expect("a panel is open");
         let number = panel.reference.number;
         let title = panel.seed.as_ref().map(|s| s.title.clone());
@@ -888,6 +901,7 @@ impl Workspace {
                     .gap(px(4.))
                     .text_xs()
                     .text_color(t.muted_foreground)
+                    .children(thread.filter(|thread| thread.back).map(|_| back_button(t, cx)))
                     .child(
                         div()
                             .flex_1()
@@ -958,11 +972,13 @@ impl Workspace {
             .into_any_element()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_pr_header(
         &mut self,
         detail: &Rc<Detail>,
         tab: Tab,
         guides: bool,
+        thread: Option<&PanelThread>,
         t: &Tokens,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -995,6 +1011,7 @@ impl Workspace {
         let number = number_link(&detail.url, detail.number, state_color, open_label);
         let condensed = panel.condensed;
         let condensed_row = self.render_pr_condensed_row(detail, t);
+        let back = thread.filter(|thread| thread.back).map(|_| back_button(t, cx));
         let crumbs = h_flex()
             .flex_1()
             .min_w_0()
@@ -1003,6 +1020,7 @@ impl Workspace {
             .gap(px(4.))
             .text_xs()
             .text_color(t.muted_foreground)
+            .children(back)
             .when(!condensed, |el| el.child(repository))
             .child(number)
             .when(condensed, |el| {
@@ -1025,7 +1043,7 @@ impl Workspace {
             .children(self.render_pr_stack(detail, method, t, cx))
             .children(self.render_pr_primary(detail, primary, method, state_label, state_color, t, cx))
             .child(self.render_pr_checkout(detail, t, cx))
-            .child(self.render_pr_menu(detail, primary, method, guides, &view, t))
+            .child(self.render_pr_menu(detail, primary, method, guides, thread, &view, t))
             .child(collapse_button(t, cx));
 
         let author = actor_label(detail.author.as_ref(), t);
@@ -1297,12 +1315,14 @@ impl Workspace {
     }
 
     /// `PullRequestActionsMenu`.
+    #[allow(clippy::too_many_arguments)]
     fn render_pr_menu(
         &self,
         detail: &Rc<Detail>,
         primary: Option<Primary>,
         method: &'static str,
         guides: bool,
+        thread: Option<&PanelThread>,
         view: &Entity<Workspace>,
         t: &Tokens,
     ) -> impl IntoElement {
@@ -1318,6 +1338,8 @@ impl Workspace {
         let maintainer = logic::can_edit_maintainer_edits(detail)
             .then(|| (panel.maintainer_choice.or(detail.maintainer_can_modify) == Some(true), panel.maintainer_saving));
         let can_link = logic::parse_change_request_url(&detail.url).is_some();
+        let current_thread =
+            thread.and_then(|thread| self.pr_current_thread(&detail.project_id, &thread.id, &detail.url));
         let handoff = panel.handoff.clone();
         let can_fix = self.shell.projects.iter().any(|p| p.id == detail.project_id);
         let detail = detail.clone();
@@ -1340,12 +1362,24 @@ impl Workspace {
                 let on = |f: fn(&mut Workspace, &mut Window, &mut Context<Workspace>)| {
                     window.listener_for(&view, move |this, _, window, cx| f(this, window, cx))
                 };
-                if can_link {
-                    menu = menu.item(
-                        PopupMenuItem::new("Link to thread")
-                            .icon(Lucide::Link)
-                            .on_click(on(super::super::Workspace::open_pr_thread_picker)),
-                    );
+                match current_thread.clone() {
+                    // `PullRequestThreadLinks display="menu-item"`: the thread showing it links or unlinks it.
+                    Some((id, linked)) if can_link || linked => {
+                        let (label, icon) =
+                            if linked { ("Unlink from this thread", Lucide::Unlink2) } else { ("Link to this thread", Lucide::Link) };
+                        menu = menu.item(PopupMenuItem::new(label).icon(icon).on_click(window.listener_for(
+                            &view,
+                            move |this, _, window, cx| this.change_pr_thread_link(id.clone(), !linked, window, cx),
+                        )));
+                    }
+                    _ if can_link => {
+                        menu = menu.item(
+                            PopupMenuItem::new("Link to thread")
+                                .icon(Lucide::Link)
+                                .on_click(on(super::super::Workspace::open_pr_thread_picker)),
+                        );
+                    }
+                    _ => {}
                 }
                 menu = menu.item(
                     PopupMenuItem::new("Refresh")
@@ -2320,6 +2354,21 @@ fn pr_markdown_view(state: &Entity<TextViewState>, t: &Tokens, view: Entity<Work
             }
         },
     )
+}
+
+/// `BackButton`: back to the thread's linked pull requests.
+fn back_button(t: &Tokens, cx: &mut Context<Workspace>) -> Button {
+    Button::new("pr-crumb-back")
+        .ghost()
+        .xsmall()
+        .size(px(20.))
+        .p_0()
+        .ml(px(-6.))
+        .tooltip("Back to pull requests")
+        .child(Icon::new(Lucide::ArrowLeft).with_size(px(14.)).text_color(t.muted_foreground))
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.open_surface(super::super::right_panel::Surface::PullRequests, window, cx);
+        }))
 }
 
 fn collapse_button(t: &Tokens, cx: &mut Context<Workspace>) -> Button {

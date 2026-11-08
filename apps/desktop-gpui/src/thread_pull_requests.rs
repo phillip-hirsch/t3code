@@ -65,11 +65,11 @@ pub struct StackLayer {
 }
 
 impl PullRequestLink {
-    pub(crate) fn key(&self) -> (String, String, u64) {
+    fn key(&self) -> (String, String, u64) {
         (self.host.to_lowercase(), self.repository.to_lowercase(), self.number)
     }
 
-    pub(crate) fn is_open(&self) -> bool {
+    fn is_open(&self) -> bool {
         self.snapshot.as_ref().is_none_or(|s| s.state == "open")
     }
 
@@ -82,6 +82,11 @@ impl PullRequestLink {
 /// `visibleThreadPullRequests`: a dismissed stack member is hidden.
 pub fn visible(links: &[PullRequestLink]) -> impl Iterator<Item = &PullRequestLink> {
     links.iter().filter(|link| link.source != "stack-dismissed")
+}
+
+/// `usePullRequestLinking().isLinked`: a visible link names the change request at `url`.
+pub fn links_url(links: &[PullRequestLink], url: &str) -> bool {
+    crate::pull_request_detail::parse_change_request_url(url).is_some_and(|key| visible(links).any(|l| l.key() == key))
 }
 
 /// `ThreadPullRequestChain`: a host's native stack, or links chained by base branch.
@@ -307,6 +312,8 @@ mod tests {
         let target = panel_target("p", &links, None, None).unwrap();
         assert_eq!((target.number, target.host.as_deref(), target.project_id.as_str()), (2, Some("github.com"), "p"));
         assert_eq!(visible(&links).count(), 2);
+        assert!(links_url(&links, "https://GitHub.com/O/R/pull/2/files"), "the thread links #2");
+        assert!(!links_url(&links, "https://github.com/o/r/pull/3"), "a dismissed link does not count");
         let closed = vec![
             link(1, "manual", "closed", "2026-01-03T00:00:00Z"),
             link(4, "manual", "merged", "2026-01-04T00:00:00Z"),

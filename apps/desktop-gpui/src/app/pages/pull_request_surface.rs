@@ -12,6 +12,7 @@ use gpui_kit::{
 
 use super::super::Workspace;
 use super::super::right_panel::Surface;
+use super::pull_request_detail::PanelThread;
 use super::pull_requests::tone;
 use crate::pull_request_detail::Reference;
 use crate::theme::{self, Tokens};
@@ -61,7 +62,11 @@ impl Workspace {
             let seed = self.pull_requests.entry_for(reference);
             self.open_pull_request_panel(reference.clone(), seed, cx);
         }
-        self.render_pull_request_panel(window, cx)
+        let thread = self.open_thread_shell().map(|shell| PanelThread {
+            id: shell.id.clone(),
+            back: links::visible(&shell.pull_requests).nth(1).is_some(),
+        });
+        self.render_pull_request_panel(thread.as_ref(), window, cx)
     }
 
     /// The Linked pull requests surface.

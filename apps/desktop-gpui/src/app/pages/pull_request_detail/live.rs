@@ -258,7 +258,7 @@ impl Workspace {
                 cx.notify();
             }))
             .child(self.render_pr_tab_strip(&t, cx))
-            .child(div().flex_1().min_h_0().child(self.render_pull_request_panel(window, cx)))
+            .child(div().flex_1().min_h_0().child(self.render_pull_request_panel(None, window, cx)))
             .child(deferred(handle).with_priority(1))
             .into_any_element()
     }
