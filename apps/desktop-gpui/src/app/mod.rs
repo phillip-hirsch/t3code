@@ -229,6 +229,7 @@ pub struct Workspace {
     sheet_focus: sidebar_sheet::SheetFocus<gpui_kit::FocusHandle>,
     /// The sheet's focus trap: Tab cycles inside it while it shows.
     sheet_trap: gpui_kit::FocusHandle,
+    titlebar_focus: titlebar::TitlebarFocus,
     details_open: bool,
     /// The details card as a popover, while the canvas is too narrow for it inline.
     details_popover: bool,
@@ -284,6 +285,8 @@ pub struct Workspace {
     files: files::FilesState,
     /// Holds focus when nothing inside does, so window shortcuts still reach the workspace.
     focus: gpui_kit::FocusHandle,
+    /// The F6 stops that are regions rather than controls.
+    areas: commands::WorkspaceAreas,
     /// Settings > Scheduled tasks, kept while the window lives; it unsubscribes while hidden.
     scheduled_tasks_view: Option<gpui_kit::AnyView>,
     preview: preview::PreviewState,
@@ -423,9 +426,12 @@ impl Workspace {
                 let workspace = cx.weak_entity();
                 cx.new(|_| sidebar::SidebarView(workspace))
             },
-            sidebar_open: sidebar_sheet::SidebarOpen::default(),
+            sidebar_open: sidebar_sheet::SidebarOpen::restored(
+                sidebar_sheet::docked_path().and_then(|path| sidebar_sheet::read_docked(&path)),
+            ),
             sheet_focus: sidebar_sheet::SheetFocus::default(),
             sheet_trap: cx.focus_handle(),
+            titlebar_focus: titlebar::TitlebarFocus::new(cx),
             details_open: true,
             details_popover: false,
             lineage_expanded: None,
@@ -458,10 +464,11 @@ impl Workspace {
             find: None,
             files: files::FilesState::default(),
             focus: cx.focus_handle(),
+            areas: commands::WorkspaceAreas::new(cx),
             scheduled_tasks_view: None,
             preview: preview::PreviewState::new(window, cx),
             t3_project_files: HashMap::new(),
-            terminals: terminal::Terminals::default(),
+            terminals: terminal::Terminals::restored(),
             side_chat: Default::default(),
             alerts: Default::default(),
             snap_shot: Default::default(),
@@ -1131,6 +1138,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_steer_queued))
             .on_action(cx.listener(Self::on_edit_queued))
             .map(|el| self.on_terminal_actions(el, cx))
+            .map(|el| self.on_menu_actions(el, cx))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if this.quit_key_down(event, cx) {
                     cx.stop_propagation();

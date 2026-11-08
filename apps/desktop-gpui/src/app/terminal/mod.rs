@@ -8,22 +8,25 @@ mod layout;
 mod links;
 mod mouse;
 mod panel;
+mod scrollbar;
 mod session;
 
 pub(in crate::app) use self::grid::TerminalTheme;
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use gpui_kit::component::button::Button;
 use gpui_kit::component::button::ButtonVariant;
 use gpui_kit::component::input::InlineToken;
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{Sizable as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{Disableable as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, AnyView, App, AppContext as _, Context, Div, DragMoveEvent, EmptyView, Entity, InteractiveElement as _,
-    IntoElement, KeyBinding, NoAction, ParentElement as _, SharedString, Stateful, StatefulInteractiveElement as _,
-    StyleRefinement, Styled as _, Subscription, Task, Window, div, px, rgb,
+    AnyElement, AnyView, App, AppContext as _, Context, Div, DragMoveEvent, EmptyView, Entity, FocusHandle,
+    InteractiveElement as _, IntoElement, KeyBinding, NoAction, ParentElement as _, SharedString, Stateful,
+    StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription, Task, Window, div, px, rgb,
 };
 use serde_json::{Value, json};
 
@@ -53,6 +56,10 @@ pub fn key_bindings() -> Vec<KeyBinding> {
 }
 
 const MIN_DRAWER_HEIGHT: f32 = 180.;
+/// `MAX_HIDDEN_MOUNTED_TERMINAL_THREADS`: hidden threads whose open drawers keep their sessions.
+const MAX_HIDDEN_THREADS: usize = 10;
+/// Drawer drags change the height every frame; the file is written once they settle.
+const PERSIST_DEBOUNCE: Duration = Duration::from_millis(300);
 const MAX_DRAWER_HEIGHT_RATIO: f32 = 0.75;
 
 /// A `TerminalSummary` from `subscribeTerminalMetadata`.
@@ -88,9 +95,17 @@ struct Pane {
 
 #[derive(Default)]
 pub(super) struct Terminals {
+    /// By thread; changed through [`Terminals::drawer`] and [`Terminals::drawer_mut`].
     drawers: HashMap<String, DrawerLayout>,
+    drawers_changed: bool,
+    /// The drawers as last saved (`t3code:terminal-state:v1`).
+    persisted: Value,
+    _persist: Option<Task<()>>,
     /// Sessions of the shown group, by terminal id.
     panes: HashMap<String, Pane>,
+    /// Hidden threads' open drawer sessions, kept so switching back finds them as they were;
+    /// least recently shown first.
+    parked: Vec<(String, HashMap<String, Pane>)>,
     /// By thread, in server order; `None` until the first snapshot.
     summaries: Option<HashMap<String, Vec<Summary>>>,
     /// The environment whose metadata stream reported each thread's terminals.
@@ -144,7 +159,67 @@ fn context_record(id: &str, terminal_id: &str, terminal_label: &str, selected: &
     })
 }
 
+/// Where the drawers are kept between launches.
+fn drawers_path() -> Option<PathBuf> {
+    Some(crate::settings::userdata_dir()?.join("terminal-state.json"))
+}
+
+/// The stored drawers, normalized; a missing or unreadable file restores none.
+fn read_drawers(path: &Path) -> HashMap<String, DrawerLayout> {
+    let stored: HashMap<String, DrawerLayout> =
+        std::fs::read(path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
+    stored.into_iter().map(|(thread_id, drawer)| (thread_id, drawer.restored())).collect()
+}
+
+/// The drawers that differ from the default, by thread id.
+fn stored_drawers(drawers: &HashMap<String, DrawerLayout>) -> Value {
+    let mut stored: Vec<(&String, &DrawerLayout)> =
+        drawers.iter().filter_map(|(thread_id, drawer)| Some((thread_id, drawer.stored()?))).collect();
+    stored.sort_by_key(|(thread_id, _)| *thread_id);
+    stored
+        .into_iter()
+        .map(|(thread_id, drawer)| (thread_id.clone(), json!(drawer)))
+        .collect::<serde_json::Map<_, _>>()
+        .into()
+}
+
 impl Terminals {
+    /// The drawers the last session left.
+    pub(super) fn restored() -> Self {
+        let drawers = drawers_path().map(|path| read_drawers(&path)).unwrap_or_default();
+        Self { persisted: stored_drawers(&drawers), drawers, ..Self::default() }
+    }
+
+    fn drawer(&mut self, thread_id: String) -> &mut DrawerLayout {
+        self.drawers_changed = true;
+        self.drawers.entry(thread_id).or_default()
+    }
+
+    fn drawer_mut(&mut self, thread_id: &str) -> Option<&mut DrawerLayout> {
+        self.drawers_changed = true;
+        self.drawers.get_mut(thread_id)
+    }
+
+    /// Saves the drawers once they settle, if they changed since the last save.
+    fn persist(&mut self, cx: &App) {
+        if !std::mem::take(&mut self.drawers_changed) {
+            return;
+        }
+        let stored = stored_drawers(&self.drawers);
+        if stored == self.persisted {
+            return;
+        }
+        self.persisted = stored.clone();
+        let Some(path) = drawers_path() else { return };
+        let executor = cx.background_executor().clone();
+        self._persist = Some(cx.background_spawn(async move {
+            executor.timer(PERSIST_DEBOUNCE).await;
+            if let Err(error) = crate::settings::write_atomically(&path, &stored) {
+                log::warn!("could not save {}: {error}", path.display());
+            }
+        }));
+    }
+
     /// The thread id the draft in `project_id` launches with, if its terminal drawer used one.
     pub(super) fn take_draft_thread(&mut self, project_id: &str) -> Option<String> {
         self.draft_threads.remove(project_id)
@@ -156,6 +231,14 @@ impl Terminals {
 
     fn running(&self, thread_id: &str) -> Vec<&str> {
         self.summaries(thread_id).iter().filter(|s| s.running_subprocess).map(|s| s.terminal_id.as_str()).collect()
+    }
+
+    /// The server terminal an empty drawer opens on: a running one first, never a panel tab's.
+    fn drawer_reuse(&self, thread_id: &str) -> Option<String> {
+        let panel = self.panel_ids(thread_id);
+        let free = |id: &&str| !panel.iter().any(|p| p == id);
+        let known = self.summaries(thread_id).iter().map(|s| s.terminal_id.as_str());
+        self.running(thread_id).into_iter().find(free).or_else(|| known.into_iter().find(free)).map(str::to_owned)
     }
 
     fn label(&self, thread_id: &str, terminal_id: &str) -> String {
@@ -206,6 +289,14 @@ impl Terminals {
             _ => {}
         }
     }
+}
+
+/// Keeps `value` as `thread_id`'s, the most recent of at most `max`.
+fn park<T>(parked: &mut Vec<(String, T)>, thread_id: String, value: T, max: usize) {
+    parked.retain(|(id, _)| *id != thread_id);
+    parked.push((thread_id, value));
+    let excess = parked.len().saturating_sub(max);
+    parked.drain(..excess);
 }
 
 fn sort_summaries(list: &mut [Summary]) {
@@ -261,6 +352,13 @@ impl Workspace {
         })
     }
 
+    /// `canOperateTerminal`: the thread's environment lets this client start, type into, resize
+    /// and close its terminals.
+    pub(super) fn terminal_operable(&self, thread_id: &str) -> bool {
+        let session = self.thread_environment(thread_id).and_then(|env| self.session(&env));
+        session.is_none_or(|session| !session.terminal_read_only)
+    }
+
     /// `terminalAvailable`: the chat has a project to start a shell in.
     pub(super) fn terminal_available(&self) -> bool {
         self.terminal_launch().is_some()
@@ -290,7 +388,8 @@ impl Workspace {
                 this.notify_sidebar(cx);
             },
         );
-        for pane in self.terminals.panes.values() {
+        let parked = self.terminals.parked.iter().flat_map(|(_, panes)| panes.values());
+        for pane in self.terminals.panes.values().chain(parked) {
             let thread_id = &pane.session.read(cx).thread_id;
             if self.thread_environment(thread_id).as_ref() == Some(&environment) {
                 pane.session.update(cx, |session, cx| session.attach(client.clone(), cx));
@@ -323,24 +422,26 @@ impl Workspace {
                 .collect();
             drawer.reconcile(&ids);
         }
+        self.terminals.drawers_changed = true;
     }
 
     /// `toggleTerminalVisibility`.
     pub(super) fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(thread_id) = self.terminal_thread(true) else { return };
-        let drawer = self.terminals.drawers.entry(thread_id.clone()).or_default();
+        let drawer = self.terminals.drawer(thread_id.clone());
         if drawer.open {
             drawer.open = false;
             self.focus_composer(window, cx);
         } else if drawer.terminal_ids.is_empty() {
             // A setup or agent-started shell already runs: show it instead of starting another.
-            let running = self.terminals.running(&thread_id).first().map(std::string::ToString::to_string);
-            let existing =
-                running.or_else(|| self.terminals.summaries(&thread_id).first().map(|s| s.terminal_id.clone()));
-            match existing {
+            match self.terminals.drawer_reuse(&thread_id) {
                 Some(id) => {
-                    self.terminals.drawers.entry(thread_id).or_default().ensure(&id);
+                    self.terminals.drawer(thread_id).ensure(&id);
                     self.terminals.focus_pending = Some(id);
+                }
+                // Without the grant the drawer opens on its empty state.
+                None if !self.terminal_operable(&thread_id) => {
+                    self.terminals.drawer(thread_id).open = true;
                 }
                 None => self.launch_terminal(thread_id, Place::New, cx),
             }
@@ -353,7 +454,7 @@ impl Workspace {
 
     fn open_drawer_for_action(&mut self) -> Option<String> {
         let thread_id = self.terminal_thread(true)?;
-        self.terminals.drawers.entry(thread_id.clone()).or_default().open = true;
+        self.terminals.drawer(thread_id.clone()).open = true;
         Some(thread_id)
     }
 
@@ -387,7 +488,7 @@ impl Workspace {
         launch.stop_on_settle = Some(run.stop_on_settle);
         let input = format!(" {}\r", run.command);
         let running: Vec<String> = self.terminals.running(&thread_id).into_iter().map(str::to_owned).collect();
-        let drawer = self.terminals.drawers.entry(thread_id.clone()).or_default();
+        let drawer = self.terminals.drawer(thread_id.clone());
         let idle: Vec<&String> = drawer.terminal_ids.iter().filter(|id| !running.contains(id)).collect();
         let reuse = idle.iter().find(|id| ***id == drawer.active_id).or(idle.first()).map(|id| (*id).clone());
         match reuse.filter(|_| !run.stop_on_settle) {
@@ -409,11 +510,11 @@ impl Workspace {
         then_write: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        if self.thread_client(&thread_id).is_none() {
+        if self.thread_client(&thread_id).is_none() || !self.terminal_operable(&thread_id) {
             return;
         }
         let terminal_id = self.next_terminal_id(&thread_id);
-        if !self.terminals.drawers.entry(thread_id.clone()).or_default().place(&terminal_id, place) {
+        if !self.terminals.drawer(thread_id.clone()).place(&terminal_id, place) {
             return;
         }
         self.open_terminal_session(thread_id, terminal_id, launch, then_write, cx);
@@ -439,7 +540,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         // A terminal runs on its thread's environment (a draft's is the open one).
-        let Some(client) = self.thread_client(&thread_id) else { return };
+        let Some(client) = self.thread_client(&thread_id).filter(|_| self.terminal_operable(&thread_id)) else {
+            return;
+        };
         self.terminals.focus_pending = Some(terminal_id.clone());
         let payload = launch.payload(&thread_id, &terminal_id);
         cx.spawn(async move |this, cx| {
@@ -460,7 +563,7 @@ impl Workspace {
 
     fn activate_terminal(&mut self, terminal_id: &str, cx: &mut Context<Self>) {
         let Some(thread_id) = self.shown_terminal_thread().map(str::to_owned) else { return };
-        if let Some(drawer) = self.terminals.drawers.get_mut(&thread_id) {
+        if let Some(drawer) = self.terminals.drawer_mut(&thread_id) {
             drawer.set_active(terminal_id);
             self.terminals.focus_pending = Some(terminal_id.to_owned());
             cx.notify();
@@ -470,6 +573,9 @@ impl Workspace {
     /// `confirmTerminalClose`, then [`Self::close_terminal`].
     fn request_close_terminal(&mut self, terminal_id: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(thread_id) = self.shown_terminal_thread().map(str::to_owned) else { return };
+        if !self.terminal_operable(&thread_id) {
+            return;
+        }
         let label = self.terminals.label(&thread_id, &terminal_id);
         let workspace = cx.weak_entity();
         window.open_alert_dialog(cx, move |alert, _, _| {
@@ -487,7 +593,12 @@ impl Workspace {
                     let (workspace, thread_id, terminal_id) =
                         (workspace.clone(), thread_id.clone(), terminal_id.clone());
                     window.defer(cx, move |_, cx| {
-                        let _ = workspace.update(cx, |this, cx| this.close_terminal(&thread_id, &terminal_id, cx));
+                        // The grant is read again: it may have changed while the dialog was open.
+                        let _ = workspace.update(cx, |this, cx| {
+                            if this.terminal_operable(&thread_id) {
+                                this.close_terminal(&thread_id, &terminal_id, cx);
+                            }
+                        });
                     });
                     true
                 })
@@ -497,7 +608,7 @@ impl Workspace {
     /// Ends the session and deletes its history; a failed close types `exit`.
     fn close_terminal(&mut self, thread_id: &str, terminal_id: &str, cx: &mut Context<Self>) {
         self.close_panel_terminal(thread_id, terminal_id);
-        if let Some(drawer) = self.terminals.drawers.get_mut(thread_id) {
+        if let Some(drawer) = self.terminals.drawer_mut(thread_id) {
             drawer.close(terminal_id);
             if drawer.open {
                 self.terminals.focus_pending = Some(drawer.active_id.clone());
@@ -517,8 +628,31 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Mounts sessions for the shown group and unmounts the rest. Hidden
-    /// terminals keep running on the server and replay their history on return.
+    /// Parks the sessions of a thread that stopped showing while its drawer is open, unparks the
+    /// shown thread's, and drops parked threads whose drawers closed.
+    fn park_terminal_panes(&mut self, shown_thread: Option<&str>, cx: &App) {
+        let terminals = &mut self.terminals;
+        let previous = terminals.panes.values().next().map(|pane| pane.session.read(cx).thread_id.clone());
+        if let Some(previous) = previous.filter(|previous| Some(previous.as_str()) != shown_thread) {
+            let group = terminals.drawers.get(&previous).filter(|d| d.open).and_then(|d| d.active_group());
+            let ids = group.map(|group| group.terminal_ids.clone()).unwrap_or_default();
+            let mut panes = std::mem::take(&mut terminals.panes);
+            panes.retain(|id, _| ids.contains(id));
+            if !panes.is_empty() {
+                park(&mut terminals.parked, previous, panes, MAX_HIDDEN_THREADS);
+            }
+        }
+        if let Some(shown) = shown_thread
+            && let Some(index) = terminals.parked.iter().position(|(thread_id, _)| thread_id == shown)
+        {
+            terminals.panes.extend(terminals.parked.remove(index).1);
+        }
+        let drawers = &terminals.drawers;
+        terminals.parked.retain(|(thread_id, _)| drawers.get(thread_id).is_some_and(|d| d.open));
+    }
+
+    /// Mounts sessions for the shown group and unmounts the rest (hidden threads' open drawers are
+    /// parked). Unmounted terminals keep running on the server and replay their history on return.
     fn sync_terminal_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let thread_id = self.shown_terminal_thread().map(str::to_owned);
         let shown: Vec<String> = match (&thread_id, self.page) {
@@ -535,6 +669,8 @@ impl Workspace {
                 .collect(),
             _ => Vec::new(),
         };
+        self.terminals.persist(cx);
+        self.park_terminal_panes(thread_id.as_deref().filter(|_| self.page.is_none()), cx);
         let thread_id = thread_id.unwrap_or_default();
         self.terminals.panes.retain(|id, pane| shown.contains(id) && pane.session.read(cx).thread_id == thread_id);
         for terminal_id in &shown {
@@ -551,7 +687,8 @@ impl Workspace {
             }
             let client = self.thread_client(&thread_id);
             let (thread, terminal) = (thread_id.clone(), terminal_id.clone());
-            let session = cx.new(|cx| TerminalSession::new(thread, terminal, launch, client, window, cx));
+            let read_only = !self.terminal_operable(&thread_id);
+            let session = cx.new(|cx| TerminalSession::new(thread, terminal, launch, client, read_only, window, cx));
             let _events = cx.subscribe_in(&session, window, |this, session, event: &SessionEvent, window, cx| {
                 let (thread_id, terminal_id) = {
                     let session = session.read(cx);
@@ -560,6 +697,10 @@ impl Workspace {
                 this.on_session_event(&thread_id, &terminal_id, event, window, cx);
             });
             self.terminals.panes.insert(terminal_id.clone(), Pane { session, _events });
+        }
+        let read_only = !self.terminal_operable(&thread_id);
+        for pane in self.terminals.panes.values() {
+            pane.session.update(cx, |session, cx| session.set_read_only(read_only, cx));
         }
         if let Some(pending) = self.terminals.focus_pending.take() {
             match self.terminals.panes.get(&pending) {
@@ -593,10 +734,14 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         match event {
-            SessionEvent::Exited => self.close_terminal(thread_id, terminal_id, cx),
+            // `handleSessionExited`: only a client that may operate the terminal cleans it up.
+            SessionEvent::Exited if self.terminal_operable(thread_id) => {
+                self.close_terminal(thread_id, terminal_id, cx);
+            }
+            SessionEvent::Exited => {}
             SessionEvent::Activated => {
                 self.activate_panel_terminal(thread_id, terminal_id, cx);
-                if let Some(drawer) = self.terminals.drawers.get_mut(thread_id)
+                if let Some(drawer) = self.terminals.drawer_mut(thread_id)
                     && drawer.active_id != terminal_id
                 {
                     drawer.set_active(terminal_id);
@@ -736,6 +881,7 @@ impl Workspace {
                         .outline()
                         .xsmall()
                         .label(self.with_terminal_shortcut("New Terminal", "terminal.new"))
+                        .disabled(!self.terminal_operable(&thread_id))
                         .on_click(cx.listener(|this, _, _, cx| this.new_terminal(cx))),
                 )
                 .into_any_element()
@@ -747,7 +893,20 @@ impl Workspace {
                 .bg(tokens.background)
                 .when(has_sidebar, |el| el.gap(px(6.)))
                 .child(self.render_terminal_panes(drawer, &tokens))
-                .when(has_sidebar, |el| el.child(self.render_terminal_sidebar(&thread_id, drawer, &tokens, cx)))
+                .when(has_sidebar, |el| {
+                    let sidebar = SidebarModel {
+                        thread_id: &thread_id,
+                        groups: drawer
+                            .sorted_groups()
+                            .into_iter()
+                            .map(|g| (g.id.as_str(), g.terminal_ids.as_slice(), g.split))
+                            .collect(),
+                        active: &drawer.active_id,
+                        limit: drawer.split_limit_reached(),
+                        panel: None,
+                    };
+                    el.child(self.render_terminal_sidebar(&sidebar, &tokens, window, cx))
+                })
                 .into_any_element()
         };
         let limit = drawer.split_limit_reached();
@@ -765,14 +924,14 @@ impl Workspace {
                 .on_drag_move(cx.listener(move |this, event: &DragMoveEvent<DrawerResize>, _, cx| {
                     let Some(thread_id) = this.shown_terminal_thread().map(str::to_owned) else { return };
                     let height = f32::from(event.bounds.bottom() - event.event.position.y).round();
-                    if let Some(drawer) = this.terminals.drawers.get_mut(&thread_id) {
+                    if let Some(drawer) = this.terminals.drawer_mut(&thread_id) {
                         drawer.height = height.clamp(MIN_DRAWER_HEIGHT, max);
                         cx.notify();
                     }
                 }))
                 .child(body)
                 .when(!has_sidebar && !drawer.terminal_ids.is_empty(), |el| {
-                    el.child(self.render_floating_actions(drawer.active_id.clone(), limit, None, &tokens, cx))
+                    el.child(self.render_floating_actions(drawer.active_id.clone(), limit, None, &tokens, window, cx))
                 })
                 .child(handle)
                 .into_any_element(),
@@ -821,44 +980,58 @@ impl Workspace {
         limit: bool,
         panel: Option<String>,
         tokens: &Tokens,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let border = tokens.border.opacity(0.8);
         let separator = || div().h(px(16.)).w(px(1.)).bg(border);
-        let button = |id: &'static str, path: &'static str, disabled: bool| {
-            action_button(id, path, disabled, tokens).p(px(4.)).when(!disabled, |el| el.hover(|s| s.bg(tokens.accent)))
+        let operable = self.shown_terminal_operable();
+        let scope = panel.clone().unwrap_or_else(|| "drawer".into());
+        let mut button = |id: &'static str, path: &'static str, disabled: bool| {
+            let el = action_button(id, path, disabled || !operable, tokens)
+                .p(px(4.))
+                .when(!disabled && operable, |el| el.hover(|s| s.bg(tokens.accent)));
+            keyboard_button(el, format!("{scope}-{id}"), !disabled && operable, tokens, window, cx)
         };
-        div().absolute().top(px(8.)).right(px(8.)).child(
-            h_flex()
-                .id("terminal-floating-actions")
-                .occlude()
-                .items_center()
-                .overflow_hidden()
-                .rounded(px(6.))
-                .border_1()
-                .border_color(border)
-                .bg(tokens.background)
-                .shadow_xs()
-                .child(self.wire_split(
-                    button("terminal-split", "icons/square-split-horizontal.svg", limit),
-                    Split::Horizontal,
-                    limit,
-                    panel.clone(),
-                    cx,
-                ))
-                .child(separator())
-                .child(self.wire_split(
-                    button("terminal-split-vertical", "icons/square-split-vertical.svg", limit),
-                    Split::Vertical,
-                    limit,
-                    panel.clone(),
-                    cx,
-                ))
-                .child(separator())
-                .child(self.wire_new(button("terminal-new", "icons/plus.svg", false), panel, cx))
-                .child(separator())
-                .child(self.wire_close(button("terminal-close", "icons/trash-2.svg", false), active, cx)),
-        )
+        let buttons = [
+            button("terminal-split", "icons/square-split-horizontal.svg", limit),
+            button("terminal-split-vertical", "icons/square-split-vertical.svg", limit),
+            button("terminal-new", "icons/plus.svg", false),
+            button("terminal-close", "icons/trash-2.svg", false),
+        ];
+        let actions = self.wire_actions(buttons, active, limit, operable, panel, cx);
+        let mut row = h_flex()
+            .id("terminal-floating-actions")
+            .occlude()
+            .items_center()
+            .overflow_hidden()
+            .rounded(px(6.))
+            .border_1()
+            .border_color(border)
+            .bg(tokens.background)
+            .shadow_xs();
+        for (index, action) in actions.into_iter().enumerate() {
+            row = row.when(index > 0, |el| el.child(separator())).child(action);
+        }
+        div().absolute().top(px(8.)).right(px(8.)).child(row)
+    }
+
+    /// Split, split vertically, new and close, in that order.
+    fn wire_actions(
+        &self,
+        [split, split_vertical, new, close]: [Stateful<Div>; 4],
+        active: String,
+        limit: bool,
+        operable: bool,
+        panel: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> [Stateful<Div>; 4] {
+        [
+            self.wire_split(split, Split::Horizontal, limit, operable, panel.clone(), cx),
+            self.wire_split(split_vertical, Split::Vertical, limit, operable, panel.clone(), cx),
+            self.wire_new(new, panel, operable, cx),
+            self.wire_close(close, active, operable, cx),
+        ]
     }
 
     fn wire_split(
@@ -866,6 +1039,7 @@ impl Workspace {
         button: Stateful<Div>,
         split: Split,
         limit: bool,
+        operable: bool,
         panel: Option<String>,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
@@ -878,7 +1052,7 @@ impl Workspace {
         } else {
             self.with_terminal_shortcut(name, command)
         };
-        button.tooltip(tooltip(label.into())).when(!limit, |el| {
+        button.tooltip(tooltip(label.into())).when(!limit && operable, |el| {
             el.on_click(cx.listener(move |this, _, window, cx| match &panel {
                 Some(surface) => this.split_panel_terminal(surface, split, window, cx),
                 None => this.split_terminal(split, cx),
@@ -886,111 +1060,153 @@ impl Workspace {
         })
     }
 
-    fn wire_new(&self, button: Stateful<Div>, panel: Option<String>, cx: &mut Context<Self>) -> Stateful<Div> {
-        button.tooltip(tooltip(self.with_terminal_shortcut("New Terminal", "terminal.new").into())).on_click(
-            cx.listener(move |this, _, window, cx| match panel {
-                Some(_) => this.add_terminal_surface(window, cx),
-                None => this.new_terminal(cx),
-            }),
+    fn wire_new(
+        &self,
+        button: Stateful<Div>,
+        panel: Option<String>,
+        operable: bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        button.tooltip(tooltip(self.with_terminal_shortcut("New Terminal", "terminal.new").into())).when(
+            operable,
+            |el| {
+                el.on_click(cx.listener(move |this, _, window, cx| match panel {
+                    Some(_) => this.add_terminal_surface(window, cx),
+                    None => this.new_terminal(cx),
+                }))
+            },
         )
     }
 
-    fn wire_close(&self, button: Stateful<Div>, active: String, cx: &mut Context<Self>) -> Stateful<Div> {
-        button
-            .tooltip(tooltip(self.with_terminal_shortcut("Close Terminal", "terminal.close").into()))
-            .on_click(cx.listener(move |this, _, window, cx| this.request_close_terminal(active.clone(), window, cx)))
+    fn wire_close(
+        &self,
+        button: Stateful<Div>,
+        active: String,
+        operable: bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        button.tooltip(tooltip(self.with_terminal_shortcut("Close Terminal", "terminal.close").into())).when(
+            operable,
+            |el| {
+                el.on_click(
+                    cx.listener(move |this, _, window, cx| this.request_close_terminal(active.clone(), window, cx)),
+                )
+            },
+        )
     }
 
-    /// The session list beside split panes once a thread has several terminals.
-    fn render_terminal_sidebar(
-        &self,
+    fn shown_terminal_operable(&self) -> bool {
+        self.shown_terminal_thread().is_none_or(|thread_id| self.terminal_operable(thread_id))
+    }
+
+    /// Shows `terminal_id` in the drawer, or in its panel tab when the sidebar is a tab's.
+    fn activate_sidebar_terminal(
+        &mut self,
         thread_id: &str,
-        drawer: &DrawerLayout,
+        terminal_id: &str,
+        panel: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        if panel.is_none() {
+            self.activate_terminal(terminal_id, cx);
+            return;
+        }
+        self.activate_panel_terminal(thread_id, terminal_id, cx);
+        self.terminals.focus_pending = Some(terminal_id.to_owned());
+        cx.notify();
+    }
+
+    /// The session list beside split panes once a drawer or panel tab has several terminals.
+    pub(super) fn render_terminal_sidebar(
+        &self,
+        sidebar: &SidebarModel<'_>,
         tokens: &Tokens,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let SidebarModel { thread_id, groups, active, limit, panel } = sidebar;
+        let (thread_id, active, limit) = (*thread_id, *active, *limit);
         let border = tokens.border.opacity(0.7);
-        let limit = drawer.split_limit_reached();
-        let header_button = |id: &'static str, path: &'static str, disabled: bool, first: bool| {
-            action_button(id, path, disabled, tokens)
+        let operable = self.terminal_operable(thread_id);
+        let scope = panel.clone().unwrap_or_else(|| "drawer".into());
+        let mut header_button = |id: &'static str, path: &'static str, disabled: bool, first: bool| {
+            let el = action_button(id, path, disabled || !operable, tokens)
                 .h_full()
                 .px(px(4.))
                 .when(!first, |el| el.border_l_1().border_color(border))
-                .when(!disabled, |el| el.hover(|s| s.bg(tokens.accent.opacity(0.7))))
+                .when(!disabled && operable, |el| el.hover(|s| s.bg(tokens.accent.opacity(0.7))));
+            keyboard_button(el, format!("{scope}-sidebar-{id}"), !disabled && operable, tokens, window, cx)
         };
-        let active = drawer.active_id.clone();
-        let header = h_flex().h(px(22.)).flex_none().justify_end().border_b_1().border_color(border).child(
-            h_flex()
-                .h_full()
-                .child(self.wire_split(
-                    header_button("terminal-split", "icons/square-split-horizontal.svg", limit, true),
-                    Split::Horizontal,
-                    limit,
-                    None,
-                    cx,
-                ))
-                .child(self.wire_split(
-                    header_button("terminal-split-vertical", "icons/square-split-vertical.svg", limit, false),
-                    Split::Vertical,
-                    limit,
-                    None,
-                    cx,
-                ))
-                .child(self.wire_new(header_button("terminal-new", "icons/plus.svg", false, false), None, cx))
-                .child(self.wire_close(header_button("terminal-close", "icons/trash-2.svg", false, false), active, cx)),
-        );
-        let groups = drawer.sorted_groups();
-        let show_headers = groups.len() > 1 || groups.iter().any(|g| g.terminal_ids.len() > 1);
-        let list = v_flex().id("terminal-session-list").flex_1().min_h_0().overflow_y_scroll().p(px(4.)).children(
-            groups.into_iter().map(|group| {
-                let group_active = group.terminal_ids.contains(&drawer.active_id);
-                let header = show_headers.then(|| {
-                    let (path, label) = match (group.terminal_ids.len() > 1, group.split) {
-                        (false, _) => ("icons/square.svg", "Single"),
-                        (true, Split::Vertical) => ("icons/square-split-vertical.svg", "Stacked"),
-                        (true, Split::Horizontal) => ("icons/square-split-horizontal.svg", "Side by side"),
-                    };
-                    let target = if group_active { drawer.active_id.clone() } else { group.terminal_ids[0].clone() };
-                    let color = if group_active { tokens.foreground } else { tokens.muted_foreground };
-                    h_flex()
-                        .id(SharedString::from(format!("terminal-group-{}", group.id)))
-                        .h(px(22.))
-                        .w_full()
-                        .gap(px(4.))
-                        .px(px(6.))
-                        .rounded(px(4.))
-                        .cursor_pointer()
-                        .text_size(px(11.))
-                        .line_height(px(16.))
-                        .text_color(color)
-                        .map(|el| {
-                            if group_active {
-                                el.bg(tokens.accent.opacity(0.5))
-                            } else {
-                                el.hover(|s| s.bg(tokens.accent.opacity(0.4)).text_color(tokens.foreground))
-                            }
-                        })
-                        .on_click(cx.listener(move |this, _, _, cx| this.activate_terminal(&target, cx)))
-                        .child(icon(path).with_size(px(12.)).flex_none())
-                        .child(div().flex_1().min_w_0().truncate().child(label))
-                        .child(
-                            div()
-                                .text_size(px(10.))
-                                .line_height(px(14.))
-                                .text_color(tokens.muted_foreground.opacity(0.7))
-                                .child(group.terminal_ids.len().to_string()),
-                        )
-                });
-                let rows: Vec<_> = group
-                    .terminal_ids
-                    .iter()
-                    .map(|terminal_id| {
-                        self.render_terminal_row(thread_id, terminal_id, terminal_id == &drawer.active_id, tokens, cx)
+        let buttons = [
+            header_button("terminal-split", "icons/square-split-horizontal.svg", limit, true),
+            header_button("terminal-split-vertical", "icons/square-split-vertical.svg", limit, false),
+            header_button("terminal-new", "icons/plus.svg", false, false),
+            header_button("terminal-close", "icons/trash-2.svg", false, false),
+        ];
+        let actions = self.wire_actions(buttons, active.to_owned(), limit, operable, panel.clone(), cx);
+        let header = h_flex()
+            .h(px(22.))
+            .flex_none()
+            .justify_end()
+            .border_b_1()
+            .border_color(border)
+            .child(h_flex().h_full().children(actions));
+        let show_headers = groups.len() > 1 || groups.iter().any(|(_, ids, _)| ids.len() > 1);
+        let mut list_groups = Vec::with_capacity(groups.len());
+        for (group_id, ids, split) in groups {
+            let group_active = ids.iter().any(|id| id == active);
+            let header = show_headers.then(|| {
+                let (path, label) = match (ids.len() > 1, split) {
+                    (false, _) => ("icons/square.svg", "Single"),
+                    (true, Split::Vertical) => ("icons/square-split-vertical.svg", "Stacked"),
+                    (true, Split::Horizontal) => ("icons/square-split-horizontal.svg", "Side by side"),
+                };
+                let target = if group_active { active.to_owned() } else { ids[0].clone() };
+                let color = if group_active { tokens.foreground } else { tokens.muted_foreground };
+                let (thread, panel) = (thread_id.to_owned(), panel.clone());
+                let el = h_flex()
+                    .id(SharedString::from(format!("terminal-group-{group_id}")))
+                    .h(px(22.))
+                    .w_full()
+                    .gap(px(4.))
+                    .px(px(6.))
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .text_size(px(11.))
+                    .line_height(px(16.))
+                    .text_color(color)
+                    .map(|el| {
+                        if group_active {
+                            el.bg(tokens.accent.opacity(0.5))
+                        } else {
+                            el.hover(|s| s.bg(tokens.accent.opacity(0.4)).text_color(tokens.foreground))
+                        }
                     })
-                    .collect();
-                v_flex().pb(px(2.)).children(header).child(v_flex().gap(px(2.)).children(rows))
-            }),
-        );
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.activate_sidebar_terminal(&thread, &target, panel.as_deref(), cx);
+                    }))
+                    .child(icon(path).with_size(px(12.)).flex_none())
+                    .child(div().flex_1().min_w_0().truncate().child(label))
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .line_height(px(14.))
+                            .text_color(tokens.muted_foreground.opacity(0.7))
+                            .child(ids.len().to_string()),
+                    );
+                keyboard_button(el, format!("{scope}-group-{group_id}"), true, tokens, window, cx)
+            });
+            let rows: Vec<_> = ids
+                .iter()
+                .map(|terminal_id| {
+                    let row = RowModel { thread_id, terminal_id, active: terminal_id == active, scope: &scope };
+                    self.render_terminal_row(&row, panel.as_deref(), tokens, window, cx)
+                })
+                .collect();
+            list_groups.push(v_flex().pb(px(2.)).children(header).child(v_flex().gap(px(2.)).children(rows)));
+        }
+        let list =
+            v_flex().id("terminal-session-list").flex_1().min_h_0().overflow_y_scroll().p(px(4.)).children(list_groups);
         v_flex()
             .w(px(144.))
             .flex_none()
@@ -1004,12 +1220,13 @@ impl Workspace {
 
     fn render_terminal_row(
         &self,
-        thread_id: &str,
-        terminal_id: &str,
-        active: bool,
+        row: &RowModel<'_>,
+        panel: Option<&str>,
         tokens: &Tokens,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
+        let RowModel { thread_id, terminal_id, active, scope } = *row;
         let label = self.terminals.label(thread_id, terminal_id);
         let close_label: SharedString = if active {
             self.with_terminal_shortcut(&format!("Close {label}"), "terminal.close")
@@ -1019,12 +1236,63 @@ impl Workspace {
         .into();
         let group = SharedString::from(format!("terminal-row-{terminal_id}"));
         let (close_id, activate_id) = (terminal_id.to_owned(), terminal_id.to_owned());
+        let (thread, panel) = (thread_id.to_owned(), panel.map(str::to_owned));
+        let operable = self.terminal_operable(thread_id);
         let glyph = |path: &'static str| {
             div().absolute().inset_0().flex().items_center().justify_center().child(icon(path).with_size(px(12.)))
         };
+        let close = div()
+            .id(SharedString::from(format!("terminal-row-close-{terminal_id}")))
+            .relative()
+            .size(px(16.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(4.));
+        // Without the grant the row shows only its terminal icon.
+        let close = if operable {
+            let focus = control_focus(format!("{scope}-row-close-{terminal_id}"), window, cx);
+            // `group-focus-visible/close`: the keyboard-focused close button shows its X.
+            let focused = focus.is_focused(window);
+            let close = close
+                .cursor_pointer()
+                .hover(|s| s.bg(tokens.muted))
+                .tooltip(tooltip(close_label))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.request_close_terminal(close_id.clone(), window, cx);
+                }))
+                .map(|el| {
+                    if focused {
+                        el.child(glyph("icons/x.svg"))
+                    } else {
+                        el.child(
+                            glyph("icons/square-terminal.svg").group_hover(group.clone(), gpui_kit::Styled::invisible),
+                        )
+                        .child(glyph("icons/x.svg").invisible().group_hover(group.clone(), gpui_kit::Styled::visible))
+                    }
+                });
+            super::titlebar::keyboard_control(close, &focus, tokens.ring)
+        } else {
+            close.child(glyph("icons/square-terminal.svg"))
+        };
+        let activate = div()
+            .id(SharedString::from(format!("terminal-row-label-{terminal_id}")))
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.activate_sidebar_terminal(&thread, &activate_id, panel.as_deref(), cx);
+            }))
+            .child(div().truncate().child(label));
+        let activate = keyboard_button(activate, format!("{scope}-row-label-{terminal_id}"), true, tokens, window, cx);
         h_flex()
             .id(group.clone())
-            .group(group.clone())
+            .group(group)
             .h(px(24.))
             .w_full()
             .gap(px(2.))
@@ -1040,38 +1308,8 @@ impl Workspace {
                         .hover(|s| s.bg(tokens.accent.opacity(0.6)).text_color(tokens.foreground))
                 }
             })
-            .child(
-                div()
-                    .id(SharedString::from(format!("terminal-row-close-{terminal_id}")))
-                    .relative()
-                    .size(px(16.))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(4.))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(tokens.muted))
-                    .tooltip(tooltip(close_label))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.request_close_terminal(close_id.clone(), window, cx);
-                    }))
-                    .child(glyph("icons/square-terminal.svg").group_hover(group.clone(), gpui_kit::Styled::invisible))
-                    .child(glyph("icons/x.svg").invisible().group_hover(group, gpui_kit::Styled::visible)),
-            )
-            .child(
-                div()
-                    .id(SharedString::from(format!("terminal-row-label-{terminal_id}")))
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| this.activate_terminal(&activate_id, cx)))
-                    .child(div().truncate().child(label)),
-            )
+            .child(close)
+            .child(activate)
     }
 
     /// The sidebar row's indicator: teal while a terminal process runs. It
@@ -1115,10 +1353,51 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.select_thread(thread_id.clone(), window, cx);
-        self.terminals.drawers.entry(thread_id).or_default().ensure(&terminal_id);
+        self.terminals.drawer(thread_id).ensure(&terminal_id);
         self.terminals.focus_pending = Some(terminal_id);
         cx.notify();
     }
+}
+
+/// What a session sidebar lists: the drawer's groups, or a panel tab's one group.
+pub(super) struct SidebarModel<'a> {
+    thread_id: &'a str,
+    /// Each group's id, terminals and split, in the sidebar's order.
+    groups: Vec<(&'a str, &'a [String], Split)>,
+    active: &'a str,
+    limit: bool,
+    /// The panel tab's surface; `None` for the drawer.
+    panel: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct RowModel<'a> {
+    thread_id: &'a str,
+    terminal_id: &'a str,
+    active: bool,
+    /// Keeps the drawer's and each panel tab's focus handles apart.
+    scope: &'a str,
+}
+
+/// A control's focus handle, kept while it renders.
+fn control_focus(key: String, window: &mut Window, cx: &mut App) -> FocusHandle {
+    window.use_keyed_state(SharedString::from(key), cx, |_, cx| cx.focus_handle().tab_stop(true)).read(cx).clone()
+}
+
+/// A drawer control as the web's `<button>`: a tab stop that Enter and Space press.
+fn keyboard_button(
+    el: Stateful<Div>,
+    key: String,
+    enabled: bool,
+    tokens: &Tokens,
+    window: &mut Window,
+    cx: &mut App,
+) -> Stateful<Div> {
+    if !enabled {
+        return el;
+    }
+    let focus = control_focus(key, window, cx);
+    super::titlebar::keyboard_control(el, &focus, tokens.ring)
 }
 
 /// A drawer action button: a 13px icon in `text-foreground/90`, dimmed when disabled.
@@ -1149,5 +1428,54 @@ mod tests {
         let text = record["text"].as_str().unwrap();
         assert_eq!(text.encode_utf16().count(), CONTEXT_TEXT_MAX);
         assert!(text.ends_with(TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn drawers_survive_a_relaunch_and_default_ones_are_not_stored() {
+        let mut drawers = HashMap::new();
+        drawers.insert("closed".to_owned(), DrawerLayout::default());
+        let mut open = DrawerLayout::default();
+        open.place("term-1", Place::New);
+        drawers.insert("thread".to_owned(), open.clone());
+        let stored = stored_drawers(&drawers);
+        assert_eq!(stored.as_object().unwrap().keys().collect::<Vec<_>>(), ["thread"]);
+
+        let dir = std::env::temp_dir().join(format!("t3-gpui-terminal-state-{}", std::process::id()));
+        let path = dir.join("terminal-state.json");
+        assert!(read_drawers(&path).is_empty());
+        crate::settings::write_atomically(&path, &stored).unwrap();
+        assert_eq!(read_drawers(&path), HashMap::from([("thread".to_owned(), open)]));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn hidden_threads_keep_their_sessions_up_to_the_limit() {
+        let mut parked = Vec::new();
+        for thread in ["a", "b", "c"] {
+            park(&mut parked, thread.to_owned(), thread, 2);
+        }
+        assert_eq!(parked, [("b".to_owned(), "b"), ("c".to_owned(), "c")], "the oldest is dropped");
+        park(&mut parked, "b".to_owned(), "b2", 2);
+        assert_eq!(parked, [("c".to_owned(), "c"), ("b".to_owned(), "b2")]);
+    }
+
+    #[test]
+    fn an_empty_drawer_reuses_a_server_terminal_no_panel_tab_shows() {
+        let mut terminals = Terminals::default();
+        let summary = |id: &str, running: bool| json!({"threadId": "t", "terminalId": id, "hasRunningSubprocess": running, "label": ""});
+        let snapshot = json!({"type": "snapshot", "terminals": [summary("default", false), summary("term-2", true), summary("term-3", false)]});
+        terminals.apply_metadata(&"env".into(), &snapshot);
+        assert_eq!(terminals.drawer_reuse("t").as_deref(), Some("term-2"), "a running terminal first");
+        let group = |ids: &[&str]| panel::PanelGroup {
+            thread_id: "t".into(),
+            terminal_ids: ids.iter().map(|id| (*id).to_owned()).collect(),
+            active: ids[0].into(),
+            split: Split::Horizontal,
+        };
+        terminals.panel.insert("surface".into(), group(&["term-2"]));
+        assert_eq!(terminals.drawer_reuse("t").as_deref(), Some("default"));
+        terminals.panel.insert("surface".into(), group(&["term-2", "default", "term-3"]));
+        assert_eq!(terminals.drawer_reuse("t"), None);
     }
 }

@@ -7,6 +7,7 @@ mod chat;
 pub(in crate::app) mod code;
 mod connections;
 pub(in crate::app) use connections::check_filesystem_read;
+pub(in crate::app) use connections::check_terminal_operate;
 pub(in crate::app) use connections::logic::{machine_icon, one_password_account};
 mod desktop_rows;
 mod diagnostics;
@@ -555,6 +556,7 @@ impl Workspace {
                                 .child({
                                     let nav = self.render_settings_nav(&section, window, cx);
                                     let page = v_flex()
+                                        .track_focus(&self.areas.settings_page)
                                         .flex_1()
                                         .min_w_0()
                                         .h_full()
@@ -705,6 +707,24 @@ impl Workspace {
         self.settings_ui.target = None;
         self.settings_ui.scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
         self.open_settings(id, cx);
+    }
+
+    /// F6's Settings sections stop: the search or a section row has focus.
+    pub(in crate::app) fn settings_nav_focused(&self, window: &Window, cx: &gpui_kit::App) -> bool {
+        self.settings_ui.search.read(cx).focus_handle(cx).is_focused(window)
+            || self.settings_ui.nav_focus.values().any(|focus| focus.is_focused(window))
+    }
+
+    /// F6 to the sections: the row that takes Tab there.
+    pub(in crate::app) fn focus_settings_nav(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let section = self.settings.clone().unwrap_or_default();
+        let tab_stop = match &self.settings_ui.nav_tab_stop {
+            Some((id, page)) if *page == section => *id,
+            _ => nav_section(&section),
+        };
+        if let Some(handle) = self.settings_ui.nav_focus.get(tab_stop) {
+            window.focus(handle, cx);
+        }
     }
 
     /// The modal or one of its nav rows has focus: Escape and `/` are the modal's then.

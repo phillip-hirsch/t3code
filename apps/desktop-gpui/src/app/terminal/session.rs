@@ -16,8 +16,9 @@ use alacritty_terminal::term::{Config, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
 use gpui_kit::{
     AppContext as _, Bounds, ClipboardItem, Context, EntityInputHandler, EventEmitter, FocusHandle,
-    InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Pixels, Render, Styled as _, Subscription,
-    Task, UTF16Selection, Window, div, point, size,
+    InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement as _, Pixels, Render, Styled as _, Subscription, Task, UTF16Selection, Window, canvas, div, fill,
+    point, px, size,
 };
 use serde_json::{Value, json};
 
@@ -29,6 +30,7 @@ use gpui_kit::component::menu::ContextMenuExt as _;
 
 use super::grid::{Batched, Geometry, TerminalGrid, TerminalTheme, batch};
 use super::keys::{KeyAction, key_action};
+use super::scrollbar::{self, ScrollState};
 use crate::rpc::{RpcClient, RpcError, StreamEvent};
 
 /// `TerminalWriteInput.data` is capped at 65,536 UTF-16 units.
@@ -49,6 +51,21 @@ impl EventListener for Listener {
 struct GridSize {
     columns: usize,
     rows: usize,
+}
+
+impl GridSize {
+    /// The server's grid when it reports one, read from a snapshot or an `activity` event.
+    fn shared(source: &Value) -> Option<Self> {
+        let count = |key: &str| source[key].as_u64().and_then(|n| usize::try_from(n).ok());
+        Some(Self { columns: count("cols")?, rows: count("rows")? })
+    }
+
+    /// `applyGrid`: other clients share the PTY, so its grid is drawn, each axis capped to the
+    /// pane's own fit (the server lags a local resize, and observers never constrain it).
+    fn shown(measured: Self, shared: Option<Self>) -> Self {
+        let Some(shared) = shared else { return measured };
+        Self { columns: shared.columns.min(measured.columns), rows: shared.rows.min(measured.rows) }
+    }
 }
 
 impl Dimensions for GridSize {
@@ -81,6 +98,25 @@ impl Launch {
             env["T3CODE_WORKTREE_PATH"] = path.clone().into();
         }
         env
+    }
+
+    /// The output stream a pane subscribes to: `terminal.attach` (which starts the shell when
+    /// `resume` is unset), or `terminal.observe` without `terminal:operate`.
+    fn stream_request(
+        &self,
+        thread_id: &str,
+        terminal_id: &str,
+        read_only: bool,
+        resume: bool,
+    ) -> (&'static str, Value) {
+        if read_only {
+            return ("terminal.observe", json!({"threadId": thread_id, "terminalId": terminal_id}));
+        }
+        let mut input = self.payload(thread_id, terminal_id);
+        if resume {
+            input["resume"] = true.into();
+        }
+        ("terminal.attach", input)
     }
 
     pub fn payload(&self, thread_id: &str, terminal_id: &str) -> Value {
@@ -155,9 +191,14 @@ pub(super) struct TerminalSession {
     pub focus: FocusHandle,
     /// Written by the grid element each prepaint, read by mouse and IME handlers.
     pub geometry: Cell<Geometry>,
+    /// The grid that fits the pane; the PTY hears this one.
     size: Option<GridSize>,
+    /// The PTY's grid as the server last reported it.
+    shared_size: Option<GridSize>,
     sent_size: Option<GridSize>,
     running: bool,
+    /// Without `terminal:operate` nothing is written to the PTY, and it is never resized.
+    read_only: bool,
     exited: bool,
     /// The attach stream replied once; later attaches resume instead of opening a shell.
     attached: bool,
@@ -169,7 +210,15 @@ pub(super) struct TerminalSession {
     pointer: pointer::PointerState,
     _attach: Option<Task<()>>,
     _resize: Option<Task<()>>,
-    _focus: [Subscription; 2],
+    scrollbar: Scrollbar,
+    _focus: [Subscription; 4],
+}
+
+/// The scrollback scrollbar: a tab stop, its track as last laid out, and where a drag holds the thumb.
+struct Scrollbar {
+    focus: FocusHandle,
+    track: Rc<Cell<Bounds<Pixels>>>,
+    grab: Option<f32>,
 }
 
 impl EventEmitter<SessionEvent> for TerminalSession {}
@@ -206,13 +255,19 @@ impl TerminalSession {
         terminal_id: String,
         launch: Launch,
         client: Option<RpcClient>,
+        read_only: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let events = Listener::default();
         let focus = cx.focus_handle();
-        let _focus =
-            [cx.on_focus(&focus, window, |_, _, cx| cx.notify()), cx.on_blur(&focus, window, |_, _, cx| cx.notify())];
+        let scrollbar = Scrollbar { focus: cx.focus_handle().tab_stop(true), track: Rc::default(), grab: None };
+        let _focus = [
+            cx.on_focus(&focus, window, |_, _, cx| cx.notify()),
+            cx.on_blur(&focus, window, |_, _, cx| cx.notify()),
+            cx.on_focus(&scrollbar.focus, window, |_, _, cx| cx.notify()),
+            cx.on_blur(&scrollbar.focus, window, |_, _, cx| cx.notify()),
+        ];
         let mut session = Self {
             thread_id,
             terminal_id,
@@ -224,8 +279,10 @@ impl TerminalSession {
             focus,
             geometry: Cell::default(),
             size: None,
+            shared_size: None,
             sent_size: None,
             running: false,
+            read_only,
             exited: false,
             attached: false,
             client: None,
@@ -234,6 +291,7 @@ impl TerminalSession {
             selecting: false,
             scroll_remainder: 0.,
             pointer: Default::default(),
+            scrollbar,
             _attach: None,
             _resize: None,
             _focus,
@@ -267,15 +325,13 @@ impl TerminalSession {
         self.pointer.hovered.as_ref()
     }
 
-    /// Subscribes to the terminal's output; called again after a reconnect.
+    /// Subscribes to the terminal's output; called again after a reconnect or a grant change.
     pub fn attach(&mut self, client: RpcClient, cx: &mut Context<Self>) {
-        let mut input = self.launch.payload(&self.thread_id, &self.terminal_id);
-        if self.attached {
-            input["resume"] = true.into();
-        }
+        let (method, input) =
+            self.launch.stream_request(&self.thread_id, &self.terminal_id, self.read_only, self.attached);
         self.client = Some(client.clone());
         self.sent_size = None;
-        let stream = client.stream("terminal.attach", input);
+        let stream = client.stream(method, input);
         self._attach = Some(cx.spawn(async move |this, cx| {
             while let Some(first) = stream.next().await {
                 let mut events = vec![first];
@@ -311,6 +367,7 @@ impl TerminalSession {
         match event["type"].as_str() {
             Some("snapshot" | "restarted") => {
                 let snapshot = &event["snapshot"];
+                self.shared_size = GridSize::shared(snapshot).or(self.shared_size);
                 self.reset();
                 self.feed(snapshot["history"].as_str().unwrap_or_default(), false, cx);
                 let status = snapshot["status"].as_str().unwrap_or_default();
@@ -328,6 +385,12 @@ impl TerminalSession {
                 self.feed(event["data"].as_str().unwrap_or_default(), true, cx);
             }
             Some("cleared") => self.reset(),
+            Some("activity") => {
+                if let Some(shared) = GridSize::shared(event) {
+                    self.shared_size = Some(shared);
+                    self.apply_grid();
+                }
+            }
             Some("exited") => self.on_exit("Process exited", cx),
             Some("closed") => self.on_exit("Terminal closed", cx),
             Some("error") => {
@@ -338,8 +401,19 @@ impl TerminalSession {
         }
     }
 
+    fn shown_size(&self) -> GridSize {
+        GridSize::shown(self.size.unwrap_or(GridSize { columns: 80, rows: 24 }), self.shared_size)
+    }
+
+    fn apply_grid(&mut self) {
+        let size = self.shown_size();
+        if (self.term.columns(), self.term.screen_lines()) != (size.columns, size.rows) {
+            self.term.resize(size);
+        }
+    }
+
     fn reset(&mut self) {
-        let size = self.size.unwrap_or(GridSize { columns: 80, rows: 24 });
+        let size = self.shown_size();
         *self.term = Term::new(Config::default(), &size, self.events.clone());
         self.parser = Processor::new();
     }
@@ -391,7 +465,7 @@ impl TerminalSession {
     /// Queues `data` for the PTY; writes go out one at a time, in order.
     /// Without a connection the input is dropped: queued keystrokes would run on reconnect.
     fn send_input(&mut self, data: &str, cx: &mut Context<Self>) {
-        let Some(client) = self.client.clone() else { return };
+        let Some(client) = self.client.clone().filter(|_| !self.read_only) else { return };
         self.outbox.push_str(data);
         if self.writing {
             return;
@@ -435,16 +509,26 @@ impl TerminalSession {
             return;
         }
         self.size = Some(size);
-        self.term.resize(size);
+        self.apply_grid();
         self._resize = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(RESIZE_DEBOUNCE).await;
             let _ = this.update(cx, TerminalSession::send_size);
         }));
     }
 
+    /// Follows the environment's `terminal:operate` grant, switching between observing and
+    /// attaching; the new stream's snapshot sends the size when granted.
+    pub fn set_read_only(&mut self, read_only: bool, cx: &mut Context<Self>) {
+        if std::mem::replace(&mut self.read_only, read_only) != read_only
+            && let Some(client) = self.client.clone()
+        {
+            self.attach(client, cx);
+        }
+    }
+
     fn send_size(&mut self, cx: &mut Context<Self>) {
         let (Some(size), Some(client)) = (self.size, self.client.clone()) else { return };
-        if !self.running || self.sent_size == Some(size) {
+        if !self.running || self.read_only || self.sent_size == Some(size) {
             return;
         }
         self.sent_size = Some(size);
@@ -518,7 +602,11 @@ impl TerminalSession {
         }
     }
 
-    fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Keys on the focused scrollbar never reach the shell.
+        if !self.focus.is_focused(window) {
+            return;
+        }
         let mode = *self.term.mode();
         let (app_cursor, alt_screen) = (mode.contains(TermMode::APP_CURSOR), mode.contains(TermMode::ALT_SCREEN));
         self.pointer.cancel_selection_menu();
@@ -543,6 +631,106 @@ impl TerminalSession {
     }
 }
 
+impl TerminalSession {
+    /// `scrollViewport`: `delta` rows toward the end of the scrollback, clamped.
+    fn scroll_rows(&mut self, delta: i64, cx: &mut Context<Self>) {
+        let delta = ScrollState::of(&self.term).clamp_delta(delta);
+        if delta == 0 {
+            return;
+        }
+        // Alacritty's display offset counts up from the live screen.
+        self.term.scroll_display(Scroll::Delta(i32::try_from(-delta).unwrap_or(i32::MAX)));
+        self.pointer.forget_hover();
+        cx.notify();
+    }
+
+    /// `onScrollbarPointerDown`: a press on the thumb holds it there; one on the track centers it.
+    fn scrollbar_press(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        window.prevent_default();
+        cx.stop_propagation();
+        let track = self.scrollbar.track.get();
+        let Some(thumb) = scrollbar::thumb(ScrollState::of(&self.term), f32::from(track.size.height)) else { return };
+        let at = f32::from(event.position.y - track.top());
+        let on_thumb = (thumb.top..thumb.top + thumb.height).contains(&at);
+        self.scrollbar.grab = Some(if on_thumb { at - thumb.top } else { thumb.height / 2. });
+        self.scrollbar_drag(event.position.y, cx);
+    }
+
+    fn scrollbar_drag(&mut self, y: Pixels, cx: &mut Context<Self>) {
+        let Some(grab) = self.scrollbar.grab else { return };
+        let track = self.scrollbar.track.get();
+        let state = ScrollState::of(&self.term);
+        let offset =
+            scrollbar::offset_at_pointer(state, f32::from(track.size.height), f32::from(y - track.top()), grab);
+        let delta = i64::try_from(offset).unwrap_or(i64::MAX) - i64::try_from(state.offset).unwrap_or(i64::MAX);
+        self.scroll_rows(delta, cx);
+    }
+
+    /// `onScrollbarKeyDown`, and Tab out: the terminal keeps Tab for the shell.
+    fn scrollbar_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let keystroke = &event.keystroke;
+        match keystroke.key.as_str() {
+            "tab" if keystroke.modifiers.shift => window.focus_prev(cx),
+            "tab" => window.focus_next(cx),
+            key => {
+                let Some(delta) = ScrollState::of(&self.term).key_delta(key) else { return };
+                self.scroll_rows(delta, cx);
+            }
+        }
+        cx.stop_propagation();
+    }
+
+    /// The thumb over the right edge while there is scrollback (`updateScrollbar`).
+    fn render_scrollbar(&self, window: &Window, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        let state = ScrollState::of(&self.term);
+        if state.max_offset() == 0 {
+            return None;
+        }
+        let tokens = crate::theme::tokens(cx);
+        let (rest, lit) = (tokens.scrollbar_thumb, tokens.scrollbar_thumb_hover);
+        let focused = self.scrollbar.focus.is_focused(window);
+        let track = self.scrollbar.track.clone();
+        let session = cx.entity();
+        let paint = move |bounds: Bounds<Pixels>, (): (), window: &mut Window, _: &mut gpui_kit::App| {
+            let Some(thumb) = scrollbar::thumb(state, f32::from(bounds.size.height)) else { return };
+            let hovered = bounds.contains(&window.mouse_position());
+            let thumb = Bounds::new(
+                point(bounds.left() + px(1.), bounds.top() + px(thumb.top)),
+                size(bounds.size.width - px(2.), px(thumb.height)),
+            );
+            window.paint_quad(fill(thumb, if hovered || focused { lit } else { rest }).corner_radii(px(3.)));
+            let dragged = session.clone();
+            window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                if phase.bubble() && event.dragging() {
+                    dragged.update(cx, |this, cx| this.scrollbar_drag(event.position.y, cx));
+                }
+            });
+            window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
+                if phase.bubble() {
+                    session.update(cx, |this, _| this.scrollbar.grab = None);
+                }
+            });
+        };
+        Some(
+            div()
+                .id("terminal-scrollbar")
+                .absolute()
+                .top(px(4.))
+                .right(px(1.))
+                .bottom(px(4.))
+                .w(px(6.))
+                .occlude()
+                .cursor_default()
+                // A hover style re-renders the view as the pointer enters and leaves.
+                .hover(gpui_kit::Styled::cursor_default)
+                .track_focus(&self.scrollbar.focus)
+                .on_mouse_down(MouseButton::Left, cx.listener(Self::scrollbar_press))
+                .on_key_down(cx.listener(Self::scrollbar_key))
+                .child(canvas(move |bounds, _, _| track.set(bounds), paint).size_full()),
+        )
+    }
+}
+
 impl Render for TerminalSession {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = TerminalTheme::new(crate::theme::tokens(cx));
@@ -560,6 +748,7 @@ impl Render for TerminalSession {
             .on_action(cx.listener(|this, _: &input::Paste, _, cx| this.paste(cx)))
             .on_action(cx.listener(|this, _: &input::SelectAll, _, cx| this.select_all(cx)))
             .child(TerminalGrid { session: cx.entity(), theme, focused })
+            .children(self.render_scrollbar(window, cx))
             .children(self.render_selection_menu())
             .context_menu(menu)
     }
@@ -652,5 +841,28 @@ mod tests {
     fn paste_brackets_when_asked_and_otherwise_sends_carriage_returns() {
         assert_eq!(paste_input("a\r\nb\nc", false), "a\rb\rc");
         assert_eq!(paste_input("ls\x1b[201~\n", true), "\x1b[200~ls[201~\n\x1b[201~");
+    }
+
+    #[test]
+    fn panes_draw_the_shared_grid_capped_to_their_fit() {
+        let fit = GridSize { columns: 100, rows: 30 };
+        assert_eq!(GridSize::shown(fit, None), fit);
+        let shared = GridSize::shared(&json!({"cols": 80, "rows": 40}));
+        assert_eq!(shared, Some(GridSize { columns: 80, rows: 40 }));
+        assert_eq!(GridSize::shown(fit, shared), GridSize { columns: 80, rows: 30 });
+        assert_eq!(GridSize::shared(&json!({"cols": 80})), None, "older servers send no grid");
+    }
+
+    #[test]
+    fn read_only_panes_observe_instead_of_attaching() {
+        let launch =
+            Launch { cwd: "/repo".into(), worktree_path: None, project_root: "/repo".into(), stop_on_settle: None };
+        let (method, input) = launch.stream_request("t", "default", true, true);
+        assert_eq!((method, input), ("terminal.observe", json!({"threadId": "t", "terminalId": "default"})));
+        let (method, input) = launch.stream_request("t", "default", false, false);
+        assert_eq!(method, "terminal.attach");
+        assert_eq!(input["cwd"], "/repo");
+        assert!(input.get("resume").is_none());
+        assert_eq!(launch.stream_request("t", "default", false, true).1["resume"], true);
     }
 }

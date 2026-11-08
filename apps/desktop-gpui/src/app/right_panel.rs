@@ -1299,6 +1299,7 @@ impl Workspace {
         Some(
             v_flex()
                 .id("right-panel")
+                .track_focus(&self.areas.panel)
                 .relative()
                 .w(px(width))
                 .h_full()

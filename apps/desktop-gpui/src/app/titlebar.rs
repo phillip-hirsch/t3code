@@ -14,8 +14,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use std::cell::Cell;
 
 use gpui_kit::{
-    AnyElement, App, Bounds, Context, CursorStyle, Decorations, Div, Element, ElementId, FontFallbacks,
-    GlobalElementId, Hsla, InspectorElementId, InteractiveElement, IntoElement, LayoutId, MouseButton,
+    AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, Decorations, Div, Element, ElementId, FocusHandle,
+    FontFallbacks, GlobalElementId, Hsla, InspectorElementId, InteractiveElement, IntoElement, LayoutId, MouseButton,
     ParentElement as _, Pixels, ResizeEdge, SharedString, Stateful, StatefulInteractiveElement as _, Styled as _,
     TextRenderingMode, Tiling, Window, WindowControlArea, div, font, hsla, px, rgb, svg,
 };
@@ -167,6 +167,34 @@ fn control(id: &'static str) -> Stateful<Div> {
     div().id(id).flex_none().size(CONTROL_SIZE).rounded(px(8.)).flex().items_center().justify_center().occlude()
 }
 
+/// A tab stop with the `focus-visible` ring that Enter and Space activate. A press leaves focus
+/// where it was, so clicking a toggle never takes it from the composer.
+pub(super) fn keyboard_control(el: Stateful<Div>, focus: &FocusHandle, ring: Hsla) -> Stateful<Div> {
+    el.track_focus(focus)
+        .focus_visible(move |style| style.border_2().border_color(ring))
+        .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+}
+
+fn is_keyboard(event: &ClickEvent) -> bool {
+    matches!(event, ClickEvent::Keyboard(_))
+}
+
+/// The titlebar toggles' tab stops.
+pub(super) struct TitlebarFocus {
+    sidebar: FocusHandle,
+    details: FocusHandle,
+    maximize: FocusHandle,
+    terminal: FocusHandle,
+    right_panel: FocusHandle,
+}
+
+impl TitlebarFocus {
+    pub(super) fn new(cx: &mut App) -> Self {
+        let stop = || cx.focus_handle().tab_stop(true);
+        Self { sidebar: stop(), details: stop(), maximize: stop(), terminal: stop(), right_panel: stop() }
+    }
+}
+
 fn tooltip(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) -> gpui_kit::AnyView {
     let text = text.into();
     move |window, cx| Tooltip::new(text.clone()).build(window, cx)
@@ -209,23 +237,21 @@ impl Workspace {
             (tokens.muted_foreground, tokens.accent, tokens.foreground, tokens.ring);
         let path = if self.sidebar_open.shown() { "icons/panel-left-close.svg" } else { "icons/panel-left.svg" };
         div().absolute().left(controls_left(window)).top_0().h(TITLEBAR_HEIGHT).flex().items_center().child(
-            control("toggle-sidebar")
-                .group("toggle-sidebar")
-                .hover(|style| style.bg(hover_bg))
-                // In the sheet it is the first tab stop, with `Button`'s inset focus-visible ring.
-                .when(self.sidebar_open.sheet(), |el| {
-                    el.track_focus(&self.sidebar.sheet_toggle)
-                        .focus_visible(|style| style.border_2().border_color(ring))
-                })
-                .child(
-                    svg()
-                        .path(path)
-                        .size_4()
-                        .text_color(color)
-                        .group_hover("toggle-sidebar", |style| style.text_color(hover_color)),
-                )
-                .tooltip(tooltip(self.with_shortcut("Toggle main sidebar", "sidebar.toggle")))
-                .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleSidebar), cx)),
+            keyboard_control(
+                control("toggle-sidebar").group("toggle-sidebar").hover(|style| style.bg(hover_bg)),
+                // In the sheet it is the sheet's first tab stop.
+                if self.sidebar_open.sheet() { &self.sidebar.sheet_toggle } else { &self.titlebar_focus.sidebar },
+                ring,
+            )
+            .child(
+                svg()
+                    .path(path)
+                    .size_4()
+                    .text_color(color)
+                    .group_hover("toggle-sidebar", |style| style.text_color(hover_color)),
+            )
+            .tooltip(tooltip(self.with_shortcut("Toggle main sidebar", "sidebar.toggle")))
+            .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleSidebar), cx)),
         )
     }
 
@@ -237,14 +263,18 @@ impl Workspace {
         let details = self.details_shown(window);
         let panel_width = self.right_panel_width(window);
         let maximized = self.right_panel_maximized();
-        let toggle = |id: &'static str, path: &'static str, pressed: bool, enabled: bool| {
+        let focus = &self.titlebar_focus;
+        // These act on press; Enter and Space reach them as keyboard clicks.
+        let toggle = |id: &'static str, path: &'static str, pressed: bool, enabled: bool, stop: &FocusHandle| {
             let color = if enabled { tokens.foreground.opacity(0.8) } else { tokens.muted_foreground };
             control(id)
                 .when(pressed, |el| el.bg(tokens.accent))
-                .when(enabled, |el| el.cursor_pointer().hover(|style| style.bg(tokens.accent)))
+                .when(enabled, |el| {
+                    keyboard_control(el.cursor_pointer().hover(|style| style.bg(tokens.accent)), stop, tokens.ring)
+                })
                 .child(icon(path).with_size(px(16.)).text_color(color))
         };
-        let details_toggle = toggle("toggle-thread-details", "icons/square-menu.svg", details, true)
+        let details_toggle = toggle("toggle-thread-details", "icons/square-menu.svg", details, true, &focus.details)
             .tooltip(tooltip(self.with_shortcut("Toggle thread details", "threadPanel.toggle")))
             // Acts on press, like a popover trigger: the popover's outside-press
             // dismissal runs first, so a press that already closed it must not reopen it.
@@ -255,7 +285,12 @@ impl Workspace {
                         this.toggle_details(window, cx);
                     }
                 }),
-            );
+            )
+            .on_click(cx.listener(|this, event, window, cx| {
+                if is_keyboard(event) {
+                    this.toggle_details(window, cx);
+                }
+            }));
         let (header_details, bar_details) = match panel_width {
             Some(_) if maximized => (None, None),
             Some(_) => (Some(details_toggle), None),
@@ -264,12 +299,19 @@ impl Workspace {
         let maximize = panel_width.map(|_| {
             let label = if maximized { "Restore panel size" } else { "Maximize panel" };
             let path = if maximized { "icons/minimize-2.svg" } else { "icons/maximize-2.svg" };
-            toggle("toggle-right-panel-maximized", path, maximized, true).tooltip(tooltip(label)).on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.toggle_right_panel_maximized(cx);
-                }),
-            )
+            toggle("toggle-right-panel-maximized", path, maximized, true, &focus.maximize)
+                .tooltip(tooltip(label))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.toggle_right_panel_maximized(cx);
+                    }),
+                )
+                .on_click(cx.listener(|this, event, _, cx| {
+                    if is_keyboard(event) {
+                        this.toggle_right_panel_maximized(cx);
+                    }
+                }))
         });
         let bar = div()
             .absolute()
@@ -283,7 +325,7 @@ impl Workspace {
             .children(bar_details)
             .child({
                 let available = self.terminal_available();
-                toggle("toggle-terminal", "icons/panel-bottom.svg", self.terminal_open(), available)
+                toggle("toggle-terminal", "icons/panel-bottom.svg", self.terminal_open(), available, &focus.terminal)
                     .tooltip(tooltip(if available {
                         self.with_shortcut("Toggle terminal drawer", "terminal.toggle")
                     } else {
@@ -295,14 +337,30 @@ impl Workspace {
                             MouseButton::Left,
                             cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx)),
                         )
+                        .on_click(cx.listener(|this, event, window, cx| {
+                            if is_keyboard(event) {
+                                this.toggle_terminal(window, cx);
+                            }
+                        }))
                     })
             })
             .child(
-                toggle("toggle-right-panel", "icons/panel-right.svg", self.right_panel_open(), true)
-                    .tooltip(tooltip(self.with_shortcut("Toggle right panel", "rightPanel.toggle")))
-                    .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                toggle(
+                    "toggle-right-panel",
+                    "icons/panel-right.svg",
+                    self.right_panel_open(),
+                    true,
+                    &focus.right_panel,
+                )
+                .tooltip(tooltip(self.with_shortcut("Toggle right panel", "rightPanel.toggle")))
+                .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                    window.dispatch_action(Box::new(ToggleRightPanel), cx);
+                })
+                .on_click(|event, window, cx| {
+                    if is_keyboard(event) {
                         window.dispatch_action(Box::new(ToggleRightPanel), cx);
-                    }),
+                    }
+                }),
             );
         // `right-[calc(env(safe-area-inset-right)+0.75rem)]` of the chat header, left of the panel.
         let header = header_details.zip(panel_width).map(|(toggle, width)| {

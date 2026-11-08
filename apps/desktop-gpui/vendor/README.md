@@ -278,3 +278,8 @@ set width is at least the trigger's and at most the window's less the 8px margin
 
 **Switches can be mixed.** gpui-base's `Switch` reports only on or off; `src/switch.rs` (in
 gpui-base) adds `mixed`, exposed as `aria-checked="mixed"` like the web's mixed `Switch`.
+
+**A dropdown menu can open from a shortcut.** The web opens the composer's Workspace menu with
+`composer.workspace` (Mod+Shift+X). 0.9.0's `DropdownMenuPopover` opens only from its trigger.
+`src/menu/dropdown_menu.rs` adds `DropdownMenuPopover::open`, passed to its `Popover` as
+`Popover::open` is, so a caller can hold the open state with `on_open_change`.

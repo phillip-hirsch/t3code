@@ -7,7 +7,7 @@
 
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
-use gpui_kit::{Context, Focusable as _, KeystrokeEvent, Window};
+use gpui_kit::{App, Context, FocusHandle, Focusable as _, KeystrokeEvent, Window};
 
 use super::keymap::{self, CAPTURE_CONTEXT};
 use super::{Target, Workspace, pages, palette, send, terminal};
@@ -64,6 +64,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> bool {
         let chat = self.page.is_none() && self.settings.is_none();
+        // Any chat route not under a modal page, such as Pull requests (`installChatRouteCommands`).
+        let chat_route = self.settings.is_none() && !self.page.is_some_and(pages::Page::is_modal);
         let palette_open = self.palette.is_some();
         // `useChatShortcuts` stands down while the palette is open (`isCommandPaletteOpen`).
         if palette_open && is_chat_shortcut(command) {
@@ -81,6 +83,13 @@ impl Workspace {
         if let Some(handled) = self.usage_shortcut(command, context, cx) {
             return handled;
         }
+        if self.page == Some(pages::Page::PullRequests)
+            && self.settings.is_none()
+            && !palette_open
+            && self.pull_requests_page_command(command, held, window, cx)
+        {
+            return true;
+        }
         match command {
             "sidebar.toggle" => self.toggle_sidebar(cx),
             "threadPanel.toggle" if chat => self.toggle_details(window, cx),
@@ -91,9 +100,9 @@ impl Workspace {
                 self.open_page(pages::Page::Usage, cx);
             }
             "commandPalette.toggle" => self.open_palette(palette::View::Root, window, cx),
-            "chat.new" if chat && !palette_open => self.new_thread(false, window, cx),
-            "chat.newLocal" if chat && !palette_open => self.new_thread(true, window, cx),
-            "chat.newWithoutProject" if chat && !palette_open => {
+            "chat.new" if chat_route && !palette_open => self.new_thread(false, window, cx),
+            "chat.newLocal" if chat_route && !palette_open => self.new_thread(true, window, cx),
+            "chat.newWithoutProject" if chat_route && !palette_open => {
                 let Some(environment) = self.scratch_environment() else { return false };
                 if !held {
                     self.start_scratch_thread(environment, None, window, cx);
@@ -202,6 +211,14 @@ impl Workspace {
                     return self.cycle_host(window, cx);
                 }
             }
+            "pullRequest.copyNumber" if self.settings.is_none() && !palette_open => {
+                return self.copy_pull_request_number(held, window, cx);
+            }
+            "composer.workspace" if chat => {
+                if !held {
+                    self.open_workspace_picker(cx);
+                }
+            }
             "composer.branch" if chat => {
                 if !held {
                     self.open_branch_picker(window, cx);
@@ -228,7 +245,7 @@ impl Workspace {
                 if held {
                     return true;
                 }
-                return self.open_favorite_editor(cx);
+                return self.open_favorite_editor(window, cx);
             }
             "appearance.cycle" => {
                 if !held {
@@ -346,14 +363,40 @@ fn is_chat_shortcut(command: &str) -> bool {
         )
 }
 
-/// A stop of the F6 cycle (`workspaceAreaProps` orders), skipping details, which take no focus here.
+/// A stop of the F6 cycle, in `workspaceAreaProps` order: the sidebar, the page's content (the
+/// conversation, home or the Pull requests list), the composer, the thread details, the right
+/// panel and the terminal. Settings has its own two: its sections and its page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Area {
     Sidebar,
-    Conversation,
+    Content,
     Composer,
+    Details,
     Panel,
     Terminal,
+    SettingsNav,
+    SettingsPage,
+}
+
+/// Focus targets for the F6 stops that are regions, not controls (`tabIndex: -1`).
+pub(super) struct WorkspaceAreas {
+    /// The Pull requests list.
+    pub(super) content: FocusHandle,
+    pub(super) details: FocusHandle,
+    /// The right panel, or the Pull requests page's panel.
+    pub(super) panel: FocusHandle,
+    pub(super) settings_page: FocusHandle,
+}
+
+impl WorkspaceAreas {
+    pub(super) fn new(cx: &mut App) -> Self {
+        Self {
+            content: cx.focus_handle(),
+            details: cx.focus_handle(),
+            panel: cx.focus_handle(),
+            settings_page: cx.focus_handle(),
+        }
+    }
 }
 
 /// The next shown area after `current` in cycle order, wrapping; from outside every area, the first.
@@ -373,44 +416,82 @@ fn next_area(shown: &[Area], current: Option<Area>, forward: bool) -> Option<Are
 }
 
 impl Workspace {
-    /// `moveWorkspaceFocus`: F6 moves focus to the next shown area; dialogs keep it.
-    pub(super) fn move_workspace_focus(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings.is_some() || self.palette.is_some() || self.sidebar_open.sheet() {
-            return;
+    /// The areas on screen, in cycle order.
+    fn shown_areas(&self, window: &Window) -> Vec<Area> {
+        if self.settings.is_some() {
+            return vec![Area::SettingsNav, Area::SettingsPage];
         }
-        let chat = self.page.is_none() && self.target.is_some();
-        let shown: Vec<Area> = [
-            (Area::Sidebar, self.sidebar_open.shown()),
-            (Area::Conversation, chat && matches!(self.target, Some(Target::Thread { .. }))),
-            (Area::Composer, chat),
-            (Area::Panel, matches!(self.active_surface(), Some(super::right_panel::Surface::Browser(_)))),
-            (Area::Terminal, self.terminal_open()),
-        ]
-        .into_iter()
-        .filter_map(|(area, on)| on.then_some(area))
-        .collect();
-        let stack = window.context_stack();
-        let current = if self.sidebar.list_focus.is_focused(window) {
+        let sidebar = (Area::Sidebar, self.sidebar_open.shown());
+        let areas = match self.page {
+            // Usage is a modal with no areas of its own.
+            Some(page) if page.is_modal() => return Vec::new(),
+            Some(pages::Page::PullRequests) => {
+                vec![sidebar, (Area::Content, true), (Area::Panel, self.pull_requests_panel_shown())]
+            }
+            Some(_) => vec![sidebar],
+            None => vec![
+                sidebar,
+                (Area::Content, matches!(self.target, None | Some(Target::Thread { .. }))),
+                (Area::Composer, self.target.is_some()),
+                (Area::Details, self.details_shown(window)),
+                (Area::Panel, self.right_panel_open()),
+                (Area::Terminal, self.terminal_open()),
+            ],
+        };
+        areas.into_iter().filter_map(|(area, on)| on.then_some(area)).collect()
+    }
+
+    /// The area holding focus; a terminal tab in the right panel belongs to the panel.
+    fn focused_area(&self, window: &Window, cx: &App) -> Option<Area> {
+        let areas = &self.areas;
+        if self.settings.is_some() {
+            return if self.settings_nav_focused(window, cx) {
+                Some(Area::SettingsNav)
+            } else {
+                areas.settings_page.contains_focused(window, cx).then_some(Area::SettingsPage)
+            };
+        }
+        if self.sidebar.list_focus.is_focused(window) {
             Some(Area::Sidebar)
         } else if self.composer.focus_handle(cx).is_focused(window) {
             Some(Area::Composer)
-        } else if keymap::focus_in(&stack, "Terminal") {
-            Some(Area::Terminal)
-        } else if keymap::focus_in(&stack, keymap::PREVIEW_CONTEXT) {
+        } else if areas.panel.contains_focused(window, cx)
+            || (self.page.is_none() && keymap::focus_in(&window.context_stack(), keymap::PREVIEW_CONTEXT))
+        {
             Some(Area::Panel)
-        } else if self.focus.is_focused(window) {
-            Some(Area::Conversation)
+        } else if areas.details.contains_focused(window, cx) {
+            Some(Area::Details)
+        } else if keymap::focus_in(&window.context_stack(), "Terminal") {
+            Some(Area::Terminal)
+        } else if areas.content.contains_focused(window, cx) || self.focus.is_focused(window) {
+            Some(Area::Content)
         } else {
             None
-        };
+        }
+    }
+
+    /// `moveWorkspaceFocus`: F6 moves focus to the next shown area; dialogs keep it.
+    pub(super) fn move_workspace_focus(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.is_some() || self.sidebar_open.sheet() || window.has_active_dialog(cx) {
+            return;
+        }
+        let shown = self.shown_areas(window);
+        let current = self.focused_area(window, cx);
         match next_area(&shown, current, forward) {
             Some(Area::Sidebar) => self.sidebar.list_focus.focus(window, cx),
-            Some(Area::Conversation) => self.focus.focus(window, cx),
+            Some(Area::Content) if self.page.is_some() => self.areas.content.focus(window, cx),
+            Some(Area::Content) => self.focus.focus(window, cx),
             Some(Area::Composer) => self.focus_composer(window, cx),
-            Some(Area::Panel) => self.preview_command("preview.focusUrl", window, cx),
+            Some(Area::Details) => self.areas.details.focus(window, cx),
+            Some(Area::Panel) if matches!(self.active_surface(), Some(super::right_panel::Surface::Browser(_))) => {
+                self.preview_command("preview.focusUrl", window, cx);
+            }
+            Some(Area::Panel) => self.areas.panel.focus(window, cx),
             Some(Area::Terminal) => {
                 self.focus_terminal_drawer(window, cx);
             }
+            Some(Area::SettingsNav) => self.focus_settings_nav(window, cx),
+            Some(Area::SettingsPage) => self.areas.settings_page.focus(window, cx),
             None => {}
         }
         self.notify_sidebar(cx);
@@ -444,6 +525,10 @@ mod tests {
             "a hidden area counts as outside"
         );
         assert_eq!(next_area(&[], None, true), None);
+        let chat = [Area::Sidebar, Area::Content, Area::Composer, Area::Details, Area::Panel, Area::Terminal];
+        assert_eq!(next_area(&chat, Some(Area::Composer), true), Some(Area::Details));
+        assert_eq!(next_area(&chat, Some(Area::Details), true), Some(Area::Panel));
+        assert_eq!(next_area(&chat, Some(Area::Sidebar), true), Some(Area::Content));
     }
 
     #[test]

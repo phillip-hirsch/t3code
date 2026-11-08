@@ -67,7 +67,84 @@ impl Workspace {
                 self.show_pr_tab(next, None, cx);
             }
         }
+        if self.pull_requests.tabs.is_empty() {
+            self.pull_requests.panel_maximized = false;
+        }
         cx.notify();
+    }
+
+    /// The Pull requests page's panel is on screen.
+    pub(in crate::app) fn pull_requests_panel_shown(&self) -> bool {
+        self.pull_requests.panel.is_some() && !self.pull_requests.panel_hidden
+    }
+
+    /// The Pull requests page's panel shortcuts (`PullRequestsPage`'s keydown listener). Returns
+    /// whether the key was claimed; a held key is claimed without acting.
+    pub(in crate::app) fn pull_requests_page_command(
+        &mut self,
+        command: &str,
+        held: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let state = &self.pull_requests;
+        let panel = state.panel.as_ref();
+        let shown = panel.is_some() && !state.panel_hidden;
+        let has_url = panel.and_then(Panel::url).is_some();
+        let Some(shortcut) = page_panel_shortcut(command, panel.is_some(), shown, has_url) else { return false };
+        if held {
+            return true;
+        }
+        match shortcut {
+            PageShortcut::Show => self.pull_requests.panel_hidden = false,
+            PageShortcut::Hide => {
+                self.pull_requests.panel_hidden = true;
+                self.pull_requests.panel_maximized = false;
+            }
+            PageShortcut::ToggleMaximized => {
+                self.pull_requests.panel_maximized = !self.pull_requests.panel_maximized;
+            }
+            PageShortcut::CloseTab => {
+                if let Some(reference) = panel.map(|p| p.reference.clone()) {
+                    self.close_pr_tab(&reference, cx);
+                }
+            }
+            PageShortcut::CopyLink => {
+                if let Some(panel) = panel {
+                    let url = panel.url().unwrap_or_default().to_owned();
+                    let short = logic::terminology(panel.provider()).1;
+                    cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
+                    window.push_notification(Notification::success(url).title(format!("{short} link copied")), cx);
+                }
+            }
+        }
+        cx.notify();
+        true
+    }
+
+    /// `pullRequest.copyNumber` while a pull request's detail is on screen, on the Pull requests
+    /// page or in the thread's panel (`PullRequestDetailPanel`'s `shortcutsEnabled`).
+    pub(in crate::app) fn copy_pull_request_number(
+        &mut self,
+        held: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(panel) = self.pull_requests.panel.as_ref() else { return false };
+        let on_page = self.page == Some(super::super::Page::PullRequests) && !self.pull_requests.panel_hidden;
+        let in_thread_panel = matches!(
+            self.active_surface(),
+            Some(super::super::super::right_panel::Surface::PullRequest(reference)) if *reference == panel.reference
+        );
+        if !on_page && !in_thread_panel {
+            return false;
+        }
+        if !held {
+            let short = logic::terminology(panel.provider()).1;
+            cx.write_to_clipboard(ClipboardItem::new_string(format!("#{}", panel.reference.number)));
+            toast_success(window, cx, format!("{short} number copied"));
+        }
+        true
     }
 
     /// Reads the shown pull request again in place, as a refresh from the host's side does;
@@ -238,11 +315,12 @@ impl Workspace {
                     .group_hover("pr-panel-resize", gpui_kit::Styled::visible)
                     .bg(t.border),
             );
+        let maximized = self.pull_requests.panel_maximized;
         v_flex()
             .id("pr-panel")
+            .track_focus(&self.areas.panel)
             .relative()
-            .flex_none()
-            .w(px(width))
+            .map(|panel| if maximized { panel.flex_1().min_w_0() } else { panel.flex_none().w(px(width)) })
             .h_full()
             .min_h_0()
             .border_l_1()
@@ -255,7 +333,7 @@ impl Workspace {
             }))
             .child(self.render_pr_tab_strip(&t, cx))
             .child(div().flex_1().min_h_0().child(self.render_pull_request_panel(window, cx)))
-            .child(deferred(handle).with_priority(1))
+            .when(!maximized, |panel| panel.child(deferred(handle).with_priority(1)))
             .into_any_element()
     }
 
@@ -404,9 +482,53 @@ impl Workspace {
     }
 }
 
+/// What a panel shortcut does on the Pull requests page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PageShortcut {
+    Show,
+    Hide,
+    ToggleMaximized,
+    CloseTab,
+    CopyLink,
+}
+
+/// The page's panel shortcut for `command`, given whether a pull request is open in the panel,
+/// whether the panel shows, and whether its link is known; `None` leaves the key alone.
+fn page_panel_shortcut(command: &str, open: bool, shown: bool, has_url: bool) -> Option<PageShortcut> {
+    match command {
+        "rightPanel.toggle" if shown => Some(PageShortcut::Hide),
+        "rightPanel.toggle" if open => Some(PageShortcut::Show),
+        "rightPanel.toggleMaximized" if shown => Some(PageShortcut::ToggleMaximized),
+        "rightPanel.close" if shown => Some(PageShortcut::CloseTab),
+        "thread.copyReference" if shown && has_url => Some(PageShortcut::CopyLink),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn page_panel_shortcuts_act_only_on_a_panel_they_can_reach() {
+        use PageShortcut::*;
+        let cases = [
+            ("rightPanel.toggle", (true, true, true), Some(Hide)),
+            ("rightPanel.toggle", (true, false, true), Some(Show)),
+            ("rightPanel.toggle", (false, false, false), None),
+            ("rightPanel.toggleMaximized", (true, true, true), Some(ToggleMaximized)),
+            ("rightPanel.toggleMaximized", (true, false, true), None),
+            ("rightPanel.close", (true, true, true), Some(CloseTab)),
+            ("rightPanel.close", (true, false, true), None),
+            ("thread.copyReference", (true, true, true), Some(CopyLink)),
+            ("thread.copyReference", (true, true, false), None),
+            ("thread.copyReference", (true, false, true), None),
+            ("chat.new", (true, true, true), None),
+        ];
+        for (command, (open, shown, has_url), expected) in cases {
+            assert_eq!(page_panel_shortcut(command, open, shown, has_url), expected, "{command} {open} {shown}");
+        }
+    }
 
     #[test]
     fn the_panel_keeps_its_minimum_and_leaves_the_list_its_own() {

@@ -156,6 +156,11 @@ mod tests {
             display_name: "repo".into(),
             members: vec![member("a", "laptop"), member("b", "server"), member("c", "laptop")],
             project_ids: vec!["a".into(), "b".into(), "c".into()],
+            project_refs: vec![
+                ("laptop".into(), "a".into()),
+                ("server".into(), "b".into()),
+                ("laptop".into(), "c".into()),
+            ],
             pinned: false,
             archived: false,
         };

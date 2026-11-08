@@ -154,6 +154,17 @@ impl Workspace {
         }
     }
 
+    /// The brand's link to `/`: the index route, which opens a draft in the most recently active
+    /// project (`IndexDraftLanding`), out of Settings or any page.
+    pub(super) fn go_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings = None;
+        let recent = crate::inbox::most_recent_project(&self.shell.projects, &self.shell.threads);
+        match recent.map(|p| p.id.clone()) {
+            Some(project_id) => self.start_draft(project_id, window, cx),
+            None => self.close_page(cx),
+        }
+    }
+
     pub(super) fn go_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(location) = self.history.step(-1) {
             self.go_to(location, window, cx);

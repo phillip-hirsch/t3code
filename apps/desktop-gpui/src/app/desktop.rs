@@ -67,6 +67,8 @@ pub(super) struct DesktopShell {
     pub(super) exposure: Option<crate::desktop::exposure::ExposureView>,
     pub(super) exposure_pending: bool,
     pub(super) _exposure_task: Option<Task<()>>,
+    /// Pairing links already added; a repeated click would only fail on the spent one-time token.
+    paired_urls: std::collections::HashSet<String>,
 }
 
 impl DesktopShell {
@@ -95,6 +97,7 @@ impl DesktopShell {
             exposure: None,
             exposure_pending: false,
             _exposure_task: None,
+            paired_urls: std::collections::HashSet::new(),
         };
         (shell, subscriptions)
     }
@@ -147,20 +150,31 @@ impl Workspace {
 
     fn open_app_link(&mut self, link: AppLink, window: &mut Window, cx: &mut Context<Self>) {
         match link {
-            // Not wired to saved environments yet; Settings › Connections pairs by host and code.
-            AppLink::Pair { .. } => toast_error(window, cx, "Could not add backend", "Failed to add backend."),
+            AppLink::Pair { pairing_url } => self.pair_from_link(pairing_url, window, cx),
             AppLink::Thread { environment_id, thread_id, query } => {
                 let listed = self.shell.threads.iter().any(|t| t.id == thread_id && t.environment_id == environment_id);
-                if !listed {
-                    toast_error(window, cx, "Could not open the link", "This thread is not on this machine.");
-                    return;
+                if listed {
+                    return self.open_linked_thread(environment_id.into(), thread_id, &query, window, cx);
                 }
-                self.select_thread_in(environment_id.into(), thread_id, window, cx);
-                match links::parse_thread_link_prompt(&query) {
-                    Err(error) => toast_error(window, cx, "Could not open the linked prompt", error),
-                    Ok(Some(prompt)) => self.place_linked_prompt(prompt, Vec::new(), window, cx),
-                    Ok(None) => {}
-                }
+                // An older or not yet listed thread: its own load decides whether it exists.
+                let Some(client) = self.env_client(&environment_id) else {
+                    return toast_error(window, cx, "Could not open the link", "This thread is not on this machine.");
+                };
+                cx.spawn_in(window, async move |this, cx| {
+                    let input = json!({"threadId": thread_id});
+                    let found = client
+                        .request("orchestration.getThreadProjection", input)
+                        .await
+                        .is_ok_and(|projection| projection["thread"]["deletedAt"].is_null());
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        if found {
+                            this.open_linked_thread(environment_id.into(), thread_id, &query, window, cx);
+                        } else {
+                            toast_error(window, cx, "Could not open the link", "This thread is not on this machine.");
+                        }
+                    });
+                })
+                .detach();
             }
             AppLink::New { query } => match links::parse_new_thread_link(&query) {
                 Err(message) => self.show_link_page(
@@ -170,6 +184,80 @@ impl Workspace {
                 Ok(link) => self.launch_new_thread_link(link, window, cx),
             },
         }
+    }
+
+    fn open_linked_thread(
+        &mut self,
+        environment_id: SharedString,
+        thread_id: String,
+        query: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_thread_in(environment_id, thread_id, window, cx);
+        match links::parse_thread_link_prompt(query) {
+            Err(error) => toast_error(window, cx, "Could not open the linked prompt", error),
+            Ok(Some(prompt)) => self.place_linked_prompt(prompt, Vec::new(), window, cx),
+            Ok(None) => {}
+        }
+    }
+
+    /// `pairFromLink`: any page can open a pairing link, so the user confirms the backend's
+    /// origin before its one-time token is spent; the paired backend is saved like one added in
+    /// Settings › Connections.
+    fn pair_from_link(&mut self, pairing_url: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.desktop.paired_urls.contains(&pairing_url) {
+            return;
+        }
+        let fail = |error: &str, window: &mut Window, cx: &mut gpui_kit::App| {
+            toast_error(window, cx, "Could not add backend", error.to_owned());
+        };
+        let Some((host, code)) = crate::environments::parse_pairing_url(&pairing_url) else {
+            return fail("Failed to add backend.", window, cx);
+        };
+        // The origin keeps the scheme visible, so a plain HTTP backend is not mistaken for HTTPS.
+        let origin = crate::environments::resolve_pairing_host(&host, &code)
+            .map_err(str::to_owned)
+            .and_then(|base| url::Url::parse(&base).map_err(|error| error.to_string()))
+            .map(|base| base.origin().ascii_serialization());
+        let origin = match origin {
+            Ok(origin) => origin,
+            Err(error) => return fail(&error, window, cx),
+        };
+        let confirmed = super::confirm::confirm(&format!("Add the backend at {origin}?"), false, window, cx);
+        let saved = self.saved_environments.clone();
+        let primary = self.primary_environment().cloned();
+        cx.spawn_in(window, async move |this, cx| {
+            if !confirmed.await.unwrap_or(false) {
+                return;
+            }
+            let catalog = saved.read_with(cx, |saved, _| saved.environments().to_vec());
+            let paired = crate::runtime().spawn(crate::environments::pair(host, code, catalog)).await;
+            let paired = paired.unwrap_or_else(|error| Err(error.to_string()));
+            let saving = match paired {
+                // The workspace's own environment is already here.
+                Ok(paired) if primary.as_deref() == Some(paired.environment_id.as_str()) => None,
+                Ok(paired) => Some(saved.update(cx, |saved, cx| saved.add(paired, cx))),
+                Err(error) => {
+                    let _ = this.update_in(cx, |_, window, cx| fail(&error, window, cx));
+                    return;
+                }
+            };
+            let saved = match saving {
+                Some(saving) => saving.finished().await,
+                None => Ok(()),
+            };
+            let _ = this.update_in(cx, |this, window, cx| match saved {
+                Ok(()) => {
+                    this.desktop.paired_urls.insert(pairing_url);
+                    let toast = Notification::success("The environment is saved and will reconnect on app startup.")
+                        .title("Backend added");
+                    window.push_notification(toast, cx);
+                }
+                Err(error) => fail(&error, window, cx),
+            });
+        })
+        .detach();
     }
 
     fn show_link_page(&mut self, state: LinkPage, cx: &mut Context<Self>) {

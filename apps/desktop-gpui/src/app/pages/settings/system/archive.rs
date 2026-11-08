@@ -719,6 +719,7 @@ mod tests {
             display_name: "Web".into(),
             members: vec![checkout("a", "web"), checkout("b", "web-b")],
             project_ids: vec!["web".into(), "web-b".into()],
+            project_refs: vec![("a".into(), "web".into()), ("b".into(), "web-b".into())],
             pinned: false,
             archived: false,
         }];

@@ -258,6 +258,7 @@ impl Workspace {
         });
         let card = v_flex()
             .id("thread-details")
+            .track_focus(&self.areas.details)
             .w_full()
             .overflow_y_scroll()
             .occlude()
@@ -494,9 +495,12 @@ impl Workspace {
         )
     }
 
-    /// `editor.openFavorite` (`OpenInPickerShortcut.ts`): opens the preferred editor while the
-    /// Open in row can show.
-    pub(super) fn open_favorite_editor(&mut self, cx: &mut Context<Self>) -> bool {
+    /// `editor.openFavorite` (`OpenInPickerShortcut.ts`): opens the shown file tab's file, else the
+    /// workspace while the Open in row can show.
+    pub(super) fn open_favorite_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if let Some(opened) = self.open_favorite_in_file_surface(window, cx) {
+            return opened;
+        }
         if self.target_project().is_none_or(|project| project.workspace_root.is_empty()) {
             return false;
         }

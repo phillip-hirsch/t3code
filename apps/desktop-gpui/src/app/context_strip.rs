@@ -99,6 +99,8 @@ pub(super) struct DraftWorkspaceState {
     /// The permissions popover that is open, by element id, and the mode it previews.
     permissions_open: Option<&'static str>,
     permissions_preview: Option<&'static str>,
+    /// The Workspace menu is open (`composer.workspace` opens it too).
+    env_mode_open: bool,
     /// `vcs.listRefs` for an open thread's checkout, by environment and cwd (`persistComposerContextStrip`).
     thread_refs: Option<(Option<SharedString>, String, Value)>,
 }
@@ -157,6 +159,16 @@ impl Workspace {
     pub(super) fn draft_workspace_open_permissions(&mut self, cx: &mut Context<Self>) {
         self.draft_workspace.permissions_open = Some("strip-permissions");
         cx.notify();
+    }
+
+    /// `composer.workspace`: opens the Workspace menu while the draft's strip shows it.
+    pub(super) fn open_workspace_picker(&mut self, cx: &mut Context<Self>) {
+        let shown =
+            matches!(self.target, Some(Target::Draft { .. })) && self.target_project().is_some() && self.is_git_repo();
+        if shown {
+            self.draft_workspace.env_mode_open = true;
+            cx.notify();
+        }
     }
 
     fn refresh_refs(&mut self, cx: &mut Context<Self>) {
@@ -605,6 +617,7 @@ impl Workspace {
         let (icon, label) = self.env_mode_choice();
         let path = self.composer_cwd();
         let menu = self.env_mode_menu(cx);
+        let view = cx.entity();
         let button = strip_button("env-mode", t)
             .child(Icon::new(icon).with_size(px(12.)))
             .child(div().max_w(px(240.)).truncate().child(label))
@@ -612,7 +625,14 @@ impl Workspace {
                 Some(keys) => format!("{label} · {keys}"),
                 None => label.to_owned(),
             })
-            .dropdown_menu_with_anchor(gpui_kit::Anchor::BottomLeft, menu);
+            .dropdown_menu_with_anchor(gpui_kit::Anchor::BottomLeft, menu)
+            .open(self.draft_workspace.env_mode_open)
+            .on_open_change(move |open, _, cx| {
+                view.update(cx, |this, cx| {
+                    this.draft_workspace.env_mode_open = *open;
+                    cx.notify();
+                });
+            });
         let wrap = div().id("env-mode-wrap").min_w_0().child(button);
         with_copy_menu(wrap, path.map(|p| clipboard_path(&p)), "Copy full path", "Path copied")
     }

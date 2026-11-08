@@ -3,10 +3,13 @@
 
 use std::collections::HashSet;
 
+use serde::{Deserialize, Serialize};
+
 pub(super) const DEFAULT_HEIGHT: f32 = 280.;
 pub(super) const MAX_PER_GROUP: usize = 4;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub(super) enum Split {
     /// Side by side.
     #[default]
@@ -15,10 +18,12 @@ pub(super) enum Split {
     Vertical,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct Group {
     pub id: String,
     pub terminal_ids: Vec<String>,
+    #[serde(rename = "splitDirection", default)]
     pub split: Split,
 }
 
@@ -28,15 +33,24 @@ pub(super) enum Place {
     Split(Split),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+/// Serialized as the web's `ThreadTerminalUiState`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub(super) struct DrawerLayout {
+    #[serde(rename = "terminalOpen")]
     pub open: bool,
+    #[serde(rename = "terminalHeight")]
     pub height: f32,
+    #[serde(rename = "terminalIds")]
     pub terminal_ids: Vec<String>,
+    #[serde(rename = "activeTerminalId")]
     pub active_id: String,
+    #[serde(rename = "terminalGroups")]
     pub groups: Vec<Group>,
+    #[serde(rename = "activeTerminalGroupId")]
     pub active_group_id: String,
     /// Closed here; a lagging server list must not bring them back.
+    #[serde(skip)]
     suppressed: HashSet<String>,
 }
 
@@ -66,6 +80,49 @@ fn group_id_for(terminal_id: &str, groups: &[Group]) -> String {
 }
 
 impl DrawerLayout {
+    /// What a relaunch restores; a default drawer is not kept (`isDefaultThreadTerminalUiState`).
+    pub fn stored(&self) -> Option<&Self> {
+        let default = Self { suppressed: self.suppressed.clone(), ..Self::default() };
+        (*self != default).then_some(self)
+    }
+
+    /// `normalizeThreadTerminalUiState` for a stored drawer: unique ids, every terminal in
+    /// exactly one group, and an active terminal and group that exist.
+    pub fn restored(mut self) -> Self {
+        let mut seen = HashSet::new();
+        self.terminal_ids = std::mem::take(&mut self.terminal_ids)
+            .into_iter()
+            .map(|id| id.trim().to_owned())
+            .filter(|id| !id.is_empty() && seen.insert(id.clone()))
+            .collect();
+        let mut grouped = HashSet::new();
+        for group in &mut self.groups {
+            group.terminal_ids.retain(|id| self.terminal_ids.contains(id) && grouped.insert(id.clone()));
+        }
+        self.groups.retain(|group| !group.terminal_ids.is_empty());
+        for id in &self.terminal_ids {
+            if !grouped.contains(id) {
+                let group_id = group_id_for(id, &self.groups);
+                self.groups.push(Group { id: group_id, terminal_ids: vec![id.clone()], split: Split::Horizontal });
+            }
+        }
+        if !self.terminal_ids.contains(&self.active_id) {
+            self.active_id = self.terminal_ids.first().cloned().unwrap_or_default();
+        }
+        if !self
+            .groups
+            .iter()
+            .any(|group| group.id == self.active_group_id && group.terminal_ids.contains(&self.active_id))
+        {
+            self.fix_active_group();
+        }
+        if !self.height.is_finite() || self.height <= 0. {
+            self.height = DEFAULT_HEIGHT;
+        }
+        self.open &= !self.terminal_ids.is_empty();
+        self
+    }
+
     pub fn active_group(&self) -> Option<&Group> {
         self.groups
             .iter()
@@ -311,6 +368,42 @@ mod tests {
         let mut ids = vec!["term-10", "term-2", "term-1"];
         ids.sort_by(|a, b| numeric_order(a, b));
         assert_eq!(ids, ["term-1", "term-2", "term-10"]);
+    }
+
+    #[test]
+    fn drawers_store_as_the_web_does_and_restore_normalized() {
+        let mut layout = DrawerLayout::default();
+        assert!(layout.stored().is_none());
+        layout.place("term-1", Place::New);
+        layout.place("term-2", Place::Split(Split::Vertical));
+        layout.height = 320.;
+        let value = serde_json::to_value(layout.stored().unwrap()).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "terminalOpen": true,
+                "terminalHeight": 320.0,
+                "terminalIds": ["term-1", "term-2"],
+                "activeTerminalId": "term-2",
+                "terminalGroups": [{"id": "group-term-1", "terminalIds": ["term-1", "term-2"], "splitDirection": "vertical"}],
+                "activeTerminalGroupId": "group-term-1",
+            })
+        );
+        let restored: DrawerLayout = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.restored(), layout);
+
+        let messy: DrawerLayout = serde_json::from_value(serde_json::json!({
+            "terminalOpen": true,
+            "terminalIds": ["term-1", " term-1 ", "term-3"],
+            "activeTerminalId": "gone",
+            "terminalGroups": [{"id": "g", "terminalIds": ["term-1", "gone"]}],
+        }))
+        .unwrap();
+        let messy = messy.restored();
+        assert_eq!(messy.terminal_ids, ["term-1", "term-3"]);
+        assert_eq!(ids(&messy), [["term-1"], ["term-3"]]);
+        assert_eq!((messy.active_id.as_str(), messy.active_group_id.as_str()), ("term-1", "g"));
+        assert_eq!(messy.height, DEFAULT_HEIGHT);
     }
 
     fn ids(layout: &DrawerLayout) -> Vec<Vec<&str>> {
