@@ -8,7 +8,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use gpui_kit::{Context, Image, ImageFormat, ImageSource, SharedString, SharedUri};
 use markdown::mdast::Node;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::Workspace;
 
@@ -49,6 +49,8 @@ pub(super) enum Source {
     Direct(String),
     Data(ImageFormat, Vec<u8>),
     WorkspaceFile(String),
+    /// An `assets.createUrl` resource, such as a tool's output image.
+    Asset(Value),
     Blocked,
 }
 
@@ -220,9 +222,32 @@ impl Workspace {
     /// that shows `key` to remeasure once it lands.
     pub(super) fn load_images(&mut self, key: &SharedString, destinations: Vec<String>, cx: &mut Context<Self>) {
         let root = self.git_cwd();
+        let sources = destinations
+            .into_iter()
+            .map(|destination| {
+                let source = classify(&destination, root.as_deref());
+                (destination, source)
+            })
+            .collect();
+        self.load_sources(key, sources, cx);
+    }
+
+    /// Starts loading each asset image (`ChatMarkdownAssetImage`), cached under its destination.
+    pub(super) fn load_asset_images(
+        &mut self,
+        key: &SharedString,
+        assets: Vec<(String, Value)>,
+        cx: &mut Context<Self>,
+    ) {
+        let sources =
+            assets.into_iter().map(|(destination, resource)| (destination, Source::Asset(resource))).collect();
+        self.load_sources(key, sources, cx);
+    }
+
+    fn load_sources(&mut self, key: &SharedString, sources: Vec<(String, Source)>, cx: &mut Context<Self>) {
         let thread_id = self.thread.as_ref().map(|t| t.id.clone());
         let cache = self.markdown_images.clone();
-        for destination in destinations {
+        for (destination, source) in sources {
             {
                 let Ok(mut cache) = cache.0.lock() else { return };
                 if cache.contains_key(&destination) {
@@ -230,8 +255,14 @@ impl Workspace {
                 }
                 cache.insert(destination.clone(), None);
             }
-            let source = classify(&destination, root.as_deref());
-            let (client, base, thread_id) = (self.client(), self.http_base().map(str::to_owned), thread_id.clone());
+            let resource = match &source {
+                Source::WorkspaceFile(path) => {
+                    thread_id.as_ref().map(|id| json!({"_tag": "media-file", "threadId": id, "path": path}))
+                }
+                Source::Asset(resource) => Some(resource.clone()),
+                _ => None,
+            };
+            let (client, base) = (self.client(), self.http_base().map(str::to_owned));
             let (key, cache) = (key.clone(), cache.clone());
             cx.spawn(async move |this, cx| {
                 let fetched: Option<(Option<String>, Vec<u8>)> = match source {
@@ -243,16 +274,15 @@ impl Workspace {
                         return;
                     }
                     Source::Direct(url) => fetch(url).await,
-                    Source::WorkspaceFile(path) => match (client, base, thread_id) {
-                        (Some(client), Some(base), Some(thread_id)) => {
-                            let resource = json!({"_tag": "media-file", "threadId": thread_id, "path": path});
+                    Source::WorkspaceFile(_) | Source::Asset(_) => match (client, base, resource) {
+                        (Some(client), Some(base), Some(resource)) => {
                             match client.request("assets.createUrl", json!({"resource": resource})).await {
                                 Ok(signed) => match signed["relativeUrl"].as_str() {
                                     Some(relative) => fetch(format!("{base}{relative}")).await,
                                     None => None,
                                 },
                                 Err(error) => {
-                                    log::debug!("assets.createUrl for a markdown image: {error}");
+                                    log::debug!("assets.createUrl for a chat image: {error}");
                                     None
                                 }
                             }

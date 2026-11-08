@@ -145,6 +145,34 @@ pub fn with_position(file: &FilePosition) -> String {
     }
 }
 
+/// `formatWorkspaceRelativePath`: a path in the workspace reads from the workspace folder's name.
+pub fn workspace_display_path(path_with_position: &str, workspace_root: Option<&str>) -> String {
+    let mut position = split_position(path_with_position, "");
+    let normalized = strip_slash_drive(&position.path.replace('\\', "/")).to_owned();
+    position.path = match workspace_root {
+        Some(raw_root) => {
+            let root = strip_slash_drive(&raw_root.trim_end_matches(['/', '\\']).replace('\\', "/")).to_owned();
+            let label = root.rsplit('/').next().unwrap_or_default().to_owned();
+            let insensitive = is_windows_absolute(strip_slash_drive(raw_root));
+            let fold = |text: &str| if insensitive { text.to_lowercase() } else { text.to_owned() };
+            let (path_key, root_key) = (fold(&normalized), fold(&root));
+            if path_key == root_key {
+                label
+            } else if path_key.starts_with(&format!("{root_key}/")) {
+                format!("{label}/{}", normalized.get(root.len() + 1..).unwrap_or_default())
+            } else if normalized.starts_with('/') || path_key.starts_with(&format!("{}/", fold(&label))) {
+                normalized
+            } else {
+                let relative =
+                    normalized.strip_prefix("./").map_or(normalized.as_str(), |rest| rest.trim_start_matches('/'));
+                format!("{label}/{relative}")
+            }
+        }
+        None => normalized,
+    };
+    with_position(&position)
+}
+
 /// `ELIDED_PATH_SEGMENT_PATTERN`: a `...` or `…` segment that shortened the path.
 fn is_elided(path: &str) -> bool {
     path.split(['/', '\\']).any(|segment| segment == "…" || (segment.len() >= 3 && segment.bytes().all(|b| b == b'.')))
@@ -547,6 +575,19 @@ fn home_of(cwd: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_paths_read_from_the_workspace_folder() {
+        let root = Some("/home/me/repo");
+        assert_eq!(workspace_display_path("/home/me/repo/src/a.rs", root), "repo/src/a.rs");
+        assert_eq!(workspace_display_path("/home/me/repo", root), "repo");
+        assert_eq!(workspace_display_path("src/a.rs:12:3", root), "repo/src/a.rs:12:3");
+        assert_eq!(workspace_display_path("./src/a.rs", root), "repo/src/a.rs");
+        assert_eq!(workspace_display_path("repo/src/a.rs", root), "repo/src/a.rs");
+        assert_eq!(workspace_display_path("/etc/hosts", root), "/etc/hosts");
+        assert_eq!(workspace_display_path("C:\\Repo\\src\\a.rs", Some("c:\\repo\\")), "repo/src/a.rs");
+        assert_eq!(workspace_display_path("src\\a.rs", None), "src/a.rs");
+    }
 
     #[test]
     fn inline_code_reads_as_a_file_only_when_it_looks_like_one() {

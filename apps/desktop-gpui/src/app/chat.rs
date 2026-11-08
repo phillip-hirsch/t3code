@@ -2280,8 +2280,19 @@ fn entry_text_details(
     if let Some(question) = &entry.question {
         return Some(question_history(&entry.id, question, t));
     }
+    // `WorkLogDetails`: a click or a text selection inside leaves the row open.
     if let Some(inspector) = super::inspector::inspector(entry, this, t, cx) {
-        return Some(div().mt(px(2.)).mb(px(6.)).pb(px(8.)).child(inspector).into_any_element());
+        return Some(
+            div()
+                .id(ElementId::Name(format!("inspector:{}", entry.id).into()))
+                .mt(px(2.))
+                .mb(px(6.))
+                .pb(px(8.))
+                .cursor_default()
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .child(inspector)
+                .into_any_element(),
+        );
     }
     let body = entry_body(entry, label)?;
     Some(
@@ -2292,11 +2303,13 @@ fn entry_text_details(
             .pb(px(8.))
             .max_h(px(256.))
             .overflow_y_scroll()
+            .cursor_text()
+            .on_click(|_, _, cx| cx.stop_propagation())
             .font_family(t.fonts.mono)
             .text_size(px(13.))
             .line_height(relative(1.625))
             .text_color(alpha(t.foreground, 0.85))
-            .child(body)
+            .child(gpui_kit::base::SelectableText::new("text", body))
             .into_any_element(),
     )
 }

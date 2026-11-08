@@ -194,6 +194,10 @@ soft break inside a text node becomes a newline. Files:
 - `src/text/format/markdown.rs`: the `Node::Text` arm of `parse_paragraph`; one test,
   `test_line_breaks_keep_soft_breaks_and_structure`.
 
+**Selectable text takes highlights.** A tool call's arguments read `key value` with the key muted,
+and stay selectable. `src/selectable_text.rs`: `SelectableText::highlights`, passing through to its
+`StyledText`.
+
 The crate's own tests need `--features test-support` and `include_str!` a `README.md` four levels
 above `src/text`, which this folder lacks: run them from a scratch copy laid out as
 `<dir>/crates/gpui-base` with a `<dir>/README.md`.
