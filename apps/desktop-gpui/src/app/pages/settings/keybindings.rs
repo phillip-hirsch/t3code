@@ -571,6 +571,10 @@ pub(super) struct KeybindingsPanel {
     workspace: WeakEntity<Workspace>,
     /// The settings environment the rows, drafts and saves belong to.
     environment: Option<SharedString>,
+    /// The selected, connected environments a change goes to (`connectedEnvironments`), and
+    /// whether this connection may write settings on each.
+    targets: Vec<SharedString>,
+    can_write: bool,
     search: Entity<InputState>,
     query: String,
     catalog: Catalog,
@@ -645,6 +649,8 @@ impl KeybindingsPanel {
         Self {
             workspace: workspace.downgrade(),
             environment,
+            targets: Vec::new(),
+            can_write: false,
             search,
             query: String::new(),
             catalog: Catalog::new(source),
@@ -853,47 +859,63 @@ impl KeybindingsPanel {
         cx.notify();
     }
 
-    /// The panel's environment and its socket, taken before a request so the reply lands there.
-    fn target_environment(&self, cx: &App) -> Option<(SharedString, crate::rpc::RpcClient)> {
-        let environment = self.environment.clone()?;
-        let client = self.workspace.upgrade()?.read(cx).env_client(&environment)?;
-        Some((environment, client))
+    /// The selected environments' sockets, taken before a request so each reply lands on its own.
+    fn target_clients(&self, cx: &App) -> Option<Vec<(SharedString, crate::rpc::RpcClient)>> {
+        let workspace = self.workspace.upgrade()?;
+        let workspace = workspace.read(cx);
+        let clients: Vec<_> = self
+            .targets
+            .iter()
+            .filter_map(|environment| Some((environment.clone(), workspace.env_client(environment)?)))
+            .collect();
+        (self.can_write && !clients.is_empty()).then_some(clients)
     }
 
-    /// `server.upsertKeybinding`, or `server.removeKeybinding` when `remove`.
+    /// `server.upsertKeybinding`, or `server.removeKeybinding` when `remove`, on every selected
+    /// environment.
     fn send(&mut self, command: String, payload: Value, remove: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((environment, client)) = self.target_environment(cx) else { return };
+        let Some(targets) = self.target_clients(cx) else { return };
+        let Some(environment) = self.environment.clone() else { return };
         self.saving = Some(command);
         cx.notify();
         let method = if remove { "server.removeKeybinding" } else { "server.upsertKeybinding" };
         cx.spawn_in(window, async move |this, cx| {
-            let result = client.request(method, payload).await;
+            let requests = targets.into_iter().map(|(target, client)| {
+                let payload = payload.clone();
+                async move { (target, client.request(method, payload).await) }
+            });
+            let results = futures::future::join_all(requests).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 // The panel moved to another environment meanwhile: its editing state is not this one's.
                 let current = this.environment.as_ref() == Some(&environment);
                 if current {
                     this.saving = None;
                 }
-                match result {
-                    Ok(value) => {
-                        if !remove && current {
-                            this.adding = None;
-                        }
+                let mut failure = None;
+                for (target, result) in results {
+                    match result {
                         // A reply without the list keeps the keymap; `keybindingsUpdated` still arrives.
-                        let rules = value.get("keybindings").filter(|rules| rules.is_array());
-                        if rules.is_none() {
-                            log::warn!("{method} reply has no keybindings list; keeping the current keymap");
-                        }
-                        if let (Some(rules), Some(workspace)) = (rules, this.workspace.upgrade()) {
-                            workspace.update(cx, |workspace, cx| {
-                                let Some(info) = workspace.env_info_mut(&environment) else { return };
-                                info.keybindings = Rc::from(keybindings::decode_rules(rules));
-                                workspace.sync_keymap(cx);
-                                cx.notify();
-                            });
+                        Ok(value) => match value.get("keybindings").filter(|rules| rules.is_array()) {
+                            Some(rules) => {
+                                let Some(workspace) = this.workspace.upgrade() else { continue };
+                                workspace.update(cx, |workspace, cx| {
+                                    let Some(info) = workspace.env_info_mut(&target) else { return };
+                                    info.keybindings = Rc::from(keybindings::decode_rules(rules));
+                                    workspace.sync_keymap(cx);
+                                    cx.notify();
+                                });
+                            }
+                            None => log::warn!("{method} reply has no keybindings list; keeping the current keymap"),
+                        },
+                        Err(error) => {
+                            failure.get_or_insert(error);
                         }
                     }
-                    Err(error) => {
+                }
+                match failure {
+                    None if !remove && current => this.adding = None,
+                    None => {}
+                    Some(error) => {
                         let (title, fallback) = if remove {
                             ("Unable to remove keybinding", "The keybinding was not removed.")
                         } else {
@@ -1018,14 +1040,13 @@ impl KeybindingsPanel {
     ) -> gpui_kit::Stateful<gpui_kit::Div> {
         let t = *t;
         let mut children = vec![settings_section("keybindings", "Keybindings", [self.render_toolbar(&t, cx)], &t)];
-        if !self.connected {
-            children.push(
-                div()
-                    .text_xs()
-                    .text_color(t.muted_foreground)
-                    .child("Connect an environment to change keybindings.")
-                    .into_any_element(),
-            );
+        let notice = if !self.connected || self.targets.is_empty() {
+            Some("Connect an environment to change keybindings.")
+        } else {
+            (!self.can_write).then_some("This connection can view keybindings but cannot change them.")
+        };
+        if let Some(notice) = notice {
+            children.push(div().text_xs().text_color(t.muted_foreground).child(notice).into_any_element());
         }
         let mut body = Vec::new();
         if self.adding.is_some() {
@@ -1808,7 +1829,12 @@ impl Workspace {
             .clone();
         let jump = self.section_target(theme::tokens(cx));
         if let Ok(panel) = panel.clone().downcast::<KeybindingsPanel>() {
-            panel.update(cx, |panel, cx| panel.follow_jump(jump, window, cx));
+            let (targets, can_write) = (view.connected_environment_ids(), view.can_write_connected());
+            panel.update(cx, |panel, cx| {
+                panel.targets = targets;
+                panel.can_write = can_write;
+                panel.follow_jump(jump, window, cx);
+            });
         }
         // Not `cached`: its dropdowns and popovers keep state in their own entities,
         // whose updates would not repaint a cached subtree.

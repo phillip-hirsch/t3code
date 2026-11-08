@@ -89,6 +89,21 @@ impl SettingsView {
             .collect()
     }
 
+    /// The selected, connected environments' ids (`connectedEnvironments`).
+    pub(in crate::app) fn connected_environment_ids(&self) -> Vec<SharedString> {
+        self.environments
+            .iter()
+            .filter(|e| e.settings.is_some() && self.scope.environment_ids.contains(&e.id))
+            .map(|e| e.id.clone().into())
+            .collect()
+    }
+
+    /// Some environment is connected and this connection may write settings on each one.
+    pub(in crate::app) fn can_write_connected(&self) -> bool {
+        let authorities = self.row_authorities();
+        !authorities.is_empty() && authorities.iter().all(|authority| authority.can_write)
+    }
+
     /// `firstManagedDenial` over the selected, connected environments' policies.
     pub(in crate::app) fn first_managed_denial(&self, deny: impl Fn(&Value) -> Option<String>) -> Option<String> {
         self.row_authorities().iter().find_map(|authority| deny(authority.policy))
