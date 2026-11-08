@@ -863,11 +863,11 @@ impl Workspace {
             .mx(px(-4.))
             .disabled(self.target.is_none())
             .token(move |token, _, _| render_chip(token, &machines, &t))
-            // A file chip opens its preview: an uploaded file's (`composerContextActions.openFile`), or
+            // A file or image chip opens its preview: an uploaded attachment's (`composerContextActions.openFile`), or
             // the workspace file a mention names in the panel (`openMention`).
             .on_token_click(move |event, window, cx| match Chip::from_id(event.token().id()) {
-                Some(Chip::Context { kind, id, .. }) if kind == "file" => {
-                    if let Some(local_id) = id.strip_prefix("file_") {
+                Some(Chip::Context { kind, id, .. }) if kind == "file" || kind == "image" => {
+                    if let Some(local_id) = id.strip_prefix("file_").or_else(|| id.strip_prefix("image_")) {
                         let _ = chip_view.update(cx, |this, cx| this.open_attachment_preview(local_id, window, cx));
                     }
                 }

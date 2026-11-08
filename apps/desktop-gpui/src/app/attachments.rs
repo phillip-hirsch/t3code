@@ -826,7 +826,19 @@ impl Workspace {
             .border_color(t.border.opacity(0.8))
             .bg(t.background)
             .map(|el| match &attachment.image {
-                Some(image) => el.child(img(image.clone()).size_full().object_fit(ObjectFit::Cover)),
+                Some(image) => {
+                    let preview_id = id.clone();
+                    el.child(
+                        div()
+                            .id(ElementId::Name(format!("preview-{id}").into()))
+                            .size_full()
+                            .cursor_pointer()
+                            .child(img(image.clone()).size_full().object_fit(ObjectFit::Cover))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_attachment_preview(&preview_id, window, cx);
+                            })),
+                    )
+                }
                 None => el.child(
                     div()
                         .size_full()
