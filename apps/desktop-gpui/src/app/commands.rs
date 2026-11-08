@@ -197,6 +197,11 @@ impl Workspace {
                     return self.cycle_host(window, cx);
                 }
             }
+            "composer.workspace" if chat => {
+                if !held {
+                    self.open_workspace_picker(cx);
+                }
+            }
             "composer.branch" if chat => {
                 if !held {
                     self.open_branch_picker(window, cx);

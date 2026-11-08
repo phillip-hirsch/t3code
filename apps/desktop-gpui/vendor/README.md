@@ -237,3 +237,8 @@ its `Size`, so `.text_base()` on the button never showed. `src/button/button.rs`
 from the pointer; gpui-pre's window now sets the gap (see gpui-pre's "Tooltips sit 4px off their
 trigger"), so `src/tooltip.rs` drops the `m_3`. Its popup also takes `TooltipPopup`'s
 `rounded-md text-xs leading-snug px-2 py-1` in place of 0.9.0's `text_sm` and `py_0p5`.
+
+**A dropdown menu can open from a shortcut.** The web opens the composer's Workspace menu with
+`composer.workspace` (Mod+Shift+X). 0.9.0's `DropdownMenuPopover` opens only from its trigger.
+`src/menu/dropdown_menu.rs` adds `DropdownMenuPopover::open`, passed to its `Popover` as
+`Popover::open` is, so a caller can hold the open state with `on_open_change`.
