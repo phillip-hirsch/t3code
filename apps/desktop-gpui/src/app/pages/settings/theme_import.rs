@@ -144,7 +144,6 @@ impl ThemeImport {
                 }
             }),
         ];
-        query.update(cx, |input, cx| input.focus(window, cx));
         Self {
             workspace,
             query,
@@ -876,7 +875,13 @@ impl Workspace {
     pub(in crate::app) fn open_theme_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let workspace = cx.weak_entity();
         let import = cx.new(|cx| ThemeImport::new(workspace, window, cx));
-        window.open_dialog(cx, move |dialog, _, _| {
+        let query = import.read(cx).query.clone();
+        // Focus search once the dialog has recorded the opener to restore on close.
+        let focus = std::cell::Cell::new(true);
+        window.open_dialog(cx, move |dialog, window, cx| {
+            if focus.replace(false) {
+                query.update(cx, |input, cx| input.focus(window, cx));
+            }
             dialog.entrance(DialogEntrance::None).w(px(768.)).title("Add a theme").child(import.clone())
         });
     }
