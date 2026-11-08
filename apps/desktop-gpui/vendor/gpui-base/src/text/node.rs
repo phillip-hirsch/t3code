@@ -3777,10 +3777,15 @@ impl BlockNode {
                                     toggle.as_ref().map_or(ix, |(_, offset)| *offset) as u64,
                                 ))
                                 .when_some(toggle, |this, (toggle, offset)| {
-                                    this.cursor_pointer().on_click(move |_, window, cx| {
-                                        cx.stop_propagation();
-                                        toggle(offset, !checked, window, cx);
-                                    })
+                                    this.cursor_pointer()
+                                        // A press on the box doesn't start a text selection.
+                                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation()
+                                        })
+                                        .on_click(move |_, window, cx| {
+                                            cx.stop_propagation();
+                                            toggle(offset, !checked, window, cx);
+                                        })
                                 })
                                 .flex()
                                 .size(rems(0.9375))

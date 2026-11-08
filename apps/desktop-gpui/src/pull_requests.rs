@@ -57,10 +57,23 @@ impl State {
     }
 }
 
+/// `PullRequestStackMembership`: the row's place in a native stack.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct StackMembership {
+    pub number: u64,
+    pub position: u64,
+    pub size: u64,
+}
+
 /// `PullRequestListEntry`.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Entry {
+    #[serde(default)]
+    pub stack: Option<StackMembership>,
+    /// The environment that answered for the row (`EnvironmentPullRequestEntry`).
+    #[serde(skip)]
+    pub environment_id: String,
     pub provider: String,
     pub host: String,
     pub project_id: String,
@@ -628,6 +641,39 @@ pub fn sort_groups(groups: &mut [Group], sort: &str, text: &str, involvement: &s
     }
 }
 
+/// `partitionPullRequestsWithPriority`: the dedicated authored and review-requested reads lead,
+/// in the main list's copy of a row where it has one; the main list's other rows follow in order.
+pub fn partition_with_priority(entries: Vec<Rc<Entry>>, authored: &[Rc<Entry>], reviewing: &[Rc<Entry>]) -> Vec<Group> {
+    let mut lead: [Vec<Rc<Entry>>; 2] = [authored.to_vec(), Vec::new()];
+    let authored_keys: HashSet<String> = authored.iter().map(|e| e.key()).collect();
+    lead[1] = reviewing.iter().filter(|e| !authored_keys.contains(&e.key())).cloned().collect();
+    let mut others = Vec::new();
+    for entry in entries {
+        let key = entry.key();
+        match lead.iter_mut().find_map(|group| group.iter_mut().find(|held| held.key() == key)) {
+            Some(held) => *held = entry,
+            None => others.push(entry),
+        }
+    }
+    let [mut authored, mut reviewing] = lead;
+    authored.sort_by(|l, r| by_recency(l, r));
+    reviewing.sort_by(|l, r| by_recency(l, r));
+    [
+        Group { key: "authored", label: "Authored", entries: authored },
+        Group { key: "reviewRequested", label: "Review requested", entries: reviewing },
+        Group { key: "others", label: "Others", entries: others },
+    ]
+    .into_iter()
+    .filter(|group| !group.entries.is_empty())
+    .collect()
+}
+
+/// A live re-read asks for every row already loaded again, in one page (`collapsedPage`).
+pub fn collapsed_page_size(page_size: u32, loaded: usize) -> u32 {
+    let loaded = u32::try_from(loaded).unwrap_or(u32::MAX);
+    page_size.max(loaded.div_ceil(PAGE_SIZE).saturating_mul(PAGE_SIZE)).min(MAX_PAGE_SIZE)
+}
+
 /// What the page asked for and how it reads the answer.
 pub struct View<'a> {
     /// The listing's state, project and host: rows held from an earlier answer are narrowed to
@@ -635,6 +681,8 @@ pub struct View<'a> {
     pub state: &'a str,
     pub project: Option<&'a str>,
     pub host: Option<&'a str>,
+    /// The server the list is narrowed to.
+    pub environment: Option<&'a str>,
     pub involvement: &'a str,
     pub sort: &'a str,
     /// Menu filters plus the qualifiers typed so far.
@@ -644,6 +692,16 @@ pub struct View<'a> {
     /// The host has answered the typed text: rows from hosts that search on the host stay even
     /// when nothing they show matches.
     pub answered_locally: bool,
+    /// The dedicated authored and review-requested reads for this scope, when the list shows
+    /// every involvement and nothing is typed.
+    pub partitions: Option<PartitionRows<'a>>,
+}
+
+/// The rows of the dedicated authored and review-requested reads.
+#[derive(Clone, Copy)]
+pub struct PartitionRows<'a> {
+    pub authored: &'a [Rc<Entry>],
+    pub reviewing: &'a [Rc<Entry>],
 }
 
 /// `pullRequestGroups` + `usePullRequestDisplayGroups`: the rows narrowed to what the reader
@@ -651,6 +709,14 @@ pub struct View<'a> {
 pub fn display_groups(list: &ListResult, view: &View, stats: &Stats) -> Vec<Group> {
     let searching_hosts: Vec<&str> =
         list.providers.iter().filter(|p| p.searches_on_host).map(|p| p.host.as_str()).collect();
+    let in_scope = |entry: &&Rc<Entry>| {
+        (view.state == "all" || entry.state.as_str() == view.state)
+            && view.project.is_none_or(|project| entry.project_id == project)
+            && view.host.is_none_or(|host| entry.host == host)
+            && view.environment.is_none_or(|environment| entry.environment_id == environment)
+            && (view.local_filters.is_empty()
+                || matches_filters(entry, view.local_filters, viewer_for(entry, &list.viewers)))
+    };
     let mut entries: Vec<Rc<Entry>> = list
         .entries
         .iter()
@@ -658,6 +724,7 @@ pub fn display_groups(list: &ListResult, view: &View, stats: &Stats) -> Vec<Grou
             (view.state == "all" || entry.state.as_str() == view.state)
                 && view.project.is_none_or(|project| entry.project_id == project)
                 && view.host.is_none_or(|host| entry.host == host)
+                && view.environment.is_none_or(|environment| entry.environment_id == environment)
         })
         .filter(|entry| match view.involvement {
             "reviewing" => entry.viewer_review_requested,
@@ -679,7 +746,13 @@ pub fn display_groups(list: &ListResult, view: &View, stats: &Stats) -> Vec<Grou
         entries.sort_by(|l, r| by_recency(l, r));
     }
     let mut groups = if view.involvement == "all" {
-        group_by_involvement(entries, &list.viewers)
+        match view.partitions.filter(|_| view.text.is_empty()) {
+            Some(rows) => {
+                let narrow = |rows: &[Rc<Entry>]| rows.iter().filter(in_scope).cloned().collect::<Vec<_>>();
+                partition_with_priority(entries, &narrow(rows.authored), &narrow(rows.reviewing))
+            }
+            None => group_by_involvement(entries, &list.viewers),
+        }
     } else {
         vec![Group { key: "others", label: "", entries }]
     };
@@ -885,7 +958,10 @@ pub fn merge_lists(answers: Vec<(String, ListResult)>) -> ListResult {
                 None => merged.providers.push(provider),
             }
         }
-        merged.entries.extend(answer.entries);
+        merged.entries.extend(answer.entries.into_iter().map(|mut entry| {
+            Rc::make_mut(&mut entry).environment_id.clone_from(&environment_id);
+            entry
+        }));
         merged.errors.extend(answer.errors);
         merged.truncated |= answer.truncated;
         if !answer.next_cursors.is_empty() {
@@ -999,6 +1075,7 @@ mod tests {
             ("b".into(), answer(vec![entry(2, json!({}))], json!({}))),
         ]);
         assert_eq!(merged.entries.iter().map(|e| e.number).collect::<Vec<_>>(), [2, 1]);
+        assert_eq!(merged.entries.iter().map(|e| e.environment_id.as_str()).collect::<Vec<_>>(), ["b", "a"]);
         assert_eq!(merged.next_cursors, *json!({"a": {"github.com": "c1"}}).as_object().unwrap());
         assert_eq!(merged.providers.len(), 1);
     }
@@ -1035,6 +1112,13 @@ mod tests {
 
     fn numbers(group: &Group) -> Vec<u64> {
         group.entries.iter().map(|e| e.number).collect()
+    }
+
+    #[test]
+    fn a_row_keeps_its_stack_membership() {
+        let row = entry(1, json!({"stack": {"number": 7, "position": 2, "size": 3, "base": "main"}}));
+        assert_eq!(row.stack, Some(StackMembership { number: 7, position: 2, size: 3 }));
+        assert_eq!(entry(2, json!({"stack": null})).stack, None);
     }
 
     #[test]
@@ -1096,11 +1180,13 @@ mod tests {
             state: "open",
             project: None,
             host: None,
+            environment: None,
             involvement: "all",
             sort: "ready",
             local_filters: &filters,
             text: "",
             answered_locally: false,
+            partitions: None,
         };
         let groups = display_groups(&list, &view, &Stats::new());
         let keys: Vec<&str> = groups.iter().map(|g| g.key).collect();
@@ -1114,6 +1200,58 @@ mod tests {
         // Rows held from an open listing leave as soon as the state filter moves to merged.
         let view = View { involvement: "all", state: "merged", ..view };
         assert!(display_groups(&list, &view, &Stats::new()).is_empty());
+    }
+
+    #[test]
+    fn dedicated_partitions_lead_with_rows_beyond_the_main_page() {
+        let viewers = HashMap::from([("github.com".to_string(), "octo".to_string())]);
+        let other = |n: u64, patch: Value| {
+            let mut fields = json!({"author": {"login": "other"}});
+            if let (Value::Object(target), Value::Object(patch)) = (&mut fields, patch) {
+                target.extend(patch);
+            }
+            entry(n, fields)
+        };
+        let list = ListResult {
+            viewers,
+            entries: vec![other(1, json!({})), other(2, json!({"title": "main copy"}))],
+            ..ListResult::default()
+        };
+        // #3 is the viewer's but past the main page; #2 is both authored and review-requested.
+        let authored = vec![entry(3, json!({})), other(2, json!({}))];
+        let reviewing = vec![other(2, json!({})), other(4, json!({"labels": [{"name": "wip"}]}))];
+        let filters = Filters::default();
+        let view = View {
+            state: "open",
+            project: None,
+            host: None,
+            environment: None,
+            involvement: "all",
+            sort: "updated",
+            local_filters: &filters,
+            text: "",
+            answered_locally: false,
+            partitions: Some(PartitionRows { authored: &authored, reviewing: &reviewing }),
+        };
+        let groups = display_groups(&list, &view, &Stats::new());
+        let keys: Vec<&str> = groups.iter().map(|g| g.key).collect();
+        assert_eq!(keys, ["authored", "reviewRequested", "others"]);
+        assert_eq!((numbers(&groups[0]), numbers(&groups[1]), numbers(&groups[2])), (vec![3, 2], vec![4], vec![1]));
+        assert_eq!(groups[0].entries[1].title, "main copy", "the main list's copy of a row is shown");
+        // Menu filters narrow the partitions too, and typed text sets them aside.
+        let filters = Filters { excluded_labels: vec!["wip".into()], ..Filters::default() };
+        let narrowed = View { local_filters: &filters, ..view };
+        assert_eq!(display_groups(&list, &narrowed, &Stats::new()).len(), 2);
+        let typed = View { text: "PR", ..narrowed };
+        assert_eq!(display_groups(&list, &typed, &Stats::new()).iter().map(|g| g.key).collect::<Vec<_>>(), ["others"]);
+    }
+
+    #[test]
+    fn a_live_reread_asks_for_every_loaded_row() {
+        assert_eq!(collapsed_page_size(PAGE_SIZE, 0), PAGE_SIZE);
+        assert_eq!(collapsed_page_size(PAGE_SIZE, 150), 2 * PAGE_SIZE);
+        assert_eq!(collapsed_page_size(3 * PAGE_SIZE, 10), 3 * PAGE_SIZE);
+        assert_eq!(collapsed_page_size(PAGE_SIZE, 10_000), MAX_PAGE_SIZE);
     }
 
     #[test]

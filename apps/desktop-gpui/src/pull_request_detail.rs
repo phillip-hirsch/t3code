@@ -40,12 +40,147 @@ pub struct Label {
     pub color: Option<String>,
 }
 
+/// `DescriptionDraft`: a description written from this client, shown in place of the host's copy
+/// until the first host reading after its saves.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DescriptionDraft {
+    key: String,
+    observed_at: Option<f64>,
+    /// `None` once the last save failed: until a host reading, nobody knows which saves landed.
+    pub body: Option<String>,
+    /// Saves still running. The host applies them in order, so the last one is `body`.
+    saves: usize,
+}
+
+impl DescriptionDraft {
+    /// `descriptionDraftInForce`.
+    pub fn in_force(draft: Option<Self>, key: &str, observed_at: Option<f64>) -> Option<Self> {
+        let mut draft = draft.filter(|d| d.key == key)?;
+        if draft.saves > 0 {
+            draft.observed_at = observed_at;
+            return Some(draft);
+        }
+        (observed_at.is_some() && draft.observed_at == observed_at).then_some(draft)
+    }
+
+    /// `startDescriptionSave`.
+    pub fn start(draft: Option<Self>, key: &str, observed_at: Option<f64>, body: String) -> Self {
+        let saves = draft.filter(|d| d.key == key).map_or(0, |d| d.saves);
+        Self { key: key.to_owned(), observed_at, body: Some(body), saves: saves + 1 }
+    }
+
+    /// `settleDescriptionSave`: each save writes the whole body, so a failure only loses `body`
+    /// when no later save is running.
+    pub fn settle(draft: Option<Self>, key: &str, saved: bool) -> Option<Self> {
+        let mut draft = draft?;
+        if draft.key != key || draft.saves == 0 {
+            return Some(draft);
+        }
+        draft.saves -= 1;
+        if !saved && draft.saves == 0 {
+            draft.body = None;
+        }
+        Some(draft)
+    }
+}
+
+/// Where `markdown`'s task-list items start, in order.
+fn task_item_starts(markdown: &str) -> Vec<usize> {
+    fn walk(node: &markdown::mdast::Node, out: &mut Vec<usize>) {
+        if let markdown::mdast::Node::ListItem(item) = node
+            && item.checked.is_some()
+            && let Some(position) = &item.position
+        {
+            out.push(position.start.offset);
+        }
+        for child in node.children().map(Vec::as_slice).unwrap_or_default() {
+            walk(child, out);
+        }
+    }
+    // The view's own options (`MarkdownExtensions::parse_options`), so the starts match its spans.
+    let mut options = markdown::ParseOptions::gfm();
+    options.constructs.math_text = true;
+    options.constructs.math_flow = true;
+    let mut out = Vec::new();
+    if let Ok(root) = markdown::to_mdast(markdown, &options) {
+        walk(&root, &mut out);
+    }
+    out
+}
+
+/// `taskListMarkerOffset`: the `[ ]` on a task item's first line, after its bullet.
+fn task_marker_offset(markdown: &str, item_start: usize) -> Option<usize> {
+    let line = markdown.get(item_start..)?.split('\n').next()?;
+    let rest = line.trim_start();
+    let rest = match rest.strip_prefix(['-', '+', '*']) {
+        Some(rest) => rest,
+        None => {
+            let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+            rest.get(digits..).filter(|_| digits > 0)?.strip_prefix(['.', ')'])?
+        }
+    };
+    let marker = rest.trim_start();
+    if marker.len() == rest.len() {
+        return None;
+    }
+    let bytes = marker.as_bytes();
+    (bytes.len() >= 3 && bytes[0] == b'[' && matches!(bytes[1], b' ' | b'x' | b'X') && bytes[2] == b']')
+        .then(|| item_start + line.len() - marker.len())
+}
+
+/// A task ticked in the shown description: `body` with that task's marker set. `shown` is the
+/// text the view parsed (`body` with comments stripped and media links resolved), so the task is
+/// found by its place among the tasks rather than by offset.
+pub fn toggle_task(body: &str, shown: &str, item_start: usize, checked: bool) -> Option<String> {
+    let index = task_item_starts(shown).iter().position(|&start| start == item_start)?;
+    let marker = task_marker_offset(body, *task_item_starts(body).get(index)?)?;
+    let mut next = body.to_owned();
+    next.replace_range(marker + 1..marker + 2, if checked { "x" } else { " " });
+    Some(next)
+}
+
+/// `PullRequestChangeBreakdown`: a change's lines split by what its files are.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct ChangeBreakdown {
+    pub code: LineCount,
+    pub tests: LineCount,
+    pub mocks: LineCount,
+    pub generated: LineCount,
+    /// Servers from before the docs split send none; their docs lines sit in `code`.
+    #[serde(default)]
+    pub docs: LineCount,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct LineCount {
+    pub additions: u64,
+    pub deletions: u64,
+}
+
+impl ChangeBreakdown {
+    /// `ChangeBreakdownGrid`'s rows: each kind that has lines, in the web's order.
+    pub fn rows(&self) -> Vec<(&'static str, LineCount)> {
+        [
+            ("Code", self.code),
+            ("Tests", self.tests),
+            ("Mocks", self.mocks),
+            ("Generated", self.generated),
+            ("Docs", self.docs),
+        ]
+        .into_iter()
+        .filter(|(_, count)| count.additions + count.deletions > 0)
+        .collect()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct Check {
     pub name: String,
     pub status: String,
     #[serde(default)]
     pub url: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -445,6 +580,22 @@ pub fn can(detail: &Detail, action: &str) -> bool {
         && detail.viewer_permissions.actions.iter().any(|a| a == action)
 }
 
+/// `usePullRequestDetail` without the connection's `source-control:write`: the reader can look
+/// at the pull request but not act on it.
+pub fn read_only(mut detail: Detail) -> Detail {
+    detail.capabilities.reactions = Some(false);
+    detail.capabilities.edit = Some(EditCapabilities { change_request: false, comment: false, maintainer_edits: None });
+    let permissions = &mut detail.viewer_permissions;
+    permissions.actions.clear();
+    permissions.comment = false;
+    permissions.resolve = false;
+    permissions.verdicts.clear();
+    permissions.request_reviewers = false;
+    permissions.update_methods.clear();
+    permissions.labels = Some(false);
+    detail
+}
+
 fn same_login(a: Option<&str>, b: Option<&str>) -> bool {
     matches!((a, b), (Some(a), Some(b)) if a.eq_ignore_ascii_case(b))
 }
@@ -547,7 +698,8 @@ pub struct StackPlan {
     pub selected_open: bool,
 }
 
-pub fn stack_plan(stack: &Stack, number: u64) -> StackPlan {
+/// `stale`: the stack is kept from before a lookup that failed or is still running.
+pub fn stack_plan(stack: &Stack, number: u64, stale: bool) -> StackPlan {
     let position = stack.layers.iter().position(|l| l.number == number).map_or(0, |i| i + 1);
     let unmerged: Vec<&StackLayer> = stack.layers.iter().filter(|l| l.state != State::Merged).collect();
     let merge: Vec<&StackLayer> = stack.layers[..position].iter().filter(|l| l.state != State::Merged).collect();
@@ -555,12 +707,14 @@ pub fn stack_plan(stack: &Stack, number: u64) -> StackPlan {
     let merge_blocked = merge.iter().any(|l| l.state != State::Open || l.is_draft);
     StackPlan {
         position,
-        merge_disabled: !selected_open
+        merge_disabled: stale
+            || !selected_open
             || merge.is_empty()
             || merge.iter().any(|l| l.head_sha.is_none())
             || merge_blocked,
         merge: merge.iter().map(|l| l.number).collect(),
-        rebase_disabled: unmerged.is_empty()
+        rebase_disabled: stale
+            || unmerged.is_empty()
             || unmerged.iter().any(|l| l.head_sha.is_none())
             || unmerged.iter().any(|l| l.state != State::Open),
         rebase: unmerged.iter().map(|l| l.number).collect(),
@@ -593,7 +747,42 @@ pub enum Primary {
     Closed,
 }
 
-pub fn primary_control(detail: &Detail, checks_state: Option<&str>) -> Option<Primary> {
+/// Who merges the shown layer of a native stack (`allowsSinglePullRequestMerge`, `stackOwnsMerge`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StackMerge {
+    /// The host's stack merges it, so the single-merge controls step aside.
+    pub owns: bool,
+    /// Membership is known and the pull request is in no stack: it may merge on its own.
+    pub single: bool,
+    /// The last stack lookup failed.
+    pub failed: bool,
+}
+
+impl Default for StackMerge {
+    fn default() -> Self {
+        Self { owns: false, single: true, failed: false }
+    }
+}
+
+impl StackMerge {
+    /// `has_stack`, `fresh` (the last lookup answered and none is in flight) and `failed` describe
+    /// the stack lookup; a host without stack actions always merges single pull requests.
+    pub fn of(detail: &Detail, has_stack: bool, fresh: bool, failed: bool) -> Self {
+        let supports = detail.capabilities.stacks == Some(true) && detail.capabilities.stack_actions == Some(true);
+        Self { owns: supports && has_stack, single: !supports || (!has_stack && fresh && !failed), failed }
+    }
+
+    /// `mergeBlockedReason`.
+    pub fn blocked_reason(self) -> Option<&'static str> {
+        (!self.single).then_some(if self.failed {
+            "Couldn't check stack membership"
+        } else {
+            "Checking stack membership…"
+        })
+    }
+}
+
+pub fn primary_control(detail: &Detail, checks_state: Option<&str>, stack: StackMerge) -> Option<Primary> {
     let has_method = !allowed_merge_methods(detail).is_empty();
     match detail.state {
         State::Merged => return Some(Primary::Merged),
@@ -614,11 +803,12 @@ pub fn primary_control(detail: &Detail, checks_state: Option<&str>) -> Option<Pr
     }
     if detail.auto_merge_enabled == Some(false)
         && checks_state.is_some_and(|s| s != "passing")
+        && !stack.owns
         && can(detail, "enable-auto-merge")
     {
         return Some(Primary::EnableAutoMerge);
     }
-    can(detail, "merge").then_some(Primary::Merge)
+    (!stack.owns && can(detail, "merge")).then_some(Primary::Merge)
 }
 
 /// The overflow menu's state actions (`showsDraftToggle`, `showsMergeNow`, ...).
@@ -635,7 +825,7 @@ pub struct MenuActions {
     pub delete_branch: bool,
 }
 
-pub fn menu_actions(detail: &Detail, primary: Option<Primary>) -> MenuActions {
+pub fn menu_actions(detail: &Detail, primary: Option<Primary>, stack: StackMerge) -> MenuActions {
     let open = detail.state == State::Open;
     let conflicting = open && detail.mergeability == "conflicting";
     let methods = allowed_merge_methods(detail).len();
@@ -645,9 +835,12 @@ pub fn menu_actions(detail: &Detail, primary: Option<Primary>) -> MenuActions {
         draft_toggle: open
             && can(detail, if detail.is_draft { "ready" } else { "draft" })
             && !(detail.is_draft && primary == Some(Primary::Ready)),
-        merge_now: mergeable && matches!(primary, Some(Primary::EnableAutoMerge | Primary::AutoMergeArmed)),
-        disable_auto_merge: armed && can(detail, "disable-auto-merge"),
-        auto_merge: open
+        merge_now: stack.single
+            && mergeable
+            && matches!(primary, Some(Primary::EnableAutoMerge | Primary::AutoMergeArmed)),
+        disable_auto_merge: stack.single && armed && can(detail, "disable-auto-merge"),
+        auto_merge: stack.single
+            && open
             && !armed
             && primary != Some(Primary::EnableAutoMerge)
             && !detail.is_draft
@@ -662,6 +855,38 @@ pub fn menu_actions(detail: &Detail, primary: Option<Primary>) -> MenuActions {
             && detail.capabilities.delete_branch == Some(true)
             && can(detail, "delete-branch"),
     }
+}
+
+/// `PullRequestChecks`: the lighter `pullRequests.checks` read of a pull request's state and checks.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChecksRead {
+    #[serde(default)]
+    pub observed_at: Option<f64>,
+    pub state: State,
+    #[serde(default)]
+    pub checks: Vec<Check>,
+}
+
+/// `pullRequestChecksRefreshIntervalMs`: checks still running are worth a tighter poll.
+pub fn checks_refresh_interval(checks: &[Check]) -> std::time::Duration {
+    let running =
+        checks.is_empty() || checks.iter().any(|c| matches!(c.status.as_str(), "pending" | "action-required"));
+    std::time::Duration::from_secs(if running { 45 } else { 60 })
+}
+
+/// `resolvePullRequestDetailChecks`: the detail with a checks read that is not older than it;
+/// without both observation times, `landed_later` decides.
+pub fn with_checks(detail: &Detail, read: &ChecksRead, landed_later: bool) -> Option<Detail> {
+    let newer = match (detail.observed_at, read.observed_at) {
+        (Some(detail), Some(checks)) => checks >= detail,
+        _ => landed_later,
+    };
+    newer.then(|| Detail {
+        state: if detail.state == State::Merged { State::Merged } else { read.state },
+        checks: read.checks.clone(),
+        ..detail.clone()
+    })
 }
 
 /// `pullRequestChecksState`.
@@ -1143,6 +1368,8 @@ pub struct Event {
     pub path: Option<String>,
     pub review_state: Option<String>,
     pub thread: Option<TimelineThread>,
+    /// The comment the event shows, for its edits, reactions and Add to chat.
+    pub comment: Option<Box<Comment>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1181,6 +1408,7 @@ fn lifecycle(id: &str, at: &str, kind: EventKind, title: String, actor: Option<A
         path: None,
         review_state: None,
         thread: None,
+        comment: None,
     }
 }
 
@@ -1199,6 +1427,7 @@ fn comment_event(comment: &Comment) -> Event {
         path: comment.path.clone(),
         review_state: comment.review_state.clone(),
         thread: None,
+        comment: Some(Box::new(comment.clone())),
     }
 }
 
@@ -1526,14 +1755,114 @@ pub fn selection_handoff(subject: &HandoffSubject, path: &str, lines: &str, requ
     with_context(bounded(request), &[subject.context(&[]), format!("{path} {lines}")])
 }
 
-/// `buildFixFindingHandoff` for one review thread.
-pub fn fix_thread_handoff(subject: &HandoffSubject, thread: &ReviewThread) -> String {
-    let mut lines = vec![
-        "Fix the review finding attached to this message. It is attached on the line it was written against."
-            .to_owned(),
-    ];
+/// One thing to fix on its own (`PullRequestFinding`).
+#[derive(Clone, Debug)]
+pub enum Finding {
+    Thread(ReviewThread),
+    Comment(Comment),
+    Check(Check),
+}
+
+impl Finding {
+    /// `pullRequestFindingKey`.
+    pub fn key(&self) -> String {
+        match self {
+            Self::Thread(thread) => format!("finding:thread:{}", thread.id),
+            Self::Comment(comment) => format!("finding:comment:{}", comment.id),
+            Self::Check(check) => format!("finding:check:{}:{}", check.name, check.url.as_deref().unwrap_or_default()),
+        }
+    }
+}
+
+/// The Summary card's finding: a remark that isn't a reply or an approval, as its conversation
+/// when it heads one.
+pub fn summary_finding(comment: &Comment, thread: Option<&ReviewThread>, reply: bool) -> Option<Finding> {
+    if reply
+        || !matches!(comment.kind.as_str(), "review" | "review-comment")
+        || review_outcome(comment.review_state.as_deref()) == Some("approved")
+    {
+        return None;
+    }
+    match thread {
+        Some(thread) => Some(Finding::Thread(thread.clone())),
+        None => visible_body(&comment.body).map(|_| Finding::Comment(comment.clone())),
+    }
+}
+
+/// `buildFixFindingHandoff`.
+pub fn fix_finding_handoff(subject: &HandoffSubject, finding: &Finding) -> String {
+    let lead = match finding {
+        Finding::Thread(_) => {
+            "Fix the review finding attached to this message. It is attached on the line it was written against."
+        }
+        Finding::Comment(_) => {
+            "Fix the review remark quoted below. It names no line, so find what it refers to before changing anything."
+        }
+        Finding::Check(_) => {
+            "Fix the failing check quoted below. Reproduce it locally first. The name is all the host reported, and the run may fail for a reason the code cannot show."
+        }
+    };
+    let mut lines = vec![lead.to_owned()];
     lines.extend(subject.preamble());
-    with_context(lines.join("\n"), &[subject.context(&[]), thread_context(thread)])
+    match finding {
+        Finding::Thread(thread) => {
+            return with_context(lines.join("\n"), &[subject.context(&[]), thread_context(thread)]);
+        }
+        Finding::Comment(comment) => {
+            let body = visible_body(&comment.body).unwrap_or_default();
+            let author = bounded_field(comment.author.as_ref().map_or("ghost", |a| a.login.as_str()));
+            let place = comment.path.as_deref().map_or(String::new(), |p| format!(" on `{}`", bounded_field(p)));
+            lines.push(format!("> {author}{place}: {}", bounded_field(&body)));
+        }
+        Finding::Check(check) => {
+            let quoted = match &check.description {
+                Some(description) => format!("{}: {description}", check.name),
+                None => check.name.clone(),
+            };
+            lines.push(format!("> {}", bounded_field(&quoted)));
+        }
+    }
+    with_context(lines.join("\n"), &[subject.context(&[])])
+}
+
+/// What Add to chat hands over (`PullRequestChatSubject`).
+#[derive(Clone, Debug)]
+pub enum ChatSubject {
+    Thread(ReviewThread),
+    Comment(Comment),
+}
+
+/// `chatSubject`: a remark on a line goes as its whole conversation; `None` with no words to
+/// talk about.
+pub fn chat_subject(comment: &Comment, thread: Option<&ReviewThread>) -> Option<ChatSubject> {
+    match thread {
+        Some(thread) => {
+            thread.comments.iter().any(|c| visible_body(&c.body).is_some()).then(|| ChatSubject::Thread(thread.clone()))
+        }
+        None => visible_body(&comment.body).map(|_| ChatSubject::Comment(comment.clone())),
+    }
+}
+
+/// `addCommentToChat`: the pull request's context and the remark (`buildPullRequestCommentContext`),
+/// a comment that belongs to a conversation going as all of it.
+pub fn chat_handoff(subject: &HandoffSubject, chat: &ChatSubject, threads: &[ReviewThread]) -> Option<String> {
+    let conversation = |thread: &ReviewThread| {
+        thread.comments.iter().any(|c| readable_body(&c.body).is_some()).then(|| thread_context(thread))
+    };
+    let context = match chat {
+        ChatSubject::Thread(thread) => conversation(thread)?,
+        ChatSubject::Comment(comment) => match threads.iter().find(|t| t.comments.iter().any(|c| c.id == comment.id)) {
+            Some(thread) => conversation(thread)?,
+            None => {
+                let body = readable_body(&comment.body)?;
+                let author = comment.author.as_ref().map_or("ghost", |a| a.login.as_str());
+                // The chip's `filePath rangeLabel`: the file a remark names, or who wrote one that names none.
+                let place = comment.path.clone().unwrap_or_else(|| format!("@{author}"));
+                format!("{place} comment\n{}", bounded(&format!("{author}: {body}")))
+            }
+        },
+    };
+    Some(with_context(String::new(), &[subject.context(&[]), context]))
 }
 
 /// `buildFixFindingsHandoff`: unresolved threads, remarks with no line, and failing checks.
@@ -1829,24 +2158,92 @@ pub fn needs_host_refresh(action: &str) -> bool {
     matches!(action, "update-branch" | "approve-workflows")
 }
 
-/// A change request link's host, repository and number (`parseChangeRequestUrl`), for the
-/// hosts whose links name the repository in the path: GitHub's `/pull/` and GitLab's `/-/merge_requests/`.
-pub fn parse_change_request_url(url: &str) -> Option<(String, String, u64)> {
-    let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
-    let (host, path) = rest.split_once('/')?;
-    let path = path.split(['?', '#']).next()?;
-    let (repository, tail) = path.split_once("/-/merge_requests/").or_else(|| {
-        let mut parts = path.splitn(3, '/');
-        let (owner, name, tail) = (parts.next()?, parts.next()?, parts.next()?);
-        let tail = tail.strip_prefix("pull/")?;
-        Some((&path[..owner.len() + 1 + name.len()], tail))
-    })?;
-    let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
-    let after = &tail[digits.len()..];
-    if repository.split('/').count() < 2 || !(after.is_empty() || after.starts_with('/')) {
+/// A change request link (`ParsedChangeRequestUrl`), as the first host that claims it reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChangeRequestLink {
+    /// The host kind that claimed it: "github", "gitlab", "forgejo", ...
+    pub provider: &'static str,
+    /// `authority ?? host`: Forgejo and Azure DevOps keep a non-default port.
+    pub host: String,
+    /// Lowercase, as every host's parser gives it.
+    pub repository: String,
+    pub number: u64,
+    /// The repository's browser URL, without query or hash.
+    pub repository_url: String,
+}
+
+/// `[^/]+` for each segment of a repository path.
+fn repository_path(segments: &[&str]) -> Option<String> {
+    segments.iter().all(|s| !s.is_empty()).then(|| segments.join("/"))
+}
+
+/// The repository path and number when `segments` end in `{repository}/{route...}/{number}`,
+/// trying the longest repository first like the hosts' greedy routes.
+fn route_match(segments: &[&str], route: &[&[&str]], repository: impl Fn(&[&str]) -> bool) -> Option<(String, u64)> {
+    (1..segments.len()).rev().find_map(|split| {
+        let (repo, rest) = segments.split_at(split);
+        let tail = &rest[..route.len().min(rest.len())];
+        if tail.len() != route.len() || !tail.iter().zip(route).all(|(seg, options)| options.contains(seg)) {
+            return None;
+        }
+        let number = rest.get(route.len())?;
+        if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) || !repository(repo) {
+            return None;
+        }
+        let number: u64 = number.parse().ok().filter(|n| (1..=9_007_199_254_740_991).contains(n))?;
+        Some((repository_path(repo)?, number))
+    })
+}
+
+/// `sourceControlClients.parseChangeRequestUrl`: the git.cafe and Azure DevOps routes claim a link
+/// first, then `/pull/`, `/-/merge_requests/`, `/pulls/` and Bitbucket's `/pull-requests/`.
+pub fn parse_change_request(url: &str) -> Option<ChangeRequestLink> {
+    let parsed = url::Url::parse(url.trim()).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
         return None;
     }
-    Some((host.to_lowercase(), repository.to_owned(), digits.parse().ok().filter(|n| *n > 0)?))
+    let hostname = parsed.host_str()?.to_lowercase();
+    let authority = match parsed.port() {
+        Some(port) => format!("{hostname}:{port}"),
+        None => hostname.clone(),
+    };
+    let path = parsed.path().strip_prefix('/')?;
+    let segments: Vec<&str> = path.split('/').collect();
+    let two = |repo: &[&str]| repo.len() == 2;
+    let many = |repo: &[&str]| repo.len() >= 2;
+    let azure = |repo: &[&str]| repo.len() >= 2 && repo[repo.len() - 2] == "_git";
+    let bitbucket = hostname == "bitbucket.org" || hostname.split('.').any(|label| label == "bitbucket");
+    let gitcafe = matches!(hostname.as_str(), "git.cafe" | "staging.git.cafe");
+    let (provider, host, (repository, number)) = None
+        .or_else(|| {
+            gitcafe
+                .then(|| route_match(&segments, &[&["pull", "pulls"]], two))
+                .flatten()
+                .map(|m| ("gitcafe", &hostname, m))
+        })
+        .or_else(|| route_match(&segments, &[&["pullrequest"]], azure).map(|m| ("azure-devops", &authority, m)))
+        .or_else(|| route_match(&segments, &[&["pull"]], two).map(|m| ("github", &hostname, m)))
+        .or_else(|| route_match(&segments, &[&["-"], &["merge_requests"]], many).map(|m| ("gitlab", &hostname, m)))
+        .or_else(|| route_match(&segments, &[&["pulls"]], many).map(|m| ("forgejo", &authority, m)))
+        .or_else(|| {
+            bitbucket
+                .then(|| route_match(&segments, &[&["pull-requests"]], two))
+                .flatten()
+                .map(|m| ("bitbucket", &hostname, m))
+        })?;
+    let origin = parsed.origin().ascii_serialization();
+    Some(ChangeRequestLink {
+        provider,
+        host: host.clone(),
+        repository_url: format!("{origin}/{repository}"),
+        repository: repository.to_lowercase(),
+        number,
+    })
+}
+
+/// A change request link's host, repository and number (`parseChangeRequestUrl`).
+pub fn parse_change_request_url(url: &str) -> Option<(String, String, u64)> {
+    parse_change_request(url).map(|link| (link.host, link.repository, link.number))
 }
 
 /// The project whose repository holds the change request: its repository key is `host/repository`.
@@ -1902,38 +2299,124 @@ mod tests {
     #[test]
     fn the_primary_control_follows_where_the_pull_request_stands() {
         let pending = Some("pending");
-        assert_eq!(primary_control(&detail(json!({"state": "merged"})), None), Some(Primary::Merged));
-        assert_eq!(primary_control(&detail(json!({"state": "closed"})), None), Some(Primary::Closed));
-        assert_eq!(primary_control(&detail(json!({"mergeability": "conflicting"})), None), Some(Primary::Resolve));
-        assert_eq!(primary_control(&detail(json!({"isDraft": true})), None), Some(Primary::Ready));
-        assert_eq!(primary_control(&detail(json!({"autoMergeEnabled": true})), None), Some(Primary::AutoMergeArmed));
         assert_eq!(
-            primary_control(&detail(json!({"autoMergeEnabled": false})), pending),
+            primary_control(&detail(json!({"state": "merged"})), None, StackMerge::default()),
+            Some(Primary::Merged)
+        );
+        assert_eq!(
+            primary_control(&detail(json!({"state": "closed"})), None, StackMerge::default()),
+            Some(Primary::Closed)
+        );
+        assert_eq!(
+            primary_control(&detail(json!({"mergeability": "conflicting"})), None, StackMerge::default()),
+            Some(Primary::Resolve)
+        );
+        assert_eq!(
+            primary_control(&detail(json!({"isDraft": true})), None, StackMerge::default()),
+            Some(Primary::Ready)
+        );
+        assert_eq!(
+            primary_control(&detail(json!({"autoMergeEnabled": true})), None, StackMerge::default()),
+            Some(Primary::AutoMergeArmed)
+        );
+        assert_eq!(
+            primary_control(&detail(json!({"autoMergeEnabled": false})), pending, StackMerge::default()),
             Some(Primary::EnableAutoMerge)
         );
-        assert_eq!(primary_control(&detail(json!({})), pending), Some(Primary::Merge), "unreported auto-merge merges");
+        assert_eq!(
+            primary_control(&detail(json!({})), pending, StackMerge::default()),
+            Some(Primary::Merge),
+            "unreported auto-merge merges"
+        );
         let viewer_cannot = detail(json!({"viewerPermissions": {"actions": []}}));
-        assert_eq!(primary_control(&viewer_cannot, None), None);
+        assert_eq!(primary_control(&viewer_cannot, None, StackMerge::default()), None);
         let no_method = detail(json!({"mergeCapabilities": {"merge": false, "squash": false, "rebase": false}}));
-        assert_eq!(primary_control(&no_method, None), None);
+        assert_eq!(primary_control(&no_method, None, StackMerge::default()), None);
     }
 
     #[test]
     fn the_menu_offers_what_the_state_allows() {
         let open = detail(json!({}));
-        let actions = menu_actions(&open, primary_control(&open, None));
+        let actions = menu_actions(&open, primary_control(&open, None, StackMerge::default()), StackMerge::default());
         assert!(actions.draft_toggle && actions.auto_merge && actions.merge_methods && actions.close);
         assert!(!actions.merge_now && !actions.reopen && !actions.revert && !actions.delete_branch);
         let armed = detail(json!({"autoMergeEnabled": true}));
-        let actions = menu_actions(&armed, primary_control(&armed, None));
+        let actions = menu_actions(&armed, primary_control(&armed, None, StackMerge::default()), StackMerge::default());
         assert!(actions.merge_now && actions.disable_auto_merge && !actions.auto_merge);
         let draft = detail(json!({"isDraft": true}));
-        assert!(!menu_actions(&draft, primary_control(&draft, None)).draft_toggle, "the header already offers ready");
+        assert!(
+            !menu_actions(&draft, primary_control(&draft, None, StackMerge::default()), StackMerge::default())
+                .draft_toggle,
+            "the header already offers ready"
+        );
         let closed = detail(json!({"state": "closed"}));
-        let actions = menu_actions(&closed, primary_control(&closed, None));
+        let actions =
+            menu_actions(&closed, primary_control(&closed, None, StackMerge::default()), StackMerge::default());
         assert!(actions.reopen && actions.delete_branch && !actions.close);
         let merged = detail(json!({"state": "merged"}));
-        assert!(menu_actions(&merged, None).revert);
+        assert!(menu_actions(&merged, None, StackMerge::default()).revert);
+    }
+
+    #[test]
+    fn a_native_stack_owns_merging_and_unresolved_membership_blocks_a_single_merge() {
+        let caps = json!({
+            "diff": true, "stacks": true, "stackActions": true, "mergeMethods": ["merge", "squash"],
+            "actions": ["merge", "enable-auto-merge", "disable-auto-merge"],
+        });
+        let stacked = detail(json!({"autoMergeEnabled": true, "capabilities": caps}));
+        let open = detail(json!({"capabilities": caps}));
+        let owner = StackMerge::of(&open, true, true, false);
+        assert!(owner.owns && !owner.single);
+        assert_eq!(primary_control(&open, None, owner), None, "the stack menu merges it");
+        let checking = StackMerge::of(&open, false, false, false);
+        assert_eq!(primary_control(&open, None, checking), Some(Primary::Merge));
+        assert_eq!(checking.blocked_reason(), Some("Checking stack membership…"));
+        assert_eq!(StackMerge::of(&open, false, false, true).blocked_reason(), Some("Couldn't check stack membership"));
+        let actions = menu_actions(&stacked, primary_control(&stacked, None, checking), checking);
+        assert!(!actions.merge_now && !actions.disable_auto_merge && !actions.auto_merge);
+        let alone = StackMerge::of(&open, false, true, false);
+        assert_eq!(alone, StackMerge::default());
+        let actions = menu_actions(&stacked, primary_control(&stacked, None, alone), alone);
+        assert!(actions.merge_now && actions.disable_auto_merge);
+        let unsupported = detail(json!({}));
+        assert_eq!(StackMerge::of(&unsupported, false, false, true).blocked_reason(), None);
+    }
+
+    #[test]
+    fn a_connection_without_write_access_reads_but_cannot_act() {
+        let open = read_only(detail(json!({"capabilities": {"actions": ["merge", "close"], "mergeMethods": ["merge"],
+            "reactions": true, "edit": {"changeRequest": true, "comment": true, "maintainerEdits": true}},
+            "viewerPermissions": {"actions": ["merge", "close"], "verdicts": ["approve"], "updateMethods": ["merge"]},
+            "maintainerCanModify": true})));
+        assert!(!can(&open, "merge") && !can(&open, "close"));
+        assert_eq!(primary_control(&open, None, StackMerge::default()), None);
+        assert!(!can_edit_change_request(&open) && !can_edit_maintainer_edits(&open));
+        let permissions = &open.viewer_permissions;
+        assert!(!permissions.comment && !permissions.resolve && !permissions.request_reviewers);
+        assert!(permissions.verdicts.is_empty() && permissions.update_methods.is_empty());
+        assert_eq!((permissions.labels, open.capabilities.reactions), (Some(false), Some(false)));
+    }
+
+    #[test]
+    fn a_checks_read_refreshes_the_detail_unless_it_is_older() {
+        let check = |status: &str| Check { name: "ci".into(), status: status.into(), url: None, description: None };
+        assert_eq!(checks_refresh_interval(&[]).as_secs(), 45);
+        assert_eq!(checks_refresh_interval(&[check("success"), check("pending")]).as_secs(), 45);
+        assert_eq!(checks_refresh_interval(&[check("success"), check("failure")]).as_secs(), 60);
+        let base = detail(json!({"observedAt": 100.0, "checks": [{"name": "ci", "status": "pending"}]}));
+        let read: ChecksRead = serde_json::from_value(
+            json!({"observedAt": 120.0, "state": "closed", "checks": [{"name": "ci", "status": "success"}]}),
+        )
+        .unwrap();
+        let merged = with_checks(&base, &read, false).unwrap();
+        assert_eq!((merged.state, merged.checks[0].status.as_str()), (State::Closed, "success"));
+        let stale: ChecksRead =
+            serde_json::from_value(json!({"observedAt": 90.0, "state": "open", "checks": []})).unwrap();
+        assert!(with_checks(&base, &stale, true).is_none(), "an older observation loses");
+        let unordered: ChecksRead = serde_json::from_value(json!({"state": "open", "checks": []})).unwrap();
+        assert!(with_checks(&base, &unordered, true).is_some() && with_checks(&base, &unordered, false).is_none());
+        let landed = detail(json!({"state": "merged"}));
+        assert_eq!(with_checks(&landed, &read, true).unwrap().state, State::Merged, "a merge stays merged");
     }
 
     #[test]
@@ -1985,11 +2468,12 @@ mod tests {
             ],
         }))
         .unwrap();
-        let plan = stack_plan(&stack, 3);
+        let plan = stack_plan(&stack, 3, false);
         assert_eq!((plan.position, plan.merge.as_slice(), plan.merge_disabled), (3, &[2, 3][..], false));
+        assert!(stack_plan(&stack, 3, true).merge_disabled, "a stale stack cannot merge");
         assert_eq!(plan.rebase, [2, 3, 4]);
         assert!(plan.rebase_disabled, "a layer without a known head cannot be rebased safely");
-        assert!(stack_plan(&stack, 4).merge_disabled, "a draft layer blocks the merge");
+        assert!(stack_plan(&stack, 4, false).merge_disabled, "a draft layer blocks the merge");
         assert_eq!(
             stack_heads(&stack, &[2, 3]),
             json!([{"number": 2, "headSha": "b1"}, {"number": 3, "headSha": "c1"}])
@@ -2000,7 +2484,7 @@ mod tests {
     fn checks_group_by_what_they_need() {
         let checks: Vec<Check> = ["failure", "pending", "success", "action-required", "skipped"]
             .iter()
-            .map(|status| Check { name: (*status).into(), status: (*status).into(), url: None })
+            .map(|status| Check { name: (*status).into(), status: (*status).into(), url: None, description: None })
             .collect();
         let (attention, running, completed) = group_checks(&checks);
         let names = |list: Vec<&Check>| list.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
@@ -2049,6 +2533,90 @@ mod tests {
     }
 
     #[test]
+    fn ticking_a_shown_task_sets_its_marker_in_the_description() {
+        let body = "<!-- - [ ] hidden -->\nIntro ![a](img.png)\n\n- [ ] one\n  1. [x] two\n* not a task\n";
+        let shown = "\nIntro ![a](https://host/img.png)\n\n- [ ] one\n  1. [x] two\n* not a task\n";
+        let second = shown.find("1. [x]").unwrap();
+        assert_eq!(
+            toggle_task(body, shown, second, false).as_deref(),
+            Some("<!-- - [ ] hidden -->\nIntro ![a](img.png)\n\n- [ ] one\n  1. [ ] two\n* not a task\n"),
+        );
+        let first = shown.find("- [ ]").unwrap();
+        assert!(toggle_task(body, shown, first, true).unwrap().contains("- [x] one"));
+        assert_eq!(toggle_task(body, shown, shown.find("* not").unwrap(), true), None);
+    }
+
+    #[test]
+    fn a_description_draft_holds_until_the_host_reads_it_after_its_saves() {
+        let draft = DescriptionDraft::start(None, "pr", Some(1.), "a".into());
+        let draft = DescriptionDraft::start(Some(draft), "pr", Some(1.), "b".into());
+        let draft = DescriptionDraft::settle(Some(draft), "pr", false);
+        assert_eq!(draft.as_ref().and_then(|d| d.body.as_deref()), Some("b"), "a later save is still running");
+        let draft = DescriptionDraft::in_force(draft, "pr", Some(2.));
+        assert!(draft.is_some(), "kept while a save runs");
+        let draft = DescriptionDraft::settle(draft, "pr", true);
+        assert!(DescriptionDraft::in_force(draft.clone(), "pr", Some(2.)).is_some(), "same reading");
+        assert!(DescriptionDraft::in_force(draft, "pr", Some(3.)).is_none(), "the host's next reading wins");
+    }
+
+    #[test]
+    fn a_change_breakdown_lists_the_kinds_with_lines() {
+        let split: Option<ChangeBreakdown> = serde_json::from_value(json!({
+            "code": {"additions": 10, "deletions": 2},
+            "tests": {"additions": 0, "deletions": 0},
+            "mocks": {"additions": 0, "deletions": 1},
+            "generated": {"additions": 0, "deletions": 0},
+        }))
+        .unwrap();
+        let rows: Vec<(&str, u64, u64)> =
+            split.unwrap().rows().into_iter().map(|(label, c)| (label, c.additions, c.deletions)).collect();
+        assert_eq!(rows, [("Code", 10, 2), ("Mocks", 0, 1)], "an older server sends no docs");
+        assert_eq!(serde_json::from_value::<Option<ChangeBreakdown>>(Value::Null).unwrap(), None);
+    }
+
+    #[test]
+    fn a_summary_card_fixes_its_remark_or_check_and_adds_its_conversation_to_chat() {
+        let activity: Activity = serde_json::from_value(json!({
+            "comments": [
+                {"id": "r", "kind": "review", "author": {"login": "ana"}, "body": "Rename  this", "createdAt": "2026-10-01T00:00:00Z", "path": "a.rs"},
+                {"id": "ok", "kind": "review", "body": "LGTM", "reviewState": "APPROVED", "createdAt": "2026-10-01T00:00:00Z"},
+                {"id": "c", "kind": "issue-comment", "author": {"login": "cy"}, "body": "Why?", "createdAt": "2026-10-01T00:00:00Z"},
+                {"id": "t1", "kind": "review-comment", "author": {"login": "bo"}, "body": "Off by one", "createdAt": "2026-10-01T00:00:00Z"},
+            ],
+            "commentCount": 4, "commentsTruncated": false, "commits": [],
+            "reviewThreads": [
+                {"id": "th", "path": "b.rs", "line": 4, "isResolved": false, "comments": [{"id": "t1", "author": {"login": "bo"}, "body": "Off by one", "createdAt": "2026-10-01T00:00:00Z"}]},
+            ],
+        }))
+        .unwrap();
+        let [remark, approval, plain, threaded] = &activity.comments[..] else { panic!("four comments") };
+        let thread = &activity.review_threads[0];
+        let d = detail(json!({}));
+        let subject = HandoffSubject::of(&d);
+        assert!(summary_finding(approval, None, false).is_none(), "an approval is not a finding");
+        assert!(summary_finding(plain, None, false).is_none(), "a plain comment is not a finding");
+        assert!(summary_finding(threaded, Some(thread), true).is_none(), "a reply goes with its conversation");
+        assert_eq!(
+            summary_finding(threaded, Some(thread), false).map(|f| f.key()).as_deref(),
+            Some("finding:thread:th")
+        );
+        let fix = fix_finding_handoff(&subject, &summary_finding(remark, None, false).unwrap());
+        assert!(fix.starts_with("Fix the review remark quoted below."), "{fix}");
+        assert!(fix.contains("\n> ana on `a.rs`: Rename this\n\nPR #7 · Add\n"), "{fix}");
+        let check =
+            Check { name: "ci".into(), status: "failure".into(), url: None, description: Some("exit 1".into()) };
+        let fix = fix_finding_handoff(&subject, &Finding::Check(check.clone()));
+        assert!(fix.starts_with("Fix the failing check quoted below.") && fix.contains("\n> ci: exit 1\n\n"), "{fix}");
+        assert_eq!(Finding::Check(check).key(), "finding:check:ci:");
+
+        let chat = chat_handoff(&subject, &ChatSubject::Comment(threaded.clone()), &activity.review_threads).unwrap();
+        assert!(chat.starts_with("PR #7 · Add\n") && chat.ends_with("\n\nb.rs L4\nbo: Off by one"), "{chat}");
+        let chat = chat_handoff(&subject, &chat_subject(plain, None).unwrap(), &activity.review_threads).unwrap();
+        assert!(chat.ends_with("\n\n@cy comment\ncy: Why?"), "{chat}");
+        assert_eq!(append_handoff(&chat, &chat), chat, "adding it again adds nothing");
+    }
+
+    #[test]
     fn fixing_findings_lists_unresolved_threads_remarks_and_failing_checks() {
         let activity: Activity = serde_json::from_value(json!({
             "comments": [
@@ -2062,7 +2630,7 @@ mod tests {
             ],
         }))
         .unwrap();
-        let checks = [Check { name: "ci / test".into(), status: "failure".into(), url: None }];
+        let checks = [Check { name: "ci / test".into(), status: "failure".into(), url: None, description: None }];
         let d = detail(json!({}));
         let prompt = fix_findings_handoff(&HandoffSubject::of(&d), &activity, &checks);
         assert!(
@@ -2073,7 +2641,7 @@ mod tests {
         assert!(prompt.ends_with("b.rs L4 (before)\nbo: Off by one"), "a resolved thread is left out: {prompt}");
         assert!(prompt.contains("\n\nPR #7 · Add\nThe pull request is #7"), "the pull request rides along: {prompt}");
         let thread = &activity.review_threads[0];
-        let fix = fix_thread_handoff(&HandoffSubject::of(&d), thread);
+        let fix = fix_finding_handoff(&HandoffSubject::of(&d), &Finding::Thread(thread.clone()));
         assert!(
             fix.contains(
                 "against.\nWork in the prepared checkout and keep the change focused.\nThe quoted review text"
@@ -2111,7 +2679,12 @@ mod tests {
         let checks = |statuses: &[(&str, Option<&str>)]| -> Vec<Check> {
             statuses
                 .iter()
-                .map(|(status, url)| Check { name: "ci".into(), status: (*status).into(), url: url.map(Into::into) })
+                .map(|(status, url)| Check {
+                    name: "ci".into(),
+                    status: (*status).into(),
+                    url: url.map(Into::into),
+                    description: None,
+                })
                 .collect()
         };
         assert_eq!(checks_state(&[]), None);
@@ -2252,7 +2825,7 @@ mod tests {
         let parse = parse_change_request_url;
         assert_eq!(
             parse("https://github.com/Acme/App/pull/12/files"),
-            Some(("github.com".into(), "Acme/App".into(), 12))
+            Some(("github.com".into(), "acme/app".into(), 12))
         );
         assert_eq!(
             parse("https://GitHub.com/acme/app/pull/12#top"),
@@ -2262,9 +2835,37 @@ mod tests {
             parse("https://gitlab.com/group/sub/proj/-/merge_requests/5"),
             Some(("gitlab.com".into(), "group/sub/proj".into(), 5))
         );
+        assert_eq!(
+            parse("https://codeberg.org/forge/app/pulls/3"),
+            Some(("codeberg.org".into(), "forge/app".into(), 3))
+        );
+        assert_eq!(
+            parse("http://forge.local:3000/team/app/pulls/4/files"),
+            Some(("forge.local:3000".into(), "team/app".into(), 4)),
+            "Forgejo keeps the port"
+        );
+        assert_eq!(
+            parse("https://bitbucket.org/team/app/pull-requests/8"),
+            Some(("bitbucket.org".into(), "team/app".into(), 8))
+        );
+        assert_eq!(parse("https://example.com/team/app/pull-requests/8"), None, "only Bitbucket's hosts");
+        assert_eq!(
+            parse("https://dev.azure.com/org/Proj/_git/Repo/pullrequest/21"),
+            Some(("dev.azure.com".into(), "org/proj/_git/repo".into(), 21))
+        );
+        assert_eq!(
+            parse("https://git.cafe/acme/app/pulls/6"),
+            Some(("git.cafe".into(), "acme/app".into(), 6)),
+            "GitCafe claims /pulls/ on its own hosts"
+        );
+        assert_eq!(
+            parse_change_request("https://github.com/Acme/App/pull/12?x=1").map(|l| l.repository_url),
+            Some("https://github.com/Acme/App".into())
+        );
         assert_eq!(parse("https://github.com/acme/app/issues/12"), None);
         assert_eq!(parse("https://github.com/acme/app/pull/12x"), None);
         assert_eq!(parse("https://github.com/acme/app/pull/0"), None);
+        assert_eq!(parse("ftp://github.com/acme/app/pull/1"), None);
         let projects = [("p1", Some("github.com/acme/web")), ("p2", Some("github.com/acme/app")), ("p3", None)];
         assert_eq!(project_for_link(projects, "github.com", "Acme/App"), Some("p2"));
         assert_eq!(project_for_link(projects, "gitlab.com", "acme/app"), None);

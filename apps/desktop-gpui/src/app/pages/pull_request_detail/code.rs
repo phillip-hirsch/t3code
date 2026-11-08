@@ -36,6 +36,8 @@ pub(in crate::app) struct CodeTab {
     patches: Rc<HashMap<String, FilePatch>>,
     /// Shown files in the viewer's order.
     shown: Rc<[String]>,
+    /// Pages that would not parse into files, with why, shown as raw text instead.
+    raw: Vec<(String, &'static str)>,
     test_files: usize,
     hidden_tests: usize,
     ignore_whitespace: bool,
@@ -69,6 +71,7 @@ impl CodeTab {
             _load: None,
             patches: Rc::default(),
             shown: Rc::default(),
+            raw: Vec::new(),
             test_files: 0,
             hidden_tests: 0,
             ignore_whitespace,
@@ -86,11 +89,6 @@ impl CodeTab {
             pages: HashMap::new(),
             loading_more: None,
         }
-    }
-
-    /// The first page of the diff has been read.
-    pub(super) fn loaded(&self) -> bool {
-        !self.slices.is_empty()
     }
 
     /// Unfolds a file and scrolls the viewer to it.
@@ -113,6 +111,11 @@ impl CodeTab {
         self.slices.last().and_then(|s| s.next_cursor.as_deref())
     }
 
+    /// Raw pages, once every page has loaded: showing them earlier would end paging.
+    fn raw_shown(&self) -> &[(String, &'static str)] {
+        if self.next_cursor().is_none() { &self.raw } else { &[] }
+    }
+
     fn is_viewed(&self, path: &str) -> bool {
         self.pressed
             .get(path)
@@ -124,6 +127,35 @@ impl CodeTab {
         !self.pressed.contains_key(path)
             && self.viewed.as_ref().is_some_and(|v| v.get(path).is_some_and(|s| s == "dismissed"))
     }
+}
+
+/// `getRenderablePatch`: one page's files, or why it shows as raw text.
+enum Parsed {
+    Files(Vec<DiffFile>),
+    Raw(&'static str),
+}
+
+fn parse_slice(patch: &str) -> Option<Parsed> {
+    if patch.trim().is_empty() {
+        return None;
+    }
+    Some(match DiffFile::parse_with(patch, DiffParseOptions::new().truncated_hunks(true)) {
+        Ok(files) if !files.is_empty() => Parsed::Files(files),
+        Ok(_) => Parsed::Raw("Unsupported diff format. Showing raw patch."),
+        Err(error) => {
+            log::warn!("unparseable pull request diff: {}", error.message());
+            Parsed::Raw("Failed to parse patch. Showing raw patch.")
+        }
+    })
+}
+
+/// A raw page: why it isn't structured, then its text.
+fn raw_slice(text: &str, reason: &'static str, t: &Tokens) -> AnyElement {
+    v_flex()
+        .gap(px(8.))
+        .child(div().text_xs().text_color(t.muted_foreground).child(reason))
+        .child(div().font_family(FONT_MONO).text_xs().text_color(t.foreground).child(text.to_owned()))
+        .into_any_element()
 }
 
 fn to_viewer_side(side: Side) -> DiffSide {
@@ -181,7 +213,7 @@ fn merge_comments(first: &[ThreadComment], later: &[ThreadComment]) -> Vec<Threa
 }
 
 /// `POST /api/pull-requests/diff` with this client's bearer session.
-async fn read_diff(endpoint: Option<Endpoint>, input: Value) -> Result<Value, String> {
+pub(super) async fn read_diff(endpoint: Option<Endpoint>, input: Value) -> Result<Value, String> {
     let endpoint = endpoint.ok_or("Not connected to the environment.")?;
     let request = async move {
         static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
@@ -356,20 +388,21 @@ impl Workspace {
     fn rebuild_pr_code(&mut self, cx: &mut Context<Self>) {
         let Some(code) = self.pr_code() else { return };
         let mut text = String::new();
+        let mut files = Vec::new();
+        code.raw.clear();
         for slice in &code.slices {
-            text.push_str(&slice.patch);
+            let patch =
+                if code.ignore_whitespace { diff_logic::hide_whitespace(&slice.patch) } else { slice.patch.clone() };
+            match parse_slice(&patch) {
+                Some(Parsed::Files(parsed)) => files.extend(parsed),
+                Some(Parsed::Raw(reason)) => code.raw.push((patch.clone(), reason)),
+                None => {}
+            }
+            text.push_str(&patch);
             if !text.is_empty() && !text.ends_with('\n') {
                 text.push('\n');
             }
         }
-        if code.ignore_whitespace {
-            text = diff_logic::hide_whitespace(&text);
-        }
-        let files =
-            DiffFile::parse_with(&text, DiffParseOptions::new().truncated_hunks(true)).unwrap_or_else(|error| {
-                log::warn!("unparseable pull request diff: {}", error.message());
-                Vec::new()
-            });
         let paths: Vec<String> = files.iter().map(|f| f.path().to_string()).collect();
         let tests: Vec<bool> = paths.iter().map(|p| diff_logic::is_test_file(p)).collect();
         code.test_files = tests.iter().filter(|t| **t).count();
@@ -393,6 +426,15 @@ impl Workspace {
                 }
             }
         });
+    }
+
+    /// A timeline commit: Code, scoped to that commit (`openCommit`).
+    pub(super) fn open_pr_commit(&mut self, oid: String, cx: &mut Context<Self>) {
+        let Some(panel) = self.pull_requests.panel.as_mut() else { return };
+        panel.tab = Tab::Code;
+        self.open_pr_code(cx);
+        self.set_pr_code_commit(Some(oid), cx);
+        cx.notify();
     }
 
     fn set_pr_code_commit(&mut self, commit: Option<String>, cx: &mut Context<Self>) {
@@ -582,6 +624,24 @@ impl Workspace {
             return frame(quiet(format!("Loading {term} diff...")));
         }
         let shown = code.shown.clone();
+        let raw = code.raw_shown();
+        let raw_list = |bordered: bool| {
+            (!raw.is_empty()).then(|| {
+                v_flex()
+                    .id("pr-code-raw")
+                    .gap(px(16.))
+                    .px(px(16.))
+                    .py(px(20.))
+                    .when(bordered, |el| el.border_t_1().border_color(Hsla { a: t.border.a * 0.6, ..t.border }))
+                    .children(raw.iter().map(|(text, reason)| raw_slice(text, reason, t)))
+            })
+        };
+        if shown.is_empty()
+            && let Some(list) = raw_list(false)
+        {
+            return frame(list.flex_1().min_h_0().overflow_y_scroll().into_any_element());
+        }
+        let unstructured = raw_list(true).map(|list| list.flex_none().max_h(px(320.)).overflow_y_scroll());
         if shown.is_empty() && code.next_cursor().is_none() {
             return frame(
                 div()
@@ -774,7 +834,16 @@ impl Workspace {
                         .on_click(cx.listener(move |this, _, _, cx| this.read_pr_diff(Some(cursor.clone()), cx))),
                 )
         });
-        frame(v_flex().flex_1().min_h_0().children(orphan_list).child(diff).children(more).into_any_element())
+        frame(
+            v_flex()
+                .flex_1()
+                .min_h_0()
+                .children(orphan_list)
+                .child(diff)
+                .children(more)
+                .children(unstructured)
+                .into_any_element(),
+        )
     }
 
     /// `PullRequestDiffUnavailableState`.
@@ -903,7 +972,7 @@ impl Workspace {
         let viewed_enabled = detail.capabilities.viewed_files.is_some();
         let environment_store = detail.capabilities.viewed_files.as_deref() == Some("environment");
         let viewed_count = code.shown.iter().filter(|p| code.is_viewed(p)).count();
-        let withheld = code.slices.iter().any(|s| s.truncated);
+        let withheld = code.slices.iter().any(|s| s.truncated) || !code.raw.is_empty();
         let warning = |id: &'static str, tip: String| {
             div()
                 .id(id)
@@ -1132,15 +1201,17 @@ impl Workspace {
         let open = code.orphans_open;
         let partial = code.next_cursor().is_some();
         let count = threads.len();
-        let heading = h_flex()
-            .id("pr-code-orphans")
+        let heading = gpui_kit::base::Button::new("pr-code-orphans")
             .w_full()
+            .justify_start()
             .gap(px(6.))
             .px(px(16.))
             .py(px(8.))
             .text_xs()
+            .line_height(gpui_kit::rems(1.))
             .text_color(t.muted_foreground)
             .cursor_pointer()
+            .focus_visible(outline_ring(t))
             .child(if partial {
                 "Conversations not on the diff loaded so far"
             } else {
@@ -1229,6 +1300,10 @@ impl Workspace {
         let loading_more = code.loading_more.as_deref() == Some(thread.id.as_str());
         let id = thread.id.clone();
         let success = t.success_foreground;
+        let chat = comments
+            .iter()
+            .any(|c| logic::visible_body(&c.body).is_some())
+            .then(|| logic::ChatSubject::Thread(ReviewThread { comments: comments.clone(), ..thread.clone() }));
         let header = h_flex()
             .gap(px(8.))
             .text_xs()
@@ -1239,10 +1314,11 @@ impl Workspace {
                     .when(thread.is_resolved, |icon| icon.text_color(success)),
             )
             .child(
-                div()
-                    .id(ElementId::Name(format!("pr-thread-toggle:{}", thread.id).into()))
+                gpui_kit::base::Button::new(ElementId::Name(format!("pr-thread-toggle:{}", thread.id).into()))
+                    .line_height(gpui_kit::rems(1.))
                     .cursor_pointer()
                     .hover(|s| s.text_color(t.foreground))
+                    .focus_visible(outline_ring(t))
                     .child(format!(
                         "{} · {count} {}",
                         if thread.is_resolved { "Resolved" } else { "Open" },
@@ -1258,8 +1334,14 @@ impl Workspace {
                     })),
             )
             .when(thread.is_outdated, |el| el.child("outdated"))
-            .children(self.render_pr_fix_thread(thread, t, cx))
-            .children(self.render_pr_thread_actions(thread, t, cx));
+            .child(
+                h_flex()
+                    .ml_auto()
+                    .gap(px(8.))
+                    .children(self.render_pr_fix(logic::Finding::Thread(thread.clone()), t, cx))
+                    .children(self.render_pr_add_to_chat(&thread.id, chat, false, t, cx))
+                    .children(self.render_pr_thread_actions(thread, t, cx)),
+            );
         let mut body = Vec::new();
         let mut reply_box = None;
         if expanded {
@@ -1354,6 +1436,14 @@ mod tests {
         );
         let shape: Vec<(&str, &str)> = merged.iter().map(|c| (c.id.as_str(), c.body.as_str())).collect();
         assert_eq!(shape, [("a", "one"), ("b", "edited"), ("c", "three")]);
+    }
+
+    #[test]
+    fn a_page_that_will_not_parse_keeps_its_text_and_why() {
+        assert!(parse_slice("  \n").is_none());
+        assert!(matches!(parse_slice("not a diff\n"), Some(Parsed::Raw(_))));
+        let patch = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n";
+        assert!(matches!(parse_slice(patch), Some(Parsed::Files(files)) if files.len() == 1));
     }
 
     #[test]

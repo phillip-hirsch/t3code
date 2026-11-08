@@ -210,7 +210,13 @@ impl Workspace {
             .right_0()
             .h(TITLEBAR_HEIGHT)
             .when(!self.sidebar_open.sheet(), |el| el.child(self.render_sidebar_toggle(window, cx)))
-            .when(self.target.is_some(), |el| el.child(self.render_panel_toggles(window, cx)))
+            .map(|el| {
+                if self.page == Some(super::pages::Page::PullRequests) && self.settings.is_none() {
+                    el.child(self.render_pull_request_page_toggles(cx))
+                } else {
+                    el.when(self.target.is_some(), |el| el.child(self.render_panel_toggles(window, cx)))
+                }
+            })
     }
 
     /// The drawn window buttons, above Settings, dialogs and toasts as Electron's native ones are;
@@ -253,6 +259,55 @@ impl Workspace {
             .tooltip(tooltip(self.with_shortcut("Toggle main sidebar", "sidebar.toggle")))
             .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleSidebar), cx)),
         )
+    }
+
+    /// The Pull requests page's `openPanelControls`: maximize while its panel shows, and the
+    /// right panel toggle, unavailable until a pull request is picked.
+    fn render_pull_request_page_toggles(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let tokens = theme::tokens(cx);
+        let (shown, maximized) = (self.pull_request_panel_shown(), self.pull_request_panel_maximized());
+        let available = self.pull_request_panel_open();
+        let toggle = |id: &'static str, path: &'static str, pressed: bool, enabled: bool| {
+            let color = if enabled { tokens.foreground.opacity(0.8) } else { tokens.muted_foreground };
+            control(id)
+                .when(pressed, |el| el.bg(tokens.accent))
+                .when(enabled, |el| el.cursor_pointer().hover(|style| style.bg(tokens.accent)))
+                .child(icon(path).with_size(px(16.)).text_color(color))
+        };
+        let maximize = shown.then(|| {
+            let label = if maximized { "Restore panel size" } else { "Maximize panel" };
+            let path = if maximized { "icons/minimize-2.svg" } else { "icons/maximize-2.svg" };
+            toggle("toggle-pr-panel-maximized", path, maximized, true).tooltip(tooltip(label)).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.toggle_pull_request_panel_maximized(cx);
+                }),
+            )
+        });
+        let panel = toggle("toggle-pr-panel", "icons/panel-right.svg", shown, available)
+            .tooltip(tooltip(if available {
+                self.with_shortcut("Toggle right panel", "rightPanel.toggle")
+            } else {
+                "Select a pull request first".into()
+            }))
+            .when(available, |el| {
+                el.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.toggle_pull_request_panel(cx);
+                    }),
+                )
+            });
+        div()
+            .absolute()
+            .top_0()
+            .right(CONTROLS_RIGHT)
+            .h(TITLEBAR_HEIGHT)
+            .flex()
+            .items_center()
+            .gap_1()
+            .children(maximize)
+            .child(panel)
     }
 
     /// `WorkspaceTitlebarControls` + `PanelLayoutControls`: thread details, terminal, right panel.

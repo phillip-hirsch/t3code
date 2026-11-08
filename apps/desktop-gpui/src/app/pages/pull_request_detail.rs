@@ -37,12 +37,17 @@ use crate::theme::{self, FONT_MONO, Tokens};
 use crate::timestamp::parse_ms;
 
 mod avatars;
+pub(super) mod breakdown;
 mod code;
 mod completions;
 mod guide;
 mod handoff;
 mod header;
+pub(super) use header::checks_body;
 mod live;
+pub(in crate::app) use live::PanelLayout;
+mod segmented;
+use segmented::Segmented;
 pub(in crate::app) mod write;
 
 const CONVERSATION_PAGE: usize = 10;
@@ -51,6 +56,14 @@ const CONFIRM_WINDOW: Duration = Duration::from_secs(3);
 const COPIED_WINDOW: Duration = Duration::from_millis(1600);
 /// A guide run takes minutes; its answer is read again at this pace while it runs.
 const GUIDE_POLL: Duration = Duration::from_secs(15);
+
+/// The thread whose right panel shows the pull request (`threadRef` beside `PullRequestDetailPanel`).
+#[derive(Clone, Debug)]
+pub(in crate::app) struct PanelThread {
+    pub id: String,
+    /// The thread links several pull requests, so the crumbs lead back to its list (`onBack`).
+    pub back: bool,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Tab {
@@ -96,6 +109,8 @@ pub(in crate::app) struct Panel {
     copied: Option<&'static str>,
     _copied: Option<Task<()>>,
     markdown: HashMap<String, (String, Entity<TextViewState>, Subscription)>,
+    /// The description as last written from here (`DescriptionDraft`).
+    description_draft: Option<logic::DescriptionDraft>,
     summary_scroll: ScrollHandle,
     timeline: ListState,
     timeline_rows: Rc<[TimelineRow]>,
@@ -109,7 +124,11 @@ pub(in crate::app) struct Panel {
     code: Option<code::CodeTab>,
     write: write::WriteState,
     stack: Option<Rc<logic::Stack>>,
+    /// The last stack lookup answered and no other is in flight (`nativeStackQuery.isFresh`).
+    stack_fresh: bool,
     stack_failed: bool,
+    /// The checks poll while the pull request is open (`usePullRequestChecksRefresh`).
+    _checks_poll: Option<Task<()>>,
     linked: Option<Vec<crate::app::palette::LinkedThread>>,
     checks_all: bool,
     maintainer_saving: bool,
@@ -118,6 +137,8 @@ pub(in crate::app) struct Panel {
     _picker_search: Option<Subscription>,
     /// The handoff being prepared, as the web keys it ("ask", "checkout:worktree", ...).
     handoff: Option<String>,
+    /// The project a handoff runs in, picked from another environment's copy (`actingScope`).
+    acting: Option<String>,
     /// The header's fold scrolled away.
     condensed: bool,
     guide_head: Option<String>,
@@ -125,6 +146,7 @@ pub(in crate::app) struct Panel {
     guide_seen: HashSet<usize>,
     guide_rail_open: bool,
     guide_files_open: HashSet<String>,
+    guide_diff: guide::GuideDiff,
 }
 
 impl Panel {
@@ -159,6 +181,7 @@ impl Panel {
             copied: None,
             _copied: None,
             markdown: HashMap::new(),
+            description_draft: None,
             summary_scroll: ScrollHandle::new(),
             timeline: ListState::new(0, ListAlignment::Top, px(600.)),
             timeline_rows: Rc::default(),
@@ -171,19 +194,23 @@ impl Panel {
             code: None,
             write: write::WriteState::default(),
             stack: None,
+            stack_fresh: false,
             stack_failed: false,
+            _checks_poll: None,
             linked: None,
             checks_all: false,
             maintainer_saving: false,
             maintainer_choice: None,
             _picker_search: None,
             handoff: None,
+            acting: None,
             condensed: false,
             guide_head: None,
             guide_position: 0,
             guide_seen: HashSet::new(),
             guide_rail_open: false,
             guide_files_open: HashSet::new(),
+            guide_diff: guide::GuideDiff::default(),
         }
     }
 
@@ -268,9 +295,9 @@ fn toast_success(window: &mut Window, cx: &mut App, title: impl Into<SharedStrin
     window.push_notification(Notification::success("").title(title), cx);
 }
 
-/// The repository's page: the pull request URL without its `/pull/N` tail.
+/// The repository's page (`parseChangeRequestUrl(url).link.repositoryUrl`).
 fn repository_url(url: &str) -> Option<String> {
-    ["/pull/", "/-/merge_requests/"].iter().find_map(|tail| url.find(tail).map(|at| url[..at].to_owned()))
+    logic::parse_change_request(url).map(|link| link.repository_url)
 }
 
 impl Workspace {
@@ -281,12 +308,17 @@ impl Workspace {
         seed: Option<Rc<Entry>>,
         cx: &mut Context<Self>,
     ) {
-        self.pull_requests.panel_hidden = false;
+        // Picking a pull request on the page shows the panel again (`openPullRequest`).
+        if self.page == Some(super::Page::PullRequests) && self.pull_requests.layout.reveal() {
+            cx.notify();
+        }
         if self.pull_requests.panel.as_ref().is_some_and(|p| p.reference == reference) {
             cx.notify();
             return;
         }
         let guides = self.review_guides_enabled(&reference.project_id);
+        self.check_pr_write_grant(&reference.project_id, cx);
+        let writable = self.pr_write_grant(&reference.project_id) == Some(true);
         let key = reference.key();
         if self.show_pr_tab(reference, seed, cx) {
             return;
@@ -295,7 +327,7 @@ impl Workspace {
             // Paints from the detail the row's prefetch read; the rest is read as on a first answer.
             Some(detail) => {
                 if let Some(panel) = self.pull_requests.panel.as_mut() {
-                    panel.detail = Some(detail);
+                    panel.detail = Some(if writable { detail } else { Rc::new(logic::read_only((*detail).clone())) });
                     panel.rebuild_timeline();
                 }
                 self.read_pr_reads_of(&key, false, cx);
@@ -307,15 +339,6 @@ impl Workspace {
         if guides {
             self.read_pr_guide(cx);
         }
-        cx.notify();
-    }
-
-    /// "Collapse pull request panel": every tab closes with it.
-    pub(super) fn close_pull_request_panel(&mut self, cx: &mut Context<Self>) {
-        self.pull_requests.panel = None;
-        self.pull_requests.tabs.clear();
-        self.pull_requests.parked.clear();
-        self.pull_requests.panel_maximized = false;
         cx.notify();
     }
 
@@ -341,6 +364,56 @@ impl Workspace {
         let seed = self.pull_requests.entry_for(&reference);
         self.open_pull_request_panel(reference, seed, cx);
         true
+    }
+
+    /// The connection's `source-control:write` on the pull request's environment
+    /// (`useEnvironmentScope`); `None` while its session check runs.
+    fn pr_write_grant(&self, project_id: &str) -> Option<bool> {
+        self.pull_requests.write_grants.get(&self.project_environment(project_id)?)?.0
+    }
+
+    /// The pull request `key` names may be acted on.
+    fn pr_panel_writable(&self, key: &str) -> bool {
+        self.pr_panel_ref(key).is_some_and(|p| self.pr_write_grant(&p.reference.project_id) == Some(true))
+    }
+
+    /// Asks the pull request's environment, once, what this connection may do there.
+    fn check_pr_write_grant(&mut self, project_id: &str, cx: &mut Context<Self>) {
+        let Some(environment) = self.project_environment(project_id) else { return };
+        if self.pull_requests.write_grants.contains_key(&environment) {
+            return;
+        }
+        let Some(endpoint) = self.env_endpoint(&environment).cloned() else { return };
+        let answered = environment.clone();
+        let task = super::settings::check_source_control_write(endpoint, cx, move |this: &mut Self, grant, cx| {
+            this.apply_pr_write_grant(&answered, grant, cx);
+        });
+        self.pull_requests.write_grants.insert(environment, (None, task));
+    }
+
+    /// A newly granted environment reads its pull requests again; one that grants nothing shows
+    /// them read-only.
+    fn apply_pr_write_grant(&mut self, environment: &SharedString, grant: Option<bool>, cx: &mut Context<Self>) {
+        let Some(entry) = self.pull_requests.write_grants.get_mut(environment) else { return };
+        let before = std::mem::replace(&mut entry.0, grant);
+        let keys: Vec<String> = self
+            .pull_requests
+            .panel
+            .iter()
+            .chain(self.pull_requests.parked.values())
+            .filter(|p| p.detail.is_some())
+            .filter(|p| self.project_environment(&p.reference.project_id).as_ref() == Some(environment))
+            .map(|p| p.reference.key())
+            .collect();
+        for key in keys {
+            if grant == Some(true) {
+                if before != Some(true) {
+                    self.read_pr_detail_of(&key, cx);
+                }
+            } else if let Some(panel) = self.pr_panel(&key) {
+                panel.detail = panel.detail.take().map(|d| Rc::new(logic::read_only((*d).clone())));
+            }
+        }
     }
 
     /// The open pull request `key` names, shown or parked in its tab, for an answer to land in.
@@ -407,6 +480,7 @@ impl Workspace {
             cx.spawn(async move |this, cx| {
                 let result = detail_client.request("pullRequests.detail", detail_input).await;
                 let _ = this.update(cx, |this, cx| {
+                    let writable = this.pr_panel_writable(&detail_key);
                     let Some(panel) = this.pr_panel(&detail_key) else { return };
                     panel.detail_loading = false;
                     let (mut first, mut landed) = (false, false);
@@ -414,7 +488,7 @@ impl Workspace {
                         Ok(Ok(detail)) => {
                             first = panel.detail.is_none();
                             landed = true;
-                            panel.detail = Some(Rc::new(detail));
+                            panel.detail = Some(Rc::new(if writable { detail } else { logic::read_only(detail) }));
                             panel.detail_error = None;
                             panel.maintainer_choice = None;
                         }
@@ -534,6 +608,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(client) = self.pull_request_client_of(key) else { return };
+        if !self.pr_panel_writable(key) {
+            return;
+        }
         let Some(panel) = self.pr_panel(key) else { return };
         if panel.pending.is_some() {
             return;
@@ -777,6 +854,18 @@ impl Workspace {
         }
     }
 
+    fn select_pr_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
+        let Some(panel) = self.pull_requests.panel.as_mut() else { return };
+        panel.tab = tab;
+        if tab == Tab::Guide && panel.guide.is_none() && !panel.guide_loading {
+            self.read_pr_guide(cx);
+        }
+        if tab == Tab::Code {
+            self.open_pr_code(cx);
+        }
+        cx.notify();
+    }
+
     fn toggle_pr_disclosure(&mut self, key: String, cx: &mut Context<Self>) {
         let Some(panel) = self.pull_requests.panel.as_mut() else { return };
         let toggled = Rc::make_mut(&mut panel.toggled);
@@ -788,26 +877,30 @@ impl Workspace {
     }
 
     /// One markdown body, parsed once and kept while the panel shows this pull request.
+    /// What a markdown body's view parses: HTML comments out, media links resolved on the host.
+    fn pr_markdown_source(&self, text: &str) -> String {
+        let panel = self.pull_requests.panel.as_ref();
+        let url =
+            panel.and_then(|p| p.detail.as_ref().map(|d| d.url.as_str()).or(p.seed.as_ref().map(|e| e.url.as_str())));
+        let stripped = logic::strip_html_comments(text);
+        match url.and_then(logic::url_origin) {
+            Some(origin) => logic::resolve_media_urls(&stripped, origin),
+            None => stripped,
+        }
+    }
+
     fn pr_markdown(&mut self, key: &str, text: &str, cx: &mut Context<Self>) -> Option<Entity<TextViewState>> {
+        let shown = self.pr_markdown_source(text);
         let panel = self.pull_requests.panel.as_mut()?;
-        let url = panel.detail.as_ref().map(|d| d.url.as_str()).or(panel.seed.as_ref().map(|e| e.url.as_str()));
-        let origin = url.and_then(logic::url_origin);
-        let source = |text: &str| {
-            let stripped = logic::strip_html_comments(text);
-            match origin {
-                Some(origin) => logic::resolve_media_urls(&stripped, origin),
-                None => stripped,
-            }
-        };
         if let Some((held, view, _)) = panel.markdown.get_mut(key) {
             if held != text {
-                let source = source(text);
+                let source = shown;
                 view.update(cx, |view, cx| view.set_text(&source, cx));
                 text.clone_into(held);
             }
             return Some(view.clone());
         }
-        let source = source(text);
+        let source = shown;
         let view = cx.new(|cx| TextViewState::markdown(&source, cx));
         let changed = cx.observe(&view, |this, _, cx| {
             if let Some(panel) = this.pull_requests.panel.as_mut() {
@@ -817,6 +910,51 @@ impl Workspace {
         });
         panel.markdown.insert(key.to_owned(), (text.to_owned(), view.clone(), changed));
         Some(view)
+    }
+
+    /// The description shown: this client's draft while it is in force, else the host's.
+    fn pr_description(&mut self, detail: &Detail) -> String {
+        let Some(panel) = self.pull_requests.panel.as_mut() else { return detail.body.clone() };
+        panel.description_draft =
+            logic::DescriptionDraft::in_force(panel.description_draft.take(), &detail.url, detail.observed_at);
+        panel.description_draft.as_ref().and_then(|d| d.body.clone()).unwrap_or_else(|| detail.body.clone())
+    }
+
+    /// A description save begins (`startDescriptionSave`); the key its settle needs.
+    fn start_pr_description_save(&mut self, body: String) -> Option<String> {
+        let panel = self.pull_requests.panel.as_mut()?;
+        let detail = panel.detail.clone()?;
+        let draft = panel.description_draft.take();
+        panel.description_draft = Some(logic::DescriptionDraft::start(draft, &detail.url, detail.observed_at, body));
+        Some(detail.url.clone())
+    }
+
+    /// A ticked task saves the description with its marker set (`toggleTask`).
+    fn toggle_pr_task(&mut self, item_start: usize, checked: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(detail) = self.pull_requests.panel.as_ref().and_then(|p| p.detail.clone()) else { return };
+        let body = self.pr_description(&detail);
+        let shown = self.pr_markdown_source(&body);
+        let Some(next) = logic::toggle_task(&body, &shown, item_start, checked).filter(|next| *next != body) else {
+            return;
+        };
+        let Some(mut payload) = self.pull_requests.panel.as_ref().map(|p| p.reference.to_json()) else { return };
+        payload["body"] = json!(next);
+        let Some(url) = self.start_pr_description_save(next) else { return };
+        self.run_pr_write(
+            "pullRequests.update",
+            payload,
+            "Could not save the description".into(),
+            None,
+            window,
+            cx,
+            move |this, key, saved, _, _| {
+                if let Some(panel) = this.pr_panel(key) {
+                    panel.description_draft =
+                        logic::DescriptionDraft::settle(panel.description_draft.take(), &url, saved);
+                }
+            },
+        );
+        cx.notify();
     }
 
     /// The merge method the header and menu use (`resolvePullRequestMergeMethod`).
@@ -834,7 +972,12 @@ impl Workspace {
         )
     }
 
-    pub(super) fn render_pull_request_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_pull_request_panel(
+        &mut self,
+        thread: Option<&PanelThread>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = *theme::tokens(cx);
         let Some(panel) = self.pull_requests.panel.as_ref() else { return div().into_any_element() };
         let frame = v_flex().size_full().min_h_0().bg(t.background);
@@ -845,7 +988,7 @@ impl Workspace {
                 }
                 _ => detail_ghost(&t),
             };
-            return frame.child(self.render_pr_seed_header(&t, cx)).child(body).into_any_element();
+            return frame.child(self.render_pr_seed_header(thread, &t, cx)).child(body).into_any_element();
         };
         let guides = self.review_guides_enabled(&detail.project_id);
         let panel = self.pull_requests.panel.as_ref().expect("checked above");
@@ -854,7 +997,7 @@ impl Workspace {
             Tab::Code if !detail.capabilities.diff => Tab::Summary,
             tab => tab,
         };
-        let header = self.render_pr_header(&detail, tab, guides, &t, window, cx);
+        let header = self.render_pr_header(&detail, tab, guides, thread, &t, window, cx);
         let body = match tab {
             Tab::Summary => self.render_pr_summary(&detail, &t, window, cx),
             Tab::Timeline => self.render_pr_timeline(&detail, &t, cx),
@@ -875,7 +1018,7 @@ impl Workspace {
     }
 
     /// The crumbs and collapse button while the detail is not in yet (`PullRequestDetailGhost`).
-    fn render_pr_seed_header(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+    fn render_pr_seed_header(&self, thread: Option<&PanelThread>, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let panel = self.pull_requests.panel.as_ref().expect("a panel is open");
         let number = panel.reference.number;
         let title = panel.seed.as_ref().map(|s| s.title.clone());
@@ -891,6 +1034,7 @@ impl Workspace {
                     .gap(px(4.))
                     .text_xs()
                     .text_color(t.muted_foreground)
+                    .children(thread.filter(|thread| thread.back).map(|_| back_button(t, cx)))
                     .child(
                         div()
                             .flex_1()
@@ -899,8 +1043,7 @@ impl Workspace {
                             .font_weight(FontWeight::MEDIUM)
                             .child(panel.reference.repository.clone()),
                     )
-                    .child(div().font_weight(FontWeight::MEDIUM).child(format!("#{number}")))
-                    .child(collapse_button(t, cx)),
+                    .child(div().font_weight(FontWeight::MEDIUM).child(format!("#{number}"))),
             )
             .children(title.map(|title| {
                 div()
@@ -961,43 +1104,59 @@ impl Workspace {
             .into_any_element()
     }
 
+    #[expect(clippy::too_many_arguments, reason = "the header draws from the panel's shared render state")]
     fn render_pr_header(
         &mut self,
         detail: &Rc<Detail>,
         tab: Tab,
         guides: bool,
+        thread: Option<&PanelThread>,
         t: &Tokens,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let breakdown = self.pr_breakdown_stat("pr-breakdown", detail, 12., t, cx);
+        let condensed_breakdown = self.pr_breakdown_stat("pr-breakdown-condensed", detail, 11., t, cx);
         let panel = self.pull_requests.panel.as_ref().expect("a panel is open");
         let term = logic::terminology(&detail.provider).0;
         let (checks_state, checks_stale) = panel.checks_state(detail);
-        let primary = logic::primary_control(detail, checks_state);
+        let stack = logic::StackMerge::of(detail, panel.stack.is_some(), panel.stack_fresh, panel.stack_failed);
+        let primary = logic::primary_control(detail, checks_state, stack);
         let method = self.pr_merge_method(panel, detail);
         let (_, state_color, state_label) = state_glyph(detail.state, detail.is_draft, t);
         let hairline = Hsla { a: t.border.a * 0.6, ..t.border };
         let now = now_ms();
         let view = cx.entity();
 
-        let repo_url = repository_url(&detail.url);
-        let repository = div()
-            .id("pr-crumb-repository")
-            .min_w_0()
-            .truncate()
-            .font_weight(FontWeight::MEDIUM)
-            .child(detail.repository.clone())
-            .when_some(repo_url, |el, url| {
+        let repository = match repository_url(&detail.url) {
+            Some(url) => {
                 let tip: SharedString = format!("Open {} repository", detail.repository).into();
-                el.cursor_pointer()
+                gpui_kit::base::Button::new("pr-crumb-repository")
+                    .block()
+                    .min_w_0()
+                    .truncate()
+                    .line_height(gpui_kit::rems(1.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .cursor_pointer()
                     .hover(|s| s.text_color(t.foreground))
+                    .focus_visible(outline_ring(t))
+                    .child(detail.repository.clone())
                     .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
                     .on_click(move |_, _, cx| cx.open_url(&url))
-            });
+                    .into_any_element()
+            }
+            None => div()
+                .min_w_0()
+                .truncate()
+                .font_weight(FontWeight::MEDIUM)
+                .child(detail.repository.clone())
+                .into_any_element(),
+        };
         let open_label = list_logic::open_on_host_label(&detail.provider);
-        let number = number_link(&detail.url, detail.number, state_color, open_label);
+        let number = number_link(&detail.url, detail.number, state_color, open_label, term, t);
         let condensed = panel.condensed;
-        let condensed_row = self.render_pr_condensed_row(detail, t);
+        let condensed_row = self.render_pr_condensed_row(detail, condensed_breakdown, t);
+        let back = thread.filter(|thread| thread.back).map(|_| back_button(t, cx));
         let crumbs = h_flex()
             .flex_1()
             .min_w_0()
@@ -1006,6 +1165,7 @@ impl Workspace {
             .gap(px(4.))
             .text_xs()
             .text_color(t.muted_foreground)
+            .children(back)
             .when(!condensed, |el| el.child(repository))
             .child(number)
             .when(condensed, |el| {
@@ -1026,14 +1186,14 @@ impl Workspace {
             .gap(px(4.))
             .children(self.render_pr_thread_count(t, cx))
             .children(self.render_pr_stack(detail, method, t, cx))
-            .children(self.render_pr_primary(detail, primary, method, state_label, state_color, t, cx))
+            .children(self.render_pr_primary(detail, primary, stack, method, state_label, state_color, t, cx))
             .child(self.render_pr_checkout(detail, t, cx))
-            .child(self.render_pr_menu(detail, primary, method, guides, &view, t))
-            .child(collapse_button(t, cx));
+            .child(self.render_pr_menu(detail, primary, stack, method, guides, thread, &view, t));
 
         let author = actor_label(detail.author.as_ref(), t);
         let checkout = logic::checkout_command(&detail.provider, detail.number).map(|command| {
-            copyable_code("pr-copy-checkout", command, panel.copied == Some("checkout"), "Copy checkout command", t)
+            let copied = panel.copied == Some("checkout");
+            copyable_code("pr-copy-checkout", command, copied, "Copy checkout command", "Checkout command copied", t)
                 .ml_auto()
                 .on_click(cx.listener(move |this, _, _, cx| {
                     let command = this
@@ -1085,6 +1245,7 @@ impl Workspace {
                             head,
                             panel.copied == Some("branch"),
                             &format!("Copy {term} branch"),
+                            "Branch name copied",
                             t,
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -1117,10 +1278,10 @@ impl Workspace {
                                 if detail.changed_files == 1 { "file" } else { "files" }
                             )),
                     )
-                    .children(diff_stat(detail.additions, detail.deletions, 12., t)),
+                    .children(breakdown),
             );
 
-        let title = match self.render_pr_title_input(t) {
+        let title = match self.render_pr_title_input(t, cx) {
             Some(input) => input,
             None => h_flex()
                 .min_h(px(24.))
@@ -1158,17 +1319,11 @@ impl Workspace {
         if detail.capabilities.diff {
             tabs.push((Tab::Code, "Code"));
         }
-        let toggle = super::usage::segmented("pr-tab", tabs.into_iter(), tab, t, window, cx, |this, tab, cx| {
-            let Some(panel) = this.pull_requests.panel.as_mut() else { return };
-            panel.tab = tab;
-            if tab == Tab::Guide && panel.guide.is_none() && !panel.guide_loading {
-                this.read_pr_guide(cx);
-            }
-            // The guide's excerpts come from the change's diff.
-            if matches!(tab, Tab::Code | Tab::Guide) {
-                this.open_pr_code(cx);
-            }
-            cx.notify();
+        let toggle = tabs.into_iter().fold(Segmented::new("pr-tab"), |group, (value, label)| {
+            let view = view.clone();
+            group.segment(label, label, value == tab, move |_, cx| {
+                view.update(cx, |this, cx| this.select_pr_tab(value, cx));
+            })
         });
         let status = match tab {
             Tab::Summary => Some(self.render_pr_checks_status(detail, checks_state, checks_stale, t, window, cx)),
@@ -1206,10 +1361,12 @@ impl Workspace {
     }
 
     /// `PullRequestPrimaryAction`.
+    #[expect(clippy::too_many_arguments, reason = "the header draws from the panel's shared render state")]
     fn render_pr_primary(
         &self,
         detail: &Detail,
         primary: Option<Primary>,
+        stack: logic::StackMerge,
         method: &'static str,
         state_label: &'static str,
         state_color: Hsla,
@@ -1262,10 +1419,15 @@ impl Workspace {
                     idle
                 };
                 let icon = if armed == Some(action) { Lucide::Check } else { Lucide::GitMerge };
+                // Still pressable-looking while membership resolves, like the web's aria-disabled.
+                let blocked = stack.blocked_reason();
                 out.push(
                     button(if primary == Primary::Merge { "pr-merge" } else { "pr-enable-auto-merge" }, icon, label)
+                        .when_some(blocked, Button::tooltip)
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.press_pr_action(action, Some(method), window, cx);
+                            if blocked.is_none() {
+                                this.press_pr_action(action, Some(method), window, cx);
+                            }
                         }))
                         .into_any_element(),
                 );
@@ -1300,18 +1462,21 @@ impl Workspace {
     }
 
     /// `PullRequestActionsMenu`.
+    #[expect(clippy::too_many_arguments, reason = "the header draws from the panel's shared render state")]
     fn render_pr_menu(
         &self,
         detail: &Rc<Detail>,
         primary: Option<Primary>,
+        stack: logic::StackMerge,
         method: &'static str,
         guides: bool,
+        thread: Option<&PanelThread>,
         view: &Entity<Workspace>,
         t: &Tokens,
     ) -> impl IntoElement {
         let panel = self.pull_requests.panel.as_ref().expect("a panel is open");
         let (term, short) = logic::terminology(&detail.provider);
-        let actions = logic::menu_actions(detail, primary);
+        let actions = logic::menu_actions(detail, primary, stack);
         let allowed = logic::allowed_merge_methods(detail);
         let busy = panel.pending.is_some();
         let deleting = panel.pending == Some("delete-branch");
@@ -1321,8 +1486,14 @@ impl Workspace {
         let maintainer = logic::can_edit_maintainer_edits(detail)
             .then(|| (panel.maintainer_choice.or(detail.maintainer_can_modify) == Some(true), panel.maintainer_saving));
         let can_link = logic::parse_change_request_url(&detail.url).is_some();
+        let current_thread =
+            thread.and_then(|thread| self.pr_current_thread(&detail.project_id, &thread.id, &detail.url));
         let handoff = panel.handoff.clone();
-        let can_fix = self.shell.projects.iter().any(|p| p.id == detail.project_id);
+        let attaches = self.pr_attaches_to_composer();
+        let can_fix = attaches || self.shell.projects.iter().any(|p| p.id == detail.project_id);
+        let fix_findings = handoff::fix_labels(attaches).findings;
+        let pickable = self.pr_pickable_environments(detail);
+        let acting = self.pr_acting_project(detail);
         let detail = detail.clone();
         let view = view.clone();
         let tip: SharedString =
@@ -1343,12 +1514,24 @@ impl Workspace {
                 let on = |f: fn(&mut Workspace, &mut Window, &mut Context<Workspace>)| {
                     window.listener_for(&view, move |this, _, window, cx| f(this, window, cx))
                 };
-                if can_link {
-                    menu = menu.item(
-                        PopupMenuItem::new("Link to thread")
-                            .icon(Lucide::Link)
-                            .on_click(on(super::super::Workspace::open_pr_thread_picker)),
-                    );
+                match current_thread.clone() {
+                    // `PullRequestThreadLinks display="menu-item"`: the thread showing it links or unlinks it.
+                    Some((id, linked)) if can_link || linked => {
+                        let (label, icon) =
+                            if linked { ("Unlink from this thread", Lucide::Unlink2) } else { ("Link to this thread", Lucide::Link) };
+                        menu = menu.item(PopupMenuItem::new(label).icon(icon).on_click(window.listener_for(
+                            &view,
+                            move |this, _, window, cx| this.change_pr_thread_link(id.clone(), !linked, window, cx),
+                        )));
+                    }
+                    _ if can_link => {
+                        menu = menu.item(
+                            PopupMenuItem::new("Link to thread")
+                                .icon(Lucide::Link)
+                                .on_click(on(super::super::Workspace::open_pr_thread_picker)),
+                        );
+                    }
+                    _ => {}
                 }
                 menu = menu.item(
                     PopupMenuItem::new("Refresh")
@@ -1390,7 +1573,7 @@ impl Workspace {
                         PopupMenuItem::new(if handoff.as_deref() == Some("findings") {
                             "Preparing..."
                         } else {
-                            "Fix findings in a thread"
+                            fix_findings
                         })
                         .icon(Lucide::Hammer)
                         .disabled(busy_handoff || !can_fix)
@@ -1411,6 +1594,7 @@ impl Workspace {
                             .on_click(on(super::super::Workspace::write_pr_guide)),
                     );
                 }
+                menu = handoff::environment_items(menu, &pickable, &acting, busy_handoff, &view, window);
                 menu = menu.separator();
                 if let Some((allowed, saving)) = maintainer {
                     let label = if saving { "Allow edits from maintainers (saving…)" } else { "Allow edits from maintainers" };
@@ -1763,15 +1947,24 @@ impl Workspace {
             meta_row(Lucide::Tag, "Labels", value, t)
         });
 
+        let body = self.pr_description(detail);
         let description = description_open.then(|| {
             if self.pr_editing("description") {
                 return self.render_pr_editor(t, cx);
             }
-            let text = if detail.body.trim().is_empty() { "_No description provided._" } else { detail.body.as_str() };
-            let markdown =
-                self.pr_markdown("description", text, cx).map(|state| pr_markdown_view(&state, t, cx.entity()));
-            let edit = logic::can_edit_change_request(detail)
-                .then(|| self.pr_edit_button("description".into(), "description", detail.body.clone(), t, cx));
+            let text = if body.trim().is_empty() { "_No description provided._" } else { body.as_str() };
+            let editable = logic::can_edit_change_request(detail);
+            let view = cx.entity();
+            let markdown = self.pr_markdown("description", text, cx).map(|state| {
+                let markdown = pr_markdown_view(&state, t, view.clone());
+                if !editable {
+                    return markdown;
+                }
+                markdown.on_task_toggle(move |item_start, checked, window, cx| {
+                    view.update(cx, |this, cx| this.toggle_pr_task(item_start, checked, window, cx));
+                })
+            });
+            let edit = editable.then(|| self.pr_edit_button("description".into(), "description", body.clone(), t, cx));
             let reactions = activity.as_ref().and_then(|a| self.render_pr_reactions(None, &a.reactions, t, cx));
             Some(
                 v_flex()
@@ -1788,7 +1981,7 @@ impl Workspace {
                     .into_any_element(),
             )
         });
-        let checks = checks_open.then(|| render_checks(&detail.checks, stale, t, cx));
+        let checks = checks_open.then(|| self.render_pr_checks(&detail.checks, stale, t, cx));
         let comment_total = activity.as_ref().map_or(0, |a| a.comment_total());
         let comments_body = comments_open.then(|| self.render_pr_comments(detail, activity.as_ref(), t, window, cx));
         let comments_actions = self.render_pr_comment_actions(activity.as_ref(), t, cx);
@@ -2005,6 +2198,7 @@ impl Workspace {
         let preview = (!open).then(|| body.as_deref().map(preview_line)).flatten();
         let opened_body =
             if open { body.as_ref().and_then(|b| self.pr_markdown(&format!("c:{}", root.id), b, cx)) } else { None };
+        let chat = self.render_pr_add_to_chat(&root.id, logic::chat_subject(root, thread), false, t, cx);
         let toggle_key = key;
         v_flex()
             .rounded(px(8.))
@@ -2025,16 +2219,18 @@ impl Workspace {
                                 )))
                             })
                             .child(
-                                h_flex()
-                                    .id(ElementId::Name(format!("pr-fold-{}", item.id()).into()))
+                                gpui_kit::base::Button::new(ElementId::Name(format!("pr-fold-{}", item.id()).into()))
+                                    .flex_none()
                                     .gap(px(6.))
                                     .px(px(8.))
                                     .py(px(4.))
                                     .rounded(px(6.))
                                     .text_xs()
+                                    .line_height(gpui_kit::rems(1.))
                                     .text_color(t.muted_foreground)
                                     .cursor_pointer()
                                     .hover(|s| s.bg(t.muted).text_color(t.foreground))
+                                    .focus_visible(outline_ring(t))
                                     .child(label)
                                     .child(
                                         Icon::new(if open { Lucide::ChevronUp } else { Lucide::ChevronDown })
@@ -2043,7 +2239,8 @@ impl Workspace {
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.toggle_pr_disclosure(toggle_key.clone(), cx);
                                     })),
-                            ),
+                            )
+                            .children(chat),
                     )
                     .children(comment_location(root, thread, t))
                     .children(
@@ -2087,6 +2284,10 @@ impl Workspace {
         let edit = (can_edit && editor.is_none())
             .then(|| self.pr_edit_button(comment.id.clone(), edit_kind, comment.body.clone(), t, cx));
         let reactions = self.render_pr_reactions(Some(&comment.id), &comment.reactions, t, cx);
+        let fix = logic::summary_finding(comment, thread, reply).and_then(|finding| self.render_pr_fix(finding, t, cx));
+        // A reply goes with its conversation, from the card that heads it.
+        let chat = if reply { None } else { logic::chat_subject(comment, thread) };
+        let chat = self.render_pr_add_to_chat(&comment.id, chat, false, t, cx);
         let outcome = logic::review_outcome(comment.review_state.as_deref());
         let state = match (outcome, comment.review_state.as_deref()) {
             (Some(outcome), _) => Some(outcome_badge(outcome, t)),
@@ -2108,8 +2309,17 @@ impl Workspace {
                     .bg(Hsla { a: t.muted.a * 0.25, ..t.muted })
                     .px(px(12.))
                     .py(px(10.))
-                    .child(comment_identity(comment, t))
-                    .children(state)
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .flex_wrap()
+                            .gap(px(8.))
+                            .child(comment_identity(comment, t))
+                            .children(state),
+                    )
+                    .children(fix)
+                    .children(chat)
                     .children(reactions.map(|r| div().ml_auto().child(r))),
             )
             .when(!reply, |el| {
@@ -2173,7 +2383,7 @@ impl Workspace {
                 TimelineRow::Comments(events) => conversation_group(events, &toggled, &view, now, &t, window, cx),
                 TimelineRow::Event(event) => match (&event.thread, event.kind) {
                     (Some(_), _) => thread_event(event, &toggled, &view, now, &t, window, cx),
-                    (None, EventKind::Commit) => commit_event(event, now, &t),
+                    (None, EventKind::Commit) => commit_event(event, &view, now, &t),
                     (None, EventKind::Opened | EventKind::Merged | EventKind::Closed) => {
                         lifecycle_event(event, term, now, &t)
                     }
@@ -2325,16 +2535,19 @@ fn pr_markdown_view(state: &Entity<TextViewState>, t: &Tokens, view: Entity<Work
     )
 }
 
-fn collapse_button(t: &Tokens, cx: &mut Context<Workspace>) -> Button {
-    Button::new("pr-collapse")
+/// `BackButton`: back to the thread's linked pull requests.
+fn back_button(t: &Tokens, cx: &mut Context<Workspace>) -> Button {
+    Button::new("pr-crumb-back")
         .ghost()
         .xsmall()
-        .size(px(24.))
+        .size(px(20.))
         .p_0()
-        .rounded(px(6.))
-        .tooltip("Collapse pull request panel")
-        .child(Icon::new(Lucide::PanelRight).with_size(px(14.)).text_color(t.muted_foreground))
-        .on_click(cx.listener(|this, _, _, cx| this.close_pull_request_panel(cx)))
+        .ml(px(-6.))
+        .tooltip("Back to pull requests")
+        .child(Icon::new(Lucide::ArrowLeft).with_size(px(14.)).text_color(t.muted_foreground))
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.open_surface(super::super::right_panel::Surface::PullRequests, window, cx);
+        }))
 }
 
 /// `Button size="xs" variant="outline"`.
@@ -2364,15 +2577,24 @@ fn ghost_button(id: impl Into<ElementId>, t: &Tokens) -> Button {
         .text_color(t.muted_foreground)
 }
 
-fn number_link(url: &str, number: u64, color: Hsla, open_label: &'static str) -> impl IntoElement {
+fn number_link(
+    url: &str,
+    number: u64,
+    color: Hsla,
+    open_label: &'static str,
+    term: &str,
+    t: &Tokens,
+) -> impl IntoElement {
     let (open, copy, menu_open) = (url.to_owned(), url.to_owned(), url.to_owned());
-    h_flex()
-        .id("pr-crumb-number")
+    gpui_kit::base::Button::new("pr-crumb-number")
         .flex_none()
         .gap(px(2.))
+        .line_height(gpui_kit::rems(1.))
         .font_weight(FontWeight::MEDIUM)
         .text_color(color)
         .cursor_pointer()
+        .focus_visible(outline_ring(t))
+        .accessibility_label(format!("Open {term} #{number} on host"))
         .child(format!("#{number}"))
         .child(Icon::new(Lucide::ExternalLink).with_size(px(10.)).text_color(color))
         .tooltip(move |window, cx| Tooltip::new(open_label).build(window, cx))
@@ -2388,25 +2610,39 @@ fn number_link(url: &str, number: u64, color: Hsla, open_label: &'static str) ->
         })
 }
 
+/// The app's default `:focus-visible` outline (`outline-ring/50`), 2px drawn inside the control.
+fn outline_ring(t: &Tokens) -> impl Fn(gpui_kit::StyleRefinement) -> gpui_kit::StyleRefinement + Copy {
+    inset_ring(Hsla { a: t.ring.a * 0.5, ..t.ring })
+}
+
+/// `focus-visible:ring-2 focus-visible:ring-inset` in `color`.
+fn inset_ring(color: Hsla) -> impl Fn(gpui_kit::StyleRefinement) -> gpui_kit::StyleRefinement + Copy {
+    move |s| s.shadow(vec![gpui_kit::BoxShadow::new(px(0.), px(0.), color).spread_radius(px(2.)).inset()])
+}
+
 /// `PullRequestCopyableCode`: shows "Copied" in place for a moment after a click.
 fn copyable_code(
     id: &'static str,
     value: String,
     copied: bool,
     label: &str,
+    copied_label: &str,
     t: &Tokens,
-) -> gpui_kit::Stateful<gpui_kit::Div> {
+) -> gpui_kit::base::Button {
     let tip: SharedString = format!("{}: {value}", if copied { "Copied" } else { label }).into();
-    div()
-        .id(id)
+    gpui_kit::base::Button::new(id)
+        .block()
         .min_w_0()
         .max_w_full()
         .px(px(4.))
         .py(px(2.))
         .rounded(px(4.))
+        .line_height(gpui_kit::rems(1.))
         .font_family(FONT_MONO)
         .cursor_pointer()
         .hover(|s| s.bg(Hsla { a: t.accent.a * 0.45, ..t.accent }).text_color(t.foreground))
+        .focus_visible(inset_ring(t.ring))
+        .accessibility_label(if copied { copied_label.to_owned() } else { label.to_owned() })
         .child(div().truncate().child(if copied { "Copied".to_owned() } else { value }))
         .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
 }
@@ -2452,6 +2688,29 @@ fn actor_label(actor: Option<&Actor>, t: &Tokens) -> impl IntoElement {
         .child(avatar(actor, 16., t))
         .child(div().truncate().font_weight(FontWeight::MEDIUM).text_color(t.foreground).child(login))
         .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+}
+
+impl Workspace {
+    /// The shown pull request's diff stat, its split read before the hover (`eager`).
+    fn pr_breakdown_stat(
+        &mut self,
+        id: &'static str,
+        detail: &Detail,
+        size: f32,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let stat = diff_stat(detail.additions, detail.deletions, size, t)?;
+        let reference = self.pull_requests.panel.as_ref()?.reference.to_json();
+        let subject = breakdown::Subject {
+            project_id: detail.project_id.clone(),
+            reference,
+            additions: detail.additions,
+            deletions: detail.deletions,
+        };
+        self.read_pr_breakdown(&subject, cx);
+        Some(breakdown::breakdown_stat(id, stat, subject, &cx.entity()))
+    }
 }
 
 fn diff_stat(additions: u64, deletions: u64, size: f32, t: &Tokens) -> Option<impl IntoElement> {
@@ -2628,18 +2887,20 @@ fn section(
         .w_full()
         .pr(px(16.))
         .child(
-            h_flex()
-                .id(ElementId::Name(format!("pr-section-{index}").into()))
+            gpui_kit::base::Button::new(ElementId::Name(format!("pr-section-{index}").into()))
                 .flex_1()
                 .min_w_0()
+                .justify_start()
                 .gap(px(6.))
                 .px(px(16.))
                 .py(px(12.))
                 .text_xs()
+                .line_height(gpui_kit::rems(1.))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(t.muted_foreground)
                 .cursor_pointer()
                 .hover(|s| s.text_color(t.foreground))
+                .focus_visible(outline_ring(t))
                 .child(title.to_owned())
                 .child(
                     Icon::new(if open { Lucide::ChevronDown } else { Lucide::ChevronRight })
@@ -2657,7 +2918,27 @@ fn section(
     v_flex().w_full().child(heading).when(open, |el| el.px(px(16.)).pb(px(16.)))
 }
 
-fn render_checks(checks: &[Check], stale: bool, t: &Tokens, cx: &mut Context<Workspace>) -> AnyElement {
+impl Workspace {
+    fn render_pr_checks(&self, checks: &[Check], stale: bool, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+        let fixes: Vec<Option<Button>> = checks
+            .iter()
+            .map(|check| {
+                matches!(check.status.as_str(), "failure" | "cancelled")
+                    .then(|| self.render_pr_fix(logic::Finding::Check(check.clone()), t, cx))
+                    .flatten()
+            })
+            .collect();
+        render_checks(checks, fixes, stale, t, cx)
+    }
+}
+
+fn render_checks(
+    checks: &[Check],
+    fixes: Vec<Option<Button>>,
+    stale: bool,
+    t: &Tokens,
+    cx: &mut Context<Workspace>,
+) -> AnyElement {
     if stale {
         return h_flex()
             .gap(px(8.))
@@ -2675,24 +2956,34 @@ fn render_checks(checks: &[Check], stale: bool, t: &Tokens, cx: &mut Context<Wor
         return muted_line("No checks reported.", t).into_any_element();
     }
     v_flex()
-        .children(checks.iter().enumerate().map(|(index, check)| {
+        .children(checks.iter().zip(fixes).enumerate().map(|(index, (check, fix))| {
             let (icon, color) = check_status_icon(&check.status, t);
             let url = check.url.clone();
             h_flex()
-                .id(ElementId::Name(format!("pr-check-{index}-{}", check.name).into()))
-                .items_start()
+                .items_center()
                 .gap(px(8.))
-                .px(px(8.))
-                .py(px(8.))
+                .pr(px(4.))
                 .rounded(px(6.))
-                .text_xs()
-                .line_height(px(20.))
-                .when(url.is_some(), gpui_kit::Styled::cursor_pointer)
                 .hover(|s| s.bg(Hsla { a: t.accent.a * 0.6, ..t.accent }))
-                .child(div().mt(px(3.)).child(Icon::new(icon).with_size(px(14.)).text_color(color)))
-                .child(div().flex_1().min_w_0().text_color(t.foreground).child(check.name.clone()))
-                .child(div().flex_none().text_color(t.muted_foreground).child(logic::check_status_label(check)))
-                .when_some(url, |el, url| el.on_click(move |_, _, cx| cx.open_url(&url)))
+                .child(
+                    h_flex()
+                        .id(ElementId::Name(format!("pr-check-{index}-{}", check.name).into()))
+                        .flex_1()
+                        .min_w_0()
+                        .items_start()
+                        .gap(px(8.))
+                        .px(px(8.))
+                        .py(px(8.))
+                        .rounded(px(6.))
+                        .text_xs()
+                        .line_height(px(20.))
+                        .when(url.is_some(), gpui_kit::Styled::cursor_pointer)
+                        .child(div().mt(px(3.)).child(Icon::new(icon).with_size(px(14.)).text_color(color)))
+                        .child(div().flex_1().min_w_0().text_color(t.foreground).child(check.name.clone()))
+                        .child(div().flex_none().text_color(t.muted_foreground).child(logic::check_status_label(check)))
+                        .when_some(url, |el, url| el.on_click(move |_, _, cx| cx.open_url(&url))),
+                )
+                .children(fix)
         }))
         .into_any_element()
 }
@@ -2925,13 +3216,26 @@ fn timeline_body(event: &Event, view: &Entity<Workspace>, t: &Tokens, cx: &mut A
 fn conversation_card(
     event: &Event,
     show_path: bool,
+    reply: bool,
     view: &Entity<Workspace>,
     now: i64,
     t: &Tokens,
     cx: &mut App,
 ) -> AnyElement {
-    let body = timeline_body(event, view, t, cx);
+    let (edit, body) = view.update(cx, |this, cx| {
+        let editor = this.render_pr_timeline_editor(event, t, cx);
+        match editor {
+            Ok(editor) => (None, editor.map(|e| div().pt(px(12.)).child(e).into_any_element())),
+            Err(edit) => (edit, None),
+        }
+    });
+    let body = match body {
+        Some(editor) => Some(editor),
+        None => timeline_body(event, view, t, cx),
+    };
+    let (chat, reactions) = view.update(cx, |this, cx| this.render_pr_timeline_actions(event, reply, t, cx));
     v_flex()
+        .group(write::EDIT_GROUP)
         .py(px(8.))
         .child(
             h_flex()
@@ -2976,10 +3280,53 @@ fn conversation_card(
                             .text_color(t.muted_foreground),
                         ),
                 )
+                .children(edit)
+                .children(chat)
+                .children(reactions)
                 .children(open_on_host_button(format!("pr-open-{}", event.id), event.url.clone(), t)),
         )
         .children(body.map(|body| div().px(px(8.)).pb(px(8.)).child(body)))
         .into_any_element()
+}
+
+impl Workspace {
+    /// An editable card's editor while it is open (`Ok`), else its edit button (`Err`).
+    fn render_pr_timeline_editor(
+        &mut self,
+        event: &Event,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> Result<Option<AnyElement>, Option<AnyElement>> {
+        let Some(comment) = event.comment.as_deref() else { return Err(None) };
+        let detail = self.pull_requests.panel.as_ref().and_then(|p| p.detail.as_ref());
+        let can_edit = detail
+            .is_some_and(|d| logic::can_edit_comment(d, &comment.kind, comment.author.as_ref(), comment.can_edit));
+        if !can_edit {
+            return Err(None);
+        }
+        if self.pr_editing(&comment.id) {
+            return Ok(self.render_pr_editor(t, cx));
+        }
+        let kind: &'static str = if comment.kind == "review-comment" { "review-comment" } else { "issue-comment" };
+        Err(Some(self.pr_edit_button(comment.id.clone(), kind, comment.body.clone(), t, cx)))
+    }
+
+    /// A Timeline card's Add to chat and reactions.
+    fn render_pr_timeline_actions(
+        &mut self,
+        event: &Event,
+        reply: bool,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> (Option<AnyElement>, Option<AnyElement>) {
+        let Some(comment) = event.comment.as_deref() else { return (None, None) };
+        let chat = (event.body.is_some() && !reply).then(|| logic::ChatSubject::Comment(comment.clone()));
+        let chat = self.render_pr_add_to_chat(&format!("timeline:{}", comment.id), chat, true, t, cx);
+        let reactions = self
+            .render_pr_reactions(Some(&comment.id), &comment.reactions, t, cx)
+            .map(|bar| div().ml_auto().child(bar).into_any_element());
+        (chat, reactions)
+    }
 }
 
 fn conversation_group(
@@ -3002,21 +3349,26 @@ fn conversation_group(
     }
     let count = events.len();
     let authors = actors.len();
-    let cards: Vec<AnyElement> =
-        if open { events.iter().map(|e| conversation_card(e, true, view, now, t, cx)).collect() } else { Vec::new() };
+    let cards: Vec<AnyElement> = if open {
+        events.iter().map(|e| conversation_card(e, true, false, view, now, t, cx)).collect()
+    } else {
+        Vec::new()
+    };
     div()
         .relative()
         .mb(px(20.))
         .pl(px(48.))
         .child(actor_marker(actors.first().copied(), Lucide::MessageSquare, !open, Some(8.), t))
         .child(
-            h_flex()
-                .id(ElementId::Name(key.clone().into()))
+            gpui_kit::base::Button::new(ElementId::Name(key.clone().into()))
                 .w_full()
                 .min_w_0()
+                .justify_start()
                 .gap(px(12.))
                 .py(px(8.))
+                .line_height(gpui_kit::rems(1.))
                 .cursor_pointer()
+                .focus_visible(outline_ring(t))
                 .text_color(if open { t.foreground } else { t.muted_foreground })
                 .when(!open, |el| el.opacity(0.55))
                 .hover(|s| s.opacity(1.))
@@ -3030,11 +3382,18 @@ fn conversation_group(
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .child(format!("{count} {}", if count == 1 { "comment" } else { "comments" })),
                         )
-                        .child(div().truncate().text_size(px(10.)).text_color(t.muted_foreground).child(format!(
-                            "{authors} {} · {}",
-                            if authors == 1 { "author" } else { "authors" },
-                            time_label(&first.at, now)
-                        ))),
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(10.))
+                                .line_height(px(14.))
+                                .text_color(t.muted_foreground)
+                                .child(format!(
+                                    "{authors} {} · {}",
+                                    if authors == 1 { "author" } else { "authors" },
+                                    time_label(&first.at, now)
+                                )),
+                        ),
                 )
                 .child(
                     Icon::new(if open { Lucide::ChevronUp } else { Lucide::ChevronDown })
@@ -3062,7 +3421,7 @@ fn thread_event(
             .relative()
             .mb(px(20.))
             .pl(px(48.))
-            .child(conversation_card(event, true, view, now, t, cx))
+            .child(conversation_card(event, true, false, view, now, t, cx))
             .into_any_element();
     };
     let dismissed = logic::review_outcome(event.review_state.as_deref()) == Some("dismissed");
@@ -3076,10 +3435,10 @@ fn thread_event(
     let success = t.success_foreground;
     let mut body = Vec::new();
     if expanded {
-        body.push(conversation_card(event, false, view, now, t, cx));
+        body.push(conversation_card(event, false, false, view, now, t, cx));
         if !thread.replies.is_empty() {
             let cards: Vec<AnyElement> =
-                thread.replies.iter().map(|r| conversation_card(r, false, view, now, t, cx)).collect();
+                thread.replies.iter().map(|r| conversation_card(r, false, true, view, now, t, cx)).collect();
             body.push(
                 v_flex()
                     .ml(px(8.))
@@ -3098,17 +3457,19 @@ fn thread_event(
         .pl(px(48.))
         .child(actor_marker(event.actor.as_ref(), Lucide::MessageSquare, !expanded, Some(0.), t))
         .child(
-            h_flex()
-                .id(ElementId::Name(key.clone().into()))
+            gpui_kit::base::Button::new(ElementId::Name(key.clone().into()))
                 .w_full()
                 .min_w_0()
+                .justify_start()
                 .gap(px(8.))
                 .px(px(8.))
                 .py(px(8.))
                 .text_size(px(11.))
+                .line_height(gpui_kit::rems(1.))
                 .text_color(t.muted_foreground)
                 .cursor_pointer()
                 .hover(|s| s.text_color(t.foreground))
+                .focus_visible(outline_ring(t))
                 .child(Icon::new(Lucide::FileCode).with_size(px(12.)))
                 .child(div().min_w_0().truncate().font_family(FONT_MONO).child(location))
                 .when(thread.is_resolved, |el| {
@@ -3149,11 +3510,24 @@ fn thread_event(
         .into_any_element()
 }
 
-fn commit_event(event: &Event, now: i64, t: &Tokens) -> AnyElement {
-    div()
+/// `CommitEvent`: opens the commit's diff in Code.
+fn commit_event(event: &Event, view: &Entity<Workspace>, now: i64, t: &Tokens) -> AnyElement {
+    let (oid, view, ring, primary) = (event.id.clone(), view.clone(), t.ring, t.primary);
+    let group: SharedString = format!("pr-commit:{}", event.id).into();
+    gpui_kit::base::Button::new(ElementId::Name(group.clone()))
+        .group(group.clone())
+        .accessibility_label(format!("View commit {}", event.id))
+        .focus_visible(move |s| {
+            s.shadow(vec![gpui_kit::BoxShadow::new(px(0.), px(0.), ring).spread_radius(px(2.)).inset()])
+        })
+        .block()
+        .w_full()
+        .rounded(px(2.))
+        .cursor_pointer()
         .relative()
         .mb(px(20.))
         .pl(px(48.))
+        .on_click(move |_, _, cx| view.update(cx, |this, cx| this.open_pr_commit(oid.clone(), cx)))
         .child(actor_marker(event.commit_authors.first(), Lucide::GitCommitHorizontal, false, None, t))
         .child(
             h_flex()
@@ -3170,6 +3544,7 @@ fn commit_event(event: &Event, now: i64, t: &Tokens) -> AnyElement {
                                 .text_xs()
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(t.foreground)
+                                .group_hover(group, move |s| s.text_color(primary))
                                 .child(event.body.clone().unwrap_or_else(|| "Untitled commit".into())),
                         )
                         .child(
@@ -3233,6 +3608,7 @@ fn verdict_event(
     let color = if stale { Hsla { a: 0.7, ..t.muted_foreground } } else { outcome_color(outcome, t) };
     let tip: SharedString = format!("{} earlier changes", logic::outcome_label(outcome)).into();
     let body = timeline_body(event, view, t, cx);
+    let (chat, reactions) = view.update(cx, |this, cx| this.render_pr_timeline_actions(event, false, t, cx));
     div()
         .relative()
         .mb(px(20.))
@@ -3284,6 +3660,8 @@ fn verdict_event(
                             .text_color(t.muted_foreground),
                         ),
                 )
+                .children(chat)
+                .children(reactions)
                 .children(open_on_host_button(format!("pr-open-{}", event.id), event.url.clone(), t)),
         )
         .children(body)

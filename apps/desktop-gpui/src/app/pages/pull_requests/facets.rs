@@ -11,7 +11,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{Icon, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, AppContext as _, Context, ElementId, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, anchored, deferred, div,
+    ScrollHandle, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, anchored, deferred, div,
     prelude::FluentBuilder as _, px, rgb,
 };
 use serde_json::{Value, json};
@@ -36,8 +36,40 @@ pub(super) struct FacetSearch {
     /// The query the host last answered; while it differs from the typed one, its answers wait.
     answered: Option<String>,
     failed: bool,
+    /// The row the arrow keys rest on, which Enter picks (the menu's highlighted item).
+    highlight: Option<usize>,
+    scroll: ScrollHandle,
     _search: Option<Task<()>>,
     _subscription: Subscription,
+}
+
+/// The rows the picker shows, in order.
+enum Visible {
+    Authors(Vec<logic::AuthorFacet>),
+    Labels(Vec<logic::LabelFacet>),
+}
+
+impl Visible {
+    /// How many rows the arrow keys move over: "Anyone" leads the authors.
+    fn len(&self) -> usize {
+        match self {
+            Visible::Authors(facets) => facets.len() + 1,
+            Visible::Labels(facets) => facets.len(),
+        }
+    }
+}
+
+/// `MenuRadioGroup`'s arrow keys: they loop past either end.
+pub(in crate::app::pages) fn step_highlight(highlight: Option<usize>, len: usize, down: bool) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    Some(match (highlight, down) {
+        (None, true) => 0,
+        (None, false) => len - 1,
+        (Some(index), true) => (index + 1) % len,
+        (Some(index), false) => (index + len - 1) % len,
+    })
 }
 
 impl FacetSearch {
@@ -53,10 +85,15 @@ impl Workspace {
             FacetKind::Labels => "Search labels",
         };
         let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
-        let subscription = cx.subscribe(&input, |this, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
+        let subscription = cx.subscribe(&input, |this, _, event: &InputEvent, cx| match event {
+            InputEvent::Change => {
+                if let Some(search) = this.pull_requests.facet_search.as_mut() {
+                    search.highlight = None;
+                }
                 this.search_facets(true, cx);
             }
+            InputEvent::PressEnter { .. } => this.pick_highlighted_facet(cx),
+            _ => {}
         });
         let focus = input.clone();
         // The menu that opened this hands focus back as it closes; take it after that.
@@ -68,6 +105,8 @@ impl Workspace {
             labels: Vec::new(),
             answered: None,
             failed: false,
+            highlight: None,
+            scroll: ScrollHandle::new(),
             _search: None,
             _subscription: subscription,
         });
@@ -142,6 +181,94 @@ impl Workspace {
         }));
     }
 
+    /// The rows for what is typed: the picked value first, then the loaded and hosted choices.
+    fn visible_facets(&self, search: &FacetSearch, cx: &gpui_kit::App) -> Visible {
+        let state = &self.pull_requests;
+        let typed = search.typed(cx);
+        let pending = search.answered.as_deref() != Some(typed.as_str());
+        let (author_facets, label_facets) =
+            state.list.as_ref().map(|l| logic::facets(&l.entries, state.state)).unwrap_or_default();
+        match search.kind {
+            FacetKind::Authors => {
+                let hosted: &[String] = if pending { &[] } else { &search.authors };
+                let value = state.menu.author.clone();
+                let login = value.as_deref().map(str::to_lowercase);
+                let selected = value.as_ref().map(|value| {
+                    author_facets
+                        .iter()
+                        .find(|f| f.login.eq_ignore_ascii_case(value))
+                        .cloned()
+                        .unwrap_or(logic::AuthorFacet { login: value.clone(), count: 0, merged: 0 })
+                });
+                Visible::Authors(
+                    selected
+                        .into_iter()
+                        .chain(
+                            logic::author_choices(&author_facets, hosted, &typed)
+                                .into_iter()
+                                .filter(|f| Some(f.login.to_lowercase()) != login),
+                        )
+                        .take(30)
+                        .collect(),
+                )
+            }
+            FacetKind::Labels => {
+                let hosted: &[(String, Option<String>)] = if pending { &[] } else { &search.labels };
+                let value: Vec<String> = state.menu.labels.iter().flatten().cloned().collect();
+                let choices = logic::label_choices(&label_facets, hosted, &typed);
+                // Picked labels the choices no longer list stay up, so they can be unpicked.
+                let mut visible: Vec<logic::LabelFacet> = value
+                    .iter()
+                    .filter(|name| !choices.iter().any(|c| c.name.eq_ignore_ascii_case(name)))
+                    .map(|name| logic::LabelFacet { name: name.clone(), color: None, count: 0 })
+                    .collect();
+                visible.extend(choices);
+                Visible::Labels(visible)
+            }
+        }
+    }
+
+    /// Picks row `index`: an author closes the picker, a label toggles and leaves it open.
+    fn pick_facet(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(search) = self.pull_requests.facet_search.as_ref() else { return };
+        match self.visible_facets(search, cx) {
+            Visible::Authors(_) if index == 0 => {
+                self.set_pull_request_scope(cx, |state| state.menu.author = None);
+                self.close_facet_search(cx);
+            }
+            Visible::Authors(facets) => {
+                let Some(facet) = facets.into_iter().nth(index - 1) else { return };
+                let current = self.pull_requests.menu.author.as_deref().map(str::to_lowercase);
+                if current != Some(facet.login.to_lowercase()) {
+                    self.set_pull_request_scope(cx, |state| state.menu.author = Some(facet.login));
+                }
+                self.close_facet_search(cx);
+            }
+            Visible::Labels(facets) => {
+                if let Some(facet) = facets.into_iter().nth(index) {
+                    self.toggle_label_filter(facet.name, cx);
+                }
+            }
+        }
+    }
+
+    fn pick_highlighted_facet(&mut self, cx: &mut Context<Self>) {
+        if let Some(index) = self.pull_requests.facet_search.as_ref().and_then(|s| s.highlight) {
+            self.pick_facet(index, cx);
+        }
+    }
+
+    fn move_facet_highlight(&mut self, down: bool, cx: &mut Context<Self>) {
+        let Some(search) = self.pull_requests.facet_search.as_ref() else { return };
+        let len = self.visible_facets(search, cx).len();
+        let Some(search) = self.pull_requests.facet_search.as_mut() else { return };
+        search.highlight = step_highlight(search.highlight, len, down);
+        if let Some(index) = search.highlight {
+            search.scroll.scroll_to_item(index);
+        }
+        cx.notify();
+    }
+
     fn toggle_label_filter(&mut self, label: String, cx: &mut Context<Self>) {
         self.set_pull_request_scope(cx, |state| {
             let mut picked: Vec<String> = state.menu.labels.iter().flatten().cloned().collect();
@@ -161,11 +288,12 @@ impl Workspace {
         let state = &self.pull_requests;
         let typed = search.typed(cx);
         let pending = search.answered.as_deref() != Some(typed.as_str());
-        let (author_facets, label_facets) =
-            state.list.as_ref().map(|l| logic::facets(&l.entries, state.state)).unwrap_or_default();
-        let row = |id: String, checked: bool| {
+        let highlight = search.highlight;
+        let visible = self.visible_facets(search, cx);
+        let row = |id: String, index: usize, checked: bool| {
             h_flex()
                 .id(ElementId::Name(id.into()))
+                .when(highlight == Some(index), |el| el.bg(t.accent))
                 .h(px(28.))
                 .px(px(8.))
                 .gap(px(8.))
@@ -173,6 +301,7 @@ impl Workspace {
                 .cursor_pointer()
                 .text_sm()
                 .hover(|s| s.bg(t.accent))
+                .on_click(cx.listener(move |this, _, _, cx| this.pick_facet(index, cx)))
                 .child(
                     div()
                         .size(px(14.))
@@ -183,35 +312,13 @@ impl Workspace {
         let empty =
             |label: &'static str| div().px(px(8.)).py(px(6.)).text_sm().text_color(t.muted_foreground).child(label);
         let mut rows: Vec<AnyElement> = Vec::new();
-        match search.kind {
-            FacetKind::Authors => {
-                let hosted: &[String] = if pending { &[] } else { &search.authors };
-                let value = state.menu.author.clone();
-                let login = value.as_deref().map(str::to_lowercase);
-                let selected = value.as_ref().map(|value| {
-                    author_facets
-                        .iter()
-                        .find(|f| f.login.eq_ignore_ascii_case(value))
-                        .cloned()
-                        .unwrap_or(logic::AuthorFacet { login: value.clone(), count: 0, merged: 0 })
-                });
-                let visible: Vec<logic::AuthorFacet> = selected
-                    .into_iter()
-                    .chain(
-                        logic::author_choices(&author_facets, hosted, &typed)
-                            .into_iter()
-                            .filter(|f| Some(f.login.to_lowercase()) != login),
-                    )
-                    .take(30)
-                    .collect();
+        match visible {
+            Visible::Authors(visible) => {
+                let login = state.menu.author.as_deref().map(str::to_lowercase);
                 rows.push(
-                    row("pr-author-anyone".into(), value.is_none())
+                    row("pr-author-anyone".into(), 0, login.is_none())
                         .child(Icon::new(Lucide::Layers).size(px(14.)).text_color(t.muted_foreground))
                         .child("Anyone")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.set_pull_request_scope(cx, |state| state.menu.author = None);
-                            this.close_facet_search(cx);
-                        }))
                         .into_any_element(),
                 );
                 if visible.is_empty() && !pending {
@@ -220,11 +327,10 @@ impl Workspace {
                             .into_any_element(),
                     );
                 }
-                for facet in visible {
+                for (index, facet) in visible.into_iter().enumerate() {
                     let checked = Some(facet.login.to_lowercase()) == login;
-                    let picked = facet.login.clone();
                     rows.push(
-                        row(format!("pr-author-{}", facet.login.to_lowercase()), checked)
+                        row(format!("pr-author-{}", facet.login.to_lowercase()), index + 1, checked)
                             .child(div().flex_1().min_w_0().truncate().child(facet.login.clone()))
                             .when(facet.merged > 0, |el| {
                                 el.child(
@@ -235,41 +341,24 @@ impl Workspace {
                                         .child(format!("{} merges loaded", facet.merged)),
                                 )
                             })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let author = picked.clone();
-                                if !checked {
-                                    this.set_pull_request_scope(cx, |state| state.menu.author = Some(author));
-                                }
-                                this.close_facet_search(cx);
-                            }))
                             .into_any_element(),
                     );
                 }
             }
-            FacetKind::Labels => {
-                let hosted: &[(String, Option<String>)] = if pending { &[] } else { &search.labels };
+            Visible::Labels(visible) => {
                 let value: Vec<String> = state.menu.labels.iter().flatten().cloned().collect();
-                let choices = logic::label_choices(&label_facets, hosted, &typed);
-                // Picked labels the choices no longer list stay up, so they can be unpicked.
-                let mut visible: Vec<logic::LabelFacet> = value
-                    .iter()
-                    .filter(|name| !choices.iter().any(|c| c.name.eq_ignore_ascii_case(name)))
-                    .map(|name| logic::LabelFacet { name: name.clone(), color: None, count: 0 })
-                    .collect();
-                visible.extend(choices);
                 if visible.is_empty() && !pending {
                     rows.push(
                         empty(if search.failed { "Couldn't search labels on the host" } else { "No labels found" })
                             .into_any_element(),
                     );
                 }
-                for facet in visible {
+                for (index, facet) in visible.into_iter().enumerate() {
                     let checked = value.iter().any(|v| v.eq_ignore_ascii_case(&facet.name));
                     let dot =
                         logic::label_color(facet.color.as_deref()).map_or(t.muted_foreground, |hex| rgb(hex).into());
-                    let picked = facet.name.clone();
                     rows.push(
-                        row(format!("pr-label-{}", facet.name.to_lowercase()), checked)
+                        row(format!("pr-label-{}", facet.name.to_lowercase()), index, checked)
                             .child(div().size(px(10.)).flex_none().rounded_full().bg(dot))
                             .child(div().flex_1().min_w_0().truncate().child(facet.name.clone()))
                             .when(facet.count > 0, |el| {
@@ -281,7 +370,6 @@ impl Workspace {
                                         .child(facet.count.to_string()),
                                 )
                             })
-                            .on_click(cx.listener(move |this, _, _, cx| this.toggle_label_filter(picked.clone(), cx)))
                             .into_any_element(),
                     );
                 }
@@ -300,10 +388,12 @@ impl Workspace {
             .occlude()
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_facet_search(cx)))
             .capture_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| {
-                if event.keystroke.key == "escape" {
-                    cx.stop_propagation();
-                    this.close_facet_search(cx);
+                match event.keystroke.key.as_str() {
+                    "escape" => this.close_facet_search(cx),
+                    "down" | "up" => this.move_facet_highlight(event.keystroke.key == "down", cx),
+                    _ => return,
                 }
+                cx.stop_propagation();
             }))
             .child(
                 h_flex()
@@ -321,7 +411,15 @@ impl Workspace {
                     )
                     .when(pending, |el| el.child(div().text_xs().text_color(t.muted_foreground).child("…"))),
             )
-            .child(v_flex().id("pr-facet-search-list").max_h(px(320.)).overflow_y_scroll().gap(px(1.)).children(rows));
+            .child(
+                v_flex()
+                    .id("pr-facet-search-list")
+                    .max_h(px(320.))
+                    .overflow_y_scroll()
+                    .track_scroll(&search.scroll)
+                    .gap(px(1.))
+                    .children(rows),
+            );
         Some(
             div()
                 .absolute()
@@ -336,5 +434,19 @@ impl Workspace {
                 )
                 .into_any_element(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::step_highlight;
+
+    #[test]
+    fn the_arrow_keys_loop_over_the_rows() {
+        assert_eq!(step_highlight(None, 3, true), Some(0));
+        assert_eq!(step_highlight(None, 3, false), Some(2));
+        assert_eq!(step_highlight(Some(2), 3, true), Some(0));
+        assert_eq!(step_highlight(Some(0), 3, false), Some(2));
+        assert_eq!(step_highlight(Some(1), 0, true), None);
     }
 }

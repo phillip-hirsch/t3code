@@ -8,6 +8,7 @@ pub(in crate::app) mod code;
 mod connections;
 pub(in crate::app) use connections::check_filesystem_read;
 pub(in crate::app) use connections::check_scope;
+pub(in crate::app) use connections::check_source_control_write;
 pub(in crate::app) use connections::logic::{machine_icon, one_password_account};
 pub(in crate::app) use connections::operates_terminals;
 pub(in crate::app) use connections::{SessionLoad, check_session};

@@ -89,7 +89,7 @@ impl Workspace {
                 let (view, url) = (view.clone(), url.clone());
                 let label = if linked { "Unlink from thread" } else { "Link to thread" };
                 menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
-                    let _ = view.update(cx, |w, cx| w.change_pr_thread_link(&thread_id, &url, !linked, window, cx));
+                    let _ = view.update(cx, |w, cx| w.change_pr_link_by_url(&thread_id, &url, !linked, window, cx));
                 }));
             }
             if let Some(thread_id) = in_preview {
@@ -109,7 +109,7 @@ impl Workspace {
     }
 
     /// `pullRequestLinking.changeLink`: links or unlinks the change request `url` names.
-    fn change_pr_thread_link(
+    fn change_pr_link_by_url(
         &mut self,
         thread_id: &str,
         url: &str,

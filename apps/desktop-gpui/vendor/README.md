@@ -205,15 +205,15 @@ soft break inside a text node becomes a newline. Files:
 and stay selectable. `src/selectable_text.rs`: `SelectableText::highlights`, passing through to its
 `StyledText`.
 
-**Task checkboxes can toggle.** The web's rendered Markdown file checks a task off by editing its
-`[ ]` (`onTaskListChange`). 0.9.0's checkboxes only show their state. The patch adds
+**Task checkboxes can toggle.** The web's rendered Markdown file and pull request description
+check a task off by editing its `[ ]` (`onTaskListChange`). 0.9.0's checkboxes only show their state. The patch adds
 `TextView::on_task_toggle`: with a handler, a task's checkbox takes clicks and passes the list
 item's source offset and the state it asks for; the app edits the source. Files:
 
 - `src/text/text_view.rs`: `TaskToggleFn`, the `task_toggle_handler` field and builder.
 - `src/text/state.rs`: the handler, passed into each frame's `NodeContext`.
 - `src/text/node.rs`: `NodeContext::task_toggle_handler`; `render_list_item` and
-  `render_list_item_row` make the checkbox clickable.
+  `render_list_item_row` make the checkbox clickable; a press on it doesn't start a selection.
 
 gpui-component's `src/text/compat.rs` forwards `on_task_toggle` from its `TextView`.
 
@@ -268,6 +268,9 @@ an input the same at every width. Files:
 **A button's text size reaches its label.** 0.9.0's `Button` sets its label row's text size from
 its `Size`, so `.text_base()` on the button never showed. `src/button/button.rs` now keeps the
 `Size`'s text size only when the caller set none.
+
+**Text views pass task toggles through.** `src/text/compat.rs`: `TextView::on_task_toggle` forwards
+to gpui-base's (see its "Task-list checkboxes can be pressed").
 
 **The tooltip looks like the web's.** 0.9.0's `Tooltip` wraps its popup in a 12px margin, the gap
 from the pointer; gpui-pre's window now sets the gap (see gpui-pre's "Tooltips sit 4px off their

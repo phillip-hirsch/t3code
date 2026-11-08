@@ -57,6 +57,9 @@ impl Workspace {
             self.held_key = Some(keystroke.clone());
             return true;
         }
+        if self.pull_request_find_key(keystroke, window, cx) {
+            return true;
+        }
         self.composer_key(keystroke, &context, window, cx)
     }
 
@@ -434,7 +437,7 @@ impl Workspace {
             // Usage is a modal with no areas of its own.
             Some(page) if page.is_modal() => return Vec::new(),
             Some(pages::Page::PullRequests) => {
-                vec![sidebar, (Area::Content, true), (Area::Panel, self.pull_requests_panel_shown())]
+                vec![sidebar, (Area::Content, true), (Area::Panel, self.pull_request_panel_shown())]
             }
             Some(_) => vec![sidebar],
             None => vec![

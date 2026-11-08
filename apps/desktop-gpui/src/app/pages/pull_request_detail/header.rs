@@ -9,6 +9,59 @@ use super::*;
 use crate::app::palette::LinkedThread;
 use crate::pull_request_detail::Stack;
 
+/// `ChecksBody`: checks needing attention and running ones first; completed ones fold behind
+/// "Show all" while any of those show.
+pub(in crate::app::pages) fn checks_body(
+    checks: &[Check],
+    show_all: bool,
+    on_toggle: impl Fn(&mut App) + 'static,
+    t: &Tokens,
+) -> AnyElement {
+    if checks.is_empty() {
+        return div().text_xs().text_color(t.muted_foreground).child("No checks reported").into_any_element();
+    }
+    let (attention, running, completed) = logic::group_checks(checks);
+    let collapsible = !(completed.is_empty() || (attention.is_empty() && running.is_empty()));
+    let rows = attention
+        .iter()
+        .chain(running.iter())
+        .copied()
+        .chain(completed.iter().copied().filter(|_| show_all || !collapsible))
+        .enumerate()
+        .map(|(index, check)| {
+            let (icon, color) = check_status_icon(&check.status, t);
+            let url = check.url.clone();
+            h_flex()
+                .gap(px(8.))
+                .text_xs()
+                .child(Icon::new(icon).with_size(px(14.)).text_color(color))
+                .child(div().flex_1().min_w_0().truncate().child(check.name.clone()))
+                .child(div().flex_none().text_color(t.muted_foreground).child(logic::check_status_label(check)))
+                .children(url.map(|url| {
+                    div()
+                        .id(ElementId::Name(format!("pr-check-details-{index}-{}", check.name).into()))
+                        .flex_none()
+                        .cursor_pointer()
+                        .text_color(t.primary)
+                        .hover(gpui_kit::Styled::underline)
+                        .child("Details")
+                        .on_click(move |_, _, cx| cx.open_url(&url))
+                }))
+        });
+    v_flex()
+        .child(v_flex().id("pr-checks-list").max_h(px(256.)).overflow_y_scroll().gap(px(4.)).children(rows))
+        .when(collapsible, |el| {
+            el.child(
+                div().mt(px(4.)).child(
+                    ghost_button("pr-checks-show-all", t)
+                        .child(if show_all { "Show less" } else { "Show all" })
+                        .on_click(move |_, _, cx| on_toggle(cx)),
+                ),
+            )
+        })
+        .into_any_element()
+}
+
 /// The pull request's key as threads record it: the link's host and lowercase repository.
 fn thread_key(detail: &Detail) -> Option<(String, String, u64)> {
     let (host, repository, number) = logic::parse_change_request_url(&detail.url)?;
@@ -25,12 +78,16 @@ impl Workspace {
 
     /// `key`'s stack and linked threads, read once the detail says what the host supports.
     pub(super) fn read_pr_extras_of(&mut self, key: &str, cx: &mut Context<Self>) {
+        self.follow_pr_checks(key, cx);
         let Some(client) = self.pull_request_client_of(key) else { return };
         let Some(panel) = self.pr_panel_ref(key) else { return };
         let Some(detail) = panel.detail.clone() else { return };
         let key = key.to_owned();
         let mut reference = panel.reference.to_json();
         if detail.capabilities.stacks == Some(true) {
+            if let Some(panel) = self.pr_panel(&key) {
+                panel.stack_fresh = false;
+            }
             let (client, key) = (client.clone(), key.clone());
             let mut input = reference.clone();
             if input.get("host").is_none()
@@ -45,6 +102,7 @@ impl Workspace {
                     match result.map(serde_json::from_value::<Option<Stack>>) {
                         Ok(Ok(stack)) => {
                             panel.stack = stack.map(Rc::new);
+                            panel.stack_fresh = true;
                             panel.stack_failed = false;
                         }
                         Ok(Err(error)) => {
@@ -171,44 +229,7 @@ impl Workspace {
             .p(px(12.))
             .content(move |_, _, cx| {
                 let t = *theme::tokens(cx);
-                let (attention, running, completed) = logic::group_checks(&checks);
-                let collapsible = !(completed.is_empty() || (attention.is_empty() && running.is_empty()));
-                let visible: Vec<&Check> = attention
-                    .iter()
-                    .chain(running.iter())
-                    .copied()
-                    .chain(completed.iter().copied().filter(|_| show_all || !collapsible))
-                    .collect();
-                let rows: Vec<AnyElement> = visible
-                    .iter()
-                    .enumerate()
-                    .map(|(index, check)| {
-                        let (icon, color) = check_status_icon(&check.status, &t);
-                        let url = check.url.clone();
-                        h_flex()
-                            .gap(px(8.))
-                            .text_xs()
-                            .child(Icon::new(icon).with_size(px(14.)).text_color(color))
-                            .child(div().flex_1().min_w_0().truncate().child(check.name.clone()))
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .text_color(t.muted_foreground)
-                                    .child(logic::check_status_label(check)),
-                            )
-                            .children(url.map(|url| {
-                                div()
-                                    .id(ElementId::Name(format!("pr-check-details-{index}-{}", check.name).into()))
-                                    .flex_none()
-                                    .cursor_pointer()
-                                    .text_color(t.primary)
-                                    .hover(gpui_kit::Styled::underline)
-                                    .child("Details")
-                                    .on_click(move |_, _, cx| cx.open_url(&url))
-                            }))
-                            .into_any_element()
-                    })
-                    .collect();
+                let view = view.clone();
                 v_flex()
                     .child(div().mb(px(8.)).text_sm().font_weight(FontWeight::MEDIUM).child(label))
                     .children(
@@ -222,35 +243,21 @@ impl Workspace {
                                     .text_color(t.muted_foreground)
                                     .child("Check details are out of date. Refresh the pull request to update them."),
                             )
-                        } else if checks.is_empty() {
-                            el.child(div().text_xs().text_color(t.muted_foreground).child("No checks reported"))
                         } else {
-                            el.child(
-                                v_flex()
-                                    .id("pr-checks-list")
-                                    .max_h(px(256.))
-                                    .overflow_y_scroll()
-                                    .gap(px(4.))
-                                    .children(rows),
-                            )
+                            el.child(checks_body(
+                                &checks,
+                                show_all,
+                                move |cx| {
+                                    view.update(cx, |this, cx| {
+                                        if let Some(panel) = this.pull_requests.panel.as_mut() {
+                                            panel.checks_all = !panel.checks_all;
+                                        }
+                                        cx.notify();
+                                    });
+                                },
+                                &t,
+                            ))
                         }
-                    })
-                    .when(collapsible && !stale, |el| {
-                        let view = view.clone();
-                        el.child(
-                            div().mt(px(4.)).child(
-                                ghost_button("pr-checks-show-all", &t)
-                                    .child(if show_all { "Show less" } else { "Show all" })
-                                    .on_click(move |_, _, cx| {
-                                        view.update(cx, |this, cx| {
-                                            if let Some(panel) = this.pull_requests.panel.as_mut() {
-                                                panel.checks_all = !panel.checks_all;
-                                            }
-                                            cx.notify();
-                                        });
-                                    }),
-                            ),
-                        )
                     })
             })
             .into_any_element()
@@ -351,7 +358,8 @@ impl Workspace {
                             .child(div().flex_none().text_xs().text_color(t.muted_foreground).child(project.clone()))
                             .on_click(move |_, window, cx| {
                                 window.close_dialog(cx);
-                                let _ = view.update(cx, |this, cx| this.link_pr_to_thread(id.clone(), window, cx));
+                                let _ = view
+                                    .update(cx, |this, cx| this.change_pr_thread_link(id.clone(), true, window, cx));
                             })
                             .into_any_element()
                     })
@@ -366,21 +374,52 @@ impl Workspace {
         });
     }
 
-    /// `thread.pull-request.link`, then the linked threads are read again.
-    fn link_pr_to_thread(&mut self, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
+    /// The thread showing the pull request, when it lives on the pull request's environment, and
+    /// whether it links it (`usePullRequestLinking().isLinked`).
+    pub(super) fn pr_current_thread(&self, project_id: &str, thread_id: &str, url: &str) -> Option<(String, bool)> {
+        let thread = self.shell.threads.iter().find(|t| t.id == thread_id)?;
+        if self.project_environment(&thread.project_id) != self.project_environment(project_id) {
+            return None;
+        }
+        Some((thread.id.clone(), crate::thread_pull_requests::links_url(&thread.pull_requests, url)))
+    }
+
+    /// `thread.pull-request.link` or `.unlink`, then the linked threads are read again.
+    pub(super) fn change_pr_thread_link(
+        &mut self,
+        thread_id: String,
+        link: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(client) = self.thread_client(&thread_id) else { return };
         let Some(detail) = self.pull_requests.panel.as_ref().and_then(|p| p.detail.clone()) else { return };
         let Some((host, repository, number)) = thread_key(&detail) else { return };
         let term = logic::terminology(&detail.provider).0;
-        let command = json!({
-            "type": "thread.pull-request.link", "commandId": super::super::super::new_id(), "threadId": thread_id,
-            "host": host, "repository": repository, "number": number, "url": detail.url, "source": "manual",
-        });
+        let id = super::super::super::new_id();
+        let command = if link {
+            json!({
+                "type": "thread.pull-request.link", "commandId": id, "threadId": thread_id,
+                "host": host, "repository": repository, "number": number, "url": detail.url, "source": "manual",
+            })
+        } else {
+            json!({
+                "type": "thread.pull-request.unlink", "commandId": id, "threadId": thread_id,
+                "host": host, "repository": repository, "number": number,
+            })
+        };
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("orchestration.dispatchCommand", command).await;
             let _ = this.update_in(cx, |this, window, cx| match result {
                 Ok(_) => this.read_pr_extras(cx),
-                Err(error) => toast_error(window, cx, format!("Could not link the {term}"), error.to_string()),
+                Err(error) => {
+                    let title = if link {
+                        format!("Could not link the {term}")
+                    } else {
+                        format!("Could not unlink the {term}")
+                    };
+                    toast_error(window, cx, title, error.to_string());
+                }
             });
         })
         .detach();
@@ -442,7 +481,8 @@ impl Workspace {
             }
             return Vec::new();
         };
-        let plan = logic::stack_plan(&stack, detail.number);
+        // A stack kept from before a failed or running lookup may have moved (`stale`).
+        let plan = logic::stack_plan(&stack, detail.number, !panel.stack_fresh || panel.stack_failed);
         let actions = detail.capabilities.stack_actions == Some(true);
         let can_merge = actions && logic::can(detail, "merge") && !logic::allowed_merge_methods(detail).is_empty();
         let can_rebase = actions && detail.viewer_permissions.stack_rebase == Some(true);
@@ -552,7 +592,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(detail) = self.pull_requests.panel.as_ref().and_then(|p| p.detail.clone()) else { return };
-        let plan = logic::stack_plan(&stack, detail.number);
+        let plan = logic::stack_plan(&stack, detail.number, false);
         let merge = action == "merge";
         let layers = if merge { plan.merge } else { plan.rebase };
         let term = logic::terminology(&detail.provider).0;
@@ -631,7 +671,7 @@ impl Workspace {
     ) {
         let Some(client) = self.pull_request_client() else { return };
         let Some(panel) = self.pull_requests.panel.as_mut() else { return };
-        if panel.pending.is_some() {
+        if panel.pending.is_some() || !panel.stack_fresh || panel.stack_failed {
             return;
         }
         let merge = action == "merge";
