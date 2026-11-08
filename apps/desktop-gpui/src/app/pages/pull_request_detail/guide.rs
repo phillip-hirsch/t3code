@@ -3,12 +3,51 @@
 //! lines, the other files it touches, questions to hand an agent, and the way to the next stop.
 
 use crate::pull_request_detail::{Guide, GuideExcerpt, GuideStop};
-use crate::pull_request_diff::{self as diff_logic, Row};
+use crate::pull_request_diff::{self as diff_logic, FilePatch, Row};
 
 use super::*;
 
 /// `@min-[56rem]/guide`: from this panel width the stops list stays beside the stop.
 const RAIL_BESIDE: f32 = 896.;
+
+/// `useGuideDiffFiles`: the whole change's diff for one written guide, read a page at a time
+/// until the stop's files are in it or the pages run out.
+#[derive(Default)]
+pub(super) struct GuideDiff {
+    head: String,
+    cursor: Option<String>,
+    done: bool,
+    files: HashMap<String, FilePatch>,
+    loading: bool,
+    error: Option<String>,
+    _read: Option<Task<()>>,
+}
+
+impl GuideDiff {
+    /// Another written guide starts the pages over.
+    fn reset_for(&mut self, head: &str) {
+        if self.head != head {
+            *self = Self { head: head.to_owned(), ..Self::default() };
+        }
+    }
+
+    /// The cursor of the page to read next, while a wanted file is missing and pages remain.
+    fn next_read(&self, wanted: &[&str]) -> Option<Option<String>> {
+        let missing = wanted.iter().any(|path| !self.files.contains_key(*path));
+        (missing && !self.done && !self.loading && self.error.is_none()).then(|| self.cursor.clone())
+    }
+
+    fn fold(&mut self, patch: &str, next_cursor: Option<String>) {
+        self.files.extend(diff_logic::index_patch(patch).into_iter().map(|file| (file.path.clone(), file)));
+        self.done = next_cursor.is_none();
+        self.cursor = next_cursor;
+    }
+
+    /// A missing file may still arrive.
+    fn pending(&self) -> bool {
+        !self.done && self.error.is_none()
+    }
+}
 
 impl Workspace {
     /// The tour of a written guide, under its banner.
@@ -28,9 +67,24 @@ impl Workspace {
             panel.guide_position = 0;
             panel.guide_seen.clear();
         }
-        let panel = self.pull_requests.panel.as_ref().expect("a panel is open");
         let count = guide.stops.len();
-        let position = panel.guide_position.min(count.saturating_sub(1));
+        let position = self.pull_requests.panel.as_ref().map_or(0, |p| p.guide_position.min(count.saturating_sub(1)));
+        if let Some(stop) = guide.stops.get(position) {
+            let wanted: Vec<&str> = stop
+                .excerpts
+                .iter()
+                .map(|e| e.path.as_str())
+                .chain(stop.files.iter().map(|f| f.path.as_str()))
+                .collect();
+            self.follow_pr_guide_diff(&guide.head_sha, &wanted, cx);
+        }
+        let panel = self.pull_requests.panel.as_ref().expect("a panel is open");
+        let diff_error = panel.guide_diff.error.clone().map(|error| {
+            div()
+                .text_xs()
+                .text_color(t.muted_foreground)
+                .child(format!("The diff could not be loaded, so excerpts are missing: {error}"))
+        });
         let seen = panel.guide_seen.clone();
         let rail_open = panel.guide_rail_open;
         let beside = width >= RAIL_BESIDE;
@@ -48,7 +102,7 @@ impl Workspace {
                 self.render_pr_guide_stop(stop, position, count, next, beside, list, t, cx)
             }
         };
-        let column = v_flex().flex_1().min_w_0().gap(px(16.)).children(banner).child(main);
+        let column = v_flex().flex_1().min_w_0().gap(px(16.)).children(banner).children(diff_error).child(main);
         div()
             .id("pr-guide")
             .size_full()
@@ -66,6 +120,41 @@ impl Workspace {
                     .child(column),
             )
             .into_any_element()
+    }
+
+    /// Reads the guide's next diff page when the stop wants a file the read pages lack.
+    fn follow_pr_guide_diff(&mut self, head: &str, wanted: &[&str], cx: &mut Context<Self>) {
+        let Some(panel) = self.pull_requests.panel.as_mut() else { return };
+        panel.guide_diff.reset_for(head);
+        let Some(cursor) = panel.guide_diff.next_read(wanted) else { return };
+        let (key, mut input) = (panel.reference.key(), panel.reference.to_json());
+        if let Some(cursor) = &cursor {
+            input["cursor"] = json!(cursor);
+        }
+        let project_id = panel.reference.project_id.clone();
+        let endpoint = self.project_endpoint(&project_id).cloned();
+        let Some(panel) = self.pull_requests.panel.as_mut() else { return };
+        let head = head.to_owned();
+        panel.guide_diff.loading = true;
+        panel.guide_diff._read = Some(cx.spawn(async move |this, cx| {
+            let result = super::code::read_diff(endpoint, input).await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(diff) = this.pr_panel(&key).map(|p| &mut p.guide_diff).filter(|d| d.head == head) else {
+                    return;
+                };
+                diff.loading = false;
+                match result {
+                    Ok(value) => {
+                        diff.fold(
+                            value["patch"].as_str().unwrap_or_default(),
+                            value["nextCursor"].as_str().map(str::to_owned),
+                        );
+                    }
+                    Err(error) => diff.error = Some(error),
+                }
+                cx.notify();
+            });
+        }));
     }
 
     fn set_pr_guide_stop(&mut self, next: usize, cx: &mut Context<Self>) {
@@ -261,7 +350,7 @@ impl Workspace {
                 )
         });
         let notes_by_excerpt = logic::excerpt_note_lines(stop);
-        let loading = self.pull_requests.panel.as_ref().and_then(|p| p.code.as_ref()).is_none_or(|c| !c.loaded());
+        let loading = self.pull_requests.panel.as_ref().is_some_and(|p| p.guide_diff.pending());
         let excerpts: Vec<AnyElement> = stop
             .excerpts
             .iter()
@@ -391,8 +480,7 @@ impl Workspace {
             .pull_requests
             .panel
             .as_ref()
-            .and_then(|p| p.code.as_ref())
-            .and_then(|c| c.patch(&excerpt.path))
+            .and_then(|p| p.guide_diff.files.get(&excerpt.path))
             .map(|file| diff_logic::excerpt_rows(&diff_logic::file_rows(file), new_side, excerpt.start, excerpt.end))
             .unwrap_or_default();
         let caption = (!excerpt.caption.trim().is_empty())
@@ -464,13 +552,12 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let panel = self.pull_requests.panel.as_ref().expect("a panel is open");
-        let code = panel.code.as_ref();
         let rows: Vec<AnyElement> = files
             .iter()
             .enumerate()
             .map(|(i, (path, note))| {
                 let open = panel.guide_files_open.contains(path);
-                let patch = code.and_then(|c| c.patch(path));
+                let patch = panel.guide_diff.files.get(path);
                 let stat = patch.map(diff_logic::FilePatch::stat);
                 let key = path.clone();
                 let trigger = h_flex()
@@ -729,4 +816,28 @@ fn code_rows(rows: &[Row], notes: &[(u64, Vec<(String, String)>)], new_side: boo
         }
     }
     out.into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn page(path: &str) -> String {
+        format!("diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-old\n+new\n")
+    }
+
+    #[test]
+    fn the_guide_reads_pages_until_the_stop_has_its_files() {
+        let mut diff = GuideDiff::default();
+        diff.reset_for("head");
+        assert_eq!(diff.next_read(&["b.rs"]), Some(None), "the first page");
+        diff.fold(&page("a.rs"), Some("2".into()));
+        assert_eq!(diff.next_read(&["b.rs"]), Some(Some("2".into())), "b.rs is on a later page");
+        assert_eq!(diff.next_read(&["a.rs"]), None, "a.rs is already read");
+        diff.fold(&page("b.rs"), None);
+        assert_eq!(diff.next_read(&["b.rs", "c.rs"]), None, "no pages remain");
+        assert!(!diff.pending(), "c.rs will never arrive");
+        diff.reset_for("next head");
+        assert_eq!(diff.next_read(&["a.rs"]), Some(None), "another guide starts over");
+    }
 }

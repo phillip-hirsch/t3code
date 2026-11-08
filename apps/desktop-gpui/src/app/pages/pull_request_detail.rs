@@ -141,6 +141,7 @@ pub(in crate::app) struct Panel {
     guide_seen: HashSet<usize>,
     guide_rail_open: bool,
     guide_files_open: HashSet<String>,
+    guide_diff: guide::GuideDiff,
 }
 
 impl Panel {
@@ -203,6 +204,7 @@ impl Panel {
             guide_seen: HashSet::new(),
             guide_rail_open: false,
             guide_files_open: HashSet::new(),
+            guide_diff: guide::GuideDiff::default(),
         }
     }
 
@@ -1240,8 +1242,7 @@ impl Workspace {
             if tab == Tab::Guide && panel.guide.is_none() && !panel.guide_loading {
                 this.read_pr_guide(cx);
             }
-            // The guide's excerpts come from the change's diff.
-            if matches!(tab, Tab::Code | Tab::Guide) {
+            if tab == Tab::Code {
                 this.open_pr_code(cx);
             }
             cx.notify();

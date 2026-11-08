@@ -91,11 +91,6 @@ impl CodeTab {
         }
     }
 
-    /// The first page of the diff has been read.
-    pub(super) fn loaded(&self) -> bool {
-        !self.slices.is_empty()
-    }
-
     /// Unfolds a file and scrolls the viewer to it.
     pub(super) fn reveal(&self, path: &str, cx: &mut App) {
         self.diff.update(cx, |state, cx| {
@@ -218,7 +213,7 @@ fn merge_comments(first: &[ThreadComment], later: &[ThreadComment]) -> Vec<Threa
 }
 
 /// `POST /api/pull-requests/diff` with this client's bearer session.
-async fn read_diff(endpoint: Option<Endpoint>, input: Value) -> Result<Value, String> {
+pub(super) async fn read_diff(endpoint: Option<Endpoint>, input: Value) -> Result<Value, String> {
     let endpoint = endpoint.ok_or("Not connected to the environment.")?;
     let request = async move {
         static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
