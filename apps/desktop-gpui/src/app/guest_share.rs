@@ -13,7 +13,7 @@ use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _, 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, AppContext as _, ClipboardItem, Context, Entity, FontWeight, InteractiveElement as _, IntoElement,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    ParentElement as _, SharedString, Styled as _, Window, div, px,
 };
 use serde_json::{Value, json};
 
@@ -209,22 +209,21 @@ impl Workspace {
         let closing = self.share_header.closing.as_deref() == Some(id.as_str());
         let thread_id = id.clone();
         let (accent, foreground) = (t.accent, t.foreground);
-        // `Button size="xs" variant="ghost-muted"`.
-        let stop = h_flex()
-            .id("guest-share-stop")
+        let ring = gpui_kit::BoxShadow::new(px(0.), px(0.), t.ring).spread_radius(px(2.)).inset();
+        // `Button size="xs" variant="ghost-muted"`, `disabled` while the close is in flight.
+        let stop = gpui_kit::base::Button::new("guest-share-stop")
             .occlude()
             .flex_none()
             .h(px(24.))
             .px(px(8.))
             .rounded(px(8.))
             .font_weight(FontWeight::MEDIUM)
+            .disabled(closing)
+            .focus_visible(move |s| s.shadow(vec![ring]))
             .child("Stop sharing")
             .when(closing, |el| el.opacity(0.64))
-            .when(!closing, |el| {
-                el.cursor_pointer()
-                    .hover(move |s| s.bg(accent).text_color(foreground))
-                    .on_click(cx.listener(move |this, _, _, cx| this.stop_guest_share(&thread_id, cx)))
-            });
+            .when(!closing, |el| el.cursor_pointer().hover(move |s| s.bg(accent).text_color(foreground)))
+            .on_click(cx.listener(move |this, _, _, cx| this.stop_guest_share(&thread_id, cx)));
         Some(
             h_flex()
                 .flex_none()
