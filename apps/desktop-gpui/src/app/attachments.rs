@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 use super::composer::ComposerDraft;
 use super::snap_shot::SnapShotSource;
 use super::{Target, Workspace, new_id};
-use crate::composer_text;
+use crate::composer_text::{self, Chip};
 use crate::theme::Tokens;
 
 pub(super) const MAX_ATTACHMENTS: usize = 100;
@@ -196,6 +196,33 @@ fn find_attachment<'a>(
         .find(|(_, attachment)| attachment.local_id == local_id)
 }
 
+/// Moves attachments whose chip left the text (it was in `previous`, not in `live`) into
+/// `retained`, and retained ones whose chip is back into `attachments`; `None` when nothing
+/// moved, else the restored attachments that need their upload taken again.
+fn reconcile_chips(
+    attachments: &mut Vec<Attachment>,
+    retained: &mut Vec<Attachment>,
+    previous: &[String],
+    live: &[String],
+) -> Option<Vec<String>> {
+    let (dropped, kept): (Vec<_>, Vec<_>) = mem::take(attachments).into_iter().partition(|a| {
+        let id = a.chip_id();
+        previous.contains(&id) && !live.contains(&id)
+    });
+    let (restored, still): (Vec<_>, Vec<_>) =
+        mem::take(retained).into_iter().partition(|a| live.contains(&a.chip_id()));
+    *attachments = kept;
+    *retained = still;
+    if dropped.is_empty() && restored.is_empty() {
+        return None;
+    }
+    retained.extend(dropped);
+    let reupload = restored.iter().filter(|a| !matches!(a.upload, Upload::Ready(_))).map(|a| a.local_id.clone());
+    let reupload = reupload.collect();
+    attachments.extend(restored);
+    Some(reupload)
+}
+
 /// A dropped file's bytes, or its size when it is over the limit and was not read.
 #[derive(Debug, PartialEq)]
 enum Read {
@@ -285,6 +312,7 @@ impl Workspace {
 
     pub(super) fn attachments_busy(&self) -> bool {
         self.attachments.iter().any(|a| a.upload == Upload::Uploading)
+            || self.target.as_ref().is_some_and(|target| self.reading_attachments.contains(target))
     }
 
     pub(super) fn has_attachments(&self) -> bool {
@@ -330,7 +358,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> bool {
         if !self.can_attach() {
-            return false;
+            return item.text().is_some_and(|text| self.paste_chips(&text, window, cx));
         }
         let mut handled = false;
         for entry in item.entries() {
@@ -358,7 +386,8 @@ impl Workspace {
                     handled = true;
                 }
                 gpui_kit::ClipboardEntry::String(text) if !handled => {
-                    handled = self.fold_pasted_text(text.text(), window, cx);
+                    handled =
+                        self.fold_pasted_text(text.text(), window, cx) || self.paste_chips(text.text(), window, cx);
                 }
                 gpui_kit::ClipboardEntry::String(_) => {}
             }
@@ -412,6 +441,9 @@ impl Workspace {
         if files.is_empty() {
             return;
         }
+        // The files belong to the composer they were added to, even if the user leaves it meanwhile.
+        let Some(origin) = self.target.clone() else { return };
+        self.reading_attachments.push(origin.clone());
         let read = cx.background_executor().spawn(async move {
             files
                 .into_iter()
@@ -425,28 +457,34 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let files = read.await;
             let _ = this.update_in(cx, |this, window, cx| {
+                if let Some(at) = this.reading_attachments.iter().position(|target| target == &origin) {
+                    this.reading_attachments.swap_remove(at);
+                }
+                let here = this.target.as_ref() == Some(&origin);
                 for (name, read) in files {
-                    let (kind, mime) = match classify(&name) {
-                        Ok(classified) => classified,
-                        Err(error) => {
-                            this.error = Some(error.into());
-                            continue;
-                        }
-                    };
-                    match read {
-                        Ok(Read::Bytes(bytes)) if !bytes.is_empty() => {
-                            this.add_attachment(name, kind, mime, bytes, window, cx);
-                        }
-                        Ok(Read::TooLarge(size)) => {
-                            this.error = this.attachment_error(&name, kind, size).map(Into::into);
-                        }
-                        Ok(Read::Bytes(_)) => {
-                            this.error = Some(format!("'{name}' is empty or could not be read.").into());
-                        }
+                    let added = classify(&name).and_then(|(kind, mime)| match read {
+                        Ok(Read::Bytes(bytes)) if !bytes.is_empty() => Ok((kind, mime, bytes)),
+                        Ok(Read::TooLarge(size)) => Err(this.attachment_error(&name, kind, size).unwrap_or_default()),
+                        Ok(Read::Bytes(_)) => Err(format!("'{name}' is empty or could not be read.")),
                         Err(error) => {
                             log::warn!("could not read {name:?}: {error}");
-                            this.error = Some(format!("'{name}' is empty or could not be read.").into());
+                            Err(format!("'{name}' is empty or could not be read."))
                         }
+                    });
+                    let result = match added {
+                        Ok((kind, mime, bytes)) if here => {
+                            this.add_attachment(name, kind, mime, bytes, window, cx);
+                            Ok(())
+                        }
+                        Ok((kind, mime, bytes)) => {
+                            this.stash_attachment(origin.clone(), name, kind, mime, bytes, cx).map(|_| ())
+                        }
+                        Err(error) => Err(error),
+                    };
+                    match result {
+                        Err(error) if here && !error.is_empty() => this.error = Some(error.into()),
+                        Err(error) if !error.is_empty() => log::warn!("an attachment for a left draft failed: {error}"),
+                        _ => {}
                     }
                 }
                 cx.notify();
@@ -559,19 +597,49 @@ impl Workspace {
         if let Some(error) = self.attachment_error(&name, Kind::Image, bytes.len() as u64) {
             return Err(error);
         }
+        let local_id = self
+            .stash_attachment(target, name, Kind::Image, mime, bytes, cx)
+            .map_err(|_| "Remove an attachment, then try this capture again.".to_owned())?;
+        if let Some((_, attachment)) = find_attachment(&mut self.attachments, &mut self.composer_drafts, &local_id) {
+            attachment.source = Some(source);
+        }
+        Ok(())
+    }
+
+    /// An attachment for `target`'s set-aside draft, with a file's chip at the end of its
+    /// prompt as the composer would add it; its local id, or why the draft can't take it.
+    fn stash_attachment(
+        &mut self,
+        target: Target,
+        name: String,
+        kind: Kind,
+        mime: &str,
+        bytes: Vec<u8>,
+        cx: &mut Context<Self>,
+    ) -> Result<String, String> {
+        if let Some(error) = self.attachment_error(&name, kind, bytes.len() as u64) {
+            return Err(error);
+        }
+        let full = || format!("You can attach up to {MAX_ATTACHMENTS} files per message.");
         let draft =
             self.composer_drafts.entry(target).or_insert_with(|| ComposerDraft::Prompt(String::new(), Vec::new()));
-        let full = || "Remove an attachment, then try this capture again.".to_owned();
-        let ComposerDraft::Prompt(_, kept) = draft else { return Err(full()) };
+        let ComposerDraft::Prompt(prompt, kept) = draft else { return Err(full()) };
         if kept.len() >= MAX_ATTACHMENTS {
             return Err(full());
         }
-        let mut attachment = Attachment::restored(Kind::Image.as_str(), name, mime.to_owned(), bytes);
-        attachment.source = Some(source);
+        let attachment = Attachment::restored(kind.as_str(), name, mime.to_owned(), bytes);
+        if kind == Kind::File {
+            let link = composer_text::context_link(kind.as_str(), &attachment.context_id(), &attachment.name);
+            if !prompt.is_empty() && !prompt.ends_with(char::is_whitespace) {
+                prompt.push(' ');
+            }
+            prompt.push_str(&link);
+            prompt.push(' ');
+        }
         let local_id = attachment.local_id.clone();
         kept.push(attachment);
-        self.upload(local_id, cx);
-        Ok(())
+        self.upload(local_id.clone(), cx);
+        Ok(local_id)
     }
 
     /// Mints a signed upload URL on the environment of the attachment's draft, then POSTs the bytes to it.
@@ -723,24 +791,28 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Drops attachments whose chip the user deleted from the text.
+    /// Sets aside attachments whose chip the user deleted from the text, and brings back
+    /// those whose chip an undo restored (`reconcileAttachmentContextReferences`).
     pub(super) fn sync_attachment_chips(&mut self, previous_chips: &[String], cx: &mut Context<Self>) {
         let state = self.composer.read(cx);
         let live: Vec<String> = state.tokens().iter().map(|s| s.token().id().to_string()).collect();
-        let dropped: Vec<String> = self
-            .attachments
-            .iter()
-            .filter(|a| {
-                let id = a.chip_id();
-                previous_chips.contains(&id) && !live.contains(&id)
-            })
-            .map(|a| a.local_id.clone())
-            .collect();
-        if dropped.is_empty() {
+        let Some(restored) =
+            reconcile_chips(&mut self.attachments, &mut self.retained_attachments, previous_chips, &live)
+        else {
             return;
+        };
+        // An upload that finished while set aside was dropped; take it again.
+        for local_id in restored {
+            self.upload(local_id, cx);
         }
-        self.attachments.retain(|a| !dropped.contains(&a.local_id));
         cx.notify();
+    }
+
+    /// The editor's undo history ended, so deleted chips can no longer come back.
+    pub(super) fn release_retained_attachments(&mut self, cx: &mut Context<Self>) {
+        for attachment in mem::take(&mut self.retained_attachments) {
+            self.release_upload(&attachment, cx);
+        }
     }
 
     /// The send payload's `attachments` and `context`, or why it cannot send yet.
@@ -755,6 +827,7 @@ impl Workspace {
         }
         let mut attachments = Vec::new();
         let mut records = self.terminal_context_records(text);
+        records.extend(environment_context_records(text));
         for attachment in &self.attachments {
             let Upload::Ready(id) = &attachment.upload else { continue };
             let (sent, record) = attachment.wire(id, text);
@@ -820,7 +893,19 @@ impl Workspace {
             .border_color(t.border.opacity(0.8))
             .bg(t.background)
             .map(|el| match &attachment.image {
-                Some(image) => el.child(img(image.clone()).size_full().object_fit(ObjectFit::Cover)),
+                Some(image) => {
+                    let preview_id = id.clone();
+                    el.child(
+                        div()
+                            .id(ElementId::Name(format!("preview-{id}").into()))
+                            .size_full()
+                            .cursor_pointer()
+                            .child(img(image.clone()).size_full().object_fit(ObjectFit::Cover))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_attachment_preview(&preview_id, window, cx);
+                            })),
+                    )
+                }
                 None => el.child(
                     div()
                         .size_full()
@@ -947,7 +1032,7 @@ impl Workspace {
     }
 }
 
-fn overlay_button(id: ElementId, icon: Lucide) -> gpui_kit::Stateful<gpui_kit::Div> {
+pub(super) fn overlay_button(id: ElementId, icon: Lucide) -> gpui_kit::Stateful<gpui_kit::Div> {
     div()
         .id(id)
         .absolute()
@@ -979,9 +1064,58 @@ fn ghost_icon(id: ElementId, icon: Lucide, t: &Tokens) -> gpui_kit::Stateful<gpu
         .child(Icon::new(icon).with_size(px(14.)))
 }
 
+/// `environmentContextRecord` for each machine the prompt mentions, once.
+fn environment_context_records(text: &str) -> Vec<Value> {
+    let mut records: Vec<Value> = Vec::new();
+    for (_, chip) in composer_text::chips(text, |_| false) {
+        let Chip::Context { kind, id, label } = chip else { continue };
+        let Some(environment_id) = id.strip_prefix("environment_").filter(|_| kind == "environment") else { continue };
+        if records.iter().all(|record| record["contextId"] != id.as_str()) {
+            let record = json!({"version": 1, "kind": "environment", "contextId": id, "label": label, "environmentId": environment_id});
+            records.push(record);
+        }
+    }
+    records
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_machine_mention_sends_its_environment_record_once() {
+        let link = composer_text::context_link("environment", "environment_e2", "Build box");
+        let records = environment_context_records(&format!("run on {link} and {link}"));
+        assert_eq!(
+            records,
+            [
+                json!({"version": 1, "kind": "environment", "contextId": "environment_e2", "label": "Build box", "environmentId": "e2"})
+            ]
+        );
+        let terminal = composer_text::context_link("terminal", "terminal_t1", "Shell");
+        assert!(environment_context_records(&format!("see {terminal}")).is_empty());
+    }
+
+    #[test]
+    fn a_deleted_chip_keeps_its_attachment_until_undo_brings_it_back() {
+        let file = |id: &str, upload: Upload| Attachment {
+            upload,
+            ..Attachment::restored_as(id.into(), "file", "a.txt".into(), "text/plain".into(), vec![1])
+        };
+        let mut attachments = vec![file("a", Upload::Ready("up-a".into())), file("b", Upload::Uploading)];
+        let mut retained = Vec::new();
+        let ids = |list: &[Attachment]| list.iter().map(|a| a.local_id.clone()).collect::<Vec<_>>();
+
+        let both = [attachments[0].chip_id(), attachments[1].chip_id()];
+        assert_eq!(reconcile_chips(&mut attachments, &mut retained, &both, &both), None);
+        assert_eq!(reconcile_chips(&mut attachments, &mut retained, &both, &[]), Some(vec![]));
+        assert_eq!((ids(&attachments), ids(&retained)), (vec![], vec!["a".to_owned(), "b".to_owned()]));
+
+        let restored = reconcile_chips(&mut attachments, &mut retained, &[], &both);
+        assert_eq!(restored, Some(vec!["b".to_owned()]), "only the unfinished upload is taken again");
+        assert_eq!((ids(&attachments), ids(&retained)), (vec!["a".to_owned(), "b".to_owned()], vec![]));
+        assert_eq!(attachments[0].upload, Upload::Ready("up-a".into()));
+    }
 
     #[test]
     fn files_classify_by_extension() {

@@ -198,6 +198,8 @@ pub struct Workspace {
     composer_empty: bool,
     /// The composer links the triage playbook (`isTriagePrompt`), which the draft hero follows.
     composer_triage: bool,
+    /// Where the prompt says "ultrathink", which can own the model's effort level.
+    composer_ultrathink: crate::model_label::Ultrathink,
     /// The floating composer's height last frame: the transcript reserves it at its end, and the
     /// "Scroll to end" pill sits above it (`composerTimelineInset`).
     composer_height: f32,
@@ -205,8 +207,15 @@ pub struct Workspace {
     timeline_lane_width: std::cell::Cell<f32>,
     /// The question card's drafts, for the first pending question.
     question: Option<QuestionDraft>,
+    /// Requests that arrived mid-typing, kept out of sight for now.
+    typing_guard: crate::composer_guard::TypingGuard,
+    _typing_idle: Option<Task<()>>,
+    /// Tab stops of the composer's attach, stop and primary (send, resume, submit) controls.
+    composer_action_focus: [gpui_kit::FocusHandle; 4],
     /// Composer text and question drafts of the targets not on screen.
     composer_drafts: HashMap<Target, composer::ComposerDraft>,
+    /// The model and permissions picks of the targets not on screen (`composerDraftStore`).
+    composer_selections: HashMap<Target, composer::ComposerSelection>,
     /// The request whose response is in flight.
     responding: Option<String>,
     /// The `@` / `$` / `/` menu.
@@ -232,6 +241,12 @@ pub struct Workspace {
     environment_remote: bool,
     /// Files from the OS are being dragged over the chat canvas.
     dragging_files: bool,
+    /// Targets whose dropped or picked files are still being read, one entry per read.
+    reading_attachments: Vec<Target>,
+    /// Attachments whose chip was deleted, kept until the editor's undo history ends.
+    retained_attachments: Vec<attachments::Attachment>,
+    /// Sent messages their thread doesn't show yet.
+    pending_sends: Vec<send::PendingSend>,
     error: Option<SharedString>,
     sidebar: sidebar::SidebarState,
     sidebar_view: Entity<sidebar::SidebarView>,
@@ -347,10 +362,11 @@ impl Workspace {
         let saved_environments = cx.new(environments::SavedEnvironments::new);
         let subscriptions = vec![
             cx.observe_in(&saved_environments, window, |this, _, window, cx| this.sync_saved_sessions(window, cx)),
-            cx.subscribe_in(&composer, window, |this, _, event: &InputEvent, _, cx| {
-                if let InputEvent::Change = event {
-                    this.on_composer_change(cx);
-                }
+            cx.subscribe_in(&composer, window, |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => this.on_composer_change(window, cx),
+                InputEvent::Focus => this.typing_guard.focus(),
+                InputEvent::Blur => this.release_typing_hold(true, window, cx),
+                InputEvent::PressEnter { .. } => {}
             }),
             // Caret moves re-read the completion trigger.
             cx.observe(&composer, |this, _, cx| this.sync_trigger(cx)),
@@ -414,10 +430,15 @@ impl Workspace {
             runtime_mode_override: None,
             composer_empty: true,
             composer_triage: false,
+            composer_ultrathink: Default::default(),
             composer_height: 0.,
             timeline_lane_width: std::cell::Cell::new(0.),
             question: None,
+            typing_guard: Default::default(),
+            _typing_idle: None,
+            composer_action_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             composer_drafts: HashMap::new(),
+            composer_selections: HashMap::new(),
             responding: None,
             menu: Default::default(),
             picker: Default::default(),
@@ -432,6 +453,9 @@ impl Workspace {
             ctrl_held: false,
             environment_remote: false,
             dragging_files: false,
+            reading_attachments: Vec::new(),
+            retained_attachments: Vec::new(),
+            pending_sends: Vec::new(),
             error: None,
             sidebar: sidebar::SidebarState::new(window, cx),
             visit: visits::VisitTracker::default(),
@@ -461,7 +485,7 @@ impl Workspace {
             landed: false,
             page: None,
             pull_requests: pages::PullRequestsState::new(window, cx),
-            usage: pages::UsageState::default(),
+            usage: pages::UsageState::new(&client_settings.values),
             settings: None,
             settings_ui: pages::settings::SettingsUi::new(window, cx),
             client_settings,
@@ -766,6 +790,7 @@ impl Workspace {
                 }
                 this.refresh_rows(cx);
                 this.refresh_thread_find(cx);
+                this.sync_typing_guard(window, cx);
                 this.sync_question(window, cx);
                 this.sync_queue_edit(window, cx);
                 this.observe_proactive_panels(cx);
@@ -796,6 +821,7 @@ impl Workspace {
         // Its draft has nowhere to go: drop it rather than leave it in the editor.
         if let Some(target) = self.target.take() {
             self.composer_drafts.remove(&target);
+            self.composer_selections.remove(&target);
         }
         self.attachments.clear();
         self.set_composer_text("", window, cx);
@@ -825,11 +851,25 @@ impl Workspace {
             }
             None => Vec::new(),
         };
+        let (sent, queued) = match self.thread.as_ref().and_then(|t| Some((&t.id, t.state.projection.as_ref()?))) {
+            Some((id, projection)) => send::pending_rows(&mut self.pending_sends, id, projection),
+            None => Default::default(),
+        };
+        new_rows.extend(sent);
         self.apply_workflow_opening(&mut new_rows, cx);
         self.sync_worktree_setup(cx);
         self.insert_worktree_setup(&mut new_rows);
         new_rows.extend(self.now_rows(cx));
-        new_rows.extend(self.queue_rows());
+        let mut queue = self.queue_rows();
+        self.load_queue_images(cx);
+        if !queued.is_empty() {
+            let at = queue.iter().position(|row| matches!(row, Row::QueueToggle { .. })).unwrap_or(queue.len());
+            if let Some(Row::Queued { last, .. }) = at.checked_sub(1).and_then(|i| queue.get_mut(i)) {
+                *last = false;
+            }
+            queue.splice(at..at, queued);
+        }
+        new_rows.extend(queue);
         let was_empty = self.rows.is_empty();
         self.sync_working_tick(&new_rows, cx);
         self.sync_subagent_tick(cx);
@@ -878,8 +918,9 @@ impl Workspace {
             retried: false,
             _subscription: None,
         });
-        self.model_override = None;
-        self.model_explicit = false;
+        let saved = self.target.as_ref().and_then(|target| self.composer_selections.remove(target));
+        self.model_override = saved.as_ref().and_then(|saved| saved.model.clone());
+        self.model_explicit = saved.is_some_and(|saved| saved.explicit);
         self.restore_composer(window, cx);
         self.reset_timeline(cx);
         self.subscribe_thread(window, cx);
@@ -913,13 +954,27 @@ impl Workspace {
         if let (Some(old), Some(leaving)) = (self.thread.take(), leaving) {
             self.retire_thread(leaving.environment(), old.id, old.state, cx);
         }
-        if opened {
-            let project = self.target_project();
-            self.model_override =
-                crate::new_thread::new_draft_model(self.server_info(), project, carried, self.sticky_model.as_ref());
-            self.model_explicit = false;
+        let saved = self.target.as_ref().and_then(|target| self.composer_selections.remove(target));
+        match saved.filter(|_| opened) {
+            Some(saved) => {
+                self.model_override = saved.model;
+                self.model_explicit = saved.explicit;
+                self.runtime_mode_override = saved.runtime_mode;
+            }
+            None => {
+                if opened {
+                    let project = self.target_project();
+                    self.model_override = crate::new_thread::new_draft_model(
+                        self.server_info(),
+                        project,
+                        carried,
+                        self.sticky_model.as_ref(),
+                    );
+                    self.model_explicit = false;
+                }
+                self.runtime_mode_override = None;
+            }
         }
-        self.runtime_mode_override = None;
         self.restore_composer(window, cx);
         if opened {
             self.freeze_open_draft(cx);
@@ -1172,7 +1227,9 @@ impl Render for Workspace {
                     return;
                 }
                 if this.page.is_some_and(pages::Page::is_modal) && event.keystroke.key == "escape" {
-                    this.close_page(cx);
+                    if !this.usage_card_escape(cx) {
+                        this.close_page(cx);
+                    }
                     cx.stop_propagation();
                     return;
                 }

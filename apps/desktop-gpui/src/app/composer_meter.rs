@@ -5,12 +5,13 @@ use std::f32::consts::{FRAC_PI_2, TAU};
 use std::time::Duration;
 
 use gpui_kit::assets::IconName as Lucide;
+use gpui_kit::base::Popup;
 use gpui_kit::component::button::Button;
-use gpui_kit::component::hover_card::HoverCard;
-use gpui_kit::component::{Disableable as _, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{Disableable as _, Icon, Sizable as _, ThemeStyled as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, Context, FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, PathBuilder,
-    SharedString, Styled as _, canvas, div, point, prelude::FluentBuilder as _, px,
+    AnyElement, Context, FontWeight, Hsla, InteractiveElement as _, IntoElement, Keystroke, ParentElement as _,
+    PathBuilder, SharedString, StatefulInteractiveElement as _, Styled as _, Task, canvas, div, point,
+    prelude::FluentBuilder as _, px,
 };
 use serde_json::json;
 
@@ -22,6 +23,61 @@ use crate::theme::Tokens;
 const RING: f32 = 20.;
 const RADIUS: f32 = 9.75 * RING / 24.;
 const STROKE: f32 = 3. * RING / 24.;
+
+/// `PopoverTrigger openOnHover delay={150}`.
+const OPEN_DELAY: Duration = Duration::from_millis(150);
+const TRIGGER: usize = 0;
+const CARD: usize = 1;
+
+/// The meter's popover (`Popover` with `openOnHover`): hovering opens it after a delay and
+/// leaving closes it, while a click or Enter pins it open until it is dismissed.
+#[derive(Default)]
+pub(super) struct MeterPopup {
+    open: bool,
+    pinned: bool,
+    /// The trigger and the card under the pointer.
+    hovered: [bool; 2],
+    timer: Option<Task<()>>,
+}
+
+impl MeterPopup {
+    /// The pointer entered or left the trigger or the card; `Some` asks for the open state after `delay`.
+    fn hover(&mut self, part: usize, hovering: bool, close_delay: Duration) -> Option<(bool, Duration)> {
+        self.hovered[part] = hovering;
+        self.timer = None;
+        match (hovering, self.open) {
+            (true, false) if part == TRIGGER => Some((true, OPEN_DELAY)),
+            (false, true) if !self.pinned && !self.hovered.contains(&true) => Some((false, close_delay)),
+            _ => None,
+        }
+    }
+
+    /// A click or Enter: pins a hover-opened card, else toggles it.
+    fn toggle(&mut self) {
+        self.timer = None;
+        if self.open && !self.pinned {
+            self.pinned = true;
+        } else {
+            self.open = !self.open;
+            self.pinned = self.open;
+        }
+    }
+
+    fn close(&mut self) {
+        self.timer = None;
+        self.open = false;
+        self.pinned = false;
+    }
+
+    /// A delayed hover change lands unless the pointer moved on or a click pinned the card.
+    fn settle(&mut self, open: bool) {
+        self.timer = None;
+        let hovered = self.hovered.contains(&true);
+        if (open && hovered) || (!open && !hovered && !self.pinned) {
+            self.open = open;
+        }
+    }
+}
 
 /// `formatPercentage`: one decimal under 10%, whole numbers above.
 fn format_percentage(value: f64) -> String {
@@ -72,7 +128,7 @@ impl Workspace {
             return reserve.then(|| div().size(px(28.)).flex_none().into_any_element());
         };
         let (usage, live) = projection.context_window()?;
-        let usage = usage.clone();
+        let usage = usage.into_owned();
         let percentage = used_percentage(&usage);
         #[expect(clippy::cast_possible_truncation, reason = "a percentage clamped to 0..=100")]
         let shown = percentage.unwrap_or(0.).clamp(0., 100.) as f32;
@@ -99,6 +155,7 @@ impl Workspace {
             || !has_compactable_conversation(projection);
         let view = cx.entity();
         let tokens = *t;
+        let close_delay = Duration::from_millis(if compactable { 150 } else { 0 });
         let trigger = div()
             .id("context-meter-trigger")
             .size(px(28.))
@@ -108,109 +165,155 @@ impl Workspace {
             .justify_center()
             .rounded(px(8.))
             .hover(|s| s.bg(tokens.accent))
-            .child(ring(shown, track, color));
-        Some(
-            HoverCard::new("context-meter")
-                .anchor(gpui_kit::Anchor::BottomRight)
-                .open_delay(Duration::from_millis(150))
-                .close_delay(Duration::from_millis(if compactable { 150 } else { 0 }))
-                .trigger(trigger)
-                .content(move |_, _, _| {
-                    let t = &tokens;
-                    let used = super::details::format_context_tokens(usage.used_tokens);
-                    let header_value = match (usage.max_tokens, percentage) {
-                        (Some(max), Some(percentage)) => format!(
-                            "{} · {used}/{}",
-                            format_percentage(percentage),
-                            super::details::format_context_tokens(max)
-                        ),
-                        _ => used,
-                    };
-                    let detail_row = |label: &'static str, value: String| {
-                        h_flex()
-                            .justify_between()
-                            .gap(px(12.))
-                            .text_size(px(11.))
-                            .line_height(px(16.))
-                            .text_color(t.muted_foreground)
-                            .child(label)
-                            .child(div().font_weight(FontWeight::MEDIUM).child(value))
-                    };
-                    let total = usage.total_processed_tokens.filter(|total| *total > 0 && !live);
-                    let compacts = live || usage.compacts_automatically == Some(true);
-                    v_flex()
-                        .w(px(256.))
-                        .gap(px(8.))
+            .when(self.composer_ui.meter.open, |el| el.bg(tokens.accent))
+            .child(ring(shown, track, color))
+            .on_hover(
+                cx.listener(move |this, hovering: &bool, _, cx| this.hover_meter(TRIGGER, *hovering, close_delay, cx)),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.composer_ui.meter.toggle();
+                cx.notify();
+            }));
+        let trigger = super::composer::action_control(trigger, &self.composer_action_focus[super::composer::METER], t);
+        let popup = Popup::new("context-meter", trigger).anchor(gpui_kit::Anchor::BottomRight);
+        if !self.composer_ui.meter.open {
+            return Some(popup.into_any_element());
+        }
+        let card = {
+            let t = &tokens;
+            let used = super::details::format_context_tokens(usage.used_tokens);
+            let header_value = match (usage.max_tokens, percentage) {
+                (Some(max), Some(percentage)) => {
+                    format!("{} · {used}/{}", format_percentage(percentage), super::details::format_context_tokens(max))
+                }
+                _ => used,
+            };
+            let detail_row = |label: &'static str, value: String| {
+                h_flex()
+                    .justify_between()
+                    .gap(px(12.))
+                    .text_size(px(11.))
+                    .line_height(px(16.))
+                    .text_color(t.muted_foreground)
+                    .child(label)
+                    .child(div().font_weight(FontWeight::MEDIUM).child(value))
+            };
+            let total = usage.total_processed_tokens.filter(|total| *total > 0 && !live);
+            let compacts = live || usage.compacts_automatically == Some(true);
+            v_flex()
+                .w(px(256.))
+                .gap(px(8.))
+                .child(
+                    h_flex()
+                        .justify_between()
+                        .gap(px(12.))
                         .child(
-                            h_flex()
-                                .justify_between()
-                                .gap(px(12.))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_color(t.muted_foreground)
-                                        .child("Context Window"),
-                                )
-                                .child(div().text_size(px(11.)).text_color(t.muted_foreground).child(header_value)),
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(t.muted_foreground)
+                                .child("Context Window"),
                         )
-                        .when(usage.max_tokens.is_some(), |el| {
-                            el.child(
-                                div()
-                                    .h(px(6.))
-                                    .w_full()
-                                    .rounded_full()
-                                    .bg(t.muted.opacity(0.6))
-                                    .child(div().h_full().w(gpui_kit::relative(shown / 100.)).rounded_full().bg(color)),
-                            )
-                        })
-                        .children(
-                            total.map(|total| {
-                                detail_row("Total processed", super::details::format_context_tokens(total))
-                            }),
-                        )
-                        .children(
-                            usage
-                                .cost
-                                .as_ref()
-                                .filter(|_| !live)
-                                .map(|cost| detail_row("Cost", format_cost(cost.amount, &cost.currency))),
-                        )
-                        .when(compacts, |el| {
-                            el.child(
-                                div()
-                                    .mt(px(4.))
-                                    .text_size(px(11.))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(t.muted_foreground)
-                                    .child(compaction_message(model.as_deref(), usage.auto_compact_threshold)),
-                            )
-                        })
-                        .when(compactable, |el| {
-                            let view = view.clone();
-                            el.child(
-                                Button::new("compact-context")
-                                    .outline()
-                                    .xsmall()
-                                    .w_full()
-                                    .mt(px(4.))
-                                    .icon(Icon::new(Lucide::Minimize2))
-                                    .label("Compact context")
-                                    .disabled(compact_blocked)
-                                    .on_click(move |_, _, cx| view.update(cx, super::Workspace::compact_context)),
-                            )
-                            .when(compact_blocked, |el| {
-                                el.child(
-                                    div()
-                                        .text_size(px(11.))
-                                        .text_color(t.muted_foreground)
-                                        .child(SharedString::from("Compacting is unavailable right now")),
-                                )
-                            })
-                        })
+                        .child(div().text_size(px(11.)).text_color(t.muted_foreground).child(header_value)),
+                )
+                .when(usage.max_tokens.is_some(), |el| {
+                    el.child(
+                        div()
+                            .h(px(6.))
+                            .w_full()
+                            .rounded_full()
+                            .bg(t.muted.opacity(0.6))
+                            .child(div().h_full().w(gpui_kit::relative(shown / 100.)).rounded_full().bg(color)),
+                    )
                 })
-                .into_any_element(),
-        )
+                .children(
+                    total.map(|total| detail_row("Total processed", super::details::format_context_tokens(total))),
+                )
+                .children(
+                    usage
+                        .cost
+                        .as_ref()
+                        .filter(|_| !live)
+                        .map(|cost| detail_row("Cost", format_cost(cost.amount, &cost.currency))),
+                )
+                .when(compacts, |el| {
+                    el.child(
+                        div()
+                            .mt(px(4.))
+                            .text_size(px(11.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(t.muted_foreground)
+                            .child(compaction_message(model.as_deref(), usage.auto_compact_threshold)),
+                    )
+                })
+                .when(compactable, |el| {
+                    let view = view.clone();
+                    el.child(
+                        Button::new("compact-context")
+                            .outline()
+                            .xsmall()
+                            .w_full()
+                            .mt(px(4.))
+                            .icon(Icon::new(Lucide::Minimize2))
+                            .label("Compact context")
+                            .disabled(compact_blocked)
+                            .on_click(move |_, _, cx| view.update(cx, super::Workspace::compact_context)),
+                    )
+                    .when(compact_blocked, |el| {
+                        el.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(t.muted_foreground)
+                                .child(SharedString::from("Compacting is unavailable right now")),
+                        )
+                    })
+                })
+        };
+        let content = v_flex()
+            .id("context-meter-card")
+            .occlude()
+            .popover_style(cx)
+            .p_3()
+            .bottom_1()
+            .overflow_hidden()
+            .child(card)
+            .on_hover(
+                cx.listener(move |this, hovering: &bool, _, cx| this.hover_meter(CARD, *hovering, close_delay, cx)),
+            )
+            // The trigger's own click toggles it.
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                if !this.composer_ui.meter.hovered[TRIGGER] {
+                    this.composer_ui.meter.close();
+                    cx.notify();
+                }
+            }));
+        Some(popup.content(content).into_any_element())
+    }
+
+    fn hover_meter(&mut self, part: usize, hovering: bool, close_delay: Duration, cx: &mut Context<Self>) {
+        let Some((open, delay)) = self.composer_ui.meter.hover(part, hovering, close_delay) else { return };
+        if delay.is_zero() {
+            self.composer_ui.meter.settle(open);
+            cx.notify();
+            return;
+        }
+        self.composer_ui.meter.timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let _ = this.update(cx, |this, cx| {
+                this.composer_ui.meter.settle(open);
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Escape closes the open card.
+    pub(super) fn context_meter_key(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) -> bool {
+        if keystroke.key != "escape" || !self.composer_ui.meter.open {
+            return false;
+        }
+        self.composer_ui.meter.close();
+        cx.notify();
+        true
     }
 
     /// `sendStandaloneCommand("/compact")`, after the thread takes the composer's mode.
@@ -319,6 +422,35 @@ fn ring(percentage: f32, track: Hsla, color: Hsla) -> impl IntoElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_meter_card_opens_on_hover_and_a_click_pins_it() {
+        let close = Duration::from_millis(150);
+        let mut meter = MeterPopup::default();
+        assert_eq!(meter.hover(TRIGGER, true, close), Some((true, OPEN_DELAY)));
+        meter.settle(true);
+        assert!(meter.open);
+        assert_eq!(meter.hover(TRIGGER, false, close), Some((false, close)));
+        assert_eq!(meter.hover(CARD, true, close), None, "moving onto the card keeps it");
+        assert_eq!(meter.hover(CARD, false, close), Some((false, close)));
+        meter.settle(false);
+        assert!(!meter.open);
+
+        meter.hover(TRIGGER, true, close);
+        meter.settle(true);
+        meter.toggle();
+        assert!(meter.open && meter.pinned, "a click pins a hovered card");
+        assert_eq!(meter.hover(TRIGGER, false, close), None, "leaving a pinned card keeps it");
+        meter.toggle();
+        assert!(!meter.open, "a second click closes it");
+
+        meter.toggle();
+        assert!(meter.open && meter.pinned, "Enter opens it without a hover");
+        meter.settle(false);
+        assert!(meter.open, "a stale hover close does not undo a pin");
+        meter.close();
+        assert!(!meter.open && !meter.pinned);
+    }
 
     #[test]
     fn percentages_keep_a_decimal_only_below_ten() {

@@ -307,19 +307,57 @@ pub struct Merged {
 /// `mergeUsage` for one environment, without `hidden` providers: each scanned source counts its
 /// buckets and distinct sessions once (bucket session counts double-count sessions spanning days).
 /// One machine's answer to `server.getUsageSummary`.
+#[derive(Clone)]
 pub struct EnvironmentUsage {
     pub environment_id: String,
     pub summary: Summary,
 }
 
+/// `usageSummary`'s `staleTimeMs`: a cold transcript scan takes seconds, so an answer this fresh is reused.
+const SUMMARY_STALE_MS: i64 = 60_000;
+
+/// Whether the page reads usage again: nothing answered yet, the answer went stale, or the
+/// prices or model aliases it was priced with changed (`refreshTrigger: usageScanSettingsAtom`).
+pub fn needs_read(answered_at: Option<i64>, now: i64, scan_settings_changed: bool) -> bool {
+    answered_at.is_none_or(|at| now - at >= SUMMARY_STALE_MS) || scan_settings_changed
+}
+
+/// An answer left out of the totals because its contract version differs (`UsageContractMismatch`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContractMismatch {
+    pub environment_id: String,
+    /// The server is older than this client, rather than newer.
+    pub server_behind: bool,
+}
+
+impl ContractMismatch {
+    /// `formatUsageContractMismatch`.
+    pub fn message(&self, environment: &str) -> String {
+        if self.server_behind {
+            format!("{environment} runs an older server version and is excluded from totals.")
+        } else {
+            format!("This client is older than the server on {environment}; its usage is excluded from totals.")
+        }
+    }
+}
+
 /// `claimSources` and `ownedContribution` of `mergeUsage`: every machine's answer as one summary
-/// in which a usage directory read by several machines counts once, for the newest healthy read.
-/// Incompatible answers are left out. The web's top-up from newer partial scans is not ported.
-pub fn combine(environments: Vec<EnvironmentUsage>) -> Option<Summary> {
-    let mut current: Vec<EnvironmentUsage> = environments.into_iter().filter(|e| e.summary.compatible()).collect();
-    if current.is_empty() {
+/// in which a usage directory read by several machines counts once, for the newest healthy read,
+/// with the incompatible answers it left out. `None` only without answers. The web's top-up from
+/// newer partial scans is not ported.
+pub fn combine(environments: Vec<EnvironmentUsage>) -> Option<(Summary, Vec<ContractMismatch>)> {
+    if environments.is_empty() {
         return None;
     }
+    let (mut current, incompatible): (Vec<EnvironmentUsage>, Vec<EnvironmentUsage>) =
+        environments.into_iter().partition(|e| e.summary.compatible());
+    let mismatches = incompatible
+        .into_iter()
+        .map(|e| ContractMismatch {
+            server_behind: e.summary.contract_version < CONTRACT_VERSION,
+            environment_id: e.environment_id,
+        })
+        .collect();
     let read_at = |e: &EnvironmentUsage| e.summary.read_at.as_deref().and_then(crate::timestamp::parse_ms).unwrap_or(0);
     current.sort_by(|a, b| read_at(b).cmp(&read_at(a)).then_with(|| a.environment_id.cmp(&b.environment_id)));
     let mut owners: HashMap<String, usize> = HashMap::new();
@@ -348,7 +386,7 @@ pub fn combine(environments: Vec<EnvironmentUsage>) -> Option<Summary> {
         }));
         combined.sources.extend(owned);
     }
-    Some(combined)
+    Some((combined, mismatches))
 }
 
 pub fn merge(summary: &Summary, hidden: &[String]) -> Merged {
@@ -548,6 +586,15 @@ impl Window {
         if let Some((since, until)) = self.hours {
             input["sinceTime"] = json!(iso(since).unwrap_or_default());
             input["untilTime"] = json!(iso(until).unwrap_or_default());
+        }
+        input
+    }
+
+    /// `usageSummaryInput`: one environment's request carries its configured `usageModelFilter`.
+    pub fn summary_input(&self, model_filter: &Value) -> Value {
+        let mut input = self.to_json();
+        if !model_filter.is_null() {
+            input["modelFilter"] = model_filter.clone();
         }
         input
     }
@@ -1603,6 +1650,22 @@ pub fn limit_notices(environments: &[LimitEnvironment<'_>], hidden_drivers: &[&s
                 notices.push(format!("{}: {notice}", label(name)));
             }
         }
+        for source in environment.sources.as_array().into_iter().flatten() {
+            let accounts = source["accounts"].as_array().map_or(&[][..], Vec::as_slice);
+            // `UsageLimitsSection` drops a source whose every account is a hidden provider's.
+            let visible = accounts
+                .iter()
+                .filter(|account| !hidden_drivers.contains(&account["driver"].as_str().unwrap_or_default()));
+            if visible.count() == 0 && !accounts.is_empty() {
+                continue;
+            }
+            let name = source["label"].as_str().unwrap_or_default();
+            if let Some(error) = source["error"].as_str() {
+                notices.push(format!("{}: {error}", label(name)));
+            } else if accounts.is_empty() {
+                notices.push(format!("{}: No accounts reported.", label(name)));
+            }
+        }
     }
     notices
 }
@@ -1670,18 +1733,50 @@ mod tests {
             .unwrap()
         };
         let usage = |id: &str, summary: Summary| EnvironmentUsage { environment_id: id.into(), summary };
-        let shared = combine(vec![
+        let (shared, _) = combine(vec![
             usage("old", summary("2026-11-01T00:00:00Z", "box", 1.)),
             usage("new", summary("2026-11-02T00:00:00Z", "box", 2.)),
         ])
         .unwrap();
         assert_eq!((shared.buckets.len(), shared.buckets[0].cost_usd, shared.sources.len()), (1, 2., 1));
-        let separate = combine(vec![
+        let (separate, _) = combine(vec![
             usage("a", summary("2026-11-01T00:00:00Z", "box-a", 1.)),
             usage("b", summary("2026-11-01T00:00:00Z", "box-b", 2.)),
         ])
         .unwrap();
         assert_eq!(merge(&separate, &[]).sessions, 4, "different machines both count");
+    }
+
+    #[test]
+    fn usage_is_read_again_once_stale_or_repriced() {
+        assert!(needs_read(None, 0, false), "nothing answered yet");
+        assert!(!needs_read(Some(1_000), 1_000 + SUMMARY_STALE_MS - 1, false));
+        assert!(needs_read(Some(1_000), 1_000 + SUMMARY_STALE_MS, false), "a minute old");
+        assert!(needs_read(Some(1_000), 1_000, true), "prices or aliases changed");
+    }
+
+    #[test]
+    fn incompatible_answers_settle_as_excluded_environments() {
+        let versioned = |id: &str, version: f64| EnvironmentUsage {
+            environment_id: id.into(),
+            summary: serde_json::from_value(json!({"contractVersion": version, "buckets": [], "sources": []})).unwrap(),
+        };
+        assert!(combine(Vec::new()).is_none());
+        let (summary, mismatches) =
+            combine(vec![versioned("old", 3.), versioned("new", CONTRACT_VERSION + 1.)]).unwrap();
+        assert!(summary.buckets.is_empty(), "nothing counts, but the answer settles");
+        assert_eq!(
+            mismatches,
+            [
+                ContractMismatch { environment_id: "old".into(), server_behind: true },
+                ContractMismatch { environment_id: "new".into(), server_behind: false },
+            ]
+        );
+        assert_eq!(mismatches[0].message("Box"), "Box runs an older server version and is excluded from totals.");
+        assert_eq!(
+            mismatches[1].message("Box"),
+            "This client is older than the server on Box; its usage is excluded from totals."
+        );
     }
 
     fn source(provider: &str, status: &str, sessions: u64) -> Value {
@@ -1756,6 +1851,9 @@ mod tests {
         );
         assert_eq!(month.periods().len(), 30);
         assert_eq!(month.to_json()["resolution"], "day");
+        assert_eq!(month.summary_input(&Value::Null), month.to_json());
+        let filter = json!({"exclude": [{"model": "gpt-5-mini"}]});
+        assert_eq!(month.summary_input(&filter)["modelFilter"], filter, "each environment's filter rides along");
         let day = Window::new(1, now, &tz, "America/Los_Angeles".into());
         let input = day.to_json();
         assert_eq!(
@@ -1961,6 +2059,17 @@ mod tests {
         assert_eq!(me.redeem, Some(("env-b".into(), json!({"instanceId": "codex"}))));
         assert_eq!(accounts[1].source_label.as_deref(), Some("Server · Team hub"));
         assert!(limit_notices(&environments, &[]).iter().any(|n| n.starts_with("Server · claude")));
+        let failed = json!([
+            {"id": "down", "label": "Down hub", "accounts": [], "error": "Connection refused."},
+            {"id": "empty", "label": "Empty hub", "accounts": []},
+            {"id": "hidden", "label": "Codex hub", "error": "Stale.", "accounts": [{"id": "a", "driver": "codex"}]},
+        ]);
+        let hubs = [LimitEnvironment { id: "env-a", label: "Laptop", providers: &[], sources: &failed }];
+        assert_eq!(
+            limit_notices(&hubs, &[]),
+            ["Down hub: Connection refused.", "Empty hub: No accounts reported.", "Codex hub: Stale."]
+        );
+        assert_eq!(limit_notices(&hubs, &["codex"]).len(), 2, "a hub of only hidden accounts says nothing");
     }
 
     #[test]

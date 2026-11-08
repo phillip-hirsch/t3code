@@ -15,6 +15,7 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
+use crate::new_thread::sanitize_new_ref_name;
 use crate::rpc::RpcClient;
 use crate::theme::{Tokens, tokens};
 
@@ -468,24 +469,6 @@ fn draft_from_task(task: Option<&Value>) -> (String, bool) {
 fn strategy(base_ref: &str, start_from_origin: bool) -> Value {
     let base_ref = base_ref.trim();
     json!({"type": "worktree", "baseRef": if base_ref.is_empty() { "main" } else { base_ref }, "startFromOrigin": start_from_origin})
-}
-
-/// `sanitizeNewRefName`: trimmed, with ASCII whitespace runs as one dash.
-fn sanitize_new_ref_name(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut in_space = false;
-    for c in raw.trim().chars() {
-        if matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c' | '\x0b') {
-            if !in_space {
-                out.push('-');
-            }
-            in_space = true;
-        } else {
-            out.push(c);
-            in_space = false;
-        }
-    }
-    out
 }
 
 /// `resolveBranchTriggerLabel` for a new worktree. Only the server knows a local branch's remote.

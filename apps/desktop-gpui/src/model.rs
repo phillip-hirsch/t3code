@@ -4,6 +4,7 @@
 //! `orchestrationV2Projection.ts`. Enum-like fields stay strings so new server
 //! values never fail a whole frame; only fields the UI reads are typed.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -68,6 +69,8 @@ pub struct ProviderModel {
     pub badge: Option<String>,
     #[serde(default)]
     pub is_legacy: bool,
+    #[serde(default)]
+    pub is_unavailable: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -160,6 +163,9 @@ pub struct Provider {
     /// Empty means every runtime mode.
     #[serde(default)]
     pub supported_runtime_modes: Vec<String>,
+    /// `continuation`: instances sharing a `groupKey` can continue each other's threads.
+    #[serde(default)]
+    pub continuation: Option<Value>,
     /// `false` hides the composer's Plan toggle.
     #[serde(default)]
     pub show_interaction_mode_toggle: Option<bool>,
@@ -1198,6 +1204,15 @@ pub struct AppThread {
     pub worktree_path: Option<String>,
     #[serde(default)]
     pub active_provider_thread_id: Option<String>,
+    /// The instance its provider session runs on (`runtime.providerInstanceId`).
+    #[serde(default)]
+    pub provider_instance_id: Option<String>,
+    /// `"v1_import"` for a thread brought over from the old event store.
+    #[serde(default)]
+    pub history_origin: Option<String>,
+    /// Where it was forked from: `{type: "run", threadId, runId}` for a fork at a run.
+    #[serde(default)]
+    pub forked_from: Option<Value>,
     /// Why the last `checkpoint.rollback` failed, keyed by its command id.
     #[serde(default)]
     pub rollback_failure: Option<RollbackFailure>,
@@ -1275,6 +1290,9 @@ pub struct ProviderThread {
     pub provider_instance_id: Option<String>,
     #[serde(default)]
     pub app_thread_id: Option<String>,
+    /// The provider's own thread, which a handoff resumes from.
+    #[serde(default)]
+    pub native_thread_ref: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1282,6 +1300,8 @@ pub struct ProviderThread {
 pub struct ProviderSession {
     pub id: String,
     pub status: String,
+    #[serde(default)]
+    pub driver: Option<String>,
     /// `OrchestrationV2ProviderCapabilities`.
     #[serde(default)]
     pub capabilities: Value,
@@ -1500,6 +1520,12 @@ impl TurnItem {
     pub fn bool(&self, key: &str) -> bool {
         self.raw.get(key).and_then(Value::as_bool) == Some(true)
     }
+
+    /// A bare `/compact` prompt (`isCompactCommandMessage`): it runs a compaction, not a turn.
+    pub fn is_bare_compact(&self) -> bool {
+        self.str("text").is_some_and(|text| text.trim().eq_ignore_ascii_case("/compact"))
+            && self.raw.get("attachments").and_then(Value::as_array).is_none_or(Vec::is_empty)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1516,6 +1542,9 @@ pub struct VisibleRow {
 #[serde(rename_all = "camelCase")]
 pub struct ThreadProjection {
     pub thread: AppThread,
+    /// `contextTransfers`: context carried between threads, such as a fork's source usage.
+    #[serde(default, deserialize_with = "lossy")]
+    pub context_transfers: Vec<Value>,
     #[serde(default, deserialize_with = "lossy")]
     pub runs: Vec<Run>,
     #[serde(default, deserialize_with = "lossy")]
@@ -1583,16 +1612,16 @@ impl ThreadProjection {
         self.runs.iter().any(|run| run.status == "queued" && run.queue_held)
     }
 
-    /// The newest turn report, else the active provider thread's snapshot, as
-    /// `latestProviderTurnTokenUsage` + `deriveLatestContextWindowSnapshot`
-    /// in `packages/client-runtime/src/state/contextWindow.ts`.
-    pub fn context_usage(&self) -> Option<&TokenUsage> {
+    /// The newest turn report, else a native fork's source usage, else the active provider
+    /// thread's snapshot, else the last compaction's counts, as `latestProviderTurnTokenUsage` +
+    /// `deriveLatestContextWindowSnapshot` in `packages/client-runtime/src/state/contextWindow.ts`.
+    pub fn context_usage(&self) -> Option<Cow<'_, TokenUsage>> {
         self.context_window().map(|(usage, _)| usage)
     }
 
     /// `context_usage` and whether it is a live turn report, which always compacts
     /// automatically and carries no totals.
-    pub fn context_window(&self) -> Option<(&TokenUsage, bool)> {
+    pub fn context_window(&self) -> Option<(Cow<'_, TokenUsage>, bool)> {
         let mut latest: Option<&TokenUsage> = None;
         for usage in self.provider_turns.iter().filter_map(|turn| turn.token_usage.as_ref()) {
             // Ties go to the later entry, since live upserts append.
@@ -1601,11 +1630,51 @@ impl ThreadProjection {
             }
         }
         if let Some(usage) = latest {
-            return Some((usage, true));
+            return Some((Cow::Borrowed(usage), true));
         }
-        let active = self.thread.active_provider_thread_id.as_ref()?;
-        let usage = self.provider_threads.iter().find(|thread| &thread.id == active)?.context_usage.as_ref()?;
-        Some((usage, false))
+        let active = self.thread.active_provider_thread_id.as_ref();
+        let snapshot = active
+            .and_then(|active| self.provider_threads.iter().find(|thread| &thread.id == active))
+            .and_then(|thread| thread.context_usage.as_ref());
+        match snapshot {
+            Some(usage) => Some((Cow::Borrowed(usage), false)),
+            None => match self.fork_source_usage() {
+                Some(usage) => Some((Cow::Owned(usage), true)),
+                None => self.compaction_usage().map(|usage| (Cow::Owned(usage), false)),
+            },
+        }
+    }
+
+    /// A fork's first context: the usage its source run had, until its own provider reports.
+    fn fork_source_usage(&self) -> Option<TokenUsage> {
+        let forked = self.thread.forked_from.as_ref().filter(|forked| forked["type"] == "run")?;
+        let instance = self.thread.model_selection.as_ref()?.instance_id.as_str();
+        let (source, run) = (forked["threadId"].as_str()?, forked["runId"].as_str()?);
+        let transfer = self.context_transfers.iter().find(|transfer| {
+            transfer["type"] == "fork"
+                && transfer["targetThreadId"] == self.thread.id.as_str()
+                && transfer["sourceThreadId"] == source
+                && transfer["sourcePoint"]["runId"] == run
+                && transfer["sourceProviderInstanceId"] == instance
+                && (transfer["status"] == "pending" || transfer["resolution"]["strategy"] == "native_fork")
+        })?;
+        serde_json::from_value(transfer["sourceTokenUsage"].clone()).ok()
+    }
+
+    /// The newest compaction's after count, with its before count as the total processed.
+    fn compaction_usage(&self) -> Option<TokenUsage> {
+        self.visible_turn_items.iter().rev().filter(|row| row.item.item_type == "compaction").find_map(|row| {
+            let item = &row.item.raw;
+            Some(TokenUsage {
+                used_tokens: item["afterTokenCount"].as_u64()?,
+                max_tokens: None,
+                auto_compact_threshold: None,
+                updated_at: item["startedAt"].as_str().or_else(|| item["updatedAt"].as_str()).map(str::to_owned),
+                total_processed_tokens: item["beforeTokenCount"].as_u64(),
+                compacts_automatically: Some(true),
+                cost: None,
+            })
+        })
     }
 
     /// `deriveProviderExtensionStatuses`: only the selected provider's current session can supply them.
@@ -1654,6 +1723,32 @@ impl ThreadProjection {
         Some((plan, markdown))
     }
 
+    /// `threadHasStarted`: it ran, holds items, or has a provider session.
+    pub fn has_started(&self) -> bool {
+        !self.runs.is_empty() || !self.turn_items.is_empty() || self.provider_session().is_some()
+    }
+
+    /// `threadSupportsProviderHandoff`: its next turn may move to another provider.
+    pub fn supports_provider_handoff(&self) -> bool {
+        if let Some(session) = self.provider_session() {
+            return session.capabilities["sessions"]["supportsProviderSwitchingViaHandoff"].as_bool() == Some(true);
+        }
+        if self.runs.iter().any(|run| is_active_run_status(&run.status)) {
+            return false;
+        }
+        if self.thread.history_origin.as_deref() == Some("v1_import") || self.runs.is_empty() {
+            return true;
+        }
+        // A stopped session leaves the projection, but its native thread can still hand off.
+        let instance = self.thread.model_selection.as_ref().map(|s| &s.instance_id);
+        self.provider_threads.iter().any(|thread| {
+            Some(&thread.id) == self.thread.active_provider_thread_id.as_ref()
+                && thread.app_thread_id.as_ref() == Some(&self.thread.id)
+                && thread.provider_instance_id.as_ref() == instance
+                && thread.native_thread_ref.as_ref().is_some_and(|r| !r.is_null())
+        })
+    }
+
     /// `resolveThreadProviderSession` in `packages/client-runtime/src/state/threadWorkflows.ts`.
     pub fn provider_session(&self) -> Option<&ProviderSession> {
         let active = self.runs.iter().rev().find(|run| is_active_run_status(&run.status));
@@ -1689,6 +1784,29 @@ impl ThreadProjection {
 
     pub fn is_running(&self) -> bool {
         self.runs.iter().any(|run| is_active_run_status(&run.status))
+    }
+
+    /// `isCompacting` in `ChatView.tsx`: the active run is compacting, so it cannot take steering.
+    pub fn is_compacting(&self) -> bool {
+        let Some(run) = self.interruptible_run().map(|run| Some(&run.id)) else { return false };
+        let compaction = |done: bool| {
+            self.visible_turn_items.iter().any(|row| {
+                let item = &row.item;
+                item.item_type == "compaction"
+                    && item.run_id.as_ref() == run
+                    && if done {
+                        matches!(item.status.as_str(), "completed" | "failed" | "interrupted" | "cancelled")
+                    } else {
+                        item.status == "running"
+                    }
+            })
+        };
+        let compact_request = self
+            .visible_turn_items
+            .iter()
+            .rfind(|row| row.item.item_type == "user_message")
+            .is_some_and(|row| row.item.is_bare_compact() && row.item.run_id.as_ref() == run);
+        compaction(false) || (compact_request && !compaction(true))
     }
 
     /// The run `run.interrupt` should target: the last unfinished one.
@@ -2240,6 +2358,63 @@ mod tests {
         let project: ProjectShell =
             serde_json::from_value(json!({"id": "p", "title": "P", "workspaceRoot": "/p"})).unwrap();
         assert_eq!(info.new_thread_model(Some(&project)).unwrap().model, "haiku", "the project's override wins");
+    }
+
+    #[test]
+    fn a_compacting_run_cannot_take_steering() {
+        let compacting = |items: &[Value]| {
+            let mut state = ThreadState::default();
+            state.apply(&json!({"kind":"snapshot","snapshotSequence":1,"projection": projection(items)})).unwrap();
+            state.projection.unwrap().is_compacting()
+        };
+        let mut compact = item("u", "user_message", "r1", 1);
+        compact["text"] = json!(" /Compact ");
+        let mut prompt = item("u2", "user_message", "r1", 3);
+        prompt["text"] = json!("hi");
+        let compaction = |status: &str| {
+            let mut item = item("c", "compaction", "r1", 2);
+            item["status"] = json!(status);
+            item
+        };
+        assert!(compacting(&[compact.clone()]), "a bare /compact before its compaction item lands");
+        assert!(!compacting(&[compact.clone(), compaction("completed")]));
+        assert!(compacting(&[prompt.clone(), compaction("running")]), "an automatic compaction mid-turn");
+        assert!(!compacting(&[compact, compaction("completed"), prompt.clone()]));
+        assert!(!compacting(&[prompt]));
+    }
+
+    #[test]
+    fn the_context_window_falls_back_to_a_fork_source_then_the_last_compaction() {
+        let item = |id: &str, after: Value| {
+            json!({"visibility": "visible", "sourceThreadId": "t", "sourceItemId": id,
+                "item": {"id": id, "type": "compaction", "threadId": "t", "startedAt": "2026-01-01T00:00:00Z",
+                    "beforeTokenCount": 9000, "afterTokenCount": after}})
+        };
+        let projection = |extra: Value| -> ThreadProjection {
+            let mut value = json!({
+                "thread": {"id": "t", "title": "t", "modelSelection": {"instanceId": "codex", "model": "m"},
+                    "forkedFrom": {"type": "run", "threadId": "src", "runId": "r1"}},
+                "visibleTurnItems": [item("c1", json!(1200)), item("c2", Value::Null)],
+            });
+            value.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(value).unwrap()
+        };
+        let compacted = projection(json!({}));
+        let (usage, live) = compacted.context_window().unwrap();
+        assert_eq!((usage.used_tokens, usage.total_processed_tokens, live), (1200, Some(9000), false));
+        assert_eq!(usage.compacts_automatically, Some(true), "a compaction without counts is skipped");
+        let transfer = |status: &str, strategy: &str| {
+            json!({"contextTransfers": [{"type": "fork", "targetThreadId": "t", "sourceThreadId": "src",
+                "sourcePoint": {"runId": "r1"}, "sourceProviderInstanceId": "codex", "status": status,
+                "resolution": {"strategy": strategy}, "sourceTokenUsage": {"usedTokens": 500, "maxTokens": 1000}}]})
+        };
+        let forked = projection(transfer("pending", ""));
+        let (usage, live) = forked.context_window().unwrap();
+        assert_eq!((usage.used_tokens, usage.max_tokens, live), (500, Some(1000), true));
+        let resolved = projection(transfer("resolved", "native_fork"));
+        assert_eq!(resolved.context_usage().unwrap().used_tokens, 500);
+        let replayed = projection(transfer("resolved", "replay"));
+        assert_eq!(replayed.context_usage().unwrap().used_tokens, 1200, "only a native fork carries usage");
     }
 
     #[test]

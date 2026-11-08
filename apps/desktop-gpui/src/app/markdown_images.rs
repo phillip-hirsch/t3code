@@ -230,6 +230,67 @@ impl Workspace {
     }
 }
 
+/// An attachment's place in the image cache, apart from any markdown destination.
+fn attachment_key(id: &str) -> String {
+    format!("t3-attachment:{id}")
+}
+
+impl Workspace {
+    /// Starts loading the image attachments `ids` names that the cache has not seen yet
+    /// (`useAssetUrls`). Their tiles keep their size, so a finished load only repaints.
+    pub(super) fn load_attachment_images<'a>(
+        &mut self,
+        ids: impl IntoIterator<Item = &'a str>,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(client), Some(base)) = (self.client(), self.http_base().map(str::to_owned)) else { return };
+        let cache = self.markdown_images.clone();
+        for id in ids {
+            let key = attachment_key(id);
+            {
+                let Ok(mut cache) = cache.0.lock() else { return };
+                if cache.contains_key(&key) {
+                    continue;
+                }
+                cache.insert(key.clone(), None);
+            }
+            let resource = json!({"_tag": "attachment", "attachmentId": id});
+            let (client, base, cache) = (client.clone(), base.clone(), cache.clone());
+            cx.spawn(async move |this, cx| {
+                let fetched = match client.request("assets.createUrl", json!({"resource": resource})).await {
+                    Ok(signed) => match signed["relativeUrl"].as_str() {
+                        Some(relative) => fetch(format!("{base}{relative}")).await,
+                        None => None,
+                    },
+                    Err(error) => {
+                        log::debug!("assets.createUrl for an attachment image: {error}");
+                        None
+                    }
+                };
+                let image = fetched.and_then(|(mime, bytes)| {
+                    let format = mime.as_deref().and_then(format_for).or_else(|| sniff(&bytes))?;
+                    Some(Arc::new(Image::from_bytes(format, bytes)))
+                });
+                let Some(image) = image else { return };
+                if let Ok(mut cache) = cache.0.lock() {
+                    cache.insert(key, Some(image));
+                }
+                let _ = this.update(cx, |this, cx| {
+                    if Arc::ptr_eq(&cache.0, &this.markdown_images.0) {
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
+    }
+
+    /// A loaded image attachment; `None` while it loads or when it could not.
+    pub(super) fn attachment_image(&self, id: &str) -> Option<Arc<Image>> {
+        self.markdown_images.0.lock().ok()?.get(&attachment_key(id)).cloned().flatten()
+    }
+}
+
 /// The bytes' format when the server named none.
 fn sniff(bytes: &[u8]) -> Option<ImageFormat> {
     match bytes {

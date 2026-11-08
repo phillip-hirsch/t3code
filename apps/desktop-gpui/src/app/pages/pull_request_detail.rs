@@ -1158,7 +1158,7 @@ impl Workspace {
         if detail.capabilities.diff {
             tabs.push((Tab::Code, "Code"));
         }
-        let toggle = super::usage::segmented("pr-tab", tabs.into_iter(), tab, t, cx, |this, tab, cx| {
+        let toggle = super::usage::segmented("pr-tab", tabs.into_iter(), tab, t, window, cx, |this, tab, cx| {
             let Some(panel) = this.pull_requests.panel.as_mut() else { return };
             panel.tab = tab;
             if tab == Tab::Guide && panel.guide.is_none() && !panel.guide_loading {

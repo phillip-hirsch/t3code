@@ -114,10 +114,19 @@ pub(super) enum ComposerDraft {
     Question(QuestionDraft),
 }
 
+/// A target's model and permissions picks while another one is on screen.
+pub(super) struct ComposerSelection {
+    pub(super) model: Option<ModelSelection>,
+    pub(super) explicit: bool,
+    pub(super) runtime_mode: Option<String>,
+}
+
 impl Workspace {
     /// A user edit. While a question is open the editor holds its custom answer;
     /// programmatic changes (`set_composer_text`) never reach the draft.
-    pub(super) fn on_composer_change(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn on_composer_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.typing_guard.typed(std::time::Instant::now());
+        self.schedule_typing_idle(window, cx);
         self.close_stash_menu(cx);
         if self.composer_ui.length_error.is_some() {
             let error = composer_text::prompt_length_error(&self.composer.read(cx).value());
@@ -170,9 +179,15 @@ impl Workspace {
     pub(super) fn sync_composer_empty(&mut self, cx: &mut Context<Self>) {
         let empty = self.composer.read(cx).text().len() == 0;
         let triage = !empty && super::palette_actions::is_triage_prompt(&self.composer.read(cx).value());
-        if empty != self.composer_empty || triage != self.composer_triage {
+        let ultrathink = if empty {
+            Default::default()
+        } else {
+            crate::model_label::prompt_ultrathink(&self.composer.read(cx).value())
+        };
+        if empty != self.composer_empty || triage != self.composer_triage || ultrathink != self.composer_ultrathink {
             self.composer_empty = empty;
             self.composer_triage = triage;
+            self.composer_ultrathink = ultrathink;
             cx.notify();
         }
     }
@@ -201,10 +216,42 @@ impl Workspace {
             };
         }
         self.chip_ids = content.tokens().iter().map(|s| s.token().id().to_string()).collect();
+        // `set_value` clears the undo history that could bring a deleted chip back.
+        self.release_retained_attachments(cx);
         self.composer.update(cx, |composer, cx| composer.set_value(content, window, cx));
         self.sync_composer_empty(cx);
         self.sync_trigger(cx);
         self.sync_composer_marks(cx);
+    }
+
+    /// Pasted file links, known skills and context links arrive as chips (`handlePaste`);
+    /// `false` leaves a paste without any, or one into code, to the editor.
+    pub(super) fn paste_chips(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let state = self.composer.read(cx);
+        let (value, selection) = (state.value(), state.selected_range());
+        let rich = self.client_settings.values.bool("composerRichTextEnabled");
+        if rich && crate::composer_edit::in_code_block(&value, selection.clone()) {
+            return false;
+        }
+        let after_space = value[..selection.start].chars().next_back().is_none_or(char::is_whitespace);
+        let skills = self.skill_names();
+        let Some((text, found)) =
+            composer_text::pasted_chips(text, after_space, |name| skills.iter().any(|s| s == name))
+        else {
+            return false;
+        };
+        let at = selection.start;
+        self.composer.update(cx, |state, cx| {
+            state.replace(text.clone(), window, cx);
+            // Same-length swaps, back to front, so every range stays put.
+            for (range, chip) in found.into_iter().rev() {
+                let token = InlineToken::new(chip.id(), &text[range.clone()]).with_label(chip.label().to_owned());
+                let _ = state.replace_range_with_token(at + range.start..at + range.end, token, window, cx);
+            }
+            let end = at + text.len();
+            state.set_selected_range(end..end, cx);
+        });
+        true
     }
 
     /// The user-invocable skills of the composer's provider, by name.
@@ -220,6 +267,16 @@ impl Workspace {
     /// Keeps the leaving target's composer; call before the target changes.
     pub(super) fn stash_composer(&mut self, cx: &mut Context<Self>) {
         let Some(target) = self.target.clone() else { return };
+        if self.model_override.is_some() || self.runtime_mode_override.is_some() {
+            let selection = ComposerSelection {
+                model: self.model_override.clone(),
+                explicit: self.model_explicit,
+                runtime_mode: self.runtime_mode_override.clone(),
+            };
+            self.composer_selections.insert(target.clone(), selection);
+        } else {
+            self.composer_selections.remove(&target);
+        }
         let attachments = std::mem::take(&mut self.attachments);
         let draft = match (self.question.take(), self.take_queue_edit_draft()) {
             (Some(question), _) => ComposerDraft::Question(question),
@@ -272,6 +329,9 @@ impl Workspace {
     /// `sync_question` drops a restored question once the thread shows it resolved.
     pub(super) fn restore_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_draft_workspace(cx);
+        self.typing_guard.reset();
+        self._typing_idle = None;
+        self.sync_typing_guard(window, cx);
         match self.target.as_ref().and_then(|target| self.composer_drafts.remove(target)) {
             Some(ComposerDraft::Question(question)) => {
                 self.question = Some(question);
@@ -297,13 +357,20 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        // The permissions popover nests in the model picker's footer, so it takes the keys first.
+        if self.permissions_key(keystroke, window, cx) || self.context_meter_key(keystroke, cx) {
+            return true;
+        }
         if self.model_picker_open() {
             return self.picker_key(keystroke, window, cx);
         }
         self.stash_menu_key(keystroke, window, cx)
             || self.draft_workspace_key(keystroke, window, cx)
             || (self.composer.focus_handle(cx).is_focused(window)
-                && (self.plan_toggle_key(keystroke, window, cx) || self.menu_key(keystroke, window, cx)))
+                && (self.code_key(keystroke, window, cx)
+                    || self.list_outdent_key(keystroke, window, cx)
+                    || self.plan_toggle_key(keystroke, window, cx)
+                    || self.menu_key(keystroke, window, cx)))
     }
 
     /// Keys left after the keymap: 1-9 on a question card, prompt history, then a plain send.
@@ -322,7 +389,86 @@ impl Workspace {
         }
         self.question_option_key(keystroke, window, cx)
             || (context.composer_focus
-                && (self.history_key(keystroke, window, cx) || self.send_key(keystroke, context, window, cx)))
+                && (self.history_key(keystroke, window, cx)
+                    || self.send_key(keystroke, context, window, cx)
+                    || self.composer_list_key(keystroke, window, cx)))
+    }
+
+    /// The rich editor's code-block keys, ahead of menus and sending (`ComposerPromptEditorTiptap`):
+    /// Enter writes a line of code or leaves the block, Tab and Shift+Tab indent.
+    fn code_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let m = keystroke.modifiers;
+        if m.control || m.platform || self.question.is_some() {
+            return false;
+        }
+        if !self.client_settings.values.bool("composerRichTextEnabled") {
+            return false;
+        }
+        let state = self.composer.read(cx);
+        let (text, selection) = (state.value(), state.selected_range());
+        let edit = match keystroke.key.as_str() {
+            "enter" => crate::composer_edit::code_enter(&text, selection),
+            "tab" => crate::composer_edit::code_tab(&text, selection, m.shift),
+            _ => None,
+        };
+        edit.is_some_and(|edit| self.apply_composer_edit(edit, window, cx))
+    }
+
+    /// Shift+Tab lifts a nested list item before it switches Build and Plan (`composerCommandKey.ts`).
+    fn list_outdent_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let m = keystroke.modifiers;
+        if keystroke.key != "tab" || !m.shift || m.control || m.alt || m.platform {
+            return false;
+        }
+        self.list_edit(crate::composer_edit::list_outdent, window, cx)
+    }
+
+    /// Enter that doesn't send continues a list; Tab nests its item (`applyListEdit`).
+    fn composer_list_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let m = keystroke.modifiers;
+        if m.control || m.platform {
+            return false;
+        }
+        match keystroke.key.as_str() {
+            "enter" => self.list_edit(crate::composer_edit::list_enter, window, cx),
+            "tab" if !m.shift && !m.alt => self.list_edit(crate::composer_edit::list_indent, window, cx),
+            _ => false,
+        }
+    }
+
+    fn list_edit(
+        &mut self,
+        edit: fn(&str, usize, &[std::ops::Range<usize>]) -> Option<crate::composer_edit::Edit>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.question.is_some() {
+            return false;
+        }
+        let state = self.composer.read(cx);
+        let selection = state.selected_range();
+        if !selection.is_empty() {
+            return false;
+        }
+        let tokens: Vec<_> = state.tokens().iter().map(gpui_kit::base::input::InlineTokenSpan::range).collect();
+        let edit = edit(&state.value(), selection.start, &tokens);
+        edit.is_some_and(|edit| self.apply_composer_edit(edit, window, cx))
+    }
+
+    fn apply_composer_edit(
+        &mut self,
+        edit: crate::composer_edit::Edit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.composer.update(cx, |state, cx| {
+            if !edit.is_noop() {
+                state.set_selected_range(edit.range, cx);
+                state.replace(edit.text, window, cx);
+            }
+            state.set_selected_range(edit.select, cx);
+        });
+        true
     }
 
     /// `shouldTypeToFocusComposer` and `usePasteToFocusComposer`: with nothing focused (a
@@ -415,10 +561,8 @@ impl Workspace {
         let Some(projection) = self.thread.as_ref().and_then(|t| t.state.projection.as_ref()) else {
             return Vec::new();
         };
-        let messages =
-            projection.visible_turn_items.iter().map(|row| &row.item).filter(|item| {
-                item.item_type == "user_message" && item.raw.get("attribution").is_none_or(Value::is_null)
-            });
+        let messages = (projection.visible_turn_items.iter().map(|row| &row.item))
+            .filter(|item| item.item_type == "user_message" && crate::queue::sent_by_user(item));
         composer_text::history_entries(messages.filter_map(|item| item.str("text")))
     }
 
@@ -463,12 +607,59 @@ impl Workspace {
         true
     }
 
+    /// `useComposerTypingGuard`: the open thread's pending requests, minding the ones new mid-typing.
+    pub(super) fn sync_typing_guard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(projection) = self.thread.as_ref().and_then(|t| t.state.projection.as_ref()) else { return };
+        let approvals = projection.pending_approvals().into_iter().map(|(request, _)| request.id.as_str());
+        let questions = projection.pending_user_inputs().into_iter().map(|(request, _)| request.id.as_str());
+        let ids: Vec<&str> = approvals.chain(questions).collect();
+        if self.typing_guard.requests(ids, std::time::Instant::now()) {
+            self.schedule_typing_idle(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// Shows what the guard held once typing has rested.
+    fn schedule_typing_idle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(at) = self.typing_guard.idle_at() else {
+            self._typing_idle = None;
+            return;
+        };
+        self._typing_idle = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(at.saturating_duration_since(std::time::Instant::now())).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.typing_guard.idle_at() == Some(at) {
+                    this.release_typing_hold(false, window, cx);
+                }
+            });
+        }));
+    }
+
+    /// Blur, a send or rested typing shows the held requests.
+    pub(super) fn release_typing_hold(&mut self, blur: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self._typing_idle = None;
+        if self.typing_guard.release(blur) {
+            self.sync_question(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// Pending approvals the composer shows: those the typing guard isn't holding.
+    pub(super) fn shown_approvals(&self) -> Vec<(&RuntimeRequest, Option<&TurnItem>)> {
+        let Some(projection) = self.open_projection() else { return Vec::new() };
+        let mut approvals = projection.pending_approvals();
+        approvals.retain(|(request, _)| !self.typing_guard.is_held(&request.id));
+        approvals
+    }
+
     /// Opens a fresh draft when the first pending question changes. The editor
     /// then holds the question's answer, and the prompt waits in the draft
     /// until the last question closes.
     pub(super) fn sync_question(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(projection) = self.thread.as_ref().and_then(|t| t.state.projection.as_ref()) else { return };
         let first = projection.pending_user_inputs().into_iter().next();
+        // A question that arrived mid-typing waits; the composer keeps the prompt meanwhile.
+        let first = first.filter(|(request, _)| !self.typing_guard.is_held(&request.id));
         if first.map(|(request, _)| &request.id) == self.question.as_ref().map(|q| &q.request_id) {
             return;
         }
@@ -572,11 +763,9 @@ impl Workspace {
     /// `true` comes back), else every live approval is declined before the
     /// message goes out.
     pub(super) fn approval_declines(&self, text: &str) -> (Vec<Value>, bool) {
-        let Some(projection) = self.thread.as_ref().and_then(|t| t.state.projection.as_ref()) else {
-            return (Vec::new(), false);
-        };
+        // Approvals the typing guard holds stay unseen and pending.
         let live: Vec<_> =
-            projection.pending_approvals().into_iter().map(|(request, _)| request).filter(|r| r.is_live()).collect();
+            self.shown_approvals().into_iter().map(|(request, _)| request).filter(|r| r.is_live()).collect();
         match live.first() {
             None => (Vec::new(), false),
             Some(first) if first.supports_feedback() => {
@@ -635,6 +824,9 @@ impl Workspace {
                 "Choose an option above"
             };
         }
+        if self.has_plan_follow_up() {
+            return "Add feedback to refine the plan, or leave this blank to implement it";
+        }
         if self.target.is_none() {
             return "Choose a project above to start a thread";
         }
@@ -671,8 +863,7 @@ impl Workspace {
     pub(super) fn render_composer(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (lane, _) = self.chat_layout(window);
         let t = *tokens(cx);
-        let projection = self.thread.as_ref().and_then(|t| t.state.projection.as_ref());
-        let approvals = projection.map(|p| p.pending_approvals()).unwrap_or_default();
+        let approvals = self.shown_approvals();
         let first_approval = approvals.first().map(|(request, _)| *request);
         let placeholder = self.placeholder(first_approval);
         let outline = if t.dark { white(0.05) } else { black(0.08) };
@@ -681,6 +872,11 @@ impl Workspace {
         let hover_view = view.clone();
         let pull_requests = Rc::new(pull_request_contexts(self.queue_edit_records()));
         let chip_tooltip = self.render_chip_tooltip(&pull_requests, &t);
+        let machines: Rc<[(String, Lucide)]> = (self.sessions().iter())
+            .filter_map(|s| {
+                Some((s.id.as_ref()?.to_string(), super::host_picker::machine_icon(s.server_info.machine_kind())))
+            })
+            .collect();
         let editor = Textarea::new(&self.composer)
             .appearance(false)
             .xsmall()
@@ -689,7 +885,7 @@ impl Workspace {
             .line_height(px(t.fonts.prompt_size * PROMPT_LEADING))
             .mx(px(-4.))
             .disabled(self.target.is_none())
-            .token(move |token, _, _| render_chip(token, &pull_requests, &t))
+            .token(move |token, _, _| render_chip(token, &pull_requests, &machines, &t))
             // A pull request chip shows its details while hovered (`PullRequestContextDetails`).
             .on_token_hover(move |event, _, cx| {
                 let hovered = event.is_hovered().then(|| (event.token().id().to_string(), event.bounds()));
@@ -700,14 +896,23 @@ impl Workspace {
                     }
                 });
             })
-            // A file chip opens its preview (`composerContextActions.openFile`).
-            .on_token_click(move |event, window, cx| {
-                if let Some(Chip::Context { kind, id, .. }) = Chip::from_id(event.token().id())
-                    && kind == "file"
-                    && let Some(local_id) = id.strip_prefix("file_")
-                {
-                    let _ = chip_view.update(cx, |this, cx| this.open_attachment_preview(local_id, window, cx));
+            // A file or image chip opens its preview: an uploaded attachment's (`composerContextActions.openFile`), or
+            // the workspace file a mention names in the panel (`openMention`).
+            .on_token_click(move |event, window, cx| match Chip::from_id(event.token().id()) {
+                Some(Chip::Context { kind, id, .. }) if kind == "file" || kind == "image" => {
+                    if let Some(local_id) = id.strip_prefix("file_").or_else(|| id.strip_prefix("image_")) {
+                        let _ = chip_view.update(cx, |this, cx| this.open_attachment_preview(local_id, window, cx));
+                    }
                 }
+                Some(Chip::File { path }) => {
+                    // A folder mention's trailing slash goes, except a drive root's (`openFile`).
+                    let trimmed = path.trim_end_matches('/');
+                    let drive_root =
+                        trimmed.len() == 2 && trimmed.ends_with(':') && trimmed.as_bytes()[0].is_ascii_alphabetic();
+                    let path = if trimmed.is_empty() || drive_root { path.clone() } else { trimmed.to_owned() };
+                    let _ = chip_view.update(cx, |this, cx| this.open_file_surface(path, window, cx));
+                }
+                _ => {}
             })
             .on_paste(move |item, window, cx| {
                 view.update(cx, |this, cx| this.paste_attachments(item, window, cx)).unwrap_or(false)
@@ -727,6 +932,18 @@ impl Workspace {
             } else {
                 vec![BoxShadow::new(px(0.), px(1.), black(0.05)).blur_radius(px(2.))]
             })
+            // A Files row dropped here joins the prompt as a mention (`isDragOverComposer`).
+            .drag_over::<super::files::MentionDrag>(move |style, _, _, _| {
+                style
+                    .bg(t.background.blend(t.card.opacity(t.glass)).blend(t.accent.opacity(0.45)))
+                    .border_color(t.primary.opacity(0.7))
+            })
+            .on_drop(cx.listener(|this, drag: &super::files::MentionDrag, window, cx| {
+                if this.target.is_some() {
+                    this.add_file_to_chat(&drag.path, window, cx);
+                    this.focus_composer(window, cx);
+                }
+            }))
             .on_modifiers_changed(cx.listener(|this, event: &ModifiersChangedEvent, _, cx| {
                 let held = event.modifiers.control || event.modifiers.platform;
                 if held != this.ctrl_held {
@@ -737,24 +954,32 @@ impl Workspace {
             .children(subagent_bar)
             .when(!subagent, |surface| {
                 surface
-                    .child(v_flex().px(px(16.)).pt(px(16.)).pb(px(8.)).children(self.render_attachments(&t, cx)).child(
-                        // The placeholder wraps over the editor's two reserved lines without
-                        // growing it, as Tiptap's zero-height `::before` does.
-                        div().relative().child(editor).children(chip_tooltip).when(self.composer_empty, |el| {
-                            el.child(
-                                div()
-                                    .absolute()
-                                    .top_0()
-                                    .left_0()
-                                    .right_0()
-                                    .font_family(t.fonts.composer)
-                                    .text_size(px(t.fonts.prompt_size))
-                                    .line_height(px(t.fonts.prompt_size * PROMPT_LEADING))
-                                    .text_color(t.muted_foreground)
-                                    .child(placeholder),
-                            )
-                        }),
-                    ))
+                    .child(
+                        v_flex()
+                            .px(px(16.))
+                            .pt(px(16.))
+                            .pb(px(8.))
+                            .children(self.render_queue_edit_attachments(&t, cx))
+                            .children(self.render_attachments(&t, cx))
+                            .child(
+                                // The placeholder wraps over the editor's two reserved lines without
+                                // growing it, as Tiptap's zero-height `::before` does.
+                                div().relative().child(editor).children(chip_tooltip).when(self.composer_empty, |el| {
+                                    el.child(
+                                        div()
+                                            .absolute()
+                                            .top_0()
+                                            .left_0()
+                                            .right_0()
+                                            .font_family(t.fonts.composer)
+                                            .text_size(px(t.fonts.prompt_size))
+                                            .line_height(px(t.fonts.prompt_size * PROMPT_LEADING))
+                                            .text_color(t.muted_foreground)
+                                            .child(placeholder),
+                                    )
+                                }),
+                            ),
+                    )
                     .children(self.composer_ui.length_error.clone().map(|error| {
                         div().px(px(16.)).pb(px(8.)).text_xs().line_height(px(16.)).text_color(t.error).child(error)
                     }))
@@ -847,8 +1072,7 @@ impl Workspace {
             .when(self.can_attach(), |el| {
                 el.child(
                     div().mr(px(8.)).child(
-                        div()
-                            .id("attach")
+                        action_control(div().id("attach"), &self.composer_action_focus[ATTACH], t)
                             .size(px(28.))
                             .flex_none()
                             .flex()
@@ -889,15 +1113,12 @@ impl Workspace {
                             });
                         });
                     })
-                    .child(
-                        h_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .justify_end()
-                            .gap(px(2.))
-                            .child(self.render_model_picker(t, cx))
-                            .children(mode_block),
-                    )
+                    .child(h_flex().flex_1().min_w_0().justify_end().gap(px(2.)).map(|el| {
+                        match self.render_provider_unavailable(t, cx) {
+                            Some(unavailable) => el.child(unavailable),
+                            None => el.child(self.render_model_picker(t, cx)).children(mode_block),
+                        }
+                    }))
                     .children(self.render_context_meter(t, cx))
                     .child(self.render_primary_action(t, cx)),
             )
@@ -910,7 +1131,7 @@ impl Workspace {
             .and_then(|t| t.state.projection.as_ref())
             .is_some_and(super::super::model::ThreadProjection::is_running);
         let stop = || {
-            round_button("stop", t.error.opacity(0.9), t.error, t)
+            action_control(round_button("stop", t.error.opacity(0.9), t.error, t), &self.composer_action_focus[STOP], t)
                 .hover(|s| s.bg(t.error))
                 .child(div().size(px(8.)).rounded(px(1.5)).bg(t.primary_foreground))
                 .tooltip(|window, cx| Tooltip::new("Interrupt").build(window, cx))
@@ -937,6 +1158,8 @@ impl Workspace {
                 (false, true) => "Submit answer",
             };
             let enabled = ready && can_respond && !responding;
+            let submit = div().id("submit-answer");
+            let submit = if enabled { action_control(submit, &self.composer_action_focus[PRIMARY], t) } else { submit };
             return h_flex()
                 .gap(px(8.))
                 .when(running, |el| el.child(stop()))
@@ -951,8 +1174,7 @@ impl Workspace {
                     )
                 })
                 .child(
-                    div()
-                        .id("submit-answer")
+                    submit
                         .h(px(28.))
                         .px(px(16.))
                         .flex()
@@ -990,7 +1212,9 @@ impl Workspace {
             } else {
                 Icon::new(Lucide::Play).with_size(px(16.)).text_color(t.primary_foreground).into_any_element()
             };
-            return round_button("resume", t.primary, t.primary, t)
+            let resume = round_button("resume", t.primary, t.primary, t);
+            let resume = if enabled { action_control(resume, &self.composer_action_focus[PRIMARY], t) } else { resume };
+            return resume
                 .child(content)
                 .when(!enabled, |el| el.opacity(0.64).shadow(Vec::new()))
                 .when(enabled, |el| {
@@ -1001,7 +1225,12 @@ impl Workspace {
                 .tooltip(|window, cx| Tooltip::new("Resume thread").build(window, cx))
                 .into_any_element();
         }
-        let disabled_reason = self.attachments_busy().then_some("Attachment(s) still uploading");
+        let disabled_reason: Option<SharedString> = if self.attachments_busy() {
+            Some("Attachment(s) still uploading".into())
+        } else {
+            // An answer to an open question still goes through.
+            self.runtime_mode_ceiling().filter(|_| self.question.is_none()).map(|(denial, _)| denial.into())
+        };
         let can_send = sendable
             && self.target.is_some()
             && self.client().is_some()
@@ -1020,7 +1249,8 @@ impl Workspace {
         let follow_up = self.follow_up_behavior();
         let alternate = if follow_up == "queue" { "steer" } else { "queue" };
         let held = if self.ctrl_held { Intent::Alternate } else { Intent::Foreground };
-        let queue = running && super::send::queues(follow_up, held);
+        let can_steer = !self.open_projection().is_some_and(crate::model::ThreadProjection::is_compacting);
+        let queue = running && super::send::queues(follow_up, held, can_steer);
         let content: AnyElement = if busy {
             Spinner::new().small().color(icon).into_any_element()
         } else if editing {
@@ -1032,8 +1262,9 @@ impl Workspace {
             svg().path("icons/app/send.svg").size(px(14.)).text_color(icon).into_any_element()
         };
         let tooltip: Option<SharedString> = match (disabled_reason, running && can_send) {
-            (Some(reason), _) => Some(reason.into()),
+            (Some(reason), _) => Some(reason),
             (None, _) if editing => Some(if busy { "Updating queued message" } else { "Update queued message" }.into()),
+            (None, true) if !can_steer => Some("Queue message".into()),
             (None, true) => {
                 let shortcut = self.client_settings.values.get("sendShortcut").as_str().unwrap_or("enter");
                 let context = super::keymap::ShortcutContext {
@@ -1053,31 +1284,25 @@ impl Workspace {
             }
             _ => None,
         };
-        round_button("send", fill, t.primary, t)
-            .when_some(stage, |el, art| {
-                el.relative()
-                    .when(!can_send, |el| el.opacity(0.64))
-                    .child(super::sidebar::stage_button_art(art, t.dark))
-            })
-            .child(div().relative().child(content))
-            .when(!can_send, |el| el.shadow(Vec::new()))
-            .when(can_send, |el| {
-                el.cursor_pointer().when(stage.is_none(), |el| el.hover(|s| s.bg(t.primary_hover))).on_click(
-                    cx.listener(|this, event: &ClickEvent, window, cx| {
-                        let modifiers = event.modifiers();
-                        let intent = if modifiers.control || modifiers.platform {
-                            Intent::Alternate
-                        } else {
-                            Intent::Foreground
-                        };
-                        this.submit_with(intent, window, cx);
-                    }),
-                )
-            })
-            .when_some(tooltip, |el, tooltip| {
-                el.tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-            })
-            .into_any_element()
+        let send = round_button("send", fill, t.primary, t);
+        let send = if can_send { action_control(send, &self.composer_action_focus[PRIMARY], t) } else { send };
+        send.when_some(stage, |el, art| {
+            el.relative().when(!can_send, |el| el.opacity(0.64)).child(super::sidebar::stage_button_art(art, t.dark))
+        })
+        .child(div().relative().child(content))
+        .when(!can_send, |el| el.shadow(Vec::new()))
+        .when(can_send, |el| {
+            el.cursor_pointer().when(stage.is_none(), |el| el.hover(|s| s.bg(t.primary_hover))).on_click(cx.listener(
+                |this, event: &ClickEvent, window, cx| {
+                    let modifiers = event.modifiers();
+                    let intent =
+                        if modifiers.control || modifiers.platform { Intent::Alternate } else { Intent::Foreground };
+                    this.submit_with(intent, window, cx);
+                },
+            ))
+        })
+        .when_some(tooltip, |el, tooltip| el.tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx)))
+        .into_any_element()
     }
 
     fn render_approval(
@@ -1264,7 +1489,8 @@ impl Workspace {
             .chain(self.render_extension_status_banner(t))
             .chain(self.render_fresh_session_banner(t, cx))
             .chain(self.render_branch_banner(t, cx))
-            .chain(self.render_question(t, cx))
+            .chain(self.render_runtime_mode_ceiling_banner(t, cx))
+            .chain(self.render_question(t, cx).or_else(|| self.render_plan_ready(t)))
             .chain(self.render_child_approvals(t, cx))
             .collect();
         let badge = self.render_stash_badge(t, cx);
@@ -1498,37 +1724,52 @@ impl Workspace {
                     },
                 )))
         });
-        let outline = if t.dark { white(0.05) } else { black(0.08) };
-        Some(
-            div()
-                .mb(px(-17.))
-                .child(
-                    v_flex()
-                        .px(px(4.))
-                        .pt(px(4.))
-                        // 4px padding plus the 17px the composer covers.
-                        .pb(px(21.))
-                        .rounded_t(px(16.))
-                        .border_1()
-                        .border_color(outline)
-                        .bg(t.card.opacity(t.glass))
-                        .text_xs()
-                        .line_height(px(16.))
-                        .shadow(if t.dark {
-                            vec![
-                                BoxShadow::new(px(0.), px(14.), black(0.75))
-                                    .blur_radius(px(32.))
-                                    .spread_radius(px(-18.)),
-                            ]
-                        } else {
-                            vec![BoxShadow::new(px(0.), px(1.), black(0.05)).blur_radius(px(2.))]
-                        })
-                        .child(header)
-                        .children(body),
-                )
-                .into_any_element(),
-        )
+        Some(top_drawer(v_flex().child(header).children(body), t))
     }
+
+    /// `ComposerPlanFollowUpBanner`: the plan the next send refines or implements.
+    fn render_plan_ready(&self, t: &Tokens) -> Option<AnyElement> {
+        let (_, markdown) = self.active_plan_follow_up()?;
+        let title = crate::proposed_plan::title(markdown).map(str::to_owned);
+        let row = h_flex()
+            .min_h(px(24.))
+            .gap(px(4.))
+            .child(div().w(px(24.)).flex_none())
+            .child(div().flex_none().font_weight(FontWeight::MEDIUM).text_color(t.muted_foreground).child("Plan ready"))
+            .children(
+                title.map(|title| {
+                    div().flex_1().min_w_0().truncate().text_color(t.foreground.opacity(0.85)).child(title)
+                }),
+            );
+        Some(top_drawer(row, t))
+    }
+}
+
+/// `ComposerBanner.Root variant="info"` in the top drawer, its bottom tucked under the composer.
+fn top_drawer(content: impl IntoElement, t: &Tokens) -> AnyElement {
+    let outline = if t.dark { white(0.05) } else { black(0.08) };
+    div()
+        .mb(px(-17.))
+        .child(
+            v_flex()
+                .px(px(4.))
+                .pt(px(4.))
+                // 4px padding plus the 17px the composer covers.
+                .pb(px(21.))
+                .rounded_t(px(16.))
+                .border_1()
+                .border_color(outline)
+                .bg(t.card.opacity(t.glass))
+                .text_xs()
+                .line_height(px(16.))
+                .shadow(if t.dark {
+                    vec![BoxShadow::new(px(0.), px(14.), black(0.75)).blur_radius(px(32.)).spread_radius(px(-18.))]
+                } else {
+                    vec![BoxShadow::new(px(0.), px(1.), black(0.05)).blur_radius(px(2.))]
+                })
+                .child(content),
+        )
+        .into_any_element()
 }
 
 fn render_option(
@@ -1643,10 +1884,17 @@ fn mark_style(style: u8, t: &Tokens) -> HighlightStyle {
 fn render_chip(
     token: &InlineTokenContext,
     pull_requests: &HashMap<String, PullRequestContext>,
+    machines: &[(String, Lucide)],
     t: &Tokens,
 ) -> AnyElement {
     let id = token.token().id();
-    let (accent, icon) = match Chip::from_id(id) {
+    let chip = Chip::from_id(id);
+    // `WorkspaceEntryTooltip`: a mention names its workspace path.
+    let path = match &chip {
+        Some(Chip::File { path }) => Some(SharedString::from(path.clone())),
+        _ => None,
+    };
+    let (accent, icon) = match chip {
         Some(Chip::Skill { .. }) => (rgb(0xb261be), Lucide::Box),
         Some(Chip::Context { kind, id, .. })
             if let Some(pr) = pull_requests.get(&id).filter(|_| kind == REVIEW_COMMENT) =>
@@ -1655,6 +1903,12 @@ fn render_chip(
         }
         Some(Chip::Context { kind, .. }) if kind == "image" => (rgb(0x0090cd), Lucide::Image),
         Some(Chip::Context { kind, .. }) if kind == "terminal" => (rgb(0x0090cd), Lucide::Terminal),
+        // `EnvironmentContextChip`: the machine's own icon.
+        Some(Chip::Context { kind, id, .. }) if kind == "environment" => {
+            let environment = id.strip_prefix("environment_").unwrap_or_default();
+            let icon = machines.iter().find(|(id, _)| id == environment).map_or(Lucide::Server, |(_, icon)| *icon);
+            (rgb(0x0090cd), icon)
+        }
         Some(Chip::Context { .. }) => (rgb(0x0090cd), Lucide::File),
         _ => (rgb(0x0096af), Lucide::File),
     };
@@ -1668,6 +1922,8 @@ fn render_chip(
         .when(token.is_selected(), |el| el.bg(t.primary.opacity(0.25)))
         .child(Icon::new(icon).with_size(px(14.)).flex_none())
         .child(div().min_w_0().truncate().child(token.token().label().clone()))
+        .id(ElementId::Name(format!("chip-{}-{id}", token.range().start).into()))
+        .when_some(path, |el, path| el.tooltip(move |window, cx| Tooltip::new(path.clone()).build(window, cx)))
         .into_any_element()
 }
 
@@ -1790,6 +2046,25 @@ pub(super) fn control_button(id: &'static str, t: &Tokens) -> Button {
     let button =
         Button::new(id).ghost().small().h(px(28.)).px(px(8.)).border_1().border_color(gpui_kit::transparent_black());
     t.breakpoint.control_text(button).font_weight(FontWeight::MEDIUM).text_color(t.foreground.opacity(0.8))
+}
+
+const ATTACH: usize = 0;
+const STOP: usize = 1;
+pub(super) const PRIMARY: usize = 2;
+pub(super) const METER: usize = 3;
+
+/// A `<button>`: a tab stop that Enter and Space press, ringed while keyboard-focused, which a
+/// click leaves the composer focused past (`preventPointerFocus`).
+pub(super) fn action_control(
+    control: gpui_kit::Stateful<gpui_kit::Div>,
+    focus: &gpui_kit::FocusHandle,
+    t: &Tokens,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
+    let ring = t.ring;
+    control
+        .track_focus(focus)
+        .focus_visible(move |s| s.border_2().border_color(ring))
+        .on_mouse_down(gpui_kit::MouseButton::Left, |_, window, _| window.prevent_default())
 }
 
 /// The send/stop circle (`h-9 w-9 sm:h-8 sm:w-8`) with its tinted shadow and inset highlight.

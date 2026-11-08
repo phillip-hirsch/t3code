@@ -53,6 +53,9 @@ pub(super) struct StashEntry {
     pub prompt: String,
     #[serde(default)]
     attachments: Vec<StashedAttachment>,
+    /// The context records its chips send (`records`): terminal selections live only in memory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    records: Vec<Value>,
     #[serde(flatten)]
     extra: Map<String, Value>,
 }
@@ -204,11 +207,12 @@ impl Store {
         }
     }
 
-    /// The entry for `prompt` and `attachments`, not saved yet.
+    /// The entry for `prompt`, `attachments` and the context `records` its chips send, not saved yet.
     pub(super) fn prepare(
         &self,
         prompt: String,
         attachments: &[Attachment],
+        records: Vec<Value>,
         created_at: String,
     ) -> std::io::Result<PendingStash> {
         let Some(dir) = self.dir.clone() else { return Err(std::io::ErrorKind::NotFound.into()) };
@@ -226,6 +230,7 @@ impl Store {
                     extra: Map::new(),
                 })
                 .collect(),
+            records,
             extra: Map::new(),
         };
         let blobs = entry
@@ -417,7 +422,8 @@ impl Workspace {
             return;
         }
         let created_at = crate::timestamp::iso(crate::timestamp::now_ms()).unwrap_or_default();
-        let pending = match self.prompt_stash.store.prepare(prompt, &self.attachments, created_at) {
+        let records = self.terminal_context_records(&prompt);
+        let pending = match self.prompt_stash.store.prepare(prompt, &self.attachments, records, created_at) {
             Ok(pending) => pending,
             Err(error) => return stash_failed(&error, window, cx),
         };
@@ -527,6 +533,11 @@ impl Workspace {
         if !durable {
             let message = "The stash file could not be updated, so this entry could still be there after a restart.";
             toast(window, cx, Notification::warning(message).title("Restored prompt may reappear in the stash"));
+        }
+        for record in &entry.records {
+            if let Some(id) = record["contextId"].as_str().filter(|_| record["kind"] == "terminal") {
+                self.terminals.contexts.entry(id.to_owned()).or_insert_with(|| record.clone());
+            }
         }
         let mut unreadable = Vec::new();
         let mut over_limit = Vec::new();
@@ -890,6 +901,7 @@ mod tests {
                     extra: Map::new(),
                 })
                 .collect(),
+            records: Vec::new(),
             extra: Map::new(),
         }
     }
@@ -901,7 +913,16 @@ mod tests {
     }
 
     fn stash(store: &mut Store, prompt: &str, attachments: &[Attachment]) -> Option<StashEntry> {
-        let pending = store.prepare(prompt.into(), attachments, String::new()).unwrap();
+        stash_with(store, prompt, attachments, Vec::new())
+    }
+
+    fn stash_with(
+        store: &mut Store,
+        prompt: &str,
+        attachments: &[Attachment],
+        records: Vec<Value>,
+    ) -> Option<StashEntry> {
+        let pending = store.prepare(prompt.into(), attachments, records, String::new()).unwrap();
         let written = pending.write_blobs();
         store.commit(pending, written).unwrap()
     }
@@ -944,12 +965,18 @@ mod tests {
         assert_eq!(reloaded.entries(), store.entries());
         assert_eq!(reloaded.entries()[0].prompt, "newest");
 
-        stash(&mut store, "with image", &[image()]);
+        let record = json!({"version": 1, "kind": "terminal", "contextId": "terminal_1", "text": "ls"});
+        stash_with(&mut store, "with image", &[image()], vec![record.clone()]);
         let id = store.entries()[0].id.clone();
+        assert_eq!(
+            Store::open(Some(dir.clone())).entries()[0].records,
+            std::slice::from_ref(&record),
+            "records are saved"
+        );
         let bytes = read_blobs(store.blob_paths(&id).unwrap());
         let (taken, attachments, durable) = store.take(&id, bytes).unwrap();
         assert!(durable);
-        assert_eq!(taken.prompt, "with image");
+        assert_eq!((taken.prompt.as_str(), taken.records), ("with image", vec![record]));
         assert_eq!((attachments[0].local_id.as_str(), attachments[0].bytes.as_deref()), ("img1", Some(&[1u8, 2][..])));
         assert!(store.take(&id, Vec::new()).is_none());
         assert_eq!(Store::open(Some(dir.clone())).entries().len(), MAX_STASH_ENTRIES - 1, "the take was saved");

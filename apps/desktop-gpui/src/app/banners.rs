@@ -211,7 +211,7 @@ pub(crate) fn provider_banner_key(provider: &Provider) -> Option<String> {
 }
 
 /// `hasProviderSetup`.
-fn has_setup(provider: &Provider) -> bool {
+pub(super) fn has_setup(provider: &Provider) -> bool {
     provider.driver == "antigravity"
         || provider.setup.as_ref().is_some_and(|setup| setup.can_authenticate || setup.can_install)
 }

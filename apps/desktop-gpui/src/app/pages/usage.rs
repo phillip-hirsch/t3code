@@ -4,20 +4,23 @@
 
 mod prices;
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::Duration;
 
 use chrono::Local;
 use gpui_kit::assets::IconName as Lucide;
-use gpui_kit::base::FocusTrapElement as _;
+use gpui_kit::base::{FocusTrapElement as _, Popup};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{Disableable as _, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{Disableable as _, Icon, Sizable as _, ThemeStyled as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, Bounds, Context, ElementId, FocusHandle, FontWeight, Hsla, InteractiveElement as _, IntoElement,
-    MouseButton, MouseMoveEvent, ParentElement as _, PathBuilder, Pixels, ScrollHandle, SharedString,
-    StatefulInteractiveElement as _, Styled as _, WeakEntity, Window, canvas, div, point, px, relative, rgb, svg,
+    AnyElement, App, Bounds, BoxShadow, Context, ElementId, FocusHandle, FontWeight, Hsla, InteractiveElement as _,
+    IntoElement, KeyDownEvent, MouseButton, MouseMoveEvent, ParentElement as _, PathBuilder, Pixels, ScrollHandle,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Task, WeakEntity, Window, canvas, div, point, px,
+    relative, rgb, svg,
 };
 use serde_json::{Value, json};
 
@@ -34,13 +37,21 @@ pub(in crate::app) struct UsageState {
     days: u32,
     /// Usage provider kinds the reader turned off.
     hidden: Vec<String>,
-    /// The environment filter: this window reads one environment, so it is on or off.
-    environment_selected: bool,
+    /// The environments the reader picked; `None` is all of them, new ones included.
+    selected: Option<Vec<SharedString>>,
     window: UsageWindow,
-    /// The answer on screen and the window it answers; a new window keeps it until it lands.
+    /// Each environment's last answer and the window they answer; a new window keeps them until it lands.
+    answers: Option<(Vec<logic::EnvironmentUsage>, UsageWindow)>,
+    /// Environments whose last read failed, with why.
+    failures: Vec<(SharedString, String)>,
+    /// The selected answers combined, as shown.
     summary: Option<(Rc<Summary>, UsageWindow)>,
     merged: Rc<Merged>,
-    error: Option<SharedString>,
+    /// Answers left out of the totals for their contract version.
+    mismatches: Vec<logic::ContractMismatch>,
+    /// When the last answer landed, and each environment's prices and aliases the read went out with.
+    answered_at: Option<i64>,
+    scan_settings: Vec<(SharedString, Value)>,
     loading: bool,
     refreshing: bool,
     generation: u64,
@@ -60,6 +71,9 @@ pub(in crate::app) struct UsageState {
     /// The limit pools and what they were built from: each environment's config revision,
     /// the hidden drivers, `limits_now`.
     pools: Option<(PoolsKey, Rc<[Pool]>)>,
+    card: SegmentCard,
+    /// Each limit segment's focus handle, by [`segment_key`].
+    segment_focus: HashMap<String, FocusHandle>,
 }
 
 type PoolsKey = (Vec<(SharedString, u64)>, Vec<String>, i64);
@@ -145,10 +159,130 @@ fn redeem_busy(redeemed: &[Redeem], key: &str) -> bool {
     redeemed.iter().any(|r| r.key == key && !matches!(r.status, RedeemStatus::Done(_)))
 }
 
+/// `PopoverTrigger`'s default `delay` before a hovered segment opens its card.
+const CARD_OPEN_DELAY: Duration = Duration::from_millis(300);
+/// Long enough for the pointer to cross the gap between a segment and its card.
+const CARD_CLOSE_DELAY: Duration = Duration::from_millis(100);
+
+/// The limit segments' one shared card (`SegmentPopoverContext`): hovering a segment opens it
+/// there and moves it between segments; a click, Enter or Space pins it until dismissed.
+#[derive(Default)]
+pub(in crate::app) struct SegmentCard {
+    /// The segment the card describes.
+    open: Option<String>,
+    pinned: bool,
+    /// The segment under the pointer, and whether the pointer is on the card.
+    hovered_segment: Option<String>,
+    hovered_card: bool,
+    email_revealed: bool,
+    timer: Option<Task<()>>,
+}
+
+impl SegmentCard {
+    /// The pointer entered or left segment `key`; `Some` asks to [`Self::settle`] after a delay.
+    fn hover_segment(&mut self, key: &str, hovering: bool) -> Option<Duration> {
+        if hovering {
+            self.hovered_segment = Some(key.to_owned());
+        } else if self.hovered_segment.as_deref() == Some(key) {
+            self.hovered_segment = None;
+        } else {
+            return None;
+        }
+        self.timer = None;
+        match (self.open.as_deref(), hovering) {
+            (None, true) => Some(CARD_OPEN_DELAY),
+            (Some(open), true) if !self.pinned && open != key => {
+                self.show(key);
+                None
+            }
+            (Some(_), false) if !self.pinned && !self.hovered_card => Some(CARD_CLOSE_DELAY),
+            _ => None,
+        }
+    }
+
+    fn hover_card(&mut self, hovering: bool) -> Option<Duration> {
+        self.hovered_card = hovering;
+        self.timer = None;
+        (!hovering && self.open.is_some() && !self.pinned && self.hovered_segment.is_none()).then_some(CARD_CLOSE_DELAY)
+    }
+
+    /// A delayed hover change lands: the hovered segment's card opens, or it closes once
+    /// neither a segment nor the card is under the pointer.
+    fn settle(&mut self) {
+        self.timer = None;
+        if self.pinned {
+            return;
+        }
+        match self.hovered_segment.clone() {
+            Some(key) if self.open.is_none() => self.show(&key),
+            None if !self.hovered_card => self.close(),
+            _ => {}
+        }
+    }
+
+    /// A click, Enter or Space on segment `key`: pins its hover-opened card, opens it pinned,
+    /// or closes it when it was already pinned.
+    fn press(&mut self, key: &str) {
+        self.timer = None;
+        if self.open.as_deref() == Some(key) && self.pinned {
+            self.close();
+        } else {
+            self.show(key);
+            self.pinned = true;
+        }
+    }
+
+    fn show(&mut self, key: &str) {
+        if self.open.as_deref() != Some(key) {
+            self.email_revealed = false;
+        }
+        self.open = Some(key.to_owned());
+    }
+
+    fn close(&mut self) {
+        *self = Self { hovered_segment: self.hovered_segment.take(), ..Self::default() };
+    }
+}
+
 /// A usage window ending now, in the system time zone.
 fn local_window(days: u32) -> UsageWindow {
     let zone = iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".into());
     UsageWindow::new(days, crate::timestamp::now_ms(), &Local, zone)
+}
+
+/// `t3code:usage-page-preferences:v1`, kept in `client-settings.json` as the web keeps it in local storage.
+const PREFERENCES_KEY: &str = "usagePagePreferences";
+
+/// `readUsagePagePreferences`: the stored metric, period and hidden providers, or the
+/// defaults (Limits, 30 days, every provider) when any of them does not decode.
+fn read_preferences(stored: &Value) -> (&'static str, u32, Vec<String>) {
+    let metric = logic::METRICS.iter().map(|(value, _)| *value).find(|value| stored["metric"] == *value);
+    let days = logic::WINDOWS.iter().map(|(days, _)| *days).find(|days| stored["windowDays"] == *days);
+    let known =
+        |kind: &Value| kind.as_str().filter(|kind| logic::PROVIDERS.iter().any(|p| p.0 == *kind)).map(str::to_owned);
+    let hidden = match &stored["hiddenProviders"] {
+        Value::Null => Some(Vec::new()),
+        Value::Array(kinds) => kinds.iter().map(known).collect(),
+        _ => None,
+    };
+    match (metric, days, hidden) {
+        (Some(metric), Some(days), Some(hidden)) => (metric, days, hidden),
+        _ => ("limits", 30, Vec::new()),
+    }
+}
+
+impl UsageState {
+    /// The page as the last session left it.
+    pub(in crate::app) fn new(client_settings: &crate::settings::Settings) -> Self {
+        let (metric, days, hidden) = read_preferences(client_settings.get(PREFERENCES_KEY));
+        Self { metric, days, hidden, window: local_window(days), ..Self::default() }
+    }
+
+    /// `saveUsagePagePreferences`.
+    fn preferences(&self) -> serde_json::Map<String, Value> {
+        let stored = json!({"metric": self.metric, "windowDays": self.days, "hiddenProviders": self.hidden});
+        serde_json::Map::from_iter([(PREFERENCES_KEY.to_owned(), stored)])
+    }
 }
 
 impl Default for UsageState {
@@ -157,11 +291,15 @@ impl Default for UsageState {
             metric: "limits",
             days: 30,
             hidden: Vec::new(),
-            environment_selected: true,
+            selected: None,
             window: local_window(30),
+            answers: None,
+            failures: Vec::new(),
             summary: None,
             merged: Rc::default(),
-            error: None,
+            mismatches: Vec::new(),
+            answered_at: None,
+            scan_settings: Vec::new(),
             loading: false,
             refreshing: false,
             generation: 0,
@@ -175,6 +313,8 @@ impl Default for UsageState {
             redeemed: Vec::new(),
             pools: None,
             chart: RefCell::default(),
+            card: SegmentCard::default(),
+            segment_focus: HashMap::new(),
         }
     }
 }
@@ -184,9 +324,43 @@ impl UsageState {
         self.metric == "tokens"
     }
 
+    fn is_selected(&self, environment_id: &str) -> bool {
+        self.selected.as_ref().is_none_or(|ids| ids.iter().any(|id| id == environment_id))
+    }
+
+    /// The selected environments' answers as one summary, or `None` while none answered.
+    fn recombine(&mut self) {
+        let (summary, mismatches) = self
+            .answers
+            .as_ref()
+            .and_then(|(answers, window)| {
+                let picked = answers.iter().filter(|a| self.is_selected(&a.environment_id)).cloned().collect();
+                let (summary, mismatches) = logic::combine(picked)?;
+                Some((Some((Rc::new(summary), window.clone())), mismatches))
+            })
+            .unwrap_or_default();
+        (self.summary, self.mismatches) = (summary, mismatches);
+        self.merged = Rc::new(match &self.summary {
+            Some((summary, _)) => logic::merge(summary, &self.hidden),
+            None => Merged::default(),
+        });
+    }
+
+    /// Why nothing shows: the first selected environment's failure.
+    fn error(&self) -> Option<&str> {
+        self.failures.iter().find(|(id, _)| self.is_selected(id)).map(|(_, message)| message.as_str())
+    }
+
     fn hidden_drivers(&self) -> Vec<&'static str> {
         logic::PROVIDERS.iter().filter(|p| self.hidden.iter().any(|h| h == p.0)).map(|p| p.2).collect()
     }
+}
+
+/// What a usage read is priced and filtered with on one environment (`usageScanSettingsAtom`
+/// and `usageModelFilterAtom`).
+fn scan_settings(info: &crate::model::ServerInfo) -> Value {
+    let settings = &info.settings;
+    json!([settings.get("usagePriceOverrides"), settings.get("usageModelAliases"), settings.get("usageModelFilter")])
 }
 
 impl Workspace {
@@ -195,21 +369,47 @@ impl Workspace {
         self.usage.limits_now = now_ms();
         if self.usage.metric == "limits" {
             self.refresh_limits(true, cx);
-        } else if self.usage.summary.is_none() && !self.usage.loading {
-            self.read_usage(false, cx);
+        } else {
+            self.revalidate_usage(cx);
         }
+    }
+
+    fn save_usage_preferences(&mut self) {
+        let patch = self.usage.preferences();
+        self.client_settings.apply(&patch);
     }
 
     fn select_usage_metric(&mut self, metric: &'static str, cx: &mut Context<Self>) {
         self.usage.metric = metric;
+        self.save_usage_preferences();
         self.usage.hover = None;
         if metric == "limits" {
             self.usage.limits_now = now_ms();
             self.refresh_limits(true, cx);
-        } else if self.usage.summary.is_none() && !self.usage.loading {
-            self.read_usage(false, cx);
+        } else {
+            self.revalidate_usage(cx);
         }
         cx.notify();
+    }
+
+    /// Reads usage again when the shown answer is stale or was priced differently; the old one
+    /// stays on screen until the new one lands.
+    fn revalidate_usage(&mut self, cx: &mut Context<Self>) {
+        if !self.usage.loading
+            && logic::needs_read(self.usage.answered_at, now_ms(), self.usage_scan_settings_changed())
+        {
+            self.read_usage(false, cx);
+        }
+    }
+
+    /// A connected environment's prices or model aliases differ from what the last read went out with.
+    fn usage_scan_settings_changed(&self) -> bool {
+        let environments = self.usage_environments();
+        environments.len() != self.usage.scan_settings.len()
+            || environments
+                .iter()
+                .zip(&self.usage.scan_settings)
+                .any(|((id, _, info), (read_id, read))| id != read_id || scan_settings(info) != *read)
     }
 
     /// `usage.*` on the open Usage page (`UsagePage.tsx`): `None` when `command` is not one;
@@ -246,6 +446,7 @@ impl Workspace {
 
     fn select_usage_window(&mut self, days: u32, cx: &mut Context<Self>) {
         self.usage.days = days;
+        self.save_usage_preferences();
         self.usage.window = local_window(days);
         self.usage.hover = None;
         self.read_usage(false, cx);
@@ -253,24 +454,40 @@ impl Workspace {
 
     fn set_hidden_usage_providers(&mut self, hidden: Vec<String>, cx: &mut Context<Self>) {
         self.usage.hidden = hidden;
-        self.remerge_usage();
+        self.save_usage_preferences();
+        self.usage.recombine();
         cx.notify();
     }
 
-    fn remerge_usage(&mut self) {
-        self.usage.merged = Rc::new(match &self.usage.summary {
-            Some((summary, _)) => logic::merge(summary, &self.usage.hidden),
-            None => Merged::default(),
-        });
+    fn select_usage_environments(&mut self, selected: Option<Vec<SharedString>>, cx: &mut Context<Self>) {
+        self.usage.selected = selected;
+        self.usage.hover = None;
+        self.usage.recombine();
+        if self.usage.metric == "limits" {
+            self.refresh_limits(true, cx);
+        }
+        cx.notify();
     }
 
-    /// The environments the page reads: every connected one.
-    fn usage_machines(&self) -> Vec<(SharedString, crate::rpc::RpcClient)> {
-        self.sessions().iter().filter_map(|s| Some((s.id.clone()?, s.client.clone()?))).collect()
+    /// The environments the page reads: every connected one, with its `usageModelFilter`.
+    fn usage_machines(&self) -> Vec<(SharedString, crate::rpc::RpcClient, Value)> {
+        self.sessions()
+            .iter()
+            .filter_map(|s| {
+                Some((s.id.clone()?, s.client.clone()?, s.server_info.settings.get("usageModelFilter").clone()))
+            })
+            .collect()
     }
 
     /// The selected environments' provider and limit-source reads, with their labels.
     fn limit_environments(&self) -> Vec<(SharedString, SharedString, &crate::model::ServerInfo)> {
+        let mut environments = self.usage_environments();
+        environments.retain(|(id, ..)| self.usage.is_selected(id));
+        environments
+    }
+
+    /// Every connected environment, with its label.
+    fn usage_environments(&self) -> Vec<(SharedString, SharedString, &crate::model::ServerInfo)> {
         self.sessions()
             .iter()
             .filter(|s| s.is_connected())
@@ -287,26 +504,34 @@ impl Workspace {
     /// (`server.refreshUsageRates`); answers with slow sources still scanning are shown, then
     /// asked again with `awaitRefresh`.
     fn read_usage(&mut self, refresh_rates: bool, cx: &mut Context<Self>) {
-        let machines: Vec<(String, crate::rpc::RpcClient)> =
-            self.usage_machines().into_iter().map(|(id, client)| (id.to_string(), client)).collect();
+        let window = self.usage.window.clone();
+        let machines: Vec<(String, crate::rpc::RpcClient, Value)> = self
+            .usage_machines()
+            .into_iter()
+            .map(|(id, client, filter)| (id.to_string(), client, window.summary_input(&filter)))
+            .collect();
         if machines.is_empty() {
             return;
         }
+        let scan: Vec<(SharedString, Value)> =
+            self.usage_environments().into_iter().map(|(id, _, info)| (id, scan_settings(info))).collect();
+        // A refresh re-prices the selected environments; every one is read so a pick shows at once.
+        let rated: Vec<crate::rpc::RpcClient> = machines
+            .iter()
+            .filter(|(id, ..)| refresh_rates && self.usage.is_selected(id))
+            .map(|(_, client, _)| client.clone())
+            .collect();
         let usage = &mut self.usage;
+        usage.scan_settings = scan;
         usage.generation += 1;
         let generation = usage.generation;
         usage.loading = true;
-        let window = usage.window.clone();
-        let input = window.to_json();
         cx.spawn(async move |this, cx| {
-            if refresh_rates {
-                let refreshes =
-                    machines.iter().map(|(_, client)| client.request("server.refreshUsageRates", json!({})));
-                futures::future::join_all(refreshes).await;
-            }
-            let mut input = input;
+            let refreshes = rated.iter().map(|client| client.request("server.refreshUsageRates", json!({})));
+            futures::future::join_all(refreshes).await;
+            let mut machines = machines;
             for attempt in 0..2 {
-                let reads = machines.iter().map(|(id, client)| {
+                let reads = machines.iter().map(|(id, client, input)| {
                     let input = input.clone();
                     async move { (id.clone(), client.request("server.getUsageSummary", input).await) }
                 });
@@ -319,29 +544,24 @@ impl Workspace {
                     }
                     // A machine that fails to answer leaves the others' usage showing.
                     let mut answers = Vec::new();
-                    let mut failure = None;
+                    usage.failures.clear();
                     for (environment_id, result) in results {
-                        match result.map(serde_json::from_value::<Summary>) {
-                            Ok(Ok(summary)) => answers.push(logic::EnvironmentUsage { environment_id, summary }),
-                            Ok(Err(error)) => {
-                                failure.get_or_insert_with(|| format!("Unreadable usage summary: {error}"));
+                        let failure = match result.map(serde_json::from_value::<Summary>) {
+                            Ok(Ok(summary)) => {
+                                answers.push(logic::EnvironmentUsage { environment_id, summary });
+                                continue;
                             }
-                            Err(error) => {
-                                failure.get_or_insert_with(|| usage_error(&error));
-                            }
-                        }
+                            Ok(Err(error)) => format!("Unreadable usage summary: {error}"),
+                            Err(error) => usage_error(&error),
+                        };
+                        usage.failures.push((environment_id.into(), failure));
                     }
                     again = attempt == 0 && answers.iter().any(|answer| answer.summary.refreshing());
-                    let answered = !answers.is_empty();
-                    match (logic::combine(answers), failure) {
-                        (Some(summary), _) => {
-                            usage.error = None;
-                            usage.summary = Some((Rc::new(summary), window.clone()));
-                            this.remerge_usage();
-                        }
-                        (None, Some(failure)) if !answered => usage.error = Some(failure.into()),
-                        (None, _) => {}
+                    if !answers.is_empty() {
+                        usage.answered_at = Some(now_ms());
+                        usage.answers = Some((answers, window.clone()));
                     }
+                    usage.recombine();
                     this.usage.loading = again;
                     if !again {
                         this.usage.refreshing = false;
@@ -351,7 +571,9 @@ impl Workspace {
                 if applied.is_err() || !again {
                     return;
                 }
-                input["awaitRefresh"] = json!(true);
+                for (_, _, input) in &mut machines {
+                    input["awaitRefresh"] = json!(true);
+                }
             }
         })
         .detach();
@@ -361,7 +583,8 @@ impl Workspace {
     /// Re-probes provider limits (`refreshUsageLimits`): automatic refreshes wait five minutes
     /// between probes.
     fn refresh_limits(&mut self, automatic: bool, cx: &mut Context<Self>) {
-        let machines = self.usage_machines();
+        let mut machines = self.usage_machines();
+        machines.retain(|(id, ..)| self.usage.is_selected(id));
         if machines.is_empty() {
             return;
         }
@@ -374,7 +597,7 @@ impl Workspace {
             self.usage.refreshing = true;
         }
         cx.spawn(async move |this, cx| {
-            let probes = machines.iter().map(|(id, client)| async move {
+            let probes = machines.iter().map(|(id, client, _)| async move {
                 (id, client.request("server.refreshProviders", json!({"workspaceSnapshotsOnDemand": true})).await)
             });
             let results = futures::future::join_all(probes).await;
@@ -395,6 +618,33 @@ impl Workspace {
         })
         .detach();
         cx.notify();
+    }
+
+    fn hover_usage_card(&mut self, segment: Option<&str>, hovering: bool, cx: &mut Context<Self>) {
+        let card = &mut self.usage.card;
+        let delay = match segment {
+            Some(key) => card.hover_segment(key, hovering),
+            None => card.hover_card(hovering),
+        };
+        cx.notify();
+        let Some(delay) = delay else { return };
+        self.usage.card.timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let _ = this.update(cx, |this, cx| {
+                this.usage.card.settle();
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Escape closes a limit segment's card before the modal.
+    pub(in crate::app) fn usage_card_escape(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.usage.card.open.is_none() {
+            return false;
+        }
+        self.usage.card.close();
+        cx.notify();
+        true
     }
 
     fn refresh_usage(&mut self, cx: &mut Context<Self>) {
@@ -460,14 +710,11 @@ impl Workspace {
 
     pub(in crate::app) fn render_usage_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme::tokens(cx);
-        let viewport = window.viewport_size();
-        let padding = if viewport.width >= px(1024.) {
-            40.
-        } else if viewport.width >= px(640.) {
-            24.
-        } else {
-            0.
-        };
+        let viewport = f32::from(window.viewport_size().width);
+        let padding = modal_padding(viewport);
+        // `@4xl/usage-header` (56rem) on the header's content box, inside the border and `ps-5 pe-2`.
+        let compact = modal_panel_width(viewport) - 2. - 28. < 896.;
+        // `AppRouteModal` focuses its surface, not its first control, and keeps Tab inside it.
         let focus = self.usage.focus.get_or_insert_with(|| cx.focus_handle()).clone();
         if std::mem::take(&mut self.usage.focus_on_render) {
             window.focus(&focus, cx);
@@ -499,7 +746,7 @@ impl Workspace {
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     // `AppRouteModal` is a modal `Dialog`: Tab stays inside the panel.
                     .focus_trap("usage-trap", &focus)
-                    .child(self.render_usage_header(&t, cx))
+                    .child(self.render_usage_header(&t, compact, window, cx))
                     .child(
                         div()
                             .id("usage-scroll")
@@ -512,44 +759,88 @@ impl Workspace {
                                     .w_full()
                                     .max_w(px(1024.))
                                     .mx_auto()
-                                    .px(px(24.))
+                                    .px(px(page_gutter(viewport)))
                                     .pt(px(24.))
                                     .pb(px(48.))
                                     .gap(px(24.))
-                                    .child(self.render_usage_body(&t, cx)),
+                                    .child(self.render_usage_body(&t, window, cx)),
                             ),
                     ),
             )
             .into_any_element()
     }
 
-    fn render_usage_header(&self, t: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_usage_header(
+        &self,
+        t: &Tokens,
+        compact: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let usage = &self.usage;
         let limits = usage.metric == "limits";
         let view = cx.entity();
         let separator = || div().flex_none().text_color(t.muted_foreground).child("/");
-        let labels: Vec<SharedString> = self.limit_environments().into_iter().map(|(_, label, _)| label).collect();
-        let environment: SharedString =
-            if labels.is_empty() { "This environment".into() } else { labels.join(", ").into() };
-        let summary = usage.summary.as_ref().map(|(s, _)| s.clone());
-        let has_issue = !limits && (usage.error.is_some() || summary.as_ref().is_some_and(|s| !s.compatible()));
-        let env_label =
-            if usage.environment_selected { "All environments".to_owned() } else { "0 environments".into() };
-        let env_status: SharedString = if usage.error.is_some() {
-            "Unavailable".into()
-        } else if summary.as_ref().is_some_and(|s| !s.compatible()) {
-            "Update required".into()
-        } else if usage.loading && summary.is_none() {
-            "Scanning…".into()
-        } else if usage.loading {
-            "Refreshing…".into()
-        } else {
-            "Ready".into()
+        let environments = self.usage_environments();
+        let selected: Vec<(SharedString, SharedString)> = environments
+            .iter()
+            .filter(|(id, ..)| usage.is_selected(id))
+            .map(|(id, label, _)| (id.clone(), label.clone()))
+            .collect();
+        let failures: Vec<String> = usage
+            .failures
+            .iter()
+            .filter_map(|(id, message)| {
+                let (_, label) = selected.iter().find(|(selected, _)| selected == id)?;
+                Some(format!("{label}: {message}"))
+            })
+            .collect();
+        let mismatch_lines: Vec<String> = usage
+            .mismatches
+            .iter()
+            .map(|mismatch| {
+                let label = environments
+                    .iter()
+                    .find(|(id, ..)| id.as_ref() == mismatch.environment_id)
+                    .map_or_else(|| mismatch.environment_id.clone(), |(_, label, _)| label.to_string());
+                mismatch.message(&label)
+            })
+            .collect();
+        let has_issue = !limits && (!failures.is_empty() || !mismatch_lines.is_empty());
+        let env_label: SharedString = match (&usage.selected, selected.as_slice()) {
+            (None, _) => "All environments".into(),
+            (Some(_), [(_, label)]) => label.clone(),
+            (Some(_), selected) => format!("{} environments", selected.len()).into(),
         };
-        let selected = usage.environment_selected;
+        // `UsageEnvironmentFilter`'s per-environment status.
+        let rows: Vec<(SharedString, SharedString, bool, SharedString, bool)> = environments
+            .iter()
+            .map(|(id, label, _)| {
+                let failed = usage.failures.iter().any(|(failed, _)| failed == id);
+                let answer = usage
+                    .answers
+                    .as_ref()
+                    .and_then(|(answers, _)| answers.iter().find(|answer| answer.environment_id == id.as_ref()));
+                let status = if failed {
+                    "Unavailable"
+                } else if answer.is_some_and(|answer| !answer.summary.compatible()) {
+                    "Update required"
+                } else if usage.loading && answer.is_none() {
+                    "Scanning…"
+                } else if usage.loading {
+                    "Refreshing…"
+                } else {
+                    "Ready"
+                };
+                (id.clone(), label.clone(), usage.is_selected(id), status.into(), failed)
+            })
+            .collect();
+        let all_ids: Vec<SharedString> = environments.iter().map(|(id, ..)| id.clone()).collect();
+        let selected_ids: Vec<SharedString> = selected.iter().map(|(id, _)| id.clone()).collect();
+        let all_selected = usage.selected.is_none();
         let env_filter = inline_menu_button("usage-environment", t)
             .text_color(t.foreground)
-            .child(env_label)
+            .child(div().min_w_0().truncate().child(env_label))
             .child(if has_issue {
                 Icon::new(Lucide::CircleAlert).with_size(px(14.)).text_color(t.warning_foreground)
             } else {
@@ -557,43 +848,50 @@ impl Workspace {
             })
             .dropdown_menu({
                 let view = view.clone();
-                let muted = t.muted_foreground;
-                let error = usage.error.clone();
-                move |menu, window, _| {
-                    let env = environment.clone();
-                    let status = env_status.clone();
-                    let error_line = error.clone();
-                    menu.item(PopupMenuItem::new("All environments").checked(selected).on_click(window.listener_for(
-                        &view,
-                        |this, _, _, cx| {
-                            this.usage.environment_selected = !this.usage.environment_selected;
-                            cx.notify();
-                        },
-                    )))
-                    .separator()
-                    .item(
-                        PopupMenuItem::element(move |_, _| {
+                let (muted, destructive) = (t.muted_foreground, t.error_foreground);
+                move |mut menu, window, _| {
+                    menu = menu
+                        .item(PopupMenuItem::new("All environments").checked(all_selected).on_click(
+                            window.listener_for(&view, move |this, _, _, cx| {
+                                this.select_usage_environments(if all_selected { Some(Vec::new()) } else { None }, cx);
+                            }),
+                        ))
+                        .separator();
+                    for (id, label, checked, status, failed) in rows.iter().cloned() {
+                        let (all_ids, selected_ids) = (all_ids.clone(), selected_ids.clone());
+                        let item = PopupMenuItem::element(move |_, _| {
                             h_flex()
                                 .min_w(px(200.))
                                 .gap(px(12.))
-                                .child(div().flex_1().min_w_0().truncate().child(env.clone()))
+                                .child(div().flex_1().min_w_0().truncate().child(label.clone()))
                                 .when(!limits, |el| {
-                                    el.child(div().flex_none().text_xs().text_color(muted).child(status.clone()))
+                                    el.child(
+                                        div()
+                                            .flex_none()
+                                            .text_xs()
+                                            .text_color(if failed { destructive } else { muted })
+                                            .child(status.clone()),
+                                    )
                                 })
                         })
-                        .checked(selected)
-                        .on_click(window.listener_for(&view, |this, _, _, cx| {
-                            this.usage.environment_selected = !this.usage.environment_selected;
-                            cx.notify();
-                        })),
-                    )
-                    .when_some(error_line.filter(|_| !limits), |menu, error| menu.separator().label(error))
-                    .separator()
-                    .item(
-                        PopupMenuItem::new("Model prices").icon(Lucide::SlidersHorizontal).on_click(
-                            window.listener_for(&view, |this, _, window, cx| this.open_model_prices(None, window, cx)),
-                        ),
-                    )
+                        .checked(checked)
+                        .on_click(window.listener_for(&view, move |this, _, _, cx| {
+                            let next = toggle_environment(&selected_ids, &id, &all_ids);
+                            this.select_usage_environments(next, cx);
+                        }));
+                        menu = menu.item(item);
+                    }
+                    if rows.is_empty() {
+                        menu = menu.label("No environments connected.");
+                    }
+                    // `UsageCoverageNotice`: why selected environments are missing from the totals.
+                    if !limits && (!failures.is_empty() || !mismatch_lines.is_empty()) {
+                        let lines = failures.iter().chain(&mismatch_lines).cloned();
+                        menu = lines.fold(menu.separator(), gpui_kit::component::menu::PopupMenu::label);
+                    }
+                    menu.separator().item(PopupMenuItem::new("Model prices").icon(Lucide::SlidersHorizontal).on_click(
+                        window.listener_for(&view, |this, _, window, cx| this.open_model_prices(None, window, cx)),
+                    ))
                 }
             });
 
@@ -611,7 +909,7 @@ impl Workspace {
             .child(provider_label)
             .child(Icon::new(Lucide::ChevronDown).with_size(px(14.)).text_color(Hsla { a: 0.6, ..t.muted_foreground }))
             .dropdown_menu({
-                let view = view;
+                let view = view.clone();
                 move |mut menu, window, _| {
                     let none_hidden = hidden.is_empty();
                     menu =
@@ -648,23 +946,22 @@ impl Workspace {
                 }
             });
 
-        let periods = segmented(
-            "usage-period",
-            logic::WINDOWS.iter().map(|(days, label)| (*days, *label)),
-            usage.days,
-            t,
-            cx,
-            super::super::Workspace::select_usage_window,
-        );
-        let metrics = segmented(
-            "usage-metric",
-            logic::METRICS.iter().map(|(value, label)| (*value, *label)),
-            usage.metric,
-            t,
-            cx,
-            super::super::Workspace::select_usage_metric,
-        );
-        let disabled = usage.refreshing || (!limits && !usage.environment_selected);
+        let periods = logic::WINDOWS.iter().map(|(days, label)| (*days, *label));
+        let metrics = logic::METRICS.iter().map(|(value, label)| (*value, *label));
+        let (periods, metrics) = if compact {
+            // Below 56rem the groups fold into compact selects.
+            let period = compact_select("usage-period", periods, usage.days, t, &view, Workspace::select_usage_window);
+            let metric =
+                compact_select("usage-metric", metrics, usage.metric, t, &view, Workspace::select_usage_metric);
+            (period.into_any_element(), metric.into_any_element())
+        } else {
+            let pick_period = Workspace::select_usage_window;
+            let period = segmented("usage-period", periods, usage.days, t, window, cx, pick_period);
+            let metric =
+                segmented("usage-metric", metrics, usage.metric, t, window, cx, Workspace::select_usage_metric);
+            (period.into_any_element(), metric.into_any_element())
+        };
+        let disabled = usage.refreshing || (!limits && selected.is_empty());
         h_flex()
             .min_h(px(48.))
             .flex_none()
@@ -687,12 +984,17 @@ impl Workspace {
                     .child(provider_filter),
             )
             .child(
-                h_flex().flex_none().gap(px(8.)).when(!limits, |el| el.child(periods)).child(metrics).child(
-                    ghost_icon_button("usage-refresh", Lucide::RefreshCw, 14., t)
-                        .disabled(disabled)
-                        .tooltip(if limits { "Refresh limits" } else { "Refresh usage" })
-                        .on_click(cx.listener(|this, _, _, cx| this.refresh_usage(cx))),
-                ),
+                h_flex()
+                    .flex_none()
+                    .gap(px(if compact { 4. } else { 8. }))
+                    .when(!limits, |el| el.child(periods))
+                    .child(metrics)
+                    .child(
+                        ghost_icon_button("usage-refresh", Lucide::RefreshCw, 14., t)
+                            .disabled(disabled)
+                            .tooltip(if limits { "Refresh limits" } else { "Refresh usage" })
+                            .on_click(cx.listener(|this, _, _, cx| this.refresh_usage(cx))),
+                    ),
             )
             .child(
                 ghost_icon_button("usage-close", Lucide::X, 16., t)
@@ -701,26 +1003,36 @@ impl Workspace {
             )
     }
 
-    fn render_usage_body(&mut self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+    fn render_usage_body(&mut self, t: &Tokens, win: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let usage = &self.usage;
         let limits = usage.metric == "limits";
-        if !usage.environment_selected {
+        if self.limit_environments().is_empty() {
             let what = if limits { "limits" } else { "usage" };
-            return muted_line(format!("Select an environment to see {what}."), t).into_any_element();
+            let ask = if self.usage_environments().is_empty() { "Connect" } else { "Select" };
+            return muted_line(format!("{ask} an environment to see {what}."), t).into_any_element();
         }
+        let viewport = f32::from(win.viewport_size().width);
         if limits {
-            return self.render_limits(t, cx);
+            return self.render_limits(t, viewport, cx);
         }
-        match (&usage.summary, &usage.error) {
+        // Saved prices or aliases reprice the scan (`refreshTrigger`); a stale answer waits for a reopen.
+        // So does a pick of environments the last read missed.
+        let unread = usage.summary.is_none() && usage.answers.is_some() && usage.error().is_none();
+        if !usage.loading && ((usage.summary.is_some() && self.usage_scan_settings_changed()) || unread) {
+            let view = cx.entity();
+            cx.defer(move |cx| view.update(cx, |this, cx| this.read_usage(false, cx)));
+        }
+        let usage = &self.usage;
+        match (&usage.summary, usage.error()) {
             (None, Some(error)) => v_flex()
                 .py(px(48.))
                 .items_center()
                 .text_sm()
                 .text_color(t.muted_foreground)
-                .child(error.clone())
+                .child(error.to_owned())
                 .into_any_element(),
-            (None, None) => usage_skeleton(t).into_any_element(),
-            (Some((summary, window)), _) => self.render_usage_overview(summary, window, t, cx),
+            (None, None) => usage_skeleton(t, viewport).into_any_element(),
+            (Some((summary, window)), _) => self.render_usage_overview(summary, window, t, win, cx),
         }
     }
 
@@ -740,7 +1052,7 @@ impl Workspace {
         pools
     }
 
-    fn render_limits(&mut self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+    fn render_limits(&mut self, t: &Tokens, viewport: f32, cx: &mut Context<Self>) -> AnyElement {
         let pools = self.limit_pools();
         let usage = &self.usage;
         let hidden = usage.hidden_drivers();
@@ -754,10 +1066,39 @@ impl Workspace {
             body = body
                 .child(muted_line("No provider on the selected environments reports subscription limits.".into(), t));
         }
+        let keys: Vec<String> = pools
+            .iter()
+            .flat_map(|pool| {
+                pool.windows.iter().flat_map(move |window| {
+                    window.columns.iter().flatten().map(move |m| segment_key(pool, window, &pool.accounts[m.account]))
+                })
+            })
+            .collect();
+        self.usage.segment_focus.retain(|key, _| keys.contains(key));
+        for key in &keys {
+            self.usage.segment_focus.entry(key.clone()).or_insert_with(|| cx.focus_handle().tab_stop(true));
+        }
+        // The card's segment is gone, so it has nothing to anchor to.
+        if self.usage.card.open.as_ref().is_some_and(|open| !keys.contains(open)) {
+            self.usage.card.close();
+        }
+        // A card's heading stacks above its bar below `md`; the bar's own `@2xl/pool` (42rem) container
+        // query, inside the card's border, `p-4` and heading column, picks the wide segments.
+        let stack = viewport < MD;
+        let pool_width = page_content_width(viewport) - 2. - 32. - if stack { 0. } else { 176. + 24. };
+        let segments = Segments {
+            stack,
+            wide: pool_width >= 672.,
+            now,
+            hour12: self.hour12(),
+            redeemed: &self.usage.redeemed,
+            card: &self.usage.card,
+            focus: &self.usage.segment_focus,
+            view: cx.weak_entity(),
+            t,
+        };
         for pool in pools.iter() {
-            let view = cx.weak_entity();
-            let redeemed = &self.usage.redeemed;
-            body = body.child(pool_section(pool, now, redeemed, &view, t));
+            body = body.child(pool_section(pool, &segments, cx));
         }
         for (label, url, message, accounts) in links {
             let open = url.clone();
@@ -822,6 +1163,7 @@ impl Workspace {
         summary: &Summary,
         window: &UsageWindow,
         t: &Tokens,
+        win: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let usage = &self.usage;
@@ -873,6 +1215,22 @@ impl Workspace {
                         }),
                 ),
         );
+        let chatgpt_sharing = !usage.hidden.iter().any(|h| h == "codex")
+            && self
+                .limit_environments()
+                .iter()
+                .any(|(_, _, info)| info.providers.iter().any(|p| super::settings::uses_chatgpt_sharing(&p.auth)));
+        if chatgpt_sharing {
+            summary_column = summary_column.child(
+                h_flex()
+                    .justify_between()
+                    .gap(px(8.))
+                    .text_xs()
+                    .text_color(t.muted_foreground)
+                    .child("ChatGPT shared usage")
+                    .child(super::settings::chatgpt_usage_button("usage-chatgpt-sharing", t).xsmall()),
+            );
+        }
         for kind in logic::rank_providers(&providers, &merged.providers, tokens) {
             let totals = merged.providers.iter().find(|p| p.provider == kind).cloned().unwrap_or_default();
             let share = if tokens { totals.token_share } else { totals.cost_share };
@@ -924,16 +1282,14 @@ impl Workspace {
 
         let chart_title =
             format!("{} {}", if hourly { "Hourly" } else { "Daily" }, if tokens { "processed tokens" } else { "cost" });
-        overview = overview.child(
-            h_flex().items_start().gap(px(24.)).child(summary_column.w(px(288.)).flex_none()).child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap(px(12.))
-                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(chart_title))
-                    .child(self.render_usage_chart(&merged, window, &providers, t, cx)),
-            ),
-        );
+        let viewport = f32::from(win.viewport_size().width);
+        let (lg, md) = (viewport >= LG, viewport >= MD);
+        let chart = v_flex()
+            .min_w_0()
+            .gap(px(12.))
+            .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(chart_title))
+            .child(self.render_usage_chart(&merged, window, &providers, t, cx));
+        overview = overview.child(summary_and_chart(lg, summary_column, chart));
 
         let metric = |label: &str, value: String| {
             v_flex()
@@ -942,21 +1298,15 @@ impl Workspace {
                 .child(div().text_xs().text_color(t.muted_foreground).child(label.to_owned()))
                 .child(dim(div()).text_base().font_weight(FontWeight::MEDIUM).child(value))
         };
-        overview = overview.child(
-            v_flex().gap(px(8.)).mt(px(18.)).child(section_title("Totals")).child(
-                h_flex().py(px(4.)).children(
-                    [
-                        metric("Processed tokens", logic::format_tokens(merged.total_tokens as f64)),
-                        metric("Cached input", logic::format_tokens(merged.cached_input_tokens as f64)),
-                        metric("Uncached input", logic::format_tokens(merged.uncached_input_tokens as f64)),
-                        metric("Output", logic::format_tokens(merged.output_tokens as f64)),
-                        metric("Cache savings", logic::format_usd(merged.cache_savings_usd)),
-                    ]
-                    .into_iter()
-                    .map(|m| m.flex_1().pr(px(24.))),
-                ),
-            ),
-        );
+        overview = overview.child(v_flex().gap(px(8.)).mt(px(18.)).child(section_title("Totals")).child(
+            totals_grid(md).children([
+                metric("Processed tokens", logic::format_tokens(merged.total_tokens as f64)),
+                metric("Cached input", logic::format_tokens(merged.cached_input_tokens as f64)),
+                metric("Uncached input", logic::format_tokens(merged.uncached_input_tokens as f64)),
+                metric("Output", logic::format_tokens(merged.output_tokens as f64)),
+                metric("Cache savings", logic::format_usd(merged.cache_savings_usd)),
+            ]),
+        ));
 
         if merged.total_tokens > 0 {
             let ink = |share: f32| mix(t.foreground, t.background, share);
@@ -1005,14 +1355,13 @@ impl Workspace {
                 bars
             };
             overview = overview.child(
-                h_flex()
-                    .mt(px(18.))
-                    .gap(px(48.))
-                    .children(bars.into_iter().map(|bar| div().flex_1().min_w_0().child(bar))),
+                share_bars_grid(lg).mt(px(18.)).children(bars.into_iter().map(|bar| div().min_w_0().child(bar))),
             );
         }
 
-        overview.child(self.render_usage_breakdown(&merged, window, &providers, t, cx).mt(px(18.))).into_any_element()
+        overview
+            .child(self.render_usage_breakdown(&merged, window, &providers, t, win, cx).mt(px(18.)))
+            .into_any_element()
     }
 
     fn render_usage_chart(
@@ -1246,6 +1595,7 @@ impl Workspace {
         window: &UsageWindow,
         providers: &[&'static str],
         t: &Tokens,
+        win: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui_kit::Div {
         let usage = &self.usage;
@@ -1258,6 +1608,7 @@ impl Workspace {
             [(false, "Model"), (true, if hourly { "Hour" } else { "Day" })].into_iter(),
             by_time,
             t,
+            win,
             cx,
             |this, by_time, cx| {
                 this.usage.by_time = by_time;
@@ -1413,6 +1764,15 @@ fn limit_inputs<'a>(
         .collect()
 }
 
+/// `UsageEnvironmentFilter`'s pick: the selection with `id` toggled, `None` once every environment is in it.
+fn toggle_environment(selected: &[SharedString], id: &SharedString, all: &[SharedString]) -> Option<Vec<SharedString>> {
+    let mut next: Vec<SharedString> = selected.iter().filter(|picked| *picked != id).cloned().collect();
+    if next.len() == selected.len() {
+        next.push(id.clone());
+    }
+    (next.len() != all.len()).then_some(next)
+}
+
 fn usage_error(error: &crate::rpc::RpcError) -> String {
     match error {
         crate::rpc::RpcError::Failure(value) => {
@@ -1427,6 +1787,55 @@ fn usage_error(error: &crate::rpc::RpcError) -> String {
         }
         _ => error.to_string(),
     }
+}
+
+/// Tailwind's `md` and `lg` viewport breakpoints.
+const MD: f32 = 768.;
+const LG: f32 = 1024.;
+
+/// `AppRouteModal`'s `sm:p-6 lg:p-10` around its panel.
+fn modal_padding(viewport: f32) -> f32 {
+    if viewport >= LG {
+        40.
+    } else if viewport >= 640. {
+        24.
+    } else {
+        0.
+    }
+}
+
+/// The panel's `sm:max-w-[80rem]` border box.
+fn modal_panel_width(viewport: f32) -> f32 {
+    (viewport - 2. * modal_padding(viewport)).min(1280.)
+}
+
+/// `WorkspacePageContainer`'s `px-5 sm:px-6`.
+fn page_gutter(viewport: f32) -> f32 {
+    if viewport >= 640. { 24. } else { 20. }
+}
+
+/// The width inside `WorkspacePageContainer width="wide"` (`max-w-5xl`), within the panel's border.
+fn page_content_width(viewport: f32) -> f32 {
+    (modal_panel_width(viewport) - 2.).min(1024.) - 2. * page_gutter(viewport)
+}
+
+/// `grid gap-6 lg:grid-cols-[minmax(0,18rem)_minmax(0,1fr)]`: the summary beside the chart, above it below `lg`.
+fn summary_and_chart(lg: bool, summary: gpui_kit::Div, chart: gpui_kit::Div) -> gpui_kit::Div {
+    if lg {
+        h_flex().items_start().gap(px(24.)).child(summary.w(px(288.)).flex_none()).child(chart.flex_1())
+    } else {
+        v_flex().gap(px(24.)).child(summary).child(chart)
+    }
+}
+
+/// `grid grid-cols-2 gap-x-6 gap-y-4 py-1 md:grid-cols-5`.
+fn totals_grid(md: bool) -> gpui_kit::Div {
+    div().grid().grid_cols(if md { 5 } else { 2 }).gap_x(px(24.)).gap_y(px(16.)).py(px(4.))
+}
+
+/// `grid gap-x-12 gap-y-8 lg:grid-cols-2`.
+fn share_bars_grid(lg: bool) -> gpui_kit::Div {
+    div().grid().grid_cols(if lg { 2 } else { 1 }).gap_x(px(48.)).gap_y(px(32.))
 }
 
 fn section_title(title: &str) -> impl IntoElement {
@@ -1489,6 +1898,43 @@ fn inline_menu_button(id: &'static str, t: &Tokens) -> Button {
         .text_color(t.muted_foreground)
 }
 
+/// `Select` with a compact ghost `SelectTrigger`: the picked option's label over a menu of the options.
+fn compact_select<V: Copy + PartialEq + 'static>(
+    id: &'static str,
+    options: impl Iterator<Item = (V, &'static str)>,
+    current: V,
+    t: &Tokens,
+    view: &gpui_kit::Entity<Workspace>,
+    pick: fn(&mut Workspace, V, &mut Context<Workspace>),
+) -> impl IntoElement {
+    let options: Vec<(V, &'static str)> = options.collect();
+    let label = options.iter().find(|(value, _)| *value == current).map_or("", |(_, label)| *label);
+    let view = view.clone();
+    Button::new(id)
+        .ghost()
+        .small()
+        .h(px(28.))
+        .px(px(7.))
+        .gap(px(4.))
+        .rounded(px(6.))
+        .text_xs()
+        .text_color(t.sidebar.secondary_label)
+        .child(label)
+        .child(
+            Icon::new(Lucide::ChevronDown).with_size(px(14.)).text_color(Hsla { a: 0.7, ..t.sidebar.secondary_label }),
+        )
+        .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |menu, window, _| {
+            options.iter().fold(menu, |menu, (value, label)| {
+                let value = *value;
+                menu.item(
+                    PopupMenuItem::new(*label)
+                        .checked(value == current)
+                        .on_click(window.listener_for(&view, move |this, _, _, cx| pick(this, value, cx))),
+                )
+            })
+        })
+}
+
 fn ghost_icon_button(id: &'static str, icon: Lucide, size: f32, t: &Tokens) -> Button {
     Button::new(id)
         .ghost()
@@ -1499,44 +1945,95 @@ fn ghost_icon_button(id: &'static str, icon: Lucide, size: f32, t: &Tokens) -> B
         .child(Icon::new(icon).with_size(px(size)).text_color(t.muted_foreground))
 }
 
-/// `ToggleGroup variant="segmented"`.
+/// A segmented group's toggles' focus handles, kept while the group renders.
+#[derive(Default)]
+struct SegmentFocus(Vec<FocusHandle>);
+
+/// `ToggleGroup`'s arrow keys: the toggle `key` moves focus to from `from` of `len`, wrapping.
+fn segment_step(key: &str, from: usize, len: usize) -> Option<usize> {
+    match key {
+        "left" => Some((from + len - 1) % len),
+        "right" => Some((from + 1) % len),
+        "home" => Some(0),
+        "end" => Some(len - 1),
+        _ => None,
+    }
+}
+
+/// `ToggleGroup variant="segmented"`: one tab stop (the pressed toggle until the arrow keys move
+/// on), arrows and Home/End move between toggles, and Enter or Space presses the focused one.
 pub(super) fn segmented<V: Copy + PartialEq + std::fmt::Debug + 'static>(
     id: &'static str,
     options: impl Iterator<Item = (V, &'static str)>,
     current: V,
     t: &Tokens,
+    window: &mut Window,
     cx: &mut Context<Workspace>,
     pick: fn(&mut Workspace, V, &mut Context<Workspace>),
 ) -> gpui_kit::Div {
+    let options: Vec<(V, &'static str)> = options.collect();
+    let state = window.use_keyed_state(SharedString::from(format!("{id}-focus")), cx, |_, _| SegmentFocus::default());
+    let handles = state.update(cx, |state, cx| {
+        state.0.resize_with(options.len(), || cx.focus_handle());
+        state.0.clone()
+    });
+    let focused = handles.iter().position(|handle| handle.is_focused(window));
+    let stop = focused.or_else(|| options.iter().position(|(value, _)| *value == current)).unwrap_or(0);
+    let keyboard = window.last_input_was_keyboard();
     let track = Hsla { a: t.input.a * 0.4, ..t.input };
-    h_flex().flex_none().gap(px(2.)).p(px(2.)).rounded(px(8.)).bg(track).children(options.map(|(value, label)| {
-        let pressed = value == current;
-        div()
-            .id(ElementId::Name(format!("{id}-{value:?}").into()))
-            .h(px(24.))
-            .px(px(10.))
-            .flex()
-            .items_center()
-            .rounded(px(6.))
-            // `text-xs` with the base's `sm:text-sm`, which wins at desktop widths.
-            .text_sm()
-            .font_weight(FontWeight::MEDIUM)
-            .cursor_pointer()
-            .map(|el| {
-                if pressed {
-                    el.text_color(t.foreground).bg(if t.dark {
-                        Hsla { a: t.input.a * 0.72, ..t.input }
+    let len = options.len();
+    h_flex().flex_none().gap(px(2.)).p(px(2.)).rounded(px(8.)).bg(track).children(options.into_iter().enumerate().map(
+        |(index, (value, label))| {
+            let pressed = value == current;
+            let focus = handles[index].clone().tab_stop(index == stop);
+            // `focus-visible:ring-2 focus-visible:ring-inset ring-ring`
+            let ring = (keyboard && focus.is_focused(window))
+                .then(|| vec![BoxShadow::new(px(0.), px(0.), t.ring).spread_radius(px(2.)).inset()]);
+            let handles = handles.clone();
+            div()
+                .id(ElementId::Name(format!("{id}-{value:?}").into()))
+                .track_focus(&focus)
+                .when_some(ring, gpui_kit::Styled::shadow)
+                .h(px(24.))
+                .px(px(10.))
+                .flex()
+                .items_center()
+                .rounded(px(6.))
+                // `text-xs` with the base's `sm:text-sm`, which wins at desktop widths.
+                .text_sm()
+                .font_weight(FontWeight::MEDIUM)
+                .cursor_pointer()
+                .map(|el| {
+                    if pressed {
+                        el.text_color(t.foreground).bg(if t.dark {
+                            Hsla { a: t.input.a * 0.72, ..t.input }
+                        } else {
+                            t.background
+                        })
                     } else {
-                        t.background
-                    })
-                } else {
-                    el.text_color(t.muted_foreground)
-                        .hover(|s| s.text_color(t.foreground).bg(Hsla { a: t.input.a * 0.32, ..t.input }))
-                }
-            })
-            .child(label)
-            .on_click(cx.listener(move |this, _, _, cx| pick(this, value, cx)))
-    }))
+                        el.text_color(t.muted_foreground)
+                            .hover(|s| s.text_color(t.foreground).bg(Hsla { a: t.input.a * 0.32, ..t.input }))
+                    }
+                })
+                .child(label)
+                .on_key_down(cx.listener(move |_, event: &KeyDownEvent, window, cx| {
+                    let keystroke = &event.keystroke;
+                    if keystroke.modifiers.modified() {
+                        return;
+                    }
+                    if let Some(next) = segment_step(&keystroke.key, index, len) {
+                        window.focus(&handles[next], cx);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }))
+                // A pressed button takes focus in a browser, so the arrow keys go on from it.
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    window.focus(&focus, cx);
+                    pick(this, value, cx);
+                }))
+        },
+    ))
 }
 
 /// `UsageShareBar`: one bar split by share, with a legend.
@@ -1604,8 +2101,27 @@ fn share_bar(
         .into_any_element()
 }
 
+/// What every limit segment reads: the layout, the clock, redeem progress, the shared card and focus handles.
+struct Segments<'a> {
+    stack: bool,
+    wide: bool,
+    now: i64,
+    hour12: bool,
+    redeemed: &'a [Redeem],
+    card: &'a SegmentCard,
+    focus: &'a HashMap<String, FocusHandle>,
+    view: WeakEntity<Workspace>,
+    t: &'a Tokens,
+}
+
+/// A segment's key: its account on one pooled window.
+fn segment_key(pool: &Pool, window: &PoolWindow, account: &logic::Account) -> String {
+    format!("{}-{}-{}-{}", pool.driver, window.kind, window.id, account.key)
+}
+
 /// `PoolSection`: one driver's windows, each pooled across its accounts.
-fn pool_section(pool: &Pool, now: i64, redeemed: &[Redeem], view: &WeakEntity<Workspace>, t: &Tokens) -> AnyElement {
+fn pool_section(pool: &Pool, segments: &Segments<'_>, cx: &App) -> AnyElement {
+    let t = segments.t;
     let color = logic::driver_kind(&pool.driver).map_or(t.foreground, |kind| provider_color(kind, t));
     v_flex()
         .gap(px(12.))
@@ -1621,9 +2137,9 @@ fn pool_section(pool: &Pool, now: i64, redeemed: &[Redeem], view: &WeakEntity<Wo
                 }))
                 .child(driver_label(&pool.driver)),
         )
-        .children(pool.windows.iter().map(|window| pool_window_card(pool, window, color, now, redeemed, view, t)))
-        // The confirm closed with no popover to report back in, so progress and the outcome show here.
-        .children(redeemed.iter().filter(|r| pool.accounts.iter().any(|a| a.key == r.key)).filter_map(|r| {
+        .children(pool.windows.iter().map(|window| pool_window_card(pool, window, color, segments, cx)))
+        // The confirm closed the card, so progress and the outcome show here.
+        .children(segments.redeemed.iter().filter(|r| pool.accounts.iter().any(|a| a.key == r.key)).filter_map(|r| {
             let status = match &r.status {
                 RedeemStatus::Confirming => return None,
                 RedeemStatus::Running => "Using reset credit…".to_owned(),
@@ -1641,22 +2157,28 @@ fn pool_section(pool: &Pool, now: i64, redeemed: &[Redeem], view: &WeakEntity<Wo
         .into_any_element()
 }
 
-fn pool_window_card(
-    pool: &Pool,
-    window: &PoolWindow,
-    color: Hsla,
-    now: i64,
-    redeemed: &[Redeem],
-    view: &WeakEntity<Workspace>,
-    t: &Tokens,
-) -> AnyElement {
+fn pool_window_card(pool: &Pool, window: &PoolWindow, color: Hsla, segments: &Segments<'_>, cx: &App) -> AnyElement {
+    let t = segments.t;
     let cursor = (pool.driver == "cursor").then(|| logic::CURSOR_WINDOWS.iter().find(|w| w.0 == window.id)).flatten();
     let label = cursor.map_or(window.label.clone(), |w| w.1.to_owned());
     let several = window.columns.len() > 1;
-    let segments = window.columns.iter().map(|member| {
+    let bars = window.columns.iter().enumerate().map(|(position, member)| {
         let Some(member) = member else { return div().flex_1().min_w_0().into_any_element() };
-        pool_segment(pool, window, member, several, color, now, redeemed, view, t)
+        pool_segment(pool, window, member, position + 1, color, segments, cx)
     });
+    let bar = h_flex().min_w_0().gap(px(4.)).children(bars);
+    // Below `@2xl/pool` the segments show numbers, and a legend row per account carries their details.
+    let bar = if segments.wide {
+        bar
+    } else {
+        v_flex().min_w_0().gap(px(4.)).child(bar).children(window.columns.iter().enumerate().filter_map(
+            |(position, member)| {
+                member.as_ref().map(|member| legend_row(pool, window, member, position + 1, color, segments))
+            },
+        ))
+    };
+    // Below `md` the heading sits above the bar.
+    let row = if segments.stack { v_flex().gap(px(12.)) } else { h_flex().gap(px(24.)) };
     v_flex()
         .gap(px(12.))
         .rounded(px(8.))
@@ -1664,37 +2186,32 @@ fn pool_window_card(
         .border_color(Hsla { a: t.border.a * 0.6, ..t.border })
         .p(px(16.))
         .child(
-            h_flex()
-                .gap(px(24.))
-                .child(
-                    v_flex()
-                        .w(px(176.))
-                        .flex_none()
-                        .gap(px(4.))
-                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(label))
-                        .child(
-                            h_flex()
-                                .items_baseline()
-                                .gap(px(8.))
-                                .child(
-                                    div()
-                                        .text_3xl()
-                                        .line_height(px(36.))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child(format!("{}%", window.remaining_percent)),
-                                )
-                                .child(div().text_sm().text_color(t.muted_foreground).child("left"))
-                                .children(
-                                    window
-                                        .pace
-                                        .map(|pace| pace_icon(format!("{}-{}", pool.driver, window.id), pace, t)),
-                                ),
-                        )
-                        .when_some(window.next_refill.filter(|_| several), |el, refill| {
-                            el.child(div().text_xs().font_weight(FontWeight::MEDIUM).child(format!("↻ +{refill}%")))
-                        }),
-                )
-                .child(h_flex().flex_1().min_w_0().gap(px(4.)).children(segments)),
+            row.child(
+                v_flex()
+                    .when(!segments.stack, |el| el.w(px(176.)).flex_none())
+                    .gap(px(4.))
+                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(label))
+                    .child(
+                        h_flex()
+                            .items_baseline()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .text_3xl()
+                                    .line_height(px(36.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(format!("{}%", window.remaining_percent)),
+                            )
+                            .child(div().text_sm().text_color(t.muted_foreground).child("left"))
+                            .children(
+                                window.pace.map(|pace| pace_icon(format!("{}-{}", pool.driver, window.id), pace, t)),
+                            ),
+                    )
+                    .when_some(window.next_refill.filter(|_| several), |el, refill| {
+                        el.child(div().text_xs().font_weight(FontWeight::MEDIUM).child(format!("↻ +{refill}%")))
+                    }),
+            )
+            .child(if segments.stack { bar } else { bar.flex_1() }),
         )
         .children(cursor.map(|w| div().text_xs().text_color(t.muted_foreground).child(w.2)))
         .into_any_element()
@@ -1751,65 +2268,43 @@ fn account_chip(email: &str) -> impl IntoElement {
         .child(if initials.is_empty() { "?".to_owned() } else { initials })
 }
 
+/// `PoolSegment`: one account's bar, a button whose shared card (`SegmentPopover`) opens on
+/// hover, click, Enter or Space.
 fn pool_segment(
     pool: &Pool,
     window: &PoolWindow,
     member: &logic::Member,
-    several: bool,
+    index: usize,
     color: Hsla,
-    now: i64,
-    redeemed: &[Redeem],
-    view: &WeakEntity<Workspace>,
-    t: &Tokens,
+    segments: &Segments<'_>,
+    cx: &App,
 ) -> AnyElement {
+    let (t, now) = (segments.t, segments.now);
     let account = &pool.accounts[member.account];
+    let key = segment_key(pool, window, account);
+    let several = window.columns.len() > 1;
     let credits = account.limits.reset_credits.clone().filter(|c| c.available_count > 0);
-    let redeem = account.redeem.clone().filter(|_| credits.is_some());
-    let color = crate::pull_requests::label_color(account.accent_color.as_deref()).map_or(color, |hex| rgb(hex).into());
+    let color = account_color(account, color);
     let remaining = logic::remaining_percent(&member.window);
     let time_left = logic::pace_remaining_percent(&member.window, now);
     let resets_in = logic::format_resets_in(&member.window, now);
-    let name: AnyElement = match (&account.display_name, &account.email) {
-        (Some(name), _) => {
-            div().min_w_0().truncate().font_weight(FontWeight::MEDIUM).child(name.clone()).into_any_element()
-        }
-        (None, Some(email)) => account_chip(email).into_any_element(),
-        (None, None) => div().child(driver_label(&account.driver)).into_any_element(),
-    };
-    let signed_in = account.environments.iter().map(|(_, label)| label.as_str()).collect::<Vec<_>>().join(", ");
-    let where_label = match &account.source_label {
-        Some(source) => Some(("Via", source.clone())),
-        None => (!signed_in.is_empty()).then_some(("Signed in", signed_in)),
-    };
-    let details: Vec<(&'static str, String)> = [
-        account.plan.clone().map(|plan| ("Plan", plan)),
-        where_label,
-        Some(("Left", format!("{remaining}%"))),
-        resets_in.clone().map(|r| ("Resets", r.replace("resets in ", "in "))),
-        time_left.map(|left| ("Even pace", format!("{left}% left by now"))),
-        (member.refill_percent > 0. && several && remaining < 100).then(|| {
-            ("Restores", format!("+{}% of pool", (member.refill_percent / window.columns.len() as f64).round()))
-        }),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    // The web's popover holds a "Use reset" button; here the segment itself is that button.
-    let credit_line = credits.as_ref().filter(|_| redeem.is_some()).map(|c| logic::reset_credits_summary(c, now, true));
-    let border = t.border;
-    let title = account.name();
-    let email = account.email.clone().filter(|_| account.display_name.is_some());
+    let name = account_name(account);
+    let open = segments.card.open.as_deref() == Some(key.as_str());
     let fill = Hsla { a: color.a * 0.35, ..color };
-    div()
-        .id(ElementId::Name(format!("pool-{}-{}-{}", pool.driver, window.id, account.key).into()))
+    let ring = t.ring;
+    let view = segments.view.clone();
+    let mut segment = div()
+        .id(ElementId::Name(format!("pool-{key}").into()))
         .relative()
-        .flex_1()
-        .min_w_0()
-        .h(px(32.))
+        .w_full()
+        .h(px(if segments.wide { 32. } else { 20. }))
         .rounded(px(6.))
         .bg(t.muted)
         .overflow_hidden()
         .cursor_pointer()
+        // `focus-visible:ring-2 ring-inset ring-ring`, and `ring-1 ring-border` while its card is open.
+        .focus_visible(move |s| s.shadow(vec![BoxShadow::new(px(0.), px(0.), ring).spread_radius(px(2.)).inset()]))
+        .when(open, |el| el.shadow(vec![BoxShadow::new(px(0.), px(0.), t.border).spread_radius(px(1.)).inset()]))
         .child(
             div().absolute().top_0().bottom_0().left_0().w(relative(remaining as f32 / 100.)).rounded(px(6.)).bg(fill),
         )
@@ -1824,129 +2319,450 @@ fn pool_segment(
                 .rounded_full()
                 .bg(t.foreground)
         }))
+        .when(!segments.wide, |el| {
+            el.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(gpui_kit::rems(0.625))
+                    .line_height(relative(1.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(Hsla { a: 0.8, ..t.foreground })
+                    .child(index.to_string()),
+            )
+        })
+        .when(segments.wide, |el| {
+            el.child(
+                h_flex()
+                    .relative()
+                    .size_full()
+                    .px(px(8.))
+                    .gap(px(6.))
+                    .text_xs()
+                    .when(several, |el| {
+                        el.child(name)
+                            .child(div().flex_none().font_weight(FontWeight::SEMIBOLD).child(format!("{remaining}%")))
+                    })
+                    .when(resets_in.is_some() || credits.is_some(), |el| {
+                        el.child(
+                            h_flex()
+                                .ml_auto()
+                                .flex_none()
+                                .gap(px(6.))
+                                .rounded(px(4.))
+                                .bg(Hsla { a: 0.85, ..t.background })
+                                .px(px(6.))
+                                .py(px(2.))
+                                .text_size(gpui_kit::rems(0.6875))
+                                .children(resets_in.as_ref().map(|r| r.replace("resets in ", "↻ ")))
+                                .when_some(credits.as_ref(), |el, credits| {
+                                    el.when(resets_in.is_some(), |el| {
+                                        el.child(div().text_color(t.muted_foreground).child("·"))
+                                    })
+                                    .child(
+                                        h_flex()
+                                            .gap(px(2.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(Icon::new(Lucide::Ticket).with_size(px(12.)))
+                                            .child(credits.available_count.to_string()),
+                                    )
+                                }),
+                        )
+                    }),
+            )
+        })
+        .on_hover({
+            let (view, key) = (view.clone(), key.clone());
+            move |hovering: &bool, _, cx| {
+                let _ = view.update(cx, |this, cx| this.hover_usage_card(Some(&key), *hovering, cx));
+            }
+        })
+        .on_click({
+            let (view, key) = (view.clone(), key.clone());
+            move |_, _, cx| {
+                let _ = view.update(cx, |this, cx| {
+                    this.usage.card.press(&key);
+                    cx.notify();
+                });
+            }
+        });
+    if let Some(focus) = segments.focus.get(&key) {
+        segment = segment.track_focus(focus);
+    }
+    let popup = Popup::new(ElementId::Name(format!("pool-popup-{key}").into()), segment)
+        .flex_1()
+        .min_w_0()
+        .anchor(gpui_kit::Anchor::BottomCenter)
+        .offset(px(6.));
+    if !open {
+        return popup.into_any_element();
+    }
+    let card = v_flex()
+        .id(ElementId::Name(format!("pool-card-{key}").into()))
+        .occlude()
+        .popover_style(cx)
+        .p(px(16.))
+        .child(segment_card(pool, window, member, segments))
+        .on_hover({
+            let view = view.clone();
+            move |hovering: &bool, _, cx| {
+                let _ = view.update(cx, |this, cx| this.hover_usage_card(None, *hovering, cx));
+            }
+        })
+        // The segment's own click toggles the card.
+        .on_mouse_down_out(move |_, _, cx| {
+            let _ = view.update(cx, |this, cx| {
+                let card = &mut this.usage.card;
+                if card.hovered_segment.is_none() || card.hovered_segment != card.open {
+                    card.close();
+                    cx.notify();
+                }
+            });
+        });
+    popup.content(card).into_any_element()
+}
+
+/// An account's accent color, or its driver's.
+fn account_color(account: &logic::Account, color: Hsla) -> Hsla {
+    crate::pull_requests::label_color(account.accent_color.as_deref()).map_or(color, |hex| rgb(hex).into())
+}
+
+/// `AccountName`: the display name, the email's chip, or the driver.
+fn account_name(account: &logic::Account) -> AnyElement {
+    match (&account.display_name, &account.email) {
+        (Some(name), _) => {
+            div().min_w_0().truncate().font_weight(FontWeight::MEDIUM).child(name.clone()).into_any_element()
+        }
+        (None, Some(email)) => account_chip(email).into_any_element(),
+        (None, None) => div().child(driver_label(&account.driver)).into_any_element(),
+    }
+}
+
+/// `LegendRow`: a narrow pool's numbered account line, which opens the segment's card.
+fn legend_row(
+    pool: &Pool,
+    window: &PoolWindow,
+    member: &logic::Member,
+    index: usize,
+    color: Hsla,
+    segments: &Segments<'_>,
+) -> AnyElement {
+    let (t, now) = (segments.t, segments.now);
+    let account = &pool.accounts[member.account];
+    let key = segment_key(pool, window, account);
+    let color = account_color(account, color);
+    let resets_in = logic::format_resets_in(&member.window, now);
+    let credits = account.limits.reset_credits.as_ref().map_or(0, |c| c.available_count);
+    let view = segments.view.clone();
+    Button::new(ElementId::Name(format!("pool-legend-{key}").into()))
+        .ghost()
+        .small()
+        .w_full()
+        .h(px(28.))
+        .px(px(7.))
+        .rounded(px(6.))
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(t.foreground)
+        .child(
+            div()
+                .size(px(16.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(4.))
+                .bg(Hsla { a: color.a * 0.35, ..color })
+                .text_size(gpui_kit::rems(0.625))
+                .line_height(relative(1.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(Hsla { a: 0.8, ..t.foreground })
+                .child(index.to_string()),
+        )
+        .child(account_name(account))
+        .child(
+            div()
+                .flex_none()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(format!("{}%", logic::remaining_percent(&member.window))),
+        )
         .child(
             h_flex()
-                .relative()
-                .size_full()
-                .px(px(8.))
+                .ml_auto()
+                .flex_none()
                 .gap(px(6.))
-                .text_xs()
-                .when(several, |el| {
-                    el.child(name)
-                        .child(div().flex_none().font_weight(FontWeight::SEMIBOLD).child(format!("{remaining}%")))
-                })
-                .when(resets_in.is_some() || credits.is_some(), |el| {
-                    el.child(
+                .text_size(gpui_kit::rems(0.6875))
+                .font_weight(FontWeight::NORMAL)
+                .text_color(t.muted_foreground)
+                .children(resets_in.as_ref().map(|r| r.replace("resets in ", "↻ ")))
+                .when(credits > 0, |el| {
+                    el.when(resets_in.is_some(), |el| el.child("·")).child(
                         h_flex()
-                            .ml_auto()
-                            .flex_none()
-                            .gap(px(6.))
-                            .rounded(px(4.))
-                            .bg(Hsla { a: 0.85, ..t.background })
-                            .px(px(6.))
-                            .py(px(2.))
-                            .text_size(gpui_kit::rems(0.6875))
-                            .children(resets_in.as_ref().map(|r| r.replace("resets in ", "↻ ")))
-                            .when_some(credits.as_ref(), |el, credits| {
-                                el.when(resets_in.is_some(), |el| {
-                                    el.child(div().text_color(t.muted_foreground).child("·"))
-                                })
-                                .child(
-                                    h_flex()
-                                        .gap(px(2.))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child(Icon::new(Lucide::Ticket).with_size(px(12.)))
-                                        .child(credits.available_count.to_string()),
-                                )
-                            }),
+                            .gap(px(2.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(t.foreground)
+                            .child(Icon::new(Lucide::Ticket).with_size(px(12.)))
+                            .child(credits.to_string()),
                     )
                 }),
         )
-        .when_some(redeem.filter(|_| !redeem_busy(redeemed, &account.key)), |el, input| {
-            let (view, key, name) = (view.clone(), account.key.clone(), account.name());
-            el.on_click(move |_, window, cx| {
-                let _ = view.update(cx, |this, cx| {
-                    this.redeem_reset_credit(key.clone(), name.clone(), input.clone(), window, cx);
-                });
-            })
-        })
-        .tooltip(move |window, cx| {
-            let details = details.clone();
-            let title = title.clone();
-            let email = email.clone();
-            let credit_line = credit_line.clone();
-            Tooltip::element(move |_, _| {
-                v_flex()
-                    .w(px(288.))
-                    .gap(px(10.))
-                    .text_xs()
-                    .child(
-                        v_flex()
-                            .gap(px(2.))
-                            .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(title.clone()))
-                            .children(email.clone().map(|e| div().child(e))),
-                    )
-                    .children(details.iter().map(|(label, value)| {
-                        h_flex().gap(px(12.)).child(div().w(px(72.)).flex_none().child(*label)).child(value.clone())
-                    }))
-                    .children(credit_line.clone().map(|line| {
-                        h_flex().gap(px(12.)).child(line).child(
-                            div()
-                                .ml_auto()
-                                .rounded(px(6.))
-                                .border_1()
-                                .border_color(border)
-                                .px(px(6.))
-                                .child("Use reset"),
-                        )
-                    }))
-            })
-            .build(window, cx)
+        .on_click(move |_, _, cx| {
+            let _ = view.update(cx, |this, cx| {
+                this.usage.card.press(&key);
+                cx.notify();
+            });
         })
         .into_any_element()
 }
 
-fn usage_skeleton(t: &Tokens) -> impl IntoElement {
+/// `SegmentPopover`: the account, its plan and where it is signed in, the window, and its reset credits.
+fn segment_card(pool: &Pool, window: &PoolWindow, member: &logic::Member, segments: &Segments<'_>) -> impl IntoElement {
+    let (t, now) = (segments.t, segments.now);
+    let account = &pool.accounts[member.account];
+    let remaining = logic::remaining_percent(&member.window);
+    let time_left = logic::pace_remaining_percent(&member.window, now);
+    let resets_in = logic::format_resets_in(&member.window, now);
+    let signed_in = account.environments.iter().map(|(_, label)| label.as_str()).collect::<Vec<_>>().join(", ");
+    let where_row = if account.environments.is_empty() {
+        account.source_label.clone().map(|source| ("Via", source))
+    } else {
+        Some(("Signed in", signed_in))
+    };
+    let resets = member.window.resets_at.as_deref().and_then(|at| {
+        let local = chrono::DateTime::from_timestamp_millis(now)?.with_timezone(&Local);
+        let when = crate::timestamp::upcoming(at, &local, segments.hour12)?;
+        Some(match &resets_in {
+            Some(r) => format!("{when} · {}", r.replace("resets in ", "in ")),
+            None => when,
+        })
+    });
+    // `pool.resets`: a member with a reset clock restores its refill as a share of the pool.
+    let members = window.columns.iter().flatten().count().max(1);
+    let restores = (member.refill_percent / members as f64).round();
+    let restores = (member.window.resets_at.is_some() && restores > 0.).then(|| format!("+{restores}% of pool"));
+    let credits = account.limits.reset_credits.clone().filter(|c| c.available_count > 0 && account.redeem.is_some());
+    let row = |label: &'static str, value: String| {
+        h_flex()
+            .gap(px(12.))
+            .child(div().w(px(72.)).flex_none().text_color(t.muted_foreground).child(label))
+            .child(div().min_w_0().text_color(t.foreground).child(value))
+    };
+    let section =
+        || v_flex().gap(px(4.)).border_t_1().border_color(Hsla { a: t.border.a * 0.6, ..t.border }).pt(px(10.));
+    let name = account.display_name.clone().unwrap_or_else(|| driver_label(&account.driver));
+    let avatar: Option<AnyElement> = if account.redeem.is_some() {
+        crate::assets::provider_icon(&account.driver).map(|(path, tint)| {
+            div()
+                .size(px(20.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(svg().path(path).size(px(16.)).text_color(tint.unwrap_or(Hsla { a: 0.8, ..t.foreground })))
+                .into_any_element()
+        })
+    } else {
+        account.email.as_deref().map(|email| account_chip(email).into_any_element())
+    };
+    let view = segments.view.clone();
+    v_flex()
+        .w(px(288.))
+        .gap(px(10.))
+        .text_xs()
+        .child(
+            v_flex()
+                .min_w_0()
+                .gap(px(2.))
+                .child(
+                    h_flex()
+                        .gap(px(8.))
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(t.foreground)
+                        .children(avatar)
+                        .child(div().min_w_0().truncate().child(name)),
+                )
+                .children(account.email.as_deref().map(|email| {
+                    let revealed = segments.card.email_revealed;
+                    let view = view.clone();
+                    super::settings::redacted_email(&format!("pool-{}", account.key), email, revealed, t).on_click(
+                        move |_, _, cx| {
+                            let _ = view.update(cx, |this, cx| {
+                                this.usage.card.email_revealed = !revealed;
+                                cx.notify();
+                            });
+                        },
+                    )
+                })),
+        )
+        .child(
+            section()
+                .children(account.plan.clone().map(|plan| row("Plan", plan)))
+                .children(where_row.map(|(label, value)| row(label, value))),
+        )
+        .child(
+            section()
+                .child(row("Left", format!("{remaining}%")))
+                .children(resets.map(|resets| row("Resets", resets)))
+                .children(time_left.map(|left| row("Even pace", format!("{left}% left by now"))))
+                .children(restores.map(|restores| row("Restores", restores))),
+        )
+        .children(credits.map(|credits| {
+            let busy = redeem_busy(segments.redeemed, &account.key);
+            let input = account.redeem.clone();
+            let (key, name) = (account.key.clone(), account.name());
+            section().text_color(t.muted_foreground).child(
+                h_flex().gap(px(12.)).child(logic::reset_credits_summary(&credits, now, true)).child(
+                    Button::new(ElementId::Name(format!("pool-reset-{}", account.key).into()))
+                        .outline()
+                        .xsmall()
+                        .ml_auto()
+                        .label(if busy { "Using…" } else { "Use reset" })
+                        .disabled(busy)
+                        .on_click(move |_, window, cx| {
+                            let Some(input) = input.clone() else { return };
+                            let _ = view.update(cx, |this, cx| {
+                                this.usage.card.close();
+                                this.redeem_reset_credit(key.clone(), name.clone(), input, window, cx);
+                            });
+                        }),
+                ),
+            )
+        }))
+}
+
+fn usage_skeleton(t: &Tokens, viewport: f32) -> impl IntoElement {
     let bar = |w: f32, h: f32| div().w(px(w)).h(px(h)).rounded(px(6.)).bg(t.muted);
+    let fill = |h: f32| div().h(px(h)).rounded(px(6.)).bg(t.muted);
+    let summary = v_flex()
+        .gap(px(20.))
+        .child(v_flex().gap(px(4.)).child(bar(144., 40.)).child(bar(128., 16.)))
+        .children(logic::PROVIDERS.iter().map(|_| {
+            v_flex()
+                .gap(px(4.))
+                .child(h_flex().justify_between().child(bar(104., 14.)).child(bar(56., 14.)))
+                .child(bar(144., 16.))
+        }));
+    let chart = v_flex().gap(px(12.)).child(bar(96., 20.)).child(fill(224.).ml(px(64.)));
     v_flex()
         .gap(px(24.))
-        .child(
-            h_flex()
-                .items_start()
-                .gap(px(24.))
-                .child(
-                    v_flex()
-                        .w(px(288.))
-                        .gap(px(20.))
-                        .child(v_flex().gap(px(4.)).child(bar(144., 40.)).child(bar(128., 16.)))
-                        .children(logic::PROVIDERS.iter().map(|_| {
-                            v_flex()
-                                .gap(px(4.))
-                                .child(h_flex().justify_between().child(bar(104., 14.)).child(bar(56., 14.)))
-                                .child(bar(144., 16.))
-                        })),
-                )
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .gap(px(12.))
-                        .child(bar(96., 20.))
-                        .child(div().ml(px(64.)).h(px(224.)).rounded(px(6.)).bg(t.muted)),
-                ),
-        )
-        .child(v_flex().gap(px(8.)).child(section_title("Totals")).child(h_flex().children(
+        .child(summary_and_chart(viewport >= LG, summary, chart))
+        .child(v_flex().gap(px(8.)).child(section_title("Totals")).child(totals_grid(viewport >= MD).children(
             ["Processed tokens", "Cached input", "Uncached input", "Output", "Cache savings"].map(|label| {
                 v_flex()
-                    .flex_1()
                     .gap(px(2.))
                     .child(div().text_xs().text_color(t.muted_foreground).child(label))
                     .child(bar(64., 24.))
             }),
         )))
         .child(
+            share_bars_grid(viewport >= LG)
+                .child(v_flex().gap(px(10.)).child(bar(112., 20.)).child(fill(8.)).child(bar(288., 16.))),
+        )
+        .child(
             v_flex()
                 .gap(px(12.))
                 .child(h_flex().justify_between().child(section_title("Breakdown")).child(bar(112., 28.)))
                 .child(div().h(px(176.)).rounded(px(6.)).bg(t.muted)),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_card_follows_the_hovered_segment_and_a_press_pins_it() {
+        let mut card = SegmentCard::default();
+        assert_eq!(card.hover_segment("a", true), Some(CARD_OPEN_DELAY));
+        card.settle();
+        assert_eq!(card.open.as_deref(), Some("a"));
+        card.email_revealed = true;
+        assert_eq!(card.hover_segment("a", false), Some(CARD_CLOSE_DELAY));
+        assert_eq!(card.hover_segment("b", true), None, "an open card moves to the next segment at once");
+        assert_eq!((card.open.as_deref(), card.email_revealed), (Some("b"), false));
+        assert_eq!(card.hover_segment("b", false), Some(CARD_CLOSE_DELAY));
+        assert_eq!(card.hover_card(true), None, "crossing onto the card keeps it");
+        card.settle();
+        assert_eq!(card.open.as_deref(), Some("b"));
+        assert_eq!(card.hover_card(false), Some(CARD_CLOSE_DELAY));
+        card.settle();
+        assert_eq!(card.open, None);
+
+        card.hover_segment("a", true);
+        card.press("a");
+        assert!(card.pinned && card.open.as_deref() == Some("a"), "Enter or a click opens it without waiting");
+        assert_eq!(card.hover_segment("a", false), None, "a pinned card stays when the pointer leaves");
+        assert_eq!(card.hover_segment("b", true), None);
+        assert_eq!(card.open.as_deref(), Some("a"), "and does not follow the pointer");
+        card.press("b");
+        assert_eq!(card.open.as_deref(), Some("b"));
+        card.press("b");
+        assert_eq!(card.open, None, "a second press closes it");
+        assert_eq!(card.hovered_segment.as_deref(), Some("b"), "closing keeps track of the pointer");
+    }
+
+    #[test]
+    fn segmented_arrows_wrap_and_home_end_jump() {
+        assert_eq!(segment_step("right", 2, 3), Some(0));
+        assert_eq!(segment_step("left", 0, 3), Some(2));
+        assert_eq!((segment_step("home", 2, 3), segment_step("end", 0, 3)), (Some(0), Some(2)));
+        assert_eq!(segment_step("down", 0, 3), None, "a horizontal group leaves up and down alone");
+    }
+
+    #[test]
+    fn page_preferences_survive_a_restart_and_bad_ones_fall_back() {
+        assert_eq!(read_preferences(&Value::Null), ("limits", 30, Vec::new()));
+        let usage = UsageState { metric: "tokens", days: 7, hidden: vec!["codex".into()], ..UsageState::default() };
+        let stored = Value::Object(usage.preferences());
+        assert_eq!(read_preferences(&stored[PREFERENCES_KEY]), ("tokens", 7, vec!["codex".to_owned()]));
+        assert_eq!(read_preferences(&json!({"metric": "cost", "windowDays": 1})), ("cost", 1, Vec::new()));
+        for bad in [
+            json!({"metric": "cost", "windowDays": 14}),
+            json!({"metric": "spend", "windowDays": 7}),
+            json!({"metric": "cost", "windowDays": 7, "hiddenProviders": ["codex", "nope"]}),
+        ] {
+            assert_eq!(read_preferences(&bad), ("limits", 30, Vec::new()), "{bad}");
+        }
+    }
+
+    fn summary(cost: f64, host: &str) -> Summary {
+        serde_json::from_value(json!({
+            "contractVersion": 6, "readAt": "2026-11-01T00:00:00Z",
+            "buckets": [{
+                "day": "2026-11-01", "provider": "codex", "model": "m", "sourcePath": "/codex",
+                "totals": {"uncachedInputTokens": 1, "cachedInputTokens": 0, "cacheCreationTokens": 0, "outputTokens": 1, "reasoningTokens": 0},
+                "costUsd": cost, "cacheSavingsUsd": 0, "costSource": "modelPriced", "records": 1, "unpricedRecords": 0, "sessions": 1,
+            }],
+            "sources": [{"fingerprint": {"provider": "codex", "resolvedHomePath": "/codex", "hostId": host}, "status": "ok"}],
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn environments_are_picked_one_at_a_time_and_totals_follow() {
+        let ids: Vec<SharedString> = vec!["a".into(), "b".into(), "c".into()];
+        assert_eq!(toggle_environment(&ids, &ids[1], &ids), Some(vec!["a".into(), "c".into()]));
+        assert_eq!(toggle_environment(&ids[..2], &ids[2], &ids), None, "every one picked is all, new ones included");
+        assert_eq!(toggle_environment(&ids[..1], &ids[0], &ids), Some(Vec::new()));
+
+        let answers = vec![
+            logic::EnvironmentUsage { environment_id: "a".into(), summary: summary(1., "box-a") },
+            logic::EnvironmentUsage { environment_id: "b".into(), summary: summary(2., "box-b") },
+        ];
+        let mut usage = UsageState { answers: Some((answers, local_window(30))), ..UsageState::default() };
+        usage.recombine();
+        assert_eq!(usage.merged.cost_usd, 3.);
+        usage.selected = Some(vec!["b".into()]);
+        usage.recombine();
+        assert_eq!(usage.merged.cost_usd, 2., "only the picked environment counts");
+        usage.failures = vec![("a".into(), "down".into())];
+        assert_eq!(usage.error(), None, "an unpicked environment's failure is not shown");
+        usage.selected = Some(Vec::new());
+        usage.recombine();
+        assert!(usage.summary.is_none());
+    }
 }

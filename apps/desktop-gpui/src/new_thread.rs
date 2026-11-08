@@ -106,10 +106,37 @@ impl DraftWorkspace {
 
 /// `vcs.listRefs` for a project's checkout, as the draft's workspace controls use it.
 pub async fn list_refs(client: &RpcClient, cwd: &str) -> Result<Value, String> {
-    client
-        .request("vcs.listRefs", json!({"cwd": cwd, "limit": REF_LIST_LIMIT}))
-        .await
-        .map_err(|error| error.to_string())
+    list_ref_page(client, cwd, "", None).await
+}
+
+/// One page of `vcs.listRefs` (`vcsRefPageAtom`): the refs matching `query`, all when it is empty.
+pub async fn list_ref_page(client: &RpcClient, cwd: &str, query: &str, cursor: Option<u64>) -> Result<Value, String> {
+    let mut input = json!({"cwd": cwd, "limit": REF_LIST_LIMIT});
+    if !query.is_empty() {
+        input["query"] = query.into();
+    }
+    if let Some(cursor) = cursor {
+        input["cursor"] = cursor.into();
+    }
+    client.request("vcs.listRefs", input).await.map_err(|error| error.to_string())
+}
+
+/// `sanitizeNewRefName`: trimmed, with ASCII whitespace runs as one dash.
+pub fn sanitize_new_ref_name(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut in_space = false;
+    for c in raw.trim().chars() {
+        if matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c' | '\x0b') {
+            if !in_space {
+                out.push('-');
+            }
+            in_space = true;
+        } else {
+            out.push(c);
+            in_space = false;
+        }
+    }
+    out
 }
 
 /// What the draft's workspace controls picked.

@@ -240,6 +240,13 @@ impl Workspace {
             && choice.existing_worktree.is_none()
     }
 
+    /// `needsLoadBalancing` and `loadBalancingSendWarning`: an automatic draft without its machine
+    /// yet waits to send, with the title and description of why.
+    pub(super) fn load_balancing_send_block(&self) -> Option<(&'static str, &'static str)> {
+        let options = self.logical_project_environments();
+        send_block(self.automatic_environment(&options), self.selection(), self.sampling(&options))
+    }
+
     /// `autoEnvironmentLabel`.
     fn auto_environment_label(&self, options: &[EnvironmentOption]) -> Option<&'static str> {
         if !self.automatic_environment(options) {
@@ -631,6 +638,27 @@ impl Workspace {
     }
 }
 
+fn send_block(
+    automatic: bool,
+    selection: Option<&Selection>,
+    sampling: Sampling,
+) -> Option<(&'static str, &'static str)> {
+    if !automatic || matches!(selection, Some(Selection::Auto { picked: Some(_) })) {
+        return None;
+    }
+    Some(match sampling {
+        Sampling::Failed => (
+            "Choose a machine to continue",
+            "No eligible machine has available resources. Choose a machine in the composer to override.",
+        ),
+        // Sampling starts once the draft shows, so a draft not sampled yet is still checking.
+        Sampling::Idle | Sampling::Pending => (
+            "Checking machine resources",
+            "Resource checks are still running. You can choose a machine in the composer.",
+        ),
+    })
+}
+
 /// `EnvironmentMachineIcon`.
 pub(super) fn machine_icon(machine: &str) -> Lucide {
     match machine {
@@ -689,5 +717,22 @@ mod tests {
         assert_eq!(typeahead.type_char('l', &labels, Some(0), now), Some(1));
         assert_eq!(typeahead.type_char('l', &labels, Some(1), now), Some(2));
         assert_eq!(typeahead.type_char('l', &labels, Some(2), now), Some(1));
+    }
+
+    #[test]
+    fn an_automatic_draft_sends_only_once_balancing_picked_its_machine() {
+        let picked = Selection::Auto { picked: Some("mac".into()) };
+        let waiting = Selection::Auto { picked: None };
+        assert_eq!(send_block(false, None, Sampling::Pending), None, "a machine picked by hand sends");
+        assert_eq!(send_block(true, Some(&picked), Sampling::Idle), None);
+        assert_eq!(
+            send_block(true, Some(&waiting), Sampling::Pending).map(|w| w.0),
+            Some("Checking machine resources")
+        );
+        assert_eq!(send_block(true, None, Sampling::Idle).map(|w| w.0), Some("Checking machine resources"));
+        assert_eq!(
+            send_block(true, Some(&waiting), Sampling::Failed).map(|w| w.0),
+            Some("Choose a machine to continue")
+        );
     }
 }

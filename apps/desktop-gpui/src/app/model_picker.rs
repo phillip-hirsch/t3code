@@ -15,7 +15,7 @@ use gpui_kit::component::popover::Popover;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Disableable as _, Icon, Selectable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    Anchor, AnyElement, AppContext as _, Context, ElementId, Entity, Focusable as _, FontWeight, Hsla,
+    Anchor, AnyElement, AppContext as _, Context, ElementId, Entity, FocusHandle, Focusable as _, FontWeight, Hsla,
     InteractiveElement as _, IntoElement, Keystroke, ParentElement as _, SharedString, StatefulInteractiveElement as _,
     Styled as _, Subscription, Window, div, prelude::FluentBuilder as _, px, svg,
 };
@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 
 use super::Workspace;
 use super::composer::{control_button, runtime_modes};
-use crate::model::{ModelSelection, OptionDescriptor, Provider, ProviderModel, ServerInfo};
+use crate::model::{ModelSelection, OptionDescriptor, Provider, ProviderModel, ServerInfo, ThreadProjection};
 use crate::model_label;
 use crate::theme::{self, Tokens};
 
@@ -32,6 +32,8 @@ const LIST: f32 = 316.;
 const EFFORT: f32 = 192.;
 const BODY_HEIGHT: f32 = 346.;
 const COMPOSER: &str = "model-picker";
+/// `ChatGptSharingControl`'s `speedNotice`.
+const CHATGPT_SPEED_NOTICE: &str = "Fast and Ultrafast are unavailable with this ChatGPT connection. Use an existing Codex CLI login for speed options your account supports.";
 
 /// `onInstanceModelChange` for a picker outside the composer.
 pub(in crate::app) type OnPick = Rc<dyn Fn(&mut Workspace, ModelSelection, &mut Window, &mut Context<Workspace>)>;
@@ -46,12 +48,50 @@ pub(in crate::app) struct PickHost {
     pub on_pick: OnPick,
 }
 
+/// The providers a started thread may continue on when its provider cannot hand off
+/// (`deriveLockedProvider`, `lockedContinuationGroupKey` in `resolveComposerProviderSelection`).
+#[derive(Debug, PartialEq)]
+struct ProviderLock {
+    driver: String,
+    group: Option<String>,
+    /// Antigravity history without a group stays on its own instance.
+    exact_instance: Option<String>,
+}
+
+impl ProviderLock {
+    fn of(projection: &ThreadProjection, providers: &[Provider]) -> Option<Self> {
+        if !projection.has_started() || projection.supports_provider_handoff() {
+            return None;
+        }
+        let selection = projection.thread.model_selection.as_ref();
+        let instance_driver = || {
+            let instance = &selection?.instance_id;
+            Some(providers.iter().find(|p| &p.instance_id == instance).map_or(instance, |p| &p.driver).clone())
+        };
+        let driver = projection.provider_session().and_then(|s| s.driver.clone()).or_else(instance_driver)?;
+        let locked = projection.thread.provider_instance_id.as_ref().or(selection.map(|s| &s.instance_id));
+        let group = locked
+            .and_then(|id| providers.iter().find(|p| &p.instance_id == id))
+            .and_then(|p| p.continuation.as_ref()?["groupKey"].as_str().map(str::to_owned));
+        let exact_instance = locked.filter(|_| driver == "antigravity" && group.is_none()).cloned();
+        Some(Self { driver, group, exact_instance })
+    }
+
+    fn allows(&self, provider: &Provider) -> bool {
+        let group = provider.continuation.as_ref().and_then(|c| c["groupKey"].as_str());
+        provider.driver == self.driver
+            && self.group.as_deref().is_none_or(|key| group == Some(key))
+            && self.exact_instance.as_ref().is_none_or(|id| *id == provider.instance_id)
+    }
+}
+
 /// The composer trigger's text and marks: what its natural width depends on, besides the font.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct TriggerText {
     name: SharedString,
     effort: Option<String>,
-    fast: bool,
+    /// [`model_label::speed_label`].
+    speed: Option<&'static str>,
     ultracode: bool,
     logo: bool,
 }
@@ -66,7 +106,9 @@ impl TriggerText {
             .as_deref()
             .map(|e| measure(e).min(96.))
             .into_iter()
-            .chain([self.fast, self.ultracode].into_iter().filter(|on| *on).map(|_| 12.))
+            // `FastBolt`: 12px, or 15px for Ultrafast's two bolts.
+            .chain(self.speed.map(|speed| if speed == "Ultrafast" { 15. } else { 12. }))
+            .chain(self.ultracode.then_some(12.))
             .collect();
         let suffix = if parts.is_empty() {
             0.
@@ -98,6 +140,9 @@ pub(super) struct PickerState {
     query: String,
     /// `autoHighlight`: nothing until a filter or the arrows highlight a row.
     highlighted: Option<usize>,
+    /// The effort column's focused stop (`effort_stops`); `None` while the search has the keys.
+    effort_focus: Option<usize>,
+    effort_handle: Option<FocusHandle>,
     show_legacy: bool,
     /// Options last picked per `(instance, model)`, restored when switching back.
     remembered: HashMap<(String, String), Vec<Value>>,
@@ -151,7 +196,10 @@ impl Workspace {
                             this.picker.query = search.read(cx).value().trim().to_owned();
                             this.picker.highlighted = (!this.picker.query.is_empty()).then_some(0);
                         }
-                        InputEvent::Focus => this.picker.search_focused = true,
+                        InputEvent::Focus => {
+                            this.picker.search_focused = true;
+                            this.picker.effort_focus = None;
+                        }
                         InputEvent::Blur => this.picker.search_focused = false,
                         InputEvent::PressEnter { .. } => return,
                     }
@@ -167,6 +215,8 @@ impl Workspace {
         });
         self.picker.query.clear();
         self.picker.highlighted = None;
+        self.picker.effort_focus = None;
+        self.picker.effort_handle.get_or_insert_with(|| cx.focus_handle());
         self.picker.tab = None;
         // Focused above before it renders, which its own focus event can miss.
         self.picker.search_focused = true;
@@ -179,10 +229,17 @@ impl Workspace {
         let Some(id) = self.picker.open.take() else { return };
         self.picker.host = None;
         self.picker.search_focused = false;
+        self.picker.effort_focus = None;
         if id.as_ref() == COMPOSER {
             self.focus_composer(window, cx);
         }
         cx.notify();
+    }
+
+    /// The driver of `current`'s provider in the open picker's environment.
+    fn picker_driver(&self, current: Option<&ModelSelection>) -> &str {
+        let provider = current.and_then(|s| self.picker_info()?.provider(&s.instance_id));
+        provider.map_or("", |p| p.driver.as_str())
     }
 
     /// The selection the open picker marks: its host's, else the composer's.
@@ -209,15 +266,29 @@ impl Workspace {
         }
     }
 
-    /// The providers the open picker offers.
+    /// The providers the open picker offers: its host's, else those the open thread may continue on.
     fn picker_includes(&self, provider: &Provider) -> bool {
-        self.picker.host.as_ref().is_none_or(|host| (host.include)(provider))
+        match &self.picker.host {
+            Some(host) => (host.include)(provider),
+            None => self.composer_provider_lock().is_none_or(|lock| lock.allows(provider)),
+        }
     }
 
-    /// The docked picker keeps its popup open; any other closes and hands the model to its host.
+    fn composer_provider_lock(&self) -> Option<ProviderLock> {
+        if !matches!(self.target, Some(super::Target::Thread { .. })) {
+            return None;
+        }
+        ProviderLock::of(self.open_projection()?, &self.server_info().providers)
+    }
+
+    /// The docked picker keeps its popup open and moves to the new model's levels; any other
+    /// closes and hands the model to its host.
     fn pick_row(&mut self, selection: ModelSelection, window: &mut Window, cx: &mut Context<Self>) {
         match self.picker.host.as_ref().map(|host| host.on_pick.clone()) {
-            None => self.pick_model(selection, cx),
+            None => {
+                self.pick_model(selection, cx);
+                self.focus_effort(false, window, cx);
+            }
             Some(on_pick) => {
                 self.close_model_picker(window, cx);
                 on_pick(self, selection, window, cx);
@@ -235,6 +306,85 @@ impl Workspace {
         cx.notify();
     }
 
+    /// The composer model's effort-column stops.
+    fn picker_effort_stops(&self) -> Vec<EffortStop> {
+        let Some(current) = self.composer_model() else { return Vec::new() };
+        let descriptors = self
+            .server_info()
+            .model(&current)
+            .and_then(|m| m.capabilities.as_ref())
+            .map(|c| c.option_descriptors.as_slice())
+            .unwrap_or_default();
+        let controls = effort_controls(descriptors, self.picker_driver(Some(&current)), self.composer_ultrathink);
+        effort_stops(&controls, &current)
+    }
+
+    /// `focusEffort`: hands the keys to the effort column; `false` when it has nowhere to land.
+    fn focus_effort(&mut self, any: bool, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(index) = effort_entry(&self.picker_effort_stops(), any) else { return false };
+        self.picker.effort_focus = Some(index);
+        if let Some(handle) = &self.picker.effort_handle {
+            handle.focus(window, cx);
+        }
+        cx.notify();
+        true
+    }
+
+    /// `ArrowLeft` out of the effort column: back to the search.
+    fn focus_picker_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker.effort_focus = None;
+        if let Some(search) = self.picker.search.clone() {
+            search.update(cx, |search, cx| search.focus(window, cx));
+        }
+        cx.notify();
+    }
+
+    /// Picks a level; one replaces the prompt's `Ultrathink:` (`getTraitSelectChange`).
+    fn pick_effort_stop(&mut self, stop: EffortStop, window: &mut Window, cx: &mut Context<Self>) {
+        match stop {
+            EffortStop::Level { id, value, owned, .. } => {
+                if owned {
+                    self.strip_ultrathink_prefix(window, cx);
+                }
+                self.set_model_option(&id, value, cx);
+            }
+            EffortStop::Toggle { id, on } => self.set_model_option(&id, Value::Bool(!on), cx),
+        }
+    }
+
+    /// Keys while the effort column has focus: Up and Down move, Enter and Space pick, Left leaves.
+    fn effort_key(&mut self, index: usize, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let stops = self.picker_effort_stops();
+        let Some(last) = stops.len().checked_sub(1) else {
+            self.focus_picker_search(window, cx);
+            return keystroke.key == "left";
+        };
+        let index = index.min(last);
+        match keystroke.key.as_str() {
+            "escape" => self.close_model_picker(window, cx),
+            "down" => self.picker.effort_focus = Some((index + 1).min(last)),
+            "up" => self.picker.effort_focus = Some(index.saturating_sub(1)),
+            "left" => self.focus_picker_search(window, cx),
+            "enter" | "space" => {
+                if let Some(stop) = stops.into_iter().nth(index) {
+                    self.pick_effort_stop(stop, window, cx);
+                }
+            }
+            _ => return false,
+        }
+        cx.notify();
+        true
+    }
+
+    /// The search's caret sits after its last character, where `ArrowRight` leaves for the column.
+    fn picker_search_caret_at_end(&self, cx: &Context<Self>) -> bool {
+        self.picker.search.as_ref().is_some_and(|search| {
+            let search = search.read(cx);
+            let range = search.selected_range();
+            range.is_empty() && range.start == search.value().len()
+        })
+    }
+
     fn set_model_option(&mut self, id: &str, value: Value, cx: &mut Context<Self>) {
         let Some(current) = self.composer_model() else { return };
         let next = model_label::with_option(&current, id, value);
@@ -244,6 +394,16 @@ impl Workspace {
         self.model_override = Some(next);
         self.model_explicit = true;
         cx.notify();
+    }
+
+    /// Drops the prompt's leading `Ultrathink:`, which a picked level replaces.
+    fn strip_ultrathink_prefix(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let prompt = self.composer.read(cx).value().to_string();
+        let stripped = model_label::strip_ultrathink_prefix(&prompt);
+        if stripped.len() != prompt.len() {
+            let stripped = stripped.to_owned();
+            self.set_composer_text(stripped, window, cx);
+        }
     }
 
     fn toggle_favorite(&mut self, selection: &ModelSelection, cx: &mut Context<Self>) {
@@ -297,9 +457,22 @@ impl Workspace {
             new: m.badge.as_deref() == Some("new"),
             legacy: m.is_legacy,
         };
-        let models =
-            |p: &'a Provider| p.models.iter().filter(move |m| !Self::model_hidden(info, p, m)).map(move |m| (p, m));
-        let providers = info.providers.iter().filter(ready).filter(|p| self.picker_includes(p));
+        // `shouldIncludeModelPickerOption`: an OpenCode or Antigravity provider that is not ready
+        // still lists the model the thread is on when that model became unavailable.
+        let kept_unavailable = move |p: &Provider, m: &ProviderModel| {
+            p.enabled
+                && matches!(p.driver.as_str(), "opencode" | "antigravity")
+                && current.is_some_and(|c| c.instance_id == p.instance_id && c.model == m.slug)
+                && m.is_unavailable
+        };
+        let models = move |p: &'a Provider| {
+            let ready = ready(&p);
+            p.models
+                .iter()
+                .filter(move |m| !Self::model_hidden(info, p, m) && (ready || kept_unavailable(p, m)))
+                .map(move |m| (p, m))
+        };
+        let providers = info.providers.iter().filter(|p| self.picker_includes(p));
         if !self.picker.query.is_empty() {
             let mut scored: Vec<(i64, bool, usize, Row)> = providers
                 .flat_map(models)
@@ -346,10 +519,14 @@ impl Workspace {
         }
     }
 
-    /// Up/Down/Enter/Escape while the picker is open; Ctrl+1-9 are `modelPicker.jump.N`.
+    /// Up/Down/Enter/Escape while the picker is open, Right into the docked effort column;
+    /// Ctrl+1-9 are `modelPicker.jump.N`.
     pub(super) fn picker_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if keystroke.modifiers.modified() {
             return false;
+        }
+        if let Some(index) = self.picker.effort_focus {
+            return self.effort_key(index, keystroke, window, cx);
         }
         let current = self.picker_current();
         let (rows, _) = self.picker_rows(current.as_ref());
@@ -368,6 +545,16 @@ impl Workspace {
             "enter" => {
                 if let Some(row) = self.picker.highlighted.and_then(|i| rows.into_iter().nth(i)) {
                     self.pick_row(row.selection, window, cx);
+                }
+            }
+            // The column shows the selected model's levels, so a highlighted model is picked first.
+            "right" if self.picker.host.is_none() && self.picker_search_caret_at_end(cx) => {
+                let highlighted = self.picker.highlighted.and_then(|i| rows.into_iter().nth(i));
+                match highlighted.filter(|row| !row.selected) {
+                    Some(row) => self.pick_row(row.selection, window, cx),
+                    None => {
+                        self.focus_effort(true, window, cx);
+                    }
                 }
             }
             _ => return false,
@@ -419,8 +606,8 @@ impl Workspace {
         true
     }
 
-    /// The composer trigger's model name, effort, and whether the fast and ultracode marks show.
-    fn trigger_labels(&self) -> (SharedString, Option<String>, bool, bool) {
+    /// The composer trigger's model name, effort, speed, and whether the ultracode mark shows.
+    fn trigger_labels(&self) -> (SharedString, Option<String>, Option<&'static str>, bool) {
         let current = self.composer_model();
         let provider = current.as_ref().and_then(|s| self.server_info().provider(&s.instance_id));
         let model = current.as_ref().and_then(|s| self.server_info().model(s));
@@ -432,21 +619,27 @@ impl Workspace {
         };
         let descriptors =
             model.and_then(|m| m.capabilities.as_ref()).map(|c| c.option_descriptors.as_slice()).unwrap_or_default();
-        let effort = current.as_ref().and_then(|s| model_label::effort_label(descriptors, s));
-        let fast = current.as_ref().is_some_and(|s| model_label::toggle_on(descriptors, "fastMode", s));
+        let ultrathink = model_label::ultrathink_select(descriptors, self.composer_ultrathink)
+            .is_some_and(|primary| model_label::reasoning(descriptors).is_some_and(|r| r.id == primary.id));
+        let effort = if ultrathink {
+            Some("Ultrathink".to_owned())
+        } else {
+            current.as_ref().and_then(|s| model_label::effort_label(descriptors, s))
+        };
+        let speed = current.as_ref().and_then(|s| model_label::speed_label(descriptors, driver, s));
         let ultracode = current.as_ref().is_some_and(|s| model_label::toggle_on(descriptors, "ultracode", s));
-        (name, effort, fast, ultracode)
+        (name, effort, speed, ultracode)
     }
 
     /// What the composer trigger shows, for measuring it.
     pub(super) fn model_trigger_text(&self) -> TriggerText {
-        let (name, effort, fast, ultracode) = self.trigger_labels();
+        let (name, effort, speed, ultracode) = self.trigger_labels();
         let logo = self
             .composer_model()
             .and_then(|s| self.server_info().provider(&s.instance_id))
             .and_then(|p| crate::assets::provider_icon(&p.driver))
             .is_some();
-        TriggerText { name, effort, fast, ultracode, logo }
+        TriggerText { name, effort, speed, ultracode, logo }
     }
 
     /// The trigger and, while open, the popover.
@@ -456,7 +649,7 @@ impl Workspace {
         let model = current.as_ref().and_then(|s| self.server_info().model(s));
         let descriptors =
             model.and_then(|m| m.capabilities.as_ref()).map(|c| c.option_descriptors.as_slice()).unwrap_or_default();
-        let (name, effort, fast, ultracode) = self.trigger_labels();
+        let (name, effort, speed, ultracode) = self.trigger_labels();
         let icon = provider.and_then(|p| crate::assets::provider_icon(&p.driver));
         let open = self.composer_picker_open();
         let disabled = self.target.is_none() || self.server_info().model_choices().is_empty();
@@ -485,7 +678,7 @@ impl Workspace {
                             .text_color(if open { t.foreground } else { t.foreground.opacity(0.8) })
                             .child(name.clone()),
                     )
-                    .when(effort.is_some() || fast || ultracode, |el| {
+                    .when(effort.is_some() || speed.is_some() || ultracode, |el| {
                         el.child(
                             h_flex()
                                 .flex_none()
@@ -493,13 +686,106 @@ impl Workspace {
                                 .gap(px(6.))
                                 .text_color(suffix_color)
                                 .children(effort.map(|e| div().max_w(px(96.)).truncate().child(e)))
-                                .when(fast, |el| el.child(Icon::new(Lucide::Zap).with_size(px(12.))))
+                                .children(speed.map(|speed| fast_bolt(speed == "Ultrafast")))
                                 .when(ultracode, |el| el.child(Icon::new(Lucide::Workflow).with_size(px(12.)))),
                         )
                     }),
             );
         let body = open.then(|| self.render_picker_body(current.as_ref(), &name, Some(descriptors), t, cx));
         self.picker_popover(COMPOSER.into(), trigger, Anchor::BottomRight, None, body, cx)
+    }
+
+    /// `showProviderUnavailable`: no provider the composer may use is enabled and available, so
+    /// the controls give way to provider setup, or say there is none.
+    pub(super) fn render_provider_unavailable(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+        // `providerCatalogPending`: until the server's config arrives, the picker stays.
+        if self.client().is_none() || self.server_info().config.is_null() {
+            return None;
+        }
+        let lock = self.composer_provider_lock();
+        let requested = self.composer_model().map(|s| s.instance_id);
+        let allowed = |p: &&Provider| lock.as_ref().is_none_or(|lock| lock.allows(p));
+        let providers = &self.server_info().providers;
+        let usable = providers.iter().filter(allowed).any(|p| {
+            p.enabled
+                && p.availability.as_deref() != Some("unavailable")
+                && (p.status != "error" || requested.as_ref() == Some(&p.instance_id))
+        });
+        if usable {
+            return None;
+        }
+        // `providerSetupInstanceId`: the provider asked for, else the first with a setup.
+        let setup = requested.is_some() || (lock.is_none() && providers.iter().any(super::banners::has_setup));
+        let label = if setup { "Open provider settings" } else { "No provider available" };
+        Some(
+            control_button("provider-unavailable", t)
+                .flex_none()
+                .disabled(!setup)
+                .child(h_flex().gap(px(6.)).child(Icon::new(Lucide::CircleAlert).with_size(px(16.))).child(label))
+                .on_click(cx.listener(|this, _, _, cx| this.open_settings("providers", cx)))
+                .into_any_element(),
+        )
+    }
+
+    /// `providerSetupEntries` (`ModelPickerProviderNotices`): providers needing setup that the open
+    /// tab names, or every one when an empty favorites list would show nothing.
+    fn picker_setup_entries(&self, tab: &Tab, rows_empty: bool) -> Vec<&Provider> {
+        if self.picker.host.is_some() || !self.picker.query.is_empty() {
+            return Vec::new();
+        }
+        let Some(info) = self.picker_info() else { return Vec::new() };
+        info.providers
+            .iter()
+            .filter(|p| self.picker_includes(p) && offers_setup(p))
+            .filter(|p| match tab {
+                Tab::Provider(id) => &p.instance_id == id,
+                Tab::Favorites => rows_empty,
+            })
+            .collect()
+    }
+
+    fn render_setup_notices(&self, entries: &[&Provider], t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+        let several = entries.len() > 1;
+        v_flex()
+            .id("picker-setup")
+            .flex_none()
+            .max_h(px(176.))
+            .overflow_y_scroll()
+            .p(px(8.))
+            .border_t_1()
+            .border_color(t.border.opacity(0.7))
+            .children(entries.iter().map(|provider| {
+                let label = if several {
+                    let name = provider.display_name.clone().unwrap_or_else(|| provider.instance_id.clone());
+                    format!("Set up {name}")
+                } else {
+                    "Open provider setup".to_owned()
+                };
+                v_flex()
+                    .px(px(4.))
+                    .py(px(6.))
+                    .text_xs()
+                    .child(
+                        div()
+                            .text_color(t.muted_foreground)
+                            .line_clamp(3)
+                            .child(super::banners::provider_status_message(provider)),
+                    )
+                    .child(
+                        div()
+                            .id(ElementId::Name(format!("picker-setup-{}", provider.instance_id).into()))
+                            .mt(px(4.))
+                            .cursor_pointer()
+                            .text_color(t.foreground)
+                            .hover(gpui_kit::Styled::underline)
+                            .child(label)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.close_model_picker(window, cx);
+                                this.open_settings("providers", cx);
+                            })),
+                    )
+            }))
+            .into_any_element()
     }
 
     /// A picker without the effort column (`ProviderModelPicker` with no `effortColumn`) on `trigger`.
@@ -563,6 +849,7 @@ impl Workspace {
         let searching = !self.picker.query.is_empty();
         let (rows, has_legacy) = self.picker_rows(current);
         let tab = self.picker_tab(current);
+        let setup = self.picker_setup_entries(&tab, rows.is_empty());
         let search = self.picker.search.clone();
         let list = v_flex()
             .id("picker-list")
@@ -575,7 +862,7 @@ impl Workspace {
             .pr(px(12.))
             .py(px(10.))
             .gap(px(2.))
-            .when(rows.is_empty(), |el| {
+            .when(rows.is_empty() && setup.is_empty(), |el| {
                 let text = if tab == Tab::Favorites && !searching { "No favorites yet" } else { "No models found" };
                 el.child(div().p(px(8.)).flex().justify_center().text_sm().text_color(t.muted_foreground).child(text))
             })
@@ -627,12 +914,17 @@ impl Workspace {
                         .child(Input::new(&search).appearance(false).small().h(px(26.)).text_sm())
                 })),
         );
+        // Inside the docked picker's fixed height, so a ChatGPT plan never resizes it.
+        let sharing = self.render_chatgpt_sharing(current, t);
+        let (list_footer, footer) = if docked.is_some() { (sharing, None) } else { (None, sharing) };
         let column = v_flex()
             .w(px(if searching { LIST + RAIL } else { LIST }))
             .h_full()
             .when(!searching, |el| el.border_l_1().border_color(rule))
             .child(search_row)
-            .child(list);
+            .child(list)
+            .when(!setup.is_empty(), |el| el.child(self.render_setup_notices(&setup, t, cx)))
+            .children(list_footer);
         v_flex()
             .id("model-picker-body")
             .w(px(RAIL + LIST + if docked.is_some() { EFFORT } else { 0. }))
@@ -648,8 +940,38 @@ impl Workspace {
                         docked.map(|descriptors| self.render_effort_column(current, model_name, descriptors, t, cx)),
                     ),
             )
+            .children(footer)
             .children(docked.map(|descriptors| self.render_picker_footer(current, descriptors, t, cx)))
             .into_any_element()
+    }
+
+    /// `ChatGptSharingControl`: why a managed ChatGPT connection has no Fast or Ultrafast.
+    fn render_chatgpt_sharing(&self, current: Option<&ModelSelection>, t: &Tokens) -> Option<AnyElement> {
+        let provider = current.and_then(|s| self.picker_info()?.provider(&s.instance_id))?;
+        if !super::pages::settings::uses_chatgpt_sharing(&provider.auth) {
+            return None;
+        }
+        let plan = h_flex()
+            .id("chatgpt-sharing")
+            .gap(px(8.))
+            .text_xs()
+            .text_color(t.muted_foreground)
+            .child(svg().path("icons/app/openai.svg").size(px(14.)).flex_none().text_color(t.muted_foreground))
+            .child("Using ChatGPT plan")
+            .tooltip(|window, cx| Tooltip::new(CHATGPT_SPEED_NOTICE).build(window, cx));
+        Some(
+            h_flex()
+                .flex_none()
+                .justify_between()
+                .gap(px(16.))
+                .px(px(12.))
+                .py(px(8.))
+                .border_t_1()
+                .border_color(t.border)
+                .child(plan)
+                .child(super::pages::settings::chatgpt_usage_button("chatgpt-sharing-usage", t).xsmall())
+                .into_any_element(),
+        )
     }
 
     fn render_rail(&self, tab: &Tab, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
@@ -681,6 +1003,8 @@ impl Workspace {
         let listed = self.picker_info().into_iter().flat_map(|info| info.providers.iter());
         let providers = listed.filter(|p| p.enabled && self.picker_includes(p)).map(|p| {
             let ready = p.availability.as_deref() != Some("unavailable") && p.status == "ready";
+            // A provider needing setup opens its tab, which offers the setup.
+            let selectable = ready || (self.picker.host.is_none() && offers_setup(p));
             let name = p.display_name.clone().unwrap_or_else(|| p.instance_id.clone());
             let tooltip: SharedString = match (ready, p.availability.as_deref(), &p.message) {
                 (true, ..) => name.clone().into(),
@@ -698,10 +1022,10 @@ impl Workspace {
                     div().text_size(px(10.)).font_weight(FontWeight::SEMIBOLD).child(initials(&name)).into_any_element()
                 }
             };
-            button(ElementId::Name(format!("rail-{id}").into()), *tab == Tab::Provider(id.clone()), ready)
+            button(ElementId::Name(format!("rail-{id}").into()), *tab == Tab::Provider(id.clone()), selectable)
                 .child(div().size(px(24.)).flex().items_center().justify_center().child(icon))
                 .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-                .when(ready, |el| {
+                .when(selectable, |el| {
                     el.on_click(cx.listener(move |this, _, _, cx| {
                         this.picker.tab = Some(Tab::Provider(id.clone()));
                         this.picker.highlighted = None;
@@ -846,14 +1170,12 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let rule = t.foreground.opacity(0.056);
-        let effort = model_label::reasoning(descriptors).filter(|d| d.id != "fastMode");
-        let others: Vec<&OptionDescriptor> = descriptors
-            .iter()
-            .filter(|d| {
-                Some(d.id.as_str()) != effort.map(|e| e.id.as_str())
-                    && !matches!(d.id.as_str(), "fastMode" | "serviceTier" | "ultracode")
-            })
-            .collect();
+        let EffortControls { effort, others, owned, locked } =
+            effort_controls(descriptors, self.picker_driver(current), self.composer_ultrathink);
+        let focus = self.picker.effort_focus;
+        let focused_bg = t.foreground.opacity(0.09);
+        // Stops count the levels first, then the switches (`effort_stops`).
+        let mut next_stop = 0;
         let heading = match (effort, others.is_empty()) {
             (Some(effort), _) => effort.label.clone(),
             (None, false) => "Options".into(),
@@ -861,31 +1183,43 @@ impl Workspace {
         };
         let rows: Vec<AnyElement> = match (effort, current) {
             (Some(descriptor), Some(selection)) => {
-                let value = model_label::current_value(descriptor, selection);
-                let choices: Vec<(Value, String, bool)> = if descriptor.kind == "boolean" {
-                    vec![(Value::Bool(true), "On".into(), false), (Value::Bool(false), "Off".into(), false)]
-                } else {
-                    descriptor
-                        .options
-                        .iter()
-                        .filter(|o| !descriptor.prompt_injected_values.contains(&o.id))
-                        .map(|o| (Value::String(o.id.clone()), o.label.clone(), o.is_default))
-                        .collect()
-                };
-                choices
-                    .into_iter()
-                    .map(|(choice, label, default)| {
+                let value = level_value(descriptor, selection, owned);
+                let choices = level_choices(descriptor);
+                if !locked {
+                    next_stop = choices.len();
+                }
+                let note = locked.then(|| {
+                    div()
+                        .px(px(8.))
+                        .pb(px(6.))
+                        .text_xs()
+                        .text_color(t.muted_foreground.opacity(0.8))
+                        .child("Your prompt contains \"ultrathink\" in the text. Remove it to change this option.")
+                        .into_any_element()
+                });
+                note.into_iter()
+                    .chain(choices.into_iter().enumerate().map(|(index, (choice, label, default))| {
                         let selected = value.as_ref() == Some(&choice);
                         let id = descriptor.id.clone();
                         option_row(ElementId::Name(format!("effort-{id}-{label}").into()), t)
+                            .when(!locked && focus == Some(index), |el| el.bg(focused_bg))
                             .child(div().flex_1().min_w_0().truncate().child(label))
                             .when(selected, |el| el.child(Icon::new(Lucide::Check).with_size(px(14.))))
                             .when(!selected && default, |el| {
                                 el.child(div().text_xs().text_color(t.muted_foreground.opacity(0.7)).child("Default"))
                             })
-                            .on_click(cx.listener(move |this, _, _, cx| this.set_model_option(&id, choice.clone(), cx)))
+                            .map(|el| {
+                                if locked {
+                                    return el.opacity(0.64).cursor_not_allowed();
+                                }
+                                el.on_click(cx.listener(move |this, _, window, cx| {
+                                    let stop =
+                                        EffortStop::Level { id: id.clone(), value: choice.clone(), selected, owned };
+                                    this.pick_effort_stop(stop, window, cx);
+                                }))
+                            })
                             .into_any_element()
-                    })
+                    }))
                     .collect()
             }
             _ if others.is_empty() => {
@@ -912,12 +1246,15 @@ impl Workspace {
                     let caption = div().text_xs().text_color(t.muted_foreground).child(descriptor.label.clone());
                     if descriptor.kind == "boolean" {
                         let on = value == Some(Value::Bool(true));
+                        let stop = next_stop;
+                        next_stop += 1;
                         v_flex()
                             .id(ElementId::Name(format!("option-{id}").into()))
                             .py(px(4.))
                             .px(px(8.))
                             .rounded(px(4.))
                             .cursor_pointer()
+                            .when(focus == Some(stop), |el| el.bg(focused_bg))
                             .hover(|s| s.bg(t.foreground.opacity(0.09)))
                             .child(caption)
                             .child(
@@ -982,6 +1319,7 @@ impl Workspace {
             .w(px(EFFORT))
             .h_full()
             .flex_none()
+            .when_some(self.picker.effort_handle.as_ref(), gpui_kit::InteractiveElement::track_focus)
             .border_l_1()
             .border_color(rule)
             .bg(t.foreground.opacity(0.012))
@@ -1039,32 +1377,53 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let rule = t.foreground.opacity(0.056);
+        // `SpeedControl`: Codex's service tiers, else Standard and Fast for a `fastMode` toggle.
+        let tier = model_label::speed_select(descriptors, self.picker_driver(current));
         let fast = descriptors.iter().find(|d| d.id == "fastMode" && d.kind == "boolean");
-        let speed = fast.zip(current).map(|(descriptor, selection)| {
-            let on = model_label::current_value(descriptor, selection) == Some(Value::Bool(true));
-            let segment = |label: &'static str, checked: bool, value: bool| {
-                h_flex()
-                    .id(label)
-                    .h(px(24.))
-                    .px(px(8.))
-                    .gap(px(4.))
-                    .rounded(px(6.))
-                    .text_xs()
-                    .cursor_pointer()
-                    .text_color(if checked { t.foreground } else { t.muted_foreground })
-                    .when(checked, |el| el.bg(t.foreground.opacity(0.079)))
-                    .when(label == "Fast", |el| el.child(Icon::new(Lucide::Zap).with_size(px(12.))))
-                    .child(label)
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| this.set_model_option("fastMode", Value::Bool(value), cx)),
-                    )
-            };
-            h_flex()
-                .p(px(2.))
-                .rounded(px(8.))
-                .bg(t.foreground.opacity(0.044))
-                .child(segment("Standard", !on, false))
-                .child(segment("Fast", on, true))
+        let segments: Vec<(String, bool, &'static str, Value, Option<String>)> = match (tier, fast, current) {
+            (Some(tier), _, Some(selection)) => {
+                let value = model_label::current_value(tier, selection);
+                tier.options
+                    .iter()
+                    .filter(|o| !tier.prompt_injected_values.contains(&o.id))
+                    .map(|o| {
+                        let choice = Value::String(o.id.clone());
+                        (o.label.clone(), value.as_ref() == Some(&choice), "serviceTier", choice, o.description.clone())
+                    })
+                    .collect()
+            }
+            (None, Some(fast), Some(selection)) => {
+                let on = model_label::current_value(fast, selection) == Some(Value::Bool(true));
+                vec![
+                    ("Standard".into(), !on, "fastMode", Value::Bool(false), None),
+                    ("Fast".into(), on, "fastMode", Value::Bool(true), None),
+                ]
+            }
+            _ => Vec::new(),
+        };
+        let speed = (!segments.is_empty()).then(|| {
+            h_flex().p(px(2.)).rounded(px(8.)).bg(t.foreground.opacity(0.044)).children(segments.into_iter().map(
+                |(label, checked, option, value, description)| {
+                    let bolt = matches!(label.as_str(), "Fast" | "Ultrafast").then(|| fast_bolt(label == "Ultrafast"));
+                    h_flex()
+                        .id(ElementId::Name(format!("speed-{label}").into()))
+                        .h(px(24.))
+                        .px(px(8.))
+                        .gap(px(4.))
+                        .rounded(px(6.))
+                        .text_xs()
+                        .cursor_pointer()
+                        .text_color(if checked { t.foreground } else { t.muted_foreground })
+                        .hover(|s| s.text_color(t.foreground))
+                        .when(checked, |el| el.bg(t.foreground.opacity(0.079)))
+                        .children(bolt)
+                        .child(label)
+                        .when_some(description.filter(|d| !d.is_empty()), |el, description| {
+                            el.tooltip(move |window, cx| Tooltip::new(description.clone()).build(window, cx))
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| this.set_model_option(option, value.clone(), cx)))
+                },
+            ))
         });
         // `UltracodeControl`: one segment that toggles it.
         let ultracode = descriptors.iter().find(|d| d.id == "ultracode" && d.kind == "boolean");
@@ -1111,6 +1470,118 @@ impl Workspace {
             ))
             .into_any_element()
     }
+}
+
+/// `FastBolt`: one bolt for Fast, two overlapping for Ultrafast.
+fn fast_bolt(ultra: bool) -> AnyElement {
+    if !ultra {
+        return Icon::new(Lucide::Zap).with_size(px(12.)).into_any_element();
+    }
+    div()
+        .relative()
+        .w(px(15.))
+        .h(px(12.))
+        .flex_none()
+        .child(Icon::new(Lucide::Zap).with_size(px(12.)).absolute().top_0().left(px(3.)))
+        .child(Icon::new(Lucide::Zap).with_size(px(12.)).absolute().top_0().left_0())
+        .into_any_element()
+}
+
+/// `shouldOfferModelPickerSetup`: an enabled provider with a setup that is not ready, not
+/// installed, signed out, or has no model to run.
+fn offers_setup(provider: &Provider) -> bool {
+    let ready =
+        provider.enabled && provider.availability.as_deref() != Some("unavailable") && provider.status == "ready";
+    provider.enabled
+        && provider.status != "disabled"
+        && super::banners::has_setup(provider)
+        && (!ready
+            || !provider.installed
+            || provider.auth.status == "unauthenticated"
+            || provider.models.iter().all(|m| m.is_unavailable))
+}
+
+/// One keyboard stop of the effort column (`[data-effort-row]:not(:disabled)`). An option's
+/// menu row is left out: its menu opens by pointer only.
+#[derive(Clone, Debug, PartialEq)]
+enum EffortStop {
+    /// A level (`[data-effort-level]`); `owned` while an `Ultrathink:` prefix holds the levels.
+    Level { id: String, value: Value, selected: bool, owned: bool },
+    /// An option's switch.
+    Toggle { id: String, on: bool },
+}
+
+/// `columnControls`: the reasoning control, the other options, and an Ultrathink prompt's hold.
+struct EffortControls<'a> {
+    effort: Option<&'a OptionDescriptor>,
+    others: Vec<&'a OptionDescriptor>,
+    /// An Ultrathink prompt owns the levels.
+    owned: bool,
+    /// One in the text locks them until it goes.
+    locked: bool,
+}
+
+fn effort_controls<'a>(
+    descriptors: &'a [OptionDescriptor],
+    driver: &str,
+    ultrathink: model_label::Ultrathink,
+) -> EffortControls<'a> {
+    let speed = model_label::speed_select(descriptors, driver);
+    let effort = model_label::reasoning(descriptors).filter(|d| d.id != "fastMode");
+    let others = descriptors
+        .iter()
+        .filter(|d| {
+            Some(d.id.as_str()) != effort.map(|e| e.id.as_str())
+                && Some(d.id.as_str()) != speed.map(|s| s.id.as_str())
+                && !matches!(d.id.as_str(), "fastMode" | "ultracode")
+        })
+        .collect();
+    let owned = model_label::ultrathink_select(descriptors, ultrathink)
+        .is_some_and(|primary| effort.is_some_and(|effort| effort.id == primary.id));
+    EffortControls { effort, others, owned, locked: owned && ultrathink == model_label::Ultrathink::Body }
+}
+
+/// A level control's choices: value, label, and whether it is the default.
+fn level_choices(descriptor: &OptionDescriptor) -> Vec<(Value, String, bool)> {
+    if descriptor.kind == "boolean" {
+        return vec![(Value::Bool(true), "On".into(), false), (Value::Bool(false), "Off".into(), false)];
+    }
+    descriptor
+        .options
+        .iter()
+        .filter(|o| !descriptor.prompt_injected_values.contains(&o.id))
+        .map(|o| (Value::String(o.id.clone()), o.label.clone(), o.is_default))
+        .collect()
+}
+
+fn level_value(descriptor: &OptionDescriptor, selection: &ModelSelection, owned: bool) -> Option<Value> {
+    if owned { Some(Value::String("ultrathink".into())) } else { model_label::current_value(descriptor, selection) }
+}
+
+/// The column's stops in order: its levels (none while locked), then the switches among its options.
+fn effort_stops(controls: &EffortControls, selection: &ModelSelection) -> Vec<EffortStop> {
+    let levels = controls.effort.filter(|_| !controls.locked).into_iter().flat_map(|descriptor| {
+        let value = level_value(descriptor, selection, controls.owned);
+        level_choices(descriptor).into_iter().map(move |(choice, _, _)| EffortStop::Level {
+            id: descriptor.id.clone(),
+            selected: value.as_ref() == Some(&choice),
+            value: choice,
+            owned: controls.owned,
+        })
+    });
+    let toggles = controls.others.iter().filter(|d| d.kind == "boolean").map(|descriptor| EffortStop::Toggle {
+        id: descriptor.id.clone(),
+        on: model_label::current_value(descriptor, selection) == Some(Value::Bool(true)),
+    });
+    levels.chain(toggles).collect()
+}
+
+/// `focusEffort`: the selected level, else the first level; with `any`, else the first stop.
+fn effort_entry(stops: &[EffortStop], any: bool) -> Option<usize> {
+    let level = |selected_only: bool| {
+        stops.iter().position(|stop| matches!(stop, EffortStop::Level { selected, .. } if *selected || !selected_only))
+    };
+    level(true).or_else(|| level(false)).or_else(|| (any && !stops.is_empty()).then_some(0))
 }
 
 fn option_row(id: ElementId, t: &Tokens) -> gpui_kit::Stateful<gpui_kit::Div> {
@@ -1181,6 +1652,75 @@ fn set_favorite(info: &mut ServerInfo, key: &(String, String), favorite: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_thread_that_cannot_hand_off_keeps_its_provider_and_continuation_group() {
+        let providers: Vec<Provider> = serde_json::from_value(json!([
+            {"instanceId": "codex", "driver": "codex", "continuation": {"groupKey": "home"}},
+            {"instanceId": "codex-work", "driver": "codex", "continuation": {"groupKey": "work"}},
+            {"instanceId": "codex-home2", "driver": "codex", "continuation": {"groupKey": "home"}},
+            {"instanceId": "claude", "driver": "claudeAgent"},
+        ]))
+        .unwrap();
+        let projection = |session_handoff: bool| -> ThreadProjection {
+            serde_json::from_value(json!({
+                "thread": {"id": "t", "title": "t", "modelSelection": {"instanceId": "codex", "model": "m"},
+                    "providerInstanceId": "codex", "activeProviderThreadId": "pt"},
+                "runs": [{"id": "r", "status": "completed", "ordinal": 1, "providerThreadId": "pt"}],
+                "providerThreads": [{"id": "pt", "appThreadId": "t", "providerSessionId": "s", "providerInstanceId": "codex"}],
+                "providerSessions": [{"id": "s", "status": "ready", "driver": "codex",
+                    "capabilities": {"sessions": {"supportsProviderSwitchingViaHandoff": session_handoff}}}],
+            }))
+            .unwrap()
+        };
+        let lock = ProviderLock::of(&projection(false), &providers).unwrap();
+        let allowed: Vec<&str> = providers.iter().filter(|p| lock.allows(p)).map(|p| p.instance_id.as_str()).collect();
+        assert_eq!(allowed, ["codex", "codex-home2"]);
+        assert_eq!(ProviderLock::of(&projection(true), &providers), None, "a handoff may switch providers");
+        let fresh: ThreadProjection = serde_json::from_value(json!({"thread": {"id": "t", "title": "t"}})).unwrap();
+        assert_eq!(ProviderLock::of(&fresh, &providers), None, "an unstarted thread picks freely");
+    }
+
+    #[test]
+    fn a_provider_with_setup_offers_it_until_it_can_run() {
+        let provider = |extra: Value| -> Provider {
+            let mut value = json!({"instanceId": "c", "driver": "codex", "enabled": true, "status": "ready",
+                "installed": true, "auth": {"status": "authenticated"}, "models": [{"slug": "m"}],
+                "setup": {"canAuthenticate": true, "canInstall": true}});
+            value.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(value).unwrap()
+        };
+        assert!(!offers_setup(&provider(json!({}))), "a ready provider needs nothing");
+        assert!(offers_setup(&provider(json!({"installed": false}))));
+        assert!(offers_setup(&provider(json!({"auth": {"status": "unauthenticated"}}))));
+        assert!(offers_setup(&provider(json!({"status": "error"}))));
+        assert!(offers_setup(&provider(json!({"models": [{"slug": "m", "isUnavailable": true}]}))));
+        assert!(!offers_setup(&provider(json!({"status": "error", "setup": null}))), "nothing to set up");
+        assert!(!offers_setup(&provider(json!({"enabled": false, "status": "error"}))));
+    }
+
+    #[test]
+    fn the_effort_column_focuses_the_selected_level_then_the_first_stop() {
+        let descriptors: Vec<OptionDescriptor> = serde_json::from_value(json!([
+            {"id": "effort", "label": "Effort", "type": "select", "options": [
+                {"id": "low", "label": "Low"}, {"id": "high", "label": "High", "isDefault": true}]},
+            {"id": "plan", "label": "Plan", "type": "boolean", "currentValue": true},
+            {"id": "mode", "label": "Mode", "type": "select", "options": [{"id": "a", "label": "A"}]},
+        ]))
+        .unwrap();
+        let selection = ModelSelection { instance_id: "c".into(), model: "m".into(), options: None };
+        let stops = |descriptors: &[OptionDescriptor]| {
+            effort_stops(&effort_controls(descriptors, "claudeAgent", model_label::Ultrathink::None), &selection)
+        };
+        let all = stops(&descriptors);
+        assert_eq!(all.len(), 3, "two levels and the switch; the menu row opens by pointer");
+        assert_eq!(all[2], EffortStop::Toggle { id: "plan".into(), on: true });
+        assert_eq!(effort_entry(&all, false), Some(1), "the default level shows as selected");
+        let switches = stops(&descriptors[1..]);
+        assert_eq!(effort_entry(&switches, false), None, "a pick lands only on levels");
+        assert_eq!(effort_entry(&switches, true), Some(0), "ArrowRight takes any stop");
+        assert_eq!(effort_entry(&[], true), None);
+    }
 
     #[test]
     fn provider_steps_wrap_through_favorites() {

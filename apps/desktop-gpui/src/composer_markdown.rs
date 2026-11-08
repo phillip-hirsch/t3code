@@ -228,7 +228,7 @@ fn blank(rest: &str) -> bool {
 }
 
 /// `parseOpeningFence`: three or more backticks or tildes, then the language.
-fn opening_fence(line: &str) -> Option<(u8, usize)> {
+pub(crate) fn opening_fence(line: &str) -> Option<(u8, usize)> {
     let fence_char = *line.as_bytes().first()?;
     let len = run_of(line, fence_char);
     let valid = matches!(fence_char, b'`' | b'~') && len >= 3;
@@ -236,7 +236,7 @@ fn opening_fence(line: &str) -> Option<(u8, usize)> {
 }
 
 /// `isClosingFence`: the opening character, at least as many times, then only spaces.
-fn is_closing_fence(line: &str, fence_char: u8, fence_len: usize) -> bool {
+pub(crate) fn is_closing_fence(line: &str, fence_char: u8, fence_len: usize) -> bool {
     let len = run_of(line, fence_char);
     len >= fence_len && blank(&line[len..])
 }

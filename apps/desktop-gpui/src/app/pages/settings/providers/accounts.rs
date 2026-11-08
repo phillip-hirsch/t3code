@@ -368,7 +368,12 @@ fn chatgpt_connection_button(id: impl Into<gpui_kit::ElementId>, label: impl Int
 }
 
 /// `RedactedSensitiveText`: the address scrambled until clicked.
-fn redacted_email(id: &str, email: &str, revealed: bool, t: &Tokens) -> gpui_kit::Stateful<gpui_kit::Div> {
+pub(in crate::app) fn redacted_email(
+    id: &str,
+    email: &str,
+    revealed: bool,
+    t: &Tokens,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
     div()
         .id(SharedString::from(format!("redacted-{id}")))
         .cursor_pointer()

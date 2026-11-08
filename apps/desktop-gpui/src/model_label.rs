@@ -174,8 +174,11 @@ pub fn effort_label(descriptors: &[OptionDescriptor], selection: &ModelSelection
         let on = value.and_then(|v| v.as_bool())?;
         return Some(format!("{} {}", descriptor.label, if on { "On" } else { "Off" }));
     }
-    let value = value?;
-    descriptor.options.iter().find(|o| Some(o.id.as_str()) == value.as_str()).map(|o| o.label.clone())
+    value
+        .and_then(|value| descriptor.options.iter().find(|o| Some(o.id.as_str()) == value.as_str()))
+        .map(|o| o.label.clone())
+        // Pi's thinking control has no default level: it names itself until one is picked.
+        .or_else(|| (descriptor.id == "thinking").then(|| descriptor.label.clone()))
 }
 
 /// `withLegacyUltracodeEffort`: Ultracode was a Claude effort level before it became its own
@@ -198,6 +201,73 @@ pub fn with_legacy_ultracode(descriptors: &[OptionDescriptor], selection: ModelS
         next = with_option(&next, "ultracode", Value::Bool(true));
     }
     next
+}
+
+/// Where a prompt says "ultrathink" (`readPromptUltrathink`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Ultrathink {
+    #[default]
+    None,
+    /// Only in its leading `Ultrathink:`, which a level pick removes.
+    Prefix,
+    /// In the text itself, which locks the levels until it goes.
+    Body,
+}
+
+pub fn prompt_ultrathink(prompt: &str) -> Ultrathink {
+    if !says_ultrathink(prompt) {
+        Ultrathink::None
+    } else if says_ultrathink(strip_ultrathink_prefix(prompt)) {
+        Ultrathink::Body
+    } else {
+        Ultrathink::Prefix
+    }
+}
+
+/// `prompt` without a leading `Ultrathink:` and the whitespace after it.
+pub fn strip_ultrathink_prefix(prompt: &str) -> &str {
+    const PREFIX: &str = "ultrathink:";
+    match prompt.get(..PREFIX.len()) {
+        Some(head) if head.eq_ignore_ascii_case(PREFIX) => prompt[PREFIX.len()..].trim_start(),
+        _ => prompt,
+    }
+}
+
+/// `isClaudeUltrathinkPrompt`: "ultrathink" as a whole word, in any case.
+fn says_ultrathink(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let word = |at: Option<&u8>| at.is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_');
+    lower
+        .match_indices("ultrathink")
+        .any(|(at, found)| !word(at.checked_sub(1).and_then(|i| bytes.get(i))) && !word(bytes.get(at + found.len())))
+}
+
+/// The select an Ultrathink prompt owns (`ultrathinkPromptControlled`): the model's first select,
+/// when it offers prompt-injected values.
+pub fn ultrathink_select(descriptors: &[OptionDescriptor], prompt: Ultrathink) -> Option<&OptionDescriptor> {
+    let primary = descriptors.iter().find(|d| d.kind == "select")?;
+    (prompt != Ultrathink::None && !primary.prompt_injected_values.is_empty()).then_some(primary)
+}
+
+/// Codex's service tier, which the picker's footer offers as speed segments (`splitSpeed`).
+pub fn speed_select<'a>(descriptors: &'a [OptionDescriptor], driver: &str) -> Option<&'a OptionDescriptor> {
+    descriptors.iter().find(|d| driver == "codex" && d.id == "serviceTier" && d.kind == "select")
+}
+
+/// `buildTraitsTriggerDisplay`'s `speedLabel`: "Fast" or "Ultrafast" while a speed option is on.
+pub fn speed_label(descriptors: &[OptionDescriptor], driver: &str, selection: &ModelSelection) -> Option<&'static str> {
+    if toggle_on(descriptors, "fastMode", selection) {
+        return Some("Fast");
+    }
+    let tier = speed_select(descriptors, driver)?;
+    let value = current_value(tier, selection)?;
+    let labelled = |label: &str| tier.options.iter().find(|o| o.label == label).map(|o| o.id.as_str());
+    match value.as_str() {
+        Some(id) if labelled("Ultrafast") == Some(id) => Some("Ultrafast"),
+        Some(id) if labelled("Fast") == Some(id) => Some("Fast"),
+        _ => None,
+    }
 }
 
 /// Whether the boolean option `id` is on for `selection`.
@@ -357,6 +427,50 @@ mod tests {
     }
 
     #[test]
+    fn an_ultrathink_prompt_owns_the_first_select_that_injects_it() {
+        assert_eq!(prompt_ultrathink("fix it"), Ultrathink::None);
+        assert_eq!(prompt_ultrathink("Ultrathink: fix it"), Ultrathink::Prefix);
+        assert_eq!(prompt_ultrathink("ULTRATHINK:   fix it"), Ultrathink::Prefix);
+        assert_eq!(prompt_ultrathink("please ultrathink about it"), Ultrathink::Body);
+        assert_eq!(prompt_ultrathink("Ultrathink: and ultrathink"), Ultrathink::Body);
+        assert_eq!(prompt_ultrathink("ultrathinking"), Ultrathink::None, "a whole word only");
+        assert_eq!(strip_ultrathink_prefix("Ultrathink:  fix it"), "fix it");
+        assert_eq!(strip_ultrathink_prefix("fix it"), "fix it");
+        let descriptors: Vec<OptionDescriptor> = serde_json::from_value(json!([
+            {"id": "effort", "label": "Effort", "type": "select", "promptInjectedValues": ["ultrathink"],
+             "options": [{"id": "high", "label": "High"}, {"id": "ultrathink", "label": "Ultrathink"}]},
+        ]))
+        .unwrap();
+        assert_eq!(ultrathink_select(&descriptors, Ultrathink::Prefix).map(|d| d.id.as_str()), Some("effort"));
+        assert!(ultrathink_select(&descriptors, Ultrathink::None).is_none());
+        let plain: Vec<OptionDescriptor> = serde_json::from_value(json!([
+            {"id": "effort", "label": "Effort", "type": "select", "options": [{"id": "high", "label": "High"}]},
+        ]))
+        .unwrap();
+        assert!(ultrathink_select(&plain, Ultrathink::Body).is_none(), "the model must inject it");
+    }
+
+    #[test]
+    fn codex_service_tiers_are_speeds_and_name_the_fast_ones() {
+        let descriptors: Vec<OptionDescriptor> = serde_json::from_value(json!([
+            {"id": "serviceTier", "label": "Service Tier", "type": "select", "currentValue": "default", "options": [
+                {"id": "default", "label": "Standard", "isDefault": true},
+                {"id": "fast", "label": "Fast"}, {"id": "priority", "label": "Ultrafast"}
+            ]}
+        ]))
+        .unwrap();
+        let selection = ModelSelection { instance_id: "codex".into(), model: "m".into(), options: None };
+        assert!(speed_select(&descriptors, "codex").is_some());
+        assert!(speed_select(&descriptors, "opencode").is_none(), "only Codex's tier is a speed");
+        assert_eq!(speed_label(&descriptors, "codex", &selection), None);
+        let fast = with_option(&selection, "serviceTier", json!("fast"));
+        assert_eq!(speed_label(&descriptors, "codex", &fast), Some("Fast"));
+        let ultra = with_option(&selection, "serviceTier", json!("priority"));
+        assert_eq!(speed_label(&descriptors, "codex", &ultra), Some("Ultrafast"));
+        assert_eq!(speed_label(&descriptors, "opencode", &ultra), None);
+    }
+
+    #[test]
     fn effort_label_reads_the_selection_then_the_default() {
         let descriptors: Vec<OptionDescriptor> = serde_json::from_value(json!([
             {"id": "fastMode", "label": "Fast", "type": "boolean", "currentValue": false},
@@ -370,5 +484,11 @@ mod tests {
         let picked = with_option(&selection, "effort", json!("max"));
         assert_eq!(effort_label(&descriptors, &picked).as_deref(), Some("Max"));
         assert_eq!(effort_label(&descriptors[..1], &selection), None, "no reasoning control, no suffix");
+        let mut unset = descriptors;
+        unset[1].options.iter_mut().for_each(|o| o.is_default = false);
+        assert_eq!(effort_label(&unset, &selection), None, "an unset effort has no label");
+        unset[1].id = "thinking".into();
+        unset[1].label = "Thinking".into();
+        assert_eq!(effort_label(&unset, &selection).as_deref(), Some("Thinking"), "Pi's thinking names itself");
     }
 }

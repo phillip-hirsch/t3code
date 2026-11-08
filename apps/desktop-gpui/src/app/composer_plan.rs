@@ -32,6 +32,8 @@ pub(super) struct ComposerUi {
     implementing: bool,
     /// Why the last send was refused for length; it follows edits until it clears.
     pub(super) length_error: Option<String>,
+    /// The context meter's popover.
+    pub(super) meter: super::composer_meter::MeterPopup,
     /// The footer controls row's laid-out width, and how its mode block fit there last.
     pub(super) footer_host: Option<f32>,
     pub(super) mode_fit: super::composer_fit::ModeFit,
@@ -155,7 +157,7 @@ impl Workspace {
         self.active_plan_follow_up().is_some()
     }
 
-    fn active_plan_follow_up(&self) -> Option<(&str, &str)> {
+    pub(super) fn active_plan_follow_up(&self) -> Option<(&str, &str)> {
         let projection = self.open_projection()?;
         let (enabled, mode) = self.interaction_mode();
         if !enabled
@@ -305,20 +307,24 @@ impl Workspace {
         let busy = self.sending || self.composer_ui.implementing;
         let enabled = !busy && self.client().is_some() && !self.target_rewinding();
         let pill = |id: &'static str| {
-            h_flex()
-                .id(id)
-                .h(px(32.))
-                .flex_none()
-                .items_center()
-                .justify_center()
-                .gap(px(6.))
-                .rounded_full()
-                .bg(t.primary)
-                .text_color(t.primary_foreground)
-                .text_sm()
-                .font_weight(FontWeight::MEDIUM)
-                .when(!enabled, |el| el.opacity(0.64))
-                .when(enabled, |el| el.cursor_pointer().hover(|s| s.bg(t.primary_hover)))
+            let pill = h_flex().id(id);
+            if enabled {
+                super::composer::action_control(pill, &self.composer_action_focus[super::composer::PRIMARY], t)
+            } else {
+                pill
+            }
+            .h(px(32.))
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .gap(px(6.))
+            .rounded_full()
+            .bg(t.primary)
+            .text_color(t.primary_foreground)
+            .text_sm()
+            .font_weight(FontWeight::MEDIUM)
+            .when(!enabled, |el| el.opacity(0.64))
+            .when(enabled, |el| el.cursor_pointer().hover(|s| s.bg(t.primary_hover)))
         };
         let label = |idle: &'static str| if busy { "Sending..." } else { idle };
         if !self.composer_empty {

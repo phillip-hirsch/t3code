@@ -9,8 +9,9 @@ use gpui_kit::component::notification::Notification;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, App, Context, ElementId, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, Styled as _, WeakEntity, Window, div, prelude::FluentBuilder as _, px, relative,
+    AnyElement, App, Context, ElementId, InteractiveElement as _, IntoElement, ObjectFit, ParentElement as _,
+    SharedString, StatefulInteractiveElement as _, Styled as _, StyledImage as _, WeakEntity, Window, div, img,
+    prelude::FluentBuilder as _, px, relative,
 };
 use serde_json::{Value, json};
 
@@ -39,7 +40,9 @@ pub(super) struct QueueEdit {
     thread_id: String,
     run_id: SharedString,
     original: String,
+    /// The attachments it keeps; removals stay local until the save (`existingAttachments`).
     attachments: Vec<Value>,
+    removed_attachment: bool,
     records: Vec<Value>,
     saved: (String, Vec<Attachment>),
     saving: bool,
@@ -180,6 +183,7 @@ impl Workspace {
             run_id: message.run_id.clone(),
             original: text.clone(),
             attachments,
+            removed_attachment: false,
             records,
             saved,
             saving: false,
@@ -221,7 +225,8 @@ impl Workspace {
             "runId": edit.run_id,
         });
         let mut has_attachments = !edit.attachments.is_empty();
-        if self.has_attachments() {
+        // Absent attachments keep the queued ones, so only an added or removed one sends the set.
+        if self.has_attachments() || edit.removed_attachment {
             let (added, context) = match self.attachment_payload(&text) {
                 Ok(payload) => payload,
                 Err(reason) => {
@@ -230,10 +235,11 @@ impl Workspace {
                     return;
                 }
             };
-            has_attachments = true;
+            has_attachments |= !added.is_empty();
             let added_records = context.as_ref().and_then(|c| c["records"].as_array()).cloned().unwrap_or_default();
+            let kept_records = retained_records(&edit.records, &edit.attachments);
             command["attachments"] = edit.attachments.iter().cloned().chain(added).collect::<Vec<_>>().into();
-            command["context"] = json!({"version": 1, "records": merge_records(&edit.records, added_records)});
+            command["context"] = json!({"version": 1, "records": merge_records(&kept_records, added_records)});
         }
         command["text"] =
             if text.is_empty() && has_attachments { ATTACHMENT_ONLY_PROMPT.to_owned() } else { text }.into();
@@ -262,6 +268,72 @@ impl Workspace {
             });
         })
         .detach();
+    }
+
+    /// Drops one of the edited message's attachments; the save sends the rest.
+    fn remove_queued_attachment(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(edit) = self.queue.edit.as_mut().filter(|edit| !edit.saving) else { return };
+        edit.attachments.retain(|attachment| attachment["id"].as_str() != Some(id));
+        edit.removed_attachment = true;
+        cx.notify();
+    }
+
+    /// Loads the queue's image thumbnails not seen yet.
+    pub(super) fn load_queue_images(&mut self, cx: &mut Context<Self>) {
+        let state = self.queue.state.clone();
+        let images = state.queued.iter().flat_map(|message| message.images.iter().map(|image| image.id.as_ref()));
+        self.load_attachment_images(images, cx);
+    }
+
+    /// `ComposerQueuedAttachmentRow`: the edited message's attachments, already uploaded.
+    pub(super) fn render_queue_edit_attachments(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let edit = self.queue.edit.as_ref().filter(|edit| !edit.attachments.is_empty() && self.question.is_none())?;
+        let tiles: Vec<AnyElement> = edit
+            .attachments
+            .iter()
+            .filter_map(|attachment| {
+                let id = attachment["id"].as_str()?.to_owned();
+                let name = attachment["name"].as_str().unwrap_or_default().to_owned();
+                let image = (attachment["type"] == "image").then(|| self.attachment_image(&id)).flatten();
+                let label = format!("Remove {name}");
+                let body = match image {
+                    Some(image) => img(image).size_full().object_fit(ObjectFit::Cover).into_any_element(),
+                    None => div()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .px(px(4.))
+                        .text_size(px(10.))
+                        .text_color(t.muted_foreground)
+                        .child(name)
+                        .into_any_element(),
+                };
+                let remove = super::attachments::overlay_button(
+                    ElementId::Name(format!("queued-attachment-{id}").into()),
+                    IconName::X,
+                )
+                .right(px(4.))
+                .top(px(4.))
+                .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+                .on_click(cx.listener(move |this, _, _, cx| this.remove_queued_attachment(&id, cx)));
+                Some(
+                    div()
+                        .relative()
+                        .size(px(64.))
+                        .flex_none()
+                        .overflow_hidden()
+                        .rounded(px(8.))
+                        .border_1()
+                        .border_color(t.border.opacity(0.8))
+                        .bg(t.background)
+                        .child(body)
+                        .child(remove)
+                        .into_any_element(),
+                )
+            })
+            .collect();
+        Some(h_flex().mb(px(12.)).gap(px(8.)).flex_wrap().children(tiles).into_any_element())
     }
 
     /// The run started or was cancelled elsewhere: a changed edit moves into the
@@ -334,6 +406,12 @@ impl Workspace {
     }
 }
 
+/// The edit's context records, less those of attachments it no longer carries.
+fn retained_records(records: &[Value], attachments: &[Value]) -> Vec<Value> {
+    let kept = |id: &Value| attachments.iter().any(|attachment| attachment["id"] == *id);
+    records.iter().filter(|record| record.get("attachmentId").is_none_or(kept)).cloned().collect()
+}
+
 /// Kept records first, new ones replacing any with the same `contextId`.
 fn merge_records(kept: &[Value], added: Vec<Value>) -> Vec<Value> {
     let mut records: Vec<Value> = Vec::with_capacity(kept.len() + added.len());
@@ -361,7 +439,9 @@ pub(super) fn queued_row(
     let editing = ui.edit.as_ref().is_some_and(|edit| edit.run_id == message.run_id);
     let busy = ui.busy.is_some();
     let blocked = workspace.edit_blocked_reason();
-    let id = &message.run_id;
+    // Sent but not queued on the server yet: no run to act on.
+    let pending = message.run_id.is_empty();
+    let id = if pending { &message.message_id } else { &message.run_id };
     let muted = t.muted_foreground;
     let bubble = div()
         .min_w_0()
@@ -374,6 +454,25 @@ pub(super) fn queued_row(
         .border_color(if editing { t.primary.opacity(0.6) } else { muted.opacity(0.4) })
         .text_sm()
         .text_color(if editing { t.foreground } else { muted })
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .when(!message.images.is_empty(), |el| {
+            el.child(h_flex().flex_wrap().gap(px(4.)).children(message.images.iter().map(|image| {
+                let tile = div()
+                    .size(px(32.))
+                    .flex_none()
+                    .overflow_hidden()
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(t.border.opacity(0.7))
+                    .bg(t.background);
+                match workspace.attachment_image(&image.id) {
+                    Some(image) => tile.child(img(image).size_full().object_fit(ObjectFit::Cover)),
+                    None => tile.child(div().size_full().bg(t.muted.opacity(0.6))),
+                }
+            })))
+        })
         .when(!message.preview.is_empty(), |el| el.child(message.preview.clone()));
     let mut controls = h_flex().gap(px(2.)).pr(px(4.)).text_xs().text_color(muted);
     let time = message
@@ -388,7 +487,7 @@ pub(super) fn queued_row(
             .group_hover(format!("queued:{id}"), |s| s.opacity(1.))
             .children(time),
     );
-    if ui.state.can_send(message) && !editing {
+    if !pending && ui.state.can_send(message) && !editing {
         // The first message's Send now names `thread.steerQueuedMessage`.
         let first = ui.state.queued.first().is_some_and(|q| &q.run_id == id);
         let tooltip: SharedString = match workspace.shortcut_label("thread.steerQueuedMessage").filter(|_| first) {
@@ -413,7 +512,7 @@ pub(super) fn queued_row(
                 let _ = this.update(cx, |w, cx| w.cancel_queue_edit(window, cx));
             }),
         );
-    } else {
+    } else if !pending {
         let edit_disabled = !message.editable || busy || blocked.is_some();
         // The last message's edit names `thread.editQueuedMessage`, labelled as from the composer.
         let edit_tooltip: SharedString = match blocked {
@@ -556,6 +655,7 @@ mod tests {
                 created_at: None,
                 sent_by_t3code: false,
                 fresh_context: false,
+                images: Vec::new(),
             })
             .collect();
         QueueState { queued, ..Default::default() }
@@ -577,6 +677,18 @@ mod tests {
         assert_eq!(shape(&rows(&state(4), false)), ["r0", "r1.", "toggle 4 false"]);
         assert_eq!(shape(&rows(&state(4), true)), ["r0", "r1", "r2", "r3.", "toggle 4 true"]);
         assert!(rows(&state(0), false).is_empty());
+    }
+
+    #[test]
+    fn removing_an_attachment_drops_its_context_record() {
+        let records = vec![
+            json!({"contextId": "a", "attachmentId": "att-1"}),
+            json!({"contextId": "b", "attachmentId": "att-2"}),
+            json!({"contextId": "terminal"}),
+        ];
+        let kept = retained_records(&records, &[json!({"id": "att-2"})]);
+        let ids: Vec<&str> = kept.iter().map(|r| r["contextId"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["b", "terminal"]);
     }
 
     #[test]

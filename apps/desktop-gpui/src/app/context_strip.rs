@@ -13,11 +13,12 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Disableable as _, Icon, Selectable as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, AppContext as _, Context, ElementId, Entity, Focusable as _, FontWeight, InteractiveElement as _,
-    IntoElement, Keystroke, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Subscription, Task, Window, div, prelude::FluentBuilder as _, px,
+    IntoElement, Keystroke, ParentElement as _, ScrollHandle, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Subscription, Task, Window, div, prelude::FluentBuilder as _, px,
 };
 use serde_json::{Value, json};
 
+use super::banners::{Variant, composer_banner};
 use super::composer::{control_button, runtime_modes};
 use super::{Target, Workspace};
 use crate::new_thread::{self, DraftWorkspace, EnvMode, WorkspaceChoice};
@@ -96,11 +97,18 @@ pub(super) struct DraftWorkspaceState {
     branch_search: Option<Entity<InputState>>,
     branch_query: String,
     _branch_search_changes: Option<Subscription>,
+    /// The open picker's `vcs.listRefs` pages for its search (`usePaginatedBranches`).
+    branch_pages: RefSearch,
+    /// The picker row Enter picks (`autoHighlight`); `None` until a search or the arrows set one.
+    branch_highlight: Option<usize>,
+    branch_scroll: ScrollHandle,
     /// The permissions popover that is open, by element id, and the mode it previews.
     permissions_open: Option<&'static str>,
     permissions_preview: Option<&'static str>,
     /// The Workspace menu is open (`composer.workspace` opens it too).
     env_mode_open: bool,
+    /// The mode the arrows have reached in the open popover (`data-highlighted`).
+    permissions_focus: Option<&'static str>,
     /// `vcs.listRefs` for an open thread's checkout, by environment and cwd (`persistComposerContextStrip`).
     thread_refs: Option<(Option<SharedString>, String, Value)>,
 }
@@ -112,6 +120,56 @@ impl DraftWorkspaceState {
         (self.project_id.as_deref() == Some(project_id)).then_some(path.as_str())
     }
 }
+
+/// The ref pages loaded for the branch picker's search, merged by name like `usePaginatedBranches`.
+#[derive(Default)]
+struct RefSearch {
+    /// The sanitized query the pages answer; empty lists every ref.
+    query: String,
+    pages: Vec<Value>,
+    /// The page in flight, and whether it is a next page.
+    loading: Option<(Task<()>, bool)>,
+}
+
+impl RefSearch {
+    /// The refs of every page in order, a later page's copy of a name replacing the earlier one.
+    fn refs(&self) -> Vec<&Value> {
+        let mut refs: Vec<&Value> = Vec::new();
+        for item in self.pages.iter().filter_map(|page| page["refs"].as_array()).flatten() {
+            match refs.iter_mut().find(|known| known["name"] == item["name"]) {
+                Some(known) => *known = item,
+                None => refs.push(item),
+            }
+        }
+        refs
+    }
+
+    fn next_cursor(&self) -> Option<u64> {
+        self.pages.last().and_then(|page| page["nextCursor"].as_u64())
+    }
+
+    /// `statusText`: the first page loading, a next page loading, or how many refs show.
+    fn status(&self) -> Option<String> {
+        match (&self.loading, self.next_cursor()) {
+            (Some((_, false)), _) if self.pages.is_empty() => Some("Loading refs...".into()),
+            (Some((_, true)), _) => Some("Loading more refs...".into()),
+            (_, Some(_)) => {
+                let total = self.pages.iter().filter_map(|page| page["totalCount"].as_u64()).max().unwrap_or(0);
+                Some(format!("Showing {} of {total} refs", self.refs().len()))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// One row of the branch picker: a ref, or "Create new ref".
+enum BranchItem {
+    Ref(Value),
+    Create(String),
+}
+
+/// `shouldLoadNextBranchPageAfterScroll`'s distance from the end.
+const NEXT_PAGE_DISTANCE: f32 = 96.;
 
 impl Workspace {
     /// Loads the draft's default workspace mode and refs when its project changes.
@@ -148,24 +206,133 @@ impl Workspace {
         }));
     }
 
-    /// Escape closes the branch picker.
+    /// The branch picker's combobox keys: Escape closes it, Up and Down highlight, Enter picks.
     pub(super) fn draft_workspace_key(
         &mut self,
         keystroke: &Keystroke,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if keystroke.key != "escape" || !self.draft_workspace.branch_open {
+        if !self.draft_workspace.branch_open || keystroke.modifiers.modified() {
             return false;
         }
-        self.draft_workspace.branch_open = false;
-        self.focus_composer(window, cx);
+        match keystroke.key.as_str() {
+            "escape" => {
+                self.draft_workspace.branch_open = false;
+                self.focus_composer(window, cx);
+            }
+            "down" | "up" => {
+                let count = self.branch_items().len();
+                if count == 0 {
+                    return true;
+                }
+                let state = &mut self.draft_workspace;
+                let next = step_highlight(state.branch_highlight, count, keystroke.key == "down");
+                state.branch_highlight = Some(next);
+                state.branch_scroll.scroll_to_item(next);
+                if next + 4 >= count {
+                    self.load_next_branch_page(cx);
+                }
+            }
+            "enter" => {
+                let Some(index) = self.draft_workspace.branch_highlight else { return false };
+                match self.branch_items().into_iter().nth(index) {
+                    Some(BranchItem::Ref(item)) => {
+                        let name = item["name"].as_str().unwrap_or_default().to_owned();
+                        self.select_branch(name, window, cx);
+                    }
+                    Some(BranchItem::Create(name)) => self.create_branch(name, cx),
+                    None => return false,
+                }
+            }
+            _ => return false,
+        }
         cx.notify();
         true
     }
 
+    /// The picker's rows: its loaded refs that match the search, then "Create new ref" when no
+    /// ref has that exact name (`branchPickerItems`, `shouldIncludeBranchPickerItem`).
+    fn branch_items(&self) -> Vec<BranchItem> {
+        let state = &self.draft_workspace;
+        let (_, worktree_base, _) = self.branch_trigger();
+        let refs = state.branch_pages.refs();
+        let query = state.branch_query.to_lowercase();
+        let sanitized = new_thread::sanitize_new_ref_name(&query);
+        let exact = refs.iter().any(|r| r["name"].as_str() == Some(state.branch_pages.query.as_str()));
+        let create =
+            (!query.is_empty() && !exact && !worktree_base).then(|| BranchItem::Create(state.branch_query.clone()));
+        refs.into_iter()
+            .filter(|r| {
+                let name = r["name"].as_str().unwrap_or_default().to_lowercase();
+                query.is_empty() || name.contains(&query) || name.contains(&sanitized)
+            })
+            .map(|r| BranchItem::Ref(r.clone()))
+            .chain(create)
+            .collect()
+    }
+
+    /// Fetches the picker's first page for its current search, or the next page after the last.
+    fn load_branch_page(&mut self, next: bool, cx: &mut Context<Self>) {
+        let cursor = if next {
+            match (&self.draft_workspace.branch_pages.loading, self.draft_workspace.branch_pages.next_cursor()) {
+                (None, Some(cursor)) => Some(cursor),
+                _ => return,
+            }
+        } else {
+            None
+        };
+        let (Some(client), Some(cwd)) = (self.client(), self.composer_cwd()) else { return };
+        let query = self.draft_workspace.branch_pages.query.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let page = new_thread::list_ref_page(&client, &cwd, &query, cursor).await;
+            let _ = this.update(cx, |this, cx| {
+                let pages = &mut this.draft_workspace.branch_pages;
+                if pages.query != query {
+                    return;
+                }
+                pages.loading = None;
+                match page {
+                    Ok(page) => {
+                        if cursor.is_none() {
+                            pages.pages.clear();
+                        }
+                        pages.pages.push(page);
+                    }
+                    Err(error) => log::warn!("could not list refs: {error}"),
+                }
+                cx.notify();
+            });
+        });
+        self.draft_workspace.branch_pages.loading = Some((task, next));
+        cx.notify();
+    }
+
+    fn load_next_branch_page(&mut self, cx: &mut Context<Self>) {
+        self.load_branch_page(true, cx);
+    }
+
+    /// The search changed: a new query starts over from its first page.
+    fn search_branches(&mut self, raw: &str, cx: &mut Context<Self>) {
+        let state = &mut self.draft_workspace;
+        state.branch_query = raw.trim().to_owned();
+        state.branch_highlight = (!state.branch_query.is_empty()).then_some(0);
+        state.branch_scroll.scroll_to_item(0);
+        let query = new_thread::sanitize_new_ref_name(raw);
+        if query == state.branch_pages.query {
+            return;
+        }
+        state.branch_pages = RefSearch { query, ..Default::default() };
+        self.load_branch_page(false, cx);
+    }
+
     pub(super) fn draft_workspace_open_permissions(&mut self, cx: &mut Context<Self>) {
         self.draft_workspace.permissions_open = Some("strip-permissions");
+        // `focusCheckedPermission`: a shortcut lands on the current mode.
+        let current = self.runtime_mode();
+        let focus = self.permission_options().into_iter().find(|o| o.mode == current && o.enabled()).map(|o| o.mode);
+        self.draft_workspace.permissions_focus = focus;
+        self.draft_workspace.permissions_preview = focus;
         cx.notify();
     }
 
@@ -194,12 +361,18 @@ impl Workspace {
                         return;
                     }
                 };
-                if thread {
-                    this.draft_workspace.thread_refs = Some((environment, cwd, refs));
-                } else if this.draft_workspace.project_id == project_id {
-                    this.draft_workspace.refs = Some(refs);
-                } else {
+                let state = &mut this.draft_workspace;
+                if !thread && state.project_id != project_id {
                     return;
+                }
+                // An open picker without a search or further pages lists the fresh first page.
+                if state.branch_open && state.branch_pages.query.is_empty() && state.branch_pages.pages.len() <= 1 {
+                    state.branch_pages.pages = vec![refs.clone()];
+                }
+                if thread {
+                    state.thread_refs = Some((environment, cwd, refs));
+                } else {
+                    state.refs = Some(refs);
                 }
                 cx.notify();
             });
@@ -217,6 +390,14 @@ impl Workspace {
             }
             _ => self.draft_workspace.refs.as_ref(),
         }
+    }
+
+    /// The previous worktree a draft of `project_id` reuses, once picked.
+    pub(super) fn draft_reused_worktree(&self, project_id: &str) -> Option<String> {
+        let state = &self.draft_workspace;
+        let (path, _) =
+            state.choice.existing_worktree.as_ref().filter(|_| state.project_id.as_deref() == Some(project_id))?;
+        Some(path.clone())
     }
 
     pub(super) fn draft_env_mode(&self) -> EnvMode {
@@ -239,6 +420,18 @@ impl Workspace {
     /// `isGitRepo` as `ChatView` reads it: the checkout's live status, not its refs reply.
     pub(super) fn is_git_repo(&self) -> bool {
         self.vcs.is_repo()
+    }
+
+    /// `name`'s ref from the picker's pages, else the checkout's first page.
+    fn find_ref(&self, name: &str) -> Option<Value> {
+        let named = |r: &&Value| r["name"].as_str() == Some(name);
+        self.draft_workspace
+            .branch_pages
+            .refs()
+            .into_iter()
+            .find(named)
+            .or_else(|| self.ref_list().iter().find(named))
+            .cloned()
     }
 
     fn ref_list(&self) -> &[Value] {
@@ -297,11 +490,7 @@ impl Workspace {
             cx.notify();
             return;
         }
-        let elsewhere = self
-            .ref_list()
-            .iter()
-            .find(|r| r["name"].as_str() == Some(&name))
-            .and_then(|r| r["worktreePath"].as_str().map(str::to_owned));
+        let elsewhere = self.find_ref(&name).and_then(|r| r["worktreePath"].as_str().map(str::to_owned));
         let root = self.composer_cwd();
         if let Some(path) = elsewhere {
             // Already checked out in a worktree: reuse it instead of switching.
@@ -385,7 +574,8 @@ impl Workspace {
                 self.draft_workspace._branch_search_changes =
                     Some(cx.subscribe_in(&search, window, |this, search, event, _, cx| {
                         if let InputEvent::Change = event {
-                            this.draft_workspace.branch_query = search.read(cx).value().trim().to_owned();
+                            let raw = search.read(cx).value().to_string();
+                            this.search_branches(&raw, cx);
                             cx.notify();
                         }
                     }));
@@ -397,8 +587,13 @@ impl Workspace {
             search.set_value("", window, cx);
             search.focus(window, cx);
         });
-        self.draft_workspace.branch_query.clear();
-        self.draft_workspace.branch_open = true;
+        // The checkout's first page until `refresh_refs` brings a fresh one.
+        let pages = self.refs().cloned().into_iter().collect();
+        let state = &mut self.draft_workspace;
+        state.branch_query.clear();
+        state.branch_highlight = None;
+        state.branch_open = true;
+        state.branch_pages = RefSearch { pages, ..Default::default() };
         self.refresh_refs(cx);
         cx.notify();
     }
@@ -408,9 +603,9 @@ impl Workspace {
     fn select_thread_branch(&mut self, thread_id: String, name: String, cx: &mut Context<Self>) {
         let Some(root) = self.target_project().map(|p| p.workspace_root.clone()) else { return };
         let active = self.open_projection().and_then(|p| p.thread.worktree_path.clone());
-        let picked = self.ref_list().iter().find(|r| r["name"].as_str() == Some(name.as_str()));
-        let elsewhere = picked.and_then(|r| r["worktreePath"].as_str()).map(str::to_owned);
-        let is_default = picked.is_some_and(|r| r["isDefault"].as_bool() == Some(true));
+        let picked = self.find_ref(&name);
+        let elsewhere = picked.as_ref().and_then(|r| r["worktreePath"].as_str()).map(str::to_owned);
+        let is_default = picked.as_ref().is_some_and(|r| r["isDefault"].as_bool() == Some(true));
         if let Some(path) = elsewhere {
             let next = (!is_within(&root, &path)).then_some(path);
             self.set_thread_branch(&thread_id, &name, next, cx);
@@ -751,17 +946,38 @@ impl Workspace {
         t: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let query = self.draft_workspace.branch_query.to_lowercase();
-        let refs: Vec<&Value> = self
-            .ref_list()
-            .iter()
-            .filter(|r| query.is_empty() || r["name"].as_str().is_some_and(|n| n.to_lowercase().contains(&query)))
-            .collect();
-        let exact =
-            self.ref_list().iter().any(|r| r["name"].as_str() == Some(self.draft_workspace.branch_query.as_str()));
-        let create = (!query.is_empty() && !exact && !worktree_base).then(|| self.draft_workspace.branch_query.clone());
-        let total = self.refs().and_then(|r| r["totalCount"].as_u64());
-        let rows = refs.iter().map(|r| {
+        let items = self.branch_items();
+        let highlight = self.draft_workspace.branch_highlight;
+        let empty = items.is_empty();
+        let rows = items.into_iter().enumerate().map(|(index, item)| {
+            let highlighted = highlight == Some(index);
+            let hover = cx.listener(move |this, _: &gpui_kit::MouseMoveEvent, _, cx| {
+                if this.draft_workspace.branch_highlight != Some(index) {
+                    this.draft_workspace.branch_highlight = Some(index);
+                    cx.notify();
+                }
+            });
+            let r = match item {
+                BranchItem::Ref(r) => r,
+                BranchItem::Create(name) => {
+                    let label = format!("Create new ref \"{name}\"");
+                    return div()
+                        .id("create-ref")
+                        .h(px(28.))
+                        .flex_none()
+                        .px(px(8.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(4.))
+                        .text_sm()
+                        .cursor_pointer()
+                        .when(highlighted, |el| el.bg(t.foreground.opacity(0.09)))
+                        .on_mouse_move(hover)
+                        .child(label)
+                        .on_click(cx.listener(move |this, _, _, cx| this.create_branch(name.clone(), cx)))
+                        .into_any_element();
+                }
+            };
             let name = r["name"].as_str().unwrap_or_default().to_owned();
             let badge = if r["current"].as_bool() == Some(true) {
                 Some("current")
@@ -786,8 +1002,9 @@ impl Workspace {
                 .rounded(px(4.))
                 .text_sm()
                 .cursor_pointer()
-                .hover(|s| s.bg(t.accent))
                 .when(checked, |el| el.bg(t.foreground.opacity(0.08)))
+                .when(highlighted, |el| el.bg(t.foreground.opacity(0.09)))
+                .on_mouse_move(hover)
                 .child(div().flex_1().min_w_0().truncate().text_color(t.foreground).child(name))
                 .children(badge.map(|badge| {
                     div()
@@ -800,7 +1017,9 @@ impl Workspace {
                 }))
                 .on_click(cx.listener(move |this, _, window, cx| this.select_branch(pick.clone(), window, cx)))
                 .context_menu(copy_menu("Copy branch name", "Branch name copied", copy))
+                .into_any_element()
         });
+        let rows: Vec<AnyElement> = rows.collect();
         let start_from_origin = self.draft_start_from_origin();
         v_flex()
             .id("branch-popover-body")
@@ -814,32 +1033,33 @@ impl Workspace {
             .child(
                 v_flex()
                     .id("branch-list")
+                    .track_scroll(&self.draft_workspace.branch_scroll)
                     .max_h(px(224.))
                     .overflow_y_scroll()
                     .py(px(8.))
                     .px(px(4.))
-                    .when(refs.is_empty() && create.is_none(), |el| {
+                    .on_scroll(cx.listener(|_, _: &gpui_kit::ScrollEvent, window, cx| {
+                        // After the list applies the scroll (`maybeFetchNextBranchPage`).
+                        cx.defer_in(window, |this, _, cx| {
+                            let scroll = &this.draft_workspace.branch_scroll;
+                            if f32::from(scroll.max_offset().y + scroll.offset().y) <= NEXT_PAGE_DISTANCE {
+                                this.load_next_branch_page(cx);
+                            }
+                        });
+                    }))
+                    .when(empty, |el| {
                         el.child(div().p(px(8.)).text_sm().text_color(t.muted_foreground).child("No refs found."))
                     })
-                    .children(rows)
-                    .children(create.map(|name| {
-                        let label = format!("Create new ref \"{name}\"");
-                        div()
-                            .id("create-ref")
-                            .h(px(28.))
-                            .px(px(8.))
-                            .flex()
-                            .items_center()
-                            .rounded(px(4.))
-                            .text_sm()
-                            .cursor_pointer()
-                            .hover(|s| s.bg(t.accent))
-                            .child(label)
-                            .on_click(cx.listener(move |this, _, _, cx| this.create_branch(name.clone(), cx)))
-                    })),
+                    .children(rows),
             )
-            .children(total.map(|total| {
-                div().px(px(12.)).pb(px(6.)).text_xs().text_color(t.muted_foreground).child(format!("Showing {} of {total} refs", self.ref_list().len()))
+            .children(self.draft_workspace.branch_pages.status().map(|status| {
+                div()
+                    .px(px(12.))
+                    .py(px(8.))
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(t.muted_foreground)
+                    .child(status)
             }))
             .when(worktree_base, |el| {
                 el.child(
@@ -924,6 +1144,7 @@ impl Workspace {
                 view.update(cx, |this, cx| {
                     this.draft_workspace.permissions_open = open.then_some(id);
                     this.draft_workspace.permissions_preview = None;
+                    this.draft_workspace.permissions_focus = None;
                     cx.notify();
                 });
             })
@@ -936,29 +1157,130 @@ impl Workspace {
         popover.into_any_element()
     }
 
-    fn render_permissions_section(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
-        let current = self.runtime_mode();
+    /// The four modes with what the composer's provider runs and the administrator allows.
+    fn permission_options(&self) -> Vec<PermissionOption> {
         let supported = self
             .composer_model()
             .and_then(|s| self.server_info().provider(&s.instance_id))
             .map(|p| p.supported_runtime_modes.clone())
             .unwrap_or_default();
+        let policy = &self.server_info().managed_policy;
+        runtime_modes()
+            .into_iter()
+            .zip(MODE_DESCRIPTIONS)
+            .map(|((mode, label, icon), description)| PermissionOption {
+                mode,
+                label,
+                icon,
+                description,
+                supported: supported.is_empty() || supported.iter().any(|m| m == mode),
+                denial: runtime_mode_denial(policy, mode),
+            })
+            .collect()
+    }
+
+    /// `runtimeModeCeilingDenial`: the thread's mode (`resolveCompatibleRuntimeMode`) is above the
+    /// administrator's ceiling, so a send would be refused; with the broadest mode left to switch to.
+    pub(super) fn runtime_mode_ceiling(&self) -> Option<(String, Option<&'static str>)> {
+        let options = self.permission_options();
+        let modes: Vec<&'static str> = options.iter().filter(|o| o.supported).map(|o| o.mode).collect();
+        let current = self.runtime_mode();
+        let mode = modes.iter().find(|m| **m == current).or(modes.first()).copied().unwrap_or(current.as_str());
+        let policy = &self.server_info().managed_policy;
+        let denial = runtime_mode_denial(policy, mode)?;
+        Some((denial, runtime_mode_fallback(policy, &modes)))
+    }
+
+    /// The `managed-runtime-mode` banner: why sending is refused, and the switch down.
+    pub(super) fn render_runtime_mode_ceiling_banner(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.question.is_some() {
+            return None;
+        }
+        let (denial, fallback) = self.runtime_mode_ceiling()?;
+        let actions = fallback.map(|mode| {
+            let label = runtime_modes().iter().find(|(id, ..)| *id == mode).map_or(mode, |(_, label, _)| label);
+            Button::new("runtime-mode-ceiling-switch")
+                .ghost()
+                .xsmall()
+                .label(format!("Switch to {label}"))
+                .on_click(cx.listener(move |this, _, _, cx| this.set_runtime_mode(mode, cx)))
+                .into_any_element()
+        });
+        Some(composer_banner(Variant::Warning, Icon::new(Lucide::Building), denial, None, actions, t))
+    }
+
+    /// The open permissions popover's keys (`ComposerPermissionsSection`'s radio items): the
+    /// arrows move between the modes it allows, Enter and Space pick one, Escape closes it.
+    pub(super) fn permissions_key(
+        &mut self,
+        keystroke: &Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.draft_workspace.permissions_open.is_none() || keystroke.modifiers.modified() {
+            return false;
+        }
+        let enabled: Vec<&'static str> =
+            self.permission_options().into_iter().filter(PermissionOption::enabled).map(|o| o.mode).collect();
+        let state = &mut self.draft_workspace;
+        match keystroke.key.as_str() {
+            "escape" => {
+                state.permissions_open = None;
+                state.permissions_focus = None;
+                state.permissions_preview = None;
+                self.focus_composer(window, cx);
+            }
+            key @ ("left" | "right" | "up" | "down") => {
+                state.permissions_focus = step_permission(&enabled, state.permissions_focus, key);
+                state.permissions_preview = state.permissions_focus;
+            }
+            "enter" | "space" => {
+                let Some(mode) = state.permissions_focus.filter(|mode| enabled.contains(mode)) else { return false };
+                self.pick_permission(mode, window, cx);
+            }
+            _ => return false,
+        }
+        cx.notify();
+        true
+    }
+
+    fn pick_permission(&mut self, mode: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let state = &mut self.draft_workspace;
+        state.permissions_open = None;
+        state.permissions_focus = None;
+        state.permissions_preview = None;
+        self.set_runtime_mode(mode, cx);
+        self.focus_composer(window, cx);
+    }
+
+    fn render_permissions_section(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+        let current = self.runtime_mode();
+        let options = self.permission_options();
+        let focus = self.draft_workspace.permissions_focus;
         let shown = self.draft_workspace.permissions_preview.map_or_else(|| current.clone(), str::to_owned);
-        let index = runtime_modes().iter().position(|(id, ..)| *id == shown).unwrap_or(0);
-        let (_, shown_label, _) = runtime_modes()[index];
-        let segments = runtime_modes().into_iter().enumerate().map(|(i, (mode, label, icon))| {
+        let shown_option = options.iter().find(|o| o.mode == shown).unwrap_or(&options[0]);
+        let shown_label = shown_option.label;
+        let shown_description: SharedString =
+            shown_option.denial.clone().map_or(shown_option.description.into(), SharedString::from);
+        let count = options.len();
+        let segments = options.iter().enumerate().map(|(i, option)| {
+            let PermissionOption { mode, label, icon, .. } = *option;
             let checked = mode == current;
-            let enabled = supported.is_empty() || supported.iter().any(|m| m == mode);
+            let enabled = option.enabled();
+            let highlighted = focus == Some(mode);
             h_flex()
                 .id(ElementId::Name(format!("mode-{mode}").into()))
                 .flex_1()
                 .h(px(24.))
                 .justify_center()
                 .when(i == 0, |el| el.rounded_l(px(6.)))
-                .when(i == 3, |el| el.rounded_r(px(6.)))
-                .text_color(if checked { t.foreground } else { t.muted_foreground })
+                .when(i + 1 == count, |el| el.rounded_r(px(6.)))
+                .text_color(if checked || highlighted { t.foreground } else { t.muted_foreground })
                 .when(checked, |el| el.bg(t.input.opacity(0.72)))
-                .when(!enabled, |el| el.opacity(0.4))
+                .when(highlighted && !checked, |el| el.bg(t.accent))
+                // `focus-visible:ring-2 ring-ring ring-inset`.
+                .when(highlighted, |el| el.border_2().border_color(t.ring))
+                .when(!enabled, |el| el.opacity(0.4).cursor_not_allowed())
                 .when(enabled && !checked, |el| el.cursor_pointer().hover(|s| s.bg(t.accent).text_color(t.foreground)))
                 .child(Icon::new(icon).with_size(px(14.)))
                 .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
@@ -970,11 +1292,7 @@ impl Workspace {
                     }
                 }))
                 .when(enabled, |el| {
-                    el.on_click(cx.listener(move |this, _, window, cx| {
-                        this.draft_workspace.permissions_open = None;
-                        this.set_runtime_mode(mode, cx);
-                        this.focus_composer(window, cx);
-                    }))
+                    el.on_click(cx.listener(move |this, _, window, cx| this.pick_permission(mode, window, cx)))
                 })
         });
         v_flex()
@@ -1000,7 +1318,7 @@ impl Workspace {
                             .text_xs()
                             .line_height(px(16.))
                             .text_color(t.muted_foreground)
-                            .child(MODE_DESCRIPTIONS[index]),
+                            .child(shown_description),
                     ),
             )
             .into_any_element()
@@ -1038,9 +1356,71 @@ fn mini_switch(on: bool, t: &Tokens) -> impl IntoElement {
         .child(div().size(px(8.)).rounded_full().bg(if on { t.primary_foreground } else { t.muted_foreground }))
 }
 
+/// One permissions segment (`resolveRuntimeModeOptions`).
+struct PermissionOption {
+    mode: &'static str,
+    label: &'static str,
+    icon: Lucide,
+    description: &'static str,
+    /// The composer's provider runs it.
+    supported: bool,
+    /// Why an administrator's ceiling rules it out.
+    denial: Option<String>,
+}
+
+impl PermissionOption {
+    fn enabled(&self) -> bool {
+        self.supported && self.denial.is_none()
+    }
+}
+
+/// `managedRuntimeModeDenial`: why `policy`'s ceiling rules `mode` out, as
+/// "Example Corp limits threads to Auto-accept edits."
+fn runtime_mode_denial(policy: &Value, mode: &str) -> Option<String> {
+    let organization = policy["organization"].as_str()?;
+    let ceiling = policy.pointer("/limits/maxRuntimeMode")?.as_str()?;
+    let rank = |mode: &str| runtime_modes().iter().position(|(id, ..)| *id == mode);
+    let (_, label, _) = runtime_modes()[rank(ceiling)?];
+    (rank(mode)? > rank(ceiling)?).then(|| format!("{organization} limits threads to {label}."))
+}
+
+/// `clampManagedRuntimeMode`'s fallback: the broadest of `modes` (narrowest first) the policy allows.
+fn runtime_mode_fallback<'a>(policy: &Value, modes: &[&'a str]) -> Option<&'a str> {
+    modes.iter().rev().copied().find(|mode| runtime_mode_denial(policy, mode).is_none())
+}
+
+/// The permissions menu's arrows over its enabled `modes`: Left and Right stop at the ends,
+/// Up and Down wrap; from no highlight they start at the first or last.
+fn step_permission(modes: &[&'static str], focus: Option<&str>, key: &str) -> Option<&'static str> {
+    let last = modes.len().checked_sub(1)?;
+    let next = match (modes.iter().position(|mode| Some(*mode) == focus), key) {
+        (None, "down" | "right") => 0,
+        (None, _) => last,
+        (Some(i), "right") => (i + 1).min(last),
+        (Some(i), "left") => i.saturating_sub(1),
+        (Some(i), "down") => (i + 1) % modes.len(),
+        (Some(i), _) => i.checked_sub(1).unwrap_or(last),
+    };
+    Some(modes[next])
+}
+
+/// `Combobox` arrows: the first or last row from none, wrapping at either end.
+fn step_highlight(current: Option<usize>, count: usize, down: bool) -> usize {
+    match (down, current) {
+        (true, None) => 0,
+        (true, Some(i)) => (i + 1) % count,
+        (false, None | Some(0)) => count - 1,
+        (false, Some(i)) => (i - 1).min(count - 1),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DraftWorkspaceState, clipboard_path};
+    use super::{
+        DraftWorkspaceState, RefSearch, clipboard_path, runtime_mode_denial, runtime_mode_fallback, step_highlight,
+        step_permission,
+    };
+    use serde_json::json;
 
     #[test]
     fn a_draft_uses_the_worktree_it_picked_for_its_own_project() {
@@ -1049,6 +1429,66 @@ mod tests {
         state.choice.existing_worktree = Some(("/repo/wt".into(), Some("feature".into())));
         assert_eq!(state.existing_worktree("p"), Some("/repo/wt"));
         assert_eq!(state.existing_worktree("other"), None, "another project's draft keeps its root");
+    }
+
+    #[test]
+    fn ref_pages_merge_by_name_and_say_how_many_show() {
+        let mut search = RefSearch::default();
+        assert_eq!(search.status(), None);
+        search.pages.push(json!({"refs": [{"name": "a"}, {"name": "b"}], "nextCursor": 2, "totalCount": 3}));
+        assert_eq!(search.next_cursor(), Some(2));
+        assert_eq!(search.status().as_deref(), Some("Showing 2 of 3 refs"));
+        search.pages.push(
+            json!({"refs": [{"name": "b", "current": true}, {"name": "c"}], "nextCursor": null, "totalCount": 3}),
+        );
+        let refs = search.refs();
+        let names: Vec<&str> = refs.iter().filter_map(|r| r["name"].as_str()).collect();
+        assert_eq!(names, ["a", "b", "c"]);
+        assert_eq!(refs[1]["current"], true, "the later page's copy wins");
+        assert_eq!(search.next_cursor(), None);
+        assert_eq!(search.status(), None, "every ref shows");
+    }
+
+    #[test]
+    fn a_managed_ceiling_denies_broader_modes_and_falls_back_to_the_broadest_left() {
+        let policy =
+            json!({"organization": "Acme", "lockedSettings": [], "limits": {"maxRuntimeMode": "auto-accept-edits"}});
+        assert_eq!(runtime_mode_denial(&policy, "auto-accept-edits"), None);
+        assert_eq!(
+            runtime_mode_denial(&policy, "full-access").as_deref(),
+            Some("Acme limits threads to Auto-accept edits.")
+        );
+        assert_eq!(runtime_mode_denial(&json!({"organization": "Acme", "lockedSettings": []}), "full-access"), None);
+        assert_eq!(runtime_mode_denial(&serde_json::Value::Null, "full-access"), None, "unmanaged");
+        let modes = ["approval-required", "auto-accept-edits", "auto", "full-access"];
+        assert_eq!(runtime_mode_fallback(&policy, &modes), Some("auto-accept-edits"));
+        assert_eq!(runtime_mode_fallback(&policy, &modes[2..]), None, "nothing the provider runs is allowed");
+    }
+
+    #[test]
+    fn permission_arrows_skip_nothing_they_are_given() {
+        let modes = ["approval-required", "auto-accept-edits", "auto"];
+        assert_eq!(step_permission(&modes, None, "right"), Some("approval-required"));
+        assert_eq!(step_permission(&modes, None, "up"), Some("auto"));
+        assert_eq!(step_permission(&modes, Some("auto"), "right"), Some("auto"), "the row stops at its end");
+        assert_eq!(step_permission(&modes, Some("auto"), "down"), Some("approval-required"), "the menu wraps");
+        assert_eq!(step_permission(&modes, Some("approval-required"), "up"), Some("auto"));
+        assert_eq!(step_permission(&modes, Some("approval-required"), "left"), Some("approval-required"));
+        assert_eq!(
+            step_permission(&modes, Some("full-access"), "down"),
+            Some("approval-required"),
+            "a denied focus restarts"
+        );
+        assert_eq!(step_permission(&[], None, "down"), None);
+    }
+
+    #[test]
+    fn branch_arrows_wrap() {
+        assert_eq!(step_highlight(None, 3, true), 0);
+        assert_eq!(step_highlight(None, 3, false), 2);
+        assert_eq!(step_highlight(Some(2), 3, true), 0);
+        assert_eq!(step_highlight(Some(0), 3, false), 2);
+        assert_eq!(step_highlight(Some(5), 3, false), 2, "a highlight past a shrunk list comes back");
     }
 
     #[test]
