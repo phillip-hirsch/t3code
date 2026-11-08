@@ -52,7 +52,8 @@ pub(in crate::app) struct UsageState {
     /// When the last answer landed, and each environment's prices and aliases the read went out with.
     answered_at: Option<i64>,
     scan_settings: Vec<(SharedString, Value)>,
-    loading: bool,
+    /// Environments whose usage read is still out.
+    pending: Vec<SharedString>,
     refreshing: bool,
     generation: u64,
     limits_now: i64,
@@ -303,7 +304,7 @@ impl Default for UsageState {
             mismatches: Vec::new(),
             answered_at: None,
             scan_settings: Vec::new(),
-            loading: false,
+            pending: Vec::new(),
             refreshing: false,
             generation: 0,
             limits_now: now_ms(),
@@ -348,6 +349,64 @@ impl UsageState {
             Some((summary, _)) => logic::merge(summary, &self.hidden),
             None => Merged::default(),
         });
+    }
+
+    /// A selected environment's usage read is still out.
+    fn loading(&self) -> bool {
+        self.pending.iter().any(|id| self.is_selected(id))
+    }
+
+    /// One environment's answer to a read of `window`, shown as soon as it lands; the first
+    /// answer for a new window replaces the kept ones. Whether to ask again once its slow
+    /// sources finish (`awaitRefresh`).
+    fn publish(
+        &mut self,
+        environment_id: &SharedString,
+        result: Result<Value, crate::rpc::RpcError>,
+        window: &UsageWindow,
+        first_attempt: bool,
+    ) -> bool {
+        self.failures.retain(|(id, _)| id != environment_id);
+        let summary = match result.map(serde_json::from_value::<Summary>) {
+            Ok(Ok(summary)) => Some(summary),
+            Ok(Err(error)) => {
+                self.failures.push((environment_id.clone(), format!("Unreadable usage summary: {error}")));
+                None
+            }
+            Err(error) => {
+                self.failures.push((environment_id.clone(), usage_error(&error)));
+                None
+            }
+        };
+        let again = first_attempt && summary.as_ref().is_some_and(Summary::refreshing);
+        match summary {
+            Some(summary) => {
+                let answer = logic::EnvironmentUsage { environment_id: environment_id.to_string(), summary };
+                let answers = match &mut self.answers {
+                    Some((answers, shown)) if shown == window => answers,
+                    answers => &mut answers.insert((Vec::new(), window.clone())).0,
+                };
+                match answers.iter_mut().find(|kept| kept.environment_id == environment_id.as_ref()) {
+                    Some(kept) => *kept = answer,
+                    None => answers.push(answer),
+                }
+                self.answered_at = Some(now_ms());
+            }
+            // A machine that fails to answer leaves the others' usage showing.
+            None => {
+                if let Some((answers, _)) = &mut self.answers {
+                    answers.retain(|kept| kept.environment_id != environment_id.as_ref());
+                }
+            }
+        }
+        if !again {
+            self.pending.retain(|id| id != environment_id);
+        }
+        if !self.loading() {
+            self.refreshing = false;
+        }
+        self.recombine();
+        again
     }
 
     /// Whether to probe this environment's limits now: never while a probe is out, and an
@@ -416,7 +475,7 @@ impl Workspace {
     /// Reads usage again when the shown answer is stale or was priced differently; the old one
     /// stays on screen until the new one lands.
     fn revalidate_usage(&mut self, cx: &mut Context<Self>) {
-        if !self.usage.loading
+        if !self.usage.loading()
             && logic::needs_read(self.usage.answered_at, now_ms(), self.usage_scan_settings_changed())
         {
             self.read_usage(false, cx);
@@ -526,78 +585,47 @@ impl Workspace {
     /// asked again with `awaitRefresh`.
     fn read_usage(&mut self, refresh_rates: bool, cx: &mut Context<Self>) {
         let window = self.usage.window.clone();
-        let machines: Vec<(String, crate::rpc::RpcClient, Value)> = self
+        let machines: Vec<(SharedString, crate::rpc::RpcClient, Value)> = self
             .usage_machines()
             .into_iter()
-            .map(|(id, client, filter)| (id.to_string(), client, window.summary_input(&filter)))
+            .map(|(id, client, filter)| (id, client, window.summary_input(&filter)))
             .collect();
+        self.usage.scan_settings =
+            self.usage_environments().into_iter().map(|(id, _, info)| (id, scan_settings(info))).collect();
+        let usage = &mut self.usage;
         if machines.is_empty() {
+            usage.refreshing = false;
             return;
         }
-        let scan: Vec<(SharedString, Value)> =
-            self.usage_environments().into_iter().map(|(id, _, info)| (id, scan_settings(info))).collect();
-        // A refresh re-prices the selected environments; every one is read so a pick shows at once.
-        let rated: Vec<crate::rpc::RpcClient> = machines
-            .iter()
-            .filter(|(id, ..)| refresh_rates && self.usage.is_selected(id))
-            .map(|(_, client, _)| client.clone())
-            .collect();
-        let usage = &mut self.usage;
-        usage.scan_settings = scan;
         usage.generation += 1;
         let generation = usage.generation;
-        usage.loading = true;
-        cx.spawn(async move |this, cx| {
-            let refreshes = rated.iter().map(|client| client.request("server.refreshUsageRates", json!({})));
-            futures::future::join_all(refreshes).await;
-            let mut machines = machines;
-            for attempt in 0..2 {
-                let reads = machines.iter().map(|(id, client, input)| {
-                    let input = input.clone();
-                    async move { (id.clone(), client.request("server.getUsageSummary", input).await) }
-                });
-                let results = futures::future::join_all(reads).await;
-                let mut again = false;
-                let applied = this.update(cx, |this, cx| {
-                    let usage = &mut this.usage;
-                    if usage.generation != generation {
+        usage.pending = machines.iter().map(|(id, ..)| id.clone()).collect();
+        for (id, client, mut input) in machines {
+            // A refresh re-prices the selected environments; every one is read so a pick shows at once.
+            let reprice = refresh_rates && self.usage.is_selected(&id);
+            let window = window.clone();
+            // Each environment's answer shows when it lands, not when the slowest one does.
+            cx.spawn(async move |this, cx| {
+                if reprice {
+                    let _ = client.request("server.refreshUsageRates", json!({})).await;
+                }
+                for attempt in 0..2 {
+                    let result = client.request("server.getUsageSummary", input.clone()).await;
+                    let mut again = false;
+                    let applied = this.update(cx, |this, cx| {
+                        if this.usage.generation == generation {
+                            again = this.usage.publish(&id, result, &window, attempt == 0);
+                            cx.notify();
+                        }
+                    });
+                    if applied.is_err() || !again {
                         return;
                     }
-                    // A machine that fails to answer leaves the others' usage showing.
-                    let mut answers = Vec::new();
-                    usage.failures.clear();
-                    for (environment_id, result) in results {
-                        let failure = match result.map(serde_json::from_value::<Summary>) {
-                            Ok(Ok(summary)) => {
-                                answers.push(logic::EnvironmentUsage { environment_id, summary });
-                                continue;
-                            }
-                            Ok(Err(error)) => format!("Unreadable usage summary: {error}"),
-                            Err(error) => usage_error(&error),
-                        };
-                        usage.failures.push((environment_id.into(), failure));
-                    }
-                    again = attempt == 0 && answers.iter().any(|answer| answer.summary.refreshing());
-                    if !answers.is_empty() {
-                        usage.answered_at = Some(now_ms());
-                        usage.answers = Some((answers, window.clone()));
-                    }
-                    usage.recombine();
-                    this.usage.loading = again;
-                    if !again {
-                        this.usage.refreshing = false;
-                    }
-                    cx.notify();
-                });
-                if applied.is_err() || !again {
-                    return;
-                }
-                for (_, _, input) in &mut machines {
                     input["awaitRefresh"] = json!(true);
                 }
-            }
-        })
-        .detach();
+            })
+            .detach();
+        }
         cx.notify();
     }
 
@@ -840,9 +868,9 @@ impl Workspace {
                     "Unavailable"
                 } else if answer.is_some_and(|answer| !answer.summary.compatible()) {
                     "Update required"
-                } else if usage.loading && answer.is_none() {
+                } else if usage.pending.contains(id) && answer.is_none() {
                     "Scanning…"
-                } else if usage.loading {
+                } else if usage.pending.contains(id) {
                     "Refreshing…"
                 } else {
                     "Ready"
@@ -1033,7 +1061,7 @@ impl Workspace {
         // Saved prices or aliases reprice the scan (`refreshTrigger`); a stale answer waits for a reopen.
         // So does a pick of environments the last read missed.
         let unread = usage.summary.is_none() && usage.answers.is_some() && usage.error().is_none();
-        if !usage.loading && ((usage.summary.is_some() && self.usage_scan_settings_changed()) || unread) {
+        if !usage.loading() && ((usage.summary.is_some() && self.usage_scan_settings_changed()) || unread) {
             let view = cx.entity();
             cx.defer(move |cx| view.update(cx, |this, cx| this.read_usage(false, cx)));
         }
@@ -1184,7 +1212,7 @@ impl Workspace {
         let usage = &self.usage;
         let merged = usage.merged.clone();
         let tokens = usage.tokens();
-        let dim = |el: gpui_kit::Div| if usage.loading || usage.refreshing { el.opacity(0.4) } else { el };
+        let dim = |el: gpui_kit::Div| if usage.loading() || usage.refreshing { el.opacity(0.4) } else { el };
         let providers = logic::active_providers(&merged);
         let hourly = window.hours.is_some();
         let messages = summary.source_messages(&usage.hidden);
@@ -2745,7 +2773,11 @@ mod tests {
     }
 
     fn summary(cost: f64, host: &str) -> Summary {
-        serde_json::from_value(json!({
+        serde_json::from_value(summary_json(cost, host)).unwrap()
+    }
+
+    fn summary_json(cost: f64, host: &str) -> Value {
+        json!({
             "contractVersion": 6, "readAt": "2026-11-01T00:00:00Z",
             "buckets": [{
                 "day": "2026-11-01", "provider": "codex", "model": "m", "sourcePath": "/codex",
@@ -2753,8 +2785,7 @@ mod tests {
                 "costUsd": cost, "cacheSavingsUsd": 0, "costSource": "modelPriced", "records": 1, "unpricedRecords": 0, "sessions": 1,
             }],
             "sources": [{"fingerprint": {"provider": "codex", "resolvedHomePath": "/codex", "hostId": host}, "status": "ok"}],
-        }))
-        .unwrap()
+        })
     }
 
     #[test]
@@ -2779,6 +2810,32 @@ mod tests {
         usage.selected = Some(Vec::new());
         usage.recombine();
         assert!(usage.summary.is_none());
+    }
+
+    #[test]
+    fn each_environment_shows_as_soon_as_it_answers() {
+        let (a, b): (SharedString, SharedString) = ("a".into(), "b".into());
+        let month = local_window(30);
+        let mut usage = UsageState {
+            selected: Some(vec![a.clone()]),
+            pending: vec![a.clone(), b.clone()],
+            ..UsageState::default()
+        };
+        assert!(usage.loading());
+        assert!(!usage.publish(&a, Ok(summary_json(1., "box-a")), &month, true));
+        assert_eq!(usage.merged.cost_usd, 1., "a shows while b is still reading");
+        assert!(!usage.loading(), "only the picked environments' reads count");
+        usage.selected = None;
+        assert!(usage.loading());
+        usage.publish(&b, Err(crate::rpc::RpcError::Disconnected("gone".into())), &month, true);
+        assert_eq!((usage.loading(), usage.merged.cost_usd), (false, 1.), "b's failure leaves a showing");
+        assert!(usage.error().is_some());
+        usage.publish(&b, Ok(summary_json(2., "box-b")), &month, true);
+        assert_eq!((usage.error(), usage.merged.cost_usd), (None, 3.));
+        let mut refreshing = summary_json(4., "box-a");
+        refreshing["sources"][0]["refreshing"] = json!(true);
+        assert!(usage.publish(&a, Ok(refreshing), &local_window(7), true), "slow sources are asked again");
+        assert_eq!(usage.merged.cost_usd, 4., "the first answer for a new period replaces the kept ones");
     }
 
     #[test]
