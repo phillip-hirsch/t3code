@@ -831,7 +831,7 @@ pub(super) fn render_row(
             lane(6., rule_row(&t).child(h_flex().h(px(24.)).px(px(4.)).text_color(t.muted_foreground).child(label)))
                 .into_any_element()
         }
-        Row::TurnFold { key, label, expanded } => {
+        Row::TurnFold { key, label, expanded, created_at } => {
             let chevron = if *expanded { IconName::ChevronDown } else { IconName::ChevronRight };
             let button = h_flex()
                 .id(ElementId::Name(key.clone()))
@@ -844,7 +844,9 @@ pub(super) fn render_row(
                 .child(label.clone())
                 .child(Icon::new(chevron).size(px(14.)))
                 .on_click(toggle(this, key.clone()));
-            lane(6., rule_row(&t).child(button)).into_any_element()
+            let time = hover_timestamp(this, format!("time:{key}"), created_at, &t, cx);
+            lane(6., rule_row(&t).group("timeline-row").flex().items_center().child(button).children(time))
+                .into_any_element()
         }
         Row::Divider { label, failed, failure, .. } => {
             let color = if *failed { t.error } else { t.muted_foreground };
@@ -1496,6 +1498,27 @@ fn compaction_label(label: &SharedString) -> Vec<AnyElement> {
 }
 
 /// The working row and turn folds: a hairline under a 24px label line.
+/// `TimelineRowTimestamp`: the row's time at its end, shown while the row is hovered.
+fn hover_timestamp(
+    this: &WeakEntity<Workspace>,
+    id: String,
+    iso: &SharedString,
+    t: &Tokens,
+    cx: &App,
+) -> Option<AnyElement> {
+    let time = message_actions::timestamp(this, id.into(), iso, t, cx)?;
+    Some(
+        div()
+            .flex_none()
+            .ml_auto()
+            .mr(px(4.))
+            .opacity(0.)
+            .group_hover("timeline-row", |s| s.opacity(1.))
+            .child(time)
+            .into_any_element(),
+    )
+}
+
 fn rule_row(t: &Tokens) -> gpui_kit::Div {
     div()
         .pt(px(4.))
@@ -2327,10 +2350,17 @@ fn work_row(work: &WorkRow, this: &WeakEntity<Workspace>, t: &Tokens, cx: &mut A
     let row = div().w_full().min_w_0().rounded(px(6.)).px(px(2.)).py(px(2.));
     let content: AnyElement = match &work.kind {
         WorkRowKind::Single { entry, label, expanded } => single_entry(entry, label, *expanded, this, t, cx),
-        WorkRowKind::Toggle { group, summary, icon, .. } => row
+        WorkRowKind::Toggle { group, summary, icon, created_at, .. } => row
             .id(ElementId::Name(work.id.clone()))
+            .group("timeline-row")
             .cursor_pointer()
-            .child(work_line(*icon, icon_color(t), summary.clone(), muted, None))
+            .child(work_line(
+                *icon,
+                icon_color(t),
+                summary.clone(),
+                muted,
+                hover_timestamp(this, format!("time:{}", work.id), created_at, t, cx),
+            ))
             .on_click(toggle(this, group.clone()))
             .into_any_element(),
         WorkRowKind::Details { entries } => v_flex()
