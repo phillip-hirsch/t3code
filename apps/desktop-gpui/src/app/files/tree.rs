@@ -26,6 +26,30 @@ use crate::composer_text::{self, Chip};
 use crate::theme::Tokens;
 
 const ROW_HEIGHT: f32 = 24.;
+
+/// A tree row dragged toward the composer, which drops it in as a mention (`composerMentionDrag.ts`).
+pub(in crate::app) struct MentionDrag {
+    pub path: String,
+}
+
+/// What follows the pointer during a [`MentionDrag`]: the row's name.
+struct MentionDragPreview(SharedString);
+
+impl gpui_kit::Render for MentionDragPreview {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = crate::theme::tokens(cx);
+        div()
+            .px(px(8.))
+            .py(px(2.))
+            .rounded(px(6.))
+            .border_1()
+            .border_color(t.border)
+            .bg(t.popover)
+            .text_xs()
+            .text_color(t.foreground)
+            .child(self.0.clone())
+    }
+}
 /// `useDirectoryEntries` reads at most four folders at once.
 const MAX_LOADS: usize = 4;
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
@@ -683,6 +707,11 @@ impl Workspace {
             .text_color(if row.ignored { ignored.into() } else { fg })
             .when(selected, |el| el.bg(fg.opacity(0.12)))
             .when(!selected, |el| el.hover(move |s| s.bg(fg.opacity(0.07))))
+            // A drag never counts as the click that would open the row.
+            .on_drag(MentionDrag { path: row.path.clone() }, {
+                let label = SharedString::from(row.label.clone());
+                move |_, _, _, cx| cx.new(|_| MentionDragPreview(label.clone()))
+            })
             .on_click(cx.listener(move |this, _, window, cx| {
                 if let Some(tree) = this.tree(&click_key) {
                     tree.focused = Some(click_row.path.clone());
@@ -817,7 +846,7 @@ impl Workspace {
     }
 
     /// Add to chat: the file's mention at the end of the composer, after a space.
-    pub(super) fn add_file_to_chat(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(in crate::app) fn add_file_to_chat(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
         let chip = Chip::File { path: path.to_owned() };
         let link = composer_text::file_link(path);
         self.composer.update(cx, |state, cx| {

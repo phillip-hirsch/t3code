@@ -901,6 +901,18 @@ impl Workspace {
             } else {
                 vec![BoxShadow::new(px(0.), px(1.), black(0.05)).blur_radius(px(2.))]
             })
+            // A Files row dropped here joins the prompt as a mention (`isDragOverComposer`).
+            .drag_over::<super::files::MentionDrag>(move |style, _, _, _| {
+                style
+                    .bg(t.background.blend(t.card.opacity(t.glass)).blend(t.accent.opacity(0.45)))
+                    .border_color(t.primary.opacity(0.7))
+            })
+            .on_drop(cx.listener(|this, drag: &super::files::MentionDrag, window, cx| {
+                if this.target.is_some() {
+                    this.add_file_to_chat(&drag.path, window, cx);
+                    this.focus_composer(window, cx);
+                }
+            }))
             .on_modifiers_changed(cx.listener(|this, event: &ModifiersChangedEvent, _, cx| {
                 let held = event.modifiers.control || event.modifiers.platform;
                 if held != this.ctrl_held {
