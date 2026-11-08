@@ -429,7 +429,7 @@ mod tests {
         .unwrap();
         let themes = settings.themes.install(aurora).unwrap();
         let choice = ThemeChoice { base: Some("aurora".into()), library: themes.clone(), ..choice };
-        settings.set_themes(themes, choice.clone());
+        settings.set_themes(themes, choice.clone()).unwrap();
         let raw: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let reloaded = ClientSettings::from_stored(&raw, None);
         assert_eq!(reloaded.values.get("timestampFormat"), "24-hour");
