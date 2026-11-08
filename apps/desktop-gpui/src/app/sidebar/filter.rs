@@ -91,9 +91,19 @@ impl Workspace {
         let Some(filter) = &self.sidebar.filter else { return };
         let query = filter.query.read(cx).value().to_string();
         let groups = self.project_groups();
-        let rows: Vec<Option<String>> =
-            Self::filter_rows(&groups, &query).into_iter().map(|g| g.map(|g| g.key.clone())).collect();
+        let shown = Self::filter_rows(&groups, &query);
         let highlight = filter.highlight;
+        // The thread pin shortcut pins the highlighted project here (`Sidebar.tsx`).
+        if self.is_pin_shortcut(&event.keystroke) {
+            if let Some(Some(group)) = shown.get(highlight) {
+                let members: Vec<String> = group.members.iter().map(|m| m.project.id.clone()).collect();
+                let pinned = group.pinned;
+                self.set_projects_pinned(&members, !pinned, cx);
+                cx.stop_propagation();
+            }
+            return;
+        }
+        let rows: Vec<Option<String>> = shown.into_iter().map(|g| g.map(|g| g.key.clone())).collect();
         match event.keystroke.key.as_str() {
             "escape" => self.close_filter(cx),
             "down" | "up" if !rows.is_empty() => {
@@ -415,6 +425,7 @@ impl Workspace {
         }));
         let popup = v_flex()
             .id("sidebar-filter-popup")
+            .key_context(crate::app::keymap::COMBOBOX_CONTEXT)
             .occlude()
             .w(px(288.))
             .max_h(px(368.))
