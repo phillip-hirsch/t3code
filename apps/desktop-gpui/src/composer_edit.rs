@@ -456,7 +456,9 @@ pub fn code_tab(text: &str, selection: Range<usize>, outdent: bool) -> Option<Ed
     }
     let line_start =
         text[block.code.start..selection.start].rfind('\n').map_or(block.code.start, |i| block.code.start + i + 1);
-    let search = selection.start.max(selection.end.saturating_sub(1)).min(block.code.end);
+    // The selection's last character, so a selection ending after a newline leaves the next line.
+    let last = text[..selection.end].char_indices().next_back().map_or(0, |(i, _)| i);
+    let search = selection.start.max(last).min(block.code.end);
     let line_end = text[search..block.code.end].find('\n').map_or(block.code.end, |i| search + i);
     let original: Vec<&str> = text[line_start..line_end].split('\n').collect();
     let next: Vec<String> = original
@@ -613,6 +615,9 @@ mod tests {
         let edit = code_tab(indented, 6..9, true).unwrap();
         assert_eq!((apply(indented, &edit), edit.select), ("```\na\nb\n```".to_owned(), 4..6));
         assert!(code_tab("```\na\n```", 4..4, true).unwrap().is_noop());
+        let wide = "```\n  \u{e9}\n```";
+        let edit = code_tab(wide, 6..8, true).unwrap();
+        assert_eq!((apply(wide, &edit), edit.select), ("```\n\u{e9}\n```".to_owned(), 4..6));
         assert_eq!(code_tab("- a", 3..3, false), None);
     }
 }
