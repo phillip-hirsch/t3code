@@ -256,3 +256,7 @@ trigger"), so `src/tooltip.rs` drops the `m_3`. Its popup also takes `TooltipPop
 
 **Soft breaks can render as line breaks.** `src/text/compat.rs`: `TextView::markdown_line_breaks`,
 passing through to gpui-base's (see its "Soft breaks can render as line breaks").
+
+**A thread's timeline reopens where it was left.** 0.9.0's `MessageScrollerState` scrolls only to
+a row's top. `src/message_scroller.rs`: `scroll_to_offset` scrolls to a row and an offset into
+it, the `logical_scroll_top` it reported.

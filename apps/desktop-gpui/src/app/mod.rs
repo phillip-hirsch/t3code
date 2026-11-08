@@ -65,6 +65,7 @@ mod pages;
 mod palette;
 mod palette_actions;
 mod plan_actions;
+mod positions;
 mod preview;
 mod prompt_stash;
 mod queue;
@@ -161,6 +162,9 @@ pub struct Workspace {
     markdown: chat::MarkdownStates,
     /// Output of the open tool entries.
     details: inspector::Details,
+    /// Where each timeline was left, and where the open one scrolls once its rows arrive.
+    positions: positions::Positions,
+    pending_position: Option<gpui_kit::ListOffset>,
     copy_feedback: message_actions::CopyFeedback,
     /// The minimap tick under the pointer.
     minimap_hover: Option<usize>,
@@ -385,6 +389,8 @@ impl Workspace {
             rows_notice_run: None,
             markdown: chat::MarkdownStates::default(),
             details: inspector::Details::default(),
+            positions: positions::Positions::default(),
+            pending_position: None,
             copy_feedback: message_actions::CopyFeedback::default(),
             minimap_hover: None,
             _working_tick: None,
@@ -826,6 +832,9 @@ impl Workspace {
                 scroller.splice(range, count, cx);
             }
         });
+        if self.open_projection().is_some() {
+            self.restore_position(cx);
+        }
     }
 
     /// Opens a listed thread on the environment it lives on.
@@ -845,6 +854,7 @@ impl Workspace {
         }
         self.page = None;
         self.stash_composer(cx);
+        self.remember_position(cx);
         let leaving = self.target.replace(target);
         if let (Some(old), Some(leaving)) = (self.thread.take(), leaving) {
             self.retire_thread(leaving.environment(), old.id, old.state, cx);
@@ -886,6 +896,9 @@ impl Workspace {
         let target = Target::Draft { env, project_id };
         let opened = self.target.as_ref() != Some(&target);
         let carried = self.carried_model();
+        if opened {
+            self.remember_position(cx);
+        }
         let leaving = self.target.replace(target);
         if let (Some(old), Some(leaving)) = (self.thread.take(), leaving) {
             self.retire_thread(leaving.environment(), old.id, old.state, cx);
@@ -919,6 +932,7 @@ impl Workspace {
         self.details = inspector::Details::default();
         self._working_tick = None;
         self.scroller.update(cx, |scroller, cx| scroller.reset(0, cx));
+        self.recall_position();
     }
 
     fn focus_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
