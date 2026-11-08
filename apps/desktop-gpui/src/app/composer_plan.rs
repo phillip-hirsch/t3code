@@ -153,7 +153,7 @@ impl Workspace {
         self.active_plan_follow_up().is_some()
     }
 
-    fn active_plan_follow_up(&self) -> Option<(&str, &str)> {
+    pub(super) fn active_plan_follow_up(&self) -> Option<(&str, &str)> {
         let projection = self.open_projection()?;
         let (enabled, mode) = self.interaction_mode();
         if !enabled

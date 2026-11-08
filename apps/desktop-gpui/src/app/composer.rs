@@ -625,6 +625,9 @@ impl Workspace {
                 "Choose an option above"
             };
         }
+        if self.has_plan_follow_up() {
+            return "Add feedback to refine the plan, or leave this blank to implement it";
+        }
         if self.target.is_none() {
             return "Choose a project above to start a thread";
         }
@@ -1241,7 +1244,7 @@ impl Workspace {
             .chain(self.render_extension_status_banner(t))
             .chain(self.render_fresh_session_banner(t, cx))
             .chain(self.render_branch_banner(t, cx))
-            .chain(self.render_question(t, cx))
+            .chain(self.render_question(t, cx).or_else(|| self.render_plan_ready(t)))
             .chain(self.render_child_approvals(t, cx))
             .collect();
         let badge = self.render_stash_badge(t, cx);
@@ -1475,37 +1478,52 @@ impl Workspace {
                     },
                 )))
         });
-        let outline = if t.dark { white(0.05) } else { black(0.08) };
-        Some(
-            div()
-                .mb(px(-17.))
-                .child(
-                    v_flex()
-                        .px(px(4.))
-                        .pt(px(4.))
-                        // 4px padding plus the 17px the composer covers.
-                        .pb(px(21.))
-                        .rounded_t(px(16.))
-                        .border_1()
-                        .border_color(outline)
-                        .bg(t.card.opacity(t.glass))
-                        .text_xs()
-                        .line_height(px(16.))
-                        .shadow(if t.dark {
-                            vec![
-                                BoxShadow::new(px(0.), px(14.), black(0.75))
-                                    .blur_radius(px(32.))
-                                    .spread_radius(px(-18.)),
-                            ]
-                        } else {
-                            vec![BoxShadow::new(px(0.), px(1.), black(0.05)).blur_radius(px(2.))]
-                        })
-                        .child(header)
-                        .children(body),
-                )
-                .into_any_element(),
-        )
+        Some(top_drawer(v_flex().child(header).children(body), t))
     }
+
+    /// `ComposerPlanFollowUpBanner`: the plan the next send refines or implements.
+    fn render_plan_ready(&self, t: &Tokens) -> Option<AnyElement> {
+        let (_, markdown) = self.active_plan_follow_up()?;
+        let title = crate::proposed_plan::title(markdown).map(str::to_owned);
+        let row = h_flex()
+            .min_h(px(24.))
+            .gap(px(4.))
+            .child(div().w(px(24.)).flex_none())
+            .child(div().flex_none().font_weight(FontWeight::MEDIUM).text_color(t.muted_foreground).child("Plan ready"))
+            .children(
+                title.map(|title| {
+                    div().flex_1().min_w_0().truncate().text_color(t.foreground.opacity(0.85)).child(title)
+                }),
+            );
+        Some(top_drawer(row, t))
+    }
+}
+
+/// `ComposerBanner.Root variant="info"` in the top drawer, its bottom tucked under the composer.
+fn top_drawer(content: impl IntoElement, t: &Tokens) -> AnyElement {
+    let outline = if t.dark { white(0.05) } else { black(0.08) };
+    div()
+        .mb(px(-17.))
+        .child(
+            v_flex()
+                .px(px(4.))
+                .pt(px(4.))
+                // 4px padding plus the 17px the composer covers.
+                .pb(px(21.))
+                .rounded_t(px(16.))
+                .border_1()
+                .border_color(outline)
+                .bg(t.card.opacity(t.glass))
+                .text_xs()
+                .line_height(px(16.))
+                .shadow(if t.dark {
+                    vec![BoxShadow::new(px(0.), px(14.), black(0.75)).blur_radius(px(32.)).spread_radius(px(-18.))]
+                } else {
+                    vec![BoxShadow::new(px(0.), px(1.), black(0.05)).blur_radius(px(2.))]
+                })
+                .child(content),
+        )
+        .into_any_element()
 }
 
 fn render_option(
