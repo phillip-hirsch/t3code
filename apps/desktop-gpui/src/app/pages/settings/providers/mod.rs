@@ -40,6 +40,7 @@ use crate::app::Workspace;
 use crate::settings::contract;
 use crate::settings::scope::ScopeKind;
 use crate::theme::{self, Tokens};
+use crate::usage::provider_display_name;
 
 /// A driver's label and its settings that may name a secret reference, with their field labels.
 pub(super) fn driver_secret_fields(kind: &str) -> Option<(&'static str, Vec<(&'static str, &'static str)>)> {
@@ -123,6 +124,65 @@ fn selected_row(
     let missing = target.is_some() && selected == target && !rows.iter().any(|row| Some(row.id.as_str()) == target);
     let row = rows.iter().find(|row| Some(row.id.as_str()) == selected).or(if missing { None } else { rows.first() });
     (row.cloned(), missing)
+}
+
+/// One environment's "Update all" candidates, as `(driver, instance id)`.
+struct UpdateMachine {
+    environment: SharedString,
+    label: String,
+    candidates: Vec<(String, String)>,
+}
+
+/// One dispatched `server.updateProvider` (`ProviderUpdateRun`).
+struct UpdateRun {
+    machine: String,
+    driver: String,
+    instance_id: String,
+    result: Result<Value, crate::rpc::RpcError>,
+}
+
+/// `getProviderUpdateRunToastView`: whether all succeeded, the title and the description.
+fn update_runs_summary(runs: &[UpdateRun]) -> Option<(bool, String, String)> {
+    if runs.is_empty() {
+        return None;
+    }
+    let failures: Vec<String> = runs
+        .iter()
+        .filter_map(|run| {
+            let label = format!("{} · {}", run.machine, provider_display_name(&run.driver));
+            match &run.result {
+                Err(error) => Some(format!("{label}: {}", acp::rpc_message(error))),
+                Ok(reply) => {
+                    let state = reply["providers"]
+                        .as_array()
+                        .and_then(|providers| providers.iter().find(|p| p["instanceId"] == run.instance_id.as_str()))
+                        .map(|provider| &provider["updateState"]);
+                    (state.and_then(|s| s["status"].as_str()) != Some("succeeded")).then(|| {
+                        let message =
+                            state.and_then(|s| s["message"].as_str()).unwrap_or("Provider update did not finish.");
+                        format!("{label}: {message}")
+                    })
+                }
+            }
+        })
+        .collect();
+    let total = runs.len();
+    if failures.is_empty() {
+        let (title, description) = if total == 1 {
+            ("Provider updated".to_owned(), "New sessions will use the updated provider.")
+        } else {
+            (format!("{total} providers updated"), "New sessions will use the updated providers.")
+        };
+        return Some((true, title, description.to_owned()));
+    }
+    let title = if failures.len() < total {
+        format!("{} of {total} provider updates failed", failures.len())
+    } else if total == 1 {
+        "Provider update failed".to_owned()
+    } else {
+        "Provider updates failed".to_owned()
+    };
+    Some((false, title, failures.join("\n")))
 }
 
 /// The detail card's height: `h-[min(44rem,calc(100dvh-11rem))] min-h-[32rem]`.
@@ -306,7 +366,7 @@ impl Workspace {
                                 })),
                         )
                     }))
-                    .child(self.render_providers_header_actions(&page, read_only, &t, cx)),
+                    .child(self.render_providers_header_actions(&page, &t, cx)),
             )
             .when(read_only, |el| {
                 let label = view.label_of(self.settings_environment().as_deref().unwrap_or_default()).to_owned();
@@ -334,14 +394,24 @@ impl Workspace {
     fn render_providers_header_actions(
         &self,
         page: &Entity<ProvidersPage>,
-        read_only: bool,
         t: &Tokens,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let state = page.read(cx);
         let refreshing = state.refreshing;
         let updating_all = state.updating_all;
-        let candidates = instances::one_click_update_candidates(&self.settings_info().providers_json);
+        let machines = self.provider_update_machines();
+        // `ProviderUpdatesAction`'s tooltip: each machine and the providers it would update.
+        let update_tooltip: SharedString = machines
+            .iter()
+            .map(|machine| {
+                let names: Vec<&str> =
+                    machine.candidates.iter().map(|(driver, _)| provider_display_name(driver)).collect();
+                format!("{}: {}", machine.label, names.join(", "))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into();
         let label: Option<SharedString> = if refreshing {
             Some("Refreshing providers".into())
         } else {
@@ -352,11 +422,11 @@ impl Workspace {
         h_flex()
             .gap_2()
             .mr(px(-8.))
-            .when(!read_only && (!candidates.is_empty() || updating_all), |el| {
+            .when(!machines.is_empty() || updating_all, |el| {
                 el.child(
                     ghost_text_button("providers-update-all", if updating_all { "Updating…" } else { "Update all" }, t)
                         .disabled(updating_all)
-                        .tooltip("Update every provider with an update available")
+                        .when(!machines.is_empty(), |button| button.tooltip(update_tooltip))
                         .on_click(
                             cx.listener(move |this, _, window, cx| this.update_all_providers(&update_page, window, cx)),
                         ),
@@ -587,33 +657,65 @@ impl Workspace {
         );
     }
 
-    /// "Update all": every one-click update candidate, then one summary notification.
+    /// `useProviderUpdates().machines`: each connected environment this session may manage,
+    /// with its one-click update candidates.
+    fn provider_update_machines(&self) -> Vec<UpdateMachine> {
+        self.sessions
+            .iter()
+            .filter(|session| session.is_connected())
+            .filter_map(|session| {
+                let id = session.id.clone()?;
+                if !self.environment_grants(&id, PROVIDERS_MANAGE) {
+                    return None;
+                }
+                let candidates = instances::one_click_update_candidates(&session.server_info.providers_json);
+                let label = session.server_info.environment_label.clone().unwrap_or_else(|| id.to_string());
+                (!candidates.is_empty()).then_some(UpdateMachine { environment: id, label, candidates })
+            })
+            .collect()
+    }
+
+    /// "Update all": every machine's candidates at once, then one summary notification.
     fn update_all_providers(&mut self, page: &Entity<ProvidersPage>, window: &mut Window, cx: &mut Context<Self>) {
-        let candidates = instances::one_click_update_candidates(&self.settings_info().providers_json);
-        let Some(client) = self.settings_client() else { return };
-        if candidates.is_empty() || page.read(cx).updating_all || self.providers_read_only() {
+        let machines = self.provider_update_machines();
+        if machines.is_empty() || page.read(cx).updating_all {
             return;
         }
+        let requests: Vec<_> = machines
+            .into_iter()
+            .filter_map(|machine| Some((self.env_client(&machine.environment)?, machine)))
+            .flat_map(|(client, machine)| {
+                machine.candidates.into_iter().map(move |(driver, instance_id)| {
+                    let (client, environment, label) =
+                        (client.clone(), machine.environment.clone(), machine.label.clone());
+                    async move {
+                        let payload = json!({"provider": driver, "instanceId": instance_id});
+                        let result = client.request("server.updateProvider", payload).await;
+                        (environment, UpdateRun { machine: label, driver, instance_id, result })
+                    }
+                })
+            })
+            .collect();
         page.update(cx, |page, cx| {
             page.updating_all = true;
             cx.notify();
         });
         let page = page.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let mut failures = Vec::new();
-            for (driver, instance_id) in candidates {
-                let payload = json!({"provider": driver, "instanceId": instance_id});
-                if let Err(error) = client.request("server.updateProvider", payload).await {
-                    failures
-                        .push(format!("{}: {error}", drivers::driver(&driver).map_or(driver.as_str(), |d| d.label)));
+            let runs = futures::future::join_all(requests).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                for (environment, run) in &runs {
+                    if let Ok(reply) = &run.result {
+                        this.apply_environment_event(
+                            environment,
+                            &json!({"type": "providerStatuses", "payload": reply}),
+                        );
+                    }
                 }
-            }
-            let _ = this.update_in(cx, |_, window, cx| {
-                if !failures.is_empty() {
-                    window.push_notification(
-                        Notification::error(failures.join("\n")).title("Some providers could not update"),
-                        cx,
-                    );
+                let runs: Vec<UpdateRun> = runs.into_iter().map(|(_, run)| run).collect();
+                if let Some((ok, title, description)) = update_runs_summary(&runs) {
+                    let note = if ok { Notification::success(description) } else { Notification::error(description) };
+                    window.push_notification(note.title(title), cx);
                 }
                 page.update(cx, |page, cx| {
                     page.updating_all = false;
@@ -1016,6 +1118,41 @@ fn dot(color: Hsla) -> impl IntoElement {
 mod tests {
     use super::*;
     use crate::app::pages::settings::connections::logic::Session;
+
+    #[test]
+    fn update_all_summarizes_every_machine_like_the_web_toast() {
+        let run = |machine: &str, driver: &str, result| UpdateRun {
+            machine: machine.into(),
+            driver: driver.into(),
+            instance_id: driver.into(),
+            result,
+        };
+        let reply = |instance: &str, status: &str| {
+            Ok(
+                json!({"providers": [{"instanceId": instance, "updateState": {"status": status, "message": "npm failed"}}]}),
+            )
+        };
+        assert_eq!(update_runs_summary(&[]), None);
+        assert_eq!(
+            update_runs_summary(&[run("Laptop", "codex", reply("codex", "succeeded"))]),
+            Some((true, "Provider updated".into(), "New sessions will use the updated provider.".into()))
+        );
+        let failed = crate::rpc::RpcError::Failure(json!({"message": "offline"}));
+        assert_eq!(
+            update_runs_summary(&[
+                run("Laptop", "codex", reply("codex", "succeeded")),
+                run("Server", "claudeAgent", reply("claudeAgent", "failed")),
+                run("Server", "codex", Err(failed)),
+            ]),
+            Some((
+                false,
+                "2 of 3 provider updates failed".into(),
+                "Server · Claude: npm failed
+Server · Codex: offline"
+                    .into()
+            ))
+        );
+    }
 
     #[test]
     fn a_navigation_target_opens_its_provider_or_says_it_is_gone() {
