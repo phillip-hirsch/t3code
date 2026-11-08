@@ -247,6 +247,26 @@ impl Workspace {
         self.set_pull_request_scope(cx, |state| state.sent = typed);
     }
 
+    /// `PullRequestsColumn`'s window listener: a bare Cmd/Ctrl+F no shortcut claimed focuses and
+    /// selects the search.
+    pub(in crate::app) fn pull_request_find_key(
+        &mut self,
+        keystroke: &gpui_kit::Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let m = &keystroke.modifiers;
+        let find = keystroke.key.eq_ignore_ascii_case("f") && (m.control || m.platform) && !m.alt && !m.shift;
+        if !find || self.page != Some(super::Page::PullRequests) || self.settings.is_some() {
+            return false;
+        }
+        self.pull_requests.search.update(cx, |input, cx| {
+            input.focus(window, cx);
+            input.select_all(window, cx);
+        });
+        true
+    }
+
     fn clear_pull_request_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.pull_requests.search.update(cx, |search, cx| search.set_value("", window, cx));
     }

@@ -48,6 +48,9 @@ impl Workspace {
             self.held_key = Some(keystroke.clone());
             return true;
         }
+        if self.pull_request_find_key(keystroke, window, cx) {
+            return true;
+        }
         self.composer_key(keystroke, &context, window, cx)
     }
 
