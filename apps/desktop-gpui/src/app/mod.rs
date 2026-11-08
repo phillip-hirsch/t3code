@@ -883,6 +883,9 @@ impl Workspace {
         self.stash_composer(cx);
         let target = Target::Draft { env, project_id };
         let opened = self.target.as_ref() != Some(&target);
+        if opened && !self.composer_drafts.contains_key(&target) {
+            self.forget_draft_routing(&target);
+        }
         let carried = self.carried_model();
         let leaving = self.target.replace(target);
         if let (Some(old), Some(leaving)) = (self.thread.take(), leaving) {

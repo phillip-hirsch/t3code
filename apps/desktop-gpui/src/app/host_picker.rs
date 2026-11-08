@@ -47,23 +47,40 @@ enum Sampling {
     Failed,
 }
 
+/// The last sample of the machines (`useLoadBalancedEnvironment`): it speaks for one draft and
+/// one set of candidates only, so another draft, or a change in who can run it, samples again.
+#[derive(Debug, PartialEq)]
+struct Sample {
+    target: Target,
+    candidates: Vec<SharedString>,
+    state: Sampling,
+}
+
+/// Where sampling stands for `target`'s draft with these `candidates`.
+fn sampling_for(sample: Option<&Sample>, target: &Target, candidates: &[SharedString]) -> Sampling {
+    sample.filter(|s| s.target == *target && s.candidates == candidates).map_or(Sampling::Idle, |s| s.state)
+}
+
 #[derive(Default)]
 pub(super) struct HostUi {
     open: bool,
-    /// By project group key, as the web keeps one draft per logical project.
-    selections: HashMap<String, Selection>,
-    sampling: Sampling,
+    /// By draft, as the web keeps them on each draft session: they follow it from machine to
+    /// machine, and a new draft starts without them.
+    selections: HashMap<Target, Selection>,
+    sample: Option<Sample>,
     _sample: Option<Task<()>>,
 }
 
-impl Workspace {
-    /// The open draft's or thread's project group key.
-    fn target_group_key(&self) -> Option<String> {
-        let project = self.target_project()?;
-        let groups = self.project_groups();
-        groups.iter().find(|g| g.contains(&project.id)).map(|g| g.key.clone())
+impl HostUi {
+    /// The draft moved from `from` to `to`, and its routing goes with it.
+    fn carry(&mut self, from: &Target, to: &Target) {
+        if let Some(selection) = self.selections.remove(from) {
+            self.selections.insert(to.clone(), selection);
+        }
     }
+}
 
+impl Workspace {
     fn option_for(&self, environment_id: &SharedString, project_id: Option<String>) -> EnvironmentOption {
         let info = self.session(environment_id).map(|s| &s.server_info);
         EnvironmentOption {
@@ -131,7 +148,19 @@ impl Workspace {
     }
 
     fn selection(&self) -> Option<&Selection> {
-        self.host.selections.get(&self.target_group_key()?)
+        self.host.selections.get(self.target.as_ref()?)
+    }
+
+    /// A draft opened afresh on `target` starts on load balancing again.
+    pub(super) fn forget_draft_routing(&mut self, target: &Target) {
+        self.host.selections.remove(target);
+    }
+
+    fn sampling(&self, options: &[EnvironmentOption]) -> Sampling {
+        let Some(target) = &self.target else { return Sampling::Idle };
+        let candidates: Vec<SharedString> =
+            self.load_balancing_candidates(options).into_iter().map(|(id, _, _)| id).collect();
+        sampling_for(self.host.sample.as_ref(), target, &candidates)
     }
 
     /// `automaticEnvironment`: the draft's machine is load balancing's choice.
@@ -154,7 +183,7 @@ impl Workspace {
             return None;
         }
         let picked = matches!(self.selection(), Some(Selection::Auto { picked: Some(_) }));
-        Some(match self.host.sampling {
+        Some(match self.sampling(options) {
             Sampling::Pending if !picked => "Checking machines…",
             Sampling::Failed if !picked => "Auto balance unavailable",
             _ => "Auto balance",
@@ -164,11 +193,11 @@ impl Workspace {
     /// Moves the draft to `option`'s checkout, opening its "No project" folder first if needed
     /// (`onEnvironmentChange`). A pick by hand turns load balancing off for this draft.
     fn change_environment(&mut self, option: EnvironmentOption, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(key) = self.target_group_key() else { return };
+        let Some(target @ Target::Draft { .. }) = self.target.clone() else { return };
         self.host.open = false;
-        self.host.selections.insert(key, Selection::Manual);
+        self.host.selections.insert(target, Selection::Manual);
         self.host._sample = None;
-        self.host.sampling = Sampling::Idle;
+        self.host.sample = None;
         let Some(project_id) = option.project_id else {
             self.open_scratch_then_retarget(option.environment_id, window, cx);
             return;
@@ -178,10 +207,10 @@ impl Workspace {
 
     /// The draft keeps its text and moves to another checkout of its project.
     pub(super) fn retarget_draft(&mut self, env: SharedString, project_id: String, cx: &mut Context<Self>) {
-        if !matches!(self.target, Some(Target::Draft { .. })) {
-            return;
-        }
-        self.target = Some(Target::Draft { env, project_id });
+        let Some(from @ Target::Draft { .. }) = self.target.clone() else { return };
+        let to = Target::Draft { env, project_id };
+        self.host.carry(&from, &to);
+        self.target = Some(to);
         self.sync_draft_workspace(cx);
         self.sync_attachment_uploads(cx);
         self.model_override = None;
@@ -249,12 +278,12 @@ impl Workspace {
             window.push_notification(Notification::warning(message).title("Keep attachments on this machine"), cx);
             return;
         }
-        let Some(key) = self.target_group_key() else { return };
-        self.host.selections.insert(key, Selection::Auto { picked: None });
+        let Some(target) = self.target.clone() else { return };
+        self.host.selections.insert(target, Selection::Auto { picked: None });
         self.draft_workspace.choice.branch = None;
         self.draft_workspace.choice.existing_worktree = None;
         self.host._sample = None;
-        self.host.sampling = Sampling::Idle;
+        self.host.sample = None;
         self.sync_load_balancing(cx);
         cx.notify();
     }
@@ -262,9 +291,8 @@ impl Workspace {
     /// Samples the candidate machines once an automatic draft has no machine yet, then moves
     /// the draft to the pick (`useLoadBalancedEnvironment` and its effect). Cheap when idle.
     pub(super) fn sync_load_balancing(&mut self, cx: &mut Context<Self>) {
+        let Some(origin @ Target::Draft { .. }) = self.target.clone() else { return };
         if !self.client_settings.values.bool("loadBalancingEnabled")
-            || !matches!(self.target, Some(Target::Draft { .. }))
-            || self.host.sampling != Sampling::Idle
             || matches!(self.selection(), Some(Selection::Auto { picked: Some(_) }))
         {
             return;
@@ -273,10 +301,12 @@ impl Workspace {
         if !self.automatic_environment(&options) {
             return;
         }
-        let Some(key) = self.target_group_key() else { return };
         let candidates = self.load_balancing_candidates(&options);
-        self.host.sampling = Sampling::Pending;
-        let origin = self.target.clone();
+        let ids: Vec<SharedString> = candidates.iter().map(|(id, _, _)| id.clone()).collect();
+        if sampling_for(self.host.sample.as_ref(), &origin, &ids) != Sampling::Idle {
+            return;
+        }
+        self.host.sample = Some(Sample { target: origin.clone(), candidates: ids, state: Sampling::Pending });
         self.host._sample = Some(cx.spawn(async move |this, cx| {
             let requests = candidates.iter().map(|(id, client, weight)| async move {
                 let resources = client.request("server.getHostResources", json!({})).await.ok();
@@ -293,12 +323,16 @@ impl Workspace {
                 let picked = load_balancing::choose(&sampled, super::sidebar::now_ms()).map(SharedString::from);
                 let target = picked.as_ref().and_then(|id| options.iter().find(|o| o.environment_id == *id));
                 match target.and_then(|o| Some((o.environment_id.clone(), o.project_id.clone()?))) {
-                    Some((env, project_id)) if this.target == origin => {
-                        this.host.sampling = Sampling::Idle;
-                        this.host.selections.insert(key, Selection::Auto { picked: Some(env.clone()) });
+                    Some((env, project_id)) if this.target.as_ref() == Some(&origin) => {
+                        this.host.sample = None;
+                        this.host.selections.insert(origin, Selection::Auto { picked: Some(env.clone()) });
                         this.retarget_draft(env, project_id, cx);
                     }
-                    _ => this.host.sampling = Sampling::Failed,
+                    _ => {
+                        if let Some(sample) = this.host.sample.as_mut().filter(|s| s.target == origin) {
+                            sample.state = Sampling::Failed;
+                        }
+                    }
                 }
                 cx.notify();
             });
@@ -473,6 +507,38 @@ impl Workspace {
                 ));
         }
         menu.into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn draft(env: &str, project: &str) -> Target {
+        Target::Draft { env: env.to_owned().into(), project_id: project.to_owned() }
+    }
+
+    #[test]
+    fn a_failed_sample_holds_only_for_its_draft_and_candidates() {
+        let (a, b) = (draft("local", "web"), draft("local", "api"));
+        let candidates: Vec<SharedString> = vec!["local".into(), "remote".into()];
+        let failed = Sample { target: a.clone(), candidates: candidates.clone(), state: Sampling::Failed };
+        assert_eq!(sampling_for(Some(&failed), &a, &candidates), Sampling::Failed);
+        assert_eq!(sampling_for(Some(&failed), &b, &candidates), Sampling::Idle, "another draft samples");
+        assert_eq!(sampling_for(Some(&failed), &a, &candidates[..1]), Sampling::Idle, "the candidates changed");
+        assert_eq!(sampling_for(None, &a, &candidates), Sampling::Idle);
+    }
+
+    #[test]
+    fn routing_follows_its_draft_and_stays_off_other_drafts() {
+        let mut host = HostUi::default();
+        let (here, there) = (draft("local", "web"), draft("remote", "web-copy"));
+        host.selections.insert(here.clone(), Selection::Manual);
+        host.carry(&here, &there);
+        assert_eq!(host.selections.get(&there), Some(&Selection::Manual));
+        assert_eq!(host.selections.get(&here), None, "a new draft back on the first machine starts fresh");
+        host.carry(&draft("local", "api"), &here);
+        assert_eq!(host.selections.get(&here), None, "a draft without a choice carries none");
     }
 }
 
