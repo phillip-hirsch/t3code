@@ -560,6 +560,7 @@ impl Workspace {
         };
         self.terminals.focus_pending = Some(terminal_id.clone());
         let payload = launch.payload(&thread_id, &terminal_id);
+        let origin = self.thread_target(&thread_id).or_else(|| self.target.clone());
         cx.spawn(async move |this, cx| {
             let mut result = client.request("terminal.open", payload).await.map(drop);
             if let (Ok(()), Some(data)) = (&result, then_write) {
@@ -570,7 +571,7 @@ impl Workspace {
                 Ok(()) => true,
                 Err(error) => {
                     let _ = this.update(cx, |this, cx| {
-                        this.error = Some(error.to_string().into());
+                        this.set_error_from(origin.as_ref(), error.to_string().into());
                         cx.notify();
                     });
                     false

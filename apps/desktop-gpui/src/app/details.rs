@@ -1246,10 +1246,11 @@ impl Workspace {
             "remoteName": remote_name,
             "protocol": options.protocol,
         });
+        let origin = self.target.clone();
         cx.spawn(async move |this, cx| {
             let result = client.request("sourceControl.publishRepository", input).await;
-            let _ =
-                this.update(cx, |this, cx| this.finish_vcs(client, checkout, result.err().map(|e| e.to_string()), cx));
+            let error = result.err().map(|e| e.to_string());
+            let _ = this.update(cx, |this, cx| this.finish_vcs(client, checkout, origin, error, cx));
         })
         .detach();
         cx.notify();

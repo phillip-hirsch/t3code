@@ -537,6 +537,7 @@ impl Workspace {
         let Some(client) = self.client() else { return };
         self.draft_workspace.choice.branch = Some(name.clone());
         let project_id = self.draft_workspace.project_id.clone();
+        let origin = self.target.clone();
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = client.request(method, input).await;
@@ -554,7 +555,7 @@ impl Workspace {
                     Err(error) => {
                         log::warn!("{method} failed: {error}");
                         this.draft_workspace.choice.branch = None;
-                        this.error = Some(failure.into());
+                        this.set_error_from(origin.as_ref(), failure.into());
                     }
                 }
                 cx.notify();
@@ -624,6 +625,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(client) = self.thread_client(&thread_id) else { return };
+        let origin = self.thread_target(&thread_id);
         cx.spawn(async move |this, cx| {
             let result = client.request(method, input).await;
             let _ = this.update(cx, |this, cx| {
@@ -639,7 +641,7 @@ impl Workspace {
                             "vcs.createRef" => "Failed to create and switch ref.",
                             _ => "Failed to switch ref.",
                         };
-                        this.error = Some(failure.into());
+                        this.set_error_from(origin.as_ref(), failure.into());
                     }
                 }
                 cx.notify();

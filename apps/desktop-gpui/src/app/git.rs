@@ -658,6 +658,7 @@ impl Workspace {
             input["projectId"] = project.id.clone().into();
         }
         let owner = self.branch_owner();
+        let origin = self.target.clone();
         let stream = client.stream("git.runStackedAction", input);
         cx.spawn(async move |this, cx| {
             let mut outcome: Result<(), String> = Ok(());
@@ -686,7 +687,7 @@ impl Workspace {
                 if let (Some(branch), Some(owner), Ok(())) = (created, owner, &outcome) {
                     this.record_created_branch(owner, branch, cx);
                 }
-                this.finish_vcs(client, checkout, outcome.err(), cx);
+                this.finish_vcs(client, checkout, origin, outcome.err(), cx);
             });
         })
         .detach();
@@ -729,27 +730,29 @@ impl Workspace {
         }
         let Some(client) = self.vcs_client() else { return };
         let Some(checkout) = self.vcs.start(label) else { return };
+        let origin = self.target.clone();
         cx.spawn(async move |this, cx| {
             let result = client.request(method, json!({"cwd": checkout.1})).await;
-            let _ =
-                this.update(cx, |this, cx| this.finish_vcs(client, checkout, result.err().map(|e| e.to_string()), cx));
+            let error = result.err().map(|e| e.to_string());
+            let _ = this.update(cx, |this, cx| this.finish_vcs(client, checkout, origin, error, cx));
         })
         .detach();
         cx.notify();
     }
 
-    /// Ends `checkout`'s git action: reports its error and refreshes that checkout's status,
-    /// which lands only if it is still the one watched.
+    /// Ends `checkout`'s git action: reports its error on `origin`, the target it started from,
+    /// and refreshes that checkout's status, which lands only if it is still the one watched.
     pub(super) fn finish_vcs(
         &mut self,
         client: RpcClient,
         checkout: Checkout,
+        origin: Option<Target>,
         error: Option<String>,
         cx: &mut Context<Self>,
     ) {
         self.vcs.finish(&checkout);
         if let Some(error) = error {
-            self.error = Some(error.into());
+            self.set_error_from(origin.as_ref(), error.into());
         }
         self.refresh_checkout(client, checkout, cx);
         cx.notify();
