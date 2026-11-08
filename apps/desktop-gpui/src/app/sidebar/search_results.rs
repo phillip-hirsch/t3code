@@ -213,9 +213,9 @@ impl Workspace {
                 let muted_icon = settled && !active;
                 let hovered = self.sidebar.hovered.as_deref() == Some(thread.id.as_str());
                 let project = self.shell.projects.iter().find(|p| p.id == thread.project_id);
-                let time =
-                    crate::timestamp::parse_ms(thread.latest_user_message_at.as_deref().unwrap_or(&thread.updated_at))
-                        .map(|at| inbox::format_relative(now - at));
+                let time = inbox::Facts { thread, child_request: None }
+                    .activity_timestamp()
+                    .map(|at| inbox::format_relative(now - at));
                 let title_color = if active {
                     sb.foreground
                 } else if settled {

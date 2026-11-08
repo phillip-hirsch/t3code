@@ -442,9 +442,11 @@ impl<'a> Facts<'a> {
 
     /// `resolveSettledThreadTimestamp`, in ms.
     pub fn settled_timestamp(&self) -> Option<i64> {
-        if let Some(settled) = ms(self.thread.settled_at.as_deref()) {
-            return Some(settled);
-        }
+        ms(self.thread.settled_at.as_deref()).or_else(|| self.activity_timestamp())
+    }
+
+    /// `resolveThreadActivityTimestamp`, in ms: the newest user message or run edge, else the last update.
+    pub fn activity_timestamp(&self) -> Option<i64> {
         [
             self.thread.latest_user_message_at.as_deref(),
             self.latest_run_requested_at(),
@@ -457,9 +459,11 @@ impl<'a> Facts<'a> {
         .or_else(|| parse_ms(&self.thread.updated_at))
     }
 
-    /// The compact time a card shows: last user message, else last update.
-    pub fn activity_timestamp(&self) -> Option<i64> {
-        parse_ms(self.thread.latest_user_message_at.as_deref().unwrap_or(&self.thread.updated_at))
+    fn active_anchor_timestamp(&self) -> i64 {
+        [Some(self.thread.created_at.as_str()), self.thread.unsettled_at.as_deref()]
+            .into_iter()
+            .filter_map(ms)
+            .fold(0, i64::max)
     }
 
     fn return_timestamp(&self) -> i64 {
@@ -701,10 +705,17 @@ pub fn partition<'a>(
     });
     if sort_active_by_send {
         sections.active.sort_by_cached_key(|f| (Reverse(f.send_timestamp()), id(f)));
-    } else {
+    } else if working_shelf {
         sections.active.sort_by_cached_key(|f| {
             let returned = returns.returned_at(id(f)).unwrap_or(0);
             (Reverse(f.return_timestamp().max(returned)), id(f))
+        });
+    } else {
+        // `sortActiveThreadsByOrderKey`: keyless rows newest anchor first, then keyed rows by key.
+        sections.active.sort_by_cached_key(|f| {
+            let key = f.thread.active_order_key.as_deref();
+            let anchor = if key.is_none() { f.active_anchor_timestamp() } else { 0 };
+            (key.is_some(), key, Reverse(anchor), id(f))
         });
     }
     sections.working.sort_by_cached_key(|f| (Reverse(f.send_timestamp()), id(f)));
@@ -1211,6 +1222,25 @@ mod tests {
     }
 
     #[test]
+    fn activity_time_is_the_newest_message_or_run_edge() {
+        let facts = |extra: Value| {
+            let thread = thread("t", extra);
+            Facts { thread: &thread, child_request: None }.activity_timestamp()
+        };
+        let replied = json!({
+            "latestUserMessageAt": "2026-11-02T00:00:00.000Z", "latestRunId": "r", "status": "running",
+            "latestRunRequestedAt": "2026-11-02T00:00:01.000Z", "latestRunStartedAt": "2026-11-02T00:00:02.000Z",
+            "latestRunCompletedAt": "2026-11-03T00:00:00.000Z",
+        });
+        assert_eq!(facts(replied), parse_ms("2026-11-03T00:00:00.000Z"));
+        assert_eq!(
+            facts(json!({"latestUserMessageAt": "2026-11-02T00:00:00.000Z"})),
+            parse_ms("2026-11-02T00:00:00.000Z")
+        );
+        assert_eq!(facts(json!({"latestUserMessageAt": "nope"})), parse_ms("2026-11-01T00:00:00.000Z"));
+    }
+
+    #[test]
     fn sections_follow_snoozed_settled_pinned_working_active_precedence() {
         let threads = vec![
             thread("snoozed", json!({"snoozedUntil": "2026-11-05T00:00:00.000Z", "settledOverride": "settled"})),
@@ -1243,6 +1273,19 @@ mod tests {
 
         let shelf_off = partition(&threads, now(), false, false, &mut ReturnTracker::default(), |_| true);
         assert!(shelf_off.working.is_empty(), "the Working shelf is off");
+    }
+
+    #[test]
+    fn without_the_working_shelf_active_rows_follow_their_order_keys() {
+        let threads = vec![
+            thread("keyed-b", json!({"activeOrderKey": "b"})),
+            thread("keyed-a", json!({"activeOrderKey": "a", "latestRunId": "r", "latestRunCompletedAt": NOW})),
+            thread("old", json!({"latestRunId": "r", "latestRunCompletedAt": NOW})),
+            thread("unsettled", json!({"unsettledAt": "2026-11-03T00:00:00.000Z"})),
+            thread("created", json!({"createdAt": "2026-11-02T00:00:00.000Z"})),
+        ];
+        let sections = partition(&threads, now(), false, false, &mut ReturnTracker::default(), |_| true);
+        assert_eq!(ids(&sections.active), ["unsettled", "created", "old", "keyed-a", "keyed-b"]);
     }
 
     #[test]
