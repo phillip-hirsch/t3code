@@ -35,6 +35,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
+use gpui_kit::base::FocusTrapElement as _;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::slider::SliderState;
@@ -463,7 +464,8 @@ impl Workspace {
                         .child(
                             h_flex()
                                 .id("settings-popup")
-                                .track_focus(&self.settings_ui.focus)
+                                // `AppRouteModal` is a modal `Dialog`: Tab stays inside the popup.
+                                .focus_trap("settings-trap", &self.settings_ui.focus)
                                 .key_context("SettingsModal")
                                 .on_key_down(cx.listener(Self::on_settings_key_down))
                                 .occlude()

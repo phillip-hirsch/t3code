@@ -8,14 +8,15 @@ use std::rc::Rc;
 
 use chrono::Local;
 use gpui_kit::assets::IconName as Lucide;
+use gpui_kit::base::FocusTrapElement as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, Bounds, Context, ElementId, FontWeight, Hsla, InteractiveElement as _, IntoElement, MouseButton,
-    MouseMoveEvent, ParentElement as _, PathBuilder, Pixels, ScrollHandle, SharedString,
+    AnyElement, Bounds, Context, ElementId, FocusHandle, FontWeight, Hsla, InteractiveElement as _, IntoElement,
+    MouseButton, MouseMoveEvent, ParentElement as _, PathBuilder, Pixels, ScrollHandle, SharedString,
     StatefulInteractiveElement as _, Styled as _, WeakEntity, Window, canvas, div, point, px, relative, rgb, svg,
 };
 use serde_json::{Value, json};
@@ -49,6 +50,9 @@ pub(in crate::app) struct UsageState {
     /// The chart column under the pointer, and where the pointer is in the plot.
     hover: Option<(usize, Pixels, Pixels)>,
     scroll: ScrollHandle,
+    /// The panel's focus and focus trap, made on its first render; opening moves focus into it.
+    focus: Option<FocusHandle>,
+    focus_on_render: bool,
     /// Reset credits being confirmed, spent, or spent with the outcome, one per account key.
     redeemed: Vec<Redeem>,
     /// The chart's data, kept across pointer moves; render may refill it, hence the cell.
@@ -166,6 +170,8 @@ impl Default for UsageState {
             by_time: false,
             hover: None,
             scroll: ScrollHandle::new(),
+            focus: None,
+            focus_on_render: false,
             redeemed: Vec::new(),
             pools: None,
             chart: RefCell::default(),
@@ -185,6 +191,7 @@ impl UsageState {
 
 impl Workspace {
     pub(in crate::app) fn usage_opened(&mut self, cx: &mut Context<Self>) {
+        self.usage.focus_on_render = true;
         self.usage.limits_now = now_ms();
         if self.usage.metric == "limits" {
             self.refresh_limits(true, cx);
@@ -461,6 +468,10 @@ impl Workspace {
         } else {
             0.
         };
+        let focus = self.usage.focus.get_or_insert_with(|| cx.focus_handle()).clone();
+        if std::mem::take(&mut self.usage.focus_on_render) {
+            window.focus(&focus, cx);
+        }
         div()
             .id("usage-modal")
             .absolute()
@@ -486,6 +497,8 @@ impl Workspace {
                     .shadow_2xl()
                     .text_color(t.foreground)
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    // `AppRouteModal` is a modal `Dialog`: Tab stays inside the panel.
+                    .focus_trap("usage-trap", &focus)
                     .child(self.render_usage_header(&t, cx))
                     .child(
                         div()
