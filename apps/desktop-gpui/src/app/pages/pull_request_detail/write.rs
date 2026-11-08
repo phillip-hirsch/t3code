@@ -124,7 +124,8 @@ pub(super) struct WriteState {
     verdict: Option<&'static str>,
     comment: Option<Entity<TextareaState>>,
     submitting: Option<&'static str>,
-    reply: Option<(String, Entity<TextareaState>)>,
+    /// Open reply boxes, one per conversation (`PullRequestReviewAnnotation`'s own `reply`).
+    replies: HashMap<String, Entity<TextareaState>>,
     editing: Option<Editing>,
     saving: bool,
     thread_pending: bool,
@@ -1065,10 +1066,11 @@ impl Workspace {
             return None;
         }
         let id = thread.id.clone();
-        match &panel.write.reply {
-            Some((open, input)) if *open == thread.id => {
+        match panel.write.replies.get(&thread.id) {
+            Some(input) => {
                 let empty = text_of(input, cx).trim().is_empty();
                 let pending = panel.write.thread_pending;
+                let (cancel, send) = (id.clone(), id.clone());
                 Some(
                     v_flex()
                         .mt(px(8.))
@@ -1079,36 +1081,40 @@ impl Workspace {
                             h_flex()
                                 .justify_end()
                                 .gap(px(8.))
-                                .child(ghost_button("pr-reply-cancel", t).child("Cancel").on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        if let Some(write) = this.pr_write() {
-                                            write.reply = None;
-                                        }
-                                        cx.notify();
-                                    },
-                                )))
                                 .child(
-                                    Button::new("pr-reply-send")
+                                    ghost_button(ElementId::Name(format!("pr-reply-cancel:{id}").into()), t)
+                                        .child("Cancel")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if let Some(write) = this.pr_write() {
+                                                write.replies.remove(&cancel);
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    Button::new(ElementId::Name(format!("pr-reply-send:{id}").into()))
                                         .primary()
                                         .xsmall()
                                         .disabled(pending || empty)
                                         .child("Reply")
-                                        .on_click(cx.listener(|this, _, window, cx| this.send_pr_reply(window, cx))),
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.send_pr_reply(&send, window, cx)
+                                        })),
                                 ),
                         )
                         .into_any_element(),
                 )
             }
-            _ => Some(
+            None => Some(
                 ghost_button(ElementId::Name(format!("pr-thread-reply:{id}").into()), t)
                     .mt(px(8.))
                     .child("Reply")
                     .on_click(cx.listener(move |this, _, window, cx| {
                         let input = cx.new(|cx| TextareaState::new(window, cx).rows(2).placeholder("Reply"));
                         input.update(cx, |input, cx| input.focus(window, cx));
-                        let sub = watch(&input, Some(crate::app::Workspace::send_pr_reply), window, cx);
+                        let sub = watch(&input, Some(crate::app::Workspace::send_focused_pr_reply), window, cx);
                         if let Some(write) = this.pr_write() {
-                            write.reply = Some((id.clone(), input));
+                            write.replies.insert(id.clone(), input);
                             write._watch.extend(sub);
                         }
                         cx.notify();
@@ -1118,19 +1124,28 @@ impl Workspace {
         }
     }
 
-    fn send_pr_reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Mod+Enter in a reply box sends that conversation's reply.
+    fn send_focused_pr_reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(write) = self.pr_write() else { return };
+        let focused = write.replies.iter().find(|(_, input)| input.focus_handle(cx).is_focused(window));
+        if let Some(thread_id) = focused.map(|(id, _)| id.clone()) {
+            self.send_pr_reply(&thread_id, window, cx);
+        }
+    }
+
+    /// Posts one conversation's reply; only that conversation's box closes once it lands.
+    fn send_pr_reply(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(mut payload) = self.pr_ref_json() else { return };
         let Some(write) = self.pr_write().filter(|w| !w.thread_pending) else { return };
-        let Some((thread_id, input)) = write.reply.clone() else { return };
+        let Some(input) = write.replies.get(thread_id).cloned() else { return };
         let body = text_of(&input, cx).trim().to_owned();
         if body.is_empty() {
             return;
         }
-        if let Some(write) = self.pr_write() {
-            write.thread_pending = true;
-        }
+        write.thread_pending = true;
         payload["threadId"] = json!(thread_id);
         payload["body"] = json!(body);
+        let thread_id = thread_id.to_owned();
         self.run_pr_write(
             "pullRequests.replyToThread",
             payload,
@@ -1138,11 +1153,11 @@ impl Workspace {
             None,
             window,
             cx,
-            |this, key, ok, _, _| {
+            move |this, key, ok, _, _| {
                 if let Some(write) = this.pr_write_of(key) {
                     write.thread_pending = false;
-                    if ok {
-                        write.reply = None;
+                    if ok && write.replies.get(&thread_id) == Some(&input) {
+                        write.replies.remove(&thread_id);
                     }
                 }
             },
