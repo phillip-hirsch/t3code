@@ -438,7 +438,15 @@ impl Workspace {
                                 .text_color(t.foreground)
                                 .hover(gpui_kit::Styled::underline)
                                 .child("Open provider setup")
-                                .on_click(cx.listener(|this, _, _, cx| this.open_settings("providers", cx))),
+                                .on_click(cx.listener({
+                                    let instance = instance.clone();
+                                    move |this, _, _, cx| match this.active_environment().cloned() {
+                                        Some(environment) => {
+                                            this.open_provider_settings(environment, instance.clone(), cx);
+                                        }
+                                        None => this.open_settings("providers", cx),
+                                    }
+                                })),
                         )
                     })
                     .child(

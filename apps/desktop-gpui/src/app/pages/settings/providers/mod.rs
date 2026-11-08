@@ -70,6 +70,9 @@ impl ProviderAccess {
 #[derive(Default)]
 pub(super) struct ProvidersPage {
     selected: Option<String>,
+    /// The instance a navigation asked for (`targetInstanceId`); while it stays selected and
+    /// unlisted, the editor says so instead of showing another provider.
+    target: Option<String>,
     refreshing: bool,
     /// Instances whose `server.updateProvider` call is in flight.
     updating: HashSet<String>,
@@ -108,6 +111,18 @@ fn idle_compaction<'a>(mode: &'a Value, legacy: &'a Value) -> &'a str {
         Value::Bool(true) => "beforeCacheExpires",
         _ => "onReturn",
     })
+}
+
+/// The row the editor shows and whether a navigation's target is missing (`targetInstanceMissing`):
+/// the selected row, else the first unless the selection is a target that is no longer listed.
+fn selected_row(
+    rows: &[instances::InstanceRow],
+    selected: Option<&str>,
+    target: Option<&str>,
+) -> (Option<instances::InstanceRow>, bool) {
+    let missing = target.is_some() && selected == target && !rows.iter().any(|row| Some(row.id.as_str()) == target);
+    let row = rows.iter().find(|row| Some(row.id.as_str()) == selected).or(if missing { None } else { rows.first() });
+    (row.cloned(), missing)
 }
 
 /// The detail card's height: `h-[min(44rem,calc(100dvh-11rem))] min-h-[32rem]`.
@@ -151,10 +166,19 @@ impl Workspace {
             self.settings_environment().as_deref(),
             self.settings_info().capability("projectProviderInstanceOverrides"),
         );
+        // A target for another environment is dropped, like the web's per-environment target.
+        if let Some((environment, instance)) = self.settings_ui.provider_target.take()
+            && self.settings_environment().as_ref() == Some(&environment)
+        {
+            page.update(cx, |page, _| {
+                page.selected = Some(instance.clone());
+                page.target = Some(instance);
+            });
+        }
         let rows = instances::instance_rows(&self.settings_info().settings, &self.settings_info().providers_json);
-        let selected = {
-            let chosen = page.read(cx).selected.clone();
-            rows.iter().find(|row| Some(&row.id) == chosen.as_ref()).or(rows.first()).cloned()
+        let (selected, target_missing) = {
+            let page = page.read(cx);
+            selected_row(&rows, page.selected.as_deref(), page.target.as_deref())
         };
         let list = rows
             .iter()
@@ -255,7 +279,11 @@ impl Workspace {
                             .p_6()
                             .text_sm()
                             .text_color(t.muted_foreground)
-                            .child("No providers configured.")
+                            .child(if target_missing {
+                                "This provider instance is no longer available on this device."
+                            } else {
+                                "No providers configured."
+                            })
                             .into_any_element(),
                     }),
             );
@@ -597,6 +625,18 @@ impl Workspace {
     }
 
     /// A request whose failure becomes an error notification titled `failure`.
+    /// Opens Providers on `environment` with `instance_id` selected (`openProviderSetup`).
+    pub(in crate::app) fn open_provider_settings(
+        &mut self,
+        environment: SharedString,
+        instance_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings_ui.scope = self.settings_ui.scope.with_machine(Some(environment.to_string()));
+        self.settings_ui.provider_target = Some((environment, instance_id));
+        self.open_settings("providers", cx);
+    }
+
     /// What this session may do with the Settings environment's providers.
     pub(super) fn provider_access(&self) -> ProviderAccess {
         let environment = self.settings_environment();
@@ -976,6 +1016,18 @@ fn dot(color: Hsla) -> impl IntoElement {
 mod tests {
     use super::*;
     use crate::app::pages::settings::connections::logic::Session;
+
+    #[test]
+    fn a_navigation_target_opens_its_provider_or_says_it_is_gone() {
+        let rows = instances::instance_rows(&json!({"providerInstances": {"codex_work": {"driver": "codex"}}}), &[]);
+        let id = |(row, missing): (Option<instances::InstanceRow>, bool)| (row.map(|r| r.id), missing);
+        assert_eq!(id(selected_row(&rows, Some("codex_work"), Some("codex_work"))), (Some("codex_work".into()), false));
+        assert_eq!(id(selected_row(&rows, Some("gone"), Some("gone"))), (None, true));
+        // Picking another row, or a stale plain selection, falls back to the first row.
+        assert_eq!(id(selected_row(&rows, Some("codex_work"), Some("gone"))), (Some("codex_work".into()), false));
+        assert_eq!(id(selected_row(&rows, Some("gone"), None)), (Some("codex".into()), false));
+        assert_eq!(id(selected_row(&[], None, None)), (None, false));
+    }
 
     #[test]
     fn provider_access_needs_a_providers_manage_grant() {
