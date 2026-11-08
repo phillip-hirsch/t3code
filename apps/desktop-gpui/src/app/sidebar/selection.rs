@@ -344,7 +344,7 @@ This permanently clears conversation history for these threads.",
         let answer = super::super::confirm::confirm(&message, true, window, cx);
         cx.spawn(async move |this, cx| {
             if answer.await == Ok(true) {
-                let _ = this.update(cx, |this, cx| run(this, cx));
+                let _ = this.update(cx, run);
             }
         })
         .detach();
