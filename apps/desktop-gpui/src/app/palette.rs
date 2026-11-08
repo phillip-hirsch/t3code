@@ -129,6 +129,8 @@ enum Run {
     ThemeEditor,
     /// Go to file or Search project contents, returning here on Esc.
     FileSearch(super::files::OverlayMode),
+    /// `workspace.focusNext` (`true`) or `workspace.focusPrevious`, once the palette has closed.
+    WorkspaceFocus(bool),
 }
 
 #[derive(Clone)]
@@ -908,6 +910,15 @@ impl Workspace {
         usage.terms = &["usage", "use", "tokens", "cost", "spend", "limits", "stats", "analytics"];
         usage.shortcut = self.shortcut("usage.open");
         rows.push(usage);
+        for (forward, key, title, command) in [
+            (true, "workspace-focus:1", "Focus Next Workspace Area", "workspace.focusNext"),
+            (false, "workspace-focus:-1", "Focus Previous Workspace Area", "workspace.focusPrevious"),
+        ] {
+            let mut row = lucide(key, IconName::Monitor, title, Run::WorkspaceFocus(forward));
+            row.terms = &["accessibility", "navigation", "focus", "F6"];
+            row.shortcut = self.shortcut(command);
+            rows.push(row);
+        }
         let mut row = lucide("settings", IconName::Settings, "Open settings", Run::Settings("general"));
         row.terms = &["settings", "preferences", "configuration", "keybindings"];
         rows.push(row);
@@ -1382,6 +1393,7 @@ impl Workspace {
                 self.set_theme_choice(choice, window, cx);
             }
             Run::ThemeEditor => self.toggle_theme_editor(window, cx),
+            Run::WorkspaceFocus(forward) => self.move_workspace_focus(forward, window, cx),
             Run::FindIn { thread_id, query, message_id } => {
                 self.select_thread(thread_id, window, cx);
                 self.open_thread_find_on(&query, message_id, window, cx);
