@@ -1014,7 +1014,7 @@ impl Workspace {
         })
     }
 
-    /// "Fix in a thread" on a review conversation (`onFixFinding`).
+    /// "Fix in a thread" on a review conversation (`onFixFinding`), "Fix" beside a thread's composer.
     pub(super) fn render_pr_fix_thread(
         &self,
         thread: &crate::pull_request_detail::ReviewThread,
@@ -1023,7 +1023,11 @@ impl Workspace {
     ) -> Option<AnyElement> {
         let panel = self.pull_requests.panel.as_ref()?;
         let detail = panel.detail.as_ref()?;
-        self.shell.projects.iter().find(|p| p.id == detail.project_id)?;
+        let attaches = self.pr_attaches_to_composer();
+        if !attaches {
+            self.shell.projects.iter().find(|p| p.id == detail.project_id)?;
+        }
+        let label = super::handoff::fix_labels(attaches).0;
         let key = format!("finding:thread:{}", thread.id);
         let preparing = panel.handoff.as_deref() == Some(key.as_str());
         let thread = thread.clone();
@@ -1032,7 +1036,7 @@ impl Workspace {
                 .ml_auto()
                 .disabled(panel.write.thread_pending || panel.handoff.is_some())
                 .child(Icon::new(Lucide::Hammer).with_size(px(12.)))
-                .child(if preparing { "Preparing..." } else { "Fix in a thread" })
+                .child(if preparing { "Preparing..." } else { label })
                 .on_click(cx.listener(move |this, _, window, cx| this.fix_pr_thread(&thread, window, cx)))
                 .into_any_element(),
         )

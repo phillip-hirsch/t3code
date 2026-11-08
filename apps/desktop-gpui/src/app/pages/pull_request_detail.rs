@@ -1407,7 +1407,9 @@ impl Workspace {
         let current_thread =
             thread.and_then(|thread| self.pr_current_thread(&detail.project_id, &thread.id, &detail.url));
         let handoff = panel.handoff.clone();
-        let can_fix = self.shell.projects.iter().any(|p| p.id == detail.project_id);
+        let attaches = self.pr_attaches_to_composer();
+        let can_fix = attaches || self.shell.projects.iter().any(|p| p.id == detail.project_id);
+        let fix_findings = handoff::fix_labels(attaches).1;
         let detail = detail.clone();
         let view = view.clone();
         let tip: SharedString =
@@ -1487,7 +1489,7 @@ impl Workspace {
                         PopupMenuItem::new(if handoff.as_deref() == Some("findings") {
                             "Preparing..."
                         } else {
-                            "Fix findings in a thread"
+                            fix_findings
                         })
                         .icon(Lucide::Hammer)
                         .disabled(busy_handoff || !can_fix)

@@ -9,7 +9,24 @@ use crate::app::Target;
 use crate::new_thread::{EnvMode, WorkspaceChoice};
 use crate::pull_request_detail::{CheckoutMode, CheckoutRequest};
 
+/// `pullRequestHandoffLabels`: beside a thread's composer the fixes land in that thread.
+pub(super) fn fix_labels(in_this_thread: bool) -> (&'static str, &'static str) {
+    if in_this_thread {
+        ("Fix", "Fix findings in this thread")
+    } else {
+        ("Fix in a thread", "Fix findings in a thread")
+    }
+}
+
 impl Workspace {
+    /// `composerDraftTarget`: the panel is a thread's Pull request surface, so a handoff's prompt
+    /// goes into the composer beside it instead of a new thread.
+    pub(super) fn pr_attaches_to_composer(&self) -> bool {
+        self.page.is_none()
+            && self.target.is_some()
+            && matches!(self.active_surface(), Some(crate::app::right_panel::Surface::PullRequest(_)))
+    }
+
     fn pr_handoff_busy(&self) -> bool {
         self.pull_requests.panel.as_ref().is_some_and(|p| p.handoff.is_some())
     }
@@ -34,18 +51,23 @@ impl Workspace {
             return;
         }
         let term = logic::terminology(&detail.provider).0;
-        if !self.shell.projects.iter().any(|p| p.id == detail.project_id) {
-            toast_error(window, cx, "Could not open a thread", "Try again from the project, or open a thread first.");
-            return;
-        }
         let question = !prompt.lines().next().unwrap_or_default().starts_with("PR #");
-        self.start_draft(detail.project_id.clone(), window, cx);
-        self.write_pr_task(&prompt, window, cx);
         let description = if question {
             "The question is in the composer. Read it over, then send.".to_owned()
         } else {
             format!("The {term} is in the composer. Type your question, then send.")
         };
+        if self.pr_attaches_to_composer() {
+            self.write_pr_task(&prompt, window, cx);
+            window.push_notification(Notification::success(description).title("Added to the composer"), cx);
+            return;
+        }
+        if !self.shell.projects.iter().any(|p| p.id == detail.project_id) {
+            toast_error(window, cx, "Could not open a thread", "Try again from the project, or open a thread first.");
+            return;
+        }
+        self.start_draft(detail.project_id.clone(), window, cx);
+        self.write_pr_task(&prompt, window, cx);
         window.push_notification(Notification::success(description).title("Asked in a thread"), cx);
     }
 
@@ -60,6 +82,15 @@ impl Workspace {
     ) {
         let Some(detail) = self.pull_requests.panel.as_ref().and_then(|p| p.detail.clone()) else { return };
         if self.pr_handoff_busy() {
+            return;
+        }
+        if let Some(task) = task.as_deref().filter(|_| self.pr_attaches_to_composer()) {
+            self.write_pr_task(task, window, cx);
+            window.push_notification(
+                Notification::success("The task is in the composer. Read it over, then send.")
+                    .title("Added to the composer"),
+                cx,
+            );
             return;
         }
         let request = CheckoutRequest {
