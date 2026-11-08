@@ -921,7 +921,7 @@ impl Workspace {
     /// panel and the mini player recorded what they draw. It only calls into a view on a change.
     pub(super) fn sync_preview_views(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let covered = self.browser_covered(window, cx);
-        self.retain_server_streams(covered, cx);
+        self.retain_server_streams(covered, window, cx);
         let panel = self.preview.panel_view.take().filter(|_| !covered);
         let mini = self.preview.mini_view.take().filter(|_| !covered);
         let shown =
