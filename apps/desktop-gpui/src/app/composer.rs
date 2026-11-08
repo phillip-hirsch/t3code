@@ -174,6 +174,11 @@ impl Workspace {
         }
     }
 
+    /// `composerDraftHasUserContent`: the open composer holds text or attachments.
+    pub(super) fn composer_has_user_content(&self, cx: &gpui_kit::App) -> bool {
+        !self.composer.read(cx).value().trim().is_empty() || self.has_attachments()
+    }
+
     /// `set_value` emits no `Change`, so this keeps `composer_empty` in step.
     /// File links, known skills and context links in `text` come back as chips.
     pub(super) fn set_composer_text(

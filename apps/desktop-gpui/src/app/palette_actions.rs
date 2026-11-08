@@ -61,7 +61,7 @@ fn toast_error(title: &str, message: impl Into<gpui_kit::SharedString>, window: 
 
 impl Workspace {
     /// `startScratchThread`: `projects.ensureScratch` on `environment`, then a draft there,
-    /// holding `prompt` if given.
+    /// holding `prompt` if given and the draft has no user content.
     pub(super) fn start_scratch_thread(
         &mut self,
         environment: SharedString,
@@ -83,8 +83,9 @@ impl Workspace {
                 let Some(project_id) = project_id else { return };
                 // A scratch project made just now may not be listed yet.
                 this.start_draft_in(environment, project_id, window, cx);
-                if let Some(prompt) = &prompt {
-                    this.set_composer_text(prompt.clone(), window, cx);
+                // Never over what the user wrote: the draft may already hold some.
+                if let Some(prompt) = prompt.filter(|_| !this.composer_has_user_content(cx)) {
+                    this.set_composer_text(prompt, window, cx);
                 }
             });
         })
