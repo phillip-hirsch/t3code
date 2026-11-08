@@ -823,6 +823,8 @@ pub struct ThreadShell {
     pub link_origin: Option<LinkOrigin>,
     #[serde(default)]
     pub delegated_from: Option<DelegatedFrom>,
+    #[serde(default, deserialize_with = "lossy")]
+    pub tags: Vec<String>,
     #[serde(default)]
     pub model_selection: Option<ModelSelection>,
     #[serde(default)]
