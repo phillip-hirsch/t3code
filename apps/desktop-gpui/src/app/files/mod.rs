@@ -72,6 +72,8 @@ pub(super) struct FilesState {
     /// A menu of the file surfaces is open; native document views hide so it shows.
     pub(super) menu_open: bool,
     _menu: Option<gpui_kit::Subscription>,
+    /// The crumb menu that is open and the folder it lists.
+    crumb_menu: Option<crumbs::CrumbMenu>,
     /// Workspace images, per environment: a draft's resource names only its path.
     images: HashMap<SharedString, Entity<super::pages::settings::code::projects::icon::Images>>,
     /// The open thread's workspace mutation, read once per frame for the tree and preview.

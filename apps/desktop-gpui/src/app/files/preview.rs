@@ -658,7 +658,7 @@ impl Workspace {
                         .text_color(tokens.muted_foreground.opacity(0.6))
                         .into_any_element()
                 } else {
-                    self.crumb_menu(&key.checkout, &parent, &path, tokens, cx)
+                    self.crumb_menu(&key.checkout, &parent, &path, project_name, tokens, cx)
                 });
             }
             parent = crumb.clone();
