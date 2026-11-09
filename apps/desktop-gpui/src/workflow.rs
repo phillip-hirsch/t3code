@@ -30,9 +30,27 @@ pub struct Opening {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Phase {
+    pub index: i64,
     pub title: String,
     pub members: Vec<Member>,
     pub settled: usize,
+    /// A member still works (or idles, resumable): the phase has not finished.
+    pub running: bool,
+}
+
+impl Phase {
+    /// `phaseStatusLabel`'s failure: a member of a finished phase failed.
+    pub fn failed(&self) -> bool {
+        !self.running && self.members.iter().any(|m| m.status == "failed")
+    }
+
+    /// `phaseElapsed` through `deriveSubagentElapsedMs`: from the first member's start, until
+    /// now while running, else until the last member's end.
+    pub fn elapsed_ms(&self, now_ms: i64) -> Option<i64> {
+        let started = self.members.iter().filter_map(|m| m.started_ms).min()?;
+        let end = if self.running { now_ms } else { self.members.iter().filter_map(|m| m.completed_ms).max()? };
+        Some(end.saturating_sub(started).max(0))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -44,6 +62,20 @@ pub struct Member {
     pub started_ms: Option<i64>,
     pub completed_ms: Option<i64>,
     pub child_thread_id: Option<String>,
+}
+
+impl Member {
+    /// `deriveSubagentElapsedMs`: until now while it works, else until it ended.
+    pub fn elapsed_ms(&self, now_ms: i64) -> Option<i64> {
+        let started = self.started_ms?;
+        let end = if is_active(&self.status) { now_ms } else { self.completed_ms? };
+        Some(end.saturating_sub(started).max(0))
+    }
+}
+
+/// `isOrchestrationV2WorkActive`.
+pub fn is_active(status: &str) -> bool {
+    matches!(status, "pending" | "running" | "waiting")
 }
 
 pub fn is_terminal(status: &str) -> bool {
@@ -73,11 +105,21 @@ pub fn is_workflow_script(text: &str, mark: Option<bool>) -> bool {
     rest.strip_prefix("meta").is_some_and(|after| !after.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
 }
 
+/// A workflow coordinator, as its subagent record names it.
+#[derive(Clone, Copy)]
+pub struct Coordinator<'a> {
+    pub id: &'a str,
+    pub status: &'a str,
+    pub completed_ms: Option<i64>,
+    /// `OrchestrationV2SubagentWorkflow`.
+    pub workflow: &'a Value,
+}
+
 /// The members of a coordinator's workflow (`workflowMembersToRuntime`).
-fn members(coordinator: &Value) -> Vec<(Member, Option<i64>, Option<String>, i64)> {
-    let coordinator_status = coordinator["status"].as_str().unwrap_or_default();
-    let coordinator_done = coordinator["completedAt"].as_str().and_then(crate::timestamp::parse_ms);
-    let Some(agents) = coordinator.pointer("/workflow/agents").and_then(Value::as_array) else { return Vec::new() };
+fn members(coordinator: Coordinator<'_>) -> Vec<(Member, Option<i64>, Option<String>, i64)> {
+    let coordinator_status = coordinator.status;
+    let coordinator_done = coordinator.completed_ms;
+    let Some(agents) = coordinator.workflow["agents"].as_array() else { return Vec::new() };
     agents
         .iter()
         .map(|agent| {
@@ -105,7 +147,7 @@ fn members(coordinator: &Value) -> Vec<(Member, Option<i64>, Option<String>, i64
                 .filter(|d| !d.is_empty());
             let index = agent["index"].as_i64().unwrap_or_default();
             let member = Member {
-                id: format!("{}:agent:{index}", coordinator["id"].as_str().unwrap_or_default()),
+                id: format!("{}:agent:{index}", coordinator.id),
                 title: agent["label"].as_str().unwrap_or("Agent").to_owned(),
                 status,
                 detail,
@@ -118,45 +160,60 @@ fn members(coordinator: &Value) -> Vec<(Member, Option<i64>, Option<String>, i64
         .collect()
 }
 
+/// `deriveWorkflowGroups` for one coordinator: its phases with members, by index, and the
+/// members no phase holds, each in agent order.
+pub fn groups(coordinator: Coordinator<'_>) -> (Vec<Phase>, Vec<Member>) {
+    let mut all = members(coordinator);
+    all.sort_by_key(|(_, _, _, index)| *index);
+    let mut titles: Vec<(i64, String)> = Vec::new();
+    for (_, phase, title, _) in &all {
+        let Some(phase) = phase else { continue };
+        let title = title.clone().unwrap_or_else(|| format!("Phase {}", phase.saturating_add(1)));
+        match titles.iter_mut().find(|(i, _)| i == phase) {
+            Some(entry) => entry.1 = title,
+            None => titles.push((*phase, title)),
+        }
+    }
+    for declared in coordinator.workflow["phases"].as_array().into_iter().flatten() {
+        let (Some(index), Some(title)) = (declared["index"].as_i64(), declared["title"].as_str()) else { continue };
+        match titles.iter_mut().find(|(i, _)| *i == index) {
+            Some(entry) => entry.1 = title.to_owned(),
+            None => titles.push((index, title.to_owned())),
+        }
+    }
+    titles.sort_by_key(|(index, _)| *index);
+    let mut phases = Vec::new();
+    for (index, title) in titles {
+        let members: Vec<Member> =
+            all.iter().filter(|(_, phase, ..)| *phase == Some(index)).map(|(m, ..)| m.clone()).collect();
+        // Both the opening block and the lineage row show only phases with members.
+        if members.is_empty() {
+            continue;
+        }
+        let settled = members.iter().filter(|m| is_terminal(&m.status)).count();
+        let running = members.iter().any(|m| is_active(&m.status) || m.status == "idle");
+        phases.push(Phase { index, title, members, settled, running });
+    }
+    let unphased = all.into_iter().filter(|(_, phase, ..)| phase.is_none()).map(|(m, ..)| m).collect();
+    (phases, unphased)
+}
+
 /// `resolveWorkflowOpening` over the parent projection's `subagents`, when loaded.
 pub fn opening(thread_id: &str, message_id: &str, script: &str, parent_subagents: Option<&[Value]>) -> Opening {
     let coordinator = parent_subagents
         .and_then(|subagents| subagents.iter().find(|s| s["childThreadId"].as_str() == Some(thread_id)));
     let text = |key: &str| coordinator.and_then(|c| c[key].as_str()).filter(|v| !v.is_empty()).map(str::to_owned);
-    let mut phases = Vec::new();
-    let mut unphased = Vec::new();
-    if let Some(coordinator) = coordinator.filter(|c| c.get("workflow").is_some_and(|w| !w.is_null())) {
-        let mut all = members(coordinator);
-        all.sort_by_key(|(_, _, _, index)| *index);
-        let mut titles: Vec<(i64, String)> = Vec::new();
-        for (_, phase, title, _) in &all {
-            let Some(phase) = phase else { continue };
-            let title = title.clone().unwrap_or_else(|| format!("Phase {}", phase.saturating_add(1)));
-            match titles.iter_mut().find(|(i, _)| i == phase) {
-                Some(entry) => entry.1 = title,
-                None => titles.push((*phase, title)),
-            }
-        }
-        for declared in coordinator.pointer("/workflow/phases").and_then(Value::as_array).into_iter().flatten() {
-            let (Some(index), Some(title)) = (declared["index"].as_i64(), declared["title"].as_str()) else { continue };
-            match titles.iter_mut().find(|(i, _)| *i == index) {
-                Some(entry) => entry.1 = title.to_owned(),
-                None => titles.push((index, title.to_owned())),
-            }
-        }
-        titles.sort_by_key(|(index, _)| *index);
-        for (index, title) in titles {
-            let members: Vec<Member> =
-                all.iter().filter(|(_, phase, ..)| *phase == Some(index)).map(|(m, ..)| m.clone()).collect();
-            // `WorkflowOpeningBlock` shows only phases with members.
-            if members.is_empty() {
-                continue;
-            }
-            let settled = members.iter().filter(|m| is_terminal(&m.status)).count();
-            phases.push(Phase { title, members, settled });
-        }
-        unphased = all.into_iter().filter(|(_, phase, ..)| phase.is_none()).map(|(m, ..)| m).collect();
-    }
+    let (phases, unphased) = coordinator
+        .filter(|c| c.get("workflow").is_some_and(|w| !w.is_null()))
+        .map(|c| {
+            groups(Coordinator {
+                id: c["id"].as_str().unwrap_or_default(),
+                status: c["status"].as_str().unwrap_or_default(),
+                completed_ms: c["completedAt"].as_str().and_then(crate::timestamp::parse_ms),
+                workflow: &c["workflow"],
+            })
+        })
+        .unwrap_or_default();
     Opening {
         message_id: message_id.to_owned(),
         script: script.to_owned(),

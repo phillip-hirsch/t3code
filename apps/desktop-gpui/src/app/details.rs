@@ -15,13 +15,14 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
-use self::lineage::{Relationships, Relative};
+use self::lineage::{Relationships, Relative, WorkflowGroup};
 use super::git::{self, GitRequest, QuickKind};
 use super::titlebar::{RIGHT_RESIZE_INSET, TITLEBAR_HEIGHT, icon};
 use super::{Target, Workspace, new_id};
 use crate::model::{DelegatedFrom, ProjectScript, ThreadShell, TokenUsage, UsageLimits};
 use crate::theme::{self, Tokens};
 use crate::thread_details;
+use crate::workflow::{Member, Phase};
 
 pub(super) mod automations;
 pub(super) mod lineage;
@@ -37,6 +38,8 @@ const METER_ROW_HEIGHT: f32 = 24.;
 const SECTION_PADDING: f32 = 18.;
 /// A section heading: 32px plus its 4px bottom margin.
 const HEADING_HEIGHT: f32 = 36.;
+/// A workflow without agents yet: one `text-2xs` line in `py-1.5`.
+const NO_AGENTS_HEIGHT: f32 = 26.;
 
 /// The card's opaque stand-ins for `dropdown-glass` (the popover at `--glass-opacity`
 /// over the canvas); GPUI has no backdrop blur.
@@ -1346,6 +1349,7 @@ impl Workspace {
             running => format!("Lineage · {running} running").into(),
         };
         let mut rows = 0usize;
+        let mut extra = 0.;
         // A lone "Previous agents" row names itself; the heading returns for status or actions.
         let show_heading = running > 0 || can_detach || parent.is_some() || !active.is_empty() || delegated.is_some();
         let mut section = v_flex().when(show_heading, |el| {
@@ -1362,8 +1366,9 @@ impl Workspace {
             rows += 1;
         }
         for child in active {
-            section = section.child(self.relationship_row(child, "icons/bot.svg", false, tokens, colors, cx));
-            rows += 1;
+            let (element, height) = self.agent_row(child, tokens, colors, cx);
+            section = section.child(element);
+            extra += height;
         }
         if !previous.is_empty() {
             let expanded = self.lineage_expanded.as_ref() == Some(id);
@@ -1400,13 +1405,14 @@ impl Workspace {
             );
             if expanded {
                 for child in previous {
-                    section = section.child(self.relationship_row(child, "icons/bot.svg", false, tokens, colors, cx));
-                    rows += 1;
+                    let (element, height) = self.agent_row(child, tokens, colors, cx);
+                    section = section.child(element);
+                    extra += height;
                 }
             }
         }
         Some(Section {
-            height: rows as f32 * ROW_HEIGHT + if show_heading { HEADING_HEIGHT } else { 0. },
+            height: rows as f32 * ROW_HEIGHT + extra + if show_heading { HEADING_HEIGHT } else { 0. },
             element: section.into_any_element(),
             min_density: Density::Full,
         })
@@ -1440,6 +1446,179 @@ impl Workspace {
             element: section.into_any_element(),
             min_density: Density::Full,
         })
+    }
+
+    /// A subagent's row, or a workflow's with its agents under it; and the height it takes.
+    fn agent_row(
+        &self,
+        child: &Relative,
+        tokens: &Tokens,
+        colors: &CardColors,
+        cx: &mut Context<Self>,
+    ) -> (AnyElement, f32) {
+        match &child.workflow {
+            Some(group) => self.workflow_row(child, group, tokens, colors, cx),
+            None => (
+                self.relationship_row(child, "icons/bot.svg", false, tokens, colors, cx).into_any_element(),
+                ROW_HEIGHT,
+            ),
+        }
+    }
+
+    /// `ThreadLineageWorkflowRow`: the coordinator's row opens its thread, a split chevron
+    /// shows its agents under collapsible phase headers, and Stop ends the whole workflow.
+    fn workflow_row(
+        &self,
+        relative: &Relative,
+        group: &WorkflowGroup,
+        tokens: &Tokens,
+        colors: &CardColors,
+        cx: &mut Context<Self>,
+    ) -> (AnyElement, f32) {
+        let id = &group.subagent_id;
+        let split: SharedString = format!("details-workflow-{id}").into();
+        let expanded = self.lineage.open_workflows.contains(id);
+        let hover = colors.hover;
+        let stopping = self.lineage.stopping.as_deref() == Some(id.as_str());
+        let operate = self.active_environment().is_some_and(|environment| self.can_operate(environment));
+        let stop = (group.stoppable && operate).then(|| {
+            let busy = self.lineage.stopping.is_some();
+            let subagent_id = id.clone();
+            focus_ring(
+                div()
+                    .id(ElementId::Name(format!("details-workflow-stop-{id}").into()))
+                    .absolute()
+                    .right(px(36.))
+                    .top(px((ROW_HEIGHT - 24.) / 2.))
+                    .size(px(24.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(6.))
+                    .text_color(tokens.error)
+                    .when(!stopping, |el| el.invisible().group_hover(split.clone(), gpui_kit::Styled::visible))
+                    .when(!busy, |el| el.cursor_pointer().hover(move |style| style.bg(hover)))
+                    .when(busy && !stopping, |el| el.opacity(0.64)),
+                colors,
+            )
+            .child(if stopping {
+                gpui_kit::component::spinner::Spinner::new().xsmall().into_any_element()
+            } else {
+                div().size(px(9.)).rounded(px(1.5)).bg(tokens.error).into_any_element()
+            })
+            .tooltip(|window, cx| Tooltip::new("Stop entire workflow").build(window, cx))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.stop_workflow(subagent_id.clone(), window, cx);
+            }))
+        });
+        let has_stop = stop.is_some();
+        let thread_id = relative.thread_id.clone();
+        let header = keyboard_button(
+            h_flex()
+                .id(ElementId::Name(format!("details-workflow-open-{id}").into()))
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .gap(px(10.))
+                .px(px(10.))
+                .rounded_l(px(8.))
+                .text_size(px(13.))
+                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                .text_color(colors.label)
+                .cursor_pointer()
+                .hover(move |style| style.bg(hover)),
+            colors,
+        )
+        .child(icon("icons/bot.svg").with_size(px(16.)).text_color(tokens.muted_foreground))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_sm()
+                .line_height(px(16.))
+                .text_color(tokens.foreground.opacity(0.85))
+                .when(has_stop, |el| el.pr(px(24.)))
+                .child(relative.title.clone()),
+        )
+        .on_click(cx.listener(move |this, _, window, cx| this.select_thread(thread_id.clone(), window, cx)));
+        let toggle_id = id.clone();
+        let chevron = focus_ring(
+            div()
+                .id(ElementId::Name(format!("details-workflow-toggle-{id}").into()))
+                .w(px(32.))
+                .h_full()
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_r(px(8.))
+                .cursor_pointer()
+                .hover(move |style| style.bg(hover)),
+            colors,
+        )
+        .child(
+            icon("icons/chevron-down.svg")
+                .with_size(px(14.))
+                .text_color(tokens.muted_foreground)
+                .when(expanded, |icon| icon.rotate(gpui_kit::radians(std::f32::consts::PI))),
+        )
+        .on_click(cx.listener(move |this, _, _, cx| {
+            if !this.lineage.open_workflows.remove(&toggle_id) {
+                this.lineage.open_workflows.insert(toggle_id.clone());
+            }
+            this.sync_lineage_tick(cx);
+            cx.notify();
+        }));
+        let line = colors.divider;
+        let head = h_flex()
+            .id(ElementId::Name(split.clone()))
+            .group(split.clone())
+            .relative()
+            .h(px(ROW_HEIGHT))
+            .w_full()
+            .flex_none()
+            .rounded(px(8.))
+            .hover(move |style| style.bg(hover))
+            .child(header)
+            .children(stop)
+            .child(div().w(px(1.)).h(px(16.)).flex_none().group_hover(split, move |style| style.bg(line)))
+            .child(chevron);
+        let mut height = ROW_HEIGHT;
+        let mut list = v_flex().pl(px(26.));
+        if expanded {
+            let now = crate::timestamp::now_ms();
+            for phase in &group.phases {
+                let open = lineage::phase_is_open(&self.lineage, id, phase);
+                list = list.child(phase_header(id, phase, open, now, tokens, colors, cx));
+                height += ROW_HEIGHT;
+                if open {
+                    for member in &phase.members {
+                        list = list.child(workflow_member_row(id, member, &group.driver, now, tokens, colors, cx));
+                        height += ROW_HEIGHT;
+                    }
+                }
+            }
+            for member in &group.unphased {
+                list = list.child(workflow_member_row(id, member, &group.driver, now, tokens, colors, cx));
+                height += ROW_HEIGHT;
+            }
+            if group.phases.is_empty() && group.unphased.is_empty() {
+                list = list.child(
+                    div()
+                        .h(px(NO_AGENTS_HEIGHT))
+                        .px(px(10.))
+                        .py(px(6.))
+                        .text_size(px(11.))
+                        .line_height(px(14.))
+                        .text_color(tokens.muted_foreground.opacity(0.7))
+                        .child("No agents yet"),
+                );
+                height += NO_AGENTS_HEIGHT;
+            }
+        }
+        (v_flex().child(head).when(expanded, |el| el.child(list)).into_any_element(), height)
     }
 
     /// One related thread; a running subagent's row shows Stop on hover.
@@ -1744,6 +1923,131 @@ fn action_row(
     } else {
         row.opacity(0.64)
     }
+}
+
+/// `CollapsibleSectionHeader variant="panel"`: a phase's title, truncated, then whether it
+/// failed, how many of its agents settled, and how long it ran.
+fn phase_header(
+    workflow_id: &str,
+    phase: &Phase,
+    open: bool,
+    now: i64,
+    tokens: &Tokens,
+    colors: &CardColors,
+    cx: &mut Context<Workspace>,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
+    let color = if phase.running { tokens.sidebar.foreground.opacity(0.8) } else { tokens.sidebar.muted_foreground };
+    let count = phase.members.len();
+    let key = (workflow_id.to_owned(), phase.index);
+    let meta =
+        |text: String| div().flex_none().text_size(px(11.)).font_weight(gpui_kit::FontWeight::NORMAL).child(text);
+    focus_ring(
+        h_flex()
+            .id(ElementId::Name(format!("details-workflow-{workflow_id}-phase-{}", phase.index).into()))
+            .h(px(ROW_HEIGHT))
+            .w_full()
+            .flex_none()
+            .gap(px(8.))
+            .pl(px(8.))
+            .pr(px(10.))
+            .rounded(px(6.))
+            .cursor_pointer()
+            .text_size(px(12.))
+            .font_weight(gpui_kit::FontWeight::MEDIUM)
+            .text_color(color),
+        colors,
+    )
+    .child(div().min_w_0().truncate().child(phase.title.clone()))
+    .child(div().flex_1().min_w(px(8.)))
+    .when(phase.failed(), |el| {
+        el.child(
+            div()
+                .flex_none()
+                .text_size(px(10.))
+                .line_height(px(10.))
+                .text_color(tokens.error_foreground)
+                .child("Failed"),
+        )
+    })
+    .child(meta(format!("{}/{count} {}", phase.settled, if count == 1 { "agent" } else { "agents" })))
+    .children(phase.elapsed_ms(now).map(|ms| meta(crate::timeline::agent_elapsed(ms))))
+    .child(
+        icon("icons/chevron-down.svg")
+            .with_size(px(12.))
+            .when(!open, |icon| icon.rotate(gpui_kit::radians(-std::f32::consts::FRAC_PI_2))),
+    )
+    .on_click(cx.listener(move |this, _, _, cx| {
+        this.lineage.phase_open.insert(key.clone(), !open);
+        this.sync_lineage_tick(cx);
+        cx.notify();
+    }))
+}
+
+/// `WorkflowMemberRow`: an agent of a workflow, its provider and status, opening its thread
+/// when it has one.
+fn workflow_member_row(
+    workflow_id: &str,
+    member: &Member,
+    driver: &str,
+    now: i64,
+    tokens: &Tokens,
+    colors: &CardColors,
+    cx: &mut Context<Workspace>,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
+    // `ThreadRelationshipIcon`'s status dot.
+    let dot = match member.status.as_str() {
+        "running" | "in_progress" | "pending" | "waiting" => tokens.info,
+        "failed" | "error" => tokens.error,
+        "completed" => tokens.success_foreground,
+        _ => tokens.muted_foreground.opacity(0.45),
+    };
+    let glyph = match crate::assets::provider_icon(driver) {
+        Some((path, tint)) => gpui_kit::component::Icon::empty()
+            .path(path)
+            .size(px(16.))
+            .text_color(tint.unwrap_or(tokens.muted_foreground))
+            .into_any_element(),
+        None => icon("icons/bot.svg").with_size(px(16.)).text_color(tokens.muted_foreground).into_any_element(),
+    };
+    let badge = div().relative().size(px(16.)).flex_none().flex().items_center().justify_center().child(glyph).child(
+        div()
+            .absolute()
+            .right(px(-4.))
+            .bottom(px(-4.))
+            .size(px(8.))
+            .rounded_full()
+            .border_2()
+            .border_color(colors.background)
+            .bg(dot),
+    );
+    let id = ElementId::Name(format!("details-workflow-{workflow_id}-member-{}", member.id).into());
+    let hover = colors.hover;
+    let element = row(colors).id(id);
+    let element = match member.child_thread_id.clone() {
+        Some(thread_id) => keyboard_button(element.cursor_pointer().hover(move |style| style.bg(hover)), colors)
+            .on_click(cx.listener(move |this, _, window, cx| this.select_thread(thread_id.clone(), window, cx))),
+        None => element.opacity(0.64),
+    };
+    element.child(badge).child(div().flex_1().min_w_0().truncate().child(member.title.clone())).children(
+        member.elapsed_ms(now).map(|ms| {
+            div()
+                .flex_none()
+                .text_size(px(11.))
+                .font_weight(gpui_kit::FontWeight::NORMAL)
+                .text_color(tokens.muted_foreground)
+                .child(crate::timeline::agent_elapsed(ms))
+        }),
+    )
+}
+
+/// `focus-visible:ring-2 ring-inset` on a control that keeps its own padding.
+fn focus_ring(element: gpui_kit::Stateful<gpui_kit::Div>, colors: &CardColors) -> gpui_kit::Stateful<gpui_kit::Div> {
+    let ring = colors.ring;
+    element
+        .tab_index(0)
+        .border_2()
+        .border_color(gpui_kit::transparent_black())
+        .focus_visible(move |style| style.border_color(ring))
 }
 
 /// `ThreadDetailsControl` as a keyboard button: a tab stop that Enter and Space click, with

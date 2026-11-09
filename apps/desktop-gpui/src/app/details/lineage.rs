@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 
 use crate::app::{Target, Workspace, new_id};
 use crate::model::{Subagent, ThreadShell};
+use crate::workflow::{self, Member, Phase};
 
 #[derive(Default)]
 pub(in crate::app) struct LineageUi {
@@ -21,6 +22,13 @@ pub(in crate::app) struct LineageUi {
     _fetches: Vec<Task<()>>,
     /// The child thread a Stop is in flight for.
     pub(super) stopping: Option<String>,
+    /// Workflow rows shown open, by coordinator subagent; each starts closed.
+    pub(super) open_workflows: HashSet<String>,
+    /// Phases opened or closed by hand, by coordinator subagent and phase index; the others
+    /// are open while they run (`phaseOpen`).
+    pub(super) phase_open: HashMap<(String, i64), bool>,
+    /// Repaints an open workflow's running elapsed times once a second.
+    _tick: Option<Task<()>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -39,6 +47,49 @@ pub(super) struct Relative {
     pub title: SharedString,
     pub status: Option<String>,
     pub stop: Option<SubagentStop>,
+    /// A workflow coordinator's agents, shown under its row (`ThreadLineageWorkflowRow`).
+    pub workflow: Option<WorkflowGroup>,
+}
+
+/// `SubagentWorkflowGroup`: a coordinator's members by phase.
+#[derive(Debug, PartialEq)]
+pub(super) struct WorkflowGroup {
+    pub subagent_id: String,
+    pub driver: String,
+    pub phases: Vec<Phase>,
+    pub unphased: Vec<Member>,
+    /// `canStopWorkflow` short of the grant: a running provider-native Claude workflow.
+    pub stoppable: bool,
+}
+
+impl WorkflowGroup {
+    fn of(agent: &Subagent) -> Option<Self> {
+        let workflow = agent.workflow.as_ref()?;
+        let (phases, unphased) = workflow::groups(workflow::Coordinator {
+            id: &agent.id,
+            status: &agent.status,
+            completed_ms: agent.completed_at.as_deref().and_then(crate::timestamp::parse_ms),
+            workflow,
+        });
+        Some(Self {
+            subagent_id: agent.id.clone(),
+            driver: agent.driver.clone(),
+            phases,
+            unphased,
+            stoppable: agent.status == "running" && agent.origin == "provider_native" && agent.driver == "claudeAgent",
+        })
+    }
+
+    /// Whether an open row of this workflow shows a time that runs.
+    pub fn ticks(&self) -> bool {
+        self.phases.iter().any(|phase| phase.running && phase.members.iter().any(|m| m.started_ms.is_some()))
+            || self.unphased.iter().any(|m| workflow::is_active(&m.status) && m.started_ms.is_some())
+    }
+}
+
+/// Whether a phase shows its members: as the user left it, else while it runs.
+pub(super) fn phase_is_open(ui: &LineageUi, subagent_id: &str, phase: &Phase) -> bool {
+    ui.phase_open.get(&(subagent_id.to_owned(), phase.index)).copied().unwrap_or(phase.running)
 }
 
 /// What a subagent's Stop needs (`interruptThreadTurn` with a `subagentId`).
@@ -135,6 +186,7 @@ pub(super) fn relationships(
                 title,
                 status: status.map(str::to_owned),
                 stop: None,
+                workflow: None,
             });
         }
     }
@@ -147,19 +199,28 @@ pub(super) fn relationships(
         }
         seen.insert(child.id.as_str());
         let agent = subagents.iter().find(|agent| agent.child_thread_id.as_deref() == Some(child.id.as_str()));
+        let group = agent.filter(|_| !side_chat).and_then(WorkflowGroup::of);
         let status = activity(child).or_else(|| match agent {
             Some(agent) if child.latest_run_id.is_none() || is_work_active(&agent.status) => {
                 Some(agent.status.as_str())
             }
             _ => Some(child.status.as_str()),
         });
+        // A workflow's row reads as its coordinator: its name and status.
+        let (title, status) = match (&group, agent) {
+            (Some(_), Some(agent)) => {
+                (workflow_name(agent).map_or_else(|| child.title.clone(), str::to_owned), Some(agent.status.as_str()))
+            }
+            _ => (child.title.clone(), status),
+        };
         let row = Relative {
             thread_id: child.id.clone(),
-            title: child.title.clone().into(),
+            title: title.into(),
             status: status.map(str::to_owned),
             stop: agent
-                .filter(|agent| !side_chat && can_stop(agent, Some(child)))
+                .filter(|agent| !side_chat && group.is_none() && can_stop(agent, Some(child)))
                 .map(|agent| stop_of(agent, Some(child))),
+            workflow: group,
         };
         match () {
             () if side_chat => relationships.side_chats.push(row),
@@ -172,10 +233,11 @@ pub(super) fn relationships(
         if seen.contains(child_id) || Some(child_id) == parent_id {
             continue;
         }
-        let title = agent
-            .title
-            .clone()
-            .map(SharedString::from)
+        let group = WorkflowGroup::of(agent);
+        let title = workflow_name(agent)
+            .filter(|_| group.is_some())
+            .or(agent.title.as_deref())
+            .map(|title| SharedString::from(title.to_owned()))
             .or_else(|| match titles(child_id) {
                 Some(Lookup::Found(title)) => Some(title),
                 _ => None,
@@ -185,7 +247,8 @@ pub(super) fn relationships(
             thread_id: child_id.to_owned(),
             title,
             status: Some(agent.status.clone()),
-            stop: can_stop(agent, None).then(|| stop_of(agent, None)),
+            stop: (group.is_none() && can_stop(agent, None)).then(|| stop_of(agent, None)),
+            workflow: group,
         };
         if is_finished(row.status.as_deref()) {
             relationships.previous.push(row);
@@ -194,6 +257,11 @@ pub(super) fn relationships(
         }
     }
     relationships
+}
+
+/// `workflow.name`, which names a workflow's row before any thread title.
+fn workflow_name(agent: &Subagent) -> Option<&str> {
+    agent.workflow.as_ref()?["name"].as_str()
 }
 
 fn stop_of(agent: &Subagent, child: Option<&ThreadShell>) -> SubagentStop {
@@ -231,8 +299,35 @@ impl Workspace {
         }))
     }
 
+    /// Keeps a once-a-second repaint alive while an open workflow row shows a running time.
+    pub(super) fn sync_lineage_tick(&mut self, cx: &mut Context<Self>) {
+        let open = &self.lineage.open_workflows;
+        let ticks = !open.is_empty()
+            && self.open_relationships().is_some_and(|relationships| {
+                relationships
+                    .active
+                    .iter()
+                    .chain(&relationships.previous)
+                    .filter_map(|row| row.workflow.as_ref())
+                    .any(|group| open.contains(&group.subagent_id) && group.ticks())
+            });
+        if !ticks {
+            self.lineage._tick = None;
+        } else if self.lineage._tick.is_none() {
+            self.lineage._tick = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+    }
+
     /// Reads the titles of related threads the shell leaves out, once each.
     pub(in crate::app) fn sync_lineage_titles(&mut self, cx: &mut Context<Self>) {
+        self.sync_lineage_tick(cx);
         let Some(Target::Thread { env, id }) = &self.target else { return };
         let Some(thread) = self.shell.threads.iter().find(|thread| &thread.id == id) else { return };
         let parent = thread.lineage.parent_thread_id.as_deref();
@@ -270,6 +365,29 @@ impl Workspace {
             });
         });
         self.lineage._fetches.push(task);
+    }
+
+    /// `stopWorkflow`: asks the open thread's server to end a workflow and every agent in it.
+    pub(super) fn stop_workflow(&mut self, subagent_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Target::Thread { env, id }) = &self.target else { return };
+        if self.lineage.stopping.is_some() || !self.can_operate(env) {
+            return;
+        }
+        let Some(client) = self.env_client(env) else { return };
+        let payload = json!({"threadId": id, "subagentId": subagent_id});
+        self.lineage.stopping = Some(subagent_id);
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = client.request("orchestration.stopWorkflow", payload).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.lineage.stopping = None;
+                if result.is_err() {
+                    window.push_notification(Notification::error("").title("Could not stop workflow"), cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// `stopSubagent`: ends the task on its owner thread, and an app-owned task's child thread.
@@ -400,6 +518,54 @@ mod tests {
         assert_eq!(found.side_chats[0].status.as_deref(), Some("running"));
         assert_eq!(ids(&found.active), ["sub"]);
         assert_eq!(ids(&found.previous), ["done"]);
+    }
+
+    #[test]
+    fn a_workflow_row_reads_as_its_coordinator_with_its_agents_by_phase() {
+        let threads = [
+            thread("current", json!({})),
+            thread(
+                "coordinator",
+                json!({"lineage": {"parentThreadId": "current", "relationshipToParent": "subagent"}, "status": "idle"}),
+            ),
+        ];
+        let workflow = json!({"name": "review", "phases": [{"index": 0, "title": "Find"}, {"index": 2, "title": "Later"}],
+        "agents": [
+            {"index": 1, "label": "perf", "state": "running", "phaseIndex": 0, "startedAt": 1000, "childThreadId": "perf-thread"},
+            {"index": 0, "label": "bugs", "state": "failed", "phaseIndex": 1, "startedAt": 1000, "completedAt": 3000},
+            {"index": 2, "label": "loose", "state": "queued"}
+        ]});
+        let coordinator = |status: &str| {
+            agent(
+                "w1",
+                Some("coordinator"),
+                json!({"origin": "provider_native", "driver": "claudeAgent", "status": status, "workflow": workflow}),
+            )
+        };
+        let found = relationships("current", None, &threads, &[coordinator("running")], |_| None);
+        let row = &found.active[0];
+        assert_eq!((row.title.as_ref(), row.status.as_deref(), &row.stop), ("review", Some("running"), &None));
+        let group = row.workflow.as_ref().unwrap();
+        assert!(group.stoppable);
+        let phases: Vec<_> = group.phases.iter().map(|p| (p.index, p.title.as_str(), p.running, p.failed())).collect();
+        // A declared phase without members is left out; a member's own phase gets a name.
+        assert_eq!(phases, [(0, "Find", true, false), (1, "Phase 2", false, true)]);
+        assert_eq!(group.unphased[0].title, "loose");
+        assert_eq!(group.phases[0].members[0].child_thread_id.as_deref(), Some("perf-thread"));
+        assert_eq!((group.phases[0].elapsed_ms(4000), group.phases[1].elapsed_ms(9000)), (Some(3000), Some(2000)));
+        assert!(group.ticks());
+
+        // A settled workflow moves to previous agents, and its queued agents read as it ended.
+        let done = relationships("current", None, &threads, &[coordinator("cancelled")], |_| None);
+        let group = done.previous[0].workflow.as_ref().unwrap();
+        assert!(!group.stoppable && !group.ticks());
+        assert_eq!(group.unphased[0].status, "cancelled");
+
+        let ui = LineageUi::default();
+        assert!(phase_is_open(&ui, "w1", &found.active[0].workflow.as_ref().unwrap().phases[0]), "running opens");
+        let mut ui = ui;
+        ui.phase_open.insert(("w1".into(), 0), false);
+        assert!(!phase_is_open(&ui, "w1", &found.active[0].workflow.as_ref().unwrap().phases[0]));
     }
 
     #[test]

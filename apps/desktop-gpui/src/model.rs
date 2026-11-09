@@ -1636,6 +1636,11 @@ pub struct Subagent {
     pub status: String,
     #[serde(default)]
     pub started_at: Option<String>,
+    #[serde(default)]
+    pub completed_at: Option<String>,
+    /// `OrchestrationV2SubagentWorkflow`, on a provider-native workflow's coordinator.
+    #[serde(default)]
+    pub workflow: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
