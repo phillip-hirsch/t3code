@@ -77,6 +77,7 @@ impl Workspace {
             return false;
         }
         let in_preview = self.preview_thread_id().map(str::to_owned);
+        let in_browser = self.preview_thread();
         let thread_link = in_preview.as_deref().and_then(|thread_id| {
             let thread = self.shell_thread(thread_id)?;
             let env = &thread.environment_id;
@@ -94,11 +95,11 @@ impl Workspace {
                     let _ = view.update(cx, |w, cx| w.change_pr_link_by_url(&thread_id, &url, !linked, window, cx));
                 }));
             }
-            if let Some(thread_id) = in_preview {
+            if let Some(thread) = in_browser {
                 let (view, url) = (view.clone(), url.clone());
                 menu = menu.item(PopupMenuItem::new("Open in integrated browser").on_click(move |_, window, cx| {
-                    let (thread_id, url) = (thread_id.clone(), url.clone());
-                    let _ = view.update(cx, |w, cx| w.request_preview_tab(thread_id, Some(url), true, window, cx));
+                    let (thread, url) = (thread.clone(), url.clone());
+                    let _ = view.update(cx, |w, cx| w.request_preview_tab(thread, Some(url), true, window, cx));
                 }));
             }
             let open = url.clone();

@@ -29,7 +29,7 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 use super::super::Workspace;
 use super::super::right_panel::Surface;
-use crate::preview::{self, NavStatus, Session, Viewport};
+use crate::preview::{self, NavStatus, Session, TabRef, ThreadRef, Viewport};
 use crate::theme::Tokens;
 
 const TAB_GONE: u16 = 4404;
@@ -171,11 +171,11 @@ struct PdfView {
 
 #[derive(Default)]
 pub(super) struct ServerStreams {
-    streams: HashMap<String, ServerStream>,
-    pdfs: HashMap<String, PdfView>,
+    streams: HashMap<TabRef, ServerStream>,
+    pdfs: HashMap<TabRef, PdfView>,
     /// The agent tabs the panel and the mini player drew this frame, and those drawn as PDFs.
-    pub(super) drawn: Vec<String>,
-    pdf_drawn: Vec<String>,
+    pub(super) drawn: Vec<TabRef>,
+    pdf_drawn: Vec<TabRef>,
 }
 
 impl Workspace {
@@ -204,28 +204,20 @@ impl Workspace {
         });
     }
 
-    /// Connects `tab_id`'s stream, or keeps it connected through this frame.
-    pub(super) fn keep_server_stream(
-        &mut self,
-        thread_id: &str,
-        tab_id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.ensure_server_stream(thread_id, tab_id, window, cx);
-        if !self.preview.server.drawn.iter().any(|drawn| drawn == tab_id) {
-            self.preview.server.drawn.push(tab_id.to_owned());
+    /// Connects `tab`'s stream, or keeps it connected through this frame.
+    pub(super) fn keep_server_stream(&mut self, tab: &TabRef, window: &mut Window, cx: &mut Context<Self>) {
+        self.ensure_server_stream(tab, window, cx);
+        if !self.preview.server.drawn.contains(tab) {
+            self.preview.server.drawn.push(tab.clone());
         }
     }
 
-    fn ensure_server_stream(&mut self, thread_id: &str, tab_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.preview.server.streams.contains_key(tab_id) {
+    fn ensure_server_stream(&mut self, key: &TabRef, window: &mut Window, cx: &mut Context<Self>) {
+        if self.preview.server.streams.contains_key(key) {
             return;
         }
         // The tab streams from its thread's environment.
-        let Some(endpoint) = self.thread_environment(thread_id).and_then(|env| self.env_endpoint(&env).cloned()) else {
-            return;
-        };
+        let Some(endpoint) = self.env_endpoint(&key.thread.environment).cloned() else { return };
         let scale = window.scale_factor();
         let size = window.viewport_size();
         #[expect(
@@ -235,8 +227,8 @@ impl Workspace {
         )]
         let max = |px: Pixels| ((f32::from(px) * scale).round() as u32).max(1).to_string();
         let query = url::form_urlencoded::Serializer::new(String::new())
-            .append_pair("threadId", thread_id)
-            .append_pair("tabId", tab_id)
+            .append_pair("threadId", &key.thread.thread_id)
+            .append_pair("tabId", &key.tab_id)
             .append_pair("maxWidth", &max(size.width))
             .append_pair("maxHeight", &max(size.height))
             .finish();
@@ -246,7 +238,7 @@ impl Workspace {
         let (outgoing, outgoing_rx) = mpsc::unbounded_channel();
         let (events_tx, events) = async_channel::unbounded();
         crate::runtime().spawn(run_stream(url, token, events_tx, outgoing_rx));
-        let tab = tab_id.to_owned();
+        let tab = key.clone();
         let task = cx.spawn_in(window, async move |this, cx| {
             while let Ok(first) = events.recv().await {
                 // The latest frame wins; older ones in the batch are never painted.
@@ -280,11 +272,11 @@ impl Workspace {
             prompt: cx.new(|cx| InputState::new(window, cx)),
             _task: task,
         };
-        self.preview.server.streams.insert(tab_id.to_owned(), stream);
+        self.preview.server.streams.insert(key.clone(), stream);
     }
 
-    fn on_server_stream(&mut self, tab_id: &str, event: Incoming, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(stream) = self.preview.server.streams.get_mut(tab_id) else { return };
+    fn on_server_stream(&mut self, key: &TabRef, event: Incoming, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(stream) = self.preview.server.streams.get_mut(key) else { return };
         match event {
             Incoming::Connected(connected) => {
                 stream.connected = connected;
@@ -341,10 +333,11 @@ impl Workspace {
                         cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text.to_owned()));
                     }
                 }
-                // `showPreviewPopup`: a page's new window opens as its own tab.
+                // `showPreviewPopup`: a page's new window opens as its own tab, on its thread's panel.
                 Some("popup") => {
                     if let Some(popup) = message["tabId"].as_str() {
-                        self.open_surface(Surface::Browser(popup.to_owned()), window, cx);
+                        let target = super::panel_target(&key.thread);
+                        self.open_surface_on(&target, Surface::Browser(popup.to_owned()), window, cx);
                     }
                 }
                 _ => {}
@@ -356,17 +349,16 @@ impl Workspace {
     /// its view starts.
     fn server_pdf_view(
         &mut self,
-        thread_id: &str,
-        tab_id: &str,
+        key: &TabRef,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Option<Entity<gpui_webview::WebView>>> {
-        let session = self.preview.threads.get(thread_id)?.get(tab_id)?;
+        let session = self.preview.threads.session(key)?;
         let NavStatus::Success { url, .. } = &session.nav_status else { return None };
-        let endpoint = self.thread_environment(thread_id).and_then(|env| self.env_endpoint(&env).cloned())?;
+        let endpoint = self.env_endpoint(&key.thread.environment)?;
         let url = preview::pdf_asset_url(url, &endpoint.http_base)?;
-        self.preview.server.pdf_drawn.push(tab_id.to_owned());
-        if let Some(pdf) = self.preview.server.pdfs.get_mut(tab_id) {
+        self.preview.server.pdf_drawn.push(key.clone());
+        if let Some(pdf) = self.preview.server.pdfs.get_mut(key) {
             if pdf.url != url {
                 if let Some(view) = &pdf.view {
                     view.update(cx, |view, _| view.load_url(&url));
@@ -375,8 +367,8 @@ impl Workspace {
             }
             return Some(pdf.view.clone());
         }
-        self.preview.server.pdfs.insert(tab_id.to_owned(), PdfView { url, view: None, shown: false });
-        let tab = tab_id.to_owned();
+        self.preview.server.pdfs.insert(key.clone(), PdfView { url, view: None, shown: false });
+        let tab = key.clone();
         // `build_view` runs only from a task.
         cx.spawn_in(window, async move |this, cx| {
             let _ = this.update_in(cx, |this, window, cx| {
@@ -398,25 +390,23 @@ impl Workspace {
     }
 
     /// Sends `input` to the agent tab on screen, if this viewer may.
-    pub(super) fn send_server_input(&self, tab_id: &str, input: Value) -> bool {
-        self.preview.server.streams.get(tab_id).is_some_and(|stream| stream.send(input))
+    pub(super) fn send_server_input(&self, tab: &TabRef, input: Value) -> bool {
+        self.preview.server.streams.get(tab).is_some_and(|stream| stream.send(input))
     }
 
     /// The agent tab's page: its latest frame with the control bar above it, or below it
     /// (`controlPosition="bottom"`) in the mini player.
-    #[expect(clippy::too_many_arguments, reason = "a render helper's layout options")]
     pub(super) fn render_server_page(
         &mut self,
-        thread_id: &str,
-        tab_id: &str,
+        key: &TabRef,
         follow_size: bool,
         bar_below: bool,
         tokens: &Tokens,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        self.keep_server_stream(thread_id, tab_id, window, cx);
-        let Some(stream) = self.preview.server.streams.get_mut(tab_id) else {
+        self.keep_server_stream(key, window, cx);
+        let Some(stream) = self.preview.server.streams.get_mut(key) else {
             return div().flex_1().into_any_element();
         };
         for image in stream.stale.drain(..) {
@@ -438,7 +428,7 @@ impl Workspace {
             stream.sent_size = Some(size);
             stream.send(json!({"type": "resize", "width": size.0, "height": size.1}));
         }
-        let stream = &self.preview.server.streams[tab_id];
+        let stream = &self.preview.server.streams[key];
         let control = stream.control.clone();
         let mine = control.as_ref().is_some_and(Control::mine);
         let bar = h_flex()
@@ -452,7 +442,7 @@ impl Workspace {
             .bg(tokens.background)
             .child(div().text_xs().text_color(tokens.muted_foreground).child(control_label(control.as_ref())))
             .children(control.as_ref().filter(|c| c.can_operate).map(|control| {
-                let tab = tab_id.to_owned();
+                let tab = key.clone();
                 let claim = if mine { "releaseControl" } else { "takeControl" };
                 Button::new("server-browser-control")
                     .outline()
@@ -464,9 +454,9 @@ impl Workspace {
                     }))
             }));
         // The native view would cover GPUI's dialog and stop overlays.
-        let overlay = self.render_server_overlay(tab_id, tokens, cx);
-        let pdf = if overlay.is_none() { self.server_pdf_view(thread_id, tab_id, window, cx) } else { None };
-        let stream = &self.preview.server.streams[tab_id];
+        let overlay = self.render_server_overlay(key, tokens, cx);
+        let pdf = if overlay.is_none() { self.server_pdf_view(key, window, cx) } else { None };
+        let stream = &self.preview.server.streams[key];
         let fit = page_fit(stream.bounds.get(), stream.frame_size, stream.viewport);
         let cursor = stream
             .agent_pointer
@@ -486,7 +476,7 @@ impl Workspace {
             });
         let frame = stream.frame.clone().map(|frame| img(frame).size_full().object_fit(ObjectFit::Contain));
         let bounds_cell = stream.bounds.clone();
-        let tab = tab_id.to_owned();
+        let tab = key.clone();
         let (down_tab, up_tab, move_tab, wheel_tab, key_tab, key_up_tab) =
             (tab.clone(), tab.clone(), tab.clone(), tab.clone(), tab.clone(), tab.clone());
         let body = div()
@@ -546,8 +536,8 @@ impl Workspace {
     }
 
     /// The page's dialog, or the stop that ended the stream.
-    fn render_server_overlay(&self, tab_id: &str, tokens: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let stream = self.preview.server.streams.get(tab_id)?;
+    fn render_server_overlay(&self, key: &TabRef, tokens: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let stream = self.preview.server.streams.get(key)?;
         let card = || {
             v_flex()
                 .absolute()
@@ -575,7 +565,7 @@ impl Workspace {
                 .bg(tokens.background)
                 .text_center()
         };
-        let tab = tab_id.to_owned();
+        let tab = key.clone();
         match &stream.stopped {
             Some(Stop::HostSetup { message, command }) => {
                 return Some(
@@ -660,8 +650,8 @@ impl Workspace {
         )
     }
 
-    fn restart_server_stream(&mut self, tab_id: &str, cx: &mut Context<Self>) {
-        if let Some(stream) = self.preview.server.streams.remove(tab_id) {
+    fn restart_server_stream(&mut self, tab: &TabRef, cx: &mut Context<Self>) {
+        if let Some(stream) = self.preview.server.streams.remove(tab) {
             for image in stream.stale.into_iter().chain(stream.frame) {
                 cx.drop_image(image, None);
             }
@@ -669,20 +659,20 @@ impl Workspace {
         cx.notify();
     }
 
-    fn server_point(&self, tab_id: &str, position: Point<Pixels>, captured: bool) -> Option<(f32, f32)> {
-        let stream = self.preview.server.streams.get(tab_id)?;
+    fn server_point(&self, tab: &TabRef, position: Point<Pixels>, captured: bool) -> Option<(f32, f32)> {
+        let stream = self.preview.server.streams.get(tab)?;
         page_fit(stream.bounds.get(), stream.frame_size, stream.viewport)?.to_page(position, captured)
     }
 
-    fn server_mouse_down(&mut self, tab_id: &str, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(stream) = self.preview.server.streams.get(tab_id) else { return };
+    fn server_mouse_down(&mut self, tab: &TabRef, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(stream) = self.preview.server.streams.get(tab) else { return };
         if !stream.control.as_ref().is_some_and(Control::mine) {
             return;
         }
         window.focus(&stream.focus.clone(), cx);
         let Some((button, bit)) = mouse_button(event.button) else { return };
-        let Some((x, y)) = self.server_point(tab_id, event.position, false) else { return };
-        let Some(stream) = self.preview.server.streams.get_mut(tab_id) else { return };
+        let Some((x, y)) = self.server_point(tab, event.position, false) else { return };
+        let Some(stream) = self.preview.server.streams.get_mut(tab) else { return };
         stream.buttons |= bit;
         stream.send(json!({
             "type": "mouse", "action": "down", "x": x, "y": y, "button": button, "buttons": stream.buttons,
@@ -691,13 +681,13 @@ impl Workspace {
         cx.stop_propagation();
     }
 
-    fn server_mouse_up(&mut self, tab_id: &str, event: &MouseUpEvent, cx: &mut Context<Self>) {
+    fn server_mouse_up(&mut self, tab: &TabRef, event: &MouseUpEvent, cx: &mut Context<Self>) {
         let Some((button, bit)) = mouse_button(event.button) else { return };
-        if self.preview.server.streams.get(tab_id).is_none_or(|s| s.buttons & bit == 0) {
+        if self.preview.server.streams.get(tab).is_none_or(|s| s.buttons & bit == 0) {
             return;
         }
-        let Some((x, y)) = self.server_point(tab_id, event.position, true) else { return };
-        let Some(stream) = self.preview.server.streams.get_mut(tab_id) else { return };
+        let Some((x, y)) = self.server_point(tab, event.position, true) else { return };
+        let Some(stream) = self.preview.server.streams.get_mut(tab) else { return };
         stream.buttons &= !bit;
         stream.send(json!({
             "type": "mouse", "action": "up", "x": x, "y": y, "button": button, "buttons": stream.buttons,
@@ -706,13 +696,13 @@ impl Workspace {
         cx.stop_propagation();
     }
 
-    fn server_mouse_move(&mut self, tab_id: &str, event: &MouseMoveEvent) {
-        let Some(stream) = self.preview.server.streams.get(tab_id) else { return };
+    fn server_mouse_move(&mut self, tab: &TabRef, event: &MouseMoveEvent) {
+        let Some(stream) = self.preview.server.streams.get(tab) else { return };
         if !stream.control.as_ref().is_some_and(Control::mine) {
             return;
         }
         let held = stream.buttons;
-        let Some((x, y)) = self.server_point(tab_id, event.position, held != 0) else { return };
+        let Some((x, y)) = self.server_point(tab, event.position, held != 0) else { return };
         let button = match held {
             0 => "none",
             b if b & 1 != 0 => "left",
@@ -725,28 +715,28 @@ impl Workspace {
         }));
     }
 
-    fn server_wheel(&self, tab_id: &str, event: &ScrollEvent) -> bool {
-        let Some((x, y)) = self.server_point(tab_id, event.position, false) else { return false };
+    fn server_wheel(&self, tab: &TabRef, event: &ScrollEvent) -> bool {
+        let Some((x, y)) = self.server_point(tab, event.position, false) else { return false };
         let (dx, dy) = match event.delta {
             ScrollDelta::Pixels(delta) => (f32::from(delta.x), f32::from(delta.y)),
             ScrollDelta::Lines(delta) => (delta.x * WHEEL_LINE_PX, delta.y * WHEEL_LINE_PX),
         };
         // GPUI's deltas point where the content moves; the DOM's where the page scrolls.
         self.send_server_input(
-            tab_id,
+            tab,
             json!({"type": "wheel", "x": x, "y": y, "deltaX": -dx, "deltaY": -dy, "modifiers": modifier_bits(event.modifiers)}),
         )
     }
 
     fn server_key(
         &mut self,
-        tab_id: &str,
+        tab: &TabRef,
         action: &str,
         keystroke: &Keystroke,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(stream) = self.preview.server.streams.get(tab_id) else { return false };
+        let Some(stream) = self.preview.server.streams.get(tab) else { return false };
         // Keys typed into the page's own overlays, such as a prompt's response, stay there.
         if !stream.control.as_ref().is_some_and(Control::mine) || !stream.focus.is_focused(window) {
             return false;
@@ -776,10 +766,10 @@ impl Workspace {
 impl Workspace {
     /// `alternatePreviewRuntime`'s label: a remote environment's tab can move between this
     /// computer and the environment's own browser. `None` for this app's own server.
-    pub(super) fn move_tab_label(&self, session: &Session) -> Option<SharedString> {
-        let environment = self.thread_environment(&session.thread_id)?;
-        let remote = self.environment_remote || self.primary_environment() != Some(&environment);
-        let info = &self.session(&environment)?.server_info;
+    pub(super) fn move_tab_label(&self, thread: &ThreadRef, session: &Session) -> Option<SharedString> {
+        let environment = &thread.environment;
+        let remote = self.environment_remote || self.primary_environment() != Some(environment);
+        let info = &self.session(environment)?.server_info;
         if !remote || !info.capability("serverBrowser") {
             return None;
         }
@@ -792,14 +782,19 @@ impl Workspace {
     }
 
     /// `handleMoveTab`: opens the page in the other runtime, then closes this tab.
-    pub(super) fn move_preview_tab(&mut self, session: Session, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.thread_client(&session.thread_id) else { return };
-        let mut input = json!({"threadId": session.thread_id, "viewport": viewport_json(&session.viewport)});
+    pub(super) fn move_preview_tab(
+        &mut self,
+        thread: ThreadRef,
+        session: Session,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.env_client(&thread.environment) else { return };
+        let mut input = json!({"threadId": thread.thread_id, "viewport": viewport_json(&session.viewport)});
         if let Some(url) = session.nav_status.url() {
             // A page moving to this computer reaches the environment's loopback servers on its host.
             input["url"] =
-                if session.server_hosted() { self.discovered_url(&session.thread_id, url) } else { url.to_owned() }
-                    .into();
+                if session.server_hosted() { self.discovered_url(&thread, url) } else { url.to_owned() }.into();
         }
         if !session.server_hosted() {
             input["runtime"] = "server".into();
@@ -807,8 +802,8 @@ impl Workspace {
         if let Some(profile) = &session.profile_id {
             input["profileId"] = profile.clone().into();
         }
-        // The moved tab opens where the move started, even if another thread shows by then.
-        let origin = self.target.clone();
+        // The moved tab opens on its thread's panel, even if another thread shows by then.
+        let origin = super::panel_target(&thread);
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("preview.open", input).await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -817,11 +812,9 @@ impl Workspace {
                 }) {
                     Ok(moved) => {
                         let tab = moved.tab_id.clone();
-                        this.preview.threads.entry(session.thread_id.clone()).or_default().apply_snapshot(moved, true);
-                        if let Some(origin) = &origin {
-                            this.open_surface_on(origin, Surface::Browser(tab), window, cx);
-                        }
-                        this.close_preview_tab(session.thread_id.clone(), session.tab_id.clone(), window, cx);
+                        this.preview.threads.entry(&thread).apply_snapshot(moved, true);
+                        this.open_surface_on(&origin, Surface::Browser(tab), window, cx);
+                        this.close_preview_tab(thread.tab(&session.tab_id), window, cx);
                     }
                     Err(error) => window.push_notification(
                         gpui_kit::component::notification::Notification::error(error)

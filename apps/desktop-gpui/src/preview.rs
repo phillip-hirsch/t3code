@@ -2,8 +2,10 @@
 //! the per-thread reducer of `apps/web/src/previewStateStore.ts`, and the address
 //! bar's URL resolution from `packages/shared/src/preview.ts`.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 
+use gpui_kit::SharedString;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -621,6 +623,102 @@ impl ThreadPreviews {
             self.active_tab =
                 self.sessions.get(index.min(self.sessions.len().saturating_sub(1))).map(|s| s.tab_id.clone());
         }
+    }
+}
+
+/// A thread on one environment (`ScopedThreadRef`). Thread ids, and the tab ids each server
+/// numbers from 1, repeat across environments, so preview state is keyed by this.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ThreadRef {
+    pub environment: SharedString,
+    pub thread_id: String,
+}
+
+impl ThreadRef {
+    pub fn new(environment: impl Into<SharedString>, thread_id: impl Into<String>) -> Self {
+        Self { environment: environment.into(), thread_id: thread_id.into() }
+    }
+
+    pub fn tab(&self, tab_id: impl Into<String>) -> TabRef {
+        TabRef { thread: self.clone(), tab_id: tab_id.into() }
+    }
+}
+
+/// One browser tab of a thread on one environment.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TabRef {
+    pub thread: ThreadRef,
+    pub tab_id: String,
+}
+
+/// What a `subscribePreviewEvents` item changed.
+#[derive(Debug, PartialEq, Eq)]
+pub struct EventApplied {
+    pub thread: ThreadRef,
+    /// The thread's list must be (re)fetched: its server restarted, or it never loaded.
+    pub needs_list: bool,
+    /// [`ThreadPreviews::fresh_reveals`].
+    pub reveals: Vec<(String, bool)>,
+}
+
+/// Every thread's tabs on every environment (`previewStateAtom` by `scopedThreadKey`).
+#[derive(Debug, Default)]
+pub struct PreviewThreads(HashMap<ThreadRef, ThreadPreviews>);
+
+impl PreviewThreads {
+    pub fn get(&self, thread: &ThreadRef) -> Option<&ThreadPreviews> {
+        self.0.get(thread)
+    }
+
+    pub fn get_mut(&mut self, thread: &ThreadRef) -> Option<&mut ThreadPreviews> {
+        self.0.get_mut(thread)
+    }
+
+    /// The thread's tabs, empty until its list or an event arrives.
+    pub fn entry(&mut self, thread: &ThreadRef) -> &mut ThreadPreviews {
+        self.0.entry(thread.clone()).or_default()
+    }
+
+    pub fn session(&self, tab: &TabRef) -> Option<&Session> {
+        self.get(&tab.thread)?.get(&tab.tab_id)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&ThreadRef, &ThreadPreviews)> {
+        self.0.iter()
+    }
+
+    /// The threads known on `environment`.
+    pub fn on_environment<'a>(&'a self, environment: &'a str) -> impl Iterator<Item = &'a ThreadRef> {
+        self.0.keys().filter(move |thread| thread.environment.as_ref() == environment)
+    }
+
+    /// One item of `environment`'s `subscribePreviewEvents` stream, applied to its thread there.
+    /// `None` for an item that names no thread.
+    pub fn apply_event(&mut self, environment: &SharedString, event: &Value) -> Option<EventApplied> {
+        let thread = ThreadRef::new(environment.clone(), event.get("threadId")?.as_str()?);
+        let previews = self.entry(&thread);
+        let before = previews.clone();
+        let applied = previews.apply_event(event);
+        let reveals = previews.fresh_reveals(&before);
+        let needs_list = match applied {
+            Ok(Applied::Relist) => true,
+            Ok(_) => !previews.list_loaded,
+            Err(error) => {
+                log::warn!("bad preview event: {error}");
+                false
+            }
+        };
+        Some(EventApplied { thread, needs_list, reveals })
+    }
+
+    /// `preview.list`'s result for `thread`, with the reveals it brought.
+    pub fn apply_list(&mut self, thread: &ThreadRef, list: &Value) -> Vec<(String, bool)> {
+        let previews = self.entry(thread);
+        let before = previews.clone();
+        if let Err(error) = previews.apply_list(list) {
+            log::warn!("bad preview list: {error}");
+        }
+        previews.fresh_reveals(&before)
     }
 }
 
@@ -1518,6 +1616,33 @@ mod tests {
             "serverEpoch": "e1", "revision": 5, "snapshot": session("c", "6")});
         previews.apply_event(&reopened).unwrap();
         assert!(previews.get("c").is_some(), "the id is usable again");
+    }
+
+    #[test]
+    fn equal_thread_and_tab_ids_on_two_environments_stay_apart() {
+        let (a, b) = (SharedString::from("env-a"), SharedString::from("env-b"));
+        let (thread_a, thread_b) = (ThreadRef::new(a.clone(), "t1"), ThreadRef::new(b.clone(), "t1"));
+        let mut threads = PreviewThreads::default();
+        let list = json!({"sessions": [session("tab-1", "1")], "serverEpoch": "epoch-a", "revision": 3});
+        assert!(threads.apply_list(&thread_a, &list).is_empty());
+
+        // Another server, another epoch: not a restart of the first one's.
+        let opened = json!({"type": "opened", "threadId": "t1", "tabId": "tab-1", "createdAt": "2",
+            "serverEpoch": "epoch-b", "revision": 1, "snapshot": session("tab-1", "2")});
+        let applied = threads.apply_event(&b, &opened).expect("names its thread");
+        assert_eq!(applied.thread, thread_b);
+        assert!(applied.needs_list, "the second environment's list hasn't loaded");
+        assert_eq!(threads.get(&thread_a).map(|p| p.list_loaded), Some(true), "the first keeps its list");
+        assert_eq!(threads.session(&thread_a.tab("tab-1")).map(|s| s.updated_at.as_str()), Some("1"));
+        assert_eq!(threads.session(&thread_b.tab("tab-1")).map(|s| s.updated_at.as_str()), Some("2"));
+
+        let closed = json!({"type": "closed", "threadId": "t1", "tabId": "tab-1", "createdAt": "3",
+            "serverEpoch": "epoch-b", "revision": 2});
+        threads.apply_event(&b, &closed);
+        assert!(threads.session(&thread_b.tab("tab-1")).is_none());
+        assert!(threads.session(&thread_a.tab("tab-1")).is_some(), "a close on one environment leaves the other");
+        assert_eq!(threads.on_environment("env-a").collect::<Vec<_>>(), [&thread_a]);
+        assert_eq!(threads.apply_event(&a, &json!({"type": "opened"})), None, "an event without a thread");
     }
 
     #[test]

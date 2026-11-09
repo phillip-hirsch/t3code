@@ -517,12 +517,13 @@ impl Workspace {
             None => self.launch_terminal_with(thread_id.clone(), Place::New, launch, Some(input), cx),
         };
         let environment = self.thread_environment(&thread_id);
-        match run.preview_url.clone().map(|url| self.resolve_server_url(environment.as_deref(), url)) {
-            Some(url) => cx
+        let preview = self.preview_thread_of(&thread_id);
+        match run.preview_url.clone().map(|url| self.resolve_server_url(environment.as_deref(), url)).zip(preview) {
+            Some((url, thread)) => cx
                 .spawn_in(window, async move |this, cx| {
                     if written.await {
                         let _ = this.update_in(cx, |this, window, cx| {
-                            this.open_preview_tab(thread_id, Some(url), window, cx);
+                            this.open_preview_tab(thread, Some(url), window, cx);
                         });
                     }
                 })
@@ -795,7 +796,7 @@ impl Workspace {
             }
             // `openTerminalLinkInPreview`: the in-app browser when links open there, else the system's.
             SessionEvent::OpenUrl { url, force_browser } => {
-                let thread = self.preview_thread_id().filter(|id| *id == thread_id).map(str::to_owned);
+                let thread = self.preview_thread().filter(|thread| thread.thread_id == *thread_id);
                 let in_app = crate::preview::link_opens_in_app(
                     url,
                     *force_browser,

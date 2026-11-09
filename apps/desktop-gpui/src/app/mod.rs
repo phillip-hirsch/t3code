@@ -949,7 +949,9 @@ impl Workspace {
         if resumed {
             self.refresh_rows(cx);
         }
-        self.load_previews(&thread_id, window, cx);
+        if let Some(thread) = self.preview_thread() {
+            self.load_previews(thread, window, cx);
+        }
         self.open_visit(&thread_id, cx);
         self.focus_composer(window, cx);
         self.notify_sidebar(cx);
