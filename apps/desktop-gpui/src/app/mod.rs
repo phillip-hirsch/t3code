@@ -289,6 +289,7 @@ pub struct Workspace {
     page: Option<pages::Page>,
     pull_requests: pages::PullRequestsState,
     usage: pages::UsageState,
+    welcome: pages::WelcomeState,
     /// The Settings modal's open section.
     settings: Option<SharedString>,
     settings_ui: pages::settings::SettingsUi,
@@ -500,6 +501,7 @@ impl Workspace {
             page: None,
             pull_requests: pages::PullRequestsState::new(window, cx),
             usage: pages::UsageState::new(&client_settings.values),
+            welcome: pages::WelcomeState::restored(),
             settings: None,
             settings_ui: pages::settings::SettingsUi::new(window, cx),
             client_settings,
@@ -820,7 +822,9 @@ impl Workspace {
             return;
         }
         self.landed = true;
-        if self.target.is_some() {
+        // Setup opens by itself only where the index route would land, so a link still opens.
+        let home = self.target.is_none() && self.page.is_none() && self.settings.is_none();
+        if self.check_first_run(home, window, cx) || self.target.is_some() {
             return;
         }
         if let Some(project_id) =
@@ -1226,6 +1230,7 @@ impl Render for Workspace {
             self.focus.focus(window, cx);
         }
         self.sync_vcs(window, cx);
+        self.sync_welcome(window, cx);
         #[cfg(windows)]
         if !self.preview.warm_requested && self.right_panel_open() {
             self.preview.warm_requested = true;
@@ -1305,7 +1310,9 @@ impl Render for Workspace {
             .child(
                 h_flex()
                     .size_full()
-                    .when(self.sidebar_open.docked(), |el| el.child(self.render_cached_sidebar()))
+                    .when(self.sidebar_open.docked() && !self.sidebar_hidden(), |el| {
+                        el.child(self.render_cached_sidebar())
+                    })
                     .child(
                         v_flex()
                             .flex_1()

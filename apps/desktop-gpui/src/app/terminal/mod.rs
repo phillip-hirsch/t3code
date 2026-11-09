@@ -10,8 +10,10 @@ mod mouse;
 mod panel;
 mod scrollbar;
 mod session;
+mod standalone;
 
 pub(in crate::app) use self::grid::TerminalTheme;
+pub(in crate::app) use self::standalone::StandaloneTerminal;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

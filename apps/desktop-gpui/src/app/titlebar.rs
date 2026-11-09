@@ -209,7 +209,9 @@ impl Workspace {
             .left_0()
             .right_0()
             .h(TITLEBAR_HEIGHT)
-            .when(!self.sidebar_open.sheet(), |el| el.child(self.render_sidebar_toggle(window, cx)))
+            .when(!self.sidebar_open.sheet() && !self.sidebar_hidden(), |el| {
+                el.child(self.render_sidebar_toggle(window, cx))
+            })
             .map(|el| {
                 if self.page == Some(super::pages::Page::PullRequests) && self.settings.is_none() {
                     el.child(self.render_pull_request_page_toggles(cx))

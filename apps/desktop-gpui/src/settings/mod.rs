@@ -291,6 +291,17 @@ impl ClientSettings {
         self.save_or_warn();
     }
 
+    /// [`Self::apply`] for a write the caller must know landed; a failed save keeps the old values.
+    pub fn try_apply(&mut self, patch: &Map<String, Value>) -> std::io::Result<()> {
+        let previous = self.values.clone();
+        self.values.apply(patch);
+        let saved = self.save();
+        if saved.is_err() {
+            self.values = previous;
+        }
+        saved
+    }
+
     fn document(&self) -> Value {
         let mut document = self.values.as_map().clone();
         document.insert(THEME_KEY.into(), self.theme.id().into());
@@ -539,6 +550,24 @@ mod tests {
         assert!(settings.set_themes(themes, choice).is_err());
         assert!(settings.themes.custom().is_empty());
         assert_eq!(settings.theme_id, None);
+        std::fs::remove_dir_all(blocker.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_setting_that_must_land_reports_a_failed_write_and_keeps_the_old_value() {
+        let patch = Map::from_iter([("onboardingCompletedAt".to_owned(), json!("2026-11-09T00:00:00.000Z"))]);
+        let path = scratch("must-land");
+        let mut settings = ClientSettings::load_from(Some(path.clone()));
+        settings.try_apply(&patch).unwrap();
+        let reread = ClientSettings::load_from(Some(path.clone()));
+        assert_eq!(reread.values.get("onboardingCompletedAt"), &json!("2026-11-09T00:00:00.000Z"), "saved to disk");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+
+        let blocker = scratch("must-land-fails");
+        std::fs::write(&blocker, "").unwrap();
+        let mut settings = ClientSettings::from_stored(&json!({}), Some(blocker.join("client-settings.json")));
+        assert!(settings.try_apply(&patch).is_err());
+        assert!(settings.values.get("onboardingCompletedAt").is_null(), "a failed write leaves setup unfinished");
         std::fs::remove_dir_all(blocker.parent().unwrap()).unwrap();
     }
 }

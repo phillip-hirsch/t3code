@@ -212,7 +212,7 @@ pub(super) fn status_key(provider: Option<&Value>) -> StatusKey {
 }
 
 /// `getProviderSummary`: a headline and an optional detail.
-pub(super) fn summary(provider: Option<&Value>) -> (String, Option<String>) {
+pub(in crate::app) fn summary(provider: Option<&Value>) -> (String, Option<String>) {
     let Some(provider) = provider else {
         return (
             "Checking provider status".into(),

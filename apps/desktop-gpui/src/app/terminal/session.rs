@@ -207,6 +207,8 @@ pub(super) struct TerminalSession {
     running: bool,
     /// Without `terminal:operate` nothing is written to the PTY, and it is never resized.
     read_only: bool,
+    /// Its menus offer Add to chat; a pane with no composer leaves it out.
+    pub can_add_to_chat: bool,
     exited: bool,
     /// The attach stream replied once; later attaches resume instead of opening a shell.
     attached: bool,
@@ -307,6 +309,7 @@ impl TerminalSession {
             sent_size: None,
             running: false,
             read_only,
+            can_add_to_chat: true,
             exited: false,
             attached: false,
             client: None,

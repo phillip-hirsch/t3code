@@ -37,17 +37,24 @@ impl TerminalSession {
     ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
         let session = cx.entity();
         move |menu, window, cx| {
-            let has_selection = session.read(cx).selected().is_some();
+            let (has_selection, can_add) = {
+                let session = session.read(cx);
+                (session.selected().is_some(), session.can_add_to_chat)
+            };
             let on = |f: fn(&mut TerminalSession, &mut Window, &mut Context<TerminalSession>)| {
                 window.listener_for(&session, move |this, _, window, cx| f(this, window, cx))
             };
-            menu.min_w(px(160.))
-                .item(
+            let menu = menu.min_w(px(160.));
+            let menu = if can_add {
+                menu.item(
                     PopupMenuItem::new("Add to chat")
                         .disabled(!has_selection)
                         .on_click(on(|this, _, cx| this.add_selection_to_chat(cx))),
                 )
-                .item(PopupMenuItem::new("Copy").disabled(!has_selection).on_click(on(|this, _, cx| this.copy(cx))))
+            } else {
+                menu
+            };
+            menu.item(PopupMenuItem::new("Copy").disabled(!has_selection).on_click(on(|this, _, cx| this.copy(cx))))
                 .item(PopupMenuItem::new("Paste").on_click(on(|this, _, cx| this.paste(cx))))
                 .item(PopupMenuItem::new("Select all").on_click(on(|this, _, cx| this.select_all(cx))))
                 .item(PopupMenuItem::new("Jump to latest").on_click(on(|this, _, cx| this.scroll_to_bottom(cx))))
@@ -74,7 +81,8 @@ impl TerminalSession {
 
     fn open_selection_menu(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         self.pointer.menu_timer = None;
-        if self.selected().is_none() {
+        // The menu that follows a selection exists for Add to chat (`showSelectionAction`).
+        if !self.can_add_to_chat || self.selected().is_none() {
             return;
         }
         let session = cx.entity();

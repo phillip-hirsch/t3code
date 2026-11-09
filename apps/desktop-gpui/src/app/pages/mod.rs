@@ -6,11 +6,13 @@ mod pull_request_surface;
 mod pull_requests;
 pub(super) mod settings;
 mod usage;
+mod welcome;
 
 use gpui_kit::{AnyElement, Context, SharedString, Window};
 
 pub(super) use pull_requests::PullRequestsState;
 pub(super) use usage::UsageState;
+pub(super) use welcome::WelcomeState;
 
 use super::{Target, Workspace};
 
@@ -26,6 +28,8 @@ pub(super) enum Page {
     Usage,
     /// An app link being opened (`/_chat/new`); its state is `DesktopShell::link_page`.
     Link,
+    /// First-run setup (`/welcome`), shown without the sidebar; see `welcome.rs`.
+    Welcome,
 }
 
 impl Page {
@@ -34,6 +38,8 @@ impl Page {
             Page::PullRequests => "Pull requests",
             Page::Usage => "Usage",
             Page::Link => "T3 Code",
+            // The web's `WorkspacePageHeader` keeps only the titlebar strip here.
+            Page::Welcome => "",
         }
     }
 
@@ -131,6 +137,7 @@ impl Workspace {
         match self.page {
             Some(Page::PullRequests) => self.pull_requests_opened(cx),
             Some(Page::Usage) => self.usage_opened(cx),
+            Some(Page::Welcome) => self.welcome_opened(cx),
             Some(Page::Link) | None => {}
         }
     }
@@ -220,6 +227,7 @@ impl Workspace {
             Page::PullRequests => Some(self.render_pull_requests(window, cx)),
             Page::Usage => None,
             Page::Link => Some(self.render_link_page(window, cx)),
+            Page::Welcome => Some(self.render_welcome(window, cx)),
         }
     }
 

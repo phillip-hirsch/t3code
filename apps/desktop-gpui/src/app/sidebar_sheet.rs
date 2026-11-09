@@ -190,6 +190,10 @@ impl Workspace {
     }
 
     pub(super) fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        // A hidden sidebar would still save the toggle, so the shortcut does nothing without one.
+        if self.sidebar_hidden() {
+            return;
+        }
         if let (Some(docked), Some(path)) = (self.sidebar_open.toggle(), docked_path()) {
             write_docked(&path, docked);
         }
@@ -199,8 +203,13 @@ impl Workspace {
 
     /// The sidebar as a `Sheet` from the left; a press anywhere else closes it. It is the
     /// window's width less 12 px (`SIDEBAR_WIDTH_MOBILE`), whatever its content.
+    /// Setup starts with an empty workspace, so the Welcome page has no thread list.
+    pub(super) fn sidebar_hidden(&self) -> bool {
+        self.page == Some(super::pages::Page::Welcome)
+    }
+
     pub(super) fn render_sidebar_sheet(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.sidebar_open.sheet() {
+        if !self.sidebar_open.sheet() || self.sidebar_hidden() {
             return None;
         }
         let sheet = AnyView::from(self.sidebar_view.clone());
