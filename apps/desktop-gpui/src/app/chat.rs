@@ -1941,11 +1941,8 @@ fn markdown_view(
                 // A thread no longer here opens nothing, as its chip shows.
                 Some(_) => {
                     let message_environment = workspace.active_environment().map(ToString::to_string);
-                    let destination = super::markdown_ui::thread_link_destination(
-                        url,
-                        message_environment.as_deref(),
-                        &workspace.shell.threads,
-                    );
+                    let destination =
+                        super::markdown_ui::thread_link_destination(url, message_environment.as_deref(), workspace);
                     if let Some((env, thread_id)) = destination {
                         workspace.select_thread_in(env, thread_id, window, cx);
                     }

@@ -848,7 +848,8 @@ struct ThreadChip {
 }
 
 /// `MarkdownThreadLink`: a thread link draws as the thread's chip, named by its current title
-/// and opening it; a link no thread here answers to draws as an unresolved chip.
+/// and opening it; a link no thread answers to, once the server says so, draws as an unresolved
+/// chip.
 pub(super) struct ThreadChips {
     pub workspace: WeakEntity<Workspace>,
 }
@@ -877,16 +878,23 @@ impl MarkdownPlugin for ThreadChips {
         let Some(chip) = node.data::<ThreadChip>() else { return div().into_any_element() };
         let Some(workspace) = self.workspace.upgrade() else { return div().into_any_element() };
         let tokens = *crate::theme::tokens(cx);
+        let message_environment = workspace.read(cx).active_environment().cloned();
+        let stale = workspace.read(cx).stale_thread_link_lookup(&chip.link, message_environment.as_deref());
+        if let Some((environment, ids)) = stale {
+            let workspace = self.workspace.clone();
+            cx.defer(move |cx| {
+                let _ = workspace.update(cx, |w, cx| w.ask_thread_link_metadata(environment, ids, cx));
+            });
+        }
         let w = workspace.read(cx);
-        let message_environment = w.active_environment().cloned();
-        let thread = resolve_thread_link(&chip.link, message_environment.as_deref(), &w.shell.threads);
+        let target = w.resolve_thread_link(&chip.link, message_environment.as_deref());
         let id = SharedString::from(format!(
             "thread-chip:{}:{}",
             chip.link.environment_id.as_deref().unwrap_or_default(),
             chip.link.thread_id
         ));
         let row = h_flex().id(id).max_w_full().gap(px(3.)).rounded(px(4.)).font_weight(FontWeight::MEDIUM);
-        let Some(thread) = thread else {
+        let LinkTarget::Thread { environment, thread_id, title, project_id } = target else {
             let unknown = crate::thread_links::unknown_label(&chip.link, message_environment.as_deref());
             let label: SharedString = chip.label.clone().map_or_else(|| unknown.into(), Into::into);
             return row
@@ -895,19 +903,17 @@ impl MarkdownPlugin for ThreadChips {
                 .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(unknown).build(window, cx))
                 .into_any_element();
         };
-        let project =
-            w.shell.projects.iter().find(|p| p.id == thread.project_id && p.environment_id == thread.environment_id);
+        let project = project_id.and_then(|project_id| {
+            w.shell.projects.iter().find(|p| p.id == project_id && p.environment_id == environment)
+        });
         let icon = match project {
             Some(project) => super::sidebar::project_icon(project, &tokens, false, 14., w.favicon(project)),
             None => Icon::new(IconName::MessagesSquare).size(px(14.)).flex_none().into_any_element(),
         };
-        let title = thread.title.trim();
-        let title: SharedString = if title.is_empty() {
-            chip.label.clone().unwrap_or_else(|| "Untitled thread".to_owned()).into()
-        } else {
-            title.to_owned().into()
+        let title: SharedString = match title.as_deref().map(str::trim) {
+            Some(title) if !title.is_empty() => title.to_owned().into(),
+            _ => chip.label.clone().unwrap_or_else(|| "Thread".to_owned()).into(),
         };
-        let (environment, thread_id) = (thread.environment_id.clone(), thread.id.clone());
         let open = self.workspace.clone();
         row.text_color(rgb(0x009c96))
             .cursor_pointer()
@@ -921,41 +927,227 @@ impl MarkdownPlugin for ThreadChips {
     }
 }
 
-/// Where a chat link to a thread opens: the thread's environment and id, as [`ThreadChips`]
-/// resolves it, so a reference-style link keeps the environment it names (`MarkdownThreadLink`).
+/// A thread's title and project as `orchestration.getThreadLinkMetadata` reports them; a server
+/// without it answers `getThreadTitles`, which names no project.
+#[derive(Clone, Debug, PartialEq)]
+struct LinkMetadata {
+    title: String,
+    project_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum LinkAnswer {
+    Asking,
+    Found(LinkMetadata),
+    /// The server answered without it: no thread there has this id.
+    Absent,
+    /// Only an answer proves a thread gone, so the link stays open.
+    Failed,
+}
+
+struct LinkLookup {
+    socket: crate::rpc::SocketId,
+    /// The environment's shell removals when asked; a removal asks again (`refreshThreadLookup`).
+    removals: u64,
+    answer: LinkAnswer,
+}
+
+/// What servers said of linked threads their shells leave out, by environment and thread
+/// (`orchestrationEnvironment.threadLinkMetadata`). A new socket or a removed thread asks again.
+#[derive(Default)]
+pub(super) struct ThreadLinkLookups(HashMap<(SharedString, String), LinkLookup>);
+
+impl ThreadLinkLookups {
+    fn answer(&self, environment: &SharedString, thread_id: &str) -> Option<&LinkAnswer> {
+        self.0.get(&(environment.clone(), thread_id.to_owned())).map(|lookup| &lookup.answer)
+    }
+
+    fn is_current(
+        &self,
+        environment: &SharedString,
+        thread_id: &str,
+        socket: &crate::rpc::SocketId,
+        removals: u64,
+    ) -> bool {
+        self.0
+            .get(&(environment.clone(), thread_id.to_owned()))
+            .is_some_and(|lookup| lookup.socket == *socket && lookup.removals == removals)
+    }
+
+    /// Marks `ids` asked on `socket`, replacing what an earlier ask said.
+    fn ask(&mut self, environment: &SharedString, ids: &[String], socket: &crate::rpc::SocketId, removals: u64) {
+        for id in ids {
+            let lookup = LinkLookup { socket: socket.clone(), removals, answer: LinkAnswer::Asking };
+            self.0.insert((environment.clone(), id.clone()), lookup);
+        }
+    }
+
+    /// Records the answer to one ask (`None` when it failed), unless a later ask replaced it.
+    /// `full` answers are `getThreadLinkMetadata`'s, the others `getThreadTitles`'.
+    fn record(
+        &mut self,
+        environment: &SharedString,
+        ids: &[String],
+        (socket, removals): (&crate::rpc::SocketId, u64),
+        answer: Option<&serde_json::Value>,
+        full: bool,
+    ) {
+        for id in ids {
+            let Some(lookup) = self.0.get_mut(&(environment.clone(), id.clone())) else { continue };
+            if lookup.socket != *socket || lookup.removals != removals {
+                continue;
+            }
+            lookup.answer = match answer.map(|answer| &answer[id.as_str()]) {
+                None => LinkAnswer::Failed,
+                Some(entry) => {
+                    let (title, project_id) = if full {
+                        (entry["title"].as_str(), entry["projectId"].as_str())
+                    } else {
+                        (entry.as_str(), None)
+                    };
+                    title.map_or(LinkAnswer::Absent, |title| {
+                        LinkAnswer::Found(LinkMetadata {
+                            title: title.to_owned(),
+                            project_id: project_id.map(str::to_owned),
+                        })
+                    })
+                }
+            };
+        }
+    }
+}
+
+/// What a thread link shows and opens (`MarkdownThreadLink`).
+#[derive(Debug, PartialEq)]
+enum LinkTarget {
+    /// The thread the shell or the server names, or, until the server answers (or when it
+    /// can't), the thread as written, named by the link's own text.
+    Thread { environment: SharedString, thread_id: String, title: Option<String>, project_id: Option<String> },
+    /// The server has no such thread, and no other environment holds a unique match.
+    Missing,
+}
+
+/// `threadLinkCandidates`: the environment a link names (or the message's), and its thread as
+/// written, then percent-decoded.
+fn link_candidates(
+    link: &crate::thread_links::ThreadLink,
+    message_environment: Option<&str>,
+) -> Option<(SharedString, Vec<String>)> {
+    let environment = link.environment_id.as_deref().or(message_environment)?;
+    let decoded = crate::thread_links::percent_decoded(&link.thread_id);
+    Some((environment.to_owned().into(), std::iter::once(link.thread_id.clone()).chain(decoded).collect()))
+}
+
+/// The thread a link names: the shell's, as written, else the first candidate the server knows;
+/// a v1 link the server denies takes a unique match in another environment.
+fn resolve_thread_link(
+    link: &crate::thread_links::ThreadLink,
+    message_environment: Option<&str>,
+    threads: &[crate::model::ThreadShell],
+    lookups: &ThreadLinkLookups,
+) -> LinkTarget {
+    let Some((environment, ids)) = link_candidates(link, message_environment) else { return LinkTarget::Missing };
+    let shell_target = |thread: &crate::model::ThreadShell| LinkTarget::Thread {
+        environment: thread.environment_id.clone(),
+        thread_id: thread.id.clone(),
+        title: Some(thread.title.clone()),
+        project_id: Some(thread.project_id.clone()),
+    };
+    if let Some(thread) = threads.iter().find(|t| t.id == ids[0] && t.environment_id == environment) {
+        return shell_target(thread);
+    }
+    let answers: Vec<Option<&LinkAnswer>> = ids.iter().map(|id| lookups.answer(&environment, id)).collect();
+    let found = ids.iter().zip(&answers).find_map(|(id, answer)| match answer {
+        Some(LinkAnswer::Found(metadata)) => Some((id, metadata)),
+        _ => None,
+    });
+    if let Some((id, metadata)) = found {
+        return LinkTarget::Thread {
+            environment,
+            thread_id: id.clone(),
+            title: Some(metadata.title.clone()),
+            project_id: metadata.project_id.clone(),
+        };
+    }
+    if !answers.iter().all(|answer| *answer == Some(&LinkAnswer::Absent)) {
+        return LinkTarget::Thread { environment, thread_id: ids[0].clone(), title: None, project_id: None };
+    }
+    if link.environment_id.is_some() {
+        return LinkTarget::Missing;
+    }
+    let elsewhere = ids.iter().find_map(|id| {
+        let mut matches = threads.iter().filter(|t| t.id == *id && t.environment_id != environment);
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first)
+    });
+    elsewhere.map_or(LinkTarget::Missing, shell_target)
+}
+
+impl Workspace {
+    fn resolve_thread_link(
+        &self,
+        link: &crate::thread_links::ThreadLink,
+        message_environment: Option<&str>,
+    ) -> LinkTarget {
+        resolve_thread_link(link, message_environment, &self.shell.threads, &self.thread_link_lookups)
+    }
+
+    /// A link's candidates when the shell lacks it and this connection has not asked for them
+    /// since the environment last removed a thread.
+    fn stale_thread_link_lookup(
+        &self,
+        link: &crate::thread_links::ThreadLink,
+        message_environment: Option<&str>,
+    ) -> Option<(SharedString, Vec<String>)> {
+        let (environment, ids) = link_candidates(link, message_environment)?;
+        if self.shell.threads.iter().any(|t| t.id == ids[0] && t.environment_id == environment) {
+            return None;
+        }
+        let socket = self.session(&environment)?.client.as_ref()?.socket_id();
+        let removals = self.shell.removals(&environment);
+        let stale = ids.iter().any(|id| !self.thread_link_lookups.is_current(&environment, id, &socket, removals));
+        stale.then_some((environment, ids))
+    }
+
+    /// Asks `environment` for the titles and projects of linked threads its shell leaves out.
+    fn ask_thread_link_metadata(&mut self, environment: SharedString, ids: Vec<String>, cx: &mut Context<Self>) {
+        let Some(session) = self.session(&environment) else { return };
+        let Some(client) = session.client.clone() else { return };
+        let full =
+            session.server_info.config.get("threadLinkMetadata").and_then(serde_json::Value::as_bool) == Some(true);
+        let (socket, removals) = (client.socket_id(), self.shell.removals(&environment));
+        if ids.iter().all(|id| self.thread_link_lookups.is_current(&environment, id, &socket, removals)) {
+            return;
+        }
+        self.thread_link_lookups.ask(&environment, &ids, &socket, removals);
+        let method = if full { "orchestration.getThreadLinkMetadata" } else { "orchestration.getThreadTitles" };
+        cx.spawn(async move |this, cx| {
+            let answer = client.request(method, json!({ "threadIds": ids })).await;
+            if let Err(error) = &answer {
+                log::warn!("{method}: {error}");
+            }
+            let _ = this.update(cx, |this, cx| {
+                let asked = (&socket, removals);
+                this.thread_link_lookups.record(&environment, &ids, asked, answer.as_ref().ok(), full);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+}
+
+/// Where a chat link to a thread opens, as [`ThreadChips`] resolves it, so a reference-style
+/// link keeps the environment it names (`MarkdownThreadLink`); a missing thread opens nothing.
 pub(super) fn thread_link_destination(
     url: &str,
     message_environment: Option<&str>,
-    threads: &[crate::model::ThreadShell],
+    workspace: &Workspace,
 ) -> Option<(SharedString, String)> {
     let link = crate::thread_links::parse(url)?;
-    let thread = resolve_thread_link(&link, message_environment, threads)?;
-    Some((thread.environment_id.clone(), thread.id.clone()))
-}
-
-/// The thread a link names: in its own environment (or the message's), as written then
-/// percent-decoded; a v1 link the message's environment lacks takes a unique match elsewhere.
-fn resolve_thread_link<'a>(
-    link: &crate::thread_links::ThreadLink,
-    message_environment: Option<&str>,
-    threads: &'a [crate::model::ThreadShell],
-) -> Option<&'a crate::model::ThreadShell> {
-    let decoded = crate::thread_links::percent_decoded(&link.thread_id);
-    let ids: Vec<&str> = std::iter::once(link.thread_id.as_str()).chain(decoded.as_deref()).collect();
-    let environment = link.environment_id.as_deref().or(message_environment);
-    for id in &ids {
-        if let Some(thread) = threads.iter().find(|t| t.id == *id && Some(t.environment_id.as_ref()) == environment) {
-            return Some(thread);
-        }
+    match workspace.resolve_thread_link(&link, message_environment) {
+        LinkTarget::Thread { environment, thread_id, .. } => Some((environment, thread_id)),
+        LinkTarget::Missing => None,
     }
-    if link.environment_id.is_some() {
-        return None;
-    }
-    ids.iter().find_map(|id| {
-        let mut matches = threads.iter().filter(|t| t.id == *id);
-        let first = matches.next()?;
-        matches.next().is_none().then_some(first)
-    })
 }
 
 /// `$…$` math when Render math is on (`MarkdownMath`), as its Unicode form; copying keeps the TeX.
@@ -1191,13 +1383,73 @@ mod tests {
     #[test]
     fn thread_links_open_in_the_environment_they_name() {
         let threads = [thread("here", "abc"), thread("there", "abc"), thread("there", "only")];
-        let open = |url: &str| thread_link_destination(url, Some("here"), &threads).map(|(e, id)| (e.to_string(), id));
-        assert_eq!(open("t3-thread://v2/there/abc"), Some(("there".into(), "abc".into())));
-        assert_eq!(open("https://app.t3.codes/threads/there/abc"), Some(("there".into(), "abc".into())));
-        assert_eq!(open("t3-thread://v1/abc"), Some(("here".into(), "abc".into())), "v1 takes the message's");
-        assert_eq!(open("t3-thread://v1/only"), Some(("there".into(), "only".into())), "or a unique match");
-        assert_eq!(open("t3-thread://v2/here/only"), None, "a scoped link never jumps machines");
-        assert_eq!(open("https://example.com"), None);
+        let mut lookups = ThreadLinkLookups::default();
+        let open = |url: &str, lookups: &ThreadLinkLookups| match resolve_thread_link(
+            &crate::thread_links::parse(url)?,
+            Some("here"),
+            &threads,
+            lookups,
+        ) {
+            LinkTarget::Thread { environment, thread_id, .. } => Some((environment.to_string(), thread_id)),
+            LinkTarget::Missing => None,
+        };
+        assert_eq!(open("t3-thread://v2/there/abc", &lookups), Some(("there".into(), "abc".into())));
+        assert_eq!(open("https://app.t3.codes/threads/there/abc", &lookups), Some(("there".into(), "abc".into())));
+        assert_eq!(open("t3-thread://v1/abc", &lookups), Some(("here".into(), "abc".into())), "v1 takes the message's");
+        // Until the message's server answers, a link opens the thread as written there.
+        assert_eq!(open("t3-thread://v1/only", &lookups), Some(("here".into(), "only".into())));
+        assert_eq!(open("t3-thread://v2/here/only", &lookups), Some(("here".into(), "only".into())));
+        let socket = crate::rpc::RpcClient::unopened().socket_id();
+        let here = SharedString::from("here");
+        let ids = ["only".to_owned()];
+        lookups.ask(&here, &ids, &socket, 0);
+        lookups.record(&here, &ids, (&socket, 0), Some(&json!({})), true);
+        assert_eq!(open("t3-thread://v1/only", &lookups), Some(("there".into(), "only".into())), "then a unique match");
+        assert_eq!(open("t3-thread://v2/here/only", &lookups), None, "a scoped link never jumps machines");
+        assert_eq!(open("https://example.com", &lookups), None);
+    }
+
+    #[test]
+    fn unloaded_thread_links_take_the_title_and_project_the_server_reports() {
+        let link = |url: &str| crate::thread_links::parse(url).unwrap();
+        let socket = crate::rpc::RpcClient::unopened().socket_id();
+        let here = SharedString::from("here");
+        let target = |thread_id: &str, title: Option<&str>, project_id: Option<&str>| LinkTarget::Thread {
+            environment: here.clone(),
+            thread_id: thread_id.to_owned(),
+            title: title.map(str::to_owned),
+            project_id: project_id.map(str::to_owned),
+        };
+        let resolve =
+            |url: &str, lookups: &ThreadLinkLookups| resolve_thread_link(&link(url), Some("here"), &[], lookups);
+        let mut lookups = ThreadLinkLookups::default();
+        // Asked as written and decoded together; the written id wins when both answer.
+        let ids = link_candidates(&link("t3-thread://v1/older%2Dthread"), Some("here")).unwrap().1;
+        assert_eq!(ids, ["older%2Dthread", "older-thread"]);
+        lookups.ask(&here, &ids, &socket, 0);
+        assert_eq!(resolve("t3-thread://v1/older%2Dthread", &lookups), target("older%2Dthread", None, None));
+        lookups.record(&here, &ids, (&socket, 1), Some(&json!({"older-thread": {"title": "Stale"}})), true);
+        assert_eq!(
+            resolve("t3-thread://v1/older%2Dthread", &lookups),
+            target("older%2Dthread", None, None),
+            "replaced"
+        );
+        lookups.record(&here, &ids, (&socket, 0), None, true);
+        assert_eq!(resolve("t3-thread://v1/older%2Dthread", &lookups), target("older%2Dthread", None, None), "failed");
+        lookups.ask(&here, &ids, &socket, 0);
+        let answer = json!({"older-thread": {"title": "Decoded essay", "projectId": "essays"}});
+        lookups.record(&here, &ids, (&socket, 0), Some(&answer), true);
+        let decoded = target("older-thread", Some("Decoded essay"), Some("essays"));
+        assert_eq!(resolve("t3-thread://v1/older%2Dthread", &lookups), decoded);
+        // A server without `threadLinkMetadata` answers titles alone.
+        let ids = ["titled".to_owned()];
+        lookups.ask(&here, &ids, &socket, 0);
+        lookups.record(&here, &ids, (&socket, 0), Some(&json!({"titled": "Older essay"})), false);
+        assert_eq!(resolve("t3-thread://v2/here/titled", &lookups), target("titled", Some("Older essay"), None));
+        assert!(lookups.is_current(&here, "titled", &socket, 0));
+        assert!(!lookups.is_current(&here, "titled", &socket, 1), "a removal asks again");
+        let reconnected = crate::rpc::RpcClient::unopened().socket_id();
+        assert!(!lookups.is_current(&here, "titled", &reconnected, 0), "so does a new socket");
     }
 
     #[test]

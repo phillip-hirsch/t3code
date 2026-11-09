@@ -1057,6 +1057,8 @@ struct ShellCursor {
     needs_snapshot: bool,
     /// A full snapshot was applied; a fresh environment's is valid at sequence 0.
     has_snapshot: bool,
+    /// Threads the subscription removed, so lookups of threads it leaves out ask again.
+    removals: u64,
 }
 
 impl ShellState {
@@ -1068,6 +1070,11 @@ impl ShellState {
     /// `environmentShell.hasSnapshotAtom`: the environment's shell snapshot arrived.
     pub fn has_snapshot(&self, environment_id: &str) -> bool {
         self.cursors.get(environment_id).is_some_and(|cursor| cursor.has_snapshot)
+    }
+
+    /// How many threads `environment_id`'s subscription removed.
+    pub fn removals(&self, environment_id: &str) -> u64 {
+        self.cursors.get(environment_id).map_or(0, |cursor| cursor.removals)
     }
 
     /// Some environment's subscription caught up with its server.
@@ -1207,6 +1214,7 @@ impl ShellState {
             "thread.removed" => {
                 let id = item["threadId"].as_str().unwrap_or_default();
                 self.threads.retain(|t| !(ours(&t.environment_id) && t.id == id));
+                cursor.removals += 1;
             }
             _ => {}
         }
