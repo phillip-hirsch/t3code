@@ -441,6 +441,16 @@ pub(super) fn text_leaves<'a>(block: &'a BlockNode, out: &mut Vec<(TextLeafKey, 
                 text_leaves(child, out);
             }
         }
+        BlockNode::Details {
+            summary, children, ..
+        } => {
+            if let Some(span) = summary.span {
+                out.push((TextLeafKey::block(span.start), TextLeaf::Paragraph(summary)));
+            }
+            for child in children {
+                text_leaves(child, out);
+            }
+        }
         _ => {}
     }
 }

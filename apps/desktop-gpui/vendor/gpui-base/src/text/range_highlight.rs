@@ -157,6 +157,16 @@ impl RenderedText {
         self.index().range_for_source(&source)
     }
 
+    /// The keys of the disclosures whose panel holds the text at `offset`.
+    pub(super) fn disclosures_hiding(&self, offset: usize) -> Vec<usize> {
+        self.index()
+            .disclosures
+            .iter()
+            .filter(|disclosure| disclosure.panel.contains(&offset))
+            .map(|disclosure| disclosure.key)
+            .collect()
+    }
+
     pub(super) fn index(&self) -> &RenderedIndex {
         self.index
             .get_or_init(|| RenderedIndex::new(&self.document))
@@ -236,6 +246,14 @@ pub(super) struct RenderedIndex {
     /// offsets of `text`, in the order of `text`. Text the parser recorded no
     /// source position for is in none.
     source_map: Vec<SourceSegment>,
+    /// Each `<details>` disclosure's key, and where the text of its panel sits.
+    disclosures: Vec<DisclosureSpan>,
+}
+
+#[derive(Debug)]
+struct DisclosureSpan {
+    key: usize,
+    panel: Range<usize>,
 }
 
 #[derive(Debug)]
@@ -283,6 +301,7 @@ impl RenderedIndex {
             leaves: builder.leaves,
             blocks,
             source_map: builder.source_map,
+            disclosures: builder.disclosures,
         };
         debug_assert_eq!(index.text.as_ref(), document.text());
         index
@@ -403,6 +422,7 @@ struct IndexBuilder {
     text: String,
     leaves: Vec<LeafSpan>,
     source_map: Vec<SourceSegment>,
+    disclosures: Vec<DisclosureSpan>,
 }
 
 impl IndexBuilder {
@@ -419,6 +439,30 @@ impl IndexBuilder {
                     self.push_block(child);
                 }
                 return;
+            }
+            BlockNode::Details {
+                summary,
+                children,
+                span,
+                ..
+            } => {
+                self.push_paragraph(
+                    summary,
+                    summary.span.map(|span| TextLeafKey::block(span.start)),
+                );
+                if self.text.len() > start {
+                    self.text.push('\n');
+                }
+                let panel_start = self.text.len();
+                for child in children {
+                    self.push_block(child);
+                }
+                if let Some(span) = span {
+                    self.disclosures.push(DisclosureSpan {
+                        key: span.start,
+                        panel: panel_start..self.text.len(),
+                    });
+                }
             }
             BlockNode::Paragraph(paragraph) => {
                 self.push_paragraph(
@@ -565,6 +609,7 @@ fn table_row_source_ends(blocks: &[BlockNode], rows: &mut Vec<(TextLeafKey, Opti
             }
             BlockNode::Root { children, .. }
             | BlockNode::Blockquote { children, .. }
+            | BlockNode::Details { children, .. }
             | BlockNode::List { children, .. }
             | BlockNode::ListItem { children, .. } => table_row_source_ends(children, rows),
             _ => {}
@@ -1334,6 +1379,12 @@ mod tests {
                 | BlockNode::Blockquote { children, .. }
                 | BlockNode::List { children, .. }
                 | BlockNode::ListItem { children, .. } => leaf_nodes(children, leaves),
+                BlockNode::Details {
+                    summary, children, ..
+                } => {
+                    leaves.push(LeafNode::Paragraph(summary));
+                    leaf_nodes(children, leaves);
+                }
                 BlockNode::Paragraph(paragraph) => leaves.push(LeafNode::Paragraph(paragraph)),
                 BlockNode::Heading { children, .. } => leaves.push(LeafNode::Paragraph(children)),
                 BlockNode::Table(table) => {

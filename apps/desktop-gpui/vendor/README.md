@@ -243,9 +243,38 @@ own width, so the row could span the block only when the caller knew its width. 
 the actions at the block's left edge too, so the row can fill it. `src/text/node.rs`: the
 `actions` container in `CodeBlock::render`.
 
+**`<details>` is a disclosure.** The chat renders `<details>`/`<summary>` as an expandable
+disclosure (the web's `MarkdownDetails`): a summary row with a chevron that opens a panel of the
+Markdown inside, between hairlines, and the thread find opens a closed one to show a match. 0.9.0
+flattens the element's children into ordinary blocks, and CommonMark ends an HTML block at a blank
+line, so the open tag, the Markdown inside and `</details>` arrive as sibling blocks. The patch:
+
+- `src/text/format/details.rs` (new): `DetailsGrouper` pairs `<details>` and `</details>` tags
+  across a container's sibling blocks, as rehype-raw's re-parse does (nested, several in one HTML
+  block, a summary in a later HTML block, one never closed holding the rest of the document, as a
+  streamed reply reads); test `tags_are_found_whole_and_case_blind`.
+- `src/text/format/markdown.rs`: `block_children` runs the root's, blockquotes' and list items'
+  blocks through it; tests `details_tags_hold_the_markdown_blocks_between_them`,
+  `details_nest_close_and_open_within_one_html_block`,
+  `a_details_element_in_one_html_block_is_a_disclosure`,
+  `a_summary_in_its_own_html_block_still_labels_the_disclosure`.
+- `src/text/format/html.rs`: a `details` arm and `parse_details`, the first `<summary>` as inline
+  text and the rest as blocks.
+- `src/text/node.rs`: `BlockNode::Details` (summary, children, the `open` attribute, span) in every
+  traversal; `render_details` draws it, the row keyboard-focusable with a focus ring;
+  `Disclosures`, the open state the reader toggled, keyed by the disclosure's source start so it
+  survives streamed re-parses, reached through `NodeContext::disclosures`.
+- `src/text/state.rs`: `TextViewState` owns the `Disclosures`; `reveal_range` opens every
+  disclosure whose panel holds the revealed text (the web's `beforematch`); test
+  `revealing_text_in_a_closed_disclosure_opens_it`.
+- `src/text/range_highlight.rs`, `src/text/stream_fade.rs`: the summary is a text leaf and the
+  panel's text stays in the rendered text while closed, so find counts it; the index records each
+  panel's range for `reveal_range`.
+
 The crate's own tests need `--features test-support` and `include_str!` a `README.md` four levels
 above `src/text`, which this folder lacks: run them from a scratch copy laid out as
-`<dir>/crates/gpui-base` with a `<dir>/README.md`.
+`<dir>/crates/gpui-base` with a `<dir>/README.md`, with `[patch.crates-io]` pointing `gpui-pre` and
+`gpui-pre-linux` at the vendored copies (`--config 'patch.crates-io.gpui-pre.path="…"'`).
 
 ## gpui-component 0.9.0
 
