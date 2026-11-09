@@ -1,15 +1,16 @@
-//! Saved remote environments (`SavedBackendListRow`, `ConnectionDiagnosisDetails.tsx`,
-//! `AddEnvironmentDialog.tsx`) and the desktop's "This app" section (`LocalEnvironmentSetting`).
-//! Only the "Remote link" route exists here: no SSH, T3 Connect, routes list or permissions.
+//! Saved remote environments (`SavedBackendListRow`, `ConnectionDiagnosisDetails.tsx`) and the
+//! desktop's "This app" section (`LocalEnvironmentSetting`). Each row opens its routes
+//! (`routes.rs`); the add dialog is `add_environment.rs`. No T3 Connect or permissions here.
 
 use std::collections::HashSet;
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
-use gpui_kit::component::{Sizable as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, ClipboardItem, Context, ElementId, Entity, FontWeight, InteractiveElement as _,
@@ -18,21 +19,38 @@ use gpui_kit::{
 };
 
 use super::super::widgets::{RowFrame, section_with_action, settings_section, switch};
-use super::logic;
+use super::add_environment::{self, RouteTarget};
+use super::routes::{self, PendingOrders};
 use super::ui::{self, Size, Variant, WebButton, text_sm, text_xs};
-use super::{error_toast, success_toast};
+use super::{error_toast, logic, success_toast};
 use crate::app::Workspace;
 use crate::app::environments::{SavedEnvironments, Saving};
 use crate::app::sidebar::now_ms;
 use crate::environments::{self, ConnectionState, HopResult, Phase, Presented, SavedEnvironment};
 use crate::theme::{self, Tokens};
 
-/// Per-section state: open diagnosis panels, and the once-a-second tick that keeps
-/// "retrying in Ns" current while some environment waits to retry.
+/// Per-section state: open diagnosis panels and route lists, route orders being saved, and
+/// the once-a-second tick that keeps "retrying in Ns" current while some environment waits.
 #[derive(Default)]
 pub(super) struct SavedUi {
     details: HashSet<String>,
+    routes: HashSet<String>,
+    pub(super) pending: PendingOrders,
     _tick: Option<Task<()>>,
+}
+
+/// Opens the add dialog for another route to a saved environment.
+type AddRoute = Rc<dyn Fn(RouteTarget, &mut Window, &mut App)>;
+
+/// Opens or folds one of a row's panels.
+fn toggle(ui: &Entity<SavedUi>, id: &str, panel: fn(&mut SavedUi) -> &mut HashSet<String>, cx: &mut App) {
+    ui.update(cx, |ui, cx| {
+        let open = panel(ui);
+        if !open.remove(id) {
+            open.insert(id.to_owned());
+        }
+        cx.notify();
+    });
 }
 
 /// Waits off the UI thread for an edit to be on disk; a dropped list saved nothing.
@@ -105,14 +123,23 @@ impl Workspace {
         });
         let primary_id = self.settings_info().environment_id.clone();
         let saved = self.saved_environments.read(cx);
+        let add_route: AddRoute = {
+            let (entity, primary_id) = (self.saved_environments.downgrade(), primary_id.clone());
+            let keymap = self.keymap.clone();
+            Rc::new(move |route, window, cx| {
+                add_environment::open(entity.clone(), primary_id.clone(), Some(route), keymap.clone(), window, cx);
+            })
+        };
         let action = {
-            let entity = self.saved_environments.downgrade();
+            let (entity, keymap) = (self.saved_environments.downgrade(), self.keymap.clone());
             WebButton::new("add-environment", "Add environment")
                 .variant(Variant::GhostMuted)
                 .icon(IconName::Plus)
                 // A redeemed pairing code is spent, so pair only when the result can be saved.
                 .disabled(!saved.editable())
-                .on_click(move |_, window, cx| open_add_dialog(entity.clone(), primary_id.clone(), window, cx))
+                .on_click(move |_, window, cx| {
+                    add_environment::open(entity.clone(), primary_id.clone(), None, keymap.clone(), window, cx);
+                })
                 .into_any_element()
         };
         let now = now_ms();
@@ -125,7 +152,6 @@ impl Workspace {
         } else if saved.environments().is_empty() {
             vec![empty_state(&t)]
         } else {
-            let open = &ui.read(cx).details;
             saved
                 .environments()
                 .iter()
@@ -136,8 +162,8 @@ impl Workspace {
                         Some(session) => session.state.clone(),
                         None => ConnectionState::default(),
                     };
-                    let expanded = open.contains(id);
-                    saved_row(&self.saved_environments, &ui, saved, environment, state, expanded, now, &t)
+                    let row = Row { environment, state, add_route: add_route.clone(), now };
+                    saved_row(&self.saved_environments, &ui, saved, row, &t, cx)
                 })
                 .collect()
         };
@@ -208,18 +234,30 @@ fn empty_media(icon: &'static str, t: &Tokens) -> impl IntoElement {
         )
 }
 
+/// One saved environment's row, as the section lists it.
+struct Row<'a> {
+    environment: &'a SavedEnvironment,
+    state: ConnectionState,
+    add_route: AddRoute,
+    now: i64,
+}
+
 fn saved_row(
     entity: &Entity<SavedEnvironments>,
     ui: &Entity<SavedUi>,
     saved: &SavedEnvironments,
-    environment: &SavedEnvironment,
-    state: ConnectionState,
-    expanded: bool,
-    now: i64,
+    row: Row<'_>,
     t: &Tokens,
+    cx: &App,
 ) -> AnyElement {
+    let Row { environment, state, add_route, now } = row;
     let id = environment.environment_id.clone();
+    let (expanded, routes_open) = {
+        let ui = ui.read(cx);
+        (ui.details.contains(&id), ui.routes.contains(&id))
+    };
     let session = saved.session(&id);
+    let active_route = session.and_then(|s| s.active_route());
     let unsupported = state.presented() == Presented::Unsupported;
     let enabled = environment.enabled && !unsupported;
     let label = environment.label.clone();
@@ -230,13 +268,16 @@ fn saved_row(
     .flatten();
     let (mut status, error_tone) = state.saved_status(environment.enabled);
     // Switched off, it makes no attempt that would say so.
-    if !environment.enabled && matches!(environment.credential, environments::Credential::Locked { .. }) {
+    let locked =
+        environment.routes.iter().any(|route| matches!(route.credential, environments::Credential::Locked { .. }));
+    if !environment.enabled && locked {
         status.push_str(" \u{b7} Credential locked");
     }
     // The headline below names the failure in full.
+    let transport = environment.transport_label(active_route);
     let subtitle = match &diagnosis {
-        Some(_) => environment.http_base.clone(),
-        None => format!("{} \u{b7} {status}", environment.http_base),
+        Some(_) => transport,
+        None => format!("{transport} \u{b7} {status}"),
     };
     let tooltip = if unsupported {
         state.last_failure.as_ref().map_or_else(|| state.status_text(), |f| f.detail.clone())
@@ -249,15 +290,43 @@ fn saved_row(
     let machine = session.and_then(|s| s.machine.clone()).unwrap_or_else(|| "server".into());
     let element_id = |part: &str| ElementId::Name(format!("saved-env-{part}-{id}").into());
 
+    let route_count = environment.routes.len();
+    let routes_toggle = {
+        let (ui, id, ring, foreground) = (ui.clone(), id.clone(), t.ring, t.foreground);
+        h_flex()
+            .id(element_id("routes"))
+            .flex_none()
+            .gap(px(2.))
+            .rounded(px(2.))
+            .text_color(t.muted_foreground)
+            .cursor_pointer()
+            .hover(move |style| style.text_color(foreground))
+            .tab_index(0)
+            .focus_visible(move |style| {
+                style.shadow(vec![gpui_kit::BoxShadow::new(px(0.), px(0.), ring).spread_radius(px(1.)).inset()])
+            })
+            .on_click(move |_, _, cx| toggle(&ui, &id, |ui| &mut ui.routes, cx))
+            .child(if route_count == 1 { "Routes".to_owned() } else { format!("{route_count} routes") })
+            .child(ui::chevron(routes_open, 12., t.muted_foreground))
+    };
+    let status_color = if enabled && error_tone && diagnosis.is_none() { t.error } else { t.muted_foreground };
     let mut details = v_flex()
         .min_w_0()
         .opacity(dim)
         .child(text_sm(div().truncate().font_weight(FontWeight::MEDIUM).text_color(t.foreground)).child(label.clone()))
         .child(
-            text_xs(div().id(element_id("status")).truncate())
-                .text_color(if enabled && error_tone && diagnosis.is_none() { t.error } else { t.muted_foreground })
-                .tooltip(ui::tooltip(tooltip))
-                .child(subtitle),
+            text_xs(h_flex().min_w_0().gap(px(4.)))
+                .child(
+                    div()
+                        .id(element_id("status"))
+                        .min_w_0()
+                        .truncate()
+                        .text_color(status_color)
+                        .tooltip(ui::tooltip(tooltip))
+                        .child(subtitle),
+                )
+                .child(div().flex_none().text_color(t.muted_foreground).child("\u{b7}"))
+                .child(routes_toggle),
         );
     if let Some(diagnosis) = &diagnosis {
         let retry = state.retry_at.map(|at| match (at - now + 999) / 1_000 {
@@ -278,14 +347,7 @@ fn saved_row(
                 .hover(|style| style.text_color(t.foreground))
                 .child("Details")
                 .child(ui::chevron(expanded, 12., t.muted_foreground))
-                .on_click(move |_, _, cx| {
-                    ui.update(cx, |ui, cx| {
-                        if !ui.details.remove(&id) {
-                            ui.details.insert(id.clone());
-                        }
-                        cx.notify();
-                    });
-                })
+                .on_click(move |_, _, cx| toggle(&ui, &id, |ui| &mut ui.details, cx))
         };
         details = details.child(
             text_xs(v_flex()).child(div().text_color(t.error).child(diagnosis.headline.clone())).child(
@@ -311,7 +373,7 @@ fn saved_row(
             });
         div().id(element_id("switch-tooltip")).tooltip(ui::tooltip(tooltip)).child(switch)
     };
-    let menu = row_menu(entity.downgrade(), environment, element_id("menu"));
+    let menu = row_menu(entity.downgrade(), ui.downgrade(), environment, active_route, routes_open, element_id("menu"));
     let mut row = v_flex().px(px(16.)).py(px(10.)).child(
         h_flex()
             .gap(px(12.))
@@ -321,6 +383,12 @@ fn saved_row(
     );
     if let (Some(diagnosis), true) = (diagnosis, expanded) {
         row = row.child(div().pl(px(28.)).child(diagnosis_panel(entity, &id, &label, diagnosis, t)));
+    }
+    if routes_open {
+        let route = RouteTarget { environment_id: id.clone(), label };
+        let on_add_route: routes::OnAddRoute = Rc::new(move |window, cx| add_route(route.clone(), window, cx));
+        let list = routes::list(entity, ui, environment, active_route, on_add_route, t, cx);
+        row = row.child(div().pl(px(28.)).child(list));
     }
     row.into_any_element()
 }
@@ -387,29 +455,49 @@ fn diagnosis_panel(
         .into_any_element()
 }
 
-/// The row's "More actions" menu: Copy MCP URL, Rename…, Remove from this device….
-fn row_menu(entity: WeakEntity<SavedEnvironments>, environment: &SavedEnvironment, id: ElementId) -> impl IntoElement {
+/// The row's "More actions" menu: Routes, Copy MCP URL, Rename…, Remove from this device….
+fn row_menu(
+    entity: WeakEntity<SavedEnvironments>,
+    ui: WeakEntity<SavedUi>,
+    environment: &SavedEnvironment,
+    active_route: Option<&str>,
+    routes_open: bool,
+    id: ElementId,
+) -> impl IntoElement {
     let (environment_id, label, mcp_url) =
-        (environment.environment_id.clone(), environment.label.clone(), environment.mcp_url());
+        (environment.environment_id.clone(), environment.label.clone(), environment.mcp_url(active_route));
     Button::new(id)
         .ghost()
         .xsmall()
         .icon(IconName::Ellipsis)
         .tooltip(format!("More actions for {label}"))
         .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |menu, _, _| {
-            let (copy_url, rename_entity, remove_entity) = (mcp_url.clone(), entity.clone(), entity.clone());
+            let (rename_entity, remove_entity) = (entity.clone(), entity.clone());
             let (rename_id, rename_label) = (environment_id.clone(), label.clone());
             let (remove_id, remove_label) = (environment_id.clone(), label.clone());
-            menu.item(PopupMenuItem::new("Copy MCP URL").on_click(move |_, window, cx| {
-                cx.write_to_clipboard(ClipboardItem::new_string(copy_url.clone()));
-                success_toast(
-                    window,
-                    cx,
-                    "MCP URL copied",
-                    format!("Add it to an agent, e.g. claude mcp add --transport http t3 {copy_url}"),
-                );
-            }))
-            .item(PopupMenuItem::new("Rename\u{2026}").on_click(move |_, window, cx| {
+            let (routes_ui, routes_id) = (ui.clone(), environment_id.clone());
+            let routes = PopupMenuItem::new(if routes_open { "Hide routes" } else { "Routes" })
+                .icon(Icon::empty().path("icons/route.svg"))
+                .on_click(move |_, _, cx| {
+                    if let Some(ui) = routes_ui.upgrade() {
+                        toggle(&ui, &routes_id, |ui| &mut ui.routes, cx);
+                    }
+                });
+            let menu = menu.item(routes);
+            // An SSH forward is a port of this run, so an SSH-only environment has no MCP URL.
+            let menu = match mcp_url.clone() {
+                Some(copy_url) => menu.item(PopupMenuItem::new("Copy MCP URL").on_click(move |_, window, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copy_url.clone()));
+                    success_toast(
+                        window,
+                        cx,
+                        "MCP URL copied",
+                        format!("Add it to an agent, e.g. claude mcp add --transport http t3 {copy_url}"),
+                    );
+                })),
+                None => menu,
+            };
+            menu.item(PopupMenuItem::new("Rename\u{2026}").on_click(move |_, window, cx| {
                 open_rename_dialog(rename_entity.clone(), rename_id.clone(), rename_label.clone(), window, cx);
             }))
             .separator()
@@ -472,219 +560,6 @@ fn confirm_local_environment(saved: WeakEntity<SavedEnvironments>, enabled: bool
                     .detach();
                 true
             })
-    });
-}
-
-/// `AddEnvironmentDialog` without routes, SSH or T3 Connect: a "Remote link" host and code.
-struct AddForm {
-    host: Entity<InputState>,
-    code: Entity<InputState>,
-    busy: bool,
-    error: Option<SharedString>,
-    saved: WeakEntity<SavedEnvironments>,
-    /// The workspace's own environment, which is never saved again.
-    primary_id: Option<String>,
-    /// A pairing that could not be saved, with the host and code it used. The code is spent,
-    /// so submitting the same fields again retries only the save.
-    unsaved: Option<(String, String, SavedEnvironment)>,
-    _subscriptions: [Subscription; 2],
-}
-
-impl AddForm {
-    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy {
-            return;
-        }
-        let fields =
-            environments::parse_remote_pairing_fields(&self.host.read(cx).value(), &self.code.read(cx).value());
-        let (host, code) = match fields {
-            Ok(fields) => fields,
-            Err(message) => return self.fail(message.to_owned(), window, cx),
-        };
-        if let Some((_, _, paired)) = self.unsaved.take().filter(|(h, c, _)| (h, c) == (&host, &code)) {
-            return self.save(host, code, paired, window, cx);
-        }
-        let Some(catalog) = self.saved.read_with(cx, |saved, _| saved.environments().to_vec()).ok() else { return };
-        self.busy = true;
-        self.error = None;
-        cx.notify();
-        cx.spawn_in(window, async move |this, cx| {
-            let result = crate::runtime().spawn(environments::pair(host.clone(), code.clone(), catalog)).await;
-            let result = result.unwrap_or_else(|error| Err(error.to_string()));
-            let _ = this.update_in(cx, |this, window, cx| match result {
-                Ok(paired) => this.save(host, code, paired, window, cx),
-                Err(error) => this.fail(error, window, cx),
-            });
-        })
-        .detach();
-    }
-
-    /// Saves a redeemed pairing; on failure the form stays open with the error, ready to retry.
-    fn save(
-        &mut self,
-        host: String,
-        code: String,
-        paired: SavedEnvironment,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.primary_id.as_deref() == Some(&paired.environment_id) {
-            // The workspace's own environment is already here (`register` skips platform entries).
-            return self.added(window, cx);
-        }
-        let saving = self.saved.update(cx, |saved, cx| saved.add(paired.clone(), cx));
-        self.busy = true;
-        cx.notify();
-        cx.spawn_in(window, async move |this, cx| {
-            let result = finished(saving).await;
-            drop(this.update_in(cx, |this, window, cx| match result {
-                Ok(()) => this.added(window, cx),
-                Err(error) => {
-                    this.unsaved = Some((host, code, paired));
-                    this.fail(error, window, cx);
-                }
-            }));
-        })
-        .detach();
-    }
-
-    fn added(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.busy = false;
-        window.close_dialog(cx);
-        success_toast(window, cx, "Backend added", "The environment is saved and will reconnect on app startup.");
-    }
-
-    fn fail(&mut self, message: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.busy = false;
-        self.error = Some(message.clone().into());
-        error_toast(window, cx, "Could not add backend", message);
-        cx.notify();
-    }
-}
-
-impl Render for AddForm {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = *theme::tokens(cx);
-        let busy = self.busy;
-        let field = |label: &'static str, input: &Entity<InputState>| {
-            v_flex()
-                .gap(px(6.))
-                .child(text_xs(div().font_weight(FontWeight::MEDIUM)).child(label))
-                .child(Input::new(input).disabled(busy))
-        };
-        // "Remote link" mode card, selected; SSH needs the desktop bridge's tunnels.
-        let mode = h_flex()
-            .min_h(px(96.))
-            .items_start()
-            .gap(px(12.))
-            .p(px(16.))
-            .rounded(px(8.))
-            .border_1()
-            .border_color(t.primary.opacity(0.5))
-            .bg(t.primary.opacity(0.05))
-            .child(
-                div()
-                    .mt(px(2.))
-                    .size(px(32.))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(6.))
-                    .border_1()
-                    .border_color(t.primary.opacity(0.3))
-                    .bg(t.primary.opacity(0.1))
-                    .child(ui::glyph("icons/chevrons-left-right-ellipsis.svg", 16., t.primary)),
-            )
-            .child(
-                v_flex().min_w_0().child(text_sm(div().font_weight(FontWeight::MEDIUM)).child("Remote link")).child(
-                    text_xs(div().mt(px(4.)).text_color(t.muted_foreground))
-                        .child("Enter a backend host and pairing code."),
-                ),
-            );
-        v_flex()
-            .gap(px(16.))
-            .child(h_flex().gap(px(12.)).child(mode.flex_1()).child(div().flex_1()))
-            .child(
-                v_flex()
-                    .gap(px(12.))
-                    .child(
-                        h_flex()
-                            .items_start()
-                            .gap(px(12.))
-                            .child(field("Host", &self.host).flex_1().min_w_0())
-                            .child(field("Pairing code", &self.code).w(px(160.)).flex_none()),
-                    )
-                    .child(
-                        ui::text_2xs(div().mt(px(4.)).text_color(t.muted_foreground))
-                            .child("Paste a full pairing URL here to fill both fields automatically."),
-                    ),
-            )
-            .when_some(self.error.clone(), |el, error| el.child(text_xs(div().text_color(t.error)).child(error)))
-            .child(
-                h_flex().w_full().child(
-                    WebButton::new("add-environment-submit", if busy { "Adding\u{2026}" } else { "Add environment" })
-                        .size(Size::Default)
-                        .icon(IconName::Plus)
-                        .disabled(busy)
-                        .full_width()
-                        .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
-                ),
-            )
-    }
-}
-
-fn open_add_dialog(
-    saved: WeakEntity<SavedEnvironments>,
-    primary_id: Option<String>,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let host = cx.new(|cx| InputState::new(window, cx).placeholder("backend.example.com"));
-    let code = cx.new(|cx| InputState::new(window, cx).placeholder("PAIRCODE"));
-    host.update(cx, |input, cx| input.focus(window, cx));
-    let form = cx.new(|cx| {
-        let on_host = |this: &mut AddForm,
-                       _: &Entity<InputState>,
-                       event: &InputEvent,
-                       window: &mut Window,
-                       cx: &mut Context<AddForm>| {
-            if let InputEvent::Change = event {
-                // `handleSavedBackendHostChange`: a pasted pairing URL fills both fields.
-                if let Some((host, code)) = environments::parse_pairing_url(&this.host.read(cx).value()) {
-                    this.host.update(cx, |input, cx| input.set_value(host, window, cx));
-                    this.code.update(cx, |input, cx| input.set_value(code, window, cx));
-                }
-                cx.notify();
-            }
-        };
-        let on_code =
-            |_: &mut AddForm, _: &Entity<InputState>, event: &InputEvent, _: &mut Window, cx: &mut Context<AddForm>| {
-                if let InputEvent::Change = event {
-                    cx.notify();
-                }
-            };
-        AddForm {
-            _subscriptions: [cx.subscribe_in(&host, window, on_host), cx.subscribe_in(&code, window, on_code)],
-            host,
-            code,
-            busy: false,
-            error: None,
-            saved,
-            primary_id,
-            unsaved: None,
-        }
-    });
-    window.open_dialog(cx, move |dialog, _, cx| {
-        let t = theme::tokens(cx);
-        dialog
-            .title("Add Environment")
-            .w(px(768.))
-            .child(
-                text_sm(div().mb(px(16.)).text_color(t.muted_foreground))
-                    .child("Pair another environment to this client."),
-            )
-            .child(form.clone())
     });
 }
 

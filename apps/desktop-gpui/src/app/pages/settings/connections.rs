@@ -12,10 +12,12 @@
 //! section is on screen, like the web's mounted component.
 
 mod access;
+mod add_environment;
 mod environments;
 mod exposure;
 mod load_balancing;
-pub(super) mod logic;
+pub(in crate::app) mod logic;
+mod routes;
 mod saved;
 mod secrets;
 pub(super) mod ui;

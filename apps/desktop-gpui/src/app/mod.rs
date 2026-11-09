@@ -80,6 +80,7 @@ mod side_chat;
 mod sidebar;
 mod sidebar_sheet;
 mod snap_shot;
+mod ssh_prompt;
 mod subagents;
 mod terminal;
 mod theme_editor;
@@ -544,6 +545,7 @@ impl Workspace {
         };
         workspace.sync_snap_shot(window, cx);
         workspace.sync_saved_sessions(window, cx);
+        ssh_prompt::listen(window, cx);
         workspace
     }
 

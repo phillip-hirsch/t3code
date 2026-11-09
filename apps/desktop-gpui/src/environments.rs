@@ -1,8 +1,9 @@
 //! Saved remote environments: the catalog this device keeps, pairing, and the connection
 //! diagnosis Settings › Environments shows. Ports the bearer route of
 //! `packages/client-runtime/src/connection/` (`onboarding.ts`, `compatibility.ts`,
-//! `diagnosis.ts`, `presentation.ts`) and `resolveRemotePairingTarget` in
-//! `packages/shared/src/remote.ts`. SSH and T3 Connect routes are not ported.
+//! `diagnosis.ts`, `presentation.ts`, `routes.ts`) and `resolveRemotePairingTarget` in
+//! `packages/shared/src/remote.ts`. A saved environment keeps direct and SSH routes; T3 Connect
+//! routes and routes learned from the server are not ported.
 //!
 //! Bearer tokens are stored encrypted by [`crate::secure_storage`] (the guarantee Electron's
 //! `safeStorage` gives the desktop app's connection catalog).
@@ -22,6 +23,7 @@ use url::Url;
 
 use crate::backend::{self, Endpoint, LocalServer};
 use crate::secure_storage as secure;
+use crate::ssh::SshTarget;
 
 /// `ORCHESTRATION_PROTOCOL_VERSION` in `packages/contracts`.
 const ORCHESTRATION_PROTOCOL_VERSION: u64 = 2;
@@ -139,6 +141,7 @@ pub enum Reason {
     Network,
     Timeout,
     Transport,
+    EndpointUnavailable,
     RemoteUnavailable,
     Authentication,
     Configuration,
@@ -152,6 +155,7 @@ impl Reason {
             Reason::Network => "network",
             Reason::Timeout => "timeout",
             Reason::Transport => "transport",
+            Reason::EndpointUnavailable => "endpoint-unavailable",
             Reason::RemoteUnavailable => "remote-unavailable",
             Reason::Authentication => "authentication",
             Reason::Configuration => "configuration",
@@ -180,11 +184,13 @@ pub struct Failure {
     pub detail: String,
     pub hop: Option<Hop>,
     pub server_update_required: bool,
+    /// The HTTP status the server declared, when one did.
+    pub http_status: Option<u16>,
 }
 
 impl Failure {
     fn new(reason: Reason, detail: impl Into<String>, hop: Option<Hop>) -> Self {
-        Self { reason, detail: detail.into(), hop, server_update_required: false }
+        Self { reason, detail: detail.into(), hop, server_update_required: false, http_status: None }
     }
 
     /// `mapRemoteEnvironmentError` for an HTTP status the server declares.
@@ -200,7 +206,7 @@ impl Failure {
                 format!("Remote environment endpoint {url} returned undeclared status {status}."),
             ),
         };
-        Self::new(reason, detail, Some(Hop::Server))
+        Self { http_status: Some(status), ..Self::new(reason, detail, Some(Hop::Server)) }
     }
 
     /// `RemoteEnvironmentAuthTimeoutError` / `RemoteEnvironmentAuthFetchError`.
@@ -224,10 +230,9 @@ impl Failure {
         Self::new(Reason::RemoteUnavailable, detail, Some(Hop::Server))
     }
 
-    /// `credentialMissingError`, or why a stored credential could not be decrypted.
-    pub fn credential_missing(environment: &SavedEnvironment) -> Self {
-        let id = environment.connection_id();
-        let detail = match &environment.credential {
+    /// `credentialMissingError` for route `id`, or why its stored credential could not be decrypted.
+    pub fn credential_missing(id: &str, credential: &Credential) -> Self {
+        let detail = match credential {
             Credential::Locked { error, .. } => {
                 let store = if cfg!(target_os = "macos") {
                     "the Keychain"
@@ -253,6 +258,24 @@ impl Failure {
     /// A socket that failed to open or closed.
     pub fn transport(detail: impl Into<String>) -> Self {
         Self::new(Reason::Transport, detail, Some(Hop::Server))
+    }
+
+    /// No saved route answered (`endpoint-unavailable`).
+    pub fn no_route_answered(label: &str) -> Self {
+        Self::new(Reason::EndpointUnavailable, format!("{label} did not answer on any saved route."), None)
+    }
+
+    /// `sshPreparationError`: a cancelled prompt blocks; anything else is retried.
+    pub fn ssh(message: &str) -> Self {
+        if message.to_lowercase().contains("cancel") {
+            return Self::new(Reason::Authentication, message, Some(Hop::Device));
+        }
+        Self::new(Reason::RemoteUnavailable, format!("Could not prepare the SSH environment: {message}"), None)
+    }
+
+    /// A blocked configuration problem, such as a route reaching another machine.
+    pub fn configuration(detail: impl Into<String>) -> Self {
+        Self::new(Reason::Configuration, detail, None)
     }
 }
 
@@ -357,19 +380,42 @@ async fn redeem_pairing_code(http_base: &str, code: &str) -> Result<String, Fail
     body["access_token"].as_str().map(str::to_owned).ok_or_else(|| Failure::invalid_json(&url))
 }
 
-/// `preparePairingRegistration` for a host and pairing code. `saved` is the catalog, so a code
-/// for an address that would add a second route to a saved environment is refused unspent.
-/// Runs on the tokio runtime; errors are the dialog's message.
-pub async fn pair(host: String, code: String, saved: Vec<SavedEnvironment>) -> Result<SavedEnvironment, String> {
-    let http_base = resolve_pairing_host(&host, &code)?;
-    let descriptor = fetch_descriptor(&http_base).await.map_err(|failure| failure.detail)?;
-    if let Some(known) = saved.iter().find(|saved| saved.environment_id == descriptor.environment_id)
-        && known.http_base != http_base
-    {
-        return Err(format!(
+/// `differentMachineError`: a route paired for one environment reached another.
+pub fn different_machine(label: &str, what: &str) -> String {
+    format!("That {what} reaches {label}, a different machine. Add it as its own environment instead.")
+}
+
+/// `assertKnownAddress`: a new environment's address must not add a route to a saved one.
+fn assert_known_address(saved: &[SavedEnvironment], environment_id: &str, route: &Route) -> Result<(), String> {
+    match saved.iter().find(|saved| saved.environment_id == environment_id) {
+        Some(known) if !known.routes.iter().any(|r| r.address_key() == route.address_key()) => Err(format!(
             "That address claims to be {}, which is already saved. Add it as a route from that environment's settings instead.",
             known.label
-        ));
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// `preparePairingRegistration` for a host and pairing code. `saved` is the catalog, so a code
+/// for an address that would add a second route to a saved environment is refused unspent;
+/// with `expected`, the code adds a route to that environment and any other one is refused.
+/// Runs on the tokio runtime; errors are the dialog's message.
+pub async fn pair(
+    host: String,
+    code: String,
+    saved: Vec<SavedEnvironment>,
+    expected: Option<String>,
+) -> Result<SavedEnvironment, String> {
+    let http_base = resolve_pairing_host(&host, &code)?;
+    let descriptor = fetch_descriptor(&http_base).await.map_err(|failure| failure.detail)?;
+    // Checked before redeeming the one-time code, so a wrong link is not spent.
+    let route = Route::direct(http_base.clone(), Credential::Missing);
+    match &expected {
+        Some(expected) if *expected != descriptor.environment_id => {
+            return Err(different_machine(&descriptor.label, "address"));
+        }
+        Some(_) => {}
+        None => assert_known_address(&saved, &descriptor.environment_id, &route)?,
     }
     // An outdated server is still saved so it can be updated from this client.
     if let Some(failure) = descriptor.compatibility_error()
@@ -381,24 +427,326 @@ pub async fn pair(host: String, code: String, saved: Vec<SavedEnvironment>) -> R
     Ok(SavedEnvironment {
         environment_id: descriptor.environment_id,
         label: descriptor.label,
-        http_base,
         enabled: true,
-        credential: Credential::Token(token),
+        routes: vec![Route { credential: Credential::Token(token), ..route }],
     })
+}
+
+/// An environment paired over SSH: the server the forward reaches and the token it issued.
+pub struct ProvisionedSsh {
+    pub environment_id: String,
+    pub label: String,
+    /// The target as ssh resolved it.
+    pub target: SshTarget,
+    pub http_base: String,
+    pub token: String,
+}
+
+/// `provisionDesktopSshEnvironment`: starts or reuses T3 Code on `target`, forwards to it and
+/// pairs with a credential minted there. With `expected`, a different machine is refused
+/// before its credential is spent. Runs on the tokio runtime.
+pub async fn provision_ssh(target: &SshTarget, expected: Option<&str>) -> Result<ProvisionedSsh, Failure> {
+    let bootstrap = crate::ssh::ensure(target, true).await.map_err(|error| Failure::ssh(&error.message))?;
+    let Some(pairing_token) = bootstrap.pairing_token else {
+        let detail = "The SSH environment did not issue a pairing credential.";
+        return Err(Failure::new(Reason::Authentication, detail, Some(Hop::Server)));
+    };
+    let descriptor = fetch_descriptor(&bootstrap.http_base).await?;
+    if expected.is_some_and(|expected| expected != descriptor.environment_id) {
+        return Err(Failure::configuration(different_machine(&descriptor.label, "host")));
+    }
+    let token = redeem_pairing_code(&bootstrap.http_base, &pairing_token).await.map_err(|failure| {
+        // A reused server on another build can fail to decode the grant this build's runner
+        // minted, and answers 500 on every retry.
+        let version = crate::ssh::app_version();
+        match &descriptor.server_version {
+            Some(server) if failure.http_status == Some(500) && *server != version => {
+                let label = &descriptor.label;
+                Failure::configuration(format!(
+                    "{label} runs T3 Code {server}, but this desktop is {version}, and that server could not accept its pairing. Restart the T3 server on {label} so it runs {version}, then retry."
+                ))
+            }
+            _ => failure,
+        }
+    })?;
+    let label = match descriptor.label.trim() {
+        "" => bootstrap.target.alias.clone(),
+        label => label.to_owned(),
+    };
+    Ok(ProvisionedSsh {
+        environment_id: descriptor.environment_id,
+        label,
+        target: bootstrap.target,
+        http_base: bootstrap.http_base,
+        token,
+    })
+}
+
+/// `registerSsh`'s preparation: an environment reached over SSH, for the add dialog to save.
+pub async fn pair_ssh(target: SshTarget, expected: Option<String>) -> Result<SavedEnvironment, String> {
+    let provisioned = provision_ssh(&target, expected.as_deref()).await.map_err(|failure| failure.detail)?;
+    Ok(SavedEnvironment {
+        environment_id: provisioned.environment_id,
+        label: provisioned.label,
+        enabled: true,
+        routes: vec![Route {
+            address: Address::Ssh(provisioned.target),
+            credential: Credential::Token(provisioned.token),
+        }],
+    })
+}
+
+/// `fetchRemoteSessionState`: whether `token` is still signed in there, and what it may do.
+pub async fn session_grants(http_base: &str, token: &str) -> Result<(bool, Vec<String>), Failure> {
+    let url = format!("{http_base}/api/auth/session");
+    let request = backend::http_client().get(&url).bearer_auth(token).timeout(REQUEST_TIMEOUT);
+    let response = request.send().await.map_err(|error| Failure::request(error, &url))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(Failure::http(status.as_u16(), &url));
+    }
+    let body: Value = response.json().await.map_err(|_| Failure::invalid_json(&url))?;
+    let granted = [&body["permissions"], &body["scopes"]]
+        .into_iter()
+        .find_map(Value::as_array)
+        .map(|scopes| scopes.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+        .unwrap_or_default();
+    Ok((body["authenticated"] == Value::Bool(true), granted))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Routes
+
+/// `ConnectionRouteKind`, for the routes this client saves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteKind {
+    Loopback,
+    Lan,
+    Tailnet,
+    Vpn,
+    Public,
+    Ssh,
+}
+
+impl RouteKind {
+    /// `ROUTE_KIND_RANK`: nearer routes go first.
+    fn rank(self) -> u8 {
+        match self {
+            RouteKind::Loopback => 0,
+            RouteKind::Lan => 1,
+            RouteKind::Tailnet | RouteKind::Vpn => 2,
+            RouteKind::Public => 3,
+            RouteKind::Ssh => 4,
+        }
+    }
+}
+
+/// Where a route reaches the environment.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Address {
+    /// `https://host:port`, no trailing slash.
+    Direct(String),
+    /// A loopback forward the system ssh opens (`SshConnectionProfile`).
+    Ssh(SshTarget),
+}
+
+/// `ConnectionRoute`: one way to reach a saved environment, with the token paired over it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Route {
+    pub address: Address,
+    pub credential: Credential,
+}
+
+impl Route {
+    pub fn direct(http_base: String, credential: Credential) -> Self {
+        Self { address: Address::Direct(http_base), credential }
+    }
+
+    /// `connectionRouteId`: `bearer:<id>:<origin>` or `ssh:<id>:<target key>`.
+    pub fn id(&self, environment_id: &str) -> String {
+        match &self.address {
+            Address::Direct(http_base) => {
+                let origin = Url::parse(http_base).map(|url| url.origin().ascii_serialization()).unwrap_or_default();
+                format!("bearer:{environment_id}:{origin}")
+            }
+            Address::Ssh(target) => format!("ssh:{environment_id}:{}", target.key()),
+        }
+    }
+
+    pub fn http_base(&self) -> Option<&str> {
+        match &self.address {
+            Address::Direct(http_base) => Some(http_base),
+            Address::Ssh(_) => None,
+        }
+    }
+
+    /// The bearer session this route's token opens at `http_base`.
+    pub fn endpoint(&self, http_base: &str) -> Option<Endpoint> {
+        match &self.credential {
+            Credential::Token(token) => Some(Endpoint::bearer(http_base, token.clone())),
+            Credential::Missing | Credential::Locked { .. } => None,
+        }
+    }
+
+    fn hostname(&self) -> Option<String> {
+        let url = Url::parse(self.http_base()?).ok()?;
+        Some(normalize_hostname(url.host_str()?))
+    }
+
+    /// `connectionRouteKind`.
+    pub fn kind(&self) -> RouteKind {
+        if matches!(self.address, Address::Ssh(_)) {
+            return RouteKind::Ssh;
+        }
+        match self.hostname() {
+            None => RouteKind::Public,
+            Some(host) if is_loopback_host(&host) => RouteKind::Loopback,
+            Some(host) if is_tailnet_host(&host) => RouteKind::Tailnet,
+            Some(host) if is_shared_address_space_host(&host) => RouteKind::Vpn,
+            Some(host) if is_private_network_host(&host) => RouteKind::Lan,
+            Some(_) => RouteKind::Public,
+        }
+    }
+
+    /// `connectionRouteLabel`.
+    pub fn label(&self) -> String {
+        match (self.kind(), &self.address) {
+            (RouteKind::Loopback, _) => "This device".into(),
+            (RouteKind::Lan, _) => "LAN".into(),
+            (RouteKind::Tailnet, _) => "Tailscale".into(),
+            (RouteKind::Vpn, _) => "VPN".into(),
+            (RouteKind::Ssh, Address::Ssh(target)) => match &target.username {
+                Some(user) => format!("SSH {user}@{}", target.hostname),
+                None => format!("SSH {}", target.hostname),
+            },
+            (RouteKind::Ssh, _) => "SSH".into(),
+            (RouteKind::Public, _) => self.hostname().unwrap_or_else(|| "Remote link".into()),
+        }
+    }
+
+    /// `connectionRouteAddress`: the base URL, or the SSH alias.
+    pub fn address_text(&self) -> String {
+        match &self.address {
+            Address::Direct(http_base) => http_base.clone(),
+            Address::Ssh(target) => target.alias.clone(),
+        }
+    }
+
+    /// `routeAddressKey`: two routes with the same key reach the same address.
+    fn address_key(&self) -> String {
+        match &self.address {
+            Address::Direct(http_base) => format!("bearer:{}", http_base.trim_end_matches('/')),
+            Address::Ssh(target) => format!("ssh:{}", target.key()),
+        }
+    }
+}
+
+/// `pendingRouteOrder`: an order still being saved, while it lists the saved routes and
+/// differs from their saved order.
+pub fn pending_route_order<'a>(pending: Option<&'a [String]>, saved: &[String]) -> Option<&'a [String]> {
+    let pending = pending.filter(|pending| pending.len() == saved.len())?;
+    let listed = pending.iter().all(|id| saved.contains(id));
+    (listed && pending != saved).then_some(pending)
+}
+
+/// `arrayMove`: `order` with the item at `from` moved to `to`.
+pub fn move_route(order: &[String], from: usize, to: usize) -> Vec<String> {
+    let mut moved = order.to_vec();
+    if from < moved.len() && to < moved.len() {
+        let item = moved.remove(from);
+        moved.insert(to, item);
+    }
+    moved
+}
+
+/// `upsertRoute`: replaces the route with the same id, else inserts the new one first among
+/// its kind, so a freshly paired address connects before an older one of the same kind.
+fn upsert_route(routes: &mut Vec<Route>, route: Route, environment_id: &str) {
+    let id = route.id(environment_id);
+    if let Some(existing) = routes.iter_mut().find(|existing| existing.id(environment_id) == id) {
+        *existing = route;
+        return;
+    }
+    let (kind, rank) = (route.kind(), route.kind().rank());
+    let index = routes.iter().position(|existing| existing.kind().rank() > rank || existing.kind() == kind);
+    routes.insert(index.unwrap_or(routes.len()), route);
+}
+
+/// `normalizeHostname`: lower case, no IPv6 brackets or trailing dots.
+fn normalize_hostname(host: &str) -> String {
+    host.to_lowercase().trim_start_matches('[').trim_end_matches(']').trim_end_matches('.').to_owned()
+}
+
+fn ipv4(host: &str) -> Option<[u8; 4]> {
+    let parts: Vec<_> = host.split('.').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let mut octets = [0; 4];
+    for (octet, part) in octets.iter_mut().zip(parts) {
+        // `Number(part)`: plain decimal digits only.
+        if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        *octet = part.parse().ok()?;
+    }
+    Some(octets)
+}
+
+/// `isLocalLoopbackHost`.
+fn is_loopback_host(host: &str) -> bool {
+    host == "localhost" || host == "::1" || ipv4(host).is_some_and(|ip| ip[0] == 127)
+}
+
+/// `isTailnetHost`: MagicDNS or Tailscale's `fd7a:115c:a1e0::/48`.
+fn is_tailnet_host(host: &str) -> bool {
+    host.ends_with(".ts.net")
+        || host.parse::<std::net::Ipv6Addr>().is_ok_and(|ip| ip.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0])
+}
+
+/// `isSharedAddressSpaceHost`: 100.64.0.0/10, which any VPN may use.
+fn is_shared_address_space_host(host: &str) -> bool {
+    ipv4(host).is_some_and(|ip| ip[0] == 100 && (64..=127).contains(&ip[1]))
+}
+
+/// `isPrivateNetworkHost`.
+fn is_private_network_host(host: &str) -> bool {
+    let local_name = host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host == "home.arpa"
+        || host.ends_with(".home.arpa")
+        || host.ends_with(".ts.net")
+        || (!host.contains('.') && !host.contains(':'));
+    if host == "::" || is_loopback_host(host) || local_name {
+        return true;
+    }
+    let mapped = host.strip_prefix("::ffff:").and_then(|rest| {
+        ipv4(rest).or_else(|| host.parse::<std::net::Ipv6Addr>().ok()?.to_ipv4_mapped().map(|ip| ip.octets()))
+    });
+    if let Some(ip) = ipv4(host).or(mapped) {
+        return matches!(ip, [0 | 10 | 127, ..] | [192, 168, ..] | [169, 254, ..])
+            || (ip[0] == 100 && (64..=127).contains(&ip[1]))
+            || (ip[0] == 172 && (16..=31).contains(&ip[1]))
+            || (ip[0] == 198 && (18..=19).contains(&ip[1]));
+    }
+    let first = host.split(':').next().unwrap_or_default();
+    host.contains(':')
+        && (1..=4).contains(&first.len())
+        && u16::from_str_radix(first, 16).is_ok_and(|hextet| hextet & 0xfe00 == 0xfc00 || hextet & 0xffc0 == 0xfe80)
 }
 
 // ---------------------------------------------------------------------------------------------
 // Catalog
 
-/// A paired environment (`BearerConnectionTarget` + profile + credential).
+/// A paired environment: one identity, reached over its routes, preferred first
+/// (`ConnectionCatalogEntry` with `alternateRoutes`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct SavedEnvironment {
     pub environment_id: String,
     pub label: String,
-    /// `https://host:port`, no trailing slash.
-    pub http_base: String,
     pub enabled: bool,
-    pub credential: Credential,
+    /// Never empty: removing the last route forgets the environment.
+    pub routes: Vec<Route>,
 }
 
 /// A saved environment's bearer token as this device holds it. `Debug` never prints the token.
@@ -437,21 +785,33 @@ impl Credential {
 }
 
 impl SavedEnvironment {
-    /// `bearerConnectionId`.
-    pub fn connection_id(&self) -> String {
-        let origin = Url::parse(&self.http_base).map(|url| url.origin().ascii_serialization()).unwrap_or_default();
-        format!("bearer:{}:{origin}", self.environment_id)
+    pub fn route(&self, route_id: &str) -> Option<&Route> {
+        self.routes.iter().find(|route| route.id(&self.environment_id) == route_id)
     }
 
-    /// `environmentMcpUrl` for a bearer route.
-    pub fn mcp_url(&self) -> String {
-        format!("{}/mcp", self.http_base)
+    pub fn route_ids(&self) -> Vec<String> {
+        self.routes.iter().map(|route| route.id(&self.environment_id)).collect()
     }
 
-    pub fn endpoint(&self) -> Option<Endpoint> {
-        match &self.credential {
-            Credential::Token(token) => Some(Endpoint::bearer(&self.http_base, token.clone())),
-            Credential::Missing | Credential::Locked { .. } => None,
+    /// `environmentMcpUrl`: on the connected route's address first, then the saved order. An
+    /// SSH forward is a loopback port of this run, so it never names one.
+    pub fn mcp_url(&self, connected_route: Option<&str>) -> Option<String> {
+        let connected = connected_route.and_then(|id| self.route(id));
+        connected.into_iter().chain(&self.routes).find_map(Route::http_base).map(|base| format!("{base}/mcp"))
+    }
+
+    /// `environmentTransportLabel`: how the row says it is reached.
+    pub fn transport_label(&self, active_route: Option<&str>) -> String {
+        if self.routes.len() > 1 {
+            return match active_route.and_then(|id| self.route(id)) {
+                Some(active) => format!("via {}", active.label()),
+                None => self.routes[0].label(),
+            };
+        }
+        match self.routes.first().map(|route| &route.address) {
+            Some(Address::Ssh(target)) => format!("SSH {}", target.display()),
+            Some(Address::Direct(http_base)) => http_base.clone(),
+            None => "Remote link".into(),
         }
     }
 }
@@ -491,21 +851,97 @@ enum Damage {
     Unreadable(String),
 }
 
+/// One saved environment as `environments.json` holds it. `routes` lists every route, preferred
+/// first; an entry from before routes holds one direct route in `httpBaseUrl` and
+/// `encryptedToken`. Saving mirrors the first direct route there, so an older build still
+/// connects, and leaves them out without one, so an older build keeps the entry untouched.
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StoredEnvironment {
     environment_id: String,
     label: String,
-    http_base_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    http_base_url: Option<String>,
     #[serde(default = "enabled_default")]
     enabled: bool,
     /// The bearer token, encrypted by [`secure`], hex.
-    #[serde(default)]
-    encrypted_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    encrypted_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    routes: Option<Vec<StoredRoute>>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+enum StoredRoute {
+    Direct {
+        http_base_url: String,
+        #[serde(default)]
+        encrypted_token: String,
+    },
+    Ssh {
+        alias: String,
+        hostname: String,
+        #[serde(default)]
+        username: Option<String>,
+        #[serde(default)]
+        port: Option<u16>,
+        #[serde(default)]
+        encrypted_token: String,
+    },
 }
 
 fn enabled_default() -> bool {
     true
+}
+
+impl StoredEnvironment {
+    /// The entry, when this build can read it and it has a route.
+    fn decode(entry: &Value) -> Option<Self> {
+        let decoded = Self::deserialize(entry)
+            .inspect_err(|error| log::warn!("keeping a saved environment this build cannot read: {error}"))
+            .ok()?;
+        let has_route =
+            decoded.routes.as_ref().is_some_and(|routes| !routes.is_empty()) || decoded.http_base_url.is_some();
+        has_route.then_some(decoded)
+    }
+
+    /// Its routes, reading a pre-routes entry as one direct route.
+    fn into_routes(self, unprotect: impl Fn(&[u8]) -> Result<Vec<u8>, String>) -> Vec<Route> {
+        let stored = match self.routes.filter(|routes| !routes.is_empty()) {
+            Some(routes) => routes,
+            None => vec![StoredRoute::Direct {
+                http_base_url: self.http_base_url.unwrap_or_default(),
+                encrypted_token: self.encrypted_token.unwrap_or_default(),
+            }],
+        };
+        stored
+            .into_iter()
+            .map(|route| match route {
+                StoredRoute::Direct { http_base_url, encrypted_token } => Route {
+                    address: Address::Direct(http_base_url.trim_end_matches('/').to_owned()),
+                    credential: open_credential(encrypted_token, &unprotect),
+                },
+                StoredRoute::Ssh { alias, hostname, username, port, encrypted_token } => Route {
+                    address: Address::Ssh(SshTarget { alias, hostname, username, port }),
+                    credential: open_credential(encrypted_token, &unprotect),
+                },
+            })
+            .collect()
+    }
+}
+
+/// A credential as stored: encrypted hex, kept as read when locked, empty when missing.
+fn seal(credential: &Credential, protect: &impl Fn(&[u8]) -> Result<Vec<u8>, String>) -> anyhow::Result<String> {
+    Ok(match credential {
+        Credential::Token(token) => {
+            let sealed =
+                protect(token.as_bytes()).map_err(|error| anyhow::anyhow!("could not encrypt a token: {error}"))?;
+            backend::hex(&sealed)
+        }
+        Credential::Locked { stored, .. } => stored.clone(),
+        Credential::Missing => String::new(),
+    })
 }
 
 impl Catalog {
@@ -546,60 +982,80 @@ impl Catalog {
         };
         let environments = entries
             .iter()
-            .filter_map(|entry| {
-                StoredEnvironment::deserialize(entry)
-                    .inspect_err(|error| log::warn!("keeping a saved environment this build cannot read: {error}"))
-                    .ok()
-            })
+            .filter_map(StoredEnvironment::decode)
             .map(|entry| SavedEnvironment {
-                credential: open_credential(entry.encrypted_token, &unprotect),
-                environment_id: entry.environment_id,
-                label: entry.label,
-                http_base: entry.http_base_url,
+                environment_id: entry.environment_id.clone(),
+                label: entry.label.clone(),
                 enabled: entry.enabled,
+                routes: entry.into_routes(&unprotect),
             })
             .collect();
         let local_environment_enabled = stored.get("localEnvironmentEnabled") != Some(&Value::Bool(false));
         Ok(Self { local_environment_enabled, environments, stored })
     }
 
+    /// One environment's entry; `read` is the entry as read, whose unknown fields stay.
+    fn entry(
+        environment: &SavedEnvironment,
+        read: Option<&Map<String, Value>>,
+        protect: &impl Fn(&[u8]) -> Result<Vec<u8>, String>,
+    ) -> anyhow::Result<Value> {
+        let mut mirror = None;
+        let routes = environment
+            .routes
+            .iter()
+            .map(|route| {
+                let encrypted_token = seal(&route.credential, protect)?;
+                Ok(match &route.address {
+                    Address::Direct(http_base) => {
+                        mirror.get_or_insert_with(|| (http_base.clone(), encrypted_token.clone()));
+                        StoredRoute::Direct { http_base_url: http_base.clone(), encrypted_token }
+                    }
+                    Address::Ssh(target) => StoredRoute::Ssh {
+                        alias: target.alias.clone(),
+                        hostname: target.hostname.clone(),
+                        username: target.username.clone(),
+                        port: target.port,
+                        encrypted_token,
+                    },
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let (http_base_url, encrypted_token) = mirror.unzip();
+        let known = serde_json::to_value(StoredEnvironment {
+            environment_id: environment.environment_id.clone(),
+            label: environment.label.clone(),
+            http_base_url,
+            enabled: environment.enabled,
+            encrypted_token,
+            routes: Some(routes),
+        })
+        .context("could not encode an environment")?;
+        let mut entry = read.cloned().unwrap_or_default();
+        // A mirror this save leaves out must not survive from the entry as read.
+        entry.remove("httpBaseUrl");
+        entry.remove("encryptedToken");
+        if let Value::Object(known) = known {
+            entry.extend(known);
+        }
+        Ok(Value::Object(entry))
+    }
+
     /// `protect` encrypts a token ([`secure::protect`] outside tests).
     fn document(&self, protect: impl Fn(&[u8]) -> Result<Vec<u8>, String>) -> anyhow::Result<Value> {
         let read: &[Value] = self.stored.get("environments").and_then(Value::as_array).map_or(&[], Vec::as_slice);
         let id = |entry: &Value| entry.get("environmentId").and_then(Value::as_str).map(str::to_owned);
-        let decodes = |entry: &Value| StoredEnvironment::deserialize(entry).is_ok();
+        let decodes = |entry: &Value| StoredEnvironment::decode(entry).is_some();
         let mut environments = self
             .environments
             .iter()
             .map(|environment| {
-                let encrypted_token = match &environment.credential {
-                    Credential::Token(token) => {
-                        let sealed = protect(token.as_bytes())
-                            .map_err(|error| anyhow::anyhow!("could not encrypt a token: {error}"))?;
-                        backend::hex(&sealed)
-                    }
-                    Credential::Locked { stored, .. } => stored.clone(),
-                    Credential::Missing => String::new(),
-                };
-                let known = serde_json::to_value(StoredEnvironment {
-                    environment_id: environment.environment_id.clone(),
-                    label: environment.label.clone(),
-                    http_base_url: environment.http_base.clone(),
-                    enabled: environment.enabled,
-                    encrypted_token,
-                })
-                .context("could not encode an environment")?;
                 // Start from the entry as read, so fields this build does not know stay.
-                let mut entry = read
+                let read = read
                     .iter()
                     .find(|entry| id(entry).as_ref() == Some(&environment.environment_id) && decodes(entry))
-                    .and_then(Value::as_object)
-                    .cloned()
-                    .unwrap_or_default();
-                if let Value::Object(known) = known {
-                    entry.extend(known);
-                }
-                Ok(Value::Object(entry))
+                    .and_then(Value::as_object);
+                Self::entry(environment, read, &protect)
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         // Entries this build could not decode stay as read, unless one it saves replaced it.
@@ -628,12 +1084,54 @@ impl Catalog {
         self.environments.iter_mut().find(|environment| environment.environment_id == environment_id)
     }
 
-    /// `EnvironmentRegistry.register` for one bearer route: replaces a saved entry with the same id.
-    pub fn upsert(&mut self, environment: SavedEnvironment) {
-        match self.get_mut(&environment.environment_id) {
-            Some(saved) => *saved = environment,
-            None => self.environments.push(environment),
+    /// `EnvironmentRegistry.register` for a paired route. A new environment is added; a saved
+    /// one gains the route (replacing one to the same address) and is switched on. With
+    /// `known_address_only`, a route to a new address of a saved environment is refused: that
+    /// is "Add route", not "Add environment".
+    pub fn register(&mut self, paired: SavedEnvironment, known_address_only: bool) -> Result<(), String> {
+        let Some(saved) = self.get_mut(&paired.environment_id) else {
+            self.environments.push(paired);
+            return Ok(());
+        };
+        let id = saved.environment_id.clone();
+        for route in paired.routes {
+            if known_address_only {
+                assert_known_address(std::slice::from_ref(saved), &id, &route)?;
+            }
+            let (key, route_id) = (route.address_key(), route.id(&id));
+            saved.routes.retain(|existing| existing.address_key() != key || existing.id(&id) == route_id);
+            upsert_route(&mut saved.routes, route, &id);
         }
+        saved.enabled = true;
+        Ok(())
+    }
+
+    /// `EnvironmentRegistry.removeRoute`; the last route takes the environment with it.
+    /// Returns the removed route.
+    pub fn remove_route(&mut self, environment_id: &str, route_id: &str) -> Option<Route> {
+        let saved = self.get_mut(environment_id)?;
+        let index = saved.routes.iter().position(|route| route.id(environment_id) == route_id)?;
+        let removed = saved.routes.remove(index);
+        if saved.routes.is_empty() {
+            self.environments.retain(|environment| environment.environment_id != environment_id);
+        }
+        Some(removed)
+    }
+
+    /// `EnvironmentRegistry.reorderRoutes`: `route_ids` must list every saved route once.
+    pub fn reorder_routes(&mut self, environment_id: &str, route_ids: &[String]) -> Result<(), &'static str> {
+        let saved = self.get_mut(environment_id).ok_or("The environment is no longer saved.")?;
+        let ids = saved.route_ids();
+        let unique: std::collections::HashSet<_> = route_ids.iter().collect();
+        if route_ids.len() != ids.len() || unique.len() != ids.len() || !ids.iter().all(|id| unique.contains(id)) {
+            return Err("The route order must list every saved route once.");
+        }
+        let mut routes: Vec<Option<Route>> = std::mem::take(&mut saved.routes).into_iter().map(Some).collect();
+        saved.routes = route_ids
+            .iter()
+            .filter_map(|id| ids.iter().position(|saved| saved == id).and_then(|index| routes[index].take()))
+            .collect();
+        Ok(())
     }
 }
 
@@ -721,7 +1219,8 @@ pub async fn resolve_workspace_endpoint() -> anyhow::Result<(Endpoint, Option<Lo
                 .environments
                 .iter()
                 .filter(|environment| environment.enabled)
-                .find_map(SavedEnvironment::endpoint);
+                .flat_map(|environment| &environment.routes)
+                .find_map(|route| route.endpoint(route.http_base()?));
             let endpoint = endpoint.ok_or(backend::Unrecoverable(
                 "The local environment is off. Turn it on in Settings › Environments, or add an environment there."
                     .into(),
@@ -1317,14 +1816,9 @@ mod tests {
         assert!(diagnosis.facts.contains(&("Next retry", "1970-01-01T00:00:00.000Z".into())));
         assert!(diagnosis.facts.contains(&("Attempts", "3".into())));
 
-        let saved = SavedEnvironment {
-            environment_id: "e".into(),
-            label: "Box".into(),
-            http_base: "https://box:4000".into(),
-            enabled: true,
-            credential: Credential::Missing,
-        };
-        let missing = state(Phase::Blocked, 1, Some(Failure::credential_missing(&saved)));
+        let route = Route::direct("https://box:4000".into(), Credential::Missing);
+        let id = route.id("e");
+        let missing = state(Phase::Blocked, 1, Some(Failure::credential_missing(&id, &route.credential)));
         let diagnosis = diagnose("Box", &missing, None).unwrap();
         assert_eq!(diagnosis.headline, "This device could not prepare the connection");
         assert!(
@@ -1336,11 +1830,8 @@ mod tests {
         assert!(text.starts_with("T3 Code connection to Box: This device could not prepare the connection\n\nThis device: FAILED\nT3 Code on Box: not checked\n\nCause: authentication"));
 
         // A credential the keyring would not open says so, rather than that none is saved.
-        let locked = SavedEnvironment {
-            credential: Credential::Locked { stored: "00".into(), error: "Could not use the Keychain: denied".into() },
-            ..saved
-        };
-        let detail = Failure::credential_missing(&locked).detail;
+        let locked = Credential::Locked { stored: "00".into(), error: "Could not use the Keychain: denied".into() };
+        let detail = Failure::credential_missing(&id, &locked).detail;
         assert!(detail.contains("is saved, but this device could not decrypt it (Could not use the Keychain: denied)"));
     }
 
@@ -1362,10 +1853,13 @@ mod tests {
         SavedEnvironment {
             environment_id: id.into(),
             label: id.into(),
-            http_base: format!("https://{id}"),
             enabled: true,
-            credential,
+            routes: vec![Route::direct(format!("https://{id}"), credential)],
         }
+    }
+
+    fn credential(environment: &SavedEnvironment) -> &Credential {
+        &environment.routes[0].credential
     }
 
     #[test]
@@ -1384,21 +1878,22 @@ mod tests {
         let mut locked = read(&document, denied);
         let error = "Could not use the Keychain: denied".to_owned();
         let expected = Credential::Locked { stored: stored.as_str().unwrap().into(), error };
-        assert_eq!(locked.environments[0].credential, expected);
-        assert_eq!(locked.environments[1].credential, Credential::Missing);
-        assert!(locked.environments[0].endpoint().is_none());
+        assert_eq!(*credential(&locked.environments[0]), expected);
+        assert_eq!(*credential(&locked.environments[1]), Credential::Missing);
+        assert!(locked.environments[0].routes[0].endpoint("https://a").is_none());
 
         // Rename it, switch it off and pair another environment, then save.
         locked.environments[0].label = "Renamed".into();
         locked.environments[0].enabled = false;
-        locked.upsert(saved("c", Credential::Token("token-c".into())));
+        locked.register(saved("c", Credential::Token("token-c".into())), true).unwrap();
         let saved_again = locked.document(seal).unwrap();
         assert_eq!(saved_again["environments"][0]["encryptedToken"], stored);
+        assert_eq!(saved_again["environments"][0]["routes"][0]["encryptedToken"], stored);
         assert_eq!(saved_again["environments"][1]["encryptedToken"], "");
 
         // A later run whose keyring opens reads every token back.
         let reopened = read(&saved_again, seal);
-        let tokens: Vec<_> = reopened.environments.iter().map(|e| e.credential.clone()).collect();
+        let tokens: Vec<_> = reopened.environments.iter().map(|e| credential(e).clone()).collect();
         assert_eq!(
             tokens,
             [Credential::Token("token-a".into()), Credential::Missing, Credential::Token("token-c".into())]
@@ -1414,7 +1909,7 @@ mod tests {
             }] });
             let catalog = read(&document, seal);
             assert!(
-                matches!(&catalog.environments[0].credential, Credential::Locked { stored: kept, .. } if kept == stored)
+                matches!(credential(&catalog.environments[0]), Credential::Locked { stored: kept, .. } if kept == stored)
             );
             assert_eq!(catalog.document(seal).unwrap()["environments"][0]["encryptedToken"], stored);
         }
@@ -1427,9 +1922,11 @@ mod tests {
             "version": 1,
             "futureSetting": { "x": 1 },
             "environments": [
-                { "environmentId": "a", "label": "A", "httpBaseUrl": "https://a", "routes": ["r"] },
+                { "environmentId": "a", "label": "A", "httpBaseUrl": "https://a", "icon": ["r"] },
                 { "environmentId": "b", "httpBaseUrl": "https://b", "kind": "ssh" },
                 { "environmentId": "c", "label": 7 },
+                { "environmentId": "d", "label": "D", "routes": [{ "type": "relay" }] },
+                { "environmentId": "e", "label": "E" },
                 "not an entry",
             ],
         });
@@ -1441,16 +1938,16 @@ mod tests {
         assert_eq!(written["futureSetting"], json!({ "x": 1 }));
         let entries = written["environments"].as_array().unwrap();
         assert_eq!(entries[0]["label"], "Renamed");
-        assert_eq!(entries[0]["routes"], json!(["r"]));
+        assert_eq!(entries[0]["icon"], json!(["r"]));
         assert_eq!(entries[1..], document["environments"].as_array().unwrap()[1..]);
 
         // Pairing "c" again replaces its unreadable entry; removing "a" drops it.
-        catalog.upsert(saved("c", Credential::Missing));
+        catalog.register(saved("c", Credential::Missing), false).unwrap();
         catalog.environments.retain(|environment| environment.environment_id != "a");
         let written = catalog.document(seal).unwrap();
         let ids: Vec<_> =
             written["environments"].as_array().unwrap().iter().map(|e| e["environmentId"].clone()).collect();
-        assert_eq!(ids, [json!("c"), json!("b"), Value::Null]);
+        assert_eq!(ids, [json!("c"), json!("b"), json!("d"), json!("e"), Value::Null]);
     }
 
     #[test]
@@ -1486,7 +1983,7 @@ mod tests {
     fn debug_output_never_shows_a_token() {
         let environment = saved("a", Credential::Token("secret-token".into()));
         let catalog = Catalog { environments: vec![environment.clone()], ..Catalog::default() };
-        for text in [format!("{environment:?}"), format!("{catalog:?}"), format!("{:#?}", environment.credential)] {
+        for text in [format!("{environment:?}"), format!("{catalog:?}"), format!("{:#?}", credential(&environment))] {
             assert!(!text.contains("secret-token"), "{text}");
         }
         assert!(format!("{environment:?}").contains("credential: Token(<redacted>)"));
@@ -1515,11 +2012,8 @@ mod tests {
         let catalog = Catalog {
             local_environment_enabled: false,
             environments: vec![SavedEnvironment {
-                environment_id: "env-1".into(),
-                label: "Box".into(),
-                http_base: "https://box".into(),
                 enabled: false,
-                credential: Credential::Token("secret-token".into()),
+                ..saved("env-1", Credential::Token("secret-token".into()))
             }],
             ..Catalog::default()
         };
@@ -1534,9 +2028,176 @@ mod tests {
         assert_eq!(Credential::Missing.reopen(), None);
         // A credential DPAPI cannot open is kept as stored.
         let mut tampered = document;
-        tampered["environments"][0]["encryptedToken"] = json!("00ff");
+        tampered["environments"][0]["routes"][0]["encryptedToken"] = json!("00ff");
         let reread = read(&tampered, secure::unprotect);
-        assert!(matches!(&reread.environments[0].credential, Credential::Locked { stored, .. } if stored == "00ff"));
+        assert!(matches!(credential(&reread.environments[0]), Credential::Locked { stored, .. } if stored == "00ff"));
+    }
+
+    fn ssh_route(alias: &str, credential: Credential) -> Route {
+        let target = SshTarget {
+            alias: alias.into(),
+            hostname: format!("{alias}.lan"),
+            username: Some("me".into()),
+            port: None,
+        };
+        Route { address: Address::Ssh(target), credential }
+    }
+
+    fn addresses(environment: &SavedEnvironment) -> Vec<String> {
+        environment.routes.iter().map(Route::address_text).collect()
+    }
+
+    #[test]
+    fn entries_saved_before_routes_read_as_one_direct_route_and_keep_working_in_older_builds() {
+        let token = backend::hex(&seal(b"token-a").unwrap());
+        let document = json!({ "environments": [{
+            "environmentId": "a", "label": "A", "httpBaseUrl": "https://a/", "encryptedToken": token, "enabled": false,
+        }] });
+        let mut catalog = read(&document, seal);
+        let migrated =
+            SavedEnvironment { enabled: false, label: "A".into(), ..saved("a", Credential::Token("token-a".into())) };
+        assert_eq!(catalog.environments, [migrated]);
+
+        // Saved with an SSH route ahead of it: `routes` lists both, and the top-level fields
+        // an older build reads mirror the direct route.
+        catalog.environments[0].routes.insert(0, ssh_route("box", Credential::Token("token-s".into())));
+        let written = catalog.document(seal).unwrap();
+        let entry = &written["environments"][0];
+        assert_eq!(entry["httpBaseUrl"], "https://a");
+        assert_eq!(entry["routes"][0]["type"], "ssh");
+        assert_eq!(entry["routes"][0]["username"], "me");
+        assert_eq!(
+            entry["routes"][1],
+            json!({ "type": "direct", "httpBaseUrl": "https://a", "encryptedToken": entry["encryptedToken"] })
+        );
+        assert_eq!(read(&written, seal).environments, catalog.environments);
+
+        // Without a direct route, the mirror goes, so an older build leaves the entry alone.
+        catalog.environments[0].routes.truncate(1);
+        let written = catalog.document(seal).unwrap();
+        let entry = written["environments"][0].as_object().unwrap();
+        assert!(!entry.contains_key("httpBaseUrl") && !entry.contains_key("encryptedToken"));
+        assert_eq!(read(&written, seal).environments, catalog.environments);
+    }
+
+    #[test]
+    fn routes_rank_by_kind_and_label_like_the_web() {
+        let kind = |base: &str| Route::direct(base.into(), Credential::Missing).kind();
+        assert_eq!(kind("http://127.0.0.1:3773"), RouteKind::Loopback);
+        assert_eq!(kind("http://[::1]:3773"), RouteKind::Loopback);
+        assert_eq!(kind("http://192.168.1.4:3773"), RouteKind::Lan);
+        assert_eq!(kind("http://devbox:3773"), RouteKind::Lan);
+        assert_eq!(kind("http://[fe80::1]:3773"), RouteKind::Lan);
+        assert_eq!(kind("https://box.tail1.ts.net"), RouteKind::Tailnet);
+        assert_eq!(kind("http://[fd7a:115c:a1e0::1]"), RouteKind::Tailnet);
+        assert_eq!(kind("http://100.100.1.2:3773"), RouteKind::Vpn);
+        assert_eq!(kind("https://box.example.com"), RouteKind::Public);
+        assert_eq!(kind("http://8.8.8.8"), RouteKind::Public);
+        assert_eq!(ssh_route("box", Credential::Missing).kind(), RouteKind::Ssh);
+
+        let label = |base: &str| Route::direct(base.into(), Credential::Missing).label();
+        assert_eq!(label("http://localhost:3773"), "This device");
+        assert_eq!(label("https://box.example.com"), "box.example.com");
+        assert_eq!(ssh_route("box", Credential::Missing).label(), "SSH me@box.lan");
+        assert_eq!(ssh_route("box", Credential::Missing).address_text(), "box");
+        assert_eq!(ssh_route("box", Credential::Missing).id("e"), r#"ssh:e:["box","box.lan","me",null]"#);
+        assert_eq!(Route::direct("https://box:443".into(), Credential::Missing).id("e"), "bearer:e:https://box");
+    }
+
+    #[test]
+    fn registering_adds_routes_under_one_identity() {
+        let mut catalog =
+            Catalog { environments: vec![saved("e", Credential::Token("public".into()))], ..Catalog::default() };
+        catalog.get_mut("e").unwrap().enabled = false;
+        catalog.get_mut("e").unwrap().label = "Renamed".into();
+        let route = |base: &str, token: &str| SavedEnvironment {
+            routes: vec![Route::direct(base.into(), Credential::Token(token.into()))],
+            ..saved("e", Credential::Missing)
+        };
+
+        // "Add environment" refuses a new address of a saved environment, unspent.
+        let refused = catalog.register(route("http://192.168.1.4:3773", "lan"), true);
+        assert_eq!(
+            refused,
+            Err("That address claims to be Renamed, which is already saved. Add it as a route from that environment's settings instead.".into())
+        );
+        // "Add route" takes it, nearest kind first, and switches the environment on.
+        catalog.register(route("http://192.168.1.4:3773", "lan"), false).unwrap();
+        catalog.register(route("https://box.tail1.ts.net", "tail"), false).unwrap();
+        let mut ssh = saved("e", Credential::Missing);
+        ssh.routes = vec![ssh_route("box", Credential::Token("ssh".into()))];
+        catalog.register(ssh, false).unwrap();
+        // A second LAN address goes first among LAN routes, so its fresh credential connects.
+        catalog.register(route("http://10.0.0.9:3773", "lan2"), false).unwrap();
+        let environment = catalog.get("e").unwrap();
+        assert_eq!(
+            addresses(environment),
+            ["http://10.0.0.9:3773", "http://192.168.1.4:3773", "https://e", "https://box.tail1.ts.net", "box"]
+        );
+        assert!(environment.enabled);
+        assert_eq!(environment.label, "Renamed");
+
+        // Pairing an address again replaces its route in place, with the new token.
+        catalog.register(route("https://e/", "public2"), true).unwrap();
+        let environment = catalog.get("e").unwrap();
+        assert_eq!(environment.routes.len(), 5);
+        assert_eq!(environment.routes[2].credential, Credential::Token("public2".into()));
+
+        // A different environment is its own entry.
+        catalog.register(saved("other", Credential::Missing), true).unwrap();
+        assert_eq!(catalog.environments.len(), 2);
+    }
+
+    #[test]
+    fn routes_reorder_and_the_last_one_takes_the_environment() {
+        let mut catalog = Catalog { environments: vec![saved("e", Credential::Missing)], ..Catalog::default() };
+        catalog.get_mut("e").unwrap().routes.push(ssh_route("box", Credential::Missing));
+        let ids = catalog.get("e").unwrap().route_ids();
+        let reversed: Vec<_> = ids.iter().rev().cloned().collect();
+        catalog.reorder_routes("e", &reversed).unwrap();
+        assert_eq!(addresses(catalog.get("e").unwrap()), ["box", "https://e"]);
+        for bad in [vec![ids[0].clone()], vec![ids[0].clone(), ids[0].clone()], vec![ids[0].clone(), "x".into()]] {
+            assert!(catalog.reorder_routes("e", &bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(addresses(catalog.get("e").unwrap()), ["box", "https://e"]);
+
+        let removed = catalog.remove_route("e", &ids[1]).unwrap();
+        assert_eq!(removed.address_text(), "box");
+        assert_eq!(addresses(catalog.get("e").unwrap()), ["https://e"]);
+        assert!(catalog.remove_route("e", "missing").is_none());
+        catalog.remove_route("e", &ids[0]).unwrap();
+        assert!(catalog.get("e").is_none());
+    }
+
+    #[test]
+    fn rows_name_the_route_in_use_and_mcp_skips_forwards() {
+        let mut environment = saved("e", Credential::Missing);
+        assert_eq!(environment.transport_label(None), "https://e");
+        assert_eq!(environment.mcp_url(None).as_deref(), Some("https://e/mcp"));
+        environment.routes.insert(0, ssh_route("box", Credential::Missing));
+        let ssh_id = environment.routes[0].id("e");
+        assert_eq!(environment.transport_label(None), "SSH me@box.lan");
+        assert_eq!(environment.transport_label(Some(&environment.routes[1].id("e"))), "via LAN");
+        assert_eq!(environment.mcp_url(Some(&ssh_id)).as_deref(), Some("https://e/mcp"));
+        environment.routes.truncate(1);
+        assert_eq!(environment.transport_label(None), "SSH me@box.lan");
+        assert_eq!(environment.mcp_url(None), None);
+    }
+
+    #[test]
+    fn a_pending_route_order_shows_until_saved_or_stale() {
+        let ids = |list: &[&str]| list.iter().map(|id| (*id).to_owned()).collect::<Vec<_>>();
+        let saved = ids(&["a", "b", "c"]);
+        let moved = move_route(&saved, 2, 0);
+        assert_eq!(moved, ids(&["c", "a", "b"]));
+        assert_eq!(move_route(&saved, 0, 2), ids(&["b", "c", "a"]));
+        assert_eq!(move_route(&saved, 0, 9), saved);
+        assert_eq!(pending_route_order(Some(&moved), &saved), Some(moved.as_slice()));
+        // Saved in that order, or a route added or removed meanwhile: the saved order shows.
+        assert_eq!(pending_route_order(Some(&moved), &moved), None);
+        assert_eq!(pending_route_order(Some(&moved), &ids(&["a", "b"])), None);
+        assert_eq!(pending_route_order(Some(&moved), &ids(&["a", "b", "d"])), None);
+        assert_eq!(pending_route_order(None, &saved), None);
     }
 
     #[test]

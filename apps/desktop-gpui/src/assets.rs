@@ -193,6 +193,8 @@ const LUCIDE_ICONS: &[(&str, &[u8])] = lucide![
     "square-split-horizontal",
     "square-split-vertical",
     "square-terminal",
+    "route",
+    "grip-vertical",
     "terminal",
     "trash-2",
     "trending-down",

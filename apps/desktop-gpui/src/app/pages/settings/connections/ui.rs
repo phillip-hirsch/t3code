@@ -190,9 +190,14 @@ impl RenderOnce for WebButton {
         base.when_some(self.icon, |el, icon| el.child(Icon::new(icon).size(px(icon_size)))).child(self.label).map(
             |el| match (self.disabled, self.on_click) {
                 (true, _) | (_, None) => el.opacity(0.64),
+                // A tab stop that Enter and Space click, with `focus-visible:ring-2`.
                 (false, Some(handler)) => el
                     .cursor_pointer()
                     .hover(move |style| style.bg(hover_bg).border_color(hover_border))
+                    .tab_index(0)
+                    .focus_visible(move |style| {
+                        style.shadow(vec![gpui_kit::BoxShadow::new(px(0.), px(0.), t.ring).spread_radius(px(2.))])
+                    })
                     .on_click(move |event, window, cx| handler(event, window, cx)),
             },
         )

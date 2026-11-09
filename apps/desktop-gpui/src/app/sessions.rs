@@ -390,10 +390,10 @@ impl Workspace {
                 continue;
             }
             let id: SharedString = environment.environment_id.clone().into();
-            let socket =
-                saved.session(&environment.environment_id).and_then(|s| Some((s.client.clone()?, s.generation)));
+            let session = saved.session(&environment.environment_id);
+            let socket = session.and_then(|s| Some((s.client.clone()?, s.generation)));
             listed.push(id.clone());
-            connections.push((id, socket, environment.endpoint()));
+            connections.push((id, socket, session.and_then(|s| s.endpoint.clone())));
         }
         let mut started = Vec::new();
         let mut closed = false;

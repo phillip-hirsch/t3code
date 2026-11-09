@@ -48,7 +48,7 @@ pub(super) const SCOPE_OPTIONS: &[(&str, &str, &str)] = &[
 ];
 
 /// `AuthStandardClientScopes` in `packages/contracts/src/auth.ts`.
-pub(super) const STANDARD_SCOPES: &[&str] = &[
+pub(in crate::app) const STANDARD_SCOPES: &[&str] = &[
     ORCHESTRATION_READ,
     ORCHESTRATION_OPERATE,
     SETTINGS_WRITE,

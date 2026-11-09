@@ -9,9 +9,13 @@ use std::time::Duration;
 use futures::channel::oneshot;
 use gpui_kit::{Context, Subscription, Task};
 
-use crate::environments::{self, Catalog, ConnectionState, Credential, Failure, Phase, SavedEnvironment};
+use crate::backend::Endpoint;
+use crate::environments::{
+    self, Address, Catalog, ConnectionState, Credential, Failure, Phase, Route, SavedEnvironment,
+};
 use crate::rpc::{self, ConnectOptions, RpcClient};
 use crate::runtime;
+use crate::ssh::SshTarget;
 
 #[derive(Default)]
 pub(crate) struct Session {
@@ -21,9 +25,19 @@ pub(crate) struct Session {
     pub machine: Option<String>,
     /// The open socket while connected.
     pub client: Option<RpcClient>,
+    /// The route that socket runs over, and the address it reached there.
+    pub route: Option<String>,
+    pub endpoint: Option<Endpoint>,
     /// Counts connections, so the workspace notices a new socket and resubscribes on it.
     pub generation: u64,
     _task: Option<Task<()>>,
+}
+
+impl Session {
+    /// The route the open connection runs over (`usePreparedConnection` while connected).
+    pub fn active_route(&self) -> Option<&str> {
+        self.route.as_deref().filter(|_| self.state.phase == Phase::Connected)
+    }
 }
 
 pub(crate) struct SavedEnvironments {
@@ -241,6 +255,7 @@ impl SavedEnvironments {
             _load: load,
             _quit: cx.on_app_quit(|this, _| {
                 this.writes.unsaved.save_before_quit();
+                crate::ssh::shutdown();
                 async {}
             }),
         }
@@ -295,13 +310,53 @@ impl SavedEnvironments {
         Some(self.catalog.as_ref()?.local_environment_enabled)
     }
 
-    /// Saves a paired environment and connects it (`registerPairingConnection`). Lists it only
-    /// once it is saved.
-    pub fn add(&mut self, environment: SavedEnvironment, cx: &mut Context<Self>) -> Saving {
+    /// Saves a paired route and connects over it (`registerPairingConnection`): a new
+    /// environment, or another route to a saved one. Lists it only once it is saved.
+    pub fn register(&mut self, paired: SavedEnvironment, known_address_only: bool, cx: &mut Context<Self>) -> Saving {
+        self.edit(cx, |catalog| catalog.register(paired, known_address_only))
+    }
+
+    /// Forgets one route; the last one takes the environment with it. An SSH route stops the
+    /// server it started there once the change is saved.
+    pub fn remove_route(&mut self, environment_id: &str, route_id: &str, cx: &mut Context<Self>) -> Saving {
         self.edit(cx, |catalog| {
-            catalog.upsert(environment);
-            Ok(())
+            catalog
+                .remove_route(environment_id, route_id)
+                .map(drop)
+                .ok_or_else(|| "That route is no longer saved.".into())
         })
+    }
+
+    /// Saves a new route order, preferred first.
+    pub fn reorder_routes(&mut self, environment_id: &str, route_ids: Vec<String>, cx: &mut Context<Self>) -> Saving {
+        self.edit(cx, |catalog| catalog.reorder_routes(environment_id, &route_ids).map_err(str::to_owned))
+    }
+
+    /// Keeps the token an SSH route paired again with while connecting, so the next connection
+    /// reuses it instead of adding another session on the host.
+    fn store_credential(
+        &mut self,
+        environment_id: &str,
+        route_id: &str,
+        credential: Credential,
+        cx: &mut Context<Self>,
+    ) {
+        let saving = self.edit(cx, |catalog| {
+            let route = catalog
+                .get_mut(environment_id)
+                .and_then(|saved| saved.routes.iter_mut().find(|route| route.id(environment_id) == route_id));
+            if let Some(route) = route {
+                route.credential = credential;
+            }
+            Ok(())
+        });
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(error) = saving.finished().await {
+                    log::warn!("could not keep the SSH route's new credential: {error}");
+                }
+            })
+            .detach();
     }
 
     pub fn set_enabled(&mut self, environment_id: &str, enabled: bool, cx: &mut Context<Self>) -> Saving {
@@ -315,7 +370,7 @@ impl SavedEnvironments {
 
     pub fn rename(&mut self, environment_id: &str, label: &str, cx: &mut Context<Self>) -> Saving {
         self.edit(cx, |catalog| {
-            let label = environments::validate_label(label)?;
+            let label = environments::validate_label(label).map_err(str::to_owned)?;
             if let Some(environment) = catalog.get_mut(environment_id) {
                 environment.label = label;
             }
@@ -340,7 +395,7 @@ impl SavedEnvironments {
 
     /// Applies `change` to the newest catalog and queues its write. The shown catalog and the
     /// connections follow once it is on disk, so a failed save changes nothing.
-    fn edit(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut Catalog) -> Result<(), &str>) -> Saving {
+    fn edit(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut Catalog) -> Result<(), String>) -> Saving {
         if self.read_only {
             return Saving(Err(self.problem.clone().unwrap_or_else(|| "Saved environments are read-only.".into())));
         }
@@ -349,7 +404,7 @@ impl SavedEnvironments {
         };
         let mut catalog = newest.clone();
         if let Err(error) = change(&mut catalog) {
-            return Saving(Err(error.to_owned()));
+            return Saving(Err(error));
         }
         let receiver = self.writes.queue(catalog);
         self.write_next(cx);
@@ -374,6 +429,7 @@ impl SavedEnvironments {
     /// Shows a catalog that is on disk, restarting the connections it changed.
     fn commit(&mut self, catalog: Catalog, cx: &mut Context<Self>) {
         let changed = changed_connections(self.catalog.as_ref(), &catalog);
+        let dropped = dropped_ssh_targets(self.catalog.as_ref(), &catalog);
         self.catalog = Some(catalog);
         for (id, saved) in changed {
             if saved {
@@ -381,6 +437,14 @@ impl SavedEnvironments {
             } else {
                 self.sessions.remove(&id);
             }
+        }
+        // `removeRoute`'s `disconnectSsh`: the forward closes and the server it started stops.
+        for target in dropped {
+            runtime().spawn(async move {
+                if let Err(error) = crate::ssh::disconnect(&target).await {
+                    log::warn!("could not disconnect SSH {}: {error}", target.alias);
+                }
+            });
         }
         cx.notify();
     }
@@ -391,6 +455,8 @@ impl SavedEnvironments {
         let session = self.sessions.entry(environment_id.to_owned()).or_default();
         session.state = ConnectionState::default();
         session.client = None;
+        session.route = None;
+        session.endpoint = None;
         let own = environment.enabled && self.primary.as_deref().is_none_or(|id| id != environment_id);
         session._task = own.then(|| Self::supervise(environment, 0, false, cx));
         cx.notify();
@@ -410,13 +476,21 @@ impl SavedEnvironments {
 
     /// Puts a credential decrypted again in place of the locked one it came from, here and
     /// in queued writes, so a write that finishes later does not lock it again.
-    fn reopened(&mut self, environment_id: &str, locked: &Credential, opened: &Credential, cx: &mut Context<Self>) {
+    fn reopened(
+        &mut self,
+        environment_id: &str,
+        route_id: &str,
+        locked: &Credential,
+        opened: &Credential,
+        cx: &mut Context<Self>,
+    ) {
         let queued = [&mut self.writes.writing, &mut self.writes.next].into_iter().flatten().map(|b| &mut b.catalog);
         for catalog in self.catalog.iter_mut().chain(queued) {
-            if let Some(environment) = catalog.get_mut(environment_id)
-                && environment.credential == *locked
-            {
-                environment.credential = opened.clone();
+            let route = catalog
+                .get_mut(environment_id)
+                .and_then(|saved| saved.routes.iter_mut().find(|route| route.id(environment_id) == route_id));
+            if let Some(route) = route.filter(|route| route.credential == *locked) {
+                route.credential = opened.clone();
             }
         }
         cx.notify();
@@ -429,16 +503,23 @@ impl SavedEnvironments {
         }
     }
 
-    /// `reopen` first decrypts a locked credential again, off the UI thread.
+    /// `reopen` first decrypts locked credentials again, off the UI thread.
     fn supervise(mut environment: SavedEnvironment, failures: u32, reopen: bool, cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |this, cx| {
             let id = environment.environment_id.clone();
-            if reopen && matches!(environment.credential, Credential::Locked { .. }) {
-                let locked = environment.credential.clone();
-                let opened = cx.background_executor().spawn(async move { locked.reopen() }).await;
-                if let Some(opened) = opened {
-                    let locked = std::mem::replace(&mut environment.credential, opened);
-                    let updated = this.update(cx, |this, cx| this.reopened(&id, &locked, &environment.credential, cx));
+            if reopen {
+                for index in 0..environment.routes.len() {
+                    let locked = environment.routes[index].credential.clone();
+                    if !matches!(locked, Credential::Locked { .. }) {
+                        continue;
+                    }
+                    let attempt = locked.clone();
+                    let Some(opened) = cx.background_executor().spawn(async move { attempt.reopen() }).await else {
+                        continue;
+                    };
+                    let route_id = environment.routes[index].id(&id);
+                    environment.routes[index].credential = opened.clone();
+                    let updated = this.update(cx, |this, cx| this.reopened(&id, &route_id, &locked, &opened, cx));
                     if updated.is_err() {
                         return;
                     }
@@ -460,14 +541,25 @@ impl SavedEnvironments {
                 let result =
                     attempt_result.unwrap_or_else(|error| Err(Box::new((Failure::transport(error.to_string()), None))));
                 match result {
-                    Ok((client, descriptor)) => {
+                    Ok(connected) => {
                         failures = 0;
+                        let Connected { client, descriptor, route_id, endpoint, refreshed } = connected;
+                        if let Some(credential) = refreshed.clone()
+                            && let Some(route) = environment.routes.iter_mut().find(|route| route.id(&id) == route_id)
+                        {
+                            route.credential = credential;
+                        }
                         let connected = this.update(cx, |this, cx| {
+                            if let Some(credential) = refreshed {
+                                this.store_credential(&id, &route_id, credential, cx);
+                            }
                             this.update_session(&id, cx, |s| {
                                 s.state = ConnectionState { phase: Phase::Connected, attempt, ..Default::default() };
                                 s.server_version = descriptor.server_version.clone();
                                 s.machine = descriptor.machine();
                                 s.client = Some(client.clone());
+                                s.route = Some(route_id.clone());
+                                s.endpoint = Some(endpoint);
                                 s.generation += 1;
                             });
                         });
@@ -526,17 +618,30 @@ impl SavedEnvironments {
     }
 }
 
-/// The environments whose connection `current` changes from `previous`: switched, readdressed,
-/// given another credential, added (`true`) or removed (`false`). A rename changes none.
+/// What starts or ends a connection: switched on or off, and each route's address and, for a
+/// direct route, its token. An SSH route's token is renewed by its own connection, so a new one
+/// does not reconnect; nor does a rename or a new route order, which the next attempt follows.
+fn connection_signature(environment: &SavedEnvironment) -> (bool, Vec<(String, Option<&Credential>)>) {
+    let mut routes: Vec<_> = environment
+        .routes
+        .iter()
+        .map(|route| {
+            let token = matches!(route.address, Address::Direct(_)).then_some(&route.credential);
+            (route.id(&environment.environment_id), token)
+        })
+        .collect();
+    routes.sort_by(|a, b| a.0.cmp(&b.0));
+    (environment.enabled, routes)
+}
+
+/// The environments whose connection `current` changes from `previous`: switched, rerouted,
+/// given another credential, added (`true`) or removed (`false`).
 fn changed_connections(previous: Option<&Catalog>, current: &Catalog) -> Vec<(String, bool)> {
-    fn route(environment: &SavedEnvironment) -> (bool, &str, &Credential) {
-        (environment.enabled, &environment.http_base, &environment.credential)
-    }
-    let before = |id: &str| previous.and_then(|catalog| catalog.get(id)).map(route);
+    let before = |id: &str| previous.and_then(|catalog| catalog.get(id)).map(connection_signature);
     let changed = current
         .environments
         .iter()
-        .filter(|environment| before(&environment.environment_id) != Some(route(environment)))
+        .filter(|environment| before(&environment.environment_id) != Some(connection_signature(environment)))
         .map(|environment| (environment.environment_id.clone(), true));
     let removed = previous
         .into_iter()
@@ -544,6 +649,23 @@ fn changed_connections(previous: Option<&Catalog>, current: &Catalog) -> Vec<(St
         .filter(|environment| current.get(&environment.environment_id).is_none())
         .map(|environment| (environment.environment_id.clone(), false));
     changed.chain(removed).collect()
+}
+
+/// The SSH targets of routes `current` no longer saves.
+fn dropped_ssh_targets(previous: Option<&Catalog>, current: &Catalog) -> Vec<SshTarget> {
+    let saved = |environment_id: &str, route_id: &str| {
+        current.get(environment_id).is_some_and(|environment| environment.route(route_id).is_some())
+    };
+    previous
+        .into_iter()
+        .flat_map(|catalog| &catalog.environments)
+        .flat_map(|environment| environment.routes.iter().map(move |route| (environment, route)))
+        .filter(|(environment, route)| !saved(&environment.environment_id, &route.id(&environment.environment_id)))
+        .filter_map(|(_, route)| match &route.address {
+            Address::Ssh(target) => Some(target.clone()),
+            Address::Direct(_) => None,
+        })
+        .collect()
 }
 
 /// A uniform random number in 0..=1 for [`environments::retry_delay_ms`].
@@ -559,15 +681,157 @@ fn retry_at(delay_ms: u64) -> i64 {
 /// Why an attempt failed, with the descriptor when it was read. Boxed: the pair is large.
 type ConnectError = Box<(Failure, Option<environments::Descriptor>)>;
 
-/// One attempt: the descriptor (identity and protocol), then the socket. Runs on the tokio runtime.
-async fn connect(environment: SavedEnvironment) -> Result<(RpcClient, environments::Descriptor), ConnectError> {
-    let Some(endpoint) = environment.endpoint() else {
-        return Err(Box::new((Failure::credential_missing(&environment), None)));
+/// An open connection, over route `route_id` at `endpoint`. `refreshed` is a token an SSH
+/// route paired again with, for the catalog to keep.
+struct Connected {
+    client: RpcClient,
+    descriptor: environments::Descriptor,
+    route_id: String,
+    endpoint: Endpoint,
+    refreshed: Option<Credential>,
+}
+
+/// `ROUTE_CHECK_TIMEOUT_MS`.
+const ROUTE_CHECK_TIMEOUT: Duration = Duration::from_millis(2_500);
+/// `ROUTE_CHECK_HEAD_START_MS`: preferred routes share one head start, so a connection does
+/// not wait the full check for a LAN this device has left.
+const ROUTE_CHECK_HEAD_START: Duration = Duration::from_millis(500);
+
+/// `RouteCheck`: whether a route's descriptor answered as this environment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RouteCheck {
+    Answered,
+    Silent,
+    Unchecked,
+}
+
+/// A route check that may still be running.
+enum Check {
+    Done(RouteCheck),
+    Running(tokio::task::JoinHandle<RouteCheck>),
+}
+
+/// The first transient and the first blocking failure, as `connectOverRoutes` keeps them.
+#[derive(Default)]
+struct Failures {
+    transient: Option<ConnectError>,
+    blocked: Option<ConnectError>,
+}
+
+impl Failures {
+    /// An unsupported server ends the attempt, since every route reaches the same server.
+    fn record(&mut self, error: ConnectError) -> Result<(), ConnectError> {
+        if error.0.reason == environments::Reason::Unsupported {
+            return Err(error);
+        }
+        let slot = if error.0.reason.blocks() { &mut self.blocked } else { &mut self.transient };
+        slot.get_or_insert(error);
+        Ok(())
+    }
+
+    fn into_error(self, label: &str) -> ConnectError {
+        self.transient.or(self.blocked).unwrap_or_else(|| Box::new((Failure::no_route_answered(label), None)))
+    }
+}
+
+/// `connectOverRoutes`: checks every route at once, then tries them in order, passing over one
+/// that did not answer within the head start; those go last, late answers before silent ones.
+/// The first connection wins. Runs on the tokio runtime.
+async fn connect_over_routes<T, C, A>(
+    label: &str,
+    count: usize,
+    check: impl Fn(usize) -> C,
+    mut attempt: impl FnMut(usize) -> A,
+) -> Result<T, ConnectError>
+where
+    C: Future<Output = RouteCheck> + Send + 'static,
+    A: Future<Output = Result<T, ConnectError>>,
+{
+    let mut checks: Vec<Check> = if count > 1 {
+        (0..count).map(|index| Check::Running(tokio::spawn(check(index)))).collect()
+    } else {
+        Vec::new()
     };
+    let head_start = tokio::time::Instant::now() + ROUTE_CHECK_HEAD_START;
+    let mut failures = Failures::default();
+    let mut silent = Vec::new();
+    for index in 0..count {
+        let checked = match checks.get_mut(index) {
+            None => RouteCheck::Unchecked,
+            Some(Check::Done(result)) => *result,
+            Some(Check::Running(handle)) => match tokio::time::timeout_at(head_start, &mut *handle).await {
+                Ok(result) => {
+                    let result = result.unwrap_or(RouteCheck::Silent);
+                    checks[index] = Check::Done(result);
+                    result
+                }
+                Err(_) => RouteCheck::Silent,
+            },
+        };
+        if checked == RouteCheck::Silent {
+            silent.push(index);
+            continue;
+        }
+        match attempt(index).await {
+            Ok(connected) => return Ok(connected),
+            Err(error) => failures.record(error)?,
+        }
+    }
+    // A slow route that answered after the head start goes before one still silent.
+    let mut late = Vec::with_capacity(silent.len());
+    for index in silent {
+        let result = match std::mem::replace(&mut checks[index], Check::Done(RouteCheck::Silent)) {
+            Check::Running(handle) => handle.await.unwrap_or(RouteCheck::Silent),
+            Check::Done(result) => result,
+        };
+        late.push((index, result));
+    }
+    late.sort_by_key(|(_, result)| *result == RouteCheck::Silent);
+    for (index, _) in late {
+        match attempt(index).await {
+            Ok(connected) => return Ok(connected),
+            Err(error) => failures.record(error)?,
+        }
+    }
+    Err(failures.into_error(label))
+}
+
+/// `checkRoute`: whether a direct route's public descriptor answers as `environment_id`. It
+/// sends no credential, so an address on another network learns nothing.
+async fn check_route(environment_id: String, route: Route) -> RouteCheck {
+    let Some(http_base) = route.http_base() else { return RouteCheck::Unchecked };
+    match tokio::time::timeout(ROUTE_CHECK_TIMEOUT, environments::fetch_descriptor(http_base)).await {
+        Ok(Ok(descriptor)) if descriptor.environment_id == environment_id => RouteCheck::Answered,
+        _ => RouteCheck::Silent,
+    }
+}
+
+/// One attempt over every route of `environment`. Runs on the tokio runtime.
+async fn connect(environment: SavedEnvironment) -> Result<Connected, ConnectError> {
+    let SavedEnvironment { environment_id, label, routes, .. } = environment;
+    let check = |index: usize| check_route(environment_id.clone(), routes[index].clone());
+    let attempt = |index: usize| connect_route(environment_id.clone(), routes[index].clone());
+    connect_over_routes(&label, routes.len(), check, attempt).await
+}
+
+/// One route: its descriptor (identity and protocol), then the socket.
+async fn connect_route(environment_id: String, route: Route) -> Result<Connected, ConnectError> {
+    let route_id = route.id(&environment_id);
+    let (http_base, token, refreshed) = match &route.address {
+        Address::Direct(http_base) => match &route.credential {
+            Credential::Token(token) => (http_base.clone(), token.clone(), None),
+            credential => return Err(Box::new((Failure::credential_missing(&route_id, credential), None))),
+        },
+        Address::Ssh(target) => {
+            let (http_base, token, refreshed) = prepare_ssh(&environment_id, target, &route.credential).await?;
+            (http_base, token, refreshed)
+        }
+    };
+    let endpoint = Endpoint::bearer(&http_base, token);
     let descriptor =
         environments::fetch_descriptor(&endpoint.http_base).await.map_err(|failure| Box::new((failure, None)))?;
-    if descriptor.environment_id != environment.environment_id {
-        let failure = Failure::environment_mismatch(&environment.environment_id, &descriptor.environment_id);
+    if descriptor.environment_id != environment_id {
+        let failure = Failure::environment_mismatch(&environment_id, &descriptor.environment_id);
         return Err(Box::new((failure, Some(descriptor))));
     }
     if let Some(failure) = descriptor.compatibility_error() {
@@ -575,12 +839,51 @@ async fn connect(environment: SavedEnvironment) -> Result<(RpcClient, environmen
     }
     let options = ConnectOptions { ws_url: endpoint.ws_url(), bearer_token: endpoint.bearer_token.clone() };
     match RpcClient::connect(runtime().handle(), options).await {
-        Ok(client) => Ok((client, descriptor)),
+        Ok(client) => Ok(Connected { client, descriptor, route_id, endpoint, refreshed }),
         Err(error) if rpc::is_unauthorized(&error) => {
             Err(Box::new((Failure::http(401, &endpoint.ws_url()), Some(descriptor))))
         }
         Err(error) => Err(Box::new((Failure::transport(format!("{error:#}")), Some(descriptor)))),
     }
+}
+
+/// `prepareDesktopSshEnvironment`: starts or reuses the server over SSH and forwards to it. The
+/// saved token is reused while the host still grants it every standard scope; otherwise this
+/// pairs again, so a reconnect adds no session on the host. Returns the forward's address,
+/// the token, and a new token to keep.
+async fn prepare_ssh(
+    environment_id: &str,
+    target: &SshTarget,
+    credential: &Credential,
+) -> Result<(String, String, Option<Credential>), ConnectError> {
+    let ssh_failure = |error: crate::ssh::SshError| Box::new((Failure::ssh(&error.message), None));
+    if let Credential::Token(token) = credential {
+        let bootstrap = crate::ssh::ensure(target, false).await.map_err(ssh_failure)?;
+        // Identity first, before the saved token is sent anywhere.
+        let descriptor =
+            environments::fetch_descriptor(&bootstrap.http_base).await.map_err(|failure| Box::new((failure, None)))?;
+        if descriptor.environment_id != environment_id {
+            let failure = Failure::configuration(environments::different_machine(&descriptor.label, "host"));
+            return Err(Box::new((failure, Some(descriptor))));
+        }
+        let granted = match environments::session_grants(&bootstrap.http_base, token).await {
+            Ok((authenticated, scopes)) => {
+                authenticated
+                    && crate::app::pages::settings::connections::logic::STANDARD_SCOPES
+                        .iter()
+                        .all(|scope| scopes.iter().any(|granted| granted == scope))
+            }
+            Err(failure) if failure.reason == environments::Reason::Authentication => false,
+            Err(failure) => return Err(Box::new((failure, Some(descriptor)))),
+        };
+        if granted {
+            return Ok((bootstrap.http_base, token.clone(), None));
+        }
+    }
+    let provisioned =
+        environments::provision_ssh(target, Some(environment_id)).await.map_err(|failure| Box::new((failure, None)))?;
+    let token = provisioned.token;
+    Ok((provisioned.http_base, token.clone(), Some(Credential::Token(token))))
 }
 
 /// Writes the catalog; the error is the message to show. Blocks on the file and the keyring.
@@ -599,10 +902,13 @@ mod tests {
         SavedEnvironment {
             environment_id: id.into(),
             label: id.into(),
-            http_base: format!("https://{id}"),
             enabled,
-            credential: Credential::Token(format!("token-{id}")),
+            routes: vec![Route::direct(format!("https://{id}"), Credential::Token(format!("token-{id}")))],
         }
+    }
+
+    fn ssh_route(alias: &str) -> Route {
+        Route { address: Address::Ssh(SshTarget::alias(alias)), credential: Credential::Token("ssh".into()) }
     }
 
     fn catalog(environments: &[SavedEnvironment]) -> Catalog {
@@ -789,12 +1095,109 @@ mod tests {
         assert_eq!(changed_connections(None, &before), [("a".into(), true), ("b".into(), true), ("c".into(), true)]);
 
         let renamed = SavedEnvironment { label: "Renamed".into(), ..a.clone() };
-        let repaired = SavedEnvironment { credential: Credential::Token("new".into()), ..environment("b", true) };
+        let mut repaired = environment("b", true);
+        repaired.routes[0].credential = Credential::Token("new".into());
         let after = catalog(&[renamed, repaired, environment("c", true), environment("d", true)]);
         assert_eq!(
             changed_connections(Some(&before), &after),
             [("b".into(), true), ("c".into(), true), ("d".into(), true)]
         );
         assert_eq!(changed_connections(Some(&before), &catalog(&[a])), [("b".into(), false), ("c".into(), false)]);
+    }
+
+    #[test]
+    fn route_order_and_ssh_tokens_do_not_reconnect_but_new_routes_do() {
+        let mut a = environment("a", true);
+        a.routes.push(ssh_route("box"));
+        let before = catalog(&[a.clone()]);
+
+        let mut reordered = a.clone();
+        reordered.routes.reverse();
+        assert!(changed_connections(Some(&before), &catalog(&[reordered])).is_empty());
+        let mut renewed = a.clone();
+        renewed.routes[1].credential = Credential::Token("renewed".into());
+        assert!(changed_connections(Some(&before), &catalog(&[renewed])).is_empty());
+
+        let mut added = a.clone();
+        added.routes.push(Route::direct("https://lan".into(), Credential::Missing));
+        assert_eq!(changed_connections(Some(&before), &catalog(&[added])), [("a".into(), true)]);
+
+        // Dropping the SSH route, or the whole environment, stops its server; a direct one has none.
+        let mut direct_only = a.clone();
+        direct_only.routes.truncate(1);
+        assert_eq!(dropped_ssh_targets(Some(&before), &catalog(&[direct_only])), [SshTarget::alias("box")]);
+        assert_eq!(dropped_ssh_targets(Some(&before), &catalog(&[])), [SshTarget::alias("box")]);
+        assert!(dropped_ssh_targets(Some(&before), &before).is_empty());
+        assert!(dropped_ssh_targets(None, &before).is_empty());
+    }
+
+    /// Runs [`connect_over_routes`] over routes whose checks answer as `checks` say (after the
+    /// given delay in ms, `None` silent once the check times out) and whose attempts end as
+    /// `attempts` say; returns the result and the routes attempted, in order.
+    async fn over_routes(
+        checks: Vec<(Option<u64>, RouteCheck)>,
+        attempts: Vec<Result<(), environments::Reason>>,
+    ) -> (Result<usize, environments::Reason>, Vec<usize>) {
+        let tried = std::cell::RefCell::new(Vec::new());
+        let count = attempts.len();
+        let check = |index: usize| {
+            let (delay, result) = checks[index];
+            async move {
+                match delay {
+                    Some(ms) => {
+                        tokio::time::sleep(Duration::from_millis(ms)).await;
+                        result
+                    }
+                    None => {
+                        tokio::time::sleep(ROUTE_CHECK_TIMEOUT).await;
+                        RouteCheck::Silent
+                    }
+                }
+            }
+        };
+        let attempt = |index: usize| {
+            tried.borrow_mut().push(index);
+            let outcome = attempts[index];
+            async move {
+                outcome.map(|()| index).map_err(|reason| {
+                    let mut failure = Failure::transport("x");
+                    failure.reason = reason;
+                    Box::new((failure, None))
+                })
+            }
+        };
+        let result = connect_over_routes("Box", count, check, attempt).await.map_err(|error| error.0.reason);
+        (result, tried.into_inner())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn routes_connect_in_order_passing_over_ones_that_do_not_answer() {
+        use environments::Reason;
+        let answered = (Some(10), RouteCheck::Answered);
+        // The first answering route wins; a silent one ahead of it is tried last.
+        let (result, tried) = over_routes(vec![(None, RouteCheck::Silent), answered], vec![Ok(()), Ok(())]).await;
+        assert_eq!((result, tried), (Ok(1), vec![1]));
+        // A route that answered after the head start goes before one that never did.
+        let late = (Some(1_000), RouteCheck::Answered);
+        let checks = vec![(None, RouteCheck::Silent), late, answered];
+        let (result, tried) = over_routes(checks, vec![Ok(()), Ok(()), Err(Reason::Network)]).await;
+        assert_eq!((result, tried), (Ok(1), vec![2, 1]));
+        // A single route is not checked first.
+        let (result, tried) = over_routes(vec![(None, RouteCheck::Silent)], vec![Ok(())]).await;
+        assert_eq!((result, tried), (Ok(0), vec![0]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_routes_report_the_first_transient_failure_and_unsupported_ends_at_once() {
+        use environments::Reason;
+        let answered = (Some(10), RouteCheck::Answered);
+        let failing = vec![Err(Reason::Authentication), Err(Reason::Network), Err(Reason::Timeout)];
+        let (result, tried) = over_routes(vec![answered; 3], failing).await;
+        assert_eq!((result, tried), (Err(Reason::Network), vec![0, 1, 2]));
+        let (result, _) = over_routes(vec![answered; 2], vec![Err(Reason::Authentication); 2]).await;
+        assert_eq!(result, Err(Reason::Authentication));
+        let (result, tried) = over_routes(vec![answered; 2], vec![Err(Reason::Unsupported), Ok(())]).await;
+        assert_eq!((result, tried), (Err(Reason::Unsupported), vec![0]));
+        assert_eq!(over_routes(Vec::new(), Vec::new()).await.0, Err(Reason::EndpointUnavailable));
     }
 }
