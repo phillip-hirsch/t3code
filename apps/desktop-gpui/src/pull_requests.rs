@@ -19,7 +19,7 @@ pub const PAGE_SIZE: u32 = 99;
 pub const MAX_PAGE_SIZE: u32 = 500;
 const MATCHED_ELSEWHERE_SCORE: u32 = 10;
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Actor {
     pub login: String,
@@ -1045,6 +1045,17 @@ pub fn host_actions<'a>(providers: &'a [ProviderSummary], entry: &Entry) -> Vec<
         Some(actions) => actions.iter().map(String::as_str).collect(),
         None if entry.provider == "github" => vec!["close", "merge", "ready", "reopen"],
         None => Vec::new(),
+    }
+}
+
+/// The quick actions among a host kind's `changeRequestActions`, for a change request known only
+/// by its URL (`sourceControlClients.findByChangeRequestUrl`); an unknown host offers none.
+pub fn kind_actions(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "github" | "gitlab" | "azure-devops" | "gitcafe" => &["merge", "ready", "close", "reopen"],
+        "forgejo" => &["merge", "close", "reopen"],
+        "bitbucket" => &["merge", "close"],
+        _ => &[],
     }
 }
 

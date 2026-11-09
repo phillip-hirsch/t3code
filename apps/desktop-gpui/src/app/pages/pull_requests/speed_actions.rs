@@ -58,11 +58,13 @@ struct Sweep {
 }
 
 /// One row's quick actions as the list draws them.
-pub(super) struct RowSpeed {
+pub(in crate::app::pages) struct RowSpeed {
     actions: Rc<[&'static str]>,
     shown: bool,
     busy: bool,
     writable: bool,
+    /// Dragging from Close sweeps across rows; only the Pull requests page's list does.
+    sweeps: bool,
 }
 
 fn label(action: &str) -> &'static str {
@@ -90,7 +92,9 @@ impl Workspace {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        if self.page != Some(super::super::Page::PullRequests) && !self.pull_requests.speed.shift {
+        let listed = self.page == Some(super::super::Page::PullRequests)
+            || matches!(self.active_surface(), Some(crate::app::right_panel::Surface::PullRequests));
+        if !listed && !self.pull_requests.speed.shift {
             return;
         }
         let m = &event.modifiers;
@@ -123,6 +127,24 @@ impl Workspace {
             shown: !actions.is_empty() && (speed.shift || busy || focused_inside),
             busy,
             writable: self.env_grant(&entry.environment_id, SOURCE_CONTROL_WRITE) == Some(true),
+            sweeps: true,
+        }
+    }
+
+    /// The quick actions a thread's linked row draws (`ThreadPullRequestsPanel`'s `actionEntry`),
+    /// which share the page's running actions by row key.
+    pub(in crate::app::pages) fn linked_row_speed(&self, entry: &Entry) -> RowSpeed {
+        let actions: Rc<[&'static str]> =
+            logic::quick_actions(entry, logic::kind_actions(&entry.provider)).into_iter().collect();
+        let speed = &self.pull_requests.speed;
+        let key = entry.key();
+        let busy = speed.acting.contains_key(&key) || speed.closing.contains(&key);
+        RowSpeed {
+            shown: !actions.is_empty() && (speed.shift || busy),
+            actions,
+            busy,
+            writable: self.env_grant(&entry.environment_id, SOURCE_CONTROL_WRITE) == Some(true),
+            sweeps: false,
         }
     }
 
@@ -415,8 +437,15 @@ impl Workspace {
     }
 }
 
+impl RowSpeed {
+    /// The group is drawn; a linked row's menu gives way to it.
+    pub(in crate::app::pages) fn shown(&self) -> bool {
+        self.shown
+    }
+}
+
 /// `SpeedModeGroup`: the row's quick actions, shown while Shift is held or one is running.
-pub(super) fn speed_group(
+pub(in crate::app::pages) fn speed_group(
     entry: &Rc<Entry>,
     speed: &RowSpeed,
     view: &Entity<Workspace>,
@@ -432,7 +461,7 @@ pub(super) fn speed_group(
         let stacked = action == "merge" && entry.stack.is_some();
         let tooltip = if stacked {
             format!("Open this {term} to merge its stack")
-        } else if action == "close" {
+        } else if action == "close" && speed.sweeps {
             "Close immediately, or drag across rows to close several".to_owned()
         } else {
             format!("{} immediately", label(action))
@@ -457,13 +486,14 @@ pub(super) fn speed_group(
             .child(label(action));
         let pressed = entry.clone();
         let swept = key.clone();
+        let sweeps = speed.sweeps;
         button
             // The row under it must not open on this press.
             .on_mouse_down(
                 MouseButton::Left,
                 window.listener_for(view, move |this, event: &gpui_kit::MouseDownEvent, _, cx| {
                     cx.stop_propagation();
-                    if action == "close" {
+                    if action == "close" && sweeps {
                         this.start_close_sweep(swept.clone(), event.position, cx);
                     }
                 }),
@@ -471,7 +501,7 @@ pub(super) fn speed_group(
             .on_click(window.listener_for(view, move |this, event: &gpui_kit::ClickEvent, window, cx| {
                 cx.stop_propagation();
                 // A pointer's Close is the end of its press, which the sweep reads.
-                if action != "close" || event.is_keyboard() {
+                if action != "close" || !sweeps || event.is_keyboard() {
                     this.run_quick_action(&pressed, action, window, cx);
                 }
             }))

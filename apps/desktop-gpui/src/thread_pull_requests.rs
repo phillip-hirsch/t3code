@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use serde::Deserialize;
 
 use crate::pull_request_detail::Reference;
+use crate::pull_requests::{Actor, Entry, StackMembership, State};
 
 /// `ThreadLinkedPullRequest`: the thread's own change request, or its branch's.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -19,6 +20,8 @@ pub struct LinkedPullRequest {
     pub url: String,
 }
 
+/// `ThreadPullRequestSnapshot`: the host's state of a link at its last sync. Fields older
+/// servers leave out read as unknown, so a link is never dropped for them.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
@@ -32,6 +35,30 @@ pub struct Snapshot {
     pub is_draft: bool,
     #[serde(default)]
     pub updated_at: Option<String>,
+    #[serde(default)]
+    pub synced_at: Option<String>,
+    #[serde(default)]
+    pub author: Option<Actor>,
+    #[serde(default)]
+    pub additions: u64,
+    #[serde(default)]
+    pub deletions: u64,
+    /// `approved`, `changes-requested` or `review-required`.
+    #[serde(default)]
+    pub review_decision: Option<String>,
+    /// `passing`, `failing` or `pending`.
+    #[serde(default)]
+    pub checks_state: Option<String>,
+    /// `mergeable`, `conflicting` or `unknown`.
+    #[serde(default)]
+    pub mergeability: Option<String>,
+}
+
+impl Snapshot {
+    /// `resolvePullRequestConflict`: an open, ready change request that conflicts with its base.
+    pub fn conflicts(&self) -> bool {
+        self.state == "open" && !self.is_draft && self.mergeability.as_deref() == Some("conflicting")
+    }
 }
 
 /// `ThreadPullRequestLink`.
@@ -48,6 +75,10 @@ pub struct PullRequestLink {
     pub snapshot: Option<Snapshot>,
     #[serde(default)]
     pub stack: Option<LinkStack>,
+    /// `ThreadPullRequestWatch`: present while the agent wakes on the change request's checks,
+    /// comments and conflicts. Only its presence is read.
+    #[serde(default)]
+    pub watch: Option<serde::de::IgnoredAny>,
 }
 
 /// `ThreadPullRequestStack`: the host's native stack the link belongs to.
@@ -55,6 +86,9 @@ pub struct PullRequestLink {
 #[serde(rename_all = "camelCase")]
 pub struct LinkStack {
     pub id: String,
+    /// The stack's own change request number.
+    #[serde(default)]
+    pub number: u64,
     #[serde(default)]
     pub layers: Vec<StackLayer>,
 }
@@ -77,6 +111,57 @@ impl PullRequestLink {
         let at = self.snapshot.as_ref().and_then(|s| s.updated_at.as_deref()).unwrap_or(&self.linked_at);
         crate::timestamp::parse_ms(at).unwrap_or(0)
     }
+
+    /// `actionEntry`: what Shift's quick actions act on, a synced and unmerged link read on
+    /// `environment_id` in `project_id`.
+    pub fn action_entry(&self, environment_id: &str, project_id: &str) -> Option<Entry> {
+        let snapshot = self.snapshot.as_ref().filter(|s| s.state != "merged")?;
+        let state = match snapshot.state.as_str() {
+            "open" => State::Open,
+            "closed" => State::Closed,
+            _ => State::Unknown,
+        };
+        let provider = crate::pull_request_detail::parse_change_request(&self.url).map_or("", |l| l.provider);
+        let stack = self.stack.as_ref().map(|stack| StackMembership {
+            number: stack.number,
+            position: stack.layers.iter().position(|l| l.number == self.number).map_or(0, |i| i as u64 + 1),
+            size: stack.layers.len() as u64,
+        });
+        let updated_at = snapshot.updated_at.clone().unwrap_or_default();
+        Some(Entry {
+            stack,
+            environment_id: environment_id.to_owned(),
+            provider: provider.to_owned(),
+            host: self.host.clone(),
+            project_id: project_id.to_owned(),
+            repository: self.repository.clone(),
+            number: self.number,
+            title: snapshot.title.clone(),
+            url: self.url.clone(),
+            author: snapshot.author.clone(),
+            head_branch: snapshot.head_branch.clone(),
+            base_branch: snapshot.base_branch.clone(),
+            state,
+            is_draft: snapshot.is_draft,
+            mergeability: snapshot.mergeability.clone().unwrap_or_else(|| "unknown".to_owned()),
+            additions: snapshot.additions,
+            deletions: snapshot.deletions,
+            created_at: self.linked_at.clone(),
+            updated_ms: crate::timestamp::parse_ms(&updated_at),
+            updated_at,
+            viewer_review_requested: false,
+            labels: Vec::new(),
+            review_decision: snapshot.review_decision.clone(),
+            checks_state: snapshot.checks_state.clone(),
+            observed_at: None,
+            created_ms: crate::timestamp::parse_ms(&self.linked_at),
+        })
+    }
+}
+
+/// `latestSyncedAt`: when the newest of the links last synced with its host.
+pub fn latest_synced_ms(links: &[PullRequestLink]) -> Option<i64> {
+    visible(links).filter_map(|l| crate::timestamp::parse_ms(l.snapshot.as_ref()?.synced_at.as_deref()?)).max()
 }
 
 /// `visibleThreadPullRequests`: a dismissed stack member is hidden.
@@ -521,6 +606,66 @@ mod tests {
         assert!(matches!(resolved("42", Some(&unknown)), Some(Err(e)) if e.contains("no known pull request URL")));
         assert_eq!(resolved("abc", Some(&identity)), None);
         assert_eq!(resolved("#0", Some(&identity)), None);
+    }
+
+    #[test]
+    fn a_link_decodes_its_full_snapshot_and_watch_and_older_servers_still_decode() {
+        let full: PullRequestLink = serde_json::from_value(json!({
+            "host": "gitlab.com", "repository": "g/p", "number": 7, "url": "https://gitlab.com/g/p/-/merge_requests/7",
+            "source": "agent", "linkedAt": "2026-01-01T00:00:00Z",
+            "snapshot": {"state": "open", "title": "T", "headBranch": "feat", "baseBranch": "main", "isDraft": false,
+                "updatedAt": "2026-01-02T00:00:00Z", "syncedAt": "2026-01-03T00:00:00Z",
+                "author": {"login": "ada", "name": "Ada", "avatarUrl": "https://x/a.png"},
+                "additions": 12, "deletions": 3, "changedFiles": 2, "reviewDecision": "approved",
+                "checksState": "failing", "mergeability": "conflicting", "closedAt": null},
+            "stack": {"kind": "native", "id": "s", "number": 9, "url": "https://gitlab.com/s", "base": "main",
+                "layers": [{"number": 6, "headBranch": "a", "state": "open"}, {"number": 7, "headBranch": "feat", "state": "open"}]},
+            "watch": {"startedAt": "2026-01-01T00:00:00Z", "headSha": null, "failedChecks": [], "passed": false,
+                "remarksThrough": "2026-01-01T00:00:00Z", "remarkIds": [], "conflicting": false, "wakes": 0},
+        }))
+        .unwrap();
+        let snapshot = full.snapshot.as_ref().unwrap();
+        assert_eq!(snapshot.author.as_ref().map(|a| a.login.as_str()), Some("ada"));
+        assert_eq!((snapshot.additions, snapshot.deletions), (12, 3));
+        assert_eq!(snapshot.review_decision.as_deref(), Some("approved"));
+        assert_eq!(snapshot.checks_state.as_deref(), Some("failing"));
+        assert!(snapshot.conflicts(), "an open, ready change request that conflicts");
+        assert!(full.watch.is_some());
+        assert_eq!(latest_synced_ms(std::slice::from_ref(&full)), crate::timestamp::parse_ms("2026-01-03T00:00:00Z"));
+
+        let entry = full.action_entry("e", "p").unwrap();
+        assert_eq!(
+            (entry.environment_id.as_str(), entry.project_id.as_str(), entry.provider.as_str()),
+            ("e", "p", "gitlab")
+        );
+        assert_eq!(entry.stack.as_ref().map(|s| (s.number, s.position, s.size)), Some((9, 2, 2)));
+        let actions = crate::pull_requests::kind_actions(&entry.provider);
+        assert_eq!(crate::pull_requests::quick_actions(&entry, actions), vec!["close", "merge"]);
+
+        // A server that predates these fields, and a link not watched.
+        let old = link(1, "manual", "open", "2026-01-01T00:00:00Z");
+        let snapshot = old.snapshot.as_ref().unwrap();
+        assert!(old.watch.is_none() && snapshot.author.is_none() && !snapshot.conflicts());
+        assert_eq!((snapshot.additions, snapshot.mergeability.as_deref()), (0, None));
+        let mut merged = old.clone();
+        merged.snapshot.as_mut().unwrap().state = "merged".into();
+        assert!(merged.action_entry("e", "p").is_none(), "a merged link has no quick actions");
+        let unsynced = PullRequestLink { snapshot: None, ..old };
+        assert!(unsynced.action_entry("e", "p").is_none(), "nor one waiting for its host");
+    }
+
+    #[test]
+    fn a_hosts_kind_offers_its_own_quick_actions() {
+        let draft = |url: &str| {
+            let mut link = link(1, "manual", "open", "2026-01-01T00:00:00Z");
+            link.url = url.into();
+            link.snapshot.as_mut().unwrap().is_draft = true;
+            let entry = link.action_entry("e", "p").unwrap();
+            crate::pull_requests::quick_actions(&entry, crate::pull_requests::kind_actions(&entry.provider))
+        };
+        assert_eq!(draft("https://github.com/o/r/pull/1"), vec!["close", "ready"]);
+        assert_eq!(draft("https://codeberg.org/o/r/pulls/1"), vec!["close"], "Forgejo cannot mark ready");
+        assert!(draft("https://example.com/o/r/1").is_empty(), "an unknown host offers none");
     }
 
     fn chained(

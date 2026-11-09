@@ -1586,7 +1586,7 @@ impl Workspace {
             (Some(Surface::File(path)), _) => self.render_files_surface(Some(path.clone()), width, window, cx),
             (Some(Surface::SideChat(thread_id)), _) => self.render_side_chat_surface(thread_id, width, window, cx),
             (Some(Surface::PullRequest(reference)), _) => self.render_pull_request_surface(reference, window, cx),
-            (Some(Surface::PullRequests), _) => self.render_linked_pull_requests(cx),
+            (Some(Surface::PullRequests), _) => self.render_linked_pull_requests(window, cx),
             (Some(Surface::Terminal(id)), _) => self.render_terminal_surface(&id.clone(), window, cx),
             _ => self.render_launcher(&tokens, cx),
         };

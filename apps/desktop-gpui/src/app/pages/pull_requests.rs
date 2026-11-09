@@ -5,7 +5,7 @@
 
 pub(super) mod facets;
 mod row_popovers;
-mod speed_actions;
+pub(super) mod speed_actions;
 use facets::FacetKind;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -171,6 +171,8 @@ pub(in crate::app) struct PullRequestsState {
         Option<(Entity<gpui_kit::component::menu::PopupMenu>, gpui_kit::Point<gpui_kit::Pixels>, Subscription)>,
     /// Shift's quick actions on rows and the close sweep.
     speed: speed_actions::SpeedActions,
+    /// Each linked pull request row's focus in the thread's Linked pull requests surface, by its key.
+    pub(super) linked_focus: std::collections::HashMap<String, FocusHandle>,
 }
 
 impl PullRequestsState {
@@ -233,6 +235,7 @@ impl PullRequestsState {
             tab_menu: None,
             tab_focus: std::collections::HashMap::new(),
             speed: speed_actions::SpeedActions::default(),
+            linked_focus: std::collections::HashMap::new(),
         }
     }
 
@@ -1624,7 +1627,7 @@ fn state_glyph(state: logic::State, is_draft: bool, t: &Tokens) -> (Lucide, Hsla
     }
 }
 
-fn checks_glyph(state: &str, t: &Tokens) -> Option<(Lucide, Hsla, &'static str)> {
+pub(super) fn checks_glyph(state: &str, t: &Tokens) -> Option<(Lucide, Hsla, &'static str)> {
     Some(match state {
         "passing" => (Lucide::CircleCheck, tone(t, 0x009966, 0x5ee9b5, 0.9), "All checks have passed"),
         "failing" => (Lucide::CircleX, t.error, "Some checks were not successful"),
@@ -1633,7 +1636,7 @@ fn checks_glyph(state: &str, t: &Tokens) -> Option<(Lucide, Hsla, &'static str)>
     })
 }
 
-fn review_glyph(decision: &str, t: &Tokens) -> Option<(Lucide, Hsla, &'static str)> {
+pub(super) fn review_glyph(decision: &str, t: &Tokens) -> Option<(Lucide, Hsla, &'static str)> {
     Some(match decision {
         "approved" => (Lucide::UserCheck, tone(t, 0x009966, 0x5ee9b5, 0.9), "Approved"),
         "changes-requested" => (Lucide::UserRoundX, tone(t, 0xe17100, 0xffb900, 0.8), "Changes requested"),
@@ -1642,7 +1645,13 @@ fn review_glyph(decision: &str, t: &Tokens) -> Option<(Lucide, Hsla, &'static st
     })
 }
 
-fn glyph(id: String, icon: Lucide, size: f32, color: Hsla, label: impl Into<SharedString>) -> impl IntoElement {
+pub(super) fn glyph(
+    id: String,
+    icon: Lucide,
+    size: f32,
+    color: Hsla,
+    label: impl Into<SharedString>,
+) -> impl IntoElement {
     let label: SharedString = label.into();
     div()
         .id(ElementId::Name(id.into()))
