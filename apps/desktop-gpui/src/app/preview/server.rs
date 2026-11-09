@@ -5,6 +5,7 @@
 
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,13 +13,15 @@ use std::time::Duration;
 use futures::{SinkExt as _, StreamExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
+
 use gpui_kit::component::{Disableable as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Bounds, ClickEvent, Context, Entity, FocusHandle, InteractiveElement as _,
-    IntoElement, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ObjectFit, ParentElement as _, Pixels, Point, RenderImage, ScrollDelta, ScrollEvent, SharedString,
-    Styled as _, StyledImage as _, Task, Window, canvas, div, img, px,
+    AnyElement, App, AppContext as _, Bounds, ClickEvent, Context, ElementInputHandler, Entity, EntityInputHandler,
+    FocusHandle, InteractiveElement as _, IntoElement, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement as _, Pixels, Point, RenderImage,
+    ScrollDelta, ScrollEvent, SharedString, Styled as _, StyledImage as _, Task, UTF16Selection, Window, canvas, div,
+    img, px, size,
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -95,6 +98,129 @@ fn control_label(control: Option<&Control>) -> &'static str {
     }
 }
 
+/// The page's text-input bridge (the web's hidden textarea): an IME composition stays here
+/// until it commits, then reaches the page as one `text` input.
+#[derive(Debug, Default)]
+struct Composition {
+    marked: String,
+}
+
+impl Composition {
+    fn mark(&mut self, text: &str) {
+        text.clone_into(&mut self.marked);
+    }
+
+    /// Committed text replaces the composition; the page types it unless it is empty.
+    fn commit(&mut self, text: &str) -> Option<String> {
+        self.marked.clear();
+        (!text.is_empty()).then(|| text.to_owned())
+    }
+
+    /// The platform ended the composition without a commit (a click, focus moving): what it
+    /// showed is kept, as a browser's `compositionend` keeps it.
+    fn unmark(&mut self) -> Option<String> {
+        let text = std::mem::take(&mut self.marked);
+        (!text.is_empty()).then_some(text)
+    }
+
+    fn marked_range(&self) -> Option<Range<usize>> {
+        (!self.marked.is_empty()).then(|| 0..self.marked.encode_utf16().count())
+    }
+}
+
+/// Typed and composed text for the page, while this viewer drives it. Keys the key listener
+/// forwards never reach it: a handled key down sends no text on any platform.
+pub(super) struct PageInput {
+    outgoing: mpsc::UnboundedSender<String>,
+    /// Connected, operable and controlled by this viewer, as `ServerStream::send` requires.
+    live: bool,
+    composition: Composition,
+}
+
+impl PageInput {
+    fn set_live(&mut self, live: bool) {
+        self.live = live;
+        if !live {
+            self.composition = Composition::default();
+        }
+    }
+
+    fn type_text(&self, text: Option<String>) {
+        if let Some(text) = text.filter(|_| self.live) {
+            let _ = self.outgoing.send(json!({"type": "text", "text": text}).to_string());
+        }
+    }
+}
+
+impl EntityInputHandler for PageInput {
+    fn text_for_range(
+        &mut self,
+        _: Range<usize>,
+        _: &mut Option<Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<String> {
+        None
+    }
+
+    fn selected_text_range(&mut self, _: bool, _: &mut Window, _: &mut Context<Self>) -> Option<UTF16Selection> {
+        let end = self.composition.marked_range().map_or(0, |range| range.end);
+        Some(UTF16Selection { range: end..end, reversed: false })
+    }
+
+    fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
+        self.composition.marked_range()
+    }
+
+    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
+        let text = self.composition.unmark();
+        self.type_text(text);
+    }
+
+    fn replace_text_in_range(&mut self, _: Option<Range<usize>>, text: &str, _: &mut Window, _: &mut Context<Self>) {
+        let text = self.composition.commit(text);
+        self.type_text(text);
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _: Option<Range<usize>>,
+        text: &str,
+        _: Option<Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+        if self.live {
+            self.composition.mark(text);
+        }
+    }
+
+    /// The frame's top-left corner, where the web pins its textarea, so the IME window opens there.
+    fn bounds_for_range(
+        &mut self,
+        _: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        Some(Bounds::new(element_bounds.origin, size(px(1.), px(16.))))
+    }
+
+    fn character_index_for_point(&mut self, _: Point<Pixels>, _: &mut Window, _: &mut Context<Self>) -> Option<usize> {
+        None
+    }
+
+    fn accepts_text_input(&self, _: &mut Window, _: &mut Context<Self>) -> bool {
+        self.live
+    }
+}
+
+/// Shift+Escape takes the keyboard back from the page (`aria-description` on the web's textarea).
+fn leaves_page(keystroke: &Keystroke) -> bool {
+    let m = &keystroke.modifiers;
+    keystroke.key == "escape" && m.shift && !(m.control || m.alt || m.platform || m.function)
+}
+
 /// What the stream's socket last told the view.
 enum Incoming {
     Connected(bool),
@@ -146,12 +272,22 @@ pub(super) struct ServerStream {
     sent_size: Option<(u32, u32)>,
     buttons: u8,
     focus: FocusHandle,
+    input: Entity<PageInput>,
     /// A `prompt` dialog's response.
     prompt: Entity<InputState>,
     _task: Task<()>,
 }
 
 impl ServerStream {
+    fn mine(&self) -> bool {
+        self.control.as_ref().is_some_and(Control::mine)
+    }
+
+    /// Whether `send` would carry this viewer's input.
+    fn live(&self) -> bool {
+        self.connected && self.control.as_ref().is_some_and(|control| control.can_operate && control.mine())
+    }
+
     /// `PreviewStreamClient.send`: only the controller sends, except the claim itself.
     fn send(&self, input: Value) -> bool {
         let Some(control) = self.control.as_ref().filter(|c| self.connected && c.can_operate) else { return false };
@@ -248,6 +384,7 @@ impl Workspace {
                     for event in batch {
                         this.on_server_stream(&tab, event, window, cx);
                     }
+                    this.sync_page_input(&tab, window, cx);
                     cx.notify();
                 });
                 if alive.is_err() {
@@ -255,6 +392,8 @@ impl Workspace {
                 }
             }
         });
+        let input =
+            cx.new(|_| PageInput { outgoing: outgoing.clone(), live: false, composition: Composition::default() });
         let stream = ServerStream {
             frame: None,
             frame_size: (0, 0),
@@ -269,6 +408,7 @@ impl Workspace {
             sent_size: None,
             buttons: 0,
             focus: cx.focus_handle(),
+            input,
             prompt: cx.new(|cx| InputState::new(window, cx)),
             _task: task,
         };
@@ -394,6 +534,26 @@ impl Workspace {
         self.preview.server.streams.get(tab).is_some_and(|stream| stream.send(input))
     }
 
+    /// Keeps the text bridge in step with control; a viewer that loses control loses the
+    /// page's keyboard too, as the web blurs its textarea (`clearInput`).
+    fn sync_page_input(&mut self, tab: &TabRef, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(stream) = self.preview.server.streams.get(tab) else { return };
+        let live = stream.live();
+        stream.input.update(cx, |input, _| input.set_live(live));
+        if !live && stream.focus.is_focused(window) {
+            self.leave_server_page(tab, window, cx);
+        }
+    }
+
+    /// Moves focus off the page to the area that shows it: the panel, or the chat under the
+    /// mini player.
+    fn leave_server_page(&self, tab: &TabRef, window: &mut Window, cx: &mut App) {
+        let in_panel = self.preview_thread().as_ref() == Some(&tab.thread)
+            && self.active_surface() == Some(&Surface::Browser(tab.tab_id.clone()));
+        let area = if in_panel { &self.areas.panel } else { &self.focus };
+        area.focus(window, cx);
+    }
+
     /// The agent tab's page: its latest frame with the control bar above it, or below it
     /// (`controlPosition="bottom"`) in the mini player.
     pub(super) fn render_server_page(
@@ -455,7 +615,7 @@ impl Workspace {
             }));
         // The native view would cover GPUI's dialog and stop overlays.
         let overlay = self.render_server_overlay(key, tokens, cx);
-        let pdf = if overlay.is_none() { self.server_pdf_view(key, window, cx) } else { None };
+        let pdf = if overlay.is_empty() { self.server_pdf_view(key, window, cx) } else { None };
         let stream = &self.preview.server.streams[key];
         let fit = page_fit(stream.bounds.get(), stream.frame_size, stream.viewport);
         let cursor = stream
@@ -476,6 +636,8 @@ impl Workspace {
             });
         let frame = stream.frame.clone().map(|frame| img(frame).size_full().object_fit(ObjectFit::Contain));
         let bounds_cell = stream.bounds.clone();
+        // The web disables its textarea over a PDF.
+        let text_input = pdf.is_none().then(|| (stream.focus.clone(), stream.input.clone()));
         let tab = key.clone();
         let (down_tab, up_tab, move_tab, wheel_tab, key_tab, key_up_tab) =
             (tab.clone(), tab.clone(), tab.clone(), tab.clone(), tab.clone(), tab.clone());
@@ -486,7 +648,18 @@ impl Workspace {
             .min_h_0()
             .overflow_hidden()
             .track_focus(&stream.focus)
-            .child(canvas(move |bounds, _, _| bounds_cell.set(bounds), |_, (), _, _| {}).absolute().size_full())
+            .child(
+                canvas(
+                    move |bounds, _, _| bounds_cell.set(bounds),
+                    move |bounds, (), window, cx| {
+                        if let Some((focus, input)) = text_input {
+                            window.handle_input(&focus, ElementInputHandler::new(bounds, input), cx);
+                        }
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
             .children(frame)
             .children(pdf.flatten().map(|view| div().absolute().inset_0().child(view)))
             .children(cursor)
@@ -535,9 +708,9 @@ impl Workspace {
         if bar_below { page.child(body).child(bar) } else { page.child(bar).child(body) }.into_any_element()
     }
 
-    /// The page's dialog, or the stop that ended the stream.
-    fn render_server_overlay(&self, key: &TabRef, tokens: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let stream = self.preview.server.streams.get(key)?;
+    /// The page's file picker and dialog (the dialog on top), or the stop that ended the stream.
+    fn render_server_overlay(&self, key: &TabRef, tokens: &Tokens, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let Some(stream) = self.preview.server.streams.get(key) else { return Vec::new() };
         let card = || {
             v_flex()
                 .absolute()
@@ -568,7 +741,7 @@ impl Workspace {
         let tab = key.clone();
         match &stream.stopped {
             Some(Stop::HostSetup { message, command }) => {
-                return Some(
+                return vec![
                     cover()
                         .child(div().max_w(px(384.)).text_sm().text_color(tokens.muted_foreground).child(*message))
                         .child(
@@ -591,10 +764,10 @@ impl Workspace {
                                 .on_click(cx.listener(move |this, _, _, cx| this.restart_server_stream(&tab, cx))),
                         )
                         .into_any_element(),
-                );
+                ];
             }
             Some(Stop::Refused) => {
-                return Some(
+                return vec![
                     cover()
                         .gap_2()
                         .child(
@@ -611,12 +784,12 @@ impl Workspace {
                                 .on_click(cx.listener(move |this, _, _, cx| this.restart_server_stream(&tab, cx))),
                         )
                         .into_any_element(),
-                );
+                ];
             }
             Some(Stop::Gone) | None => {}
         }
-        let control = stream.control.as_ref()?;
-        let dialog = control.dialog.as_ref()?;
+        let mut overlays = Vec::new();
+        let Some(dialog) = stream.control.as_ref().and_then(|control| control.dialog.as_ref()) else { return overlays };
         let is_prompt = dialog.kind == "prompt";
         let respond = |id: &'static str, label: &'static str, accept: bool, cx: &mut Context<Self>| {
             let (tab, prompt) = (tab.clone(), stream.prompt.clone());
@@ -630,11 +803,11 @@ impl Workspace {
                 this.send_server_input(&tab, input);
             }))
         };
-        Some(
+        overlays.push(
             card()
                 .child(div().text_sm().child(SharedString::from(dialog.message.clone())))
                 .map(|el| {
-                    if control.mine() {
+                    if stream.mine() {
                         el.when(is_prompt, |el| el.child(Input::new(&stream.prompt))).child(
                             h_flex()
                                 .justify_end()
@@ -647,7 +820,8 @@ impl Workspace {
                     }
                 })
                 .into_any_element(),
-        )
+        );
+        overlays
     }
 
     fn restart_server_stream(&mut self, tab: &TabRef, cx: &mut Context<Self>) {
@@ -733,12 +907,21 @@ impl Workspace {
         tab: &TabRef,
         action: &str,
         keystroke: &Keystroke,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(stream) = self.preview.server.streams.get(tab) else { return false };
         // Keys typed into the page's own overlays, such as a prompt's response, stay there.
-        if !stream.control.as_ref().is_some_and(Control::mine) || !stream.focus.is_focused(window) {
+        if !stream.focus.is_focused(window) {
+            return false;
+        }
+        if leaves_page(keystroke) {
+            if action == "down" {
+                self.leave_server_page(tab, window, cx);
+            }
+            return true;
+        }
+        if !stream.mine() {
             return false;
         }
         let m = &keystroke.modifiers;
@@ -1074,7 +1257,7 @@ fn decode_jpeg(bytes: &[u8]) -> Option<(Arc<RenderImage>, (u32, u32))> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui_kit::{point, size};
+    use gpui_kit::point;
 
     #[test]
     fn control_labels_follow_the_controller() {
@@ -1129,6 +1312,30 @@ mod tests {
         assert_eq!(key("space").text.as_deref(), Some(" "));
         assert!(dom_key(&Keystroke::parse("f13").ok().unwrap()).is_none());
         assert_eq!(modifier_bits(Modifiers { shift: true, control: true, ..Default::default() }), 10);
+    }
+
+    #[test]
+    fn compositions_reach_the_page_only_when_they_commit() {
+        let mut composition = Composition::default();
+        composition.mark("に");
+        assert_eq!(composition.marked_range(), Some(0..1));
+        composition.mark("日本");
+        assert_eq!(composition.commit("日本"), Some("日本".into()));
+        assert_eq!(composition.marked_range(), None);
+        composition.mark("ka");
+        assert_eq!(composition.commit(""), None, "a cancelled composition types nothing");
+        composition.mark("😀");
+        assert_eq!(composition.marked_range(), Some(0..2), "ranges count UTF-16 units");
+        assert_eq!(composition.unmark(), Some("😀".into()), "an ended composition keeps its text");
+        assert_eq!(composition.unmark(), None);
+    }
+
+    #[test]
+    fn shift_escape_alone_leaves_the_page() {
+        let leaves = |text: &'static str| leaves_page(&Keystroke::parse(text).ok().unwrap());
+        assert!(leaves("shift-escape"));
+        assert!(!leaves("escape"), "Escape reaches the page");
+        assert!(!leaves("ctrl-shift-escape"));
     }
 
     #[test]
