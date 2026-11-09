@@ -24,6 +24,8 @@ use crate::theme::Tokens;
 /// `useComposerPathSearch` waits this long after the last keystroke.
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
 const SEARCH_LIMIT: u32 = 80;
+/// `projects.searchEntries` takes at most this many UTF-16 units of query.
+const SEARCH_QUERY_MAX: usize = 256;
 /// `--chat-composer-drawer-inset` and the 17px the composer covers.
 const DRAWER_INSET: f32 = 22.;
 const OVERLAP: f32 = 17.;
@@ -187,7 +189,7 @@ impl Workspace {
         self.menu.loading = true;
         self.menu._search = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SEARCH_DEBOUNCE).await;
-            let input = json!({"cwd": cwd, "query": query, "limit": SEARCH_LIMIT});
+            let input = json!({"cwd": cwd, "query": bounded_query(&query), "limit": SEARCH_LIMIT});
             let result = client.request("projects.searchEntries", input).await;
             let _ = this.update(cx, |this, cx| {
                 // A newer query replaced this one.
@@ -450,6 +452,19 @@ fn menu_row(item: &MenuItem, kind: TriggerKind, active: bool, t: &Tokens) -> gpu
         }))
 }
 
+/// A long pasted path cut to the request's bound, never inside a surrogate pair.
+fn bounded_query(query: &str) -> &str {
+    let mut units = 0;
+    let end = query
+        .char_indices()
+        .find(|(_, c)| {
+            units += c.len_utf16();
+            units > SEARCH_QUERY_MAX
+        })
+        .map_or(query.len(), |(at, _)| at);
+    &query[..end]
+}
+
 /// `resolveProviderSkillSourceKind`: where a skill comes from, as its badge shows it.
 fn skill_badge(scope: Option<&str>, path: &str) -> ((Lucide, &'static str), Option<&'static str>) {
     let path = path.replace('\\', "/");
@@ -465,4 +480,20 @@ fn skill_badge(scope: Option<&str>, path: &str) -> ((Lucide, &'static str), Opti
         }
     };
     (kind, Some(" Skill"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bounded_query;
+
+    #[test]
+    fn path_queries_stop_at_256_utf16_units_without_splitting_a_pair() {
+        let a = |n: usize| "a".repeat(n);
+        assert_eq!(bounded_query("src"), "src");
+        assert_eq!(bounded_query(&a(256)), a(256));
+        let long = [a(86), "b".repeat(86), "c".repeat(86), "unique.ts".into()].join("/");
+        assert_eq!(bounded_query(&long), [a(86), "b".repeat(86), "c".repeat(82)].join("/"));
+        assert_eq!(bounded_query(&format!("{}😀/boundary.ts", a(255))), a(255));
+        assert_eq!(bounded_query(&format!("{}😀/boundary.ts", a(254))), format!("{}😀", a(254)));
+    }
 }
