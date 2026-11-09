@@ -60,6 +60,7 @@ pub mod main_window;
 mod markdown_images;
 mod markdown_ui;
 pub mod menu;
+mod mermaid;
 mod message_actions;
 mod minimap;
 mod model_picker;
@@ -340,6 +341,7 @@ pub struct Workspace {
     now: thread_now::NowUi,
     markdown_images: markdown_images::ImageCache,
     image_viewer: image_viewer::ViewerUi,
+    diagrams: mermaid::Diagrams,
     entry_kinds: Arc<markdown_ui::EntryKinds>,
     workflow: workflow::WorkflowUi,
     setup: worktree_setup::SetupWatch,
@@ -532,6 +534,7 @@ impl Workspace {
             now: Default::default(),
             markdown_images: Default::default(),
             image_viewer: Default::default(),
+            diagrams: Default::default(),
             entry_kinds: Default::default(),
             workflow: Default::default(),
             setup: Default::default(),

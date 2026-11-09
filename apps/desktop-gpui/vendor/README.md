@@ -256,6 +256,17 @@ with the image's URL. Linked images keep following their link. Files:
   `Paragraph::render`, and the image's URL on `InlineFlowItem::Image`.
 - `src/text/inline_flow.rs`: `InlineFlow::image_click_handler` and `image_element`.
 
+**Code blocks can draw as something else.** The web's chat draws a closed Mermaid fence as its
+diagram, with the source a toggle away. 0.9.0 always draws a fenced block as code. The patch adds
+`TextView::code_block_renderer`: the closure gets each `CodeBlock` and returns the element that
+replaces it, keeping the block's spacing, or `None` to draw the block as usual. Files:
+
+- `src/text/text_view.rs`: `CodeBlockRenderFn`, the `code_block_renderer` field and builder.
+- `src/text/state.rs`: the renderer, carried to each frame's `NodeContext`.
+- `src/text/node.rs`: `NodeContext::code_block_renderer`, asked first in `CodeBlock::render`.
+
+gpui-component's `src/text/compat.rs` forwards `code_block_renderer` from its `TextView`.
+
 The crate's own tests need `--features test-support` and `include_str!` a `README.md` four levels
 above `src/text`, which this folder lacks: run them from a scratch copy laid out as
 `<dir>/crates/gpui-base` with a `<dir>/README.md`.
@@ -373,3 +384,6 @@ headers are sticky. The patch, in `src/diff/state.rs` and `src/diff/mod.rs`:
 
 **Markdown images open on a click.** `src/text/compat.rs`: `TextView::on_image_click`, passing
 through to gpui-base's (see its "Markdown images open on a click").
+
+**Code blocks can draw as something else.** `src/text/compat.rs`: `TextView::code_block_renderer`,
+passing through to gpui-base's (see its "Code blocks can draw as something else").

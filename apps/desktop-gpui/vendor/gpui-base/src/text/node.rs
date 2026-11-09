@@ -2575,6 +2575,18 @@ impl CodeBlock {
         cx: &mut App,
     ) -> AnyElement {
         let style = &node_cx.style;
+        let gap = if options.is_last {
+            rems(0.)
+        } else {
+            style.paragraph_gap()
+        };
+        if let Some(element) = node_cx
+            .code_block_renderer
+            .as_ref()
+            .and_then(|render| render(self, window, cx))
+        {
+            return gapped(element, gap);
+        }
         let leaf_key = self.span.map(|span| TextLeafKey::block(span.start));
         // The language sits quietly in the top-right corner, where custom
         // actions go instead when the caller provides them; the top padding
@@ -2686,14 +2698,7 @@ impl CodeBlock {
             }
         };
 
-        gapped(
-            block,
-            if options.is_last {
-                rems(0.)
-            } else {
-                style.paragraph_gap()
-            },
-        )
+        gapped(block, gap)
     }
 }
 
@@ -2706,6 +2711,7 @@ pub(crate) struct NodeContext {
     pub(crate) link_refs: HashMap<SharedString, LinkMark>,
     pub(crate) style: Arc<TextViewStyle>,
     pub(crate) code_block_actions: Option<Arc<CodeBlockActionsFn>>,
+    pub(crate) code_block_renderer: Option<Arc<super::text_view::CodeBlockRenderFn>>,
     pub(crate) code_block_highlighter: Option<Arc<CodeBlockHighlighterFn>>,
     pub(crate) table_actions: Option<Arc<TableActionsFn>>,
     pub(crate) image_source: Option<Arc<super::text_view::ImageSourceFn>>,

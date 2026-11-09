@@ -1032,9 +1032,10 @@ impl Workspace {
                     return self.render_full_file(key, full, width, tokens, cx);
                 }
                 if logic::is_mermaid(&key.path) && render_mermaid {
-                    let revision = state.revision;
-                    let source = self.files.documents.stale(key, revision).then(|| state.saved.clone());
-                    return self.render_mermaid(key, revision, source, window, cx);
+                    let palette = self.diagrams.palette(tokens);
+                    let id = crate::app::mermaid::diagram_key(&state.saved, &palette, true);
+                    let source = self.diagrams.file_source(id).is_none().then(|| state.saved.clone());
+                    return self.render_mermaid(id, source, window, cx);
                 }
                 if let Some(delimiter) = delimiter {
                     let saved = &state.saved;

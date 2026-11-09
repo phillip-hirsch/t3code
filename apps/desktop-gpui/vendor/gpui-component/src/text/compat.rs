@@ -173,6 +173,14 @@ impl TextView {
         self.inner = self.inner.code_block_actions(f);
         self
     }
+    /// Draws chosen code blocks another way, or `None` to draw them as usual.
+    pub fn code_block_renderer<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&CodeBlock, &mut Window, &mut App) -> Option<AnyElement> + Send + Sync + 'static,
+    {
+        self.inner = self.inner.code_block_renderer(f);
+        self
+    }
     /// Renders an element in the corner of every table.
     pub fn table_actions<F, E>(mut self, f: F) -> Self
     where

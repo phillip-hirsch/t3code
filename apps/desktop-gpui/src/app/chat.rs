@@ -133,10 +133,11 @@ impl Workspace {
         if let Some(state) = self.markdown.0.get(&key).filter(|state| state.text == *text) {
             return state.view.clone();
         }
-        let source = self.with_skill_links(text);
+        let source: SharedString = self.with_skill_links(text).into();
         self.load_markdown_images(&key, &source, cx);
         if let Some(state) = self.markdown.0.get_mut(&key) {
             state.text = text.clone();
+            state.source = source.clone();
             state.view.update(cx, |view, cx| view.set_text(&source, cx));
             return state.view.clone();
         }
@@ -153,9 +154,8 @@ impl Workspace {
             }
             this.paint_find(&row_key, cx);
         });
-        self.markdown
-            .0
-            .insert(key.clone(), MarkdownState { view: view.clone(), text: text.clone(), nowrap: false, _changed });
+        let state = MarkdownState { view: view.clone(), text: text.clone(), source, nowrap: false, _changed };
+        self.markdown.0.insert(key.clone(), state);
         self.paint_find(&key, cx);
         view
     }
@@ -172,6 +172,13 @@ impl Workspace {
     /// The markdown view kept for `key` (a message's id), if it has rendered.
     pub(super) fn markdown_view(&self, key: &str) -> Option<Entity<TextViewState>> {
         self.markdown.0.get(key).map(|state| state.view.clone())
+    }
+
+    /// Re-lays out `key`'s markdown, whose row remeasures (see [`Self::markdown_state`]).
+    pub(super) fn relayout_markdown(&mut self, key: &str, cx: &mut Context<Self>) {
+        if let Some(state) = self.markdown.0.get(key) {
+            state.view.update(cx, |_, cx| cx.notify());
+        }
     }
 
     pub(super) fn markdown_keys(&self) -> Vec<SharedString> {
@@ -235,6 +242,8 @@ pub(super) struct MarkdownStates(HashMap<SharedString, MarkdownState>);
 struct MarkdownState {
     view: Entity<TextViewState>,
     text: SharedString,
+    /// The markdown the view parsed, which its source spans index.
+    source: SharedString,
     /// The code-block wrap toggle is off (`wordWrap` defaults on).
     nowrap: bool,
     _changed: Subscription,
@@ -294,10 +303,12 @@ fn markdown_with(
         let wrap = !workspace.markdown.0.get(&key).is_some_and(|state| state.nowrap);
         let math = workspace.client_settings.values.get("mathRenderingEnabled") == &serde_json::Value::Bool(true);
         let chips = (workspace.git_cwd(), workspace.entry_kinds.clone());
-        (workspace.markdown_state(key, text, cx), wrap, workspace.markdown_images.clone(), math, chips)
+        let state = workspace.markdown_state(key.clone(), text, cx);
+        let source = workspace.markdown.0.get(&key).map(|state| state.source.clone()).unwrap_or_default();
+        (state, source, wrap, workspace.markdown_images.clone(), math, chips)
     }) {
-        Ok((state, wrap, images, math, chips)) => {
-            markdown_view(&state, kind, key_for_view, wrap, width, this, chips, t)
+        Ok((state, source, wrap, images, math, chips)) => {
+            markdown_view(&state, &source, kind, key_for_view, wrap, width, this, chips, t)
                 .image_source(images.resolver())
                 .when(math, |view| view.plugin(super::markdown_ui::InlineMath).plugin(super::markdown_ui::DisplayMath))
                 .into_any_element()
@@ -1830,6 +1841,7 @@ fn folded_row(
 
 fn markdown_view(
     state: &Entity<TextViewState>,
+    source: &SharedString,
     kind: MarkdownKind,
     key: SharedString,
     wrap: bool,
@@ -1842,7 +1854,9 @@ fn markdown_view(
     let inline_code = inline_code_style(t);
     let t = *t;
     let (header_this, link_this, table_this, image_this) = (this.clone(), this.clone(), this.clone(), this.clone());
-    let (table_key, image_key) = (key.clone(), key.clone());
+    let (table_key, image_key, diagram_key) = (key.clone(), key.clone(), key.clone());
+    let (diagram_this, diagram_source) = (this.clone(), source.clone());
+    let header_source = source.clone();
     TextView::new(state)
         .style(markdown_style(&t, kind == MarkdownKind::User, wrap))
         .inline_code_style(inline_code)
@@ -1854,9 +1868,39 @@ fn markdown_view(
         .when(kind == MarkdownKind::User, TextView::markdown_line_breaks)
         .code_block_actions(move |block, _, cx| {
             let wrap_key = key.clone();
-            code_block_header(&header_this, &key, block, wrap, streaming, true, width, &t, cx, move |workspace, cx| {
-                workspace.toggle_code_wrap(&wrap_key, cx);
-            })
+            // A Mermaid fence counts as streaming only while it is still open.
+            let (streaming, toggle) = match mermaid_fence(block, &header_source, streaming) {
+                Some(MermaidFence { at, open: false }) => {
+                    let showing = header_this.upgrade().is_some_and(|w| w.read(cx).diagrams.shows_source(&key, at));
+                    (false, Some(super::mermaid::view_toggle(&header_this, &key, at, showing, &t)))
+                }
+                Some(MermaidFence { open: true, .. }) => (true, None),
+                None => (streaming, None),
+            };
+            code_block_header(
+                &header_this,
+                &key,
+                block,
+                wrap,
+                streaming,
+                true,
+                width,
+                toggle,
+                &t,
+                cx,
+                move |workspace, cx| {
+                    workspace.toggle_code_wrap(&wrap_key, cx);
+                },
+            )
+        })
+        // `MarkdownMermaidCodeBlock`: a closed Mermaid fence draws its diagram.
+        .code_block_renderer(move |block, window, cx| {
+            let fence = mermaid_fence(block, &diagram_source, streaming).filter(|fence| !fence.open)?;
+            let code = block.code();
+            if code.trim().is_empty() {
+                return None;
+            }
+            super::mermaid::chat_diagram(&diagram_this, &diagram_key, fence.at, code, &t, window, cx)
         })
         .table_actions(move |table, _, cx| super::markdown_ui::table_actions(table, &table_this, &table_key, &t, cx))
         .on_image_click(move |url, window, cx| {
@@ -1945,6 +1989,7 @@ pub(super) fn code_block_header(
     streaming: bool,
     run: bool,
     width: Option<f32>,
+    view_toggle: Option<AnyElement>,
     t: &Tokens,
     cx: &App,
     toggle_wrap: impl Fn(&mut Workspace, &mut Context<Workspace>) + 'static,
@@ -2022,8 +2067,31 @@ pub(super) fn code_block_header(
                 .text_color(label_color)
                 .children(block.lang().filter(|lang| !lang.is_empty())),
         )
-        .child(h_flex().gap(px(2.)).child(wrap_button).children(run).children((!streaming).then_some(copy)))
+        .child(
+            h_flex()
+                .gap(px(2.))
+                .child(wrap_button)
+                .children(run)
+                .children(view_toggle)
+                .children((!streaming).then_some(copy)),
+        )
         .into_any_element()
+}
+
+/// A Mermaid fence: its place in the message, and whether it is still streaming open.
+struct MermaidFence {
+    at: usize,
+    open: bool,
+}
+
+fn mermaid_fence(block: &gpui_kit::base::text::CodeBlock, source: &str, streaming: bool) -> Option<MermaidFence> {
+    if block.lang().as_deref() != Some("mermaid") {
+        return None;
+    }
+    let span = block.span.as_ref()?;
+    let open = streaming
+        && !source.get(span.start..span.end).is_some_and(|fence| super::mermaid::fence_closed(fence, &block.code()));
+    Some(MermaidFence { at: span.start, open })
 }
 
 /// `MarkdownCodeBlock`'s `canRun`: a shell block whose command reads the same in the terminal.

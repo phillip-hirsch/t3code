@@ -2556,6 +2556,7 @@ fn pr_markdown_view(state: &Entity<TextViewState>, t: &Tokens, view: Entity<Work
                 // No `onRunCommand`: a terminal here would open in the last active thread.
                 false,
                 None,
+                None,
                 &t,
                 cx,
                 move |this, cx| {
