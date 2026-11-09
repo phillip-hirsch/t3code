@@ -636,7 +636,16 @@ impl Workspace {
     }
 
     fn settings_results(&self, cx: &gpui_kit::App) -> Vec<&'static SearchItem> {
-        search::search(&self.settings_ui.search.read(cx).value(), search::shipped())
+        let mut results = search::search(&self.settings_ui.search.read(cx).value(), search::shipped());
+        results.retain(|item| self.setting_offered(item));
+        results
+    }
+
+    /// Whether the connected environments offer an item that depends on them
+    /// (`useAvailableSettingsSearchItems`); the rest follow the build (`search::available`).
+    pub(in crate::app) fn setting_offered(&self, item: &SearchItem) -> bool {
+        !item.fast_worktree_checkout_only
+            || self.sessions.iter().any(|s| s.is_connected() && s.server_info.capability("fastWorktreeCheckout"))
     }
 
     /// Opens the result's section and scrolls its row into view (`handleSearchResultClick`).

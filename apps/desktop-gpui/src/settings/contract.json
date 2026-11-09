@@ -14,6 +14,7 @@
       "logsAfterDays": null
     },
     "worktreesDirectory": "",
+    "fastWorktreeCheckout": false,
     "previousWorktreesDirectories": [],
     "responseStreamingMode": "paragraph",
     "enableProviderUpdateChecks": true,
@@ -517,6 +518,14 @@
       "searchTerms": [
         "beta alpha simlock callstack simulator emulator ios android pool lease gateway"
       ]
+    },
+    {
+      "id": "worktree-fast-checkout",
+      "title": "Fast worktree checkout",
+      "to": "labs",
+      "scope": "environment",
+      "fastWorktreeCheckoutOnly": true,
+      "searchTerms": ["beta fast worktree checkout clone apfs copy-on-write cache macos speed"]
     },
     {
       "id": "auto-settle-inactive-threads",

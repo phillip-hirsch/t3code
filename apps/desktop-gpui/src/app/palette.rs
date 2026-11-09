@@ -1353,7 +1353,8 @@ impl Workspace {
             .collect();
         let suggestions = nested_rows(&action_rows, submenus, &tokens);
         let project_rows = self.project_search_rows();
-        let settings = setting_rows();
+        let mut settings = setting_rows();
+        settings.retain(|row| !matches!(row.run, Run::Setting(item) if !self.setting_offered(item)));
         let linked = palette.linked.as_ref().filter(|linked| linked.query == query).map(LinkedSearch::rows);
         let rank = |typos: bool| {
             let actions = score_rows(action_rows.clone(), &tokens, typos);

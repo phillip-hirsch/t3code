@@ -140,6 +140,7 @@ impl Workspace {
         let t = *theme::tokens(cx);
         let workspace = cx.weak_entity();
         let described = |id: &'static str, parts: &'static [Part]| rich_text(id, parts, workspace.clone());
+        let fast_checkout = self.fast_worktree_checkout_offered(view);
         let mut row = |this: &mut Self, row: SettingRow| this.setting_row(view, row, window, cx);
         let multiline = view.bool("boringSidebarEnabled").then(|| {
             let nested = row(
@@ -161,7 +162,7 @@ impl Workspace {
         if let Some(multiline) = multiline {
             boring = boring.body(multiline);
         }
-        let beta = [
+        let mut beta = vec![
             row(self, boring),
             // The web hides the switch behind "Sign in" while signed out of T3 Connect; this client has
             // no T3 Connect sign-in, which the web treats as a build without it (`GuestLinksRow`).
@@ -187,7 +188,27 @@ impl Workspace {
                     .switch(),
             ),
         ];
+        if fast_checkout {
+            beta.push(row(
+                self,
+                SettingRow::new("worktree-fast-checkout")
+                    .description("On a Mac, clone new worktrees from a checkout cached in the T3 home folder instead of writing every file. Uses Git\u{2019}s normal checkout when it can\u{2019}t. Turning it off deletes the cache.")
+                    .setting("fastWorktreeCheckout")
+                    .switch(),
+            ));
+        }
         self.settings_page("labs", view, [settings_section("beta", "Beta", beta, &t)], cx)
+    }
+
+    /// `FastWorktreeCheckoutRow`: only macOS servers honor the setting, so it shows for an
+    /// environment scope whose connected machines all offer it.
+    fn fast_worktree_checkout_offered(&self, view: &SettingsView) -> bool {
+        let connected = view.connected_environment_ids();
+        !view.scope.is_project()
+            && !connected.is_empty()
+            && connected
+                .iter()
+                .all(|id| self.session(id).is_some_and(|s| s.server_info.capability("fastWorktreeCheckout")))
     }
 
     pub(super) fn render_settings_about(

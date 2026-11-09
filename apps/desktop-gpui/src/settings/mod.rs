@@ -52,6 +52,8 @@ pub struct SearchItem {
     pub wsl_available_only: bool,
     pub managed_tunnel_only: bool,
     pub peer_links_only: bool,
+    /// Offered only while some connected environment can clone worktrees from a cached checkout.
+    pub fast_worktree_checkout_only: bool,
 }
 
 pub fn contract() -> &'static Contract {
