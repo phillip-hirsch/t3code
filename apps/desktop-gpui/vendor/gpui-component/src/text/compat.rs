@@ -369,6 +369,10 @@ pub(super) fn resolve_component_style(
     legacy: TextViewStyle,
 ) -> gpui_base::TextViewStyle {
     let themed = super::base_text_view_style(theme);
+    let themed = match legacy.foreground {
+        Some(color) => themed.with_foreground(color),
+        None => themed,
+    };
 
     let refined = |mut base: gpui::StyleRefinement, overlay: &StyleRefinement| {
         base.refine(overlay);

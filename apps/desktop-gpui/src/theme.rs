@@ -66,6 +66,8 @@ pub struct Tokens {
     pub sidebar: SidebarTokens,
     /// `--glass-opacity`: the alpha of glass surfaces such as the composer.
     pub glass: f32,
+    /// `--appearance-contrast-boost` as a fraction: 0 up to 100% contrast, 1 at 200%.
+    pub contrast_boost: f32,
     pub fonts: Fonts,
     /// The window's side of the web's `sm` breakpoint, which sizes controls.
     pub breakpoint: Breakpoint,
@@ -187,6 +189,7 @@ impl Tokens {
                 icon: hex(0x8b8b8b),
             },
             glass: 0.8,
+            contrast_boost: 0.,
             fonts: Fonts::default(),
             breakpoint: Breakpoint::Sm,
         }
@@ -235,6 +238,7 @@ impl Tokens {
                 icon: hex(0x86858e),
             },
             glass: 0.8,
+            contrast_boost: 0.,
             fonts: Fonts::default(),
             breakpoint: Breakpoint::Sm,
         }
@@ -443,6 +447,11 @@ impl Tokens {
         colors.map_or(base, |colors| base.themed(&colors))
     }
 
+    /// Chat body text: `text-foreground/[calc(90%+var(--appearance-contrast-boost)/10)]`.
+    pub fn chat_text(&self) -> Hsla {
+        self.foreground.opacity(0.9 + self.contrast_boost / 10.)
+    }
+
     /// The `--contrast-*` tokens (`index.css`): below 100% text fades toward its surface and
     /// borders toward transparent; above it text moves toward black (light) or white
     /// (dark) and borders toward the text color.
@@ -468,6 +477,7 @@ impl Tokens {
             sidebar.row_active = with_alpha(sidebar.foreground, 0.11);
         }
         self.glass = appearance.glass / 100.;
+        self.contrast_boost = boost;
         self.fonts = appearance.fonts;
         self
     }
@@ -708,6 +718,8 @@ mod tests {
         assert_eq!(hex_of(default.foreground), hex_of(Tokens::dark().foreground), "100% changes nothing");
         assert_eq!(hex_of(default.border), hex_of(Tokens::dark().border));
         assert_eq!(default.glass, 0.64);
+        assert_eq!(default.chat_text().a, 0.9, "chat text sits at 90% of the foreground");
+        assert_eq!(at(200., true).chat_text().a, 1., "and reaches 100% at full contrast");
         // 50%: text halfway to its surface (oklab), borders at half alpha.
         let low = at(50., true);
         assert_eq!(hex_of(low.border).1, 0.04);

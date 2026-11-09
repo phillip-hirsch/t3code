@@ -789,21 +789,18 @@ pub(super) fn render_row(
             lane(16., v_flex().group("timeline-meta").child(meta)).into_any_element()
         }
         Row::Assistant { id, text, streaming, terminal, updated_at, status, fork, changes, .. } => {
-            let body = div()
-                .px(px(4.))
-                .py(px(2.))
-                .text_size(px(TEXT))
-                .line_height(px(LINE))
-                .text_color(alpha(t.foreground, 0.9))
-                .child(markdown_with(
-                    this,
-                    id.clone(),
-                    text,
-                    MarkdownKind::Assistant { streaming: *streaming },
-                    Some(lane_width - 8.),
-                    &t,
-                    cx,
-                ));
+            let body =
+                div().px(px(4.)).py(px(2.)).text_size(px(TEXT)).line_height(px(LINE)).text_color(t.chat_text()).child(
+                    markdown_with(
+                        this,
+                        id.clone(),
+                        text,
+                        MarkdownKind::Assistant { streaming: *streaming },
+                        Some(lane_width - 8.),
+                        &t,
+                        cx,
+                    ),
+                );
             // The finished reply's actions (`AssistantMessageMeta`) hold their space while hidden.
             let meta = terminal.then(|| {
                 message_actions::assistant_meta(this, id, text, *streaming, updated_at, status, fork.as_ref(), &t, cx)
@@ -2062,6 +2059,7 @@ pub(super) fn markdown_style(t: &Tokens, user: bool, wrap: bool) -> TextViewStyl
         code_block.overflow.x = Some(gpui_kit::Overflow::Scroll);
     }
     let mut style = TextViewStyle::default()
+        .foreground(t.chat_text())
         .paragraph_gap(rems(0.65))
         .heading_font_size(move |level, _| {
             px(match level {
@@ -2202,21 +2200,18 @@ fn plan_card(
         .text_xs()
         .font_weight(FontWeight::MEDIUM)
         .child("Plan");
-    let mut body = div()
-        .relative()
-        .mt(px(16.))
-        .text_size(px(TEXT))
-        .line_height(px(LINE))
-        .text_color(alpha(t.foreground, 0.9))
-        .child(markdown_with(
-            this,
-            body_key,
-            body_text,
-            MarkdownKind::Assistant { streaming: false },
-            Some(lane_width - 42.),
-            t,
-            cx,
-        ));
+    let mut body =
+        div().relative().mt(px(16.)).text_size(px(TEXT)).line_height(px(LINE)).text_color(t.chat_text()).child(
+            markdown_with(
+                this,
+                body_key,
+                body_text,
+                MarkdownKind::Assistant { streaming: false },
+                Some(lane_width - 42.),
+                t,
+                cx,
+            ),
+        );
     if collapsed {
         body = body.max_h(px(416.)).overflow_hidden().child(
             div().absolute().left_0().right_0().bottom_0().h(px(96.)).bg(linear_gradient(

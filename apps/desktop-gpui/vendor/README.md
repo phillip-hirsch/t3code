@@ -298,6 +298,11 @@ its `Size`, so `.text_base()` on the button never showed. `src/button/button.rs`
 **Text views pass task toggles through.** `src/text/compat.rs`: `TextView::on_task_toggle` forwards
 to gpui-base's (see its "Task-list checkboxes can be pressed").
 
+**A text view style can set the body color.** A `TextView` given a `TextViewStyle` stops following
+its container's text color (gpui-base only inherits it when no style is passed), so chat text drew at
+the full theme foreground where the web dims it to 90%. `src/text/style.rs` adds
+`TextViewStyle::foreground`, and `src/text/compat.rs` applies it over the themed foreground.
+
 **The tooltip looks like the web's.** 0.9.0's `Tooltip` wraps its popup in a 12px margin, the gap
 from the pointer; gpui-pre's window now sets the gap (see gpui-pre's "Tooltips sit 4px off their
 trigger"), so `src/tooltip.rs` drops the `m_3`. Its popup also takes `TooltipPopup`'s

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use gpui::{HighlightStyle, Pixels, Rems, StyleRefinement, px, rems};
+use gpui::{HighlightStyle, Hsla, Pixels, Rems, StyleRefinement, px, rems};
 
 use crate::highlighter::HighlightTheme;
 
@@ -56,6 +56,11 @@ pub struct TextViewStyle {
     pub inline_code: HighlightStyle,
     /// Whether content-specific rendering should use dark-mode assets.
     pub is_dark: bool,
+    /// Body text color. `None` keeps the theme foreground.
+    ///
+    /// A text view given a style no longer follows its container's text
+    /// color, so a caller that dims or tints body text sets it here.
+    pub foreground: Option<Hsla>,
 }
 
 impl Default for TextViewStyle {
@@ -71,6 +76,7 @@ impl Default for TextViewStyle {
             table_cell: StyleRefinement::default(),
             inline_code: HighlightStyle::default(),
             is_dark: false,
+            foreground: None,
         }
     }
 }
@@ -94,10 +100,17 @@ impl PartialEq for TextViewStyle {
             && self.table_cell == other.table_cell
             && self.inline_code == other.inline_code
             && self.is_dark == other.is_dark
+            && self.foreground == other.foreground
     }
 }
 
 impl TextViewStyle {
+    /// Set the body text color in place of the theme foreground.
+    pub fn foreground(mut self, color: Hsla) -> Self {
+        self.foreground = Some(color);
+        self
+    }
+
     /// Set paragraph gap, default is 0.75 rem.
     pub fn paragraph_gap(mut self, gap: Rems) -> Self {
         self.paragraph_gap = gap;
