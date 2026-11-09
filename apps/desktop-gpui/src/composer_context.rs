@@ -12,6 +12,33 @@ const MAX_RECORDS: usize = 200;
 /// `MAX_FRAGMENT_CHARS`, in UTF-16 units.
 const MAX_FRAGMENT_CHARS: usize = 16_000_000;
 
+/// `clampContextText`'s marker.
+const TRUNCATION_MARKER: &str = "\n… truncated …";
+
+/// `clampContextText`: `value` cut to `max` UTF-16 units, marker included, at a char boundary.
+pub fn clamp_text(value: &str, max: usize) -> String {
+    if value.encode_utf16().count() <= max {
+        return value.to_owned();
+    }
+    let budget = max.saturating_sub(TRUNCATION_MARKER.encode_utf16().count());
+    let mut units = 0;
+    let end = value.char_indices().find(|(_, c)| {
+        units += c.len_utf16();
+        units > budget
+    });
+    let mut clamped = value[..end.map_or(value.len(), |(at, _)| at)].to_owned();
+    clamped.push_str(TRUNCATION_MARKER);
+    clamped
+}
+
+/// `sanitizeComposerContextLabel`: one line of at most 200 chars, `kind` when nothing is left.
+pub fn sanitize_label(label: &str, kind: &str) -> String {
+    let spaced: String =
+        label.chars().map(|c| if matches!(c, '[' | ']' | '\\' | '\r' | '\n') { ' ' } else { c }).collect();
+    let label: String = spaced.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(200).collect();
+    if label.is_empty() { kind.to_owned() } else { label }
+}
+
 /// `CONTEXT_ID_PATTERN`: `^[a-z0-9_-]{1,128}$`, any case.
 fn valid_id(id: &str) -> bool {
     (1..=128).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
@@ -141,6 +168,17 @@ impl ContextRecords {
             Some(at) => self.0[at] = record,
             None => self.0.push(record),
         }
+    }
+
+    pub fn remove(&mut self, id: &str) -> Option<Value> {
+        let at = self.0.iter().position(|record| id_of(record) == Some(id))?;
+        Some(self.0.remove(at))
+    }
+
+    /// Replaces the record with `record`'s context id; `false` when none is held.
+    pub fn replace(&mut self, record: Value) -> bool {
+        let held = id_of(&record).and_then(|id| self.0.iter().position(|held| id_of(held) == Some(id)));
+        held.map(|at| self.0[at] = record).is_some()
     }
 
     pub fn extend(&mut self, records: impl IntoIterator<Item = Value>) {

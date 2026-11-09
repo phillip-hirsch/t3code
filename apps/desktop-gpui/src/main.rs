@@ -38,6 +38,7 @@ mod pull_requests;
 mod queue;
 mod quit_shortcut;
 mod requests;
+mod review_comment;
 mod rpc;
 mod search;
 mod secure_storage;

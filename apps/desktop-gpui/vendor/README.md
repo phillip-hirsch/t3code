@@ -364,3 +364,9 @@ headers are sticky. The patch, in `src/diff/state.rs` and `src/diff/mod.rs`:
 - `DiffState::sticky_header` and `render_diff`'s `diff-sticky-header` overlay: once the list
   scrolls past a file's header, that header draws pinned over the top of the body, pushed up by
   the next file's header as it arrives; a canvas records its height for the push.
+
+**A diff file lists its patch body.** The web's review comments name a selection by its rows in
+the patch (`reviewCommentContext.ts`) and quote those rows; 0.9.0 keeps a file's lines private.
+The patch, in `src/diff/document.rs`: `DiffFile::patch_body`, each line of the patch in order as a
+`DiffPatchLine` (its line on each side and its text), exported from `src/diff/mod.rs`. Test: an
+assertion in `alignment_covers_each_source_line_once`.

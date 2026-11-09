@@ -6,6 +6,7 @@
 
 mod commit_link;
 mod diff_base;
+mod diff_comments;
 mod diff_load;
 mod diff_open;
 mod diff_tree;
@@ -417,6 +418,8 @@ pub(super) struct RightPanel {
     pending_reveal: Option<((Target, DiffScope), SharedString)>,
     toolbar_focus: DiffToolbarFocus,
     tree_pane: diff_tree::TreePane,
+    /// The line comment being written (`AnnotatableCodeView`'s draft).
+    comment: Option<diff_comments::DiffComment>,
     _diff_events: Subscription,
 }
 
@@ -474,6 +477,7 @@ impl RightPanel {
             pending_reveal: None,
             toolbar_focus: DiffToolbarFocus::new(cx),
             tree_pane: diff_tree::TreePane::new(cx),
+            comment: None,
             _diff_events: diff_events,
         }
     }
@@ -2329,6 +2333,7 @@ impl Workspace {
                 .map_or_else(|| format!("Commit {}", &sha[..sha.len().min(7)]), |c| c.subject.clone())
                 .into(),
         };
+        let section = diff_comments::section(&scope, &turns, &scope_label);
         let view = cx.entity();
         let menu_scope = scope.clone();
         let menu_turns = turns;
@@ -2687,6 +2692,7 @@ impl Workspace {
                                 .flex_1()
                                 .min_h_0()
                                 .text_size(px(tokens.fonts.code_size));
+                            let diff = self.with_diff_comments(diff, section, tokens, cx);
                             match scheme {
                                 DiffColorScheme::RedGreen => diff.into_any_element(),
                                 DiffColorScheme::BlueOrange => DiffTint {

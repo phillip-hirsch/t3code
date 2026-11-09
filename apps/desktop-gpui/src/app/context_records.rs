@@ -64,6 +64,27 @@ fn message_records(held: &ContextRecords, text: &str) -> Vec<Value> {
     records
 }
 
+/// `removeInlineContextReference`'s cuts: each chip with the space after it, else the one before.
+fn chip_removals(text: &str, mut spans: Vec<std::ops::Range<usize>>) -> Vec<std::ops::Range<usize>> {
+    spans.sort_by_key(|span| span.start);
+    let mut cuts: Vec<std::ops::Range<usize>> = Vec::with_capacity(spans.len());
+    for span in spans {
+        let previous_end = cuts.last().map_or(0, |cut| cut.end);
+        if span.start < previous_end {
+            continue;
+        }
+        let cut = if text[span.end..].starts_with(' ') {
+            span.start..span.end + 1
+        } else if span.start > previous_end && text[..span.start].ends_with(' ') {
+            span.start - 1..span.end
+        } else {
+            span
+        };
+        cuts.push(cut);
+    }
+    cuts
+}
+
 /// Where a chip goes into a set-aside prompt: after its text, a space apart.
 fn append_chip(prompt: &mut String, link: &str) {
     if !prompt.is_empty() && !prompt.ends_with(char::is_whitespace) {
@@ -105,6 +126,73 @@ impl Workspace {
         }
         cx.notify();
         Some(link)
+    }
+
+    /// The records of `target`'s draft: the composer's on screen, else the set-aside prompt's.
+    pub(super) fn draft_records(&self, target: &Target) -> Option<&ContextRecords> {
+        if self.target.as_ref() == Some(target) {
+            return self.question.is_none().then_some(&self.context.records);
+        }
+        match self.composer_drafts.get(target)? {
+            ComposerDraft::Prompt(_, _, records) => Some(records),
+            ComposerDraft::Question(_) => None,
+        }
+    }
+
+    /// Replaces a record `target`'s draft holds (a comment whose lines moved), keeping its chip.
+    pub(super) fn replace_context_record(&mut self, target: &Target, record: Value, cx: &mut Context<Self>) {
+        let replaced = if self.target.as_ref() == Some(target) {
+            self.context.records.replace(record)
+        } else {
+            match self.composer_drafts.get_mut(target) {
+                Some(ComposerDraft::Prompt(_, _, records)) => records.replace(record),
+                _ => false,
+            }
+        };
+        if replaced {
+            cx.notify();
+        }
+    }
+
+    /// Removes a record from `target`'s draft with its chips (`removeReviewComment`). On screen
+    /// the edit is one undo step, which brings both back.
+    pub(super) fn remove_context_record(
+        &mut self,
+        target: &Target,
+        kind: &str,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let chip = Chip::Context { kind: kind.to_owned(), id: id.to_owned(), label: String::new() }.id();
+        if self.target.as_ref() == Some(target) {
+            let state = self.composer.read(cx);
+            let spans: Vec<_> = state
+                .tokens()
+                .iter()
+                .filter(|span| span.token().id().as_ref() == chip.as_str())
+                .map(gpui_kit::base::input::InlineTokenSpan::range)
+                .collect();
+            let removals = chip_removals(&state.value(), spans);
+            if let Some(first) = removals.first().map(|range| range.start) {
+                let edits: Vec<_> = removals.into_iter().map(|range| (range, String::new())).collect();
+                self.composer.update(cx, |state, cx| state.replace_ranges(&edits, first..first, window, cx));
+                self.sync_context_chips(cx);
+            }
+            self.context.records.remove(id);
+            self.sync_composer_empty(cx);
+        } else if let Some(ComposerDraft::Prompt(prompt, _, records)) = self.composer_drafts.get_mut(target) {
+            let spans = composer_text::chips(prompt, |_| false)
+                .into_iter()
+                .filter(|(_, found)| found.id() == chip)
+                .map(|(range, _)| range)
+                .collect();
+            for range in chip_removals(prompt, spans).into_iter().rev() {
+                prompt.replace_range(range, "");
+            }
+            records.remove(id);
+        }
+        cx.notify();
     }
 
     /// A chip at the caret, a space apart from the text around it.
@@ -444,6 +532,23 @@ mod tests {
             import_slot(&b, reference, (Some(&a), "", &mut on_screen), &mut drafts).is_none(),
             "a draft left with nothing"
         );
+    }
+
+    #[test]
+    fn a_removed_chip_takes_one_space_with_it() {
+        let link = composer_text::context_link("review-comment", "rc", "a.ts L3");
+        let text = format!("fix {link} and {link}");
+        let first = 4..4 + link.len();
+        let second = text.len() - link.len()..text.len();
+        let cuts = chip_removals(&text, vec![second.clone(), first.clone()]);
+        assert_eq!(cuts, [first.start..first.end + 1, second.start - 1..second.end]);
+        let mut left = text;
+        for cut in cuts.into_iter().rev() {
+            left.replace_range(cut, "");
+        }
+        assert_eq!(left, "fix and");
+        let whole = 0..link.len();
+        assert_eq!(chip_removals(&link, std::iter::once(whole.clone()).collect()).first(), Some(&whole));
     }
 
     #[test]

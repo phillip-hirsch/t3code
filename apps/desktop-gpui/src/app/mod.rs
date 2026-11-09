@@ -74,6 +74,7 @@ mod queue;
 mod quit;
 mod recovery;
 mod request_cards;
+mod review_comments;
 mod right_panel;
 mod send;
 mod sessions;

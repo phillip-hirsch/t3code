@@ -116,9 +116,8 @@ pub(super) struct Terminals {
     panel: HashMap<String, panel::PanelGroup>,
 }
 
-/// `COMPOSER_CONTEXT_TERMINAL_TEXT_MAX_CHARS` and `clampContextText`'s marker.
+/// `COMPOSER_CONTEXT_TERMINAL_TEXT_MAX_CHARS`.
 const CONTEXT_TEXT_MAX: usize = 64_000;
-const TRUNCATION_MARKER: &str = "\n… truncated …";
 
 /// `formatTerminalContextLabel`.
 fn context_label(terminal_label: &str, line_start: usize, line_end: usize) -> String {
@@ -131,17 +130,7 @@ fn context_label(terminal_label: &str, line_start: usize, line_end: usize) -> St
 
 /// `terminalContextRecord`: the text clamped to the server's limit in UTF-16 units.
 fn context_record(id: &str, terminal_id: &str, terminal_label: &str, selected: &session::Selected) -> Value {
-    let mut text = selected.text.clone();
-    if text.encode_utf16().count() > CONTEXT_TEXT_MAX {
-        let budget = CONTEXT_TEXT_MAX - TRUNCATION_MARKER.encode_utf16().count();
-        let mut units = 0;
-        let end = text.char_indices().find(|(_, c)| {
-            units += c.len_utf16();
-            units > budget
-        });
-        text.truncate(end.map_or(text.len(), |(i, _)| i));
-        text.push_str(TRUNCATION_MARKER);
-    }
+    let text = crate::composer_context::clamp_text(&selected.text, CONTEXT_TEXT_MAX);
     let label = context_label(terminal_label, selected.line_start, selected.line_end);
     json!({
         "version": 1,
@@ -1438,7 +1427,7 @@ mod tests {
         assert_eq!(record["label"], "Terminal 1 lines 2-9");
         let text = record["text"].as_str().unwrap();
         assert_eq!(text.encode_utf16().count(), CONTEXT_TEXT_MAX);
-        assert!(text.ends_with(TRUNCATION_MARKER));
+        assert!(text.ends_with("\n… truncated …"));
     }
 
     #[test]
