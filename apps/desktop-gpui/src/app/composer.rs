@@ -1998,14 +1998,8 @@ struct PullRequestContext {
 }
 
 impl PullRequestContext {
-    /// `resolvePullRequestState`: the glyph, the label, and the tone as light, dark and dark alpha.
     fn state(&self) -> (Lucide, &'static str, u32, u32, f32) {
-        match self.state.as_str() {
-            "merged" => (Lucide::GitMerge, "Merged", 0x7f22fe, 0xc4b4ff, 0.9),
-            "closed" => (Lucide::GitPullRequestClosed, "Closed", 0xe7000b, 0xffa2a2, 0.9),
-            _ if self.is_draft => (Lucide::GitPullRequestDraft, "Draft", 0x71717b, 0x9f9fa9, 0.8),
-            _ => (Lucide::GitPullRequestArrow, "Open", 0x009966, 0x5ee9b5, 0.9),
-        }
+        pull_request_state(&self.state, self.is_draft)
     }
 
     /// `capitalizeTerm(singular)` for the host the URL names (`findByChangeRequestUrl`).
@@ -2019,6 +2013,21 @@ impl PullRequestContext {
             "Change request"
         }
     }
+}
+
+/// `resolvePullRequestState`: the glyph, the label, and the tone as light, dark and dark alpha.
+pub(super) fn pull_request_state(state: &str, is_draft: bool) -> (Lucide, &'static str, u32, u32, f32) {
+    match state {
+        "merged" => (Lucide::GitMerge, "Merged", 0x7f22fe, 0xc4b4ff, 0.9),
+        "closed" => (Lucide::GitPullRequestClosed, "Closed", 0xe7000b, 0xffa2a2, 0.9),
+        _ if is_draft => (Lucide::GitPullRequestDraft, "Draft", 0x71717b, 0x9f9fa9, 0.8),
+        _ => (Lucide::GitPullRequestArrow, "Open", 0x009966, 0x5ee9b5, 0.9),
+    }
+}
+
+/// [`pull_request_state`]'s tone for the theme.
+pub(super) fn pull_request_tone(light: u32, dark: u32, alpha: f32, t: &Tokens) -> Hsla {
+    if t.dark { Hsla::from(rgb(dark)).opacity(alpha) } else { rgb(light).into() }
 }
 
 /// The review-comment records' change requests, by the context id their chips carry.
@@ -2044,7 +2053,7 @@ impl Workspace {
         let Some(Chip::Context { kind, id, .. }) = Chip::from_id(chip) else { return None };
         let pr = pull_requests.get(&id).filter(|_| kind == REVIEW_COMMENT)?;
         let (glyph, label, light, dark, alpha) = pr.state();
-        let tone: Hsla = if t.dark { Hsla::from(rgb(dark)).opacity(alpha) } else { rgb(light).into() };
+        let tone = pull_request_tone(light, dark, alpha, t);
         let branch = |name: &str| div().min_w_0().truncate().font_family(t.fonts.mono).child(name.to_owned());
         let details = v_flex()
             .max_w(px(320.))

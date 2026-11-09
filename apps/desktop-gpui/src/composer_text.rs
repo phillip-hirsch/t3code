@@ -11,6 +11,8 @@ pub enum TriggerKind {
     Path,
     Skill,
     SlashCommand,
+    /// `#123` or `#text`: a pull request of the project.
+    PullRequest,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,6 +44,13 @@ pub fn detect(text: &str, cursor: usize) -> Option<Trigger> {
             return None;
         }
         return trigger(TriggerKind::SlashCommand, query);
+    }
+    // `^#([\p{L}\p{N}][\p{L}\p{N}_-]*)?$`
+    if let Some(query) = token.strip_prefix('#') {
+        let mut chars = query.chars();
+        let valid = chars.next().is_none_or(char::is_alphanumeric)
+            && chars.all(|c| c.is_alphanumeric() || matches!(c, '_' | '-'));
+        return if valid { trigger(TriggerKind::PullRequest, query) } else { None };
     }
     if let Some(symbol) = token.chars().next().filter(|c| is_currency(*c)) {
         let query = &token[symbol.len_utf8()..];
@@ -469,6 +478,15 @@ mod tests {
         assert_eq!(kind("costs $5"), None);
         assert_eq!(kind("$10k."), None);
         assert_eq!(kind("$1e9"), None);
+        assert_eq!(kind("fixes #"), Some((PullRequest, String::new())));
+        assert_eq!(kind("#12"), Some((PullRequest, "12".into())));
+        assert_eq!(kind("#crash-fix_2"), Some((PullRequest, "crash-fix_2".into())));
+        assert_eq!(kind("#é"), Some((PullRequest, "é".into())));
+        assert_eq!(kind("## Heading"), None);
+        assert_eq!(kind("##"), None);
+        assert_eq!(kind("#-x"), None);
+        assert_eq!(kind("#a.b"), None);
+        assert_eq!(kind("C#"), None);
         let t = detect("a\n@x y", 4).unwrap();
         assert_eq!((t.range, t.query), (2..4, "x".into()));
     }
