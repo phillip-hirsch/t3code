@@ -148,11 +148,12 @@ impl Workspace {
         let input = cx.new(|cx| InputState::new(window, cx).masked(true).placeholder(placeholder));
         let id = card.item_id.clone();
         let card = card.clone();
-        let subscription = cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, _, cx| match event {
-            InputEvent::PressEnter { .. } => this.answer_secret(&card, true, cx),
-            InputEvent::Change => cx.notify(),
-            _ => {}
-        });
+        let subscription =
+            cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { .. } => this.answer_secret(&card, true, window, cx),
+                InputEvent::Change => cx.notify(),
+                _ => {}
+            });
         self.requests.secrets.insert(id, (input.clone(), subscription));
         input
     }
@@ -178,14 +179,15 @@ impl Workspace {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder(REFERENCE_PLACEHOLDER));
         let id = card.item_id.clone();
         let card = card.clone();
-        let subscription = cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, _, cx| match event {
-            InputEvent::PressEnter { .. } => this.answer_secret(&card, true, cx),
-            InputEvent::Change => {
-                this.requests.errors.remove(&card.item_id);
-                cx.notify();
-            }
-            _ => {}
-        });
+        let subscription =
+            cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { .. } => this.answer_secret(&card, true, window, cx),
+                InputEvent::Change => {
+                    this.requests.errors.remove(&card.item_id);
+                    cx.notify();
+                }
+                _ => {}
+            });
         self.requests.references.insert(id, (input.clone(), subscription));
         input
     }
@@ -199,8 +201,18 @@ impl Workspace {
         cx.notify();
     }
 
+    /// A timeline card's controls disable once it is answered, so focus goes on to the composer
+    /// (`workspaceFocus` recovering a finished conversation prompt). A side-chat card keeps its own.
+    fn leave_answered_card(&mut self, card: &RequestCard, window: &mut Window, cx: &mut Context<Self>) {
+        let in_timeline =
+            self.rows.iter().any(|row| matches!(row, timeline::Row::Request(shown) if shown.item_id == card.item_id));
+        if in_timeline {
+            self.focus_composer(window, cx);
+        }
+    }
+
     /// `secrets.answerRequest`: save the typed value, read it from a secret provider, or decline.
-    fn answer_secret(&mut self, card: &RequestCard, save: bool, cx: &mut Context<Self>) {
+    fn answer_secret(&mut self, card: &RequestCard, save: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(client) = self.client() else { return };
         let id = card.item_id.clone();
         if self.requests.busy.contains(&id) {
@@ -239,6 +251,7 @@ impl Workspace {
         let input = json!({"threadId": card.thread_id, "turnItemId": id, "answer": answer});
         self.requests.busy.insert(id.clone());
         self.requests.errors.remove(&id);
+        self.leave_answered_card(card, window, cx);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = client.request("secrets.answerRequest", input).await;
@@ -260,13 +273,14 @@ impl Workspace {
         .detach();
     }
 
-    fn decline_link(&mut self, card: &RequestCard, cx: &mut Context<Self>) {
+    fn decline_link(&mut self, card: &RequestCard, window: &mut Window, cx: &mut Context<Self>) {
         let Some(client) = self.client() else { return };
         let id = card.item_id.clone();
         if !self.requests.busy.insert(id.clone()) {
             return;
         }
         self.requests.errors.remove(&id);
+        self.leave_answered_card(card, window, cx);
         cx.notify();
         let input = json!({"threadId": card.thread_id, "turnItemId": id, "answer": {"type": "decline"}});
         cx.spawn(async move |this, cx| {
@@ -362,8 +376,8 @@ fn secret_card(
                 .children(picker)
                 .child(div().flex_1().min_w_0().child(Input::new(input).disabled(busy)))
                 .child(Button::new("secret-save").primary().label("Save securely").disabled(busy || empty).on_click(
-                    move |_, _, cx| {
-                        let _ = save_view.update(cx, |w, cx| w.answer_secret(&save_card, true, cx));
+                    move |_, window, cx| {
+                        let _ = save_view.update(cx, |w, cx| w.answer_secret(&save_card, true, window, cx));
                     },
                 )),
         )
@@ -389,8 +403,8 @@ fn secret_card(
                         .text_color(t.muted_foreground)
                         .label("Decline")
                         .disabled(busy)
-                        .on_click(move |_, _, cx| {
-                            let _ = decline_view.update(cx, |w, cx| w.answer_secret(&decline_card, false, cx));
+                        .on_click(move |_, window, cx| {
+                            let _ = decline_view.update(cx, |w, cx| w.answer_secret(&decline_card, false, window, cx));
                         }),
                 ),
         )
@@ -477,8 +491,8 @@ fn link_card(card: &Rc<RequestCard>, workspace: &Entity<Workspace>, t: &Tokens, 
                         .text_color(t.muted_foreground)
                         .label("Decline")
                         .disabled(busy)
-                        .on_click(move |_, _, cx| {
-                            let _ = view.update(cx, |w, cx| w.decline_link(&decline_card, cx));
+                        .on_click(move |_, window, cx| {
+                            let _ = view.update(cx, |w, cx| w.decline_link(&decline_card, window, cx));
                         }),
                 )
                 .child(
