@@ -81,8 +81,6 @@ struct HostedTab {
     /// apply until the tab is adjusted (`browserDefaultTabState`).
     defaults: (f64, Appearance),
     shown: bool,
-    /// The tab's own page events, which a load's failure probe reports on.
-    page_events: async_channel::Sender<PageEvent>,
     _events: Task<()>,
 }
 
@@ -763,9 +761,9 @@ impl Workspace {
                 }
                 let (sender, events) = async_channel::unbounded();
                 let mut context = partition.context();
-                let builder = page_builder(partition.builder(context.as_mut()), &url, sender.clone());
+                let builder = page_builder(partition.builder(context.as_mut()), &url, sender);
                 match build_view(builder, window, cx) {
-                    Ok(webview) => this.adopt_view(thread_id, tab_id, url, webview, (sender, events), window, cx),
+                    Ok(webview) => this.adopt_view(thread_id, tab_id, url, webview, events, window, cx),
                     Err(error) => {
                         this.error = Some(format!("Unable to start the browser: {error}").into());
                         cx.notify();
@@ -782,7 +780,7 @@ impl Workspace {
         tab_id: String,
         url: String,
         webview: WebView,
-        (page_events, events): (async_channel::Sender<PageEvent>, async_channel::Receiver<PageEvent>),
+        events: async_channel::Receiver<PageEvent>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -811,7 +809,6 @@ impl Workspace {
                 appearance: None,
                 defaults: self.browser_defaults(),
                 shown: false,
-                page_events,
                 _events: pump,
             },
         );
@@ -823,10 +820,9 @@ impl Workspace {
         let title = tab.status.title().unwrap_or_default().to_owned();
         match event {
             PageEvent::Started(url) => tab.status = NavStatus::Loading { url, title },
-            // A failure reported for this load stays; the error page's load is not a success.
+            // A failed load also finishes (WebView2, WebKitGTK); only a new load clears the failure.
             PageEvent::Finished(url) => {
-                if !matches!(&tab.status, NavStatus::LoadFailed { url: failed, .. } if *failed == url) {
-                    probe_failure(tab.view.read(cx).raw(), &url, &tab.page_events);
+                if !matches!(tab.status, NavStatus::LoadFailed { .. }) {
                     tab.status = NavStatus::Success { url, title };
                 }
             }
@@ -849,6 +845,8 @@ impl Workspace {
                 }
             }
             PageEvent::Failed { url, code, description } => {
+                // A first load that fails can leave WKWebView without the URL it tried.
+                let url = if url.is_empty() { tab.status.url().unwrap_or_default().to_owned() } else { url };
                 tab.status = NavStatus::LoadFailed { url, title, code, description, download: None };
             }
             PageEvent::OpenLink(url) => {
@@ -931,7 +929,11 @@ impl Workspace {
         if server {
             self.send_server_input(tab_id, json!({"type": "reload"}));
         } else if let Some(tab) = self.preview.tabs.get(tab_id) {
-            let _ = tab.view.read(cx).raw().reload();
+            // WebKit keeps no entry for a page that failed to load, so a reload would load the one before.
+            let _ = match &tab.status {
+                NavStatus::LoadFailed { url, .. } if !url.is_empty() => tab.view.read(cx).raw().load_url(url),
+                _ => tab.view.read(cx).raw().reload(),
+            };
         }
     }
 
@@ -1485,20 +1487,6 @@ fn clear_cookies(view: &wry::WebView) {
     }
 }
 
-/// wry reports a failed navigation as a finished one: asks the page whether it is WebView2's
-/// error page, and if so reports the load as failed with the error it names.
-fn probe_failure(view: &wry::WebView, url: &str, events: &async_channel::Sender<PageEvent>) {
-    let (url, events) = (url.to_owned(), events.clone());
-    let probed = view.evaluate_script_with_callback(preview::FAILURE_PROBE, move |result| {
-        if let Some((code, description)) = preview::failed_load(&result) {
-            let _ = events.try_send(PageEvent::Failed { url: url.clone(), code, description: description.into() });
-        }
-    });
-    if let Err(error) = probed {
-        log::warn!("could not check the page for a failed load: {error}");
-    }
-}
-
 /// Builds a native view in `window` (gpui-webview's safe constructor). Call it from inside a task's
 /// update, never from an event handler or `defer`: WebView2's constructor runs the window's message
 /// loop, and only while a task runs does GPUI post no other task to that loop, so no task re-enters
@@ -1532,6 +1520,16 @@ fn page_builder<'a>(
                     wry::PageLoadEvent::Started => PageEvent::Started(url),
                     wry::PageLoadEvent::Finished => PageEvent::Finished(url),
                 });
+            }
+        })
+        // Electron's `did-fail-load`, from each platform's own navigation failure callback.
+        .with_on_page_load_error_handler({
+            let sender = sender.clone();
+            move |error| {
+                if let Some((code, description)) = preview::net_error(&error) {
+                    let _ =
+                        sender.try_send(PageEvent::Failed { url: error.url, code, description: description.into() });
+                }
             }
         })
         .with_document_title_changed_handler({
