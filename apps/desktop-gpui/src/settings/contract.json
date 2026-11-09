@@ -69,6 +69,7 @@
     "hideTaggedThreads": false,
     "guestSharingEnabled": false,
     "linkedEnvironmentsEnabled": false,
+    "promptSuggestionsEnabled": false,
     "sidebarAutoSettleKeepPullRequests": false,
     "sidebarAutoSettleOnMerge": true,
     "backgroundActivity": {
@@ -510,6 +511,13 @@
       "to": "labs",
       "scope": "environment",
       "searchTerms": ["beta link another machine vps peer agents work there delegate"]
+    },
+    {
+      "id": "prompt-suggestions-beta",
+      "title": "Suggest next prompt",
+      "to": "labs",
+      "scope": "environment",
+      "searchTerms": ["beta tab autocomplete predict next message claude codex ghost text"]
     },
     {
       "id": "simlock-hosts",

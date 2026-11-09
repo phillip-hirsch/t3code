@@ -193,6 +193,13 @@ impl Workspace {
             ),
             row(
                 self,
+                SettingRow::new("prompt-suggestions-beta")
+                    .description("Show a predicted next message in the empty composer after a Claude or Codex turn. Tab uses it. Each is an extra cached request on your plan. Needs Codex 0.165+. Claude threads update on restart.")
+                    .setting("promptSuggestionsEnabled")
+                    .switch(),
+            ),
+            row(
+                self,
                 SettingRow::new("simlock-hosts")
                     .description(described("simlock-description", SIMLOCK))
                     .setting("simlockDeviceHostsEnabled")

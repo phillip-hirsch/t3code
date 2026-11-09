@@ -38,6 +38,7 @@ mod composer_fit;
 mod composer_menu;
 mod composer_meter;
 mod composer_plan;
+mod composer_suggestion;
 mod confirm;
 mod context_strip;
 mod desktop;
@@ -346,6 +347,7 @@ pub struct Workspace {
     subagents: subagents::SubagentUi,
     banners: banners::BannerUi,
     fresh_sessions: fresh_session::FreshSessions,
+    prompt_suggestions: composer_suggestion::PromptSuggestions,
     /// Window bounds persistence and other desktop shell state.
     desktop: desktop::DesktopShell,
     /// Running threads synced in the background.
@@ -537,6 +539,7 @@ impl Workspace {
             subagents: Default::default(),
             banners: Default::default(),
             fresh_sessions: Default::default(),
+            prompt_suggestions: Default::default(),
             desktop,
             keep_alive: Default::default(),
             saved_environments,
@@ -1212,6 +1215,7 @@ impl Render for Workspace {
         }
         self.follow_rows_surface(cx);
         self.sync_error_scope();
+        self.sync_prompt_suggestion(cx);
         self.sync_saved_connection_banner(cx);
         self.sync_sheet_focus(window, cx);
         self.sidebar.fit_window(window);

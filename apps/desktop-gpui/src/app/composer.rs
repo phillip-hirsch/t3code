@@ -391,7 +391,8 @@ impl Workspace {
                 && (self.code_key(keystroke, window, cx)
                     || self.list_outdent_key(keystroke, window, cx)
                     || self.plan_toggle_key(keystroke, window, cx)
-                    || self.menu_key(keystroke, window, cx)))
+                    || self.menu_key(keystroke, window, cx)
+                    || self.prompt_suggestion_key(keystroke, window, cx)))
     }
 
     /// Keys left after the keymap: 1-9 on a question card, prompt history, then a plain send.
@@ -829,7 +830,7 @@ impl Workspace {
         cx.notify();
     }
 
-    /// `ChatComposer.tsx` placeholder precedence.
+    /// `ChatComposer.tsx` placeholder precedence; an offered prompt suggestion replaces only the default.
     fn placeholder(&self, approval: Option<&RuntimeRequest>) -> &'static str {
         if let Some(approval) = approval {
             return if approval.supports_feedback() {
@@ -887,6 +888,7 @@ impl Workspace {
         let approvals = self.shown_approvals();
         let first_approval = approvals.first().map(|(request, _)| *request);
         let placeholder = self.placeholder(first_approval);
+        let suggestion = self.offered_prompt_suggestion(first_approval.is_some());
         let outline = if t.dark { white(0.05) } else { black(0.08) };
         let view = cx.weak_entity();
         let chip_view = view.clone();
@@ -1006,7 +1008,16 @@ impl Workspace {
                                             .text_size(px(t.fonts.prompt_size))
                                             .line_height(px(t.fonts.prompt_size * PROMPT_LEADING))
                                             .text_color(t.muted_foreground)
-                                            .child(placeholder),
+                                            .map(|el| match suggestion {
+                                                Some(text) => {
+                                                    el.child(super::composer_suggestion::suggested_placeholder(
+                                                        text,
+                                                        t.fonts.prompt_size * PROMPT_LEADING,
+                                                        &t,
+                                                    ))
+                                                }
+                                                None => el.child(placeholder),
+                                            }),
                                     )
                                 }),
                             ),
