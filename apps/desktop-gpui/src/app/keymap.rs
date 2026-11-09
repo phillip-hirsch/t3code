@@ -208,22 +208,77 @@ fn resolve_on<'a>(rules: &'a [Rule], keystroke: &Keystroke, context: &ShortcutCo
         .filter(|command| !(context.combobox_focus && *command == "thread.pin"))
 }
 
-/// `effectiveShortcutsForCommand(…)[0]`: the command's newest shortcut no later rule claims.
-fn effective_shortcut(rules: &[Rule], command: &str, context: &ShortcutContext, mac: bool) -> Option<Shortcut> {
-    let normalize =
-        |s: &Shortcut| (s.meta_key || (s.mod_key && mac), s.ctrl_key || (s.mod_key && !mac), s.shift_key, s.alt_key);
-    let mut claimed: Vec<std::borrow::Cow<'_, Shortcut>> = Vec::new();
-    for rule in rules.iter().rev().filter(|rule| context.admits(rule)) {
+/// `effectiveShortcutsForCommand`: the command's shortcuts no later rule claims, newest first.
+fn effective_shortcuts<'a>(
+    rules: &'a [Rule],
+    command: &'a str,
+    context: &'a ShortcutContext,
+    mac: bool,
+) -> impl Iterator<Item = Shortcut> + 'a {
+    let normalize = move |s: &Shortcut| {
+        (s.meta_key || (s.mod_key && mac), s.ctrl_key || (s.mod_key && !mac), s.shift_key, s.alt_key)
+    };
+    let mut claimed: Vec<std::borrow::Cow<'a, Shortcut>> = Vec::new();
+    rules.iter().rev().filter(|rule| context.admits(rule)).filter_map(move |rule| {
         let shortcut = shortcut_for_context(rule, context);
         if claimed.iter().any(|seen| seen.key == shortcut.key && normalize(seen) == normalize(&shortcut)) {
-            continue;
+            return None;
         }
-        if rule.command == command {
-            return Some(shortcut.into_owned());
-        }
+        let effective = (rule.command == command).then(|| shortcut.clone().into_owned());
         claimed.push(shortcut);
-    }
-    None
+        effective
+    })
+}
+
+/// `effectiveShortcutsForCommand(…)[0]`.
+fn effective_shortcut(rules: &[Rule], command: &str, context: &ShortcutContext, mac: bool) -> Option<Shortcut> {
+    effective_shortcuts(rules, command, context, mac).next()
+}
+
+/// `PREVIEW_FORWARDED_COMMANDS`: the shell commands a focused browser page hands back to the app
+/// (`ReopenClosedViewShortcut.tsx`). `view.reopenClosed` joins them once this client keeps a
+/// closed-view history.
+pub(super) const PAGE_FORWARDED_COMMANDS: [&str; 6] = [
+    "workspace.focusNext",
+    "workspace.focusPrevious",
+    "sidebar.toggle",
+    "rightPanel.toggle",
+    "rightPanel.toggleMaximized",
+    "preview.focusUrl",
+];
+
+/// `PreviewForwardedShortcut`, with `mod` resolved to the platform's modifier for the page.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub(super) struct PageChord {
+    pub command: &'static str,
+    pub key: String,
+    pub meta: bool,
+    pub ctrl: bool,
+    pub shift: bool,
+    pub alt: bool,
+}
+
+/// The chords a focused browser page forwards, resolved as the web registers them: the preview
+/// focused and open, the terminal as it is, nothing else focused.
+pub(super) fn page_chords(rules: &[Rule], terminal_open: bool) -> Vec<PageChord> {
+    page_chords_on(rules, terminal_open, MAC)
+}
+
+fn page_chords_on(rules: &[Rule], terminal_open: bool, mac: bool) -> Vec<PageChord> {
+    let context = &ShortcutContext { preview_focus: true, preview_open: true, terminal_open, ..Default::default() };
+    PAGE_FORWARDED_COMMANDS
+        .into_iter()
+        .flat_map(|command| {
+            effective_shortcuts(rules, command, context, mac).map(move |s| PageChord {
+                command,
+                meta: s.meta_key || (s.mod_key && mac),
+                ctrl: s.ctrl_key || (s.mod_key && !mac),
+                shift: s.shift_key,
+                alt: s.alt_key,
+                key: s.key,
+            })
+        })
+        .collect()
 }
 
 /// `formatShortcutKeyLabel`.
@@ -569,6 +624,44 @@ mod tests {
         let shortcut = compile("mod+shift+arrowup", "x", None).unwrap().shortcut;
         assert_eq!(format_label(&shortcut, true), "\u{21e7}\u{2318}Up");
         assert_eq!(format_label(&compile("esc", "x", None).unwrap().shortcut, false), "Esc");
+    }
+
+    #[test]
+    fn pages_forward_the_shell_chords_the_keymap_resolves() {
+        let chord =
+            |command, key: &str, ctrl, shift, alt, meta| PageChord { command, key: key.into(), meta, ctrl, shift, alt };
+        assert_eq!(
+            page_chords_on(defaults(), false, false),
+            [
+                chord("workspace.focusNext", "f6", true, false, false, false),
+                chord("workspace.focusNext", "f6", false, false, false, false),
+                chord("workspace.focusPrevious", "f6", true, true, false, false),
+                chord("workspace.focusPrevious", "f6", false, true, false, false),
+                chord("sidebar.toggle", "b", true, false, false, false),
+                chord("rightPanel.toggle", "b", true, false, true, false),
+                chord("preview.focusUrl", "l", true, false, false, false),
+            ],
+            "every shortcut of each command, with `mod` as Ctrl; nothing binds toggleMaximized"
+        );
+        let mac = page_chords_on(defaults(), false, true);
+        assert!(mac.contains(&chord("sidebar.toggle", "b", false, false, false, true)), "`mod` is Cmd on macOS");
+
+        let custom = merge_with_defaults(&[
+            compile("mod+shift+m", "rightPanel.toggleMaximized", None).unwrap(),
+            compile("mod+l", "usage.open", None).unwrap(),
+            compile("mod+alt+s", "sidebar.toggle", Some("terminalOpen")).unwrap(),
+        ]);
+        let commands = |terminal_open| {
+            page_chords_on(&custom, terminal_open, false)
+                .into_iter()
+                .map(|chord| (chord.command, chord.key))
+                .collect::<Vec<_>>()
+        };
+        let closed = commands(false);
+        assert!(closed.contains(&("rightPanel.toggleMaximized", "m".into())), "a user binding joins the set");
+        assert!(!closed.iter().any(|(command, _)| *command == "preview.focusUrl"), "a later rule claims its chord");
+        assert!(!closed.contains(&("sidebar.toggle", "s".into())), "its condition needs an open terminal");
+        assert!(commands(true).contains(&("sidebar.toggle", "s".into())));
     }
 
     #[test]

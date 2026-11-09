@@ -64,7 +64,7 @@ impl Workspace {
     }
 
     /// Runs `command`; `held` is a key repeat, which most commands swallow without acting.
-    fn run_command(
+    pub(super) fn run_command(
         &mut self,
         command: &str,
         held: bool,

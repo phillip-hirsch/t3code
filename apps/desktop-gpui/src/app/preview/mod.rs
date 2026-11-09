@@ -6,6 +6,7 @@
 //! the server's own Chromium and stream to the panel (`server.rs`).
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::base::FocusTrapElement as _;
@@ -25,6 +26,7 @@ use gpui_kit::{
 use gpui_webview::WebView;
 use serde_json::{Value, json};
 
+use super::keymap;
 use super::right_panel::Surface;
 use super::titlebar::TITLEBAR_HEIGHT;
 use super::{Target, Workspace};
@@ -64,6 +66,22 @@ pub(super) enum PageEvent {
     },
     /// The page asked for a new window (`window.open`, `target=_blank`).
     OpenLink(String),
+    /// The focused page handed back a shell shortcut's command.
+    Shortcut(String),
+}
+
+/// The chords a focused page forwards (`setForwardedShortcuts`), and what they were resolved from.
+struct PageChords {
+    source: Option<(Rc<[crate::keybindings::Rule]>, bool)>,
+    list: Vec<keymap::PageChord>,
+    /// `list` as JSON, for the pages' script.
+    json: Rc<str>,
+}
+
+impl Default for PageChords {
+    fn default() -> Self {
+        Self { source: None, list: Vec::new(), json: "[]".into() }
+    }
 }
 
 struct HostedTab {
@@ -80,6 +98,8 @@ struct HostedTab {
     /// apply until the tab is adjusted (`browserDefaultTabState`).
     defaults: (f64, Appearance),
     shown: bool,
+    /// The chords the view's script starts each new document with.
+    chords: Rc<str>,
     _events: Task<()>,
 }
 
@@ -120,6 +140,7 @@ pub(super) struct PreviewState {
     discovery: empty::Discovery,
     /// Failed tabs showing the unreachable page's details.
     unreachable_details: HashSet<TabRef>,
+    chords: PageChords,
     /// A hidden view that keeps WebView2's browser process running, so tabs and file previews
     /// start without its startup cost.
     #[cfg(windows)]
@@ -158,6 +179,7 @@ impl PreviewState {
             history: crate::browser_history::BrowserHistory::load(),
             discovery: Default::default(),
             unreachable_details: HashSet::new(),
+            chords: PageChords::default(),
             #[cfg(windows)]
             _warm: None,
             #[cfg(windows)]
@@ -760,7 +782,8 @@ impl Workspace {
                 }
                 let (sender, events) = async_channel::unbounded();
                 let mut context = partition.context();
-                let builder = page_builder(partition.builder(context.as_mut()), &url, sender);
+                let chords = this.preview.chords.json.clone();
+                let builder = page_builder(partition.builder(context.as_mut()), &url, &chords, sender);
                 match build_view(builder, window, cx) {
                     Ok(webview) => this.adopt_view(tab, url, webview, events, window, cx),
                     Err(error) => {
@@ -806,6 +829,8 @@ impl Workspace {
                 appearance: None,
                 defaults: self.browser_defaults(),
                 shown: false,
+                // The same set `host_tab` just built the view with.
+                chords: self.preview.chords.json.clone(),
                 _events: pump,
             },
         );
@@ -821,6 +846,11 @@ impl Workspace {
             PageEvent::Finished(url) => {
                 if !matches!(tab.status, NavStatus::LoadFailed { .. }) {
                     tab.status = NavStatus::Success { url, title };
+                }
+                // The new document started with the chords the view was built with.
+                if tab.chords != self.preview.chords.json {
+                    let script = preview::shortcut_update_script(&self.preview.chords.json);
+                    let _ = tab.view.read(cx).raw().evaluate_script(&script);
                 }
             }
             PageEvent::Title(new_title) => match &mut tab.status {
@@ -850,12 +880,67 @@ impl Workspace {
                 self.open_preview_tab(key.thread.clone(), Some(url), window, cx);
                 return;
             }
+            PageEvent::Shortcut(command) => {
+                self.page_shortcut(key, &command, window, cx);
+                return;
+            }
         }
         let status = tab.status.clone();
         self.record_title(&key.thread, &status);
         self.report_status(key, cx);
         self.sync_address(window, cx);
         cx.notify();
+    }
+
+    /// A shell shortcut a focused page handed back (`MENU_ACTION_CHANNEL`). The page can post any
+    /// message, so only a forwarded command from a page on screen runs.
+    fn page_shortcut(&mut self, key: &TabRef, command: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.preview.tabs.get(key).filter(|tab| tab.shown) else { return };
+        let Some(command) = self.preview.chords.list.iter().find(|chord| chord.command == command).map(|c| c.command)
+        else {
+            return;
+        };
+        if matches!(command, "workspace.focusNext" | "workspace.focusPrevious" | "preview.focusUrl") {
+            // GPUI focus alone can't take the keyboard back from the native view.
+            let _ = tab.view.read(cx).raw().focus_parent();
+            // F6 moves on from the area that shows the page: the panel, or the chat under the mini player.
+            if command != "preview.focusUrl" {
+                let in_panel = self.preview_thread().as_ref() == Some(&key.thread)
+                    && self.active_surface() == Some(&Surface::Browser(key.tab_id.clone()));
+                let area = if in_panel { &self.areas.panel } else { &self.focus };
+                area.focus(window, cx);
+            }
+        }
+        let context = keymap::ShortcutContext {
+            preview_focus: true,
+            preview_open: true,
+            terminal_open: self.terminal_open(),
+            right_panel_open: self.right_panel_open(),
+            ..Default::default()
+        };
+        self.run_command(command, false, &context, window, cx);
+    }
+
+    /// Resolves the chords pages forward again when the keymap or the terminal changed, and swaps
+    /// a changed set into every hosted page.
+    fn sync_page_chords(&mut self, cx: &App) {
+        let terminal_open = self.terminal_open();
+        let chords = &mut self.preview.chords;
+        if chords.source.as_ref().is_some_and(|(rules, open)| Rc::ptr_eq(rules, &self.keymap) && *open == terminal_open)
+        {
+            return;
+        }
+        chords.source = Some((self.keymap.clone(), terminal_open));
+        let list = keymap::page_chords(&self.keymap, terminal_open);
+        if list == chords.list {
+            return;
+        }
+        chords.json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".into()).into();
+        chords.list = list;
+        let script = preview::shortcut_update_script(&chords.json);
+        for tab in self.preview.tabs.values() {
+            let _ = tab.view.read(cx).raw().evaluate_script(&script);
+        }
     }
 
     /// `preview.reportStatus`, once per change, so the server and agents see this tab's page.
@@ -934,6 +1019,7 @@ impl Workspace {
     /// Applies each hosted tab's zoom, colour scheme and visibility to its native view, after the
     /// panel and the mini player recorded what they draw. It only calls into a view on a change.
     pub(super) fn sync_preview_views(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_page_chords(cx);
         let covered = self.browser_covered(window, cx);
         self.retain_server_streams(covered, window, cx);
         let panel = self.preview.panel_view.take().filter(|_| !covered);
@@ -1483,21 +1569,27 @@ pub(super) fn build_view(builder: wry::WebViewBuilder, window: &mut Window, cx: 
     WebView::build(builder, window, cx)
 }
 
-/// A tab's view: its page events, and the script that reports its history.
+/// A tab's view: its page events, and the scripts that report its history and forward the app's
+/// shell `chords` while it has focus.
 fn page_builder<'a>(
     builder: wry::WebViewBuilder<'a>,
     url: &str,
+    chords: &str,
     sender: async_channel::Sender<PageEvent>,
 ) -> wry::WebViewBuilder<'a> {
     builder
         .with_url(url)
         .with_devtools(true)
         .with_initialization_script(preview::HISTORY_SCRIPT)
+        .with_initialization_script(preview::shortcut_script(chords, keymap::MAC))
         .with_ipc_handler({
             let sender = sender.clone();
             move |request| {
-                if let Some(history) = preview::history_message(request.body()) {
+                let body = request.body();
+                if let Some(history) = preview::history_message(body) {
                     let _ = sender.try_send(PageEvent::History(history));
+                } else if let Some(command) = preview::shortcut_message(body) {
+                    let _ = sender.try_send(PageEvent::Shortcut(command));
                 }
             }
         })

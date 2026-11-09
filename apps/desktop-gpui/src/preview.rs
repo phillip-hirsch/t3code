@@ -357,6 +357,55 @@ pub fn history_message(body: &str) -> Option<PageHistory> {
     })
 }
 
+/// Hands the app's shell chords back from a focused page, as Electron's `before-input-event`
+/// forwarding does: a matching key never reaches the page, and unless it repeats its command
+/// posts over wry's IPC. Keys match as `matchesKeybindingShortcut` reads them.
+/// `window.__t3PageShortcuts(chords)` swaps the set when the keymap changes.
+const SHORTCUT_SCRIPT: &str = r#"(() => {
+  if (window !== window.top || !window.ipc) return;
+  let chords = __CHORDS__;
+  const mac = __MAC__;
+  Object.defineProperty(window, "__t3PageShortcuts", { value: (next) => { chords = next; } });
+  const codes = { Backquote: "`", Backslash: "\\", BracketLeft: "[", BracketRight: "]", Comma: ",", Equal: "=", Minus: "-", Period: ".", Quote: "'", Semicolon: ";", Slash: "/" };
+  const keysOf = (event) => {
+    const lower = event.key.toLowerCase();
+    const key = lower === "esc" ? "escape" : lower;
+    const keys = new Set([key]);
+    const letter = /^Key([A-Z])$/.exec(event.code || "");
+    if (letter && !/^[a-z]$/.test(key)) keys.add(letter[1].toLowerCase());
+    const digit = /^Digit([0-9])$/.exec(event.code || "");
+    keys.add(/^[a-z]$/.test(key) ? key : (digit ? digit[1] : codes[event.code]) ?? key);
+    return keys;
+  };
+  addEventListener("keydown", (event) => {
+    if (!event.isTrusted || event.isComposing || typeof event.key !== "string") return;
+    if (!mac && event.ctrlKey && event.altKey && /^(?:[^a-zA-Z0-9]|Dead)$/u.test(event.key)) return;
+    const keys = keysOf(event);
+    const chord = chords.find((c) => c.meta === event.metaKey && c.ctrl === event.ctrlKey && c.shift === event.shiftKey && c.alt === event.altKey && keys.has(c.key));
+    if (!chord) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    if (!event.repeat) window.ipc.postMessage(JSON.stringify({ t3Shortcut: chord.command }));
+  }, true);
+})();"#;
+
+/// [`SHORTCUT_SCRIPT`] starting with `chords`, a JSON array of `PageChord`s.
+pub fn shortcut_script(chords: &str, mac: bool) -> String {
+    SHORTCUT_SCRIPT.replace("__CHORDS__", chords).replace("__MAC__", if mac { "true" } else { "false" })
+}
+
+/// Swaps the chords [`SHORTCUT_SCRIPT`] forwards in the page already loaded.
+pub fn shortcut_update_script(chords: &str) -> String {
+    format!("window.__t3PageShortcuts?.({chords});")
+}
+
+/// The command a page's [`SHORTCUT_SCRIPT`] forwarded. The page can post one too, so the caller
+/// runs only a command it forwards.
+pub fn shortcut_message(body: &str) -> Option<String> {
+    let message: serde_json::Value = serde_json::from_str(body).ok()?;
+    Some(message.get("t3Shortcut")?.as_str()?.to_owned())
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RevealRequest {
@@ -1522,6 +1571,18 @@ mod tests {
         assert_eq!(history_message(r#"{"t3History":{"url":"https://a.test/","back":true}}"#), None);
         assert_eq!(history_message("not json"), None);
         assert_eq!(history_message(r#"{"other":1}"#), None);
+    }
+
+    #[test]
+    fn the_shortcut_script_posts_what_the_app_reads() {
+        let chords = r#"[{"command":"sidebar.toggle","key":"b","meta":false,"ctrl":true,"shift":false,"alt":false}]"#;
+        let script = shortcut_script(chords, true);
+        assert!(script.contains(&format!("let chords = {chords};")) && script.contains("const mac = true;"));
+        assert!(!script.contains("__CHORDS__") && !script.contains("__MAC__"));
+        assert!(script.contains("postMessage(JSON.stringify({ t3Shortcut: chord.command }))"));
+        assert_eq!(shortcut_message(r#"{"t3Shortcut":"sidebar.toggle"}"#).as_deref(), Some("sidebar.toggle"));
+        assert_eq!(shortcut_message(r#"{"t3Shortcut":1}"#), None);
+        assert_eq!(shortcut_message(r#"{"t3History":{}}"#), None);
     }
 
     #[test]
