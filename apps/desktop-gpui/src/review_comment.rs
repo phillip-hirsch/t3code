@@ -194,6 +194,37 @@ fn label(section_id: &str, file_path: &str, range_label: &str) -> String {
     format!("{prefix}{base} {range}")
 }
 
+/// `isPullRequestSummaryContext`'s number: a comment that stands for a whole pull request.
+fn summary_number(comment: &Value) -> Option<u64> {
+    if let Some(number) = comment["pullRequest"]["number"].as_u64() {
+        return Some(number);
+    }
+    let field = |key: &str| comment[key].as_str().unwrap_or_default();
+    let number =
+        field("filePath").strip_prefix("PR #").filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    number
+        .filter(|_| field("sectionId").starts_with("pull-request:") && field("diff").trim().is_empty())
+        .and_then(|n| n.parse().ok())
+}
+
+/// `reviewCommentContextRecord` for a `ReviewCommentContext` built as JSON, under the context id
+/// its producer id `id` folds into.
+pub fn context_record(id: &str, mut comment: Value) -> Value {
+    let field = |key: &str| comment[key].as_str().unwrap_or_default().to_owned();
+    let label = match summary_number(&comment) {
+        Some(number) => format!("#{number}"),
+        None => label(&field("sectionId"), &field("filePath"), &field("rangeLabel")),
+    };
+    let (text, diff) = (clamp_text(&field("text"), TEXT_MAX), clamp_text(&field("diff"), DIFF_MAX));
+    comment["version"] = 1.into();
+    comment["contextId"] = crate::composer_context::kind_scoped_id(KIND, id).into();
+    comment["kind"] = KIND.into();
+    comment["label"] = sanitize_label(&label, KIND).into();
+    comment["text"] = text.into();
+    comment["diff"] = diff.into();
+    comment
+}
+
 /// `reviewCommentContextRecord`.
 fn record(
     context_id: &str,
@@ -315,6 +346,20 @@ mod tests {
         assert_eq!(label("branch", "a.ts", "+3 to -5"), "a.ts +3 to -5");
         let record = file_comment("rc", "[odd]\\name.ts", 1, 1, "", "x");
         assert_eq!(record["label"], "name.ts L1");
+
+        let summary = |patch: Value| {
+            let mut comment = json!({"sectionId": "pull-request:7", "filePath": "PR #7", "rangeLabel": "Title", "text": "t", "diff": ""});
+            for (key, value) in patch.as_object().unwrap() {
+                comment[key] = value.clone();
+            }
+            context_record("pull-request-context:u", comment)
+        };
+        let record = summary(json!({}));
+        assert_eq!((record["label"].as_str(), record["kind"].as_str()), (Some("#7"), Some(KIND)));
+        assert_eq!(record["contextId"], crate::composer_context::kind_scoped_id(KIND, "pull-request-context:u"));
+        assert_eq!(summary(json!({"pullRequest": {"number": 9}}))["label"], "#9", "its pull request names it");
+        assert_eq!(summary(json!({"diff": "@@"}))["label"], "#7 PR #7 Title", "quoted code is a line comment");
+        assert_eq!(summary(json!({"filePath": "b/a.ts", "rangeLabel": "L4"}))["label"], "#7 a.ts L4");
     }
 
     #[test]

@@ -152,6 +152,7 @@ pub(in crate::app) struct Panel {
     guide_rail_open: bool,
     guide_files_open: HashSet<String>,
     guide_diff: guide::GuideDiff,
+    guide_picking: Option<guide::Picking>,
 }
 
 impl Panel {
@@ -218,6 +219,7 @@ impl Panel {
             guide_rail_open: false,
             guide_files_open: HashSet::new(),
             guide_diff: guide::GuideDiff::default(),
+            guide_picking: None,
         }
     }
 

@@ -118,6 +118,41 @@ pub fn referenced_ids(text: &str) -> Vec<&str> {
     ids
 }
 
+/// `stripInlineContextReferences`: `text` without its context links.
+pub fn strip_references(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    for (range, _, _) in references(text) {
+        let opener = range.start - HREF_PREFIX.len() - 2;
+        // A label holds no brackets, so its link starts at the last `[` before `](`.
+        let Some(open) = text[copied..opener].rfind('[').map(|at| copied + at) else { continue };
+        let open = if text[..open].ends_with('!') { open - 1 } else { open };
+        out.push_str(&text[copied..open]);
+        copied = range.end + 1;
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
+/// `ensureInlineContextReferences`: `prompt` with a chip after it for each record it doesn't
+/// reference yet, a space apart.
+pub fn ensure_references(prompt: &str, records: &[Value]) -> String {
+    let mut referenced: HashSet<String> = referenced_ids(prompt).into_iter().map(str::to_owned).collect();
+    let mut out = prompt.to_owned();
+    for record in records {
+        let (Some(kind), Some(id)) = (record["kind"].as_str(), id_of(record)) else { continue };
+        if !referenced.insert(id.to_owned()) {
+            continue;
+        }
+        if !out.is_empty() && !out.ends_with([' ', '\n', '\t', '\r']) {
+            out.push(' ');
+        }
+        out.push_str(&crate::composer_text::context_link(kind, id, record["label"].as_str().unwrap_or_default()));
+        out.push(' ');
+    }
+    out
+}
+
 /// `text` with each reference to an id in `ids` pointing at its new id.
 pub fn rewrite_ids(text: &str, ids: &HashMap<String, String>) -> String {
     let mut out = String::with_capacity(text.len());
@@ -434,6 +469,25 @@ mod tests {
             link("file", "file_1")
         );
         assert_eq!(referenced_ids(&text), ["file_1"]);
+        let image = crate::composer_text::context_link("image", "image_1", "a.png");
+        assert_eq!(strip_references(&format!("a {} b {image}!", link("file", "file_1"))), "a  b !");
+        assert_eq!(strip_references("[x] (t3-context://v1/file/f)"), "[x] (t3-context://v1/file/f)");
+    }
+
+    #[test]
+    fn missing_chips_go_after_the_prompt_once() {
+        let held = link("review-comment", "rc1");
+        let records = [record("review-comment", "rc1"), record("review-comment", "rc2"), record("terminal", "t")];
+        assert_eq!(
+            ensure_references(&format!("ask {held}"), &records[..2]),
+            format!("ask {held} {} ", link("review-comment", "rc2"))
+        );
+        assert_eq!(
+            ensure_references("line\n", &records[2..]),
+            format!("line\n{} ", link("terminal", "t")),
+            "a newline is space enough"
+        );
+        assert_eq!(ensure_references("", &[]), "");
     }
 
     #[test]

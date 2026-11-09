@@ -538,7 +538,7 @@ impl Workspace {
             project_id: project_id.clone(),
             url: pull_request.url(),
             term: terminology("github").0,
-            task: prompt.clone(),
+            task: prompt.clone().map(Into::into),
             mode: CheckoutMode::Worktree,
         };
         let settled = |this: &mut Workspace| {

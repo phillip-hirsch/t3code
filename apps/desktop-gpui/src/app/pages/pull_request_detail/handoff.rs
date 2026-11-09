@@ -171,29 +171,51 @@ impl Workspace {
         }
     }
 
-    /// Adds a handoff's prompt to the composer (`writeHandoffToComposer`).
-    fn write_pr_task(&mut self, prompt: &str, window: &mut Window, cx: &mut Context<Self>) {
+    /// Adds a handoff to the composer on screen (`writeHandoffToComposer`): its prompt after the
+    /// text, its records beside the draft's, and a chip for each record the text lacks. `false`
+    /// while a question card holds the editor, whose answer takes no context.
+    fn write_pr_task(&mut self, task: &logic::Handoff, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.question.is_some() || self.target.is_none() {
+            return false;
+        }
         let existing = self.composer.read(cx).value().to_string();
-        let next = logic::append_handoff(&existing, prompt);
-        self.set_composer_text(next, window, cx);
+        let held: Vec<Value> =
+            self.context.records.iter().filter(|r| r["kind"] == crate::review_comment::KIND).cloned().collect();
+        let next = logic::append_handoff(&existing, &held, task);
+        let text = crate::composer_context::ensure_references(&next.prompt, &next.comments);
+        // The records go in first, so the chips the new text renders keep them.
+        self.context.records.extend(next.comments);
+        if text != existing {
+            self.set_composer_text(text, window, cx);
+        }
+        cx.notify();
+        true
     }
 
-    /// `startAsk`: a new thread that knows which pull request is meant.
-    pub(super) fn start_pr_ask(&mut self, prompt: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(detail) = self.pull_requests.panel.as_ref().and_then(|p| p.detail.clone()) else { return };
+    /// `startAsk`: a new thread that knows which pull request is meant. `keep_guide` shows the
+    /// guide beside it again when it is asked from there.
+    pub(super) fn start_pr_ask(
+        &mut self,
+        task: logic::Handoff,
+        keep_guide: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = self.pull_requests.panel.as_ref() else { return };
+        let (Some(detail), reference) = (panel.detail.clone(), panel.reference.clone()) else { return };
         if self.pr_handoff_busy() {
             return;
         }
         let term = logic::terminology(&detail.provider).0;
-        let question = !prompt.lines().next().unwrap_or_default().starts_with("PR #");
-        let description = if question {
-            "The question is in the composer. Read it over, then send.".to_owned()
-        } else {
+        let description = if task.prompt.is_empty() {
             format!("The {term} is in the composer. Type your question, then send.")
+        } else {
+            "The question is in the composer. Read it over, then send.".to_owned()
         };
         if self.pr_attaches_to_composer() {
-            self.write_pr_task(&prompt, window, cx);
-            window.push_notification(Notification::success(description).title("Added to the composer"), cx);
+            if self.write_pr_task(&task, window, cx) {
+                window.push_notification(Notification::success(description).title("Added to the composer"), cx);
+            }
             return;
         }
         let project_id = self.pr_acting_project(&detail);
@@ -201,8 +223,15 @@ impl Workspace {
             toast_error(window, cx, "Could not open a thread", "Try again from the project, or open a thread first.");
             return;
         }
-        self.start_draft(project_id, window, cx);
-        self.write_pr_task(&prompt, window, cx);
+        self.start_draft(project_id.clone(), window, cx);
+        let opened = matches!(&self.target, Some(Target::Draft { project_id: p, .. }) if *p == project_id);
+        if !opened || !self.write_pr_task(&task, window, cx) {
+            toast_error(window, cx, "Could not open a thread", "Try again from the project, or open a thread first.");
+            return;
+        }
+        if keep_guide {
+            self.open_surface(crate::app::right_panel::Surface::PullRequest(reference), window, cx);
+        }
         window.push_notification(Notification::success(description).title("Asked in a thread"), cx);
     }
 
@@ -210,7 +239,7 @@ impl Workspace {
     pub(super) fn start_pr_handoff(
         &mut self,
         kind: String,
-        task: Option<String>,
+        task: Option<logic::Handoff>,
         mode: CheckoutMode,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -219,13 +248,14 @@ impl Workspace {
         if self.pr_handoff_busy() {
             return;
         }
-        if let Some(task) = task.as_deref().filter(|_| self.pr_attaches_to_composer()) {
-            self.write_pr_task(task, window, cx);
-            window.push_notification(
-                Notification::success("The task is in the composer. Read it over, then send.")
-                    .title("Added to the composer"),
-                cx,
-            );
+        if let Some(task) = task.as_ref().filter(|_| self.pr_attaches_to_composer()) {
+            if self.write_pr_task(task, window, cx) {
+                window.push_notification(
+                    Notification::success("The task is in the composer. Read it over, then send.")
+                        .title("Added to the composer"),
+                    cx,
+                );
+            }
             return;
         }
         let project_id = self.pr_acting_project(&detail);
@@ -354,12 +384,12 @@ impl Workspace {
 
     pub(super) fn ask_about_pr(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(detail) = self.pull_requests.panel.as_ref().and_then(|p| p.detail.clone()) else { return };
-        self.start_pr_ask(logic::ask_handoff(&logic::HandoffSubject::of(&detail)), window, cx);
+        self.start_pr_ask(logic::ask_handoff(&logic::HandoffSubject::of(&detail)), false, window, cx);
     }
 
     pub(super) fn explain_pr(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(detail) = self.pull_requests.panel.as_ref().and_then(|p| p.detail.clone()) else { return };
-        self.start_pr_ask(logic::explain_handoff(&logic::HandoffSubject::of(&detail)), window, cx);
+        self.start_pr_ask(logic::explain_handoff(&logic::HandoffSubject::of(&detail)), false, window, cx);
     }
 
     pub(super) fn fix_pr_findings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -387,29 +417,34 @@ impl Workspace {
         let Some(panel) = self.pull_requests.panel.as_ref() else { return };
         let Some(detail) = panel.detail.clone() else { return };
         let threads = panel.activity.as_ref().map_or(&[][..], |a| a.review_threads.as_slice());
-        let Some(text) = logic::chat_handoff(&logic::HandoffSubject::of(&detail), chat, threads) else { return };
-        self.write_pr_task(&text, window, cx);
-        window.push_notification(Notification::success("").title("Added to the composer"), cx);
+        let subject = logic::HandoffSubject::of(&detail);
+        let Some(comment) = logic::chat_comment(&subject, chat, threads) else { return };
+        let held: Vec<Value> = self.context.records.iter().cloned().collect();
+        let task = logic::chat_handoff(&subject, comment, &held);
+        if self.write_pr_task(&task, window, cx) {
+            window.push_notification(Notification::success("").title("Added to the composer"), cx);
+        }
     }
 
     pub(super) fn resolve_pr_conflicts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(detail) = self.pull_requests.panel.as_ref().and_then(|p| p.detail.clone()) else { return };
         let prompt = logic::resolve_conflicts_prompt(&logic::HandoffSubject::of(&detail));
-        self.start_pr_handoff("conflicts".into(), Some(prompt), CheckoutMode::Worktree, window, cx);
+        self.start_pr_handoff("conflicts".into(), Some(prompt.into()), CheckoutMode::Worktree, window, cx);
     }
 
-    /// The selected lines and a request about them, for an agent (`addSelectionToAgent`).
+    /// Picked lines (`comment`, their `review-comment` record) and a request about them, for an
+    /// agent (`addSelectionToAgent`); `keep_guide` when they were picked in the guide.
     pub(super) fn add_pr_selection_to_agent(
         &mut self,
-        path: String,
-        lines: String,
-        request: String,
+        comment: Value,
+        request: &str,
+        keep_guide: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(detail) = self.pull_requests.panel.as_ref().and_then(|p| p.detail.clone()) else { return };
-        let prompt = logic::selection_handoff(&logic::HandoffSubject::of(&detail), &path, &lines, &request);
-        self.start_pr_ask(prompt, window, cx);
+        let task = logic::selection_handoff(&logic::HandoffSubject::of(&detail), comment, request);
+        self.start_pr_ask(task, keep_guide, window, cx);
     }
 
     /// `PullRequestCheckoutMenu`: "Check out" with its two places.

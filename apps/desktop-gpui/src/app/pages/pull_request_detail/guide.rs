@@ -3,8 +3,9 @@
 //! lines, the other files it touches, questions to hand an agent, and the way to the next stop.
 
 use crate::pull_request_detail::{Guide, GuideExcerpt, GuideStop};
-use crate::pull_request_diff::{self as diff_logic, FilePatch, Row};
+use crate::pull_request_diff::{self as diff_logic, FilePatch, Row, Side};
 
+use super::write::Point;
 use super::*;
 
 /// `@min-[56rem]/guide`: from this panel width the stops list stays beside the stop.
@@ -47,6 +48,51 @@ impl GuideDiff {
     fn pending(&self) -> bool {
         !self.done && self.error.is_none()
     }
+
+    pub(super) fn file(&self, path: &str) -> Option<&FilePatch> {
+        self.files.get(path)
+    }
+}
+
+/// Lines being picked in an excerpt by dragging over their numbers; the draft opens on release.
+pub(super) struct Picking {
+    excerpt: String,
+    path: String,
+    anchor: Point,
+    head: Point,
+}
+
+/// The line a row shows in an excerpt: a removed line's old number, any other its new one.
+fn row_point(row: &Row) -> Point {
+    match (row.mark, row.old, row.new) {
+        ('-', Some(old), _) | (_, Some(old), None) => (Side::Left, old),
+        (_, _, new) => (Side::Right, new.unwrap_or_default()),
+    }
+}
+
+/// The row of `rows` that shows `point`: `getReviewPositionAnchor`'s side and line.
+fn row_at(rows: &[Row], (side, line): Point) -> Option<usize> {
+    rows.iter().position(|row| match side {
+        Side::Left => row.old == Some(line),
+        Side::Right => row.new == Some(line),
+    })
+}
+
+/// The rows from `a` to `b`, either way round.
+fn picked_rows(rows: &[Row], a: Point, b: Point) -> Option<std::ops::RangeInclusive<usize>> {
+    let (a, b) = (row_at(rows, a)?, row_at(rows, b)?);
+    Some(a.min(b)..=a.max(b))
+}
+
+/// What an excerpt's rows carry while comments can be written on them.
+#[derive(Default)]
+struct RowHooks {
+    /// Dresses a row's line number: it starts a pick and extends one on drag, and its `+`
+    /// drafts on that line alone.
+    pick: Option<Box<dyn Fn(Point, gpui_kit::Div) -> gpui_kit::Div>>,
+    picked: Option<std::ops::RangeInclusive<usize>>,
+    /// Pending comments and the draft, under the row they sit on.
+    under: HashMap<usize, Vec<AnyElement>>,
 }
 
 impl Workspace {
@@ -164,6 +210,11 @@ impl Workspace {
         }
         panel.guide_position = next;
         panel.guide_rail_open = false;
+        // Another stop shows other excerpts, so lines picked in these are let go.
+        panel.guide_picking = None;
+        if panel.write.draft.as_ref().is_some_and(|d| d.excerpt.is_some()) {
+            panel.write.draft = None;
+        }
         cx.notify();
     }
 
@@ -360,7 +411,10 @@ impl Workspace {
             .excerpts
             .iter()
             .enumerate()
-            .map(|(i, excerpt)| self.render_pr_guide_excerpt(excerpt, &notes_by_excerpt[i], loading, t, cx))
+            .map(|(i, excerpt)| {
+                let key = format!("{index}:{i}");
+                self.render_pr_guide_excerpt(key, excerpt, &notes_by_excerpt[i], loading, t, cx)
+            })
             .collect();
         let notes = (!stop.notes.is_empty()).then(|| {
             v_flex()
@@ -471,9 +525,11 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// `GuideExcerpt`: the lines the guide points at, with its notes' markers under theirs.
+    /// `GuideExcerpt`: the lines the guide points at, with its notes' markers under theirs, and
+    /// lines to pick for a review comment or a question to an agent. `key` names the excerpt.
     fn render_pr_guide_excerpt(
         &self,
+        key: String,
         excerpt: &GuideExcerpt,
         notes: &[(u64, Vec<(String, String)>)],
         loading: bool,
@@ -528,11 +584,18 @@ impl Workspace {
                 .child(if loading { "Loading the diff..." } else { "These lines are not in the loaded diff." })
                 .into_any_element()
         } else {
-            code_rows(&rows, notes, new_side, t)
+            code_rows(&rows, notes, new_side, self.pr_excerpt_hooks(&key, &excerpt.path, &rows, t, cx), t)
+        };
+        let end_pick = |this: &mut Self, _: &gpui_kit::MouseUpEvent, window: &mut Window, cx: &mut Context<Self>| {
+            this.end_pr_guide_pick(window, cx);
         };
         v_flex()
+            .id(ElementId::Name(format!("pr-guide-excerpt:{key}").into()))
             .min_w_0()
             .gap(px(6.))
+            // A drag over the line numbers may end anywhere.
+            .on_mouse_up(gpui_kit::MouseButton::Left, cx.listener(end_pick))
+            .on_mouse_up_out(gpui_kit::MouseButton::Left, cx.listener(end_pick))
             .children(caption)
             .child(
                 v_flex()
@@ -599,7 +662,7 @@ impl Workspace {
                         cx.notify();
                     }));
                 let body = open.then(|| match patch {
-                    Some(patch) => code_rows(&diff_logic::file_rows(patch), &[], true, t),
+                    Some(patch) => code_rows(&diff_logic::file_rows(patch), &[], true, RowHooks::default(), t),
                     None => div()
                         .px(px(12.))
                         .py(px(8.))
@@ -643,12 +706,7 @@ impl Workspace {
         t: &Tokens,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let can_ask = self
-            .pull_requests
-            .panel
-            .as_ref()
-            .and_then(|p| p.detail.as_ref())
-            .is_some_and(|d| self.shell.projects.iter().any(|p| p.id == d.project_id));
+        let can_ask = self.pr_can_ask();
         if stop.questions.is_empty() && !can_ask {
             return None;
         }
@@ -712,14 +770,113 @@ impl Workspace {
         )
     }
 
+    /// Whether a question can go to an agent: into the composer beside the panel, or a new
+    /// thread in the acting project (`startAsk`).
+    pub(super) fn pr_can_ask(&self) -> bool {
+        self.pr_attaches_to_composer()
+            || self.pull_requests.panel.as_ref().and_then(|p| p.detail.as_ref()).is_some_and(|detail| {
+                let acting = self.pr_acting_project(detail);
+                self.shell.projects.iter().any(|p| p.id == acting)
+            })
+    }
+
+    /// `ExcerptCommenting` for one excerpt's `rows`: picking lines while no draft is open, the
+    /// picked rows, and the pending comments and draft under their lines.
+    fn pr_excerpt_hooks(&self, key: &str, path: &str, rows: &[Row], t: &Tokens, cx: &mut Context<Self>) -> RowHooks {
+        let Some(panel) = self.pull_requests.panel.as_ref() else { return RowHooks::default() };
+        if !(panel.detail.as_ref().is_some_and(|d| super::write::pr_can_comment(d)) || self.pr_can_ask()) {
+            return RowHooks::default();
+        }
+        let draft = panel.write.draft.as_ref();
+        let here = draft.filter(|d| d.excerpt.as_deref() == Some(key));
+        let picked = match (panel.guide_picking.as_ref().filter(|p| p.excerpt == key), here) {
+            (Some(picking), _) => picked_rows(rows, picking.anchor, picking.head),
+            (None, Some(draft)) => picked_rows(rows, draft.picked.0, draft.picked.1),
+            (None, None) => None,
+        };
+        let mut under: HashMap<usize, Vec<AnyElement>> = HashMap::new();
+        for comment in self.pr_pending_comments().iter().filter(|c| c.path() == path) {
+            if let Some(at) = row_at(rows, comment.anchor()) {
+                under.entry(at).or_default().push(self.render_pr_pending_comment(comment, t, cx));
+            }
+        }
+        if let Some(at) = here.and_then(|draft| row_at(rows, draft.anchor())) {
+            under.entry(at).or_default().extend(self.render_pr_line_draft(t, cx));
+        }
+        let view = cx.entity();
+        let (key, path, tokens) = (key.to_owned(), path.to_owned(), *t);
+        let pick = draft.is_none().then(|| {
+            Box::new(move |point: Point, cell: gpui_kit::Div| {
+                let (down, moved, add) = (view.clone(), view.clone(), view.clone());
+                let (start, drag, one) = ((key.clone(), path.clone()), key.clone(), (key.clone(), path.clone()));
+                let plus = div()
+                    .absolute()
+                    .left(px(2.))
+                    .top(px(2.))
+                    .size(px(16.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(4.))
+                    .bg(tokens.primary)
+                    .text_color(tokens.primary_foreground)
+                    .opacity(0.)
+                    .group_hover(LINE_GROUP, |s| s.opacity(1.))
+                    .child(Icon::new(Lucide::Plus).with_size(px(12.)))
+                    .on_mouse_down(gpui_kit::MouseButton::Left, move |_, window, cx| {
+                        cx.stop_propagation();
+                        let (key, path) = one.clone();
+                        let () = add.update(cx, |this, cx| {
+                            this.begin_pr_excerpt_comment(key, path, (point, point), window, cx);
+                        });
+                    });
+                cell.relative()
+                    .cursor_pointer()
+                    .hover(move |s| s.text_color(tokens.foreground))
+                    .on_mouse_down(gpui_kit::MouseButton::Left, move |_, _, cx| {
+                        let (key, path) = start.clone();
+                        let () = down.update(cx, |this, cx| this.start_pr_guide_pick(key, path, point, cx));
+                    })
+                    .on_mouse_move(move |event, _, cx| {
+                        if event.pressed_button == Some(gpui_kit::MouseButton::Left) {
+                            let () = moved.update(cx, |this, cx| this.drag_pr_guide_pick(&drag, point, cx));
+                        }
+                    })
+                    .child(plus)
+            }) as Box<dyn Fn(Point, gpui_kit::Div) -> gpui_kit::Div>
+        });
+        RowHooks { pick, picked, under }
+    }
+
+    fn start_pr_guide_pick(&mut self, excerpt: String, path: String, point: Point, cx: &mut Context<Self>) {
+        let Some(panel) = self.pull_requests.panel.as_mut().filter(|p| p.write.draft.is_none()) else { return };
+        panel.guide_picking = Some(Picking { excerpt, path, anchor: point, head: point });
+        cx.notify();
+    }
+
+    fn drag_pr_guide_pick(&mut self, excerpt: &str, point: Point, cx: &mut Context<Self>) {
+        let picking = self.pull_requests.panel.as_mut().and_then(|p| p.guide_picking.as_mut());
+        if let Some(picking) = picking.filter(|p| p.excerpt == excerpt && p.head != point) {
+            picking.head = point;
+            cx.notify();
+        }
+    }
+
+    /// `onLineSelectionEnd`: the picked lines get a draft.
+    fn end_pr_guide_pick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(picking) = self.pull_requests.panel.as_mut().and_then(|p| p.guide_picking.take()) else { return };
+        self.begin_pr_excerpt_comment(picking.excerpt, picking.path, (picking.anchor, picking.head), window, cx);
+        cx.notify();
+    }
+
     fn ask_about_pr_guide_stop(&mut self, index: usize, question: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(panel) = self.pull_requests.panel.as_ref() else { return };
         let Some(detail) = panel.detail.clone() else { return };
         let Some(stop) = panel.guide_tour.as_ref().and_then(|g| g.as_ref().ok()?.stops.get(index).cloned()) else {
             return;
         };
-        let prompt = logic::guide_stop_handoff(&logic::HandoffSubject::of(&detail), index, &stop, &question);
-        self.start_pr_ask(prompt, window, cx);
+        let task = logic::guide_stop_handoff(&logic::HandoffSubject::of(&detail), index, &stop, &question);
+        self.start_pr_ask(task, true, window, cx);
     }
 
     /// "Open file": the Code tab, scrolled to the file.
@@ -751,8 +908,15 @@ fn marker_chip(marker: &str, t: &Tokens) -> impl IntoElement {
         .child(marker.to_owned())
 }
 
-/// A few lines of a diff, numbered on both sides, with note markers under the lines they name.
-fn code_rows(rows: &[Row], notes: &[(u64, Vec<(String, String)>)], new_side: bool, t: &Tokens) -> AnyElement {
+/// A few lines of a diff, numbered on both sides, with note markers under the lines they name
+/// and what `hooks` puts there.
+fn code_rows(
+    rows: &[Row],
+    notes: &[(u64, Vec<(String, String)>)],
+    new_side: bool,
+    mut hooks: RowHooks,
+    t: &Tokens,
+) -> AnyElement {
     let added = if t.dark { gpui_kit::rgb(0x00d492).into() } else { gpui_kit::rgb(0x007a55).into() };
     let tint = |color: Hsla| Hsla { a: 0.12, ..color };
     let number = |n: Option<u64>| {
@@ -776,21 +940,29 @@ fn code_rows(rows: &[Row], notes: &[(u64, Vec<(String, String)>)], new_side: boo
         }
     };
     let mut out = v_flex().font_family(FONT_MONO).text_size(px(12.)).line_height(px(20.)).py(px(4.));
-    for row in rows {
+    for (index, row) in rows.iter().enumerate() {
         let line = if new_side { row.new } else { row.old };
+        let picked = hooks.picked.as_ref().is_some_and(|picked| picked.contains(&index));
         let bg = match row.mark {
+            _ if picked => Some(Hsla { a: 0.16, ..t.primary }),
             '+' => Some(tint(added)),
             '-' => Some(tint(t.error)),
             _ => None,
         };
         // Pierre's unified view: one number per row, the old one only for a deletion.
+        let number = number(row.new.or(row.old));
+        let number = match &hooks.pick {
+            Some(pick) => pick(row_point(row), number),
+            None => number,
+        };
         out = out.child(
             h_flex()
                 .relative()
                 .min_w_0()
+                .group(LINE_GROUP)
                 .when_some(bg, gpui_kit::Styled::bg)
                 .children(bar(row.mark))
-                .child(number(row.new.or(row.old)))
+                .child(number)
                 .child(div().w(px(8.)).flex_none())
                 .child(
                     div()
@@ -819,9 +991,15 @@ fn code_rows(rows: &[Row], notes: &[(u64, Vec<(String, String)>)], new_side: boo
                     })),
             );
         }
+        if let Some(under) = hooks.under.remove(&index) {
+            out = out.child(v_flex().py(px(4.)).font_family(theme::FONT_SANS).children(under));
+        }
     }
     out.into_any_element()
 }
+
+/// Rows grouped for their `+` to show on hover.
+const LINE_GROUP: &str = "pr-guide-line";
 
 #[cfg(test)]
 mod tests {
@@ -844,5 +1022,19 @@ mod tests {
         assert!(!diff.pending(), "c.rs will never arrive");
         diff.reset_for("next head");
         assert_eq!(diff.next_read(&["a.rs"]), Some(None), "another guide starts over");
+    }
+
+    #[test]
+    fn excerpt_lines_pick_on_the_side_they_show() {
+        let patch = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -4,3 +4,3 @@\n keep\n-old\n+new\n tail\n";
+        let files = diff_logic::index_patch(patch);
+        let rows = diff_logic::file_rows(&files[0]);
+        let points: Vec<Point> = rows.iter().map(row_point).collect();
+        assert_eq!(points, [(Side::Right, 4), (Side::Left, 5), (Side::Right, 5), (Side::Right, 6)]);
+        assert_eq!(row_at(&rows, (Side::Left, 4)), Some(0), "a kept line sits on either side");
+        assert_eq!(row_at(&rows, (Side::Left, 5)), Some(1));
+        assert_eq!(row_at(&rows, (Side::Right, 5)), Some(2));
+        assert_eq!(picked_rows(&rows, (Side::Right, 6), (Side::Left, 5)), Some(1..=3), "dragged upwards");
+        assert_eq!(picked_rows(&rows, (Side::Right, 6), (Side::Right, 40)), None, "a line outside the excerpt");
     }
 }
