@@ -10,6 +10,8 @@ mod diff_load;
 mod diff_open;
 mod diff_tree;
 
+pub(in crate::app) use diff_load::contents_loader;
+
 use std::collections::{HashMap, HashSet};
 
 use gpui_kit::assets::IconName;
@@ -1184,7 +1186,7 @@ impl Workspace {
             && matches!(self.right_panel.load, DiffLoad::Ready { .. } | DiffLoad::Empty(_));
         let install = if retain { Install::Update } else { Install::Replace };
         self.right_panel.loaded = Some(key);
-        let (Some(client), Target::Thread { id: thread_id, .. }) = (self.client(), target) else { return };
+        let (Some(client), Target::Thread { env, id: thread_id }) = (self.client(), target) else { return };
         if self.vcs.status.as_ref().is_some_and(|s| !s.local.is_repo) {
             self.right_panel.load =
                 DiffLoad::Empty("Turn diffs are unavailable because this project is not a git repository.");
@@ -1268,6 +1270,13 @@ impl Workspace {
                 Ok(Some(parsed)) => parsed.base.clone(),
                 _ => None,
             };
+            // `createGitDiffFileContentsLoader`: a git comparison's files read in full, from its refs.
+            let contents_source = match (&parsed, source_kind, &cwd) {
+                (Ok(Some(parsed)), Some(kind), Some(cwd)) => {
+                    Some(json!({"cwd": cwd, "sourceKind": kind, "baseRef": parsed.base, "headRef": parsed.head}))
+                }
+                _ => None,
+            };
             let base_ref = if commit_sha.is_some() { remembered_base } else { source_base.or(remembered_base) };
             let patch_request = source_kind.zip(cwd).map(|(source_kind, cwd)| diff_load::PatchRequest {
                 cwd,
@@ -1282,6 +1291,15 @@ impl Workspace {
                     this.right_panel.diff_read_at = Some(std::time::Instant::now());
                 }
                 let previous = this.right_panel.patches.take().filter(|_| retain);
+                let loader = contents_source.map(|source| {
+                    contents_loader(
+                        cx.weak_entity(),
+                        move |this| this.env_client(&env),
+                        "review.getDiffFileContents",
+                        source,
+                    )
+                });
+                diff.update(cx, |state, cx| state.set_contents_loader(loader, cx));
                 this.right_panel.load = match parsed {
                     Err(error) => DiffLoad::Failed(error.into()),
                     Ok(None) => {

@@ -386,7 +386,20 @@ impl Workspace {
 
     /// Parses the loaded pages into the viewer, hiding whitespace and tests as asked.
     fn rebuild_pr_code(&mut self, cx: &mut Context<Self>) {
+        let workspace = cx.weak_entity();
+        let Some(panel) = self.pull_requests.panel.as_ref() else { return };
+        let (key, mut source) = (panel.reference.key(), panel.reference.to_json());
         let Some(code) = self.pr_code() else { return };
+        // `createPullRequestDiffFileContentsLoader`: the shown files read in full from the host.
+        if let Some(commit) = &code.commit {
+            source["commit"] = json!(commit);
+        }
+        let loader = crate::app::right_panel::contents_loader(
+            workspace,
+            move |this| this.pull_request_client_of(&key),
+            "pullRequests.diffFileContents",
+            source,
+        );
         let mut text = String::new();
         let mut files = Vec::new();
         code.raw.clear();
@@ -420,6 +433,7 @@ impl Workspace {
         let fold = code.folded;
         code.diff.update(cx, |state, cx| {
             state.set_files(ordered, cx);
+            state.set_contents_loader(Some(loader), cx);
             if fold {
                 for path in &fresh {
                     state.set_file_collapsed(path, true, cx);
