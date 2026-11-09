@@ -3,9 +3,90 @@
 //! Ghostty surface). Text the encoder would only type back arrives through the input handler
 //! instead, so IME and dead keys keep working.
 
+use std::borrow::Cow;
+use std::collections::HashSet;
+
 use gpui_kit::Keystroke;
 
-use super::core::{KeyAction as Press, KeyInput, Modifiers};
+use super::core::{Core, KeyAction as Press, KeyInput, Modifiers};
+
+/// Typing across key events: the keys whose press the program heard, and an IME or dead-key
+/// composition in progress.
+#[derive(Debug, Default)]
+pub(super) struct Keyboard {
+    /// `encodedKeyCodes`: these keys' releases go to the program too.
+    encoded: HashSet<String>,
+    /// The marked text's length in UTF-16 units.
+    preedit: usize,
+}
+
+impl Keyboard {
+    /// A fresh press proves a release was missed.
+    pub fn forget_missed_release(&mut self, keystroke: &Keystroke, held: bool) {
+        if !held {
+            self.encoded.remove(&keystroke.key);
+        }
+    }
+
+    /// The input handler's marked text: non-empty while the IME or a dead key composes.
+    pub fn set_preedit(&mut self, text: &str) {
+        self.preedit = text.encode_utf16().count();
+    }
+
+    /// The marked text's range, while there is one.
+    pub fn preedit(&self) -> Option<std::ops::Range<usize>> {
+        (self.preedit > 0).then_some(0..self.preedit)
+    }
+
+    /// The composition's committed text, which the terminal sends as typed.
+    pub fn commit<'a>(&mut self, text: &'a str) -> Option<&'a str> {
+        self.preedit = 0;
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// `isTerminalCompositionKey`: keys mid-composition belong to the IME. X11 Compose sequences
+    /// mark no text, but GPUI strips the character from each key they swallow.
+    pub fn composing(&self, keystroke: &Keystroke) -> bool {
+        let m = &keystroke.modifiers;
+        self.preedit > 0
+            || (keystroke.key_char.is_none()
+                && !(m.control || m.alt || m.platform || m.function)
+                && single_char(&keystroke.key).is_some_and(|c| !c.is_control()))
+    }
+
+    /// `encodeKey` for a press: bytes for the program, or `None` when there is nothing to send
+    /// or the input handler types the text, so IME and dead keys work. The program hears the
+    /// release either way.
+    pub fn press(&mut self, core: &mut Core, input: &KeyInput<'_>) -> Option<String> {
+        let data = core.encode_key(input);
+        if data.is_empty() {
+            return None;
+        }
+        self.encoded.insert(input.key.to_owned());
+        (Some(data.as_str()) != input.text.as_deref()).then_some(data)
+    }
+
+    /// Kitty sessions that asked for releases hear them, for the keys whose press they heard.
+    pub fn release(&mut self, core: &mut Core, keystroke: &Keystroke, mac: bool) -> Option<String> {
+        if !self.encoded.remove(&keystroke.key) || self.preedit > 0 {
+            return None;
+        }
+        let data = core.encode_key(&key_input(keystroke, Press::Release, mac));
+        (!data.is_empty()).then_some(data)
+    }
+}
+
+/// The keystroke with the Shift the window saw held: GPUI on Windows and Linux reports Shift+/
+/// as `?` with Shift consumed, where the web still sees Shift (Kitty reports it).
+pub(super) fn with_held_shift(keystroke: &Keystroke, shift: bool) -> Keystroke {
+    let mut keystroke = keystroke.clone();
+    let caseless =
+        single_char(&keystroke.key).is_some_and(|c| !c.is_control() && !c.is_lowercase() && !c.is_uppercase());
+    if shift && caseless {
+        keystroke.modifiers.shift = true;
+    }
+    keystroke
+}
 
 /// What the key does in the terminal itself, before anything is sent.
 #[derive(Debug, PartialEq, Eq)]
@@ -118,8 +199,9 @@ fn key_action_on(
             _ => {}
         }
     }
-    // macOS Option composes the layout's characters, which arrive as text (`ghosttyConsumedMods`).
-    if mac && alt && !ctrl && produces_character(keystroke) {
+    // A macOS Option dead key composes through the input handler; a character Option typed is
+    // encoded with Option consumed (`ghosttyConsumedMods`), so plain sessions still get the text.
+    if mac && alt && !ctrl && keystroke.key_char.is_none() && produces_character(keystroke) {
         return None;
     }
     // `isTerminalAltGraphText`: AltGr arrives as Ctrl+Alt; its character is text.
@@ -144,27 +226,45 @@ fn produces_character(keystroke: &Keystroke) -> bool {
 pub(super) fn key_input(keystroke: &Keystroke, action: Press, mac: bool) -> KeyInput<'_> {
     let m = &keystroke.modifiers;
     let mods = Modifiers { shift: m.shift, ctrl: m.control, alt: m.alt, meta: m.platform };
-    let base = single_char(&keystroke.key);
-    // `event.key`: the produced character, or the key's own one when the platform omits it.
-    let text = keystroke
-        .key_char
-        .as_deref()
-        .filter(|text| single_char(text).is_some_and(|c| !c.is_control()))
-        .or_else(|| base.filter(|_| !m.shift).map(|_| keystroke.key.as_str()));
+    let base = key_character(&keystroke.key);
+    // `event.key`: the produced character, or the key's own one with Shift applied when the
+    // platform omits it (Ctrl chords on Windows and Linux).
+    let text = match keystroke.key_char.as_deref().filter(|text| single_char(text).is_some_and(|c| !c.is_control())) {
+        Some(text) => Some(Cow::Borrowed(text)),
+        None => base.map(|c| match c {
+            ' ' => Cow::Borrowed(" "),
+            _ if m.shift => Cow::Owned(c.to_uppercase().collect()),
+            _ => Cow::Borrowed(keystroke.key.as_str()),
+        }),
+    };
     // `ghosttyConsumedMods`: Shift that produced the character, and macOS Option that composed it.
     let consumed = if m.control || m.platform || text.is_none() || (m.alt && !mac) {
         Modifiers::default()
     } else {
         Modifiers { shift: m.shift, alt: m.alt, ..Modifiers::default() }
     };
-    KeyInput {
-        action,
-        key: &keystroke.key,
-        mods,
-        consumed,
-        text,
-        unshifted: base.map(|c| c.to_ascii_lowercase()).filter(|c| !c.is_control()),
+    KeyInput { action, key: &keystroke.key, mods, consumed, text, unshifted: base.and_then(|c| unshifted(c, m.shift)) }
+}
+
+/// The character a key names: its own, or a space for `"space"`.
+fn key_character(key: &str) -> Option<char> {
+    if key == "space" {
+        return Some(' ');
     }
+    single_char(key).filter(|c| !c.is_control())
+}
+
+/// `ghosttyUnshiftedCodepoint` without layout data: GPUI names letters in lower case, and a
+/// shifted symbol by the US key under it; other shifted symbols stay unknown, as on the web.
+fn unshifted(c: char, shift: bool) -> Option<char> {
+    if !shift {
+        return Some(c.to_ascii_lowercase());
+    }
+    if c.is_lowercase() || c.is_uppercase() {
+        return single_char(&c.to_lowercase().to_string());
+    }
+    let mut buf = [0; 4];
+    crate::app::keymap::unshifted(c.encode_utf8(&mut buf)).and_then(single_char)
 }
 
 #[cfg(test)]
@@ -189,12 +289,17 @@ mod tests {
     /// The bytes a keystroke sends on Windows and Linux (`mac` false) or macOS; `None` when
     /// the terminal does nothing with it, or the input handler types it.
     fn sent(core: &mut Core, keystroke: &Keystroke, mac: bool) -> Option<String> {
+        pressed(&mut Keyboard::default(), core, keystroke, mac)
+    }
+
+    /// [`sent`], with the keyboard's state carried across keys.
+    fn pressed(keyboard: &mut Keyboard, core: &mut Core, keystroke: &Keystroke, mac: bool) -> Option<String> {
+        if keyboard.composing(keystroke) {
+            return None;
+        }
         match key_action_on(keystroke, false, core.alt_screen(), false, mac)? {
             KeyAction::Send(data) => Some(data.to_owned()),
-            KeyAction::Encode(input) => {
-                let data = core.encode_key(&input);
-                (!data.is_empty() && Some(data.as_str()) != input.text).then_some(data)
-            }
+            KeyAction::Encode(input) => keyboard.press(core, &input),
             _ => None,
         }
     }
@@ -240,6 +345,11 @@ mod tests {
         assert_eq!(sent(&mut core, &typed("alt-l", Some("l")), false).as_deref(), Some("\x1bl"));
         assert_eq!(sent(&mut core, &typed("ctrl-alt-q", Some("@")), false), None, "AltGr types its character");
         assert_eq!(sent(&mut core, &typed("ctrl-alt-q", Some("q")), false).as_deref(), Some("\x1b\x11"));
+        // A Kitty session that asked for every key hears Option characters as keys, not text.
+        core.write(b"\x1b[>11u");
+        assert_eq!(sent(&mut core, &typed("alt-l", Some("@")), true).as_deref(), Some("\x1b[108;3u"));
+        assert_eq!(sent(&mut core, &typed("alt-e", None), true), None, "a dead key still composes");
+        assert_eq!(sent(&mut core, &typed("ctrl-alt-q", Some("@")), false), None, "AltGr still types");
     }
 
     #[test]
@@ -271,6 +381,8 @@ mod tests {
             ("alt-left", "\x1bb"),
             ("alt-x", "\x1bx"),
             ("alt-enter", "\x1b\r"),
+            // Windows and Linux give Ctrl+Shift chords no character; the web's `event.key` is "D".
+            ("ctrl-shift-d", "\x1b[100;6u"),
         ] {
             assert_eq!(send(spec).as_deref(), Some(bytes), "{spec}");
         }
@@ -296,8 +408,47 @@ mod tests {
         assert_eq!(core.encode_key(&key_input(&a, Press::Repeat, false)), "\x1b[97;1:2u");
         assert_eq!(core.encode_key(&key_input(&a, Press::Release, false)), "\x1b[97;1:3u");
         assert_eq!(sent(&mut core, &key("escape"), false).as_deref(), Some("\x1b[27u"));
+        assert_eq!(sent(&mut core, &key("ctrl-space"), false).as_deref(), Some("\x1b[32;5u"));
+        assert_eq!(sent(&mut core, &typed("space", Some(" ")), false).as_deref(), Some("\x1b[32u"));
         core.write(b"\x1b[<u");
         assert_eq!(sent(&mut core, &a, false), None, "popping the flags restores plain text");
+        // Report-events without report-all: the press is text for the input handler, the release a key.
+        core.write(b"\x1b[>3u");
+        let mut keyboard = Keyboard::default();
+        assert_eq!(pressed(&mut keyboard, &mut core, &a, false), None);
+        assert_eq!(keyboard.release(&mut core, &a, false).as_deref(), Some("\x1b[97;1:3u"));
+        assert_eq!(keyboard.release(&mut core, &a, false), None, "one release per press");
+    }
+
+    #[test]
+    fn shifted_punctuation_keeps_its_shift() {
+        let mut core = core(80, 24);
+        // GPUI on Windows and Linux reports Shift+/ as "?" with Shift consumed.
+        let question = with_held_shift(&typed("?", Some("?")), true);
+        assert_eq!(sent(&mut core, &question, false), None, "legacy sessions get the typed text");
+        core.write(b"\x1b[>15u");
+        assert_eq!(sent(&mut core, &question, false).as_deref(), Some("\x1b[47:63;2u"));
+        let unshifted = with_held_shift(&typed("?", Some("?")), false);
+        assert_eq!(sent(&mut core, &unshifted, false).as_deref(), Some("\x1b[63::47u"), "a layout's own ?, unshifted");
+    }
+
+    #[test]
+    fn composition_keeps_its_keys_from_the_encoder() {
+        let mut core = core(80, 24);
+        // Report-all: every key would otherwise be encoded.
+        core.write(b"\x1b[>11u");
+        let mut keyboard = Keyboard::default();
+        let e = typed("e", Some("e"));
+        keyboard.set_preedit("´");
+        assert_eq!(pressed(&mut keyboard, &mut core, &e, false), None);
+        assert_eq!(pressed(&mut keyboard, &mut core, &key("enter"), false), None, "Enter commits");
+        assert_eq!(keyboard.release(&mut core, &e, false), None);
+        assert_eq!(keyboard.commit("é"), Some("é"));
+        assert_eq!(keyboard.preedit(), None);
+        assert_eq!(pressed(&mut keyboard, &mut core, &e, false).as_deref(), Some("\x1b[101u"));
+        // X11 Compose sequences show no marked text; their keys carry no character until composed.
+        assert_eq!(pressed(&mut keyboard, &mut core, &key("a"), false), None);
+        assert_eq!(pressed(&mut keyboard, &mut core, &key("shift-a"), false), None);
     }
 
     #[test]

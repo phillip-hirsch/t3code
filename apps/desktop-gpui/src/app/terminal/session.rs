@@ -3,7 +3,6 @@
 //! clipboard. Output only re-renders this view.
 
 use std::cell::Cell;
-use std::collections::HashSet;
 use std::ops::Range;
 use std::rc::Rc;
 use std::time::Duration;
@@ -22,7 +21,7 @@ mod pointer;
 use gpui_kit::component::input;
 use gpui_kit::component::menu::ContextMenuExt as _;
 
-use super::core::{Core, KeyAction as Press};
+use super::core::Core;
 use super::grid::{Batched, CursorCell, Frame, Geometry, TerminalGrid, TerminalTheme, batch};
 use super::keys::{self, KeyAction, key_action};
 use super::model::{ScreenLink, ViewportPoint};
@@ -161,8 +160,7 @@ pub(super) struct TerminalSession {
     client: Option<RpcClient>,
     outbox: String,
     writing: bool,
-    /// Keys whose press went to the program, which hears their release too (`encodedKeyCodes`).
-    encoded_keys: HashSet<String>,
+    keyboard: keys::Keyboard,
     scroll_remainder: f32,
     pointer: pointer::PointerState,
     _attach: Option<Task<()>>,
@@ -244,6 +242,8 @@ impl TerminalSession {
             }),
             cx.on_blur(&focus, window, |this, _, cx| {
                 this.focused = false;
+                // A composition the IME never ended must not keep the next keys from the shell.
+                this.keyboard.set_preedit("");
                 this.cursor_on = true;
                 cx.notify();
             }),
@@ -271,7 +271,7 @@ impl TerminalSession {
             client: None,
             outbox: String::new(),
             writing: false,
-            encoded_keys: HashSet::new(),
+            keyboard: keys::Keyboard::default(),
             scroll_remainder: 0.,
             pointer: Default::default(),
             scrollbar,
@@ -639,10 +639,10 @@ impl TerminalSession {
         if !self.focus.is_focused(window) {
             return;
         }
-        let keystroke = &event.keystroke;
-        // A fresh press proves a release was missed.
-        if !event.is_held {
-            self.encoded_keys.remove(&keystroke.key);
+        let keystroke = &keys::with_held_shift(&event.keystroke, window.modifiers().shift);
+        self.keyboard.forget_missed_release(keystroke, event.is_held);
+        if self.keyboard.composing(keystroke) {
+            return;
         }
         self.pointer.cancel_selection_menu();
         // Formatting the selection is not free; only copy chords need to know it is there.
@@ -663,12 +663,7 @@ impl TerminalSession {
             }
             Some(KeyAction::Send(data)) => self.input(data, cx),
             Some(KeyAction::Encode(input)) => {
-                let data = self.core.encode_key(&input);
-                // Text the encoder only types back is the input handler's, so IME and dead keys work.
-                if data.is_empty() || Some(data.as_str()) == input.text {
-                    return;
-                }
-                self.encoded_keys.insert(keystroke.key.clone());
+                let Some(data) = self.keyboard.press(&mut self.core, &input) else { return };
                 self.input(&data, cx);
             }
             Some(KeyAction::Copy { keep_selection }) => {
@@ -684,13 +679,9 @@ impl TerminalSession {
     }
 
     /// Kitty sessions that asked for releases hear them, for the keys whose press they heard.
-    fn key_up(&mut self, event: &KeyUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let keystroke = &event.keystroke;
-        if !self.encoded_keys.remove(&keystroke.key) {
-            return;
-        }
-        let data = self.core.encode_key(&keys::key_input(keystroke, Press::Release, cfg!(target_os = "macos")));
-        if !data.is_empty() {
+    fn key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let keystroke = keys::with_held_shift(&event.keystroke, window.modifiers().shift);
+        if let Some(data) = self.keyboard.release(&mut self.core, &keystroke, cfg!(target_os = "macos")) {
             self.send_input(&data, cx);
             cx.stop_propagation();
         }
@@ -836,26 +827,31 @@ impl EntityInputHandler for TerminalSession {
         Some(UTF16Selection { range: 0..0, reversed: false })
     }
 
+    /// Composing keys go to the IME first while this is set (macOS reads it before each key).
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
-        None
+        self.keyboard.preedit()
     }
 
-    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {}
+    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
+        self.keyboard.set_preedit("");
+    }
 
     fn replace_text_in_range(&mut self, _: Option<Range<usize>>, text: &str, _: &mut Window, cx: &mut Context<Self>) {
-        if !text.is_empty() {
+        if let Some(text) = self.keyboard.commit(text) {
             self.input(text, cx);
         }
     }
 
+    /// The terminal draws no preedit; it only keeps the composing keys from the encoder.
     fn replace_and_mark_text_in_range(
         &mut self,
         _: Option<Range<usize>>,
-        _: &str,
+        text: &str,
         _: Option<Range<usize>>,
         _: &mut Window,
         _: &mut Context<Self>,
     ) {
+        self.keyboard.set_preedit(text);
     }
 
     /// The cursor cell, so the IME window opens next to the prompt.

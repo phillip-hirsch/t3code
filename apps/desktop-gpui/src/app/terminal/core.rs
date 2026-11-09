@@ -68,7 +68,7 @@ pub(super) struct KeyInput<'a> {
     /// Modifiers the layout used to produce `text` (`ghosttyConsumedMods`).
     pub consumed: Modifiers,
     /// The character the key types, without Ctrl applied.
-    pub text: Option<&'a str>,
+    pub text: Option<std::borrow::Cow<'a, str>>,
     /// The key's character without Shift, for Kitty's alternate keys.
     pub unshifted: Option<char>,
 }
@@ -507,7 +507,7 @@ impl Core {
             .set_consumed_mods(input.consumed.mods())
             .set_composing(false)
             .set_unshifted_codepoint(input.unshifted.unwrap_or('\0'))
-            .set_utf8(input.text.filter(|text| !text.chars().any(char::is_control)));
+            .set_utf8(input.text.as_deref().filter(|text| !text.chars().any(char::is_control)));
         let mut out = Vec::new();
         match self.key_encoder.encode_to_vec(&self.key_event, &mut out) {
             Ok(()) => String::from_utf8_lossy(&out).into_owned(),
