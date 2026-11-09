@@ -9,7 +9,7 @@ mod diff_base;
 mod diff_load;
 mod diff_open;
 mod diff_tool_call;
-mod diff_tree;
+pub(super) mod diff_tree;
 
 pub(in crate::app) use diff_load::contents_loader;
 
@@ -429,15 +429,10 @@ pub(super) struct RightPanel {
     patch_states: std::rc::Rc<HashMap<SharedString, diff_load::FileState>>,
     hide_test_files: bool,
     tree_open: bool,
-    /// Folded tree folders (with their trailing `/`) and the file picked in the tree.
-    tree_folded: HashSet<String>,
-    tree_selected: Option<String>,
-    /// The tree's visible rows, rebuilt when the shown files or the folds change.
-    tree_rows: std::rc::Rc<[diff_tree::Row]>,
+    tree: diff_tree::DiffTree,
     /// The file `open_turn_diff` asked for, scrolled to once the shown selection holds it.
     pending_reveal: Option<((Target, DiffScope), SharedString)>,
     toolbar_focus: DiffToolbarFocus,
-    tree_pane: diff_tree::TreePane,
     _diff_events: Subscription,
 }
 
@@ -489,12 +484,9 @@ impl RightPanel {
             patch_states: std::rc::Rc::default(),
             hide_test_files: false,
             tree_open: false,
-            tree_folded: HashSet::new(),
-            tree_selected: None,
-            tree_rows: std::rc::Rc::new([]),
+            tree: diff_tree::DiffTree::new(cx),
             pending_reveal: None,
             toolbar_focus: DiffToolbarFocus::new(cx),
-            tree_pane: diff_tree::TreePane::new(cx),
             _diff_events: diff_events,
         }
     }
@@ -2872,7 +2864,14 @@ impl Workspace {
                         })
                         .when(tree_open, |el| {
                             let row = self.right_panel_width(window).unwrap_or_default();
-                            el.child(self.render_diff_tree(row, tokens, window, cx))
+                            el.child(self.render_diff_tree(
+                                diff_tree::TreeOwner::Changes,
+                                row,
+                                None,
+                                tokens,
+                                window,
+                                cx,
+                            ))
                         }),
                 )
                 // `DiffFileLoadingBoundary` while file patches are still on their way.

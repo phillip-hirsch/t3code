@@ -40,6 +40,7 @@ use crate::timestamp::parse_ms;
 pub(super) mod avatars;
 pub(super) mod breakdown;
 mod code;
+pub(super) use code::stored_file_tree_open;
 mod completions;
 mod guide;
 mod handoff;
