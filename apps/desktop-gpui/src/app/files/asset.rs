@@ -15,7 +15,7 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use super::logic::{self, FileKind, Office};
-use super::{FileKey, archive, chrome, document, notebook, office};
+use super::{FileKey, archive, chrome, document, notebook, office, rtf};
 use crate::app::{Target, Workspace};
 use crate::theme::Tokens;
 
@@ -24,6 +24,7 @@ pub(super) enum Viewer {
     Archive(archive::Archive),
     Notebook(notebook::Notebook),
     Office(office::OfficeDoc),
+    Rtf(rtf::RtfDoc),
 }
 
 /// The parsed bytes, built off the UI thread; `Viewer` adds the UI's entities.
@@ -31,6 +32,7 @@ enum Parsed {
     Archive(archive::Listing),
     Notebook(notebook::NotebookData),
     Office(office::OfficeData),
+    Rtf(Vec<Vec<rtf::Line>>),
 }
 
 enum AssetLoad {
@@ -69,6 +71,7 @@ fn read_limit(kind: FileKind) -> Option<(u64, &'static str)> {
     match kind {
         FileKind::Archive => Some((archive::MAX_BYTES, "Preview limited to files under 50 MB.")),
         FileKind::Office(Office::Ipynb) => Some((notebook::MAX_BYTES, "Notebook preview limited to files under 8 MB.")),
+        FileKind::Office(Office::Rtf) => Some((rtf::MAX_BYTES, "Rich text preview limited to files under 8 MB.")),
         FileKind::Office(Office::Docx | Office::Xlsx | Office::Pptx) => {
             Some((office::MAX_BYTES, "Preview limited to files under 50 MB."))
         }
@@ -80,6 +83,7 @@ fn parse(kind: FileKind, name: &str, bytes: &[u8]) -> Result<Parsed, String> {
     match kind {
         FileKind::Archive => archive::open_archive(name, bytes).map(Parsed::Archive),
         FileKind::Office(Office::Ipynb) => notebook::open_notebook(bytes).map(Parsed::Notebook),
+        FileKind::Office(Office::Rtf) => rtf::open_rtf(bytes).map(Parsed::Rtf),
         FileKind::Office(office) => office::open_office(office, bytes).map(Parsed::Office),
         _ => Err("Could not preview this file.".into()),
     }
@@ -167,6 +171,7 @@ impl Workspace {
                         AssetLoad::Ready(Viewer::Notebook(notebook::Notebook::new(data, size)))
                     }
                     Ok((Parsed::Office(data), _)) => AssetLoad::Ready(Viewer::Office(office::OfficeDoc::new(data))),
+                    Ok((Parsed::Rtf(pages), size)) => AssetLoad::Ready(Viewer::Rtf(rtf::RtfDoc::new(pages, size))),
                     Err(error) => AssetLoad::Failed(error),
                 };
                 cx.notify();
@@ -308,6 +313,7 @@ impl Workspace {
             Some(AssetLoad::Ready(Viewer::Archive(_))) => self.render_archive_listing(key, tokens, cx),
             Some(AssetLoad::Ready(Viewer::Notebook(_))) => self.render_notebook(key, tokens, window, cx),
             Some(AssetLoad::Ready(Viewer::Office(_))) => self.render_office(key, width, tokens, cx),
+            Some(AssetLoad::Ready(Viewer::Rtf(_))) => self.render_rtf(key, width, tokens, cx),
         }
     }
 }

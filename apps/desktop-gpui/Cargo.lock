@@ -8410,6 +8410,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "encoding_rs",
  "env_logger",
  "file_icon_provider",
  "flate2",

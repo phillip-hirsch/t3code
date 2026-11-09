@@ -14,6 +14,7 @@ mod office;
 mod open_in;
 mod overlay;
 mod preview;
+mod rtf;
 mod table;
 mod tree;
 
