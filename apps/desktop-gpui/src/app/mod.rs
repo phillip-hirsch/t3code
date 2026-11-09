@@ -1127,24 +1127,13 @@ impl Workspace {
 
     /// `runtime-request.respond` for the open thread; `response` holds `decision`, `feedback` or `answers`.
     fn respond_command(&self, request_id: &str, response: Value) -> Option<Value> {
-        let thread = self.thread.as_ref()?;
-        let mut command = json!({
-            "type": "runtime-request.respond",
-            "commandId": new_id(),
-            "threadId": thread.id,
-            "requestId": request_id,
-        });
-        if let (Some(command), Value::Object(fields)) = (command.as_object_mut(), response) {
-            command.extend(fields);
-        }
-        Some(command)
+        Some(respond_value(&self.thread.as_ref()?.id, request_id, response))
     }
 
-    /// Answers a runtime request; `response` holds `decision`, `feedback` or `answers`.
-    fn respond(&mut self, request_id: String, response: Value, cx: &mut Context<Self>) {
-        let (Some(command), Some(client)) = (self.respond_command(&request_id, response), self.client()) else {
-            return;
-        };
+    /// Answers a runtime request in the pane's thread; `response` holds `decision`, `feedback` or `answers`.
+    fn respond(&mut self, pane: side_chat::ChatPane, request_id: String, response: Value, cx: &mut Context<Self>) {
+        let Some((client, thread_id)) = self.pane_client(pane, cx) else { return };
+        let command = respond_value(&thread_id, &request_id, response);
         self.responding = Some(request_id.clone());
         cx.spawn(async move |this, cx| {
             let result = client.request("orchestration.dispatchCommand", command).await;
@@ -1152,7 +1141,9 @@ impl Workspace {
                 if this.responding.as_ref() == Some(&request_id) {
                     this.responding = None;
                 }
-                if let Err(error) = result {
+                if let Err(error) = result
+                    && this.pane_shows(pane, &thread_id)
+                {
                     this.error = Some(error.to_string().into());
                 }
                 cx.notify();
@@ -1186,6 +1177,20 @@ impl Workspace {
 
 fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+/// `runtime-request.respond` in `thread_id`, with `response`'s fields.
+fn respond_value(thread_id: &str, request_id: &str, response: Value) -> Value {
+    let mut command = json!({
+        "type": "runtime-request.respond",
+        "commandId": new_id(),
+        "threadId": thread_id,
+        "requestId": request_id,
+    });
+    if let (Some(command), Value::Object(fields)) = (command.as_object_mut(), response) {
+        command.extend(fields);
+    }
+    command
 }
 
 fn draft_title(text: &str) -> String {

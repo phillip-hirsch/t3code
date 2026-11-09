@@ -16,7 +16,7 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, ElementId, Entity, Focusable as _, FontWeight, InteractiveElement as _,
+    AnyElement, App, AppContext as _, Context, Entity, Focusable as _, FontWeight, InteractiveElement as _,
     IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled as _,
     Subscription, Task, Window, div, px,
 };
@@ -437,8 +437,6 @@ impl Workspace {
             Some(projection) => timeline::rows(projection, &self.expanded, &options, &mut view.cache),
             None => Vec::new(),
         };
-        // The side chat answers its approvals under its own timeline.
-        rows.retain(|row| !matches!(row, Row::Approval { .. }));
         for row in &mut rows {
             match row {
                 Row::User { revert, .. } => *revert = None,
@@ -534,18 +532,6 @@ impl Workspace {
             let Some(run) = projection.interruptible_run() else { return };
             json!({"type": "run.interrupt", "commandId": new_id(), "threadId": thread_id, "runId": run.id, "holdQueue": true})
         };
-        self.dispatch(command, cx);
-    }
-
-    fn respond_side_chat(&mut self, request_id: &str, decision: &str, cx: &mut Context<Self>) {
-        let Some((_, thread_id)) = self.pane_client(ChatPane::Side, cx) else { return };
-        let command = json!({
-            "type": "runtime-request.respond",
-            "commandId": new_id(),
-            "threadId": thread_id,
-            "requestId": request_id,
-            "decision": decision,
-        });
         self.dispatch(command, cx);
     }
 
@@ -755,32 +741,19 @@ This permanently clears its conversation history."
                     .into_any_element()
             }
         };
+        // As in the open thread: approvals the timeline shows where they were asked stay there.
         let approvals: Vec<AnyElement> = projection
             .map(|p| p.pending_approvals())
             .unwrap_or_default()
             .into_iter()
-            .filter(|(request, _)| request.is_live())
+            .filter(|(request, _)| {
+                !view
+                    .rows
+                    .iter()
+                    .any(|row| matches!(row, Row::Approval { request_id, .. } if *request_id == request.id))
+            })
             .map(|(request, item)| {
-                let label =
-                    item.and_then(|i| i.str("prompt")).filter(|p| !p.is_empty()).unwrap_or("Approval requested");
-                let choice = |decision: &'static str, text: &'static str, cx: &mut Context<Self>| {
-                    let request_id = request.id.clone();
-                    Button::new(ElementId::Name(format!("side-chat-{decision}-{}", request.id).into()))
-                        .ghost()
-                        .xsmall()
-                        .label(text)
-                        .on_click(cx.listener(move |this, _, _, cx| this.respond_side_chat(&request_id, decision, cx)))
-                };
-                h_flex()
-                    .gap_2()
-                    .px_3()
-                    .py_1()
-                    .text_xs()
-                    .child(Icon::new(IconName::Shield).size(px(12.)).text_color(t.warning))
-                    .child(div().flex_1().min_w_0().truncate().text_color(t.muted_foreground).child(label.to_owned()))
-                    .child(choice("decline", "Decline", cx))
-                    .child(choice("accept", "Approve", cx))
-                    .into_any_element()
+                div().px_3().child(self.render_approval(ChatPane::Side, request, item, t, cx)).into_any_element()
             })
             .collect();
         let running = projection.is_some_and(ThreadProjection::is_running);

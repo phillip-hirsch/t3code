@@ -25,6 +25,7 @@ use super::attachments::Attachment;
 use super::composer_fit::{ControlsWidths, ModeFit, resolve_mode_fit};
 use super::context_strip::PermissionsForm;
 use super::send::Intent;
+use super::side_chat::ChatPane;
 use super::{Target, Workspace, new_id};
 use crate::composer_text::{self, Chip};
 use crate::model::{ModelSelection, RuntimeRequest, TurnItem};
@@ -694,7 +695,7 @@ impl Workspace {
         if self.responding.is_some() {
             return;
         }
-        self.respond(request_id, json!({"answers": answers}), cx);
+        self.respond(ChatPane::Main, request_id, json!({"answers": answers}), cx);
     }
 
     fn previous_question(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -972,7 +973,7 @@ impl Workspace {
                     approvals
                         .iter()
                         .filter(|(request, _)| !self.timeline_shows_approval(&request.id))
-                        .map(|(request, item)| self.render_approval(request, *item, &t, cx)),
+                        .map(|(request, item)| self.render_approval(ChatPane::Main, request, *item, &t, cx)),
                 )
                 .children(self.render_banner_dock(&t, cx))
                 .child(
@@ -1302,6 +1303,7 @@ impl Workspace {
 
     pub(super) fn render_approval(
         &self,
+        pane: ChatPane,
         request: &RuntimeRequest,
         item: Option<&TurnItem>,
         t: &Tokens,
@@ -1363,7 +1365,9 @@ impl Workspace {
                     .when(!enabled, |el| el.opacity(0.64))
                     .when(enabled, |el| {
                         el.cursor_pointer().hover(|s| s.underline().text_color(t.foreground)).on_click(cx.listener(
-                            move |this, _, _, cx| this.respond(request_id.clone(), json!({"decision": decision}), cx),
+                            move |this, _, _, cx| {
+                                this.respond(pane, request_id.clone(), json!({"decision": decision}), cx);
+                            },
                         ))
                     })
             };
@@ -1407,7 +1411,7 @@ impl Workspace {
                                 let item =
                                     if warning.is_some() { item.icon(Icon::new(Lucide::TriangleAlert)) } else { item };
                                 menu = menu.item(item.on_click(window.listener_for(&view, move |this, _, _, cx| {
-                                    this.respond(request_id.clone(), json!({"decision": decision}), cx);
+                                    this.respond(pane, request_id.clone(), json!({"decision": decision}), cx);
                                 })));
                             }
                             menu
