@@ -31,9 +31,13 @@ pub(crate) enum DisplayRow {
     File(usize),
     /// Binary, metadata-only or empty file summary, for a file without source rows.
     Notice(usize),
+    /// The separator before hunk `hunk`, or after the last hunk when `hunk`
+    /// is the hunk count. `hidden` holds the gap's pairs it hides, which a
+    /// hydrated file has; a patch-only file has none to hide.
     Hunk {
         file: usize,
         hunk: usize,
+        hidden: Range<usize>,
     },
     Fold {
         file: usize,
@@ -73,8 +77,69 @@ pub(crate) enum FoldExpansion {
     Up,
     /// The lines just below the preceding source.
     Down,
+    /// The expansion count of lines at each end.
+    Both,
     All,
 }
+
+/// How many lines of the unchanged gap before a hunk show at each end
+/// (Pierre's expanded hunk region).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GapReveal {
+    from_start: usize,
+    from_end: usize,
+}
+
+impl GapReveal {
+    /// Reveals `lines` more at the ends `expansion` names.
+    pub(crate) fn expand(self, expansion: FoldExpansion, lines: usize) -> Self {
+        let (start, end) = match expansion {
+            FoldExpansion::Down => (lines, 0),
+            FoldExpansion::Up => (0, lines),
+            FoldExpansion::Both => (lines, lines),
+            FoldExpansion::All => (usize::MAX, 0),
+        };
+        Self {
+            from_start: self.from_start.saturating_add(start),
+            from_end: self.from_end.saturating_add(end),
+        }
+    }
+
+    /// Splits a gap into its shown top, hidden middle and shown bottom. The
+    /// gap after the last hunk reveals from its top only, and a gap shorter
+    /// than `min_collapsed` shows whole.
+    pub(crate) fn split(
+        self,
+        gap: Range<usize>,
+        trailing: bool,
+        min_collapsed: usize,
+    ) -> [Range<usize>; 3] {
+        if gap.len() < min_collapsed {
+            return [gap.clone(), gap.end..gap.end, gap.end..gap.end];
+        }
+        let top = gap.start + self.from_start.min(gap.len());
+        let bottom = if trailing {
+            gap.end
+        } else {
+            gap.end - self.from_end.min(gap.end - top)
+        };
+        [gap.start..top, top..bottom, bottom..gap.end]
+    }
+}
+
+/// Both sides of a file in full, for [`DiffFile::with_contents`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DiffFileContents {
+    pub original: String,
+    pub modified: String,
+}
+
+/// Reads a file's full contents so a [`DiffState`] can show the unchanged
+/// lines its patch omits. Called with the patch-only file on the first
+/// expansion of its unchanged lines; a failed read leaves the file as it was,
+/// and the next expansion reads again.
+pub type DiffContentsLoader =
+    Rc<dyn Fn(&DiffFile, &mut App) -> Task<anyhow::Result<DiffFileContents>>>;
 
 /// Notifications from the readonly comparison surface.
 #[derive(Clone, Debug)]
@@ -215,6 +280,13 @@ pub struct DiffState {
     expansion_lines: usize,
     min_collapsed_lines: usize,
     expanded: Vec<Vec<Range<usize>>>,
+    /// Each file's revealed gap ends, by gap index (see [`DisplayRow::Hunk`]).
+    revealed: Vec<Vec<GapReveal>>,
+    contents_loader: Option<DiffContentsLoader>,
+    /// Content reads in flight, by path, each with its own number so a read
+    /// that was dropped does not end a later one.
+    loading_contents: HashMap<SharedString, u64>,
+    next_contents_read: u64,
     collapsed: HashSet<SharedString>,
     resolutions: HashMap<(SharedString, usize), DiffConflictResolution>,
     file_rows: Vec<FileRows>,
@@ -341,6 +413,10 @@ impl DiffState {
         let files = files.into_iter().collect::<Vec<_>>();
         let mut state = Self {
             expanded: vec![Vec::new(); files.len()],
+            revealed: vec![Vec::new(); files.len()],
+            contents_loader: None,
+            loading_contents: HashMap::new(),
+            next_contents_read: 0,
             presentations: vec![None; files.len()],
             file_ixs: file_ixs(&files),
             files,
@@ -574,7 +650,11 @@ impl DiffState {
         }
         let row_height = self.row_height.unwrap_or(px(20.));
         let limit = viewport.bottom() + margin;
-        let first = self.list.logical_scroll_top().item_ix.min(self.rows.len() - 1);
+        let first = self
+            .list
+            .logical_scroll_top()
+            .item_ix
+            .min(self.rows.len() - 1);
         let (mut last, mut next_top) = (first, viewport.top());
         for ix in first..self.rows.len() {
             let top = match self.list.bounds_for_item(ix) {
@@ -680,6 +760,8 @@ impl DiffState {
             .retain(|path| self.file_ixs.contains_key(path));
         self.resolutions.clear();
         self.expanded = vec![Vec::new(); self.files.len()];
+        self.revealed = vec![Vec::new(); self.files.len()];
+        self.loading_contents.clear();
         self.reset_presentation();
         self.layout = None;
         self.annotations.clear();
@@ -755,13 +837,24 @@ impl DiffState {
             self.selecting = false;
         }
         self.resolutions.retain(|(path, _), _| kept_path(path));
+        self.loading_contents.retain(|path, _| kept_path(path));
         self.expanded = previous
             .iter()
             .map(|old| old.map_or_else(Vec::new, |old| mem::take(&mut self.expanded[old])))
             .collect();
+        self.revealed = previous
+            .iter()
+            .map(|old| old.map_or_else(Vec::new, |old| mem::take(&mut self.revealed[old])))
+            .collect();
         let presentations = previous
             .iter()
             .map(|old| old.and_then(|old| self.presentations[old].take()))
+            .collect();
+        // A file that stays keeps the full contents it was hydrated with.
+        let files = files
+            .into_iter()
+            .zip(&previous)
+            .map(|(file, old)| old.map_or(file, |old| self.files[old].clone()))
             .collect();
         self.files = files;
         self.file_ixs = file_ixs(&self.files);
@@ -809,10 +902,18 @@ impl DiffState {
         cx.notify();
     }
 
-    /// Reveals all unchanged source while preserving the configured context count.
+    /// Reveals all unchanged source while preserving the configured context
+    /// count; a file's lines outside its hunks show once it is hydrated.
     pub fn expand_unchanged(&mut self, cx: &mut Context<Self>) {
-        for (expanded, file) in self.expanded.iter_mut().zip(&self.files) {
+        for ((expanded, revealed), file) in self
+            .expanded
+            .iter_mut()
+            .zip(&mut self.revealed)
+            .zip(&self.files)
+        {
             *expanded = vec![0..file.pairs().len()];
+            *revealed =
+                vec![GapReveal::default().expand(FoldExpansion::All, 0); file.hunks().len() + 1];
         }
         self.rebuild_at_anchor();
         cx.notify();
@@ -821,7 +922,157 @@ impl DiffState {
     /// Restores the configured context disclosures.
     pub fn collapse_unchanged(&mut self, cx: &mut Context<Self>) {
         self.expanded.iter_mut().for_each(Vec::clear);
+        self.revealed.iter_mut().for_each(Vec::clear);
         self.rebuild_at_anchor();
+        cx.notify();
+    }
+
+    /// Reads full files to show the unchanged lines their patches omit
+    /// (Pierre's `loadDiffFiles`), or offers none with `None`. With a loader,
+    /// the separators of each [loadable](DiffFile::can_load_contents) file
+    /// expand, and one more follows its last hunk. Reads in flight are dropped.
+    pub fn set_contents_loader(
+        &mut self,
+        loader: Option<DiffContentsLoader>,
+        cx: &mut Context<Self>,
+    ) {
+        self.contents_loader = loader;
+        self.loading_contents.clear();
+        self.rebuild_at_anchor();
+        cx.notify();
+    }
+
+    /// Whether file `file`'s unchanged lines outside its hunks can show: it
+    /// is hydrated, or the loader can read it.
+    pub(crate) fn can_expand_gaps(&self, file: usize) -> bool {
+        self.files.get(file).is_some_and(|document| {
+            document.is_hydrated() || self.contents_loader.is_some() && document.can_load_contents()
+        })
+    }
+
+    /// Reveals part or all of the unchanged gap before hunk `gap` (or after
+    /// the last), reading the file's contents first when it has none.
+    pub(crate) fn expand_gap(
+        &mut self,
+        file: usize,
+        gap: usize,
+        expansion: FoldExpansion,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_expand_gaps(file) {
+            return;
+        }
+        let revealed = &mut self.revealed[file];
+        if revealed.len() <= gap {
+            revealed.resize(gap + 1, GapReveal::default());
+        }
+        revealed[gap] = revealed[gap].expand(expansion, self.expansion_lines);
+        if self.files[file].is_hydrated() {
+            self.rebuild_at_anchor();
+            cx.notify();
+        } else {
+            self.load_contents(file, cx);
+        }
+    }
+
+    /// Reads a patch-only file's contents and hydrates it once they arrive,
+    /// unless the file was replaced meanwhile.
+    fn load_contents(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let file = self.files[ix].clone();
+        let Some(loader) = self.contents_loader.clone() else {
+            return;
+        };
+        if self.loading_contents.contains_key(file.path()) {
+            return;
+        }
+        let read = loader(&file, cx);
+        let (path, id) = (file.path().clone(), self.next_contents_read);
+        self.next_contents_read += 1;
+        self.loading_contents.insert(path.clone(), id);
+        cx.spawn(async move |this, cx| {
+            let contents = read.await;
+            let hydrated = cx
+                .background_spawn(async move {
+                    let contents = contents?;
+                    let hydrated = file.with_contents(&contents.original, &contents.modified)?;
+                    anyhow::Ok((file, hydrated))
+                })
+                .await;
+            let _ = this.update(cx, |state, cx| {
+                if state.loading_contents.get(&path) != Some(&id) {
+                    return;
+                }
+                state.loading_contents.remove(&path);
+                match hydrated {
+                    Ok((file, hydrated)) => state.hydrate(&file, hydrated, cx),
+                    Err(error) => {
+                        log::warn!("could not read {path} in full for the diff: {error:#}");
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Puts `hydrated` in the place of `from`, the patch-only file it was
+    /// built from, keeping its expanded context, selection and viewport.
+    fn hydrate(&mut self, from: &DiffFile, hydrated: DiffFile, cx: &mut Context<Self>) {
+        let Some(ix) = self
+            .file_ix(from.path())
+            .filter(|&ix| !self.files[ix].is_hydrated() && self.files[ix].is_same(from))
+        else {
+            return;
+        };
+        let anchor = self.row_position(self.list.logical_scroll_top().item_ix);
+        let entity = Some(self.selection.entity_id());
+        let text_in_file = self.selection.snapshot(cx).is_some_and(|snapshot| {
+            [snapshot.anchor(), snapshot.cursor()]
+                .into_iter()
+                .any(|point| {
+                    point.entity_id() == entity
+                        && point
+                            .content_key()
+                            .is_some_and(|key| decode_key(key.value()).0 == ix)
+                })
+        });
+        if let Some(window) = self.window
+            && text_in_file
+        {
+            TextSelection::clear_for_window(window, cx);
+        }
+        // Folds inside hunks move by the gap lines now before their hunk.
+        let shift = |pair: usize| {
+            from.hunks()
+                .iter()
+                .zip(hydrated.hunks())
+                .find(|(old, _)| old.pairs().contains(&pair))
+                .map_or(hydrated.pairs().len(), |(old, new)| {
+                    pair - old.pairs().start + new.pairs().start
+                })
+        };
+        self.expanded[ix] = self.expanded[ix]
+            .iter()
+            .filter(|range| !range.is_empty())
+            .map(|range| shift(range.start)..shift(range.end - 1) + 1)
+            .collect();
+        self.files[ix] = hydrated;
+        let mut presentations = mem::take(&mut self.presentations);
+        presentations[ix] = None;
+        self.reset_presentation();
+        self.presentations = presentations;
+        self.annotations.clear();
+        self.geometry.borrow_mut().clear();
+        self.rebuild(false);
+        let end = self
+            .header_rows
+            .get(ix + 1)
+            .copied()
+            .unwrap_or(self.rows.len());
+        self.list.remeasure_items(self.header_rows[ix]..end);
+        if let Some(anchor) = anchor {
+            self.reveal_line(&anchor);
+        }
+        self.ensure_presentation(cx);
         cx.notify();
     }
 
@@ -1014,13 +1265,16 @@ impl DiffState {
         cx: &mut Context<Self>,
     ) {
         let lines = self.expansion_lines;
+        let up = pairs.end.saturating_sub(lines).max(pairs.start)..pairs.end;
+        let down = pairs.start..(pairs.start + lines).min(pairs.end);
         let revealed = match expansion {
-            FoldExpansion::All => pairs,
-            FoldExpansion::Up => pairs.end.saturating_sub(lines).max(pairs.start)..pairs.end,
-            FoldExpansion::Down => pairs.start..(pairs.start + lines).min(pairs.end),
+            FoldExpansion::All => vec![pairs],
+            FoldExpansion::Up => vec![up],
+            FoldExpansion::Down => vec![down],
+            FoldExpansion::Both => vec![down, up],
         };
         if let Some(expanded) = self.expanded.get_mut(file) {
-            expanded.push(revealed);
+            expanded.extend(revealed);
             self.rebuild_at_anchor();
             cx.notify();
         }
@@ -1345,10 +1599,22 @@ impl DiffState {
 
     fn expand_line(&mut self, position: &DiffLinePosition) -> Option<usize> {
         let row = self.source_row(position)?;
-        if let Some(DisplayRow::Fold { file, pairs }) = self.rows.get(row) {
-            let (file, pairs) = (*file, pairs.clone());
-            self.expanded[file].push(pairs);
-            self.rebuild_at_anchor();
+        match self.rows.get(row) {
+            Some(DisplayRow::Fold { file, pairs }) => {
+                let (file, pairs) = (*file, pairs.clone());
+                self.expanded[file].push(pairs);
+                self.rebuild_at_anchor();
+            }
+            Some(DisplayRow::Hunk { file, hunk, .. }) => {
+                let (file, gap) = (*file, *hunk);
+                let revealed = &mut self.revealed[file];
+                if revealed.len() <= gap {
+                    revealed.resize(gap + 1, GapReveal::default());
+                }
+                revealed[gap] = revealed[gap].expand(FoldExpansion::All, 0);
+                self.rebuild_at_anchor();
+            }
+            _ => {}
         }
         self.source_row(position)
     }
@@ -1534,6 +1800,8 @@ impl DiffState {
                     self.context_lines,
                     self.min_collapsed_lines,
                     &self.expanded[ix],
+                    &self.revealed[ix],
+                    self.contents_loader.is_some() && file.can_load_contents(),
                 );
             }
         }
@@ -1685,15 +1953,17 @@ fn source_rows(files: &[DiffFile], rows: &[DisplayRow]) -> Vec<FileRows> {
                 modified,
                 ..
             } => map(*file, *original, *modified),
-            DisplayRow::Fold { file, pairs } => {
+            DisplayRow::Fold { file, pairs }
+            | DisplayRow::Hunk {
+                file,
+                hidden: pairs,
+                ..
+            } => {
                 for pair in &files[*file].pairs()[pairs.clone()] {
                     map(*file, pair.original(), pair.modified());
                 }
             }
-            DisplayRow::File(_)
-            | DisplayRow::Notice(_)
-            | DisplayRow::Hunk { .. }
-            | DisplayRow::Conflict { .. } => {}
+            DisplayRow::File(_) | DisplayRow::Notice(_) | DisplayRow::Conflict { .. } => {}
         }
     }
     file_rows
@@ -1736,18 +2006,9 @@ pub(crate) fn decode_key(key: u64) -> (usize, DiffSide, usize) {
     )
 }
 
-/// The end of the hunk containing each pair; a fixture without hunks is one.
-fn hunk_ends(document: &DiffFile) -> Vec<usize> {
-    let pairs = document.pairs();
-    let mut hunk_end = vec![pairs.len(); pairs.len()];
-    for hunk in document.hunks() {
-        hunk_end[hunk.pairs()].fill(hunk.pairs().end);
-    }
-    hunk_end
-}
-
 /// Which pairs show as code: changes with their context, expanded ranges,
-/// and collapsed ranges shorter than `min_collapsed_lines`.
+/// and collapsed ranges shorter than `min_collapsed_lines`. Context and folds
+/// stay within their hunk, or within the gap between two.
 fn visible_pairs(
     document: &DiffFile,
     context: Option<usize>,
@@ -1755,12 +2016,11 @@ fn visible_pairs(
     expanded: &[Range<usize>],
 ) -> Vec<bool> {
     let pairs = document.pairs();
-    let hunks = document.hunks();
     let mut hunk_end = vec![pairs.len(); pairs.len()];
     let mut hunk_start = vec![0; pairs.len()];
-    for hunk in hunks {
-        hunk_start[hunk.pairs()].fill(hunk.pairs().start);
-        hunk_end[hunk.pairs()].fill(hunk.pairs().end);
+    for segment in document.segments() {
+        hunk_start[segment.clone()].fill(segment.start);
+        hunk_end[segment.clone()].fill(segment.end);
     }
     // Interval boundaries avoid repeatedly filling overlapping context windows.
     // Projection remains linear in source lines plus the number of disclosures.
@@ -1817,6 +2077,11 @@ fn visible_pairs(
     visible
 }
 
+/// Projects a file's hunks and the separators between them. A hydrated
+/// file's gaps show their revealed ends around the separator; a patch-only
+/// file has a separator before each hunk, and one after the last while
+/// `loadable`, since only a contents read can tell what follows.
+#[allow(clippy::too_many_arguments)]
 fn project_file(
     rows: &mut Vec<DisplayRow>,
     file: usize,
@@ -1825,27 +2090,67 @@ fn project_file(
     context: Option<usize>,
     min_collapsed_lines: usize,
     expanded: &[Range<usize>],
+    revealed: &[GapReveal],
+    loadable: bool,
 ) {
     let pairs = document.pairs();
     let hunks = document.hunks();
-    let hunk_end = hunk_ends(document);
     let visible = visible_pairs(document, context, min_collapsed_lines, expanded);
-    let mut hunk_ix = 0;
-    let mut ix = 0;
-    while ix < pairs.len() {
-        while let Some(hunk) = hunks.get(hunk_ix) {
-            if hunk.pairs().start != ix {
-                break;
+    if hunks.is_empty() {
+        project_pairs(rows, file, pairs, mode, &visible, 0..pairs.len());
+        return;
+    }
+    let unchanged = |rows: &mut Vec<DisplayRow>, range: Range<usize>| {
+        rows.extend(pairs[range].iter().map(|pair| DisplayRow::Code {
+            file,
+            original: pair.original(),
+            modified: pair.modified(),
+            changed: false,
+        }));
+    };
+    for gap in 0..=hunks.len() {
+        let trailing = gap == hunks.len();
+        if document.is_hydrated() {
+            let reveal = revealed.get(gap).copied().unwrap_or_default();
+            let [top, hidden, bottom] =
+                reveal.split(document.gap_pairs(gap), trailing, min_collapsed_lines);
+            unchanged(rows, top);
+            if !hidden.is_empty() {
+                rows.push(DisplayRow::Hunk {
+                    file,
+                    hunk: gap,
+                    hidden,
+                });
             }
+            unchanged(rows, bottom);
+        } else if !trailing || loadable {
             rows.push(DisplayRow::Hunk {
                 file,
-                hunk: hunk_ix,
+                hunk: gap,
+                hidden: 0..0,
             });
-            hunk_ix += 1;
         }
+        if let Some(hunk) = hunks.get(gap) {
+            project_pairs(rows, file, pairs, mode, &visible, hunk.pairs());
+        }
+    }
+}
+
+/// Projects one hunk's pairs, or a fixture's whole file: changes, their
+/// context and folds.
+fn project_pairs(
+    rows: &mut Vec<DisplayRow>,
+    file: usize,
+    pairs: &[super::document::LinePair],
+    mode: DiffMode,
+    visible: &[bool],
+    range: Range<usize>,
+) {
+    let mut ix = range.start;
+    while ix < range.end {
         if !visible[ix] {
             let start = ix;
-            while ix < pairs.len() && ix < hunk_end[start] && !visible[ix] {
+            while ix < range.end && !visible[ix] {
                 ix += 1;
             }
             rows.push(DisplayRow::Fold {
@@ -1854,7 +2159,7 @@ fn project_file(
             });
         } else if mode == DiffMode::Unified && pairs[ix].is_changed() {
             let start = ix;
-            while ix < pairs.len() && ix < hunk_end[start] && pairs[ix].is_changed() {
+            while ix < range.end && pairs[ix].is_changed() {
                 ix += 1;
             }
             for pair in &pairs[start..ix] {

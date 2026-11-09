@@ -722,6 +722,8 @@ Diff:
     ru: "Строк вне патча: %{count}"
     zh-CN: "patch 中未包含 %{count} 行"
     zh-HK: "patch 中未包含 %{count} 行"
+  MoreContext:
+    en: "More unchanged context may be available"
   ExpandAbove:
     en: Show %{count} lines above
     pt-BR: "Mostrar %{count} linhas acima"

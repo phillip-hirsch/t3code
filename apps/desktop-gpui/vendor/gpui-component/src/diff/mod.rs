@@ -13,10 +13,12 @@ mod state;
 
 pub use conflict::{DiffConflict, DiffConflictResolution};
 pub use decoration::{DiffDecoration, DiffGutterMarker};
-pub use document::{DiffFile, DiffFileStatus, DiffLinePosition, DiffLineRange, DiffSide};
+pub use document::{
+    DiffContentsMismatch, DiffFile, DiffFileStatus, DiffLinePosition, DiffLineRange, DiffSide,
+};
 pub use parser::{DiffParseError, DiffParseOptions};
 pub use presentation::DiffInlineUnit;
-pub use state::{DiffEvent, DiffState};
+pub use state::{DiffContentsLoader, DiffEvent, DiffFileContents, DiffState};
 
 use std::{collections::HashMap, rc::Rc, sync::Arc};
 
@@ -32,7 +34,7 @@ use rust_i18n::t;
 
 use crate::{
     ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _,
-    button::{Button, ButtonVariants as _},
+    button::{Button, ButtonCustomVariant, ButtonRounded, ButtonVariants as _},
     h_flex,
     input::{Copy, SelectAll},
     scroll::{ScrollableMask, Scrollbar},
@@ -562,6 +564,14 @@ fn render_diff(
         content_width
     };
     let code = Rc::new(CodePresentation {
+        expandable_gaps: (0..state.files().len())
+            .map(|file| state.can_expand_gaps(file))
+            .collect(),
+        collapsed: state
+            .files()
+            .iter()
+            .map(|file| state.is_file_collapsed(file.path()))
+            .collect(),
         files: state.files().to_vec(),
         presentations: state.presentations().to_vec(),
         mode,
@@ -836,6 +846,11 @@ fn body_focused(state: &DiffState, window: &Window, cx: &mut Context<DiffState>)
 
 struct CodePresentation {
     files: Vec<DiffFile>,
+    /// Whether each file's unchanged gaps can expand ([`DiffState::can_expand_gaps`]).
+    expandable_gaps: Vec<bool>,
+    /// Whether each file is folded to its header. Read here, not from the
+    /// state, which the sticky header renders inside an update of.
+    collapsed: Vec<bool>,
     presentations: Vec<Option<Arc<FilePresentation>>>,
     mode: DiffMode,
     content_width: Pixels,
@@ -974,7 +989,9 @@ fn render_row(
     match row {
         DisplayRow::File(file) => render_file_header(*file, &code, window, cx),
         DisplayRow::Notice(file) => render_notice(&code.files[*file], cx),
-        DisplayRow::Hunk { file, hunk } => render_hunk_separator(*file, *hunk, &code, cx),
+        DisplayRow::Hunk { file, hunk, hidden } => {
+            render_hunk_separator(*file, *hunk, hidden.len(), &code, cx)
+        }
         DisplayRow::Fold { file, pairs } => render_fold(*file, pairs.clone(), &code, cx),
         DisplayRow::Conflict {
             file,
@@ -1033,13 +1050,17 @@ fn render_row(
     }
 }
 
+/// The separator before hunk `hunk`, or after the last one. `hidden` counts
+/// the lines a hydrated file's separator hides.
 fn render_hunk_separator(
     file: usize,
     hunk: usize,
+    hidden: usize,
     code: &CodePresentation,
     cx: &App,
 ) -> AnyElement {
-    let hunks = code.files[file].hunks();
+    let document = &code.files[file];
+    let hunks = document.hunks();
     let row = h_flex()
         .w_full()
         .px_3()
@@ -1047,35 +1068,155 @@ fn render_hunk_separator(
         .text_xs()
         .text_color(cx.theme().muted_foreground);
     match code.hunk_separator {
-        DiffHunkSeparator::Metadata => row
-            .h_6()
-            .child(hunks[hunk].label().clone())
-            .into_any_element(),
+        DiffHunkSeparator::Metadata => match hunks.get(hunk) {
+            Some(metadata) => row.h_6().child(metadata.label().clone()).into_any_element(),
+            None => div().into_any_element(),
+        },
         DiffHunkSeparator::LineInfo => {
-            let hidden = hunks[hunk].hidden_lines_before(hunk.checked_sub(1).map(|ix| &hunks[ix]));
-            if hidden == 0 {
-                return div().into_any_element();
-            }
-            let label = if hidden == 1 {
-                t!("Diff.HiddenLine").to_string()
+            let first = hunk == 0;
+            let trailing = hunk == hunks.len();
+            // The gap's size, and how much of it is hidden; unknown after the
+            // last hunk until the file's contents are read.
+            let (size, hidden) = if document.is_hydrated() {
+                (document.gap_pairs(hunk).len(), Some(hidden))
+            } else if trailing {
+                (0, None)
             } else {
-                t!("Diff.HiddenLines", count = hidden).to_string()
+                let lines =
+                    hunks[hunk].hidden_lines_before(hunk.checked_sub(1).map(|ix| &hunks[ix]));
+                (lines, Some(lines))
             };
+            let label = match hidden {
+                Some(0) => return div().into_any_element(),
+                Some(1) => t!("Diff.HiddenLine").to_string(),
+                Some(count) => t!("Diff.HiddenLines", count = count).to_string(),
+                None => t!("Diff.MoreContext").to_string(),
+            };
+            let surface = cx.theme().foreground.opacity(0.03);
+            let text = cx.theme().foreground.opacity(0.5);
+            let bar = h_flex()
+                .flex_1()
+                .h_full()
+                .text_size(px(11.))
+                .text_color(text);
             // A rounded bar inset from the edges, one step off the code surface.
-            h_flex().w_full().h_6().px_2().child(
-                h_flex()
+            let row = h_flex().w_full().h_6().px_2();
+            if !code.expandable_gaps[file] {
+                return row
+                    .child(
+                        bar.px(px(6.))
+                            .rounded(px(6.))
+                            .bg(surface)
+                            .child(div().truncate().child(label)),
+                    )
+                    .into_any_element();
+            }
+            // Pierre's expandable line-info separator: the expand buttons in
+            // their own cell, then the count, which expands both ends.
+            let lines = code.expansion_lines;
+            let chunked = size > lines;
+            let style = ButtonCustomVariant::new(cx)
+                .color(surface)
+                .foreground(text)
+                .hover(cx.theme().foreground.opacity(0.08))
+                .active(cx.theme().foreground.opacity(0.08))
+                .shadow(false);
+            let expand = |id: &'static str, expansion: FoldExpansion| {
+                let state = code.state.clone();
+                Button::new((id, hunk))
+                    .custom(style)
+                    .rounded(ButtonRounded::None)
+                    .cursor_pointer()
+                    .on_click(move |_, _, cx| {
+                        state.update(cx, |state, cx| state.expand_gap(file, hunk, expansion, cx))
+                    })
+            };
+            let arrow = |id, expansion, icon: IconName, label: String| {
+                expand(id, expansion)
+                    .icon(icon)
+                    .xsmall()
+                    .w_full()
+                    .h_auto()
                     .flex_1()
-                    .h_full()
-                    .px(px(6.))
-                    .rounded(px(6.))
-                    .bg(cx.theme().foreground.opacity(0.03))
-                    .text_size(px(11.))
-                    .text_color(cx.theme().foreground.opacity(0.5))
-                    .child(div().truncate().child(label)),
+                    .accessibility_label(label)
+            };
+            let below = || t!("Diff.ExpandBelow", count = lines).to_string();
+            let above = || t!("Diff.ExpandAbove", count = lines).to_string();
+            let mut arrows = Vec::new();
+            if chunked {
+                if !first {
+                    arrows.push(arrow(
+                        "expand-down",
+                        FoldExpansion::Down,
+                        IconName::ChevronDown,
+                        below(),
+                    ));
+                }
+                if !trailing {
+                    arrows.push(arrow(
+                        "expand-up",
+                        FoldExpansion::Up,
+                        IconName::ChevronUp,
+                        above(),
+                    ));
+                }
+            } else {
+                let all = t!("Diff.ExpandLines", count = size).to_string();
+                arrows.push(match (first, trailing) {
+                    (true, _) => arrow("expand-up", FoldExpansion::Up, IconName::ChevronUp, all),
+                    (_, true) => arrow(
+                        "expand-down",
+                        FoldExpansion::Down,
+                        IconName::ChevronDown,
+                        all,
+                    ),
+                    _ => arrow(
+                        "expand-both",
+                        FoldExpansion::Both,
+                        IconName::ChevronsUpDown,
+                        all,
+                    ),
+                });
+            }
+            let stacked = arrows.len() > 1;
+            let arrows = arrows.into_iter().enumerate().map(|(ix, button)| {
+                button
+                    .when(ix == 0, |this| this.rounded_tl(px(6.)))
+                    .when((ix == 0 && !stacked) || ix == 1, |this| {
+                        this.rounded_bl(px(6.))
+                    })
+            });
+            let count = expand("expand-count", FoldExpansion::Both)
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .px(px(6.))
+                .rounded_tr(px(6.))
+                .rounded_br(px(6.))
+                .text_size(px(11.))
+                .content_style(
+                    StyleRefinement::default().justify_start(),
+                    crate::Size::XSmall,
+                )
+                .label(label);
+            row.child(
+                bar.gap(px(2.))
+                    .child(
+                        v_flex()
+                            .w(px(34.))
+                            .h_full()
+                            .flex_none()
+                            .gap(px(2.))
+                            .children(arrows),
+                    )
+                    .child(count),
             )
             .into_any_element()
         }
-        DiffHunkSeparator::Simple => row.h_1().into_any_element(),
+        DiffHunkSeparator::Simple => match hunks.get(hunk) {
+            Some(_) => row.h_1().into_any_element(),
+            None => div().into_any_element(),
+        },
     }
 }
 
@@ -1243,7 +1384,7 @@ fn render_file_header(
     let document = &code.files[file];
     let foreground = cx.theme().muted_foreground;
     let border = cx.theme().border;
-    let collapsed = code.state.read(cx).is_file_collapsed(document.path());
+    let collapsed = code.collapsed[file];
     let content = if let Some(render) = &code.header.content {
         render(document, window, cx)
     } else {

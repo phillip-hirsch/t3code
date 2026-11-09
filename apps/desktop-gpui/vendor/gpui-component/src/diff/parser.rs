@@ -450,7 +450,10 @@ fn parse_hunk(
         original_start..file.original.lines.len(),
         modified_start..file.modified.lines.len(),
         header.to_owned().into(),
-        first_original..first_original + old_used,
+        [
+            first_original..first_original + old_used,
+            first_modified..first_modified + new_used,
+        ],
         truncated,
     ));
     file.last_hunk_start = Some((first_original, first_modified));

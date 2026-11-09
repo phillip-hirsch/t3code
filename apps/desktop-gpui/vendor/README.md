@@ -249,6 +249,11 @@ above `src/text`, which this folder lacks: run them from a scratch copy laid out
 
 ## gpui-component 0.9.0
 
+The crate's tests need `--features test-support` and `include_bytes!` files of the upstream
+monorepo: run them from a scratch workspace with this folder as `<dir>/crates/ui`, gpui-kit-assets
+as `crates/assets`, the vendored gpui-base as `crates/base`, stub `examples/fixtures/test.md` and
+`themes/aurora.json`, and `[patch.crates-io]` entries for the vendored gpui crates.
+
 **The diff view draws like the web's.** The web renders diffs with Pierre diffs, whose unified
 view shows one line number per row (the new line, or the old one for a deletion), marks changed
 rows with a 4px bar at the leading edge (dashed for deletions) and separates hunks with an
@@ -256,12 +261,35 @@ rows with a 4px bar at the leading edge (dashed for deletions) and separates hun
 the numbers, and its line-info separator reads "N lines not in patch" on a flat strip. The patch
 draws one lane per Unified row, moves the bar to the row's edge, and draws the separator as the
 web's rounded bar with Pierre's wording. The app picks `DiffHunkSeparator::LineInfo` and
-`DiffChangeIndicator::Bars`, Pierre's defaults. Expanding unchanged lines needs the full files,
-which the app doesn't load, so the separator has no expand buttons. Files:
+`DiffChangeIndicator::Bars`, Pierre's defaults. Files:
 
 - `src/diff/mod.rs`: `code_width`, the lanes and bar in `code_line`, `change_bar`, and the
   `LineInfo` arm of `render_hunk_separator`.
 - `locales/ui.yml`: `Diff.HiddenLine` and the English `Diff.HiddenLines`.
+
+**Unchanged lines outside the hunks expand from the full files.** Pierre fills in a partial diff
+when the caller gives it `loadDiffFiles` (`canHydrateCollapsedContext`): the line-info separators
+get expand chevrons, and a "More unchanged context may be available" separator follows the last
+hunk. 0.9.0 keeps only the patch's lines. The patch adds `DiffState::set_contents_loader`: with a
+`DiffContentsLoader`, a modified or renamed file's separators expand (up, down or both by the
+expansion count, the count expanding both ends), the first expansion reads the file and
+`DiffFile::with_contents` rebuilds it with every line of both sides, and each gap between hunks
+shows its revealed ends (`GapReveal`) around a separator that hides the rest. A failed read leaves
+the patch as it was. `DiffFile::is_same` also matches a hydrated file to the patch-only file it
+came from, so `update_files` keeps it. Files:
+
+- `src/diff/document.rs`: `with_contents`, `can_load_contents`, `is_hydrated`, `gap_pairs`,
+  `segments`, each hunk's modified source lines, and `is_same`.
+- `src/diff/state.rs`: `DisplayRow::Hunk`'s `hidden` pairs and the trailing separator in
+  `project_file`, `GapReveal`, `set_contents_loader`, `expand_gap`, `load_contents`, `hydrate`,
+  and `FoldExpansion::Both`.
+- `src/diff/mod.rs`: the expandable `LineInfo` arm of `render_hunk_separator`.
+- `src/diff/parser.rs`, `src/diff/presentation.rs`: hunks record both sides' lines; a hydrated
+  file highlights in one pass.
+- `locales/ui.yml`: `Diff.MoreContext`.
+- `src/diff/review_tests.rs`: `gap_reveals_grow_from_either_end_and_stop_at_the_gap`,
+  `full_contents_fill_the_gaps_between_hunks`,
+  `expanding_a_gap_reads_the_file_once_and_reveals_its_lines`.
 
 **Lazily read files join a diff without resetting it.** The app reads a large diff one file at a
 time and shows each batch as it settles. 0.9.0's only way to change the files is `set_files`,
@@ -356,4 +384,6 @@ headers are sticky. The patch, in `src/diff/state.rs` and `src/diff/mod.rs`:
   below it, counting rows never laid out at the row height.
 - `DiffState::sticky_header` and `render_diff`'s `diff-sticky-header` overlay: once the list
   scrolls past a file's header, that header draws pinned over the top of the body, pushed up by
-  the next file's header as it arrives; a canvas records its height for the push.
+  the next file's header as it arrives; a canvas records its height for the push. The overlay
+  renders inside the state's update, so file headers read whether their file is folded from
+  `CodePresentation::collapsed`, not from the state.

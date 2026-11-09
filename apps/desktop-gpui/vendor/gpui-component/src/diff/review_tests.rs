@@ -370,3 +370,161 @@ fn changing_presentation_options_keeps_selection_and_scroll(cx: &mut TestAppCont
     });
     assert!(events.borrow().is_empty());
 }
+
+#[test]
+fn gap_reveals_grow_from_either_end_and_stop_at_the_gap() {
+    use super::state::GapReveal;
+    let gap = 10..40;
+    let none = GapReveal::default();
+    assert_eq!(none.split(gap.clone(), false, 2), [10..10, 10..40, 40..40]);
+    // Down continues the lines above; Up the lines above the next hunk.
+    let down = none.expand(FoldExpansion::Down, 20);
+    assert_eq!(down.split(gap.clone(), false, 2), [10..30, 30..40, 40..40]);
+    let both_ends = down.expand(FoldExpansion::Up, 20);
+    assert_eq!(
+        both_ends.split(gap.clone(), false, 2),
+        [10..30, 30..30, 30..40]
+    );
+    let both = none.expand(FoldExpansion::Both, 5);
+    assert_eq!(both.split(gap.clone(), false, 2), [10..15, 15..35, 35..40]);
+    // The gap after the last hunk reveals from its top only.
+    assert_eq!(both.split(gap.clone(), true, 2), [10..15, 15..40, 40..40]);
+    let up = none.expand(FoldExpansion::Up, 5);
+    assert_eq!(up.split(gap.clone(), true, 2), [10..10, 10..40, 40..40]);
+    let all = none
+        .expand(FoldExpansion::All, 0)
+        .expand(FoldExpansion::Down, 1);
+    assert_eq!(all.split(gap, false, 2), [10..40, 40..40, 40..40]);
+    // A gap shorter than the threshold is never hidden.
+    assert_eq!(none.split(5..6, false, 2), [5..6, 6..6, 6..6]);
+    assert_eq!(none.split(5..5, true, 2), [5..5, 5..5, 5..5]);
+}
+
+/// Thirty lines with lines 5 and 25 changed, as a one-line-context patch.
+const PARTIAL: &str = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -4,3 +4,3 @@\n line 4\n-line 5\n+changed 5\n line 6\n@@ -24,3 +24,3 @@\n line 24\n-line 25\n+changed 25\n line 26\n";
+
+fn partial_contents() -> super::DiffFileContents {
+    let original = (1..=30)
+        .map(|line| format!("line {line}\n"))
+        .collect::<String>();
+    let modified = original
+        .replace("line 5\n", "changed 5\n")
+        .replace("line 25\n", "changed 25\n");
+    super::DiffFileContents { original, modified }
+}
+
+#[test]
+fn full_contents_fill_the_gaps_between_hunks() {
+    let file = DiffFile::parse(PARTIAL).unwrap().remove(0);
+    assert!(file.can_load_contents() && !file.is_hydrated());
+    let contents = partial_contents();
+    let hydrated = file
+        .with_contents(&contents.original, &contents.modified)
+        .unwrap();
+    assert!(hydrated.is_hydrated() && !hydrated.can_load_contents());
+    assert_eq!(hydrated.pairs().len(), 30);
+    assert_eq!(
+        (0..=2)
+            .map(|gap| hydrated.gap_pairs(gap))
+            .collect::<Vec<_>>(),
+        [0..3, 6..23, 26..30]
+    );
+    assert_eq!((hydrated.additions(), hydrated.deletions()), (2, 2));
+    assert_eq!(hydrated.lines_count(DiffSide::Modified), 30);
+    assert_eq!(
+        hydrated.text_for_lines(DiffSide::Modified, 24, 26),
+        "line 24\nchanged 25\nline 26\n"
+    );
+    assert!(hydrated.is_same(&file) && !file.is_same(&hydrated));
+    // Every line keeps its place in patch order.
+    let patch = hydrated.patch_lines();
+    assert_eq!(patch.len(), 32);
+    for side in [DiffSide::Original, DiffSide::Modified] {
+        for ix in 0..30 {
+            assert_eq!(patch[hydrated.patch_ix(side, ix)].line(side), Some(ix));
+        }
+    }
+    // Contents that cannot hold the hunks, or whose gaps differ, are refused.
+    let short = (1..=20)
+        .map(|line| format!("line {line}\n"))
+        .collect::<String>();
+    assert!(file.with_contents(&short, &short).is_err());
+    let longer = format!("{}extra\n", contents.modified);
+    assert!(file.with_contents(&contents.original, &longer).is_err());
+    assert!(
+        hydrated
+            .with_contents(&contents.original, &contents.modified)
+            .is_err()
+    );
+    let added = DiffFile::parse("--- /dev/null\n+++ b/n.txt\n@@ -0,0 +1 @@\n+n\n").unwrap();
+    assert!(!added[0].can_load_contents());
+}
+
+fn separators(state: &DiffState) -> Vec<(usize, std::ops::Range<usize>)> {
+    state
+        .rows()
+        .iter()
+        .filter_map(|row| match row {
+            DisplayRow::Hunk { hunk, hidden, .. } => Some((*hunk, hidden.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+#[gpui::test]
+fn expanding_a_gap_reads_the_file_once_and_reveals_its_lines(cx: &mut TestAppContext) {
+    let reads = Rc::new(std::cell::Cell::new(0));
+    let fail = Rc::new(std::cell::Cell::new(true));
+    let loader: super::DiffContentsLoader = {
+        let (reads, fail) = (reads.clone(), fail.clone());
+        Rc::new(move |file: &DiffFile, _: &mut gpui::App| {
+            assert_eq!(file.path().as_str(), "a.txt");
+            reads.set(reads.get() + 1);
+            gpui::Task::ready(if fail.get() {
+                Err(anyhow::anyhow!("offline"))
+            } else {
+                Ok(partial_contents())
+            })
+        })
+    };
+    let files = DiffFile::parse(PARTIAL).unwrap();
+    let state = cx.new(|cx| DiffState::new(files.clone(), cx).with_expansion_lines(5));
+    state.update(cx, |state, cx| {
+        // Without a loader nothing follows the last hunk, and nothing expands.
+        assert_eq!(separators(state), [(0, 0..0), (1, 0..0)]);
+        assert!(!state.can_expand_gaps(0));
+        state.set_contents_loader(Some(loader), cx);
+        assert_eq!(separators(state), [(0, 0..0), (1, 0..0), (2, 0..0)]);
+        state.expand_gap(0, 1, FoldExpansion::Down, cx);
+    });
+    cx.run_until_parked();
+    state.update(cx, |state, cx| {
+        // A failed read leaves the patch as it was; the next expansion reads again.
+        assert!(!state.files()[0].is_hydrated());
+        fail.set(false);
+        state.expand_gap(0, 1, FoldExpansion::Down, cx);
+        state.expand_gap(0, 1, FoldExpansion::Up, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(reads.get(), 2);
+    state.update(cx, |state, cx| {
+        assert!(state.files()[0].is_hydrated());
+        // Expansions asked for while reading apply once the lines arrive.
+        assert_eq!(separators(state), [(0, 0..3), (1, 16..18), (2, 26..30)]);
+        state.expand_gap(0, 2, FoldExpansion::Both, cx);
+        assert_eq!(separators(state), [(0, 0..3), (1, 16..18)]);
+        // Revealing a hidden line opens its gap.
+        state.scroll_to_line(DiffLinePosition::new("a.txt", DiffSide::Modified, 2), cx);
+        assert_eq!(separators(state), [(1, 16..18)]);
+        // The same file arriving again keeps its contents and revealed lines.
+        state.update_files(files.clone(), cx);
+        assert!(state.files()[0].is_hydrated());
+        assert_eq!(separators(state), [(1, 16..18)]);
+        state.collapse_unchanged(cx);
+        assert_eq!(separators(state), [(0, 0..3), (1, 6..23), (2, 26..30)]);
+        // A new patch starts over.
+        state.set_files(files, cx);
+        assert!(!state.files()[0].is_hydrated());
+    });
+    assert_eq!(reads.get(), 2);
+}
