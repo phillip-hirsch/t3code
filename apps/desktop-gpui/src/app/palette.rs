@@ -71,6 +71,19 @@ impl MessageMatch {
             hits: value["hits"].as_u64().and_then(|hits| u32::try_from(hits).ok()),
         })
     }
+
+    /// The hit's thread on the environment that answered.
+    pub(super) fn thread_key(&self) -> ScopedId {
+        ScopedId::new(self.environment_id.clone(), self.thread_id.as_str())
+    }
+
+    fn is_from(&self, key: &ScopedId) -> bool {
+        self.environment_id == key.env && self.thread_id == key.id
+    }
+
+    pub(super) fn is_from_thread(&self, thread: &crate::model::ThreadShell) -> bool {
+        self.environment_id == thread.environment_id && self.thread_id == thread.id
+    }
 }
 
 /// Server message search for a query over every connected environment, debounced
@@ -103,13 +116,14 @@ pub(super) enum View {
 
 #[derive(Clone)]
 enum Run {
-    NewThread(String),
+    /// A draft in this project, on its environment.
+    NewThread(ScopedId),
     Open(View),
-    Thread(String),
+    Thread(ScopedId),
     /// A thread on this environment, which the shell may not list (an archived linked thread).
     ThreadIn(SharedString, String),
     /// A project group's members and the checkout to start a thread in when none has one.
-    Project(Vec<String>, String),
+    Project(Vec<ScopedId>, ScopedId),
     /// "Add project" (`openAddProjectFlow`).
     AddProject,
     /// An environment's sources (`startAddProjectSourceSelection`).
@@ -128,7 +142,7 @@ enum Run {
     Find,
     /// A message hit: opens its thread with find on the query, at the message.
     FindIn {
-        thread_id: String,
+        thread: ScopedId,
         query: String,
         message_id: Option<String>,
     },
@@ -174,7 +188,7 @@ impl Run {
 #[derive(Clone)]
 enum RowIcon {
     Lucide(IconName),
-    Project(String),
+    Project(ScopedId),
 }
 
 #[derive(Clone)]
@@ -191,7 +205,7 @@ enum Description {
 /// and whether it is the open thread.
 #[derive(Clone)]
 struct ThreadSubtitle {
-    project: Option<(String, SharedString)>,
+    project: Option<(ScopedId, SharedString)>,
     location: SharedString,
     branch: Option<SharedString>,
     worktree: bool,
@@ -354,9 +368,9 @@ struct MessageOrder {
 
 /// `ShownOrder`: message result keys in the order the palette last showed them for `query`.
 #[derive(Debug, PartialEq)]
-struct ShownOrder {
+struct ShownOrder<K = ScopedId> {
     query: String,
-    keys: Vec<String>,
+    keys: Vec<K>,
     /// How many of `keys` are on screen; only those hold their places.
     shown: usize,
 }
@@ -366,14 +380,18 @@ const LATE_ROOM: usize = 3;
 
 /// `nextShownOrder`: shown rows keep their places when a slower environment answers, so the
 /// pointer and the arrows stay on the same row; its best matches may take a few rows more.
-fn next_shown_order(previous: Option<ShownOrder>, query: &str, ranked: Vec<String>, limit: usize) -> ShownOrder {
+fn next_shown_order<K: PartialEq + Clone>(
+    previous: Option<ShownOrder<K>>,
+    query: &str,
+    ranked: Vec<K>,
+    limit: usize,
+) -> ShownOrder<K> {
     let Some(previous) = previous.filter(|p| p.query == query) else {
         let shown = limit.min(ranked.len());
         return ShownOrder { query: query.to_owned(), keys: ranked, shown };
     };
-    let kept: Vec<String> =
-        previous.keys[..previous.shown].iter().filter(|key| ranked.contains(key)).cloned().collect();
-    let rest: Vec<String> = ranked.into_iter().filter(|key| !kept.contains(key)).collect();
+    let kept: Vec<K> = previous.keys[..previous.shown].iter().filter(|key| ranked.contains(key)).cloned().collect();
+    let rest: Vec<K> = ranked.into_iter().filter(|key| !kept.contains(key)).collect();
     let arrived = rest.iter().filter(|key| !previous.keys.contains(key)).count();
     let shown = (kept.len() + rest.len()).min(limit + LATE_ROOM).min(limit.max(kept.len() + arrived.min(LATE_ROOM)));
     ShownOrder { query: previous.query, keys: [kept, rest].concat(), shown }
@@ -443,7 +461,7 @@ struct ThreadRanking {
 struct RankingKey {
     query: String,
     revision: u64,
-    current: Option<String>,
+    current: Option<ScopedId>,
     /// Rows show "5m ago" and rank by recency.
     minute: i64,
 }
@@ -872,7 +890,9 @@ impl Workspace {
     /// The open thread's or draft's project, on the target's environment.
     pub(super) fn current_project(&self) -> Option<&ProjectShell> {
         let (env, id) = match self.target.as_ref()? {
-            Target::Thread { env, id } => (env, &self.shell.threads.iter().find(|t| &t.id == id)?.project_id),
+            Target::Thread { env, id } => {
+                (env, &self.shell.thread(&ScopedId::new(env.clone(), id.as_str()))?.project_id)
+            }
             Target::Draft { env, project_id } => (env, project_id),
         };
         self.shell.projects.iter().find(|p| &p.id == id && p.environment_id == *env)
@@ -883,7 +903,7 @@ impl Workspace {
         let groups = self.project_groups();
         groups
             .iter()
-            .find(|g| g.project_ids.contains(&project.id))
+            .find(|g| g.contains_project(project))
             .map_or_else(|| project_name(project), |g| g.display_name.clone().into())
     }
 
@@ -897,7 +917,7 @@ impl Workspace {
             .map(|g| NoProjectEntry {
                 scratch: g.members[0].is_scratch,
                 pinned: g.pinned,
-                preferred: contextual.is_some_and(|p| g.contains(&p.id)),
+                preferred: contextual.is_some_and(|p| g.contains_project(p)),
             })
             .collect();
         let mut rows: Vec<(String, Row)> = pickable
@@ -906,8 +926,8 @@ impl Workspace {
             .map(|g| {
                 let target = g.target_for(contextual);
                 // `runProject`: the contextual checkout when it is one of the group's, else the target.
-                let start = contextual.filter(|p| g.contains(&p.id)).unwrap_or(target);
-                let run = Run::NewThread(start.id.clone());
+                let start = contextual.filter(|p| g.contains_project(p)).unwrap_or(target);
+                let run = Run::NewThread(ScopedId::of_project(start));
                 let mut row = self.project_row(format!("new-in-{}", target.id), g, target, run);
                 // `buildNewThreadInProjectItems`: every member's name and path, and the machine.
                 row.data_terms.extend(
@@ -961,7 +981,7 @@ impl Workspace {
     /// `buildProjectActionItems`: a project group's row at its `target` checkout, matched by its
     /// names and path.
     fn project_row(&self, key: String, group: &crate::project_groups::ProjectGroup, p: &ProjectShell, run: Run) -> Row {
-        let mut row = Row::new(key, RowIcon::Project(p.id.clone()), group.display_name.clone(), run);
+        let mut row = Row::new(key, RowIcon::Project(ScopedId::of_project(p)), group.display_name.clone(), run);
         let machine = self.location_machine(&p.environment_id);
         let location = self.location_label(&p.environment_id);
         row.description = Some(Description::Location(machine, location, p.workspace_root.clone().into()));
@@ -981,7 +1001,7 @@ impl Workspace {
             .into_iter()
             .map(|g| {
                 let p = g.target_for(contextual);
-                let run = Run::Project(g.project_ids.clone(), p.id.clone());
+                let run = Run::Project(g.member_refs(), ScopedId::of_project(p));
                 let mut row = self.project_row(format!("project-{}", p.id), g, p, run);
                 let mut labels: Vec<SharedString> = Vec::new();
                 for member in &g.members {
@@ -1018,8 +1038,12 @@ impl Workspace {
             Row::new(key, RowIcon::Lucide(icon), title, run)
         };
         if let Some(project) = current {
-            let mut row =
-                lucide("new-thread-here", IconName::SquarePen, "New thread in", Run::NewThread(project.id.clone()));
+            let mut row = lucide(
+                "new-thread-here",
+                IconName::SquarePen,
+                "New thread in",
+                Run::NewThread(ScopedId::of_project(project)),
+            );
             row.strong = Some(self.group_name(project));
             row.terms = &["new thread", "chat", "create", "draft"];
             self.bind_shortcut(&mut row, "chat.newLocal");
@@ -1050,10 +1074,7 @@ impl Workspace {
             row.terms = &["triage", "bug", "issue", "report", "broken", "debug", "help", "support"];
             rows.push(row);
         }
-        let thread = match &self.target {
-            Some(Target::Thread { id, .. }) => self.shell.threads.iter().find(|t| &t.id == id),
-            _ => None,
-        };
+        let thread = self.target.as_ref().and_then(Target::thread_key).and_then(|key| self.shell.thread(&key));
         if thread.is_some() && self.thread_find_available() {
             let mut row = lucide("find-current-thread", IconName::TextSearch, "Find in current thread", Run::Find);
             row.terms = &["find", "search", "messages", "plans"];
@@ -1249,9 +1270,9 @@ impl Workspace {
             format!("thread-{}", thread.id),
             RowIcon::Lucide(IconName::MessageSquare),
             thread.title.clone(),
-            Run::Thread(thread.id.clone()),
+            Run::Thread(ScopedId::of_thread(thread)),
         );
-        let project = self.shell.projects.iter().find(|p| p.id == thread.project_id);
+        let project = self.shell.project(&ScopedId::thread_project(thread));
         let project = project.map(|p| p.title.trim()).filter(|title| !title.is_empty());
         // `runtime?.providerInstanceId ?? modelSelection.instanceId`.
         let instance = thread
@@ -1260,12 +1281,12 @@ impl Workspace {
             .or_else(|| thread.model_selection.as_ref().map(|m| m.instance_id.as_str()));
         let driver = instance.and_then(|i| self.env_info(&thread.environment_id)?.provider(i)).map(|p| &p.driver);
         row.description = Some(Description::Thread(ThreadSubtitle {
-            project: project.map(|title| (thread.project_id.clone(), title.to_owned().into())),
+            project: project.map(|title| (ScopedId::thread_project(thread), title.to_owned().into())),
             location: self.location_label(&thread.environment_id),
             branch: thread.branch.as_deref().map(str::trim).filter(|b| !b.is_empty()).map(|b| b.to_owned().into()),
             worktree: thread.worktree_path.as_deref().is_some_and(|path| !path.trim().is_empty()),
             provider: driver.and_then(|driver| crate::assets::provider_icon(driver)),
-            current: self.open_thread_id() == Some(&*thread.id),
+            current: self.route_key() == Some(thread.thread_ref()),
         }));
         row.time = crate::timestamp::parse_ms(thread.latest_user_message_at.as_deref().unwrap_or(&thread.updated_at))
             .map(|at| ago(now - at));
@@ -1275,7 +1296,7 @@ impl Workspace {
     /// `ThreadRowContext`: the project, and the machine when there are several, for a row whose
     /// second line shows a message snippet instead.
     fn thread_context(&self, thread: &crate::model::ThreadShell) -> Option<SharedString> {
-        let project = self.shell.projects.iter().find(|p| p.id == thread.project_id).map(|p| p.title.trim());
+        let project = self.shell.project(&ScopedId::thread_project(thread)).map(|p| p.title.trim());
         let environment = (self.sessions().len() > 1).then(|| self.location_label(&thread.environment_id));
         let parts: Vec<&str> = project.into_iter().chain(environment.as_deref()).filter(|p| !p.is_empty()).collect();
         (!parts.is_empty()).then(|| parts.join(" · ").into())
@@ -1420,13 +1441,14 @@ impl Workspace {
         let shown = shown.map_or(&[][..], |order| &order.keys[..order.shown]);
         let message_rows: Vec<Row> = shown
             .iter()
-            .filter_map(|thread_id| palette.messages.matches.iter().find(|m| &m.thread_id == thread_id))
+            .filter_map(|key| palette.messages.matches.iter().find(|m| m.is_from(key)))
             .filter_map(|m| {
-                let thread = self.palette_threads().find(|t| t.id == m.thread_id)?;
+                let thread = self.palette_threads().find(|t| m.is_from_thread(t))?;
                 let mut row = self.thread_row(thread, now);
-                row.key = format!("message-{}-{}", m.thread_id, m.at.as_deref().unwrap_or_default()).into();
+                let at = m.at.as_deref().unwrap_or_default();
+                row.key = format!("message-{}-{}-{at}", m.environment_id, m.thread_id).into();
                 row.run = Run::FindIn {
-                    thread_id: m.thread_id.clone(),
+                    thread: ScopedId::of_thread(thread),
                     query: super::find::query_for_message(&m.snippet, query),
                     message_id: m.message_id.clone(),
                 };
@@ -1464,12 +1486,12 @@ impl Workspace {
             .matches
             .iter()
             .filter_map(|found| {
-                let thread = self.palette_threads().find(|t| t.id == found.thread_id)?;
+                let thread = self.palette_threads().find(|t| found.is_from_thread(t))?;
                 let titled = self.match_thread_fields(thread, &tokens, false).is_some();
                 (!titled).then(|| (found, self.thread_use(thread)))
             })
             .collect();
-        let ranked = rank_messages(entries, &tokens, now).into_iter().map(|m| m.thread_id.clone()).collect();
+        let ranked = rank_messages(entries, &tokens, now).into_iter().map(MessageMatch::thread_key).collect();
         let Some(palette) = &mut self.palette else { return };
         let order = next_shown_order(palette.message_order.order.take(), &key.0, ranked, MESSAGE_LIMIT);
         palette.message_order = MessageOrder { key, order: Some(order) };
@@ -1489,7 +1511,7 @@ impl Workspace {
             id: &thread.id,
             title: &thread.title,
             branch: thread.branch.as_deref(),
-            project: self.shell.projects.iter().find(|p| p.id == thread.project_id).map(|p| p.title.as_str()),
+            project: self.shell.project(&ScopedId::thread_project(thread)).map(|p| p.title.as_str()),
             environment: environment.as_deref(),
             pull_requests: &pull_requests,
         };
@@ -1526,7 +1548,7 @@ impl Workspace {
         let key = RankingKey {
             query: query.to_owned(),
             revision: self.shell.revision,
-            current: self.route_thread().map(str::to_owned),
+            current: self.target.as_ref().and_then(Target::thread_key),
             minute: now / 60_000,
         };
         if palette.threads.as_ref().is_some_and(|ranking| ranking.key == key) {
@@ -1535,7 +1557,7 @@ impl Workspace {
         let tokens = search::fold_query(query);
         let (strict, typos) = if tokens.is_empty() {
             let mut recent: Vec<_> =
-                self.palette_threads().filter(|t| key.current.as_deref() != Some(t.id.as_str())).collect();
+                self.palette_threads().filter(|t| !key.current.as_ref().is_some_and(|c| c.is_thread(t))).collect();
             // Recent means used recently: written in or opened, whichever is later.
             recent.sort_by_cached_key(|t| std::cmp::Reverse(self.thread_use(t).recent()));
             let rows = recent.into_iter().take(RECENT_LIMIT).map(|t| (self.thread_row(t, now), false)).collect();
@@ -1552,12 +1574,12 @@ impl Workspace {
 
     /// Scores every listed thread, then builds rows for the first [`THREAD_LIMIT`] only.
     fn score_threads(&self, tokens: &[Vec<char>], typos: bool, now: i64) -> RankedThreads {
-        let current = self.route_thread();
+        let current = self.route_key();
         let mut scored: Vec<(&crate::model::ThreadShell, f32, bool, f32)> = self
             .palette_threads()
             .filter_map(|thread| {
                 let found = self.match_thread_fields(thread, tokens, typos)?;
-                let rank = if current == Some(thread.id.as_str()) {
+                let rank = if current == Some(thread.thread_ref()) {
                     -1.
                 } else {
                     found.quality * self.thread_use(thread).boost(now)
@@ -1709,10 +1731,10 @@ impl Workspace {
             self.settings = None;
         }
         match run {
-            Run::NewThread(project_id) => self.start_draft(project_id, window, cx),
-            Run::Thread(thread_id) => self.select_thread(thread_id, window, cx),
+            Run::NewThread(project) => self.start_draft_in(project.env, project.id, window, cx),
+            Run::Thread(thread) => self.select_thread_in(thread.env, thread.id, window, cx),
             Run::ThreadIn(environment, thread_id) => self.select_thread_in(environment, thread_id, window, cx),
-            Run::Project(members, project_id) => self.open_project_group(&members, project_id, window, cx),
+            Run::Project(members, project) => self.open_project_group(&members, project, window, cx),
             Run::Settings(section) => self.open_settings(section, cx),
             Run::Setting(item) => self.open_settings_search_result(item, window, cx),
             Run::ProjectSettings(project_id) => self.open_project_settings(&project_id, cx),
@@ -1737,8 +1759,8 @@ impl Workspace {
             Run::WorkspaceFocus(forward) => self.move_workspace_focus(forward, window, cx),
             Run::LinkPullRequest(thread_id) => self.open_link_pull_request(thread_id, window, cx),
             Run::LinkedPullRequests => self.open_surface(super::right_panel::Surface::PullRequests, window, cx),
-            Run::FindIn { thread_id, query, message_id } => {
-                self.select_thread(thread_id, window, cx);
+            Run::FindIn { thread, query, message_id } => {
+                self.select_thread_in(thread.env, thread.id, window, cx);
                 self.open_thread_find_on(&query, message_id, window, cx);
             }
             Run::Open(_)
@@ -1751,18 +1773,18 @@ impl Workspace {
     }
 
     /// `openProjectFromSearch`: the group's latest thread by the sidebar's order, settled or not,
-    /// else a new draft in `project_id`.
+    /// else a new draft in `project`.
     fn open_project_group(
         &mut self,
-        members: &[String],
-        project_id: String,
+        members: &[ScopedId],
+        project: ScopedId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let sort_order = self.thread_sort_order();
-        match latest_thread(&self.shell.threads, members, &sort_order).map(|t| t.id.clone()) {
-            Some(thread_id) => self.select_thread(thread_id, window, cx),
-            None => self.start_draft(project_id, window, cx),
+        match latest_thread(&self.shell.threads, members, &sort_order).map(ScopedId::of_thread) {
+            Some(thread) => self.select_thread_in(thread.env, thread.id, window, cx),
+            None => self.start_draft_in(project.env, project.id, window, cx),
         }
     }
 
@@ -1819,19 +1841,19 @@ impl Workspace {
             p.environment_id == environment && crate::project_groups::normalize_path(&p.workspace_root) == key
         });
         if let Some(existing) = existing {
-            let project_id = existing.id.clone();
+            let project = ScopedId::of_project(existing);
             if existing.archived_at.is_some() {
-                let mutation = json!({"type": "project.update", "commandId": new_id(), "projectId": project_id, "archived": false});
-                self.mutate_project(mutation, cx);
+                let mutation = json!({"type": "project.update", "commandId": new_id(), "projectId": project.id, "archived": false});
+                self.mutate_project(&project.env, mutation, cx);
             }
             // A settled latest thread is left for a new draft.
             let sort_order = self.thread_sort_order();
-            let latest = latest_thread(&self.shell.threads, std::slice::from_ref(&project_id), &sort_order)
+            let latest = latest_thread(&self.shell.threads, std::slice::from_ref(&project), &sort_order)
                 .filter(|thread| thread.settled_override.as_deref() != Some("settled"))
-                .map(|thread| thread.id.clone());
+                .map(ScopedId::of_thread);
             match latest {
-                Some(thread_id) => self.select_thread(thread_id, window, cx),
-                None => self.start_draft(project_id, window, cx),
+                Some(thread) => self.select_thread_in(thread.env, thread.id, window, cx),
+                None => self.start_draft_in(project.env, project.id, window, cx),
             }
             return;
         }
@@ -1859,8 +1881,9 @@ impl Workspace {
         .detach();
     }
 
-    pub(super) fn mutate_project(&mut self, mutation: Value, cx: &mut Context<Self>) {
-        let Some(client) = self.command_client(&mutation) else { return };
+    /// `projects.mutate` on the project's environment.
+    pub(super) fn mutate_project(&mut self, environment: &str, mutation: Value, cx: &mut Context<Self>) {
+        let Some(client) = self.env_client(environment) else { return };
         cx.spawn(async move |this, cx| {
             if let Err(error) = client.request("projects.mutate", mutation).await {
                 let _ = this.update(cx, |this, cx| {
@@ -2255,7 +2278,7 @@ impl Workspace {
             RowIcon::Lucide(name) => {
                 Icon::new(*name).size(px(16.)).text_color(tokens.muted_foreground).into_any_element()
             }
-            RowIcon::Project(project_id) => match self.shell.projects.iter().find(|p| &p.id == project_id) {
+            RowIcon::Project(project) => match self.shell.project(project) {
                 Some(project) => super::sidebar::project_icon(project, tokens, false, 16., self.favicon(project)),
                 None => div().size(px(16.)).into_any_element(),
             },
@@ -2267,8 +2290,8 @@ impl Workspace {
         let muted = tokens.muted_foreground;
         let dot = || div().flex_none().text_color(muted.opacity(0.5)).child("·");
         let mut parts: Vec<AnyElement> = Vec::new();
-        if let Some((project_id, title)) = &subtitle.project {
-            let project = self.shell.projects.iter().find(|p| &p.id == project_id);
+        if let Some((project, title)) = &subtitle.project {
+            let project = self.shell.project(project);
             let favicon = project.map(|p| super::sidebar::project_icon(p, tokens, false, 12., self.favicon(p)));
             parts.push(
                 h_flex()
@@ -2698,11 +2721,11 @@ fn resolve_project_path(value: &str, cwd: Option<&str>) -> String {
     trim_trailing_separators(&format!("{root}{}", segments.join(separator)))
 }
 
-/// `sortThreads(..)[0]`: the newest unarchived thread of `project_ids` by the sidebar's thread
-/// order, settled ones included; a tie goes to the larger id.
+/// `sortThreads(..)[0]`: the newest unarchived thread of `projects` (on their environments) by
+/// the sidebar's thread order, settled ones included; a tie goes to the larger id.
 fn latest_thread<'a>(
     threads: &'a [crate::model::ThreadShell],
-    project_ids: &[String],
+    projects: &[ScopedId],
     sort_order: &str,
 ) -> Option<&'a crate::model::ThreadShell> {
     let parse = crate::timestamp::parse_ms;
@@ -2717,7 +2740,7 @@ fn latest_thread<'a>(
     };
     threads
         .iter()
-        .filter(|t| listed_in_palette(t) && project_ids.contains(&t.project_id))
+        .filter(|t| listed_in_palette(t) && projects.iter().any(|p| p.env == t.environment_id && p.id == t.project_id))
         .max_by(|a, b| sorted_at(a).cmp(&sorted_at(b)).then_with(|| a.id.cmp(&b.id)))
 }
 
@@ -2943,18 +2966,22 @@ mod tests {
         let row = |title: &str, run: Run| {
             Row::new(title.to_owned(), RowIcon::Lucide(IconName::Palette), title.to_owned(), run)
         };
-        let mut here = row("New thread in", Run::NewThread("p1".into()));
+        let mut here = row("New thread in", Run::NewThread(ScopedId::new("env", "p1")));
         here.strong = Some("t3code".into());
         let new_in = row("New thread in...", Run::Open(View::NewThreadIn));
         let themes = row("Change theme", Run::Open(View::Themes));
         let actions = vec![here, new_in.clone(), themes.clone()];
-        let mut project = row("t3code", Run::NewThread("p1".into()));
+        let mut project = row("t3code", Run::NewThread(ScopedId::new("env", "p1")));
         project.data_terms = vec![r"H:\Developer\t3code".into()];
         let children = || {
             vec![
                 (
                     &new_in,
-                    vec![project.clone(), row("docs", Run::NewThread("p2".into())), row("No project", Run::Triage)],
+                    vec![
+                        project.clone(),
+                        row("docs", Run::NewThread(ScopedId::new("env", "p2"))),
+                        row("No project", Run::Triage),
+                    ],
                 ),
                 (&themes, vec![row("Dracula", Run::Theme(Some("dracula".into())))]),
             ]
@@ -3194,14 +3221,14 @@ mod tests {
             row.command = Some(command.to_owned().into());
             row
         };
-        let here = row("here", "chat.newLocal", Run::NewThread("p1".into()));
-        let jump = row("p2", "thread.jump.2", Run::NewThread("p2".into()));
+        let here = row("here", "chat.newLocal", Run::NewThread(ScopedId::new("env", "p1")));
+        let jump = row("p2", "thread.jump.2", Run::NewThread(ScopedId::new("env", "p2")));
         let rows = [&here, &jump];
         assert!(
-            matches!(palette_shortcut(&rows, "chat.newLocal"), PaletteShortcut::Run(Run::NewThread(id)) if id == "p1")
+            matches!(palette_shortcut(&rows, "chat.newLocal"), PaletteShortcut::Run(Run::NewThread(p)) if p.id == "p1")
         );
         assert!(
-            matches!(palette_shortcut(&rows, "thread.jump.2"), PaletteShortcut::Run(Run::NewThread(id)) if id == "p2")
+            matches!(palette_shortcut(&rows, "thread.jump.2"), PaletteShortcut::Run(Run::NewThread(p)) if p.id == "p2")
         );
         assert!(matches!(palette_shortcut(&rows, "thread.jump.3"), PaletteShortcut::Swallow), "a jump never leaves");
         assert!(matches!(palette_shortcut(&rows, "chat.new"), PaletteShortcut::Pass));
@@ -3226,7 +3253,7 @@ mod tests {
             if let (Some(base), Value::Object(extra)) = (fields.as_object_mut(), extra) {
                 base.extend(extra);
             }
-            thread(fields)
+            crate::model::ThreadShell { environment_id: "env".into(), ..thread(fields) }
         };
         let threads = [
             at("old", "p1", "2026-01-01T00:00:00Z", json!({})),
@@ -3234,10 +3261,12 @@ mod tests {
             at("archived", "p1", "2026-01-05T00:00:00Z", json!({"archivedAt": "2026-01-06T00:00:00Z"})),
             at("elsewhere", "p3", "2026-01-09T00:00:00Z", json!({})),
         ];
-        let group = ["p1".to_owned(), "p2".to_owned()];
+        let group = [ScopedId::new("env", "p1"), ScopedId::new("env", "p2")];
         let latest = |order: &str| latest_thread(&threads, &group, order).map(|t| t.id.as_str());
         assert_eq!(latest("updated_at"), Some("other-checkout"));
         assert_eq!(latest_thread(&threads, &group[..1], "updated_at").map(|t| t.id.as_str()), Some("old"));
-        assert_eq!(latest_thread(&threads, &["p4".to_owned()], "updated_at").map(|t| t.id.as_str()), None);
+        assert_eq!(latest_thread(&threads, &[ScopedId::new("env", "p4")], "updated_at").map(|t| t.id.as_str()), None);
+        // `p1` on another machine is another project.
+        assert_eq!(latest_thread(&threads, &[ScopedId::new("copy", "p1")], "updated_at").map(|t| t.id.as_str()), None);
     }
 }

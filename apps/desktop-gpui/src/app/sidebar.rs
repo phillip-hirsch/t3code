@@ -800,13 +800,6 @@ impl Workspace {
         self.sidebar.search.read(cx).value().trim().to_lowercase()
     }
 
-    pub(super) fn route_thread(&self) -> Option<&str> {
-        match &self.target {
-            Some(Target::Thread { id, .. }) => Some(id),
-            _ => None,
-        }
-    }
-
     /// The open thread on its environment.
     pub(super) fn route_key(&self) -> Option<ThreadRef<'_>> {
         self.target.as_ref().and_then(target_thread_ref)
