@@ -8,7 +8,7 @@ use chrono::{DateTime, LocalResult, NaiveDateTime, Offset as _, TimeZone, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::model::{ModelSelection, ProjectShell, ServerInfo};
+use crate::model::{ModelSelection, ProjectShell, ServerInfo, ThreadShell};
 use crate::settings::scope::{Scope, ScopeKind};
 
 /// `ScheduledTask` (`packages/contracts/src/scheduledTask.ts`). The schedule, workspace
@@ -257,6 +257,131 @@ impl Default for DraftState {
             base_model_selection: None,
         }
     }
+}
+
+impl DraftState {
+    /// `moveDraftToThread`: runs post to `thread_id`, continuing it unless a one-thread mode was picked.
+    pub fn move_to_thread(&mut self, thread_id: &str, project_id: &str) {
+        thread_id.clone_into(&mut self.thread_id);
+        project_id.clone_into(&mut self.project_id);
+        if self.thread_mode == ThreadMode::NewThread {
+            self.thread_mode = ThreadMode::Continue;
+        }
+    }
+
+    /// `unbindDraftFromThread`: leaves the thread but keeps the mode. Like MCP, new threads stay
+    /// out of the shared checkout, so a project-checkout task gets a worktree from the remote.
+    pub fn unbind_from_thread(&mut self) {
+        if self.thread_id.is_empty() {
+            return;
+        }
+        self.thread_id.clear();
+        if self.workspace_mode == WorkspaceMode::Root {
+            self.workspace_mode = WorkspaceMode::Worktree;
+            self.start_from_origin = true;
+        }
+    }
+
+    /// `changeDraftProject`: a thread belongs to one project, so another project unbinds it.
+    pub fn change_project(&mut self, project_id: &str) {
+        if project_id != self.project_id {
+            self.unbind_from_thread();
+            project_id.clone_into(&mut self.project_id);
+        }
+    }
+
+    /// The Destination select: "New thread each run" leaves the bound thread.
+    pub fn set_thread_mode(&mut self, mode: ThreadMode) {
+        if mode == ThreadMode::NewThread {
+            self.unbind_from_thread();
+        }
+        self.thread_mode = mode;
+    }
+}
+
+/// One row of the destination thread picker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct DestinationChoice {
+    /// A thread id, or [`NEW_THREAD_DESTINATION`].
+    pub value: String,
+    pub label: String,
+    /// What a search matches: the thread's own title, which may be empty.
+    search_text: Option<String>,
+}
+
+/// Thread ids are trimmed, so the leading space keeps this from matching one.
+pub(super) const NEW_THREAD_DESTINATION: &str = " new-thread";
+
+impl DestinationChoice {
+    /// "New thread each run" shows only without a search; threads match on their title.
+    pub fn matches(&self, query: &str) -> bool {
+        let search = query.trim().to_lowercase();
+        match &self.search_text {
+            None => search.is_empty(),
+            Some(text) => text.to_lowercase().contains(&search),
+        }
+    }
+}
+
+/// The destination picker's trigger label (`currentLabel`) and selected value.
+pub(super) fn destination_current(
+    threads: &[ThreadShell],
+    environment: &str,
+    draft: &DraftState,
+) -> (String, Option<String>) {
+    if !draft.thread_id.is_empty() {
+        let title = threads
+            .iter()
+            .find(|t| t.environment_id == environment && t.id == draft.thread_id)
+            .map(|t| t.title.trim())
+            .filter(|title| !title.is_empty());
+        let label = title.map_or_else(|| format!("Thread {}", draft.thread_id), str::to_owned);
+        return (label, Some(draft.thread_id.clone()));
+    }
+    if draft.thread_mode == ThreadMode::NewThread {
+        return (ThreadMode::NewThread.label().to_owned(), Some(NEW_THREAD_DESTINATION.to_owned()));
+    }
+    ("Started by the first run".to_owned(), None)
+}
+
+/// The picker's rows (`items`): "New thread each run", the current thread, then the threads a
+/// task can move to (`scheduledTaskDestinationThreads`): the project's listed, unarchived
+/// threads on its environment, most recently updated first.
+pub(super) fn destination_choices(
+    threads: &[ThreadShell],
+    environment: &str,
+    project_id: &str,
+    draft: &DraftState,
+) -> Vec<DestinationChoice> {
+    let (current_label, _) = destination_current(threads, environment, draft);
+    let mut others: Vec<&ThreadShell> = threads
+        .iter()
+        .filter(|t| {
+            t.environment_id == environment
+                && t.project_id == project_id
+                && t.id != draft.thread_id
+                && t.archived_at.is_none()
+                && t.deleted_at.is_none()
+                && t.is_listed()
+        })
+        .collect();
+    others.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    let new_thread = DestinationChoice {
+        value: NEW_THREAD_DESTINATION.to_owned(),
+        label: ThreadMode::NewThread.label().to_owned(),
+        search_text: None,
+    };
+    let current = (!draft.thread_id.is_empty()).then(|| DestinationChoice {
+        value: draft.thread_id.clone(),
+        label: current_label.clone(),
+        search_text: Some(current_label),
+    });
+    let others = others.into_iter().map(|t| DestinationChoice {
+        value: t.id.clone(),
+        label: if t.title.is_empty() { "Untitled thread".to_owned() } else { t.title.clone() },
+        search_text: Some(t.title.clone()),
+    });
+    std::iter::once(new_thread).chain(current).chain(others).collect()
 }
 
 /// Formats an instant as a `datetime-local` value in `tz`.
@@ -702,6 +827,112 @@ mod tests {
         );
         assert_eq!(split_model_key("codex:gpt-5:mini").map(|s| s.model), Some("gpt-5:mini".into()));
         assert_eq!(split_model_key(":gpt"), None);
+    }
+
+    #[test]
+    fn destination_changes_unbind_the_thread_they_leave() {
+        let mut bound = task(json!({"type": "interval", "everyMs": 60_000}));
+        bound.thread_id = Some("thread:bound".into());
+        bound.workspace_strategy = json!({"type": "root"});
+        let bound = task_to_draft(&bound, &zone());
+
+        // Unbinding leaves the shared checkout for a new worktree from the remote.
+        let mut draft = bound.clone();
+        draft.set_thread_mode(ThreadMode::NewThread);
+        assert_eq!(
+            (draft.thread_id.as_str(), draft.thread_mode, draft.workspace_mode, draft.start_from_origin),
+            ("", ThreadMode::NewThread, WorkspaceMode::Worktree, true)
+        );
+        let mut draft = bound.clone();
+        draft.set_thread_mode(ThreadMode::FreshSession);
+        assert_eq!((draft.thread_id.as_str(), draft.workspace_mode), ("thread:bound", WorkspaceMode::Root));
+
+        let mut draft = bound.clone();
+        draft.change_project("p1");
+        assert_eq!(draft.thread_id, "thread:bound", "the same project keeps the thread");
+        draft.change_project("p2");
+        assert_eq!((draft.thread_id.as_str(), draft.project_id.as_str()), ("", "p2"));
+
+        let mut unbound = DraftState { workspace_mode: WorkspaceMode::Root, start_from_origin: false, ..bound.clone() };
+        unbound.thread_id.clear();
+        unbound.unbind_from_thread();
+        assert_eq!((unbound.workspace_mode, unbound.start_from_origin), (WorkspaceMode::Root, false));
+
+        let mut draft = DraftState::default();
+        draft.move_to_thread("t2", "p1");
+        assert_eq!(
+            (draft.thread_id.as_str(), draft.project_id.as_str(), draft.thread_mode),
+            ("t2", "p1", ThreadMode::Continue)
+        );
+        let mut draft = DraftState { thread_mode: ThreadMode::FreshSession, ..bound };
+        draft.move_to_thread("t2", "p1");
+        assert_eq!(draft.thread_mode, ThreadMode::FreshSession);
+    }
+
+    #[test]
+    fn the_destination_picker_lists_the_projects_threads_newest_first() {
+        let thread = |env: &str, id: &str, title: &str, updated: &str, extra: Value| {
+            let mut value =
+                json!({"id": id, "projectId": "p1", "title": title, "status": "idle", "updatedAt": updated});
+            value.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            let mut thread: ThreadShell = serde_json::from_value(value).unwrap();
+            thread.environment_id = env.to_owned().into();
+            thread
+        };
+        let none = json!({});
+        let threads = vec![
+            thread("laptop", "old", "Older settled run", "2026-01-01T00:00:00Z", none.clone()),
+            thread("laptop", "new", "Fresh run", "2026-03-01T00:00:00Z", none.clone()),
+            thread("laptop", "blank", "", "2026-02-01T00:00:00Z", none.clone()),
+            thread("laptop", "bound", "  Nightly  ", "2026-04-01T00:00:00Z", none.clone()),
+            thread(
+                "laptop",
+                "archived",
+                "Archived",
+                "2026-05-01T00:00:00Z",
+                json!({"archivedAt": "2026-05-02T00:00:00Z"}),
+            ),
+            thread(
+                "laptop",
+                "child",
+                "Subagent",
+                "2026-05-01T00:00:00Z",
+                json!({"lineage": {"relationshipToParent": "subagent"}}),
+            ),
+            thread("laptop", "elsewhere", "Other project", "2026-05-01T00:00:00Z", json!({"projectId": "p2"})),
+            thread("desktop", "remote", "Other environment", "2026-05-01T00:00:00Z", none),
+        ];
+        let draft =
+            DraftState { thread_id: "bound".into(), thread_mode: ThreadMode::Continue, ..DraftState::default() };
+        let choices = destination_choices(&threads, "laptop", "p1", &draft);
+        let rows: Vec<(&str, &str)> = choices.iter().map(|c| (c.value.as_str(), c.label.as_str())).collect();
+        assert_eq!(
+            rows,
+            [
+                (NEW_THREAD_DESTINATION, "New thread each run"),
+                ("bound", "Nightly"),
+                ("new", "Fresh run"),
+                ("blank", "Untitled thread"),
+                ("old", "Older settled run"),
+            ]
+        );
+        let matching = |query: &str| -> Vec<&str> {
+            choices.iter().filter(|c| c.matches(query)).map(|c| c.value.as_str()).collect()
+        };
+        assert_eq!(matching(" RUN "), ["new", "old"], "a search hides New thread each run");
+        assert_eq!(matching("nightly"), ["bound"]);
+        assert!(matching("untitled").is_empty(), "an untitled thread matches on its own title");
+
+        assert_eq!(destination_current(&threads, "laptop", &draft), ("Nightly".into(), Some("bound".into())));
+        let gone = DraftState { thread_id: "gone".into(), ..draft.clone() };
+        assert_eq!(destination_current(&threads, "laptop", &gone).0, "Thread gone");
+        let first_run = DraftState { thread_id: String::new(), ..draft };
+        assert_eq!(destination_current(&threads, "laptop", &first_run), ("Started by the first run".into(), None));
+        let each_run = DraftState::default();
+        assert_eq!(
+            destination_current(&threads, "laptop", &each_run),
+            ("New thread each run".into(), Some(NEW_THREAD_DESTINATION.into()))
+        );
     }
 
     #[test]
