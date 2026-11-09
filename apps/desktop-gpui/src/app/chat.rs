@@ -2059,7 +2059,8 @@ pub(super) fn markdown_style(t: &Tokens, user: bool, wrap: bool) -> TextViewStyl
         code_block.overflow.x = Some(gpui_kit::Overflow::Scroll);
     }
     let mut style = TextViewStyle::default()
-        .foreground(t.chat_text())
+        // User bubbles pass `text-foreground` to the web's ChatMarkdown, which overrides its 90% rule.
+        .foreground(if user { t.foreground } else { t.chat_text() })
         .paragraph_gap(rems(0.65))
         .heading_font_size(move |level, _| {
             px(match level {
