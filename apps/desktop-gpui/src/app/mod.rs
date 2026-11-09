@@ -809,7 +809,7 @@ impl Workspace {
                 this.refresh_rows(cx);
                 this.refresh_thread_find(cx);
                 this.sync_typing_guard(window, cx);
-                this.sync_question(window, cx);
+                this.sync_question(side_chat::ChatPane::Main, window, cx);
                 this.sync_queue_edit(side_chat::ChatPane::Main, window, cx);
                 this.observe_proactive_panels(cx);
             },

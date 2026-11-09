@@ -1,8 +1,8 @@
 //! Side chats (`SideChatPane.tsx`, `useSideChat.ts`): a hidden fork of a thread's latest stable
 //! point that takes a side question in its own right-panel tab while the thread keeps working.
 //! The tab shows the side chat's timeline with its own now and queue footer, its pending
-//! approvals and a plain-text composer; Bring back hands its last reply to the main thread's
-//! next message.
+//! approvals and question card, and a plain-text composer; Bring back hands its last reply to
+//! the main thread's next message.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -26,9 +26,12 @@ use super::right_panel::Surface;
 use super::titlebar::icon;
 use super::{Target, Workspace, new_id};
 use crate::model::{ModelSelection, Run, ThreadProjection, ThreadShell, ThreadState};
+use crate::requests::QuestionDraft;
 use crate::rpc::RpcClient;
 use crate::theme::{self, Tokens};
 use crate::timeline::{self, Row};
+
+const PLACEHOLDER: &str = "Ask a side question";
 
 /// `threadOperationFailure`: the connection lacks `orchestration:operate`.
 const NOT_OPERATE: &str = "This connection cannot change threads.";
@@ -55,6 +58,9 @@ pub(super) struct SideChatView {
     sending: bool,
     pub(super) queue: super::queue::QueueUi,
     pub(super) now: super::thread_now::NowFooter,
+    /// The question card's drafts for the side chat's first pending question; the editor holds
+    /// its custom answer meanwhile.
+    question: Option<QuestionDraft>,
     /// Repaints the footer's and timeline's clocks once a second while one runs.
     _tick: Option<Task<()>>,
     _subscription: Option<Task<()>>,
@@ -87,9 +93,10 @@ impl SideChats {
     /// message's edit ends here; the side chat keeps its own draft.
     fn release_view(&mut self, cx: &App) {
         let Some(mut view) = self.view.take() else { return };
-        let text = match view.queue.take_edit_draft() {
-            Some((text, _)) => text,
-            None => view.composer.read(cx).value().to_string(),
+        let text = match (view.question.take(), view.queue.take_edit_draft()) {
+            (Some(question), _) => question.prompt,
+            (None, Some((text, _))) => text,
+            (None, None) => view.composer.read(cx).value().to_string(),
         };
         if text.is_empty() {
             self.drafts.remove(&view.thread_id);
@@ -372,13 +379,14 @@ impl Workspace {
             TextareaState::new(window, cx)
                 .auto_grow(1, 8)
                 .submit_on_enter(true)
-                .placeholder("Ask a side question")
+                .placeholder(PLACEHOLDER)
                 .default_value(draft)
         });
         let events =
             vec![cx.subscribe_in(&composer, window, |this, composer, event: &InputEvent, window, cx| match event {
                 InputEvent::PressEnter { secondary: false, .. } => this.send_side_chat(window, cx),
                 InputEvent::Change => {
+                    this.save_custom_answer(ChatPane::Side, cx);
                     let empty = composer.read(cx).value().trim().is_empty();
                     if let Some(view) = this.side_chat.view.as_mut().filter(|view| view.empty != empty) {
                         view.empty = empty;
@@ -406,6 +414,7 @@ impl Workspace {
             move |this, window, cx| {
                 if this.side_chat.view.as_ref().is_some_and(|v| v.thread_id == batch_id) {
                     this.refresh_side_chat_rows(cx);
+                    this.sync_question(ChatPane::Side, window, cx);
                     this.sync_queue_edit(ChatPane::Side, window, cx);
                 }
             },
@@ -422,6 +431,7 @@ impl Workspace {
             sending: false,
             queue: Default::default(),
             now: Default::default(),
+            question: None,
             _tick: None,
             _subscription: Some(subscription),
             _events: events,
@@ -473,7 +483,11 @@ impl Workspace {
     }
 
     fn send_side_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // While a queued message is open here, the send saves it.
+        // An open question takes the send as its answer; an open queued message, as its edit.
+        if self.side_chat_question().is_some() {
+            self.advance_question(ChatPane::Side, window, cx);
+            return;
+        }
         if self.pane_queue_edit(ChatPane::Side).is_some() {
             self.save_queue_edit(ChatPane::Side, window, cx);
             return;
@@ -757,29 +771,22 @@ This permanently clears its conversation history."
             })
             .collect();
         let running = projection.is_some_and(ThreadProjection::is_running);
-        let button = match primary_action(self.pane_queue_edit(ChatPane::Side), running, view.empty) {
-            PrimaryAction::Update { saving } => Button::new("side-chat-update")
-                .primary()
-                .xsmall()
-                .icon(Icon::new(IconName::Check))
-                .tooltip(if saving { "Updating queued message" } else { "Update queued message" })
-                .disabled(saving)
-                .on_click(cx.listener(|this, _, window, cx| this.send_side_chat(window, cx))),
-            PrimaryAction::Stop => Button::new("side-chat-stop")
+        let stop = |cx: &mut Context<Self>| {
+            Button::new("side-chat-stop")
                 .xsmall()
                 .icon(Icon::new(IconName::Square))
                 .tooltip("Stop")
-                .on_click(cx.listener(|this, _, _, cx| this.stop_side_chat(cx))),
-            PrimaryAction::Send => Button::new("side-chat-send")
-                .primary()
-                .xsmall()
-                .icon(Icon::new(IconName::ArrowUp))
-                .tooltip("Send")
-                .disabled(view.sending)
-                .on_click(cx.listener(|this, _, window, cx| this.send_side_chat(window, cx))),
+                .on_click(cx.listener(|this, _, _, cx| this.stop_side_chat(cx)))
+        };
+        let question = self.render_question(ChatPane::Side, t, cx);
+        let button = match self.side_chat_question() {
+            Some(draft) => self.render_side_question_actions(draft, running, stop(cx), cx),
+            None => self.render_side_primary_action(view, running, stop(cx), cx),
         };
         let composer = h_flex()
-            .m_2()
+            .mx_2()
+            .mb_2()
+            .when(question.is_none(), gpui_kit::Styled::mt_2)
             .p_2()
             .gap_2()
             .items_end()
@@ -796,7 +803,81 @@ This permanently clears its conversation history."
                     .text_size(px(t.fonts.prompt_size)),
             )
             .child(button);
-        v_flex().flex_1().min_h_0().child(timeline).children(approvals).child(composer).into_any_element()
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .child(timeline)
+            .children(approvals)
+            // The card's drawer tucks under the composer, as in the open thread.
+            .children(question.map(|question| div().mt_2().mx(px(16.)).child(question)))
+            .child(composer)
+            .into_any_element()
+    }
+
+    /// Previous and Submit for the side chat's question card, after Stop while it runs.
+    fn render_side_question_actions(
+        &self,
+        draft: &QuestionDraft,
+        running: bool,
+        stop: Button,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let responding = self.responding.as_ref() == Some(&draft.request_id);
+        let can_respond = self
+            .pending_question_request(ChatPane::Side)
+            .is_some_and(|(request, _)| request.capability() != Some("not_resumable"));
+        let (label, enabled) = super::composer::question_submit(draft, responding, can_respond);
+        h_flex()
+            .gap_1()
+            .when(running, |el| el.child(stop))
+            .when(draft.index > 0, |el| {
+                el.child(
+                    Button::new("side-chat-previous-question")
+                        .outline()
+                        .xsmall()
+                        .label("Previous")
+                        .disabled(responding)
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.previous_question(ChatPane::Side, window, cx)),
+                        ),
+                )
+            })
+            .child(
+                Button::new("side-chat-submit-answer")
+                    .primary()
+                    .xsmall()
+                    .label(label)
+                    .disabled(!enabled)
+                    .on_click(cx.listener(|this, _, window, cx| this.advance_question(ChatPane::Side, window, cx))),
+            )
+            .into_any_element()
+    }
+
+    fn render_side_primary_action(
+        &self,
+        view: &SideChatView,
+        running: bool,
+        stop: Button,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match primary_action(self.pane_queue_edit(ChatPane::Side), running, view.empty) {
+            PrimaryAction::Update { saving } => Button::new("side-chat-update")
+                .primary()
+                .xsmall()
+                .icon(Icon::new(IconName::Check))
+                .tooltip(if saving { "Updating queued message" } else { "Update queued message" })
+                .disabled(saving)
+                .on_click(cx.listener(|this, _, window, cx| this.send_side_chat(window, cx))),
+            PrimaryAction::Stop => stop,
+            PrimaryAction::Send => Button::new("side-chat-send")
+                .primary()
+                .xsmall()
+                .icon(Icon::new(IconName::ArrowUp))
+                .tooltip("Send")
+                .disabled(view.sending)
+                .on_click(cx.listener(|this, _, window, cx| this.send_side_chat(window, cx))),
+        }
+        .into_any_element()
     }
 }
 
@@ -811,6 +892,14 @@ impl Workspace {
             },
             ChatPane::Side => self.side_chat.view.as_ref().map(|view| (view.env.clone(), view.thread_id.clone())),
         }
+    }
+
+    pub(super) fn side_chat_question(&self) -> Option<&QuestionDraft> {
+        self.side_chat.view.as_ref()?.question.as_ref()
+    }
+
+    pub(super) fn side_chat_question_slot(&mut self) -> Option<&mut Option<QuestionDraft>> {
+        self.side_chat.view.as_mut().map(|view| &mut view.question)
     }
 
     /// Whether the pane still shows `thread_id`, for a result that arrives later.
@@ -884,7 +973,11 @@ impl Workspace {
             ChatPane::Side => {
                 let Some(view) = self.side_chat.view.as_mut() else { return };
                 view.empty = text.trim().is_empty();
-                view.composer.update(cx, |state, cx| state.set_value(text, window, cx));
+                let placeholder = view.question.as_ref().map_or(PLACEHOLDER, super::composer::question_placeholder);
+                view.composer.update(cx, |state, cx| {
+                    state.set_placeholder(placeholder, window, cx);
+                    state.set_value(text, window, cx);
+                });
                 cx.notify();
             }
         }

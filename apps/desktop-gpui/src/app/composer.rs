@@ -135,7 +135,7 @@ impl Workspace {
                 cx.notify();
             }
         }
-        self.save_custom_answer(cx);
+        self.save_custom_answer(ChatPane::Main, cx);
         self.sync_composer_empty(cx);
         self.reveal_branch_banner();
         let state = self.composer.read(cx);
@@ -309,7 +309,7 @@ impl Workspace {
         match self.target.as_ref().and_then(|target| self.composer_drafts.remove(target)) {
             Some(ComposerDraft::Question(question)) => {
                 self.question = Some(question);
-                self.load_custom_answer(window, cx);
+                self.load_custom_answer(ChatPane::Main, window, cx);
             }
             Some(ComposerDraft::Prompt(prompt, attachments)) => {
                 self.question = None;
@@ -570,15 +570,17 @@ impl Workspace {
         if !resting || self.palette.is_some() || window.has_active_dialog(cx) {
             return false;
         }
-        let Some(draft) = &self.question else { return false };
+        // The open thread's card first, else the side chat's.
+        let pane = if self.question.is_some() { ChatPane::Main } else { ChatPane::Side };
+        let Some(draft) = self.question(pane) else { return false };
         if draft.collapsed
-            || self.pending_question_request().is_none_or(|(r, _)| r.capability() == Some("not_resumable"))
+            || self.pending_question_request(pane).is_none_or(|(r, _)| r.capability() == Some("not_resumable"))
         {
             return false;
         }
         let Some(option) = draft.questions[draft.index].options.get(digit - 1) else { return false };
         let value = option.value().to_owned();
-        self.pick_option(value, window, cx);
+        self.pick_option(pane, value, window, cx);
         true
     }
 
@@ -614,7 +616,7 @@ impl Workspace {
     pub(super) fn release_typing_hold(&mut self, blur: bool, window: &mut Window, cx: &mut Context<Self>) {
         self._typing_idle = None;
         if self.typing_guard.release(blur) {
-            self.sync_question(window, cx);
+            self.sync_question(ChatPane::Main, window, cx);
             cx.notify();
         }
     }
@@ -627,41 +629,65 @@ impl Workspace {
         approvals
     }
 
-    /// Opens a fresh draft when the first pending question changes. The editor
+    pub(super) fn question(&self, pane: ChatPane) -> Option<&QuestionDraft> {
+        match pane {
+            ChatPane::Main => self.question.as_ref(),
+            ChatPane::Side => self.side_chat_question(),
+        }
+    }
+
+    fn question_slot(&mut self, pane: ChatPane) -> Option<&mut Option<QuestionDraft>> {
+        match pane {
+            ChatPane::Main => Some(&mut self.question),
+            ChatPane::Side => self.side_chat_question_slot(),
+        }
+    }
+
+    fn question_mut(&mut self, pane: ChatPane) -> Option<&mut QuestionDraft> {
+        self.question_slot(pane)?.as_mut()
+    }
+
+    /// Opens a fresh draft when the pane's first pending question changes. The editor
     /// then holds the question's answer, and the prompt waits in the draft
     /// until the last question closes.
-    pub(super) fn sync_question(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(projection) = self.thread.as_ref().and_then(|t| t.state.projection.as_ref()) else { return };
+    pub(super) fn sync_question(&mut self, pane: ChatPane, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(projection) = self.pane_projection(pane) else { return };
         let first = projection.pending_user_inputs().into_iter().next();
         // A question that arrived mid-typing waits; the composer keeps the prompt meanwhile.
-        let first = first.filter(|(request, _)| !self.typing_guard.is_held(&request.id));
-        if first.map(|(request, _)| &request.id) == self.question.as_ref().map(|q| &q.request_id) {
+        let first = first.filter(|(request, _)| pane == ChatPane::Side || !self.typing_guard.is_held(&request.id));
+        if first.map(|(request, _)| &request.id) == self.question(pane).map(|q| &q.request_id) {
             return;
         }
         let next = first.and_then(|(request, item)| QuestionDraft::new(request.id.clone(), requests::questions(item)));
-        match (self.question.take(), next) {
+        let Some(previous) = self.question_slot(pane).map(Option::take) else { return };
+        match (previous, next) {
             (None, None) => {}
-            (Some(previous), None) => self.set_composer_text(previous.prompt, window, cx),
+            (Some(previous), None) => self.set_pane_text(pane, previous.prompt, window, cx),
             (previous, Some(draft)) => {
                 let prompt = match previous {
                     Some(previous) => previous.prompt,
-                    None => self.composer.read(cx).value().to_string(),
+                    None => self.pane_text(pane, cx),
                 };
-                self.question = Some(QuestionDraft { prompt, ..draft });
-                self.load_custom_answer(window, cx);
+                if let Some(slot) = self.question_slot(pane) {
+                    *slot = Some(QuestionDraft { prompt, ..draft });
+                }
+                self.load_custom_answer(pane, window, cx);
             }
         }
     }
 
-    fn pending_question_request(&self) -> Option<(&RuntimeRequest, &TurnItem)> {
-        let id = &self.question.as_ref()?.request_id;
-        let projection = self.thread.as_ref()?.state.projection.as_ref()?;
-        projection.pending_user_inputs().into_iter().find(|(request, _)| &request.id == id)
+    pub(super) fn pending_question_request(&self, pane: ChatPane) -> Option<(&RuntimeRequest, &TurnItem)> {
+        let id = &self.question(pane)?.request_id;
+        self.pane_projection(pane)?.pending_user_inputs().into_iter().find(|(request, _)| &request.id == id)
     }
 
-    fn save_custom_answer(&mut self, cx: &mut Context<Self>) {
-        let text = self.composer.read(cx).value().to_string();
-        let Some(draft) = &mut self.question else { return };
+    /// A user edit in the pane's composer, while a question holds it, is the custom answer.
+    pub(super) fn save_custom_answer(&mut self, pane: ChatPane, cx: &mut Context<Self>) {
+        if self.question(pane).is_none() {
+            return;
+        }
+        let text = self.pane_text(pane, cx);
+        let Some(draft) = self.question_mut(pane) else { return };
         let question = &draft.questions[draft.index];
         if text.is_empty() && !draft.drafts.contains_key(&question.id) {
             return;
@@ -670,23 +696,23 @@ impl Workspace {
         draft.drafts.insert(question.id.clone(), next);
     }
 
-    fn load_custom_answer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(draft) = &self.question else { return };
+    fn load_custom_answer(&mut self, pane: ChatPane, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(draft) = self.question(pane) else { return };
         let question = &draft.questions[draft.index];
         let text = draft.drafts.get(&question.id).and_then(|d| d.custom.clone()).unwrap_or_default();
-        self.set_composer_text(text, window, cx);
+        self.set_pane_text(pane, text, window, cx);
     }
 
     /// Next question, or submit on the last; a no-op while the active one is unanswered.
-    pub(super) fn advance_question(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(draft) = &mut self.question else { return };
+    pub(super) fn advance_question(&mut self, pane: ChatPane, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(draft) = self.question_mut(pane) else { return };
         let question = &draft.questions[draft.index];
         if requests::answer(question, draft.drafts.get(&question.id)).is_none() {
             return;
         }
         if draft.index + 1 < draft.questions.len() {
             draft.index += 1;
-            self.load_custom_answer(window, cx);
+            self.load_custom_answer(pane, window, cx);
             cx.notify();
             return;
         }
@@ -695,31 +721,31 @@ impl Workspace {
         if self.responding.is_some() {
             return;
         }
-        self.respond(ChatPane::Main, request_id, json!({"answers": answers}), cx);
+        self.respond(pane, request_id, json!({"answers": answers}), cx);
     }
 
-    fn previous_question(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(draft) = &mut self.question else { return };
+    pub(super) fn previous_question(&mut self, pane: ChatPane, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(draft) = self.question_mut(pane) else { return };
         draft.index = draft.index.saturating_sub(1);
-        self.load_custom_answer(window, cx);
+        self.load_custom_answer(pane, window, cx);
         cx.notify();
     }
 
-    fn pick_option(&mut self, value: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(draft) = &mut self.question else { return };
+    fn pick_option(&mut self, pane: ChatPane, value: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(draft) = self.question_mut(pane) else { return };
         let question = &draft.questions[draft.index];
         let next = requests::toggle(question, draft.drafts.get(&question.id), &value);
         let advance = !question.multi_select;
         draft.drafts.insert(question.id.clone(), next);
         let at = (draft.request_id.clone(), draft.index);
-        self.set_composer_text("", window, cx);
+        self.set_pane_text(pane, String::new(), window, cx);
         cx.notify();
         if advance {
             cx.spawn_in(window, async move |this, cx| {
                 cx.background_executor().timer(AUTO_ADVANCE).await;
                 let _ = this.update_in(cx, |this, window, cx| {
-                    if this.question.as_ref().is_some_and(|q| (q.request_id.clone(), q.index) == at) {
-                        this.advance_question(window, cx);
+                    if this.question(pane).is_some_and(|q| (q.request_id.clone(), q.index) == at) {
+                        this.advance_question(pane, window, cx);
                     }
                 });
             })
@@ -727,9 +753,9 @@ impl Workspace {
         }
     }
 
-    fn dismiss_question(&mut self, request_id: String, cx: &mut Context<Self>) {
-        let Some(thread) = &self.thread else { return };
-        let command = json!({"type": "thread.user-input.dismiss", "commandId": new_id(), "threadId": thread.id, "requestId": request_id});
+    fn dismiss_question(&mut self, pane: ChatPane, request_id: String, cx: &mut Context<Self>) {
+        let Some((_, thread_id)) = self.pane_client(pane, cx) else { return };
+        let command = json!({"type": "thread.user-input.dismiss", "commandId": new_id(), "threadId": thread_id, "requestId": request_id});
         self.dispatch(command, cx);
     }
 
@@ -793,11 +819,7 @@ impl Workspace {
             };
         }
         if let Some(draft) = &self.question {
-            return if draft.questions[draft.index].allows_custom() {
-                "Type your own answer, or leave this blank to use the selected option"
-            } else {
-                "Choose an option above"
-            };
+            return question_placeholder(draft);
         }
         if self.has_plan_follow_up() {
             return "Add feedback to refine the plan, or leave this blank to implement it";
@@ -1121,25 +1143,10 @@ impl Workspace {
         };
         if let Some(draft) = &self.question {
             let responding = self.responding.as_ref() == Some(&draft.request_id);
-            let can_respond =
-                self.pending_question_request().is_some_and(|(r, _)| r.capability() != Some("not_resumable"));
-            let last = draft.index + 1 == draft.questions.len();
-            let question = &draft.questions[draft.index];
-            let answered = requests::answer(question, draft.drafts.get(&question.id)).is_some();
-            let ready = if last {
-                draft.questions.iter().enumerate().all(|(i, q)| {
-                    (i == draft.index && answered) || requests::answer(q, draft.drafts.get(&q.id)).is_some()
-                })
-            } else {
-                answered
-            };
-            let label = match (responding, last) {
-                (true, _) => "Submitting...",
-                (false, false) => "Next question",
-                (false, true) if draft.index > 0 => "Submit answers",
-                (false, true) => "Submit answer",
-            };
-            let enabled = ready && can_respond && !responding;
+            let can_respond = self
+                .pending_question_request(ChatPane::Main)
+                .is_some_and(|(r, _)| r.capability() != Some("not_resumable"));
+            let (label, enabled) = question_submit(draft, responding, can_respond);
             let submit = div().id("submit-answer");
             let submit = if enabled { action_control(submit, &self.composer_action_focus[PRIMARY], t) } else { submit };
             return h_flex()
@@ -1152,7 +1159,9 @@ impl Workspace {
                             .small()
                             .label("Previous")
                             .disabled(responding)
-                            .on_click(cx.listener(|this, _, window, cx| this.previous_question(window, cx))),
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.previous_question(ChatPane::Main, window, cx)),
+                            ),
                     )
                 })
                 .child(
@@ -1170,9 +1179,9 @@ impl Workspace {
                         .child(label)
                         .when(!enabled, |el| el.opacity(0.64))
                         .when(enabled, |el| {
-                            el.cursor_pointer()
-                                .hover(|s| s.bg(t.primary_hover))
-                                .on_click(cx.listener(|this, _, window, cx| this.advance_question(window, cx)))
+                            el.cursor_pointer().hover(|s| s.bg(t.primary_hover)).on_click(
+                                cx.listener(|this, _, window, cx| this.advance_question(ChatPane::Main, window, cx)),
+                            )
                         }),
                 )
                 .into_any_element();
@@ -1489,7 +1498,7 @@ impl Workspace {
             .chain(self.render_fresh_session_banner(t, cx))
             .chain(self.render_branch_banner(t, cx))
             .chain(self.render_runtime_mode_ceiling_banner(t, cx))
-            .chain(self.render_question(t, cx).or_else(|| self.render_plan_ready(t)))
+            .chain(self.render_question(ChatPane::Main, t, cx).or_else(|| self.render_plan_ready(t)))
             .chain(self.render_child_approvals(t, cx))
             .collect();
         let badge = self.render_stash_badge(t, cx);
@@ -1609,9 +1618,9 @@ impl Workspace {
         )
     }
 
-    fn render_question(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let draft = self.question.as_ref()?;
-        let (request, item) = self.pending_question_request()?;
+    pub(super) fn render_question(&self, pane: ChatPane, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let draft = self.question(pane)?;
+        let (request, item) = self.pending_question_request(pane)?;
         let question = &draft.questions[draft.index];
         let disabled = request.capability() == Some("not_resumable") || self.responding.as_ref() == Some(&request.id);
         let dismissible = item.str("responseMode") == Some("message") || request.capability() == Some("message");
@@ -1627,8 +1636,8 @@ impl Workspace {
             .rounded(px(12.))
             .cursor_pointer()
             .hover(|s| s.bg(t.foreground.opacity(0.05)))
-            .on_click(cx.listener(|this, _, _, cx| {
-                if let Some(draft) = &mut this.question {
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if let Some(draft) = this.question_mut(pane) {
                     draft.collapsed = !draft.collapsed;
                     cx.notify();
                 }
@@ -1689,7 +1698,7 @@ impl Workspace {
                                 })
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
-                                    this.dismiss_question(request_id.clone(), cx);
+                                    this.dismiss_question(pane, request_id.clone(), cx);
                                 })),
                         )
                     }),
@@ -1716,9 +1725,9 @@ impl Workspace {
                         let value = option.value().to_owned();
                         let selected = requests::is_selected(question, draft_answer, &value);
                         render_option(question, option, index, selected, disabled, t).when(!disabled, |el| {
-                            el.on_click(
-                                cx.listener(move |this, _, window, cx| this.pick_option(value.clone(), window, cx)),
-                            )
+                            el.on_click(cx.listener(move |this, _, window, cx| {
+                                this.pick_option(pane, value.clone(), window, cx);
+                            }))
                         })
                     },
                 )))
@@ -1744,8 +1753,35 @@ impl Workspace {
     }
 }
 
+/// The editor's placeholder while a question card holds it.
+pub(super) fn question_placeholder(draft: &QuestionDraft) -> &'static str {
+    if draft.questions[draft.index].allows_custom() {
+        "Type your own answer, or leave this blank to use the selected option"
+    } else {
+        "Choose an option above"
+    }
+}
+
+/// The question card's submit (`ComposerPrimaryActions`): its label, and whether it can go. The
+/// last question submits once every question has an answer; an earlier one moves on once it has.
+pub(super) fn question_submit(draft: &QuestionDraft, responding: bool, can_respond: bool) -> (&'static str, bool) {
+    let last = draft.index + 1 == draft.questions.len();
+    let answered = |index: usize| {
+        let question = &draft.questions[index];
+        requests::answer(question, draft.drafts.get(&question.id)).is_some()
+    };
+    let ready = if last { (0..draft.questions.len()).all(answered) } else { answered(draft.index) };
+    let label = match (responding, last) {
+        (true, _) => "Submitting...",
+        (false, false) => "Next question",
+        (false, true) if draft.index > 0 => "Submit answers",
+        (false, true) => "Submit answer",
+    };
+    (label, ready && can_respond && !responding)
+}
+
 /// `ComposerBanner.Root variant="info"` in the top drawer, its bottom tucked under the composer.
-fn top_drawer(content: impl IntoElement, t: &Tokens) -> AnyElement {
+pub(super) fn top_drawer(content: impl IntoElement, t: &Tokens) -> AnyElement {
     let outline = if t.dark { white(0.05) } else { black(0.08) };
     div()
         .mb(px(-17.))
@@ -2079,6 +2115,24 @@ fn black(alpha: f32) -> Hsla {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_question_submits_once_every_answer_is_in() {
+        let question = |id: &str| -> Question {
+            serde_json::from_value(json!({"id": id, "header": "H", "question": "?", "options": [{"label": "Red"}]}))
+                .unwrap()
+        };
+        let mut draft = QuestionDraft::new("r".into(), vec![question("a"), question("b")]).unwrap();
+        assert_eq!(question_submit(&draft, false, true), ("Next question", false), "unanswered");
+        draft.drafts.insert("a".into(), requests::toggle(&draft.questions[0], None, "Red"));
+        assert_eq!(question_submit(&draft, false, true), ("Next question", true));
+        draft.index = 1;
+        assert_eq!(question_submit(&draft, false, true), ("Submit answers", false), "the last needs its answer");
+        draft.drafts.insert("b".into(), requests::toggle(&draft.questions[1], None, "Red"));
+        assert_eq!(question_submit(&draft, false, true), ("Submit answers", true));
+        assert_eq!(question_submit(&draft, true, true), ("Submitting...", false));
+        assert_eq!(question_submit(&draft, false, false), ("Submit answers", false), "not resumable");
+    }
 
     #[test]
     fn review_comment_chips_keep_their_change_request() {

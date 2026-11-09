@@ -189,7 +189,7 @@ impl Workspace {
             return;
         }
         if self.question.is_some() {
-            self.advance_question(window, cx);
+            self.advance_question(super::side_chat::ChatPane::Main, window, cx);
             return;
         }
         if self.editing_queued() {
