@@ -9,7 +9,7 @@ use std::rc::Rc;
 use libghostty_vt::error::Error;
 use libghostty_vt::fmt::Format;
 use libghostty_vt::key::{self, Mods};
-use libghostty_vt::render::{CellIterator, CursorVisualStyle, Dirty, RowIterator};
+use libghostty_vt::render::{CellIterator, Colors, CursorVisualStyle, Dirty, RowIterator};
 use libghostty_vt::screen::{CellWide, GridRef, Screen, TrackedGridRef};
 use libghostty_vt::selection::{FormatOptions, SelectLineOptions, SelectWordOptions, Selection};
 use libghostty_vt::style::{PaletteIndex, RgbColor, Underline};
@@ -140,6 +140,8 @@ pub(super) struct Core {
     selection: Option<(TrackedGridRef, TrackedGridRef)>,
     /// Redraw every row next frame: Ghostty does not mark rows dirty for selection or theme changes.
     force_full: bool,
+    /// The colors the rows were last resolved with; Ghostty marks no row dirty when OSC 4, 10 or 11 changes them.
+    colors: Option<Colors>,
     graphemes: Vec<char>,
 }
 
@@ -354,6 +356,7 @@ impl Core {
             snapshot: Snapshot::default(),
             selection: None,
             force_full: true,
+            colors: None,
             graphemes: Vec::new(),
         };
         core.default_cursor_blink();
@@ -697,16 +700,22 @@ impl Core {
     }
 
     fn update_snapshot(&mut self) -> Result<(), Error> {
-        let Self { terminal, render, row_iterator, cell_iterator, snapshot, force_full, graphemes, .. } = self;
+        let Self {
+            terminal, render, row_iterator, cell_iterator, snapshot, force_full, colors: shown, graphemes, ..
+        } = self;
         let frame = render.update(terminal)?;
         let dirty = frame.dirty()?;
         let colors = frame.colors()?;
         let (fg, bg) = (rgb(colors.foreground), rgb(colors.background));
+        let recolored = shown.as_ref() != Some(&colors);
+        snapshot.cursor_color = colors.cursor.map_or(fg, rgb);
+        if recolored {
+            *shown = Some(colors);
+        }
         let cols = usize::from(frame.cols()?);
         let rows = usize::from(frame.rows()?);
         snapshot.fg = fg;
         snapshot.bg = bg;
-        snapshot.cursor_color = colors.cursor.map_or(fg, rgb);
         snapshot.cursor = if frame.cursor_visible()? {
             frame.cursor_viewport()?.map(|at| ViewportPoint { x: usize::from(at.x), y: usize::from(at.y) })
         } else {
@@ -719,7 +728,7 @@ impl Core {
             CursorVisualStyle::BlockHollow => CursorShape::BlockHollow,
             _ => CursorShape::Block,
         };
-        let mut full = std::mem::take(force_full) || dirty == Dirty::Full;
+        let mut full = std::mem::take(force_full) || recolored || dirty == Dirty::Full;
         if snapshot.cols != cols || snapshot.rows.len() != rows {
             snapshot.cols = cols;
             snapshot.rows.resize_with(rows, Row::default);

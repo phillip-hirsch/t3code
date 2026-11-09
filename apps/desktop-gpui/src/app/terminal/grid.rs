@@ -134,6 +134,8 @@ pub(super) struct Span {
 
 #[derive(Default, Debug)]
 pub(super) struct Batched {
+    /// The terminal's background, painted under every span (`renderGhosttySnapshot`).
+    pub background: Hsla,
     pub runs: Vec<Run>,
     pub backgrounds: Vec<Span>,
     pub selection: Vec<Span>,
@@ -153,7 +155,7 @@ fn is_blank(cell: &Cell) -> bool {
 /// Groups the visible cells into text runs and background spans (`renderGhosttySnapshot`).
 /// A wide glyph ends its run, so every glyph after it still starts on its own cell.
 pub(super) fn batch(snapshot: &Snapshot, theme: &TerminalTheme) -> Batched {
-    let mut out = Batched::default();
+    let mut out = Batched { background: hsla(snapshot.bg), ..Batched::default() };
     for (row, cells) in snapshot.rows.iter().enumerate() {
         let mut run: Option<PendingRun> = None;
         let mut wide = false;
@@ -334,6 +336,7 @@ struct Cursor {
 pub(super) struct GridPrepaint {
     hitbox: Hitbox,
     geometry: Geometry,
+    background: Hsla,
     backgrounds: Vec<Bounds<Pixels>>,
     background_colors: Vec<Hsla>,
     lines: Vec<(Point<Pixels>, ShapedLine)>,
@@ -470,6 +473,7 @@ impl Element for TerminalGrid {
         GridPrepaint {
             hitbox,
             geometry,
+            background: frame.batched.background,
             backgrounds,
             background_colors,
             lines,
@@ -493,6 +497,8 @@ impl Element for TerminalGrid {
         window.set_cursor_style(cursor, &prepaint.hitbox);
         let line_height = prepaint.geometry.line_height;
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            // Cells in the terminal's own background paint no span; a program may have changed it.
+            window.paint_quad(fill(bounds, prepaint.background));
             for (bounds, color) in prepaint.backgrounds.iter().zip(&prepaint.background_colors) {
                 window.paint_quad(fill(*bounds, *color));
             }
@@ -587,6 +593,31 @@ mod tests {
         // Blue under "ab", then the inverse cells paint the blue foreground's swap: the default text color.
         assert_eq!(spans, [(0, 2, to_rgb(theme.palette[4])), (2, 2, to_rgb(theme.foreground))]);
         assert_eq!(batched.runs.last().map(|run| to_rgb(run.style.color)), Some(to_rgb(theme.palette[4])));
+    }
+
+    #[test]
+    fn the_frame_fills_the_terminal_background() {
+        let theme = theme();
+        assert_eq!(to_rgb(batch(&snapshot("ab"), &theme).background), to_rgb(theme.background));
+        // A program's background (OSC 11) and DEC reverse video: default cells paint no span over it.
+        for (output, background) in [
+            ("\x1b]11;rgb:12/34/56\x07ab", Rgb { r: 0x12, g: 0x34, b: 0x56 }),
+            ("\x1b[?5hab", to_rgb(theme.foreground)),
+        ] {
+            let batched = batch(&snapshot(output), &theme);
+            assert_eq!(to_rgb(batched.background), background, "{output:?}");
+            assert!(batched.backgrounds.is_empty(), "{output:?}");
+        }
+        // A later change redraws the rows already shown.
+        let mut core = core(20, 3);
+        core.set_theme(&theme.core());
+        core.write(b"ab");
+        let before = core.snapshot().revision;
+        core.write(b"\x1b]11;rgb:12/34/56\x07");
+        let batched = batch(core.snapshot(), &theme);
+        assert!(core.snapshot().revision > before, "the cached batch is rebuilt");
+        assert_eq!(to_rgb(batched.background), Rgb { r: 0x12, g: 0x34, b: 0x56 });
+        assert!(batched.backgrounds.is_empty());
     }
 
     #[test]
