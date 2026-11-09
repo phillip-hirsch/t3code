@@ -15,7 +15,7 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use super::logic::{self, FileKind, Office};
-use super::{FileKey, archive, chrome, document, notebook, office};
+use super::{FileKey, archive, chrome, document, notebook};
 use crate::app::{Target, Workspace};
 use crate::theme::Tokens;
 
@@ -23,14 +23,12 @@ use crate::theme::Tokens;
 pub(super) enum Viewer {
     Archive(archive::Archive),
     Notebook(notebook::Notebook),
-    Office(office::OfficeDoc),
 }
 
 /// The parsed bytes, built off the UI thread; `Viewer` adds the UI's entities.
 enum Parsed {
     Archive(archive::Listing),
     Notebook(notebook::NotebookData),
-    Office(office::OfficeData),
 }
 
 enum AssetLoad {
@@ -69,9 +67,6 @@ fn read_limit(kind: FileKind) -> Option<(u64, &'static str)> {
     match kind {
         FileKind::Archive => Some((archive::MAX_BYTES, "Preview limited to files under 50 MB.")),
         FileKind::Office(Office::Ipynb) => Some((notebook::MAX_BYTES, "Notebook preview limited to files under 8 MB.")),
-        FileKind::Office(Office::Docx | Office::Xlsx | Office::Pptx) => {
-            Some((office::MAX_BYTES, "Preview limited to files under 50 MB."))
-        }
         _ => None,
     }
 }
@@ -80,7 +75,6 @@ fn parse(kind: FileKind, name: &str, bytes: &[u8]) -> Result<Parsed, String> {
     match kind {
         FileKind::Archive => archive::open_archive(name, bytes).map(Parsed::Archive),
         FileKind::Office(Office::Ipynb) => notebook::open_notebook(bytes).map(Parsed::Notebook),
-        FileKind::Office(office) => office::open_office(office, bytes).map(Parsed::Office),
         _ => Err("Could not preview this file.".into()),
     }
 }
@@ -166,7 +160,6 @@ impl Workspace {
                     Ok((Parsed::Notebook(data), size)) => {
                         AssetLoad::Ready(Viewer::Notebook(notebook::Notebook::new(data, size)))
                     }
-                    Ok((Parsed::Office(data), _)) => AssetLoad::Ready(Viewer::Office(office::OfficeDoc::new(data))),
                     Err(error) => AssetLoad::Failed(error),
                 };
                 cx.notify();
@@ -221,7 +214,6 @@ impl Workspace {
         &mut self,
         key: &FileKey,
         kind: FileKind,
-        width: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -267,7 +259,7 @@ impl Workspace {
                     this.save_asset_file(&save_key, "Could not save file".into(), None, window, cx);
                 },
             )));
-        let body = self.render_asset_body(key, kind, width, &tokens, window, cx);
+        let body = self.render_asset_body(key, kind, &tokens, window, cx);
         v_flex().flex_1().min_h_0().overflow_hidden().child(header).child(body).into_any_element()
     }
 
@@ -275,12 +267,11 @@ impl Workspace {
         &mut self,
         key: &FileKey,
         kind: FileKind,
-        width: f32,
         tokens: &Tokens,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        if kind == FileKind::Font {
+        if matches!(kind, FileKind::Font | FileKind::Office(Office::Docx | Office::Xlsx | Office::Pptx)) {
             return self.render_document(key, kind, window, cx);
         }
         if read_limit(kind).is_none() {
@@ -307,7 +298,6 @@ impl Workspace {
             }
             Some(AssetLoad::Ready(Viewer::Archive(_))) => self.render_archive_listing(key, tokens, cx),
             Some(AssetLoad::Ready(Viewer::Notebook(_))) => self.render_notebook(key, tokens, window, cx),
-            Some(AssetLoad::Ready(Viewer::Office(_))) => self.render_office(key, width, tokens, cx),
         }
     }
 }

@@ -1,7 +1,7 @@
 //! Files the web hands to the browser engine (`BrowserDocumentFrame`, `WorkspaceVideoPreview`,
 //! `WorkspaceAudioPreview`): rendered HTML, video and audio play in a native WebView of the
-//! file's signed asset URL, and PDFs in the PDF.js viewer (`super::pdf`). Also "Open file in
-//! preview browser".
+//! file's signed asset URL, and PDFs and Office files in viewer pages (`super::viewer`). Also
+//! "Open file in preview browser".
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -19,7 +19,7 @@ use gpui_webview::WebView;
 use serde_json::{Value, json};
 
 use super::FileKey;
-use super::logic::{self, FileKind};
+use super::logic::{self, FileKind, Office};
 use super::media::MediaKind;
 use crate::app::{Target, Workspace};
 
@@ -41,14 +41,14 @@ pub(super) struct DocView {
     content: u64,
     shown: bool,
     used: u64,
-    /// A PDF's resource, signed again for each read of the file, and the theme its page shows.
-    pdf_resource: Option<Value>,
-    pdf_theme: Option<super::pdf::PdfTheme>,
+    /// A viewer page's resource, signed again for each read of the file, and the theme it shows.
+    resource: Option<Value>,
+    theme: Option<super::viewer::ViewerTheme>,
     _task: Option<Task<()>>,
     _links: Option<Task<()>>,
     _media: Option<Task<()>>,
-    /// A PDF viewer's protocol and report listeners.
-    _pdf: Vec<Task<()>>,
+    /// A viewer page's protocol and report listeners.
+    _viewer: Vec<Task<()>>,
 }
 
 impl DocView {
@@ -64,12 +64,12 @@ impl DocView {
             content,
             shown: false,
             used: 0,
-            pdf_resource: None,
-            pdf_theme: None,
+            resource: None,
+            theme: None,
             _task: None,
             _links: None,
             _media: None,
-            _pdf: Vec::new(),
+            _viewer: Vec::new(),
         }
     }
 }
@@ -130,17 +130,17 @@ impl Documents {
         self.views.get(key).is_none_or(|doc| doc.content != revision)
     }
 
-    /// Marks `key`'s PDF viewer as starting, with the resource it reads and its listeners.
-    pub(super) fn begin_pdf(&mut self, key: &FileKey, resource: Value, tasks: Vec<Task<()>>) {
+    /// Marks `key`'s viewer page as starting, with the resource it reads and its listeners.
+    pub(super) fn begin_viewer(&mut self, key: &FileKey, resource: Value, tasks: Vec<Task<()>>) {
         if let Some(doc) = self.views.get_mut(key) {
-            doc.pdf_resource = Some(resource);
-            doc._pdf = tasks;
+            doc.resource = Some(resource);
+            doc._viewer = tasks;
             doc._task = Some(Task::ready(()));
         }
     }
 
-    pub(super) fn pdf_resource(&self, key: &FileKey) -> Option<&Value> {
-        self.views.get(key)?.pdf_resource.as_ref()
+    pub(super) fn viewer_resource(&self, key: &FileKey) -> Option<&Value> {
+        self.views.get(key)?.resource.as_ref()
     }
 
     /// The `fileRevision` the viewer last read, which a workspace mutation compares against.
@@ -150,19 +150,23 @@ impl Documents {
         }
     }
 
-    pub(super) fn set_pdf_theme(&mut self, key: &FileKey, theme: super::pdf::PdfTheme) {
+    pub(super) fn set_theme(&mut self, key: &FileKey, theme: &super::viewer::ViewerTheme) {
         if let Some(doc) = self.views.get_mut(key) {
-            doc.pdf_theme = Some(theme);
+            doc.theme = Some(*theme);
         }
     }
 
     /// `key`'s view when its page shows a theme other than `theme`, which it now records.
-    pub(super) fn pdf_theme_changed(&mut self, key: &FileKey, theme: super::pdf::PdfTheme) -> Option<Entity<WebView>> {
+    pub(super) fn theme_changed(
+        &mut self,
+        key: &FileKey,
+        theme: &super::viewer::ViewerTheme,
+    ) -> Option<Entity<WebView>> {
         let doc = self.views.get_mut(key)?;
-        if doc.pdf_theme.is_none_or(|shown| shown == theme) {
+        if doc.theme.is_none_or(|shown| shown == *theme) {
             return None;
         }
-        doc.pdf_theme = Some(theme);
+        doc.theme = Some(*theme);
         doc.view.clone()
     }
 }
@@ -175,6 +179,17 @@ pub(super) struct Documents {
     frame: u64,
     /// PDF reading positions, kept after a viewer closes.
     pub(super) pdf_positions: super::pdf::Positions,
+}
+
+/// The viewer page that shows `kind`, and its global API's name.
+fn viewer_of(kind: FileKind) -> Option<(&'static super::viewer::ViewerSpec, &'static str)> {
+    match kind {
+        FileKind::Pdf => Some((&super::pdf::VIEWER, super::pdf::GLOBAL)),
+        FileKind::Office(Office::Docx | Office::Xlsx | Office::Pptx) => {
+            Some((&super::office::VIEWER, super::office::GLOBAL))
+        }
+        _ => None,
+    }
 }
 
 /// A colour as CSS: `#rrggbb`, or `rgba(...)` when translucent like many dark tokens.
@@ -383,17 +398,16 @@ impl Workspace {
         documents.drawn = Some(key.clone());
         let state = documents.views.entry(key.clone()).or_insert_with(|| DocView::new(kind, mutation.clone(), 0));
         if state.view.is_none() && state._task.is_none() && state.failed.is_none() {
-            if kind == FileKind::Pdf {
-                self.start_pdf(key.clone(), window, cx);
-            } else {
-                self.start_document(key.clone(), kind, window, cx);
+            match viewer_of(kind) {
+                Some((spec, _)) => self.start_viewer(key.clone(), spec, window, cx),
+                None => self.start_document(key.clone(), kind, window, cx),
             }
         } else if state.view.is_some() && state.mutation != mutation {
             state.mutation = mutation;
             self.refresh_document(key.clone(), kind, window, cx);
         }
-        if kind == FileKind::Pdf {
-            self.sync_pdf_theme(key, cx);
+        if let Some((_, global)) = viewer_of(kind) {
+            self.sync_viewer_theme(key, global, cx);
         }
         let menu = (kind == FileKind::Video).then(|| self.render_media_menu()).flatten();
         let Some(state) = self.files.documents.views.get(key) else { return div().into_any_element() };
@@ -783,10 +797,11 @@ impl Workspace {
                 if let Some(view) = &state.view {
                     let raw = view.read(cx).raw();
                     // Media keep playing what they play; the new bytes load once playback pauses.
-                    // A PDF reads the new revision from where the reader is.
+                    // A viewer page reads the new revision itself: a PDF from where the reader is.
                     let _ = match kind {
                         FileKind::Video | FileKind::Audio => raw.evaluate_script(&media_adopt_script(&url)),
                         FileKind::Pdf => raw.evaluate_script(super::pdf::RELOAD_SCRIPT),
+                        FileKind::Office(_) => raw.evaluate_script(super::office::RELOAD_SCRIPT),
                         _ => raw.load_html(&document_page(kind, &url, &background, dark)),
                     };
                     state.url = Some(url);

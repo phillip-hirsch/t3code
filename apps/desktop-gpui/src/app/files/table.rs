@@ -158,13 +158,6 @@ pub(super) fn column_label(mut column: usize) -> String {
 }
 
 impl Table {
-    /// A spreadsheet's cells under lettered columns.
-    pub(super) fn grid(rows: &[Vec<String>]) -> Self {
-        let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
-        let rows = rows.iter().map(|row| row.iter().map(|c| SharedString::from(c.clone())).collect()).collect();
-        Self::new(Cells { header: Vec::new(), rows, columns })
-    }
-
     pub(super) fn new(Cells { header, rows, columns }: Cells) -> Self {
         let list = ListState::new(rows.len(), ListAlignment::Top, px(300.)).with_uniform_item_height(px(ROW_HEIGHT));
         Self { header, rows, columns, scroll: ScrollHandle::new(), list, measured: RefCell::new(0..0) }

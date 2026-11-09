@@ -916,10 +916,10 @@ impl Workspace {
                     logic::FileKind::Pdf | logic::FileKind::Video | logic::FileKind::Audio => {
                         self.render_document(key, kind, window, cx)
                     }
-                    _ => self.render_asset_file(key, kind, width, window, cx),
+                    _ => self.render_asset_file(key, kind, window, cx),
                 };
             }
-            Some(Load::Binary) => return self.render_asset_file(key, kind, width, window, cx),
+            Some(Load::Binary) => return self.render_asset_file(key, kind, window, cx),
             Some(Load::Text { .. })
                 if kind == logic::FileKind::Html && self.files.shows_rendered(key, Rendered::Html) =>
             {

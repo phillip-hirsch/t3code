@@ -17,6 +17,7 @@ mod pdf;
 mod preview;
 mod table;
 mod tree;
+mod viewer;
 
 use std::collections::HashMap;
 
@@ -69,7 +70,7 @@ pub(super) struct FilesState {
     html_source: bool,
     table_source: bool,
     mermaid_source: bool,
-    /// PDFs, rendered HTML and media in native views, and PDF reading positions.
+    /// PDFs, Office files, rendered HTML and media in native views, and PDF reading positions.
     documents: document::Documents,
     /// Parsed documents and archives.
     assets: asset::Assets,
