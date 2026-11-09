@@ -238,12 +238,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The driver of `current`'s provider in the open picker's environment.
-    fn picker_driver(&self, current: Option<&ModelSelection>) -> &str {
-        let provider = current.and_then(|s| self.picker_info()?.provider(&s.instance_id));
-        provider.map_or("", |p| p.driver.as_str())
-    }
-
     /// The selection the open picker marks: its host's, else the composer's.
     fn picker_current(&self) -> Option<ModelSelection> {
         match &self.picker.host {
@@ -319,7 +313,7 @@ impl Workspace {
             .and_then(|m| m.capabilities.as_ref())
             .map(|c| c.option_descriptors.as_slice())
             .unwrap_or_default();
-        let controls = effort_controls(descriptors, self.picker_driver(Some(&current)), self.composer_ultrathink);
+        let controls = effort_controls(descriptors, self.composer_ultrathink);
         effort_stops(&controls, &current)
     }
 
@@ -630,7 +624,7 @@ impl Workspace {
         } else {
             current.as_ref().and_then(|s| model_label::effort_label(descriptors, s))
         };
-        let speed = current.as_ref().and_then(|s| model_label::speed_label(descriptors, driver, s));
+        let speed = current.as_ref().and_then(|s| model_label::speed_label(descriptors, s));
         let ultracode = current.as_ref().is_some_and(|s| model_label::toggle_on(descriptors, "ultracode", s));
         (name, effort, speed, ultracode)
     }
@@ -1175,8 +1169,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let rule = t.foreground.opacity(0.056);
-        let EffortControls { effort, others, owned, locked } =
-            effort_controls(descriptors, self.picker_driver(current), self.composer_ultrathink);
+        let EffortControls { effort, others, owned, locked } = effort_controls(descriptors, self.composer_ultrathink);
         let focus = self.picker.effort_focus;
         let focused_bg = t.foreground.opacity(0.09);
         // Stops count the levels first, then the switches (`effort_stops`).
@@ -1382,8 +1375,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let rule = t.foreground.opacity(0.056);
-        // `SpeedControl`: Codex's service tiers, else Standard and Fast for a `fastMode` toggle.
-        let tier = model_label::speed_select(descriptors, self.picker_driver(current));
+        // `SpeedControl`: a service tier's segments, else Standard and Fast for a `fastMode` toggle.
+        let tier = model_label::speed_select(descriptors);
         let fast = descriptors.iter().find(|d| d.id == "fastMode" && d.kind == "boolean");
         let segments: Vec<(String, bool, &'static str, Value, Option<String>)> = match (tier, fast, current) {
             (Some(tier), _, Some(selection)) => {
@@ -1526,12 +1519,8 @@ struct EffortControls<'a> {
     locked: bool,
 }
 
-fn effort_controls<'a>(
-    descriptors: &'a [OptionDescriptor],
-    driver: &str,
-    ultrathink: model_label::Ultrathink,
-) -> EffortControls<'a> {
-    let speed = model_label::speed_select(descriptors, driver);
+fn effort_controls(descriptors: &[OptionDescriptor], ultrathink: model_label::Ultrathink) -> EffortControls<'_> {
+    let speed = model_label::speed_select(descriptors);
     let effort = model_label::reasoning(descriptors).filter(|d| d.id != "fastMode");
     let others = descriptors
         .iter()
@@ -1715,7 +1704,7 @@ mod tests {
         .unwrap();
         let selection = ModelSelection { instance_id: "c".into(), model: "m".into(), options: None };
         let stops = |descriptors: &[OptionDescriptor]| {
-            effort_stops(&effort_controls(descriptors, "claudeAgent", model_label::Ultrathink::None), &selection)
+            effort_stops(&effort_controls(descriptors, model_label::Ultrathink::None), &selection)
         };
         let all = stops(&descriptors);
         assert_eq!(all.len(), 3, "two levels and the switch; the menu row opens by pointer");
