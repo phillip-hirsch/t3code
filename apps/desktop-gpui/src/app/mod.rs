@@ -33,6 +33,7 @@ mod banners;
 mod changed_files;
 mod chat;
 mod commands;
+mod compact_send;
 mod composer;
 mod composer_fit;
 mod composer_menu;
@@ -45,6 +46,7 @@ mod desktop;
 mod details;
 mod draft_picker;
 pub(crate) mod environments;
+mod fanout;
 mod files;
 mod find;
 mod fresh_session;
@@ -216,7 +218,7 @@ pub struct Workspace {
     typing_guard: crate::composer_guard::TypingGuard,
     _typing_idle: Option<Task<()>>,
     /// Tab stops of the composer's attach, stop and primary (send, resume, submit) controls.
-    composer_action_focus: [gpui_kit::FocusHandle; 4],
+    composer_action_focus: [gpui_kit::FocusHandle; 5],
     /// Composer text and question drafts of the targets not on screen.
     composer_drafts: HashMap<Target, composer::ComposerDraft>,
     /// The model and permissions picks of the targets not on screen (`composerDraftStore`).
@@ -811,6 +813,7 @@ impl Workspace {
                 this.sync_typing_guard(window, cx);
                 this.sync_question(side_chat::ChatPane::Main, window, cx);
                 this.sync_queue_edit(side_chat::ChatPane::Main, window, cx);
+                this.sync_resume_compaction(cx);
                 this.observe_proactive_panels(cx);
             },
         ));

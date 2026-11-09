@@ -166,6 +166,27 @@ impl ThreadMessage<'_> {
     }
 }
 
+/// The `/compact` a send into a stale session runs first (`idleCompaction: onReturn`).
+fn compact_before(thread_id: &str, model: Option<&ModelSelection>) -> Value {
+    let mut command = json!({
+        "type": "message.dispatch",
+        "commandId": new_id(),
+        "createdBy": "user",
+        "creationSource": "web",
+        "threadId": thread_id,
+        "messageId": new_id(),
+        "text": "/compact",
+        "attachments": [],
+        "idleCompaction": "onReturn",
+        "deliveryIntent": "auto",
+        "dispatchMode": {"type": "start_immediately"},
+    });
+    if let Some(model) = model {
+        command["modelSelection"] = model.to_json();
+    }
+    command
+}
+
 impl Workspace {
     /// `followUpBehavior`, except that a send declines a waiting approval, so it steers.
     pub(super) fn follow_up_behavior(&self) -> &str {
@@ -248,6 +269,8 @@ impl Workspace {
         let mut background = false;
         // Thread settings the message runs with, applied right before it.
         let mut settings_commands = Vec::new();
+        // A stale Claude session compacts first, then this message queues behind that run.
+        let mut compact_command = None;
         let mut sent_mode = None;
         let mut pending_send = None;
         let (method, mut payload, new_thread_id, workspace) = match target {
@@ -262,15 +285,19 @@ impl Workspace {
                 let projection = self.thread.as_ref().and_then(|t| t.state.projection.as_ref());
                 let running = projection.is_some_and(super::super::model::ThreadProjection::is_running);
                 let can_steer = !projection.is_some_and(super::super::model::ThreadProjection::is_compacting);
+                // Feedback answers an approval, so there is no turn to compact before.
+                let compacts = !text_is_feedback && self.compacts_before_send(&text, fresh_arm.is_some());
+                compact_command = compacts.then(|| compact_before(&thread_id, self.model_override.as_ref()));
                 let command = ThreadMessage {
                     thread_id: &thread_id,
                     text: message_text,
                     attachments,
                     context,
-                    // A fresh session starts its own turn, so it never steers into the running one.
+                    // A fresh session starts its own turn, so it never steers into the running one;
+                    // after a compaction the message waits for that run.
                     dispatch: dispatch_fields(
-                        running,
-                        fresh_arm.is_some() || queues(self.follow_up_behavior(), intent, can_steer),
+                        running || compacts,
+                        compacts || fresh_arm.is_some() || queues(self.follow_up_behavior(), intent, can_steer),
                     ),
                     model: self.model_override.as_ref(),
                     source_plan: follow_up
@@ -286,13 +313,17 @@ impl Workspace {
                     message_id: command["messageId"].as_str().unwrap_or_default().to_owned(),
                     text: command["text"].as_str().unwrap_or_default().to_owned().into(),
                     created_at: crate::timestamp::iso(crate::timestamp::now_ms()).unwrap_or_default().into(),
-                    queued: running && command.get("deliveryIntent").is_none(),
+                    queued: (running || compacts) && command.get("deliveryIntent").is_none(),
                 });
                 ("orchestration.dispatchCommand", command, None, None)
             }
             Target::Draft { project_id, .. } => {
                 if let Some((title, description)) = self.load_balancing_send_block() {
                     window.push_notification(Notification::warning(description).title(title), cx);
+                    return;
+                }
+                if self.model_fanout().is_some() {
+                    self.submit_fanout(text, attachments, context, window, cx);
                     return;
                 }
                 let Some(model) = self.composer_model() else {
@@ -364,6 +395,11 @@ impl Workspace {
                         break;
                     }
                 }
+            }
+            if result.is_ok()
+                && let Some(command) = compact_command
+            {
+                result = client.request("orchestration.dispatchCommand", command).await.map_err(|e| e.to_string());
             }
             if result.is_ok() && !text_is_feedback {
                 if let Some((workspace, root)) = workspace {
@@ -574,6 +610,24 @@ mod tests {
         assert!(queued.get("freshContext").is_none());
         let fresh = ThreadMessage { fresh_context: true, ..message(None, None) };
         assert_eq!(fresh.command()["freshContext"], true);
+    }
+
+    #[test]
+    fn compacting_first_runs_a_marked_compact_and_queues_the_message_behind_it() {
+        let model = ModelSelection { instance_id: "claude".into(), model: "opus".into(), options: None };
+        let mut compact = compact_before("t1", Some(&model));
+        let object = compact.as_object_mut().unwrap();
+        assert!(object.remove("commandId").is_some_and(|id| id.is_string()));
+        assert!(object.remove("messageId").is_some_and(|id| id.is_string()));
+        assert_eq!(
+            compact,
+            json!({
+                "type": "message.dispatch", "createdBy": "user", "creationSource": "web", "threadId": "t1",
+                "text": "/compact", "attachments": [], "idleCompaction": "onReturn", "deliveryIntent": "auto",
+                "dispatchMode": {"type": "start_immediately"}, "modelSelection": model.to_json(),
+            })
+        );
+        assert!(compact_before("t1", None).get("modelSelection").is_none());
     }
 
     #[test]

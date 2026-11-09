@@ -45,6 +45,10 @@ pub(super) struct ComposerUi {
     pub(super) chip_hover: Option<(String, gpui_kit::Bounds<gpui_kit::Pixels>)>,
     /// The rich editor's Markdown presentation and its code language picker.
     pub(super) rich: super::composer_rich::RichUi,
+    /// The models each draft starts at once.
+    pub(super) fanout: super::fanout::FanoutState,
+    /// Compacting an idle thread before its next send.
+    pub(super) compact: super::compact_send::CompactState,
 }
 
 /// `resolveComposerInteractionMode`: whether the toggle shows, and the mode sends use.

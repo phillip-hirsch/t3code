@@ -1123,6 +1123,8 @@ impl Workspace {
                             None => el.child(self.render_model_picker(t, cx)).children(mode_block),
                         }
                     }))
+                    // `@max-[480px]/composer-surface:hidden` on the toggle's label.
+                    .children(self.render_compact_toggle(self.chat_layout(window).0.width < 480., t, cx))
                     .children(self.render_context_meter(t, cx))
                     .child(self.render_primary_action(t, cx)),
             )
@@ -1224,7 +1226,9 @@ impl Workspace {
                 .tooltip(|window, cx| Tooltip::new("Resume thread").build(window, cx))
                 .into_any_element();
         }
-        let disabled_reason: Option<SharedString> = if self.attachments_busy() {
+        let disabled_reason: Option<SharedString> = if self.model_fanout().is_some_and(<[_]>::is_empty) {
+            Some("Select at least one model.".into())
+        } else if self.attachments_busy() {
             Some("Attachment(s) still uploading".into())
         } else {
             // An answer to an open question still goes through.
@@ -1260,9 +1264,13 @@ impl Workspace {
         } else {
             svg().path("icons/app/send.svg").size(px(14.)).text_color(icon).into_any_element()
         };
+        let compact_tokens = self.compact_send_tokens().map(super::details::format_context_tokens);
         let tooltip: Option<SharedString> = match (disabled_reason, running && can_send) {
             (Some(reason), _) => Some(reason),
             (None, _) if editing => Some(if busy { "Updating queued message" } else { "Update queued message" }.into()),
+            (None, _) if compact_tokens.is_some() && !busy => {
+                compact_tokens.map(|tokens| format!("Summarize {tokens} tokens of history, then send").into())
+            }
             (None, true) if !can_steer => Some("Queue message".into()),
             (None, true) => {
                 let shortcut = self.client_settings.values.get("sendShortcut").as_str().unwrap_or("enter");
@@ -2063,6 +2071,7 @@ const ATTACH: usize = 0;
 const STOP: usize = 1;
 pub(super) const PRIMARY: usize = 2;
 pub(super) const METER: usize = 3;
+pub(super) const COMPACT: usize = 4;
 
 /// A `<button>`: a tab stop that Enter and Space press, ringed while keyboard-focused, which a
 /// click leaves the composer focused past (`preventPointerFocus`).

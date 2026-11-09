@@ -106,7 +106,7 @@ const HEALTH_KEY: &str = "providerHealthRefreshInterval";
 const HEALTH: usize = 1;
 
 /// `globalIdleCompaction`: the mode, or the legacy switch from before modes.
-fn idle_compaction<'a>(mode: &'a Value, legacy: &'a Value) -> &'a str {
+pub(in crate::app) fn idle_compaction<'a>(mode: &'a Value, legacy: &'a Value) -> &'a str {
     mode.as_str().unwrap_or(match legacy {
         Value::String(mode) => mode,
         Value::Bool(true) => "beforeCacheExpires",
