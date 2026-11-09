@@ -810,7 +810,7 @@ impl Workspace {
                 this.refresh_thread_find(cx);
                 this.sync_typing_guard(window, cx);
                 this.sync_question(window, cx);
-                this.sync_queue_edit(window, cx);
+                this.sync_queue_edit(side_chat::ChatPane::Main, window, cx);
                 this.observe_proactive_panels(cx);
             },
         ));
@@ -878,9 +878,9 @@ impl Workspace {
         self.insert_worktree_setup(&mut new_rows);
         // The footer: a pending handoff, what the thread is doing now, then the queue.
         new_rows.extend(self.pending_handoff_row());
-        new_rows.extend(self.now_rows(cx));
-        let mut queue = self.queue_rows();
-        self.load_queue_images(cx);
+        new_rows.extend(self.now_rows(side_chat::ChatPane::Main, cx));
+        let mut queue = self.queue_rows(side_chat::ChatPane::Main);
+        self.load_queue_images(side_chat::ChatPane::Main, cx);
         if !queued.is_empty() {
             let at = queue.iter().position(|row| matches!(row, Row::QueueToggle { .. })).unwrap_or(queue.len());
             if let Some(Row::Queued { last, .. }) = at.checked_sub(1).and_then(|i| queue.get_mut(i)) {

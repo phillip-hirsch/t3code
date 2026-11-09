@@ -160,7 +160,7 @@ impl Workspace {
                     && self.go_to_adjacent_thread(command == "thread.next", window, cx);
             }
             // The queue control's own guards decide; with nothing to act on the key falls through.
-            "thread.steerQueuedMessage" if chat => return held || self.steer_next_queued(cx),
+            "thread.steerQueuedMessage" if chat => return held || self.steer_next_queued(window, cx),
             "thread.editQueuedMessage" if chat => return held || self.edit_latest_queued(window, cx),
             "thread.stop" if chat => {
                 if !self.turn_running() {

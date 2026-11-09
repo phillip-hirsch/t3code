@@ -193,7 +193,7 @@ impl Workspace {
             return;
         }
         if self.editing_queued() {
-            self.save_queue_edit(window, cx);
+            self.save_queue_edit(super::side_chat::ChatPane::Main, window, cx);
             return;
         }
         let text = self.composer.read(cx).value().trim().to_owned();
