@@ -12,7 +12,10 @@ use gpui::{
 };
 use gpui::{Corners, Pixels};
 
-use crate::{AxisExt, OngoingScrollExt as _, ScrollbarHandle, StyledExt as _};
+use crate::{
+    AxisExt, OngoingScrollExt as _, Scrollbar, ScrollbarHandle, ScrollbarMode,
+    ScrollbarThumbStyle, StyledExt as _,
+};
 
 thread_local! {
     static LAST_HORIZONTAL_SCROLL_CLAIM: Cell<Option<HorizontalScrollClaim>> =
@@ -72,13 +75,31 @@ fn caller_id() -> ElementId {
 /// scrolling when there is no vertical overflow. This wrapper keeps the visual
 /// clipping and scroll offset, while delegating wheel input to [`ScrollableMask`]
 /// so vertical wheel events can continue bubbling to the parent scroller.
+///
+/// t3code: while the content overflows, a horizontal scrollbar stays visible
+/// with its thumb in `thumb` at 60% (80% hovered or dragged), 1px off the
+/// bottom edge, so overflow is discoverable when the cut falls between
+/// columns (the web's chat tables).
 pub(crate) fn horizontal_scroll_area(
     id: impl Into<ElementId>,
     scroll_handle: &ScrollHandle,
     style: &StyleRefinement,
+    thumb: Hsla,
     child: impl IntoElement,
 ) -> impl IntoElement {
     let id = id.into();
+    let thumb_style = |alpha: f32| {
+        move |style: ScrollbarThumbStyle| style.bg(thumb.opacity(alpha)).inset(px(1.))
+    };
+    let scrollbar = Scrollbar::horizontal(scroll_handle)
+        .id(ElementId::NamedChild(id.clone().into(), "scrollbar".into()))
+        .mode(ScrollbarMode::Always)
+        .styles(|styles| {
+            styles
+                .thumb(thumb_style(0.6))
+                .thumb_hover(thumb_style(0.8))
+                .thumb_active(thumb_style(0.8))
+        });
 
     // The mask must be a sibling of the scrolled element (like in Table), not
     // a child of it: children are prepainted with the scroll offset applied,
@@ -112,6 +133,7 @@ pub(crate) fn horizontal_scroll_area(
         )
         .child(ScrollableMask::new(Axis::Horizontal, scroll_handle).id(id))
         .child(frame)
+        .child(div().absolute().inset_0().child(scrollbar))
 }
 
 /// Keeps a rounded scroll viewport's corners clean at every scroll offset.

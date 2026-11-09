@@ -243,6 +243,14 @@ own width, so the row could span the block only when the caller knew its width. 
 the actions at the block's left edge too, so the row can fill it. `src/text/node.rs`: the
 `actions` container in `CodeBlock::render`.
 
+**Wide tables scroll, with a scrollbar.** The web's chat tables sit in a scroll area whose
+horizontal scrollbar stays visible while they overflow, its thumb `muted-foreground` at 60% (80%
+hovered). 0.9.0 scrolls only tables whose style opts into `overflow_x: scroll`, clips the others
+past their column floors, and draws no scrollbar on either. The patch: `src/text/node.rs`
+(`BlockNode::render_table`) puts every table in `horizontal_scroll_area`, keeping each layout's
+column floors, and `src/scrollable_mask.rs` (`horizontal_scroll_area`) adds an always-shown
+horizontal `Scrollbar` in the text style's muted color, 1px off the bottom edge.
+
 The crate's own tests need `--features test-support` and `include_str!` a `README.md` four levels
 above `src/text`, which this folder lacks: run them from a scratch copy laid out as
 `<dir>/crates/gpui-base` with a `<dir>/README.md`.
