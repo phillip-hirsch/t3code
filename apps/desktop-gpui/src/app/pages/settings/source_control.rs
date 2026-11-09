@@ -122,6 +122,13 @@ const HOSTS: &[HostDefinition] = &[
         fields: &[],
     },
     HostDefinition {
+        kind: "cursor-origin",
+        label: "Cursor Origin",
+        icon: "icons/app/source-control/cursor-origin.svg",
+        credentials: None,
+        fields: &[],
+    },
+    HostDefinition {
         kind: "gitlab",
         label: "GitLab",
         icon: "icons/app/source-control/gitlab.svg",
@@ -2029,7 +2036,8 @@ fn vcs_icon(kind: &str) -> Option<&'static str> {
 
 /// A host or VCS mark at 18px: GitHub's is one color and follows the text, the rest are drawn as is.
 fn source_control_icon(path: &'static str, t: &Tokens) -> AnyElement {
-    if path.ends_with("/github.svg") {
+    // GitHub's and Cursor's marks are one color and follow the text.
+    if path.ends_with("/github.svg") || path.ends_with("/cursor-origin.svg") {
         svg().path(path).size(px(18.)).text_color(t.foreground.opacity(0.8)).into_any_element()
     } else {
         img(path).size(px(18.)).into_any_element()

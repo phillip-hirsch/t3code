@@ -36,6 +36,7 @@ const APP_ICONS: &[(&str, &[u8])] = &[
     ("icons/app/onepassword.svg", include_bytes!("../assets/icons/onepassword.svg")),
     ("icons/app/source-control/azure-devops.svg", include_bytes!("../assets/icons/source-control/azure-devops.svg")),
     ("icons/app/source-control/bitbucket.svg", include_bytes!("../assets/icons/source-control/bitbucket.svg")),
+    ("icons/app/source-control/cursor-origin.svg", include_bytes!("../assets/icons/source-control/cursor-origin.svg")),
     ("icons/app/source-control/forgejo.svg", include_bytes!("../assets/icons/source-control/forgejo.svg")),
     ("icons/app/source-control/git.svg", include_bytes!("../assets/icons/source-control/git.svg")),
     ("icons/app/source-control/gitcafe.svg", include_bytes!("../assets/icons/source-control/gitcafe.svg")),

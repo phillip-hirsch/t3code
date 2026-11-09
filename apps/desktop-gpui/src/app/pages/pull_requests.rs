@@ -1672,13 +1672,13 @@ struct RowOrigin {
     environment: Option<SharedString>,
 }
 
-/// A source control host's mark (`getSourceControlPresentationForKind(kind).Icon`): GitHub's is
-/// one color and follows the text, the others are drawn as they are.
+/// A source control host's mark (`getSourceControlPresentationForKind(kind).Icon`): GitHub's and
+/// Cursor's are one color and follow the text, the others are drawn as they are.
 fn host_mark(kind: &str, size: f32, color: Hsla) -> AnyElement {
     let path = match kind {
-        "github" => {
+        "github" | "cursor-origin" => {
             return svg()
-                .path("icons/app/source-control/github.svg")
+                .path(format!("icons/app/source-control/{kind}.svg"))
                 .size(px(size))
                 .text_color(color)
                 .into_any_element();

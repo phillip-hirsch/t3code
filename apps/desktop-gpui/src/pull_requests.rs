@@ -1005,6 +1005,7 @@ pub fn open_on_host_label(provider: &str) -> &'static str {
         "gitlab" => "Open on GitLab",
         "bitbucket" => "Open on Bitbucket",
         "azure-devops" => "Open on Azure DevOps",
+        "cursor-origin" => "Open on Cursor Origin",
         _ => "Open on host",
     }
 }
@@ -1015,6 +1016,7 @@ pub fn provider_name(kind: &str) -> &'static str {
         "gitlab" => "GitLab",
         "bitbucket" => "Bitbucket",
         "azure-devops" => "Azure DevOps",
+        "cursor-origin" => "Cursor Origin",
         _ => "Source control",
     }
 }

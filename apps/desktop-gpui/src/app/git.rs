@@ -113,7 +113,7 @@ impl VcsStatus {
     pub fn pr_label(&self) -> &'static str {
         match self.local.source_control_provider.as_ref().map(|p| p.kind.as_str()) {
             Some("gitlab") => "MR",
-            Some("github" | "gitcafe" | "forgejo" | "bitbucket" | "azure-devops") => "PR",
+            Some("github" | "cursor-origin" | "gitcafe" | "forgejo" | "bitbucket" | "azure-devops") => "PR",
             _ => "change request",
         }
     }
