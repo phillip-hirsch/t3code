@@ -114,6 +114,22 @@ pub(super) enum ComposerDraft {
     Question(QuestionDraft),
 }
 
+impl ComposerDraft {
+    /// Its prompt and attachment count.
+    pub(super) fn content(&self) -> (&str, usize) {
+        match self {
+            Self::Prompt(prompt, attachments) => (prompt, attachments.len()),
+            Self::Question(question) => (&question.prompt, 0),
+        }
+    }
+
+    /// `composerDraftHasUserContent`.
+    pub(super) fn has_content(&self) -> bool {
+        let (prompt, attachments) = self.content();
+        !prompt.trim().is_empty() || attachments > 0
+    }
+}
+
 /// A target's model and permissions picks while another one is on screen.
 pub(super) struct ComposerSelection {
     pub(super) model: Option<ModelSelection>,

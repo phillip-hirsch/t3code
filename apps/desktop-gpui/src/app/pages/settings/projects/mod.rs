@@ -471,13 +471,7 @@ impl Workspace {
                         toast_error(window, cx, format!("Failed to remove \"{title}\""), error);
                         return true;
                     }
-                    // The project's draft goes with it.
-                    if let Some(draft) = this.draft_target(id) {
-                        this.composer_drafts.remove(&draft);
-                        if this.target.as_ref() == Some(&draft) {
-                            this.target = None;
-                        }
-                    }
+                    this.forget_project_drafts(id);
                     false
                 });
                 if failed.unwrap_or(true) {

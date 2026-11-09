@@ -893,7 +893,7 @@ impl Workspace {
             Target::Thread { env, id } => {
                 (env, &self.shell.thread(&ScopedId::new(env.clone(), id.as_str()))?.project_id)
             }
-            Target::Draft { env, project_id } => (env, project_id),
+            Target::Draft { env, project_id, .. } => (env, project_id),
         };
         self.shell.projects.iter().find(|p| &p.id == id && p.environment_id == *env)
     }

@@ -97,8 +97,6 @@ pub(super) struct SidebarState {
     /// Every thread row in sidebar order, as last drawn, for Shift-click ranges.
     thread_order: Vec<ScopedId>,
     selection: selection::Selection,
-    /// Draft rows by project, newest first.
-    draft_order: Vec<ScopedId>,
     /// The open draft's row as it was when opened; `None` when it had no content then
     /// (`SidebarDraftBlock`'s `frozenActive`).
     open_draft_preview: Option<SharedString>,
@@ -218,7 +216,6 @@ impl SidebarState {
             inbox_order: Vec::new(),
             thread_order: Vec::new(),
             selection: Default::default(),
-            draft_order: Vec::new(),
             open_draft_preview: None,
             provider_pill: Default::default(),
             checkout_branches: HashMap::new(),
@@ -1350,7 +1347,7 @@ impl Workspace {
             Some(Target::Thread { env, id }) => {
                 self.shell.thread(&ScopedId::new(env.clone(), id.as_str())).map(ScopedId::thread_project)
             }
-            Some(Target::Draft { env, project_id }) => Some(ScopedId::new(env.clone(), project_id.as_str())),
+            Some(Target::Draft { env, project_id, .. }) => Some(ScopedId::new(env.clone(), project_id.as_str())),
             None => None,
         };
         current.or_else(|| self.shell.projects.iter().find(|p| p.archived_at.is_none()).map(ScopedId::of_project))

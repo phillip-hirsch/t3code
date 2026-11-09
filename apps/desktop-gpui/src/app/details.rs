@@ -233,7 +233,7 @@ impl Workspace {
     fn details_key(&self) -> Option<String> {
         match self.target.as_ref()? {
             Target::Thread { env, id } => Some(format!("{env}:{id}")),
-            Target::Draft { env, project_id } => Some(format!("{env}:draft:{project_id}")),
+            Target::Draft { env, project_id, .. } => Some(format!("{env}:draft:{project_id}")),
         }
     }
 

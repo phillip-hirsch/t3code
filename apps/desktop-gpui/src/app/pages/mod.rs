@@ -198,7 +198,7 @@ impl Workspace {
         self.settings_ui.access_environment = None;
         match location {
             Location::Chat(Some(Target::Thread { id: thread_id, .. })) => self.select_thread(thread_id, window, cx),
-            Location::Chat(Some(Target::Draft { project_id, .. })) => self.start_draft(project_id, window, cx),
+            Location::Chat(Some(target @ Target::Draft { .. })) => self.open_draft_entry(target, window, cx),
             Location::Chat(None) => {}
             Location::Page(page) => {
                 self.page_entered(page);
@@ -234,7 +234,7 @@ mod tests {
     use super::*;
 
     fn draft(id: &str) -> Location {
-        Location::Chat(Some(Target::Draft { env: "e".into(), project_id: id.into() }))
+        Location::Chat(Some(Target::draft("e".into(), id.into(), crate::app::draft_sessions::DraftId::for_test(id))))
     }
 
     #[test]

@@ -32,6 +32,7 @@ use serde_json::{Value, json};
 
 use self::layout::{DrawerLayout, Place, Split};
 use self::session::{Launch, SessionEvent, TerminalSession};
+use super::draft_sessions::DraftId;
 use super::titlebar::icon;
 use super::{Target, Workspace};
 use crate::composer_text::Chip;
@@ -111,7 +112,7 @@ pub(super) struct Terminals {
     /// The environment whose metadata stream reported each thread's terminals.
     summary_environments: HashMap<String, SharedString>,
     /// The id a draft's thread will launch with, so its terminals carry over.
-    draft_threads: HashMap<String, String>,
+    draft_threads: HashMap<DraftId, String>,
     /// The terminal to focus once it mounts, by thread: another thread's request never lands.
     focus_pending: Option<(String, String)>,
     /// Selections added to chat, by context id: the `TerminalContextRecord` each chip sends.
@@ -230,14 +231,14 @@ impl Terminals {
         }));
     }
 
-    /// The thread id the draft in `project_id` launches with, if its terminal drawer used one.
-    pub(super) fn take_draft_thread(&mut self, project_id: &str) -> Option<String> {
-        self.draft_threads.remove(project_id)
+    /// The thread id `draft` launches with, if its terminal drawer used one.
+    pub(super) fn take_draft_thread(&mut self, draft: &DraftId) -> Option<String> {
+        self.draft_threads.remove(draft)
     }
 
-    /// The project whose unsent draft launches with `thread_id`.
-    fn draft_project(&self, thread_id: &str) -> Option<&str> {
-        self.draft_threads.iter().find(|(_, id)| *id == thread_id).map(|(project_id, _)| project_id.as_str())
+    /// The unsent draft that launches with `thread_id`.
+    fn draft_of(&self, thread_id: &str) -> Option<&DraftId> {
+        self.draft_threads.iter().find(|(_, id)| *id == thread_id).map(|(draft, _)| draft)
     }
 
     fn summaries(&self, thread_id: &str) -> &[Summary] {
@@ -330,11 +331,11 @@ impl Workspace {
     pub(in crate::app) fn terminal_thread(&mut self, create: bool) -> Option<String> {
         match self.target.as_ref()? {
             Target::Thread { id, .. } => Some(id.clone()),
-            Target::Draft { project_id, .. } => match self.terminals.draft_threads.get(project_id) {
+            Target::Draft { draft, .. } => match self.terminals.draft_threads.get(draft) {
                 Some(id) => Some(id.clone()),
                 None if create => {
                     let id = super::new_id();
-                    self.terminals.draft_threads.insert(project_id.clone(), id.clone());
+                    self.terminals.draft_threads.insert(draft.clone(), id.clone());
                     Some(id)
                 }
                 None => None,
@@ -345,7 +346,7 @@ impl Workspace {
     fn shown_terminal_thread(&self) -> Option<&str> {
         match self.target.as_ref()? {
             Target::Thread { id, .. } => Some(id),
-            Target::Draft { project_id, .. } => self.terminals.draft_threads.get(project_id).map(String::as_str),
+            Target::Draft { draft, .. } => self.terminals.draft_threads.get(draft).map(String::as_str),
         }
     }
 
@@ -576,8 +577,8 @@ impl Workspace {
         };
         self.terminals.focus_later(&thread_id, &terminal_id);
         let payload = launch.payload(&thread_id, &terminal_id);
-        let origin = match self.terminals.draft_project(&thread_id) {
-            Some(project_id) => self.draft_target(project_id),
+        let origin = match self.terminals.draft_of(&thread_id) {
+            Some(draft) => self.drafts.target(draft),
             None => self.thread_target(&thread_id),
         }
         .or_else(|| self.target.clone());
@@ -1475,13 +1476,14 @@ mod tests {
     }
 
     #[test]
-    fn a_drafts_future_thread_maps_back_to_its_project_until_sent() {
+    fn a_drafts_future_thread_maps_back_to_its_draft_until_sent() {
         let mut terminals = Terminals::default();
-        terminals.draft_threads.insert("project".into(), "future".into());
-        assert_eq!(terminals.draft_project("future"), Some("project"));
-        assert_eq!(terminals.draft_project("other"), None);
-        terminals.take_draft_thread("project");
-        assert_eq!(terminals.draft_project("future"), None, "a sent draft's thread is listed");
+        let draft = DraftId::for_test("draft");
+        terminals.draft_threads.insert(draft.clone(), "future".into());
+        assert_eq!(terminals.draft_of("future"), Some(&draft));
+        assert_eq!(terminals.draft_of("other"), None);
+        terminals.take_draft_thread(&draft);
+        assert_eq!(terminals.draft_of("future"), None, "a sent draft's thread is listed");
     }
 
     #[test]

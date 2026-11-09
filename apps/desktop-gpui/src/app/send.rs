@@ -290,7 +290,7 @@ impl Workspace {
                 });
                 ("orchestration.dispatchCommand", command, None, None)
             }
-            Target::Draft { project_id, .. } => {
+            Target::Draft { project_id, draft, .. } => {
                 if let Some((title, description)) = self.load_balancing_send_block() {
                     window.push_notification(Notification::warning(description).title(title), cx);
                     return;
@@ -318,7 +318,7 @@ impl Workspace {
                         project.workspace_root.clone(),
                     ))
                 });
-                let thread_id = self.terminals.take_draft_thread(&project_id).unwrap_or_else(new_id);
+                let thread_id = self.terminals.take_draft_thread(&draft).unwrap_or_else(new_id);
                 let mut initial = json!({"messageId": new_id(), "text": message_text, "attachments": attachments});
                 if let Some(context) = context {
                     initial["context"] = context;
@@ -392,8 +392,11 @@ impl Workspace {
                         }
                         this.record_prompt_sent(window, cx);
                         if new_thread_id.is_some() {
-                            // The launched draft's picks went with it.
+                            // The launched draft's picks went with it, and its project's next draft is new.
                             this.composer_selections.remove(&origin);
+                            if let Some(draft) = origin.draft_id() {
+                                this.drafts.promote(draft);
+                            }
                         }
                         let here = this.target.as_ref() == Some(&origin);
                         match (new_thread_id, background) {

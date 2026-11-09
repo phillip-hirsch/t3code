@@ -702,7 +702,7 @@ impl Workspace {
                 if empty {
                     this.start_draft_in(env, project_id, window, cx);
                 } else {
-                    this.move_draft_to_project(env, project_id, window, cx);
+                    this.move_draft_to_project(env, project_id, cx);
                 }
             });
         })

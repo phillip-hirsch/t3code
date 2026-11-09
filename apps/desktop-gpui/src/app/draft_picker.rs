@@ -221,7 +221,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if self.composer_has_user_content(cx) && matches!(self.target, Some(super::Target::Draft { .. })) {
-            self.move_draft_to_project(env, project_id, window, cx);
+            self.move_draft_to_project(env, project_id, cx);
         } else {
             self.start_draft_in(env, project_id, window, cx);
         }

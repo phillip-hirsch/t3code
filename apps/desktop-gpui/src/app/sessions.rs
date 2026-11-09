@@ -533,9 +533,20 @@ impl Workspace {
         matches!(&self.target, Some(Target::Thread { env, id }) if *env == key.env && *id == key.id)
     }
 
-    /// A project's draft as a target, on the project's environment.
-    pub(super) fn draft_target(&self, project_id: &str) -> Option<Target> {
-        Some(Target::Draft { env: self.project_environment(project_id)?, project_id: project_id.to_owned() })
+    /// A removed project's drafts go with it, the open one too.
+    pub(super) fn forget_project_drafts(&mut self, project_id: &str) {
+        let Some(env) = self.project_environment(project_id) else { return };
+        let of_project = |target: &Target| match target {
+            Target::Draft { env: draft_env, project_id: draft_project, .. } => {
+                *draft_env == env && draft_project == project_id
+            }
+            Target::Thread { .. } => false,
+        };
+        self.composer_drafts.retain(|target, _| !of_project(target));
+        if self.target.as_ref().is_some_and(of_project) {
+            self.target = None;
+        }
+        self.drafts.forget_project(&ScopedId::new(env, project_id));
     }
 
     /// A listed thread as a target, on its environment.

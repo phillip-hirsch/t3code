@@ -286,10 +286,13 @@ impl Workspace {
         self.retarget_draft(option.environment_id, project_id, cx);
     }
 
-    /// The draft keeps its text and moves to another checkout of its project.
+    /// The draft keeps its identity and text and moves to another checkout, becoming that
+    /// project's draft (`setLogicalProjectDraftThreadId`).
     pub(super) fn retarget_draft(&mut self, env: SharedString, project_id: String, cx: &mut Context<Self>) {
         let Some(from @ Target::Draft { .. }) = self.target.clone() else { return };
-        let to = Target::Draft { env, project_id };
+        let Some(draft) = from.draft_id().cloned() else { return };
+        self.drafts.assign(crate::model::ScopedId::new(env.clone(), project_id.as_str()), &draft);
+        let to = Target::draft(env, project_id, draft);
         carry(&mut self.host.selections, &from, &to);
         self.target = Some(to);
         self.sync_draft_workspace(cx);
@@ -301,18 +304,11 @@ impl Workspace {
     }
 
     /// `selectProject` for a draft with content: it moves to the project and keeps an explicit model;
-    /// an inherited one resolves again for the destination.
-    /// A project that already holds an unsent draft keeps it, and that draft opens instead.
-    pub(super) fn move_draft_to_project(
-        &mut self,
-        env: SharedString,
-        project_id: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let destination = Target::Draft { env: env.clone(), project_id: project_id.clone() };
-        if self.composer_drafts.contains_key(&destination) || self.target.as_ref() == Some(&destination) {
-            self.start_draft_in(env, project_id, window, cx);
+    /// an inherited one resolves again for the destination. The draft keeps its identity; a draft
+    /// the project already holds stays as its own sidebar row.
+    pub(super) fn move_draft_to_project(&mut self, env: SharedString, project_id: String, cx: &mut Context<Self>) {
+        let Some(Target::Draft { env: from_env, project_id: from, .. }) = &self.target else { return };
+        if (from_env, from) == (&env, &project_id) {
             return;
         }
         let (model, explicit) = (self.model_override.take(), self.model_explicit);
@@ -682,7 +678,7 @@ mod tests {
     use super::*;
 
     fn draft(env: &str, project: &str) -> Target {
-        Target::Draft { env: env.to_owned().into(), project_id: project.to_owned() }
+        Target::draft(env.to_owned().into(), project.to_owned(), crate::app::draft_sessions::DraftId::for_test(project))
     }
 
     #[test]
