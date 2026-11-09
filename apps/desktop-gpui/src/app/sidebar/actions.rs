@@ -1184,7 +1184,7 @@ impl ThreadMenu {
             let (view, id) = (view.clone(), self.thread_id.clone());
             menu = menu.submenu("Auto-settle behavior", window, cx, move |menu, _, cx| {
                 let mut menu = native_rows(menu, cx);
-                for (label, on) in [("Enabled", true), ("Disabled", false)] {
+                for (label, on) in [("Follow settings", true), ("Never", false)] {
                     let (view, id) = (view.clone(), id.clone());
                     menu = menu.item(PopupMenuItem::new(label).checked(enabled == on).on_click(move |_, _, cx| {
                         let _ = view.update(cx, |this, cx| {
