@@ -732,8 +732,13 @@ impl DiffFile {
         self
     }
 
-    pub(crate) fn lines_count(&self, side: DiffSide) -> usize {
+    /// How many of `side`'s lines the file holds: the patch's, or every line once hydrated.
+    pub fn lines_count(&self, side: DiffSide) -> usize {
         self.lines(side).len()
+    }
+    /// How many hunks the patch has.
+    pub fn hunk_count(&self) -> usize {
+        self.inner.hunks.len()
     }
 
     /// Copies patch-provided lines. Unavailable context is omitted, without

@@ -8,6 +8,7 @@ mod commit_link;
 mod diff_base;
 mod diff_load;
 mod diff_open;
+mod diff_tool_call;
 mod diff_tree;
 
 pub(in crate::app) use diff_load::contents_loader;
@@ -67,6 +68,11 @@ pub(super) enum DiffScope {
     Unstaged,
     Turn(String),
     Commit(String),
+    /// A tool call's recorded file change, by the thread and item it was recorded in.
+    ToolCall {
+        thread_id: String,
+        item_id: String,
+    },
 }
 
 /// One completed turn the Diff menu offers (`ThreadCheckpointSummary`).
@@ -278,6 +284,19 @@ enum DiffLoad {
         truncated: bool,
         /// Patch reads asked for that have not settled.
         pending: usize,
+        /// A tool call's recorded files and how many its patch leaves out.
+        omitted: Option<(usize, usize)>,
+    },
+    /// A tool call's patch the viewer can't read, as text with why.
+    Raw {
+        reason: &'static str,
+        text: SharedString,
+        truncated: bool,
+    },
+    /// File contents a tool call recorded without a diff, each under its label.
+    Recorded {
+        content: std::rc::Rc<[(&'static str, SharedString)]>,
+        truncated: bool,
     },
     Empty(&'static str),
     Failed(SharedString),
@@ -867,6 +886,26 @@ impl Workspace {
         self.open_surface(Surface::Diff, window, cx);
     }
 
+    /// `onOpenToolDiff` (`selectToolCall` then the Diff tab): the file change a tool call
+    /// recorded, by the thread and item it was recorded in. It opens without a git repository.
+    pub(super) fn open_tool_call_diff(
+        &mut self,
+        thread_id: String,
+        item_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !matches!(self.target, Some(Target::Thread { .. })) {
+            return;
+        }
+        if let Some(panel) = self.panel_state_mut() {
+            panel.scope = DiffScope::ToolCall { thread_id, item_id };
+            panel.turn_file = None;
+        }
+        self.right_panel.pending_reveal = None;
+        self.open_surface(Surface::Diff, window, cx);
+    }
+
     /// `openFile` for the open target's panel.
     pub(super) fn open_file_surface(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
         self.page = None;
@@ -1150,6 +1189,7 @@ impl Workspace {
             DiffScope::Turn(run) => {
                 (turns.iter().find(|t| &t.run_id == run).map_or(0, |t| u64::from(t.turn_count)), 0, 0)
             }
+            DiffScope::ToolCall { .. } => (0, 0, 0),
             _ => self.vcs.status.as_ref().map_or((0, 0, 0), |s| {
                 let (ins, del, _) = git::changes_totals(s);
                 (ins, del, s.local.working_tree.insertions + s.local.working_tree.deletions)
@@ -1157,6 +1197,8 @@ impl Workspace {
         };
         let mutation = match &scope {
             DiffScope::Turn(_) => (None, None),
+            // `resolveToolCallDiffTarget`: the item is read again once it changes.
+            DiffScope::ToolCall { thread_id, item_id } => (self.tool_call_revision(thread_id, item_id), None),
             _ => self
                 .open_projection()
                 .map(|p| workspace_mutation_id(p, turns.first().map(|t| t.completed_at.as_str())))
@@ -1172,7 +1214,7 @@ impl Workspace {
             base_ref: base_ref.clone(),
             ignore_whitespace,
             version,
-            mutation,
+            mutation: mutation.clone(),
             refresh: self.right_panel.refresh,
         };
         if self.right_panel.loaded.as_ref() == Some(&key) {
@@ -1187,6 +1229,16 @@ impl Workspace {
         let install = if retain { Install::Update } else { Install::Replace };
         self.right_panel.loaded = Some(key);
         let (Some(client), Target::Thread { env, id: thread_id }) = (self.client(), target) else { return };
+        if let DiffScope::ToolCall { thread_id, item_id } = &scope {
+            let mut input = json!({"threadId": thread_id, "itemId": item_id});
+            if let Some(revision) = mutation.0 {
+                input["revision"] = revision.into();
+            }
+            if let Some(cwd) = cwd {
+                self.read_branch_commits(client.clone(), cwd, remembered_base, cx);
+            }
+            return self.read_tool_call_diff(selection, client, input, ignore_whitespace, install, window, cx);
+        }
         if self.vcs.status.as_ref().is_some_and(|s| !s.local.is_repo) {
             self.right_panel.load =
                 DiffLoad::Empty("Turn diffs are unavailable because this project is not a git repository.");
@@ -1229,21 +1281,10 @@ impl Workspace {
             DiffScope::Unstaged => Some("working-tree"),
             DiffScope::Commit(_) => Some("commit"),
             DiffScope::Branch => Some("branch-range"),
-            DiffScope::Turn(_) => None,
+            DiffScope::Turn(_) | DiffScope::ToolCall { .. } => None,
         };
         if let Some(cwd) = cwd.clone() {
-            let mut input = json!({"cwd": cwd});
-            if let Some(base) = remembered_base.clone() {
-                input["baseRef"] = base.into();
-            }
-            let client = client.clone();
-            self.right_panel._commits_task = Some(cx.spawn(async move |this, cx| {
-                let Ok(reply) = client.request("review.getBranchCommits", input).await else { return };
-                let _ = this.update(cx, |this, cx| {
-                    this.right_panel.commits = parse_commits(&reply);
-                    cx.notify();
-                });
-            }));
+            self.read_branch_commits(client.clone(), cwd, remembered_base.clone(), cx);
         }
         let commit_sha = match &scope {
             DiffScope::Commit(sha) => Some(sha.clone()),
@@ -1344,10 +1385,100 @@ impl Workspace {
                             base: parsed.base,
                             truncated: parsed.truncated,
                             pending,
+                            omitted: None,
                         }
                     }
                 };
                 this.rebuild_tree_rows(cx);
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    /// `branchCommitsQuery`: the branch's commits for the scope menu.
+    fn read_branch_commits(&mut self, client: RpcClient, cwd: String, base: Option<String>, cx: &mut Context<Self>) {
+        let mut input = json!({"cwd": cwd});
+        if let Some(base) = base {
+            input["baseRef"] = base.into();
+        }
+        self.right_panel._commits_task = Some(cx.spawn(async move |this, cx| {
+            let Ok(reply) = client.request("review.getBranchCommits", input).await else { return };
+            let _ = this.update(cx, |this, cx| {
+                this.right_panel.commits = parse_commits(&reply);
+                cx.notify();
+            });
+        }));
+    }
+
+    /// The revision of a tool call's item in the thread or side chat on screen
+    /// (`turnItemDetailRevision`), while it is still a file change there.
+    fn tool_call_revision(&self, thread_id: &str, item_id: &str) -> Option<String> {
+        let projections = self.open_projection().into_iter().chain(self.side_chat_projection());
+        let mut rows = projections.flat_map(|projection| &projection.visible_turn_items);
+        let row = rows.find(|row| row.source_thread_id == thread_id && row.source_item_id == item_id)?;
+        (row.item.item_type == "file_change").then(|| super::inspector::revision(&row.item).to_string())
+    }
+
+    /// `useTurnItemDetail` for a tool call selection: reads the item and shows its recorded diff.
+    fn read_tool_call_diff(
+        &mut self,
+        selection: (Target, DiffScope),
+        client: RpcClient,
+        input: Value,
+        ignore_whitespace: bool,
+        install: Install,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(install, Install::Replace) {
+            self.right_panel.load = DiffLoad::Loading;
+        }
+        (self.right_panel.patches, self.right_panel.patch_states) = (None, std::rc::Rc::default());
+        let diff = self.right_panel.diff.clone();
+        self.right_panel.diff_reading = true;
+        self.right_panel._task = Some(cx.spawn_in(window, async move |this, cx| {
+            let reply = client.request("orchestration.getTurnItem", input).await;
+            let view = cx
+                .background_executor()
+                .spawn(async move {
+                    reply
+                        .map(|reply| diff_tool_call::view(&reply, ignore_whitespace))
+                        .map_err(|error| error.to_string())
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.right_panel.diff_reading = false;
+                diff.update(cx, |state, cx| state.set_contents_loader(None, cx));
+                let view = match view {
+                    Ok(view) => view,
+                    Err(error) => {
+                        this.right_panel.load = DiffLoad::Failed(error.into());
+                        return cx.notify();
+                    }
+                };
+                let truncated = view.truncated;
+                if !matches!(view.body, diff_tool_call::Body::Files { .. }) {
+                    this.clear_diff(cx);
+                }
+                this.right_panel.load = match view.body {
+                    diff_tool_call::Body::Files { files, omitted } => {
+                        let additions = files.iter().map(DiffFile::additions).sum();
+                        let deletions = files.iter().map(DiffFile::deletions).sum();
+                        this.show_diff_files(&selection, files, install, cx);
+                        this.rebuild_tree_rows(cx);
+                        DiffLoad::Ready { additions, deletions, head: None, base: None, truncated, pending: 0, omitted }
+                    }
+                    diff_tool_call::Body::NoPatch => DiffLoad::Empty("No patch available for this selection."),
+                    diff_tool_call::Body::NoNetChanges => DiffLoad::Empty("No net changes in this selection."),
+                    diff_tool_call::Body::Raw { reason, text } => {
+                        DiffLoad::Raw { reason, text: text.into(), truncated }
+                    }
+                    diff_tool_call::Body::Recorded(content) => DiffLoad::Recorded {
+                        content: content.into_iter().map(|(label, text)| (label, text.into())).collect(),
+                        truncated,
+                    },
+                };
                 cx.notify();
             });
         }));
@@ -1536,7 +1667,9 @@ impl Workspace {
         self.right_panel_open()
             && self.active_surface() == Some(&Surface::Diff)
             && self.diff_available()
-            && self.panel_state().is_some_and(|panel| !matches!(panel.scope, DiffScope::Turn(_)))
+            && self.panel_state().is_some_and(|panel| {
+                matches!(panel.scope, DiffScope::Branch | DiffScope::Unstaged | DiffScope::Commit(_))
+            })
     }
 
     /// `useLiveRefresh(…, { refreshOnShow })` for the git diff: showing it, or the window
@@ -2346,6 +2479,7 @@ impl Workspace {
                 .find(|c| &c.sha == sha)
                 .map_or_else(|| format!("Commit {}", &sha[..sha.len().min(7)]), |c| c.subject.clone())
                 .into(),
+            DiffScope::ToolCall { .. } => "Tool call".into(),
         };
         let view = cx.entity();
         let menu_scope = scope.clone();
@@ -2461,11 +2595,12 @@ impl Workspace {
                 })
             });
         let scheme = self.diff_color_scheme();
-        let (stats, truncated, pending) = match &self.right_panel.load {
-            DiffLoad::Ready { additions, deletions, truncated, pending, .. } => {
-                (Some((*additions, *deletions)), *truncated, *pending)
+        let (stats, truncated, pending, omitted) = match &self.right_panel.load {
+            DiffLoad::Ready { additions, deletions, truncated, pending, omitted, .. } => {
+                (Some((*additions, *deletions)), *truncated, *pending, *omitted)
             }
-            _ => (None, false, 0),
+            DiffLoad::Raw { truncated, .. } | DiffLoad::Recorded { truncated, .. } => (None, *truncated, 0, None),
+            _ => (None, false, 0, None),
         };
         // `comparisonHeadRef` / `comparisonBaseRef`, with the base as its picker.
         let refs = matches!(scope, DiffScope::Branch).then(|| {
@@ -2486,7 +2621,7 @@ impl Workspace {
             let narrow = refs_width < window.rem_size() * 20.;
             self.render_base_ref_picker(&head, &base, narrow, tokens, window, cx)
         });
-        let can_refresh = !matches!(scope, DiffScope::Turn(_));
+        let can_refresh = matches!(scope, DiffScope::Branch | DiffScope::Unstaged | DiffScope::Commit(_));
         let (shows_files, all_collapsed) = {
             let state = self.right_panel.diff.read(cx);
             let shows = matches!(self.right_panel.load, DiffLoad::Ready { .. }) && !state.files().is_empty();
@@ -2622,6 +2757,25 @@ impl Workspace {
                         )
                     }),
             );
+        // `bg-muted/40` notices above the patch.
+        let notice = |text: SharedString| {
+            div()
+                .px_3()
+                .py(px(6.))
+                .border_b_1()
+                .border_color(tokens.border.opacity(0.7))
+                .bg(tokens.muted.opacity(0.4))
+                .text_size(px(11.))
+                .text_color(tokens.muted_foreground)
+                .child(text)
+        };
+        let truncated_notice =
+            truncated.then(|| notice("This preview exceeds the size limit. Changes shown are incomplete.".into()));
+        let omitted_notice = omitted.map(|(recorded, omitted)| {
+            notice(
+                format!("This tool call changed {recorded} files. The recorded patch omits {omitted} of them.").into(),
+            )
+        });
         let quiet = |text: SharedString| {
             div()
                 .flex_1()
@@ -2637,6 +2791,7 @@ impl Workspace {
         let body = match &self.right_panel.load {
             DiffLoad::Idle | DiffLoad::Loading => quiet(
                 match &scope {
+                    DiffScope::ToolCall { .. } => "Loading tool call diff...",
                     DiffScope::Turn(_) => "Loading checkpoint diff...",
                     DiffScope::Unstaged => "Loading uncommitted changes...",
                     DiffScope::Commit(_) => "Loading commit...",
@@ -2652,22 +2807,23 @@ impl Workspace {
                 .text_color(tokens.error.opacity(0.8))
                 .child(error.clone())
                 .into_any_element(),
+            DiffLoad::Raw { reason, text, .. } => v_flex()
+                .flex_1()
+                .min_h_0()
+                .children(truncated_notice)
+                .child(raw_patch(reason, text, wrap, tokens))
+                .into_any_element(),
+            DiffLoad::Recorded { content, .. } => v_flex()
+                .flex_1()
+                .min_h_0()
+                .children(truncated_notice)
+                .child(recorded_contents(content, wrap, tokens))
+                .into_any_element(),
             DiffLoad::Ready { .. } => v_flex()
                 .flex_1()
                 .min_h_0()
-                .when(truncated, |el| {
-                    el.child(
-                        div()
-                            .px_3()
-                            .py(px(6.))
-                            .border_b_1()
-                            .border_color(tokens.border)
-                            .bg(tokens.muted)
-                            .text_size(px(11.))
-                            .text_color(tokens.muted_foreground)
-                            .child("This preview exceeds the size limit. Changes shown are incomplete."),
-                    )
-                })
+                .children(truncated_notice)
+                .children(omitted_notice)
                 .child(
                     h_flex()
                         .flex_1()
@@ -2789,6 +2945,59 @@ impl Workspace {
             .child(segment("diff-stacked", "icons/rows-3.svg", !split, false, cx))
             .child(segment("diff-split", "icons/columns-2.svg", split, true, cx))
     }
+}
+
+/// A tool call's patch the viewer can't read: why, then its text (`renderablePatch.kind === "raw"`).
+fn raw_patch(reason: &'static str, text: &SharedString, wrap: bool, tokens: &Tokens) -> impl IntoElement {
+    let block = div()
+        .id("diff-raw-patch")
+        .rounded(px(6.))
+        .border_1()
+        .border_color(tokens.border.opacity(0.7))
+        .bg(tokens.background.opacity(0.7))
+        .p_3()
+        .font_family(tokens.fonts.mono)
+        .text_size(px(11.))
+        .line_height(gpui_kit::relative(1.625))
+        .text_color(tokens.muted_foreground.opacity(0.9))
+        .when(!wrap, gpui_kit::Styled::whitespace_nowrap)
+        .overflow_x_scroll()
+        .child(gpui_kit::base::SelectableText::new("diff-raw-patch-text", text.clone()));
+    div().id("diff-raw").flex_1().min_h_0().overflow_y_scroll().p_2().child(
+        v_flex()
+            .gap_2()
+            .child(div().text_size(px(11.)).text_color(tokens.muted_foreground.opacity(0.75)).child(reason))
+            .child(block),
+    )
+}
+
+/// File contents a tool call recorded without a diff, each under its label.
+fn recorded_contents(content: &[(&'static str, SharedString)], wrap: bool, tokens: &Tokens) -> impl IntoElement {
+    let entries = content.iter().enumerate().map(|(index, (label, text))| {
+        let text = if text.is_empty() { SharedString::from("Empty content.") } else { text.clone() };
+        v_flex().gap_1().child(div().text_color(tokens.muted_foreground).child(*label)).child(
+            div()
+                .id(ElementId::NamedInteger("diff-recorded".into(), index as u64))
+                .font_family(tokens.fonts.mono)
+                .text_size(px(11.))
+                .when(!wrap, gpui_kit::Styled::whitespace_nowrap)
+                .overflow_x_scroll()
+                .child(gpui_kit::base::SelectableText::new(
+                    ElementId::NamedInteger("diff-recorded-text".into(), index as u64),
+                    text,
+                )),
+        )
+    });
+    v_flex()
+        .id("diff-recorded-contents")
+        .flex_1()
+        .min_h_0()
+        .overflow_y_scroll()
+        .p_3()
+        .gap_3()
+        .text_xs()
+        .child(div().text_color(tokens.muted_foreground).child("The provider recorded file content without a diff."))
+        .children(entries)
 }
 
 /// A menu row's 16px icon (`sm:size-4`, `-mx-0.5`): the menu lays icons out in a 12px box, so

@@ -406,3 +406,9 @@ focuses the diff. 0.9.0 has no find. The patch:
   `reveal_match_horizontally`.
 - `locales/ui.yml`: the English `Diff.Search*` strings.
 - `src/diff/search_tests.rs`.
+
+**A parsed file reports its hunks and each side's lines.** The app checks a tool call's recorded
+patch the way the web reads Pierre's `hunks`, `additionLines` and `deletionLines`: an added file
+must have no original lines, a deleted one no modified lines. 0.9.0 keeps both counts
+crate-private. `src/diff/document.rs`: `DiffFile::lines_count` is public and `DiffFile::hunk_count`
+is new.

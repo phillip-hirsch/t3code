@@ -9,7 +9,8 @@ use std::rc::Rc;
 use gpui_kit::StyledImage as _;
 use gpui_kit::assets::IconName;
 use gpui_kit::base::SelectableText;
-use gpui_kit::component::{Icon, h_flex, v_flex};
+use gpui_kit::component::button::Button;
+use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, App, Context, ElementId, FontWeight, HighlightStyle, InteractiveElement as _, IntoElement,
     ParentElement as _, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Task, WeakEntity,
@@ -113,8 +114,8 @@ fn needs_fetch(item: &TurnItem, streams_output: bool) -> bool {
     }
 }
 
-/// `"live"` until the item settles, then its `updatedAt`.
-fn revision(item: &TurnItem) -> SharedString {
+/// `"live"` until the item settles, then its `updatedAt` (`turnItemDetailRevision`).
+pub(super) fn revision(item: &TurnItem) -> SharedString {
     match item.status.as_str() {
         "idle" | "pending" | "running" | "waiting" => "live".into(),
         _ => item.str("updatedAt").unwrap_or_default().to_owned().into(),
@@ -494,7 +495,12 @@ pub(super) fn inspector(entry: &Entry, this: &WeakEntity<Workspace>, t: &Tokens,
         "command_execution" | "dynamic_tool" => tool_body(entry, &item, workspace, t),
         "file_change" => {
             let scheme = super::git::DiffColorScheme::from_settings(&workspace.client_settings.values);
-            file_change(&entry.id, &item, root.as_deref(), scheme, t)
+            // `onOpenToolDiff`, on a server thread only.
+            let open_diff = matches!(workspace.target, Some(super::Target::Thread { .. }))
+                .then(|| workspace.source_of(&entry.item.0.id))
+                .flatten()
+                .map(|source| open_diff_button(&entry.id, source, this, t));
+            file_change(&entry.id, &item, root.as_deref(), scheme, open_diff, t)
         }
         "file_search" | "web_search" => search(entry, &item, root.as_deref(), this, t),
         _ => {
@@ -604,6 +610,7 @@ fn file_change(
     item: &TurnItem,
     root: Option<&str>,
     scheme: super::git::DiffColorScheme,
+    open_diff: Option<Button>,
     t: &Tokens,
 ) -> gpui_kit::Div {
     let raw = &item.raw;
@@ -627,7 +634,8 @@ fn file_change(
                 .items_center()
                 .gap(px(8.))
                 .child(div().font_family(FONT_MONO).text_color(t.muted_foreground).child(selectable("path", path)))
-                .children(counts),
+                .children(counts)
+                .children(open_diff),
         )
         .children(failed_diff.map(|diff| structured(&format!("diff:{id}"), diff.to_owned().into(), t)))
         .when(!changes.is_empty(), |el| {
@@ -638,6 +646,31 @@ fn file_change(
                     }),
                 ),
             )
+        })
+}
+
+/// `Open diff` (`Button size="xs" variant="outline"`): the change's recorded diff in the panel.
+fn open_diff_button(
+    id: &str,
+    (thread_id, item_id): (String, String),
+    this: &WeakEntity<Workspace>,
+    t: &Tokens,
+) -> Button {
+    let this = this.clone();
+    Button::new(ElementId::Name(format!("open-tool-diff:{id}").into()))
+        .outline()
+        .xsmall()
+        .h(px(24.))
+        .px(px(8.))
+        .rounded(px(6.))
+        .border_color(t.input)
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .label("Open diff")
+        .on_click(move |_, window, cx| {
+            cx.stop_propagation();
+            let (thread_id, item_id) = (thread_id.clone(), item_id.clone());
+            let _ = this.update(cx, |workspace, cx| workspace.open_tool_call_diff(thread_id, item_id, window, cx));
         })
 }
 
