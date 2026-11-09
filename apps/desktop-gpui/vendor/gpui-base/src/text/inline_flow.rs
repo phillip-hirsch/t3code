@@ -31,6 +31,7 @@ pub(super) struct InlineFlow {
     id: ElementId,
     items: Vec<InlineFlowItem>,
     link_click_handler: Option<Arc<LinkClickHandlerFn>>,
+    image_click_handler: Option<Arc<super::text_view::ImageClickHandlerFn>>,
     /// The block editor leaf this flow renders (design D3): its fragments
     /// and atoms are reported to the editor sink as pieces.
     editor_key: Option<u64>,
@@ -66,6 +67,7 @@ pub(super) enum InlineFlowItem {
         reveal: Option<RevealAt>,
     },
     Image {
+        url: gpui::SharedUri,
         source: ImageSource,
         link: Option<LinkMark>,
         title: String,
@@ -283,8 +285,17 @@ impl InlineFlow {
             id: id.into(),
             items,
             link_click_handler,
+            image_click_handler: None,
             editor_key: None,
         }
+    }
+
+    pub(super) fn image_click_handler(
+        mut self,
+        handler: Option<Arc<super::text_view::ImageClickHandlerFn>>,
+    ) -> Self {
+        self.image_click_handler = handler;
+        self
     }
 
     pub(super) fn editor_key(mut self, key: Option<u64>) -> Self {
@@ -295,16 +306,25 @@ impl InlineFlow {
         self
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn image_element(
         ix: usize,
+        url: &gpui::SharedUri,
         source: &ImageSource,
         link: &Option<LinkMark>,
         _title: &str,
         size: Size<Pixels>,
         link_click_handler: Option<Arc<LinkClickHandlerFn>>,
+        image_click_handler: Option<&Arc<super::text_view::ImageClickHandlerFn>>,
+        cx: &App,
     ) -> AnyElement {
-        img(source.clone())
-            .id(ix)
+        let element = img(source.clone()).id(ix);
+        let element = if link.is_none() {
+            super::text_view::clickable_image(element, url, image_click_handler, cx)
+        } else {
+            element
+        };
+        element
             .object_fit(ObjectFit::Contain)
             .max_w(relative(1.))
             .w(size.width)
@@ -730,6 +750,7 @@ impl Element for InlineFlow {
                     size: fragment_size,
                 } => {
                     let InlineFlowItem::Image {
+                        url,
                         source,
                         link,
                         title,
@@ -743,11 +764,14 @@ impl Element for InlineFlow {
                         report_box(*item_ix, Bounds::new(bounds.origin + origin, fragment_size));
                     let mut element = Self::image_element(
                         elements.len(),
+                        url,
                         source,
                         link,
                         title.as_str(),
                         fragment_size,
                         self.link_click_handler.clone(),
+                        self.image_click_handler.as_ref(),
+                        cx,
                     );
                     element.prepaint_as_root(
                         bounds.origin + origin,

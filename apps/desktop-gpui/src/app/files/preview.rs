@@ -98,6 +98,8 @@ pub(super) struct PreviewState {
     revealed: Option<u64>,
     /// The open request the rendered view was picked over (`handledReveal`).
     rendered_reveal: Option<u64>,
+    /// An image's zoom in the panel.
+    image_zoom: crate::app::image_viewer::PreviewZoom,
     _read: Option<Task<()>>,
     _full: Option<Task<()>>,
     _save: Option<Task<()>>,
@@ -122,6 +124,7 @@ impl PreviewState {
             mutation: None,
             revealed: None,
             rendered_reveal: None,
+            image_zoom: Default::default(),
             _read: None,
             _full: None,
             _save: None,
@@ -256,8 +259,9 @@ impl Workspace {
         state.mutation = Some(mutation);
         if state.kind == logic::FileKind::Image {
             state.load = Load::Image;
-            // `workspace-revision`: a mutation fetches the image again.
+            // `workspace-revision`: a mutation fetches the image again, at its fitted size.
             if changed {
+                state.image_zoom.zoom = None;
                 let resource = self.image_resource(key);
                 if let Some(images) = self.files.images.get(&key.checkout.env) {
                     images.update(cx, |images, _| images.forget(&resource));
@@ -960,15 +964,15 @@ impl Workspace {
                     let tooltip: SharedString = logic::absolute_path(&key.checkout.cwd, &key.path).into();
                     let menu_key = key.clone();
                     let menu_image = ready.clone();
+                    let failed = ready.is_none();
                     div()
                         .id("workspace-image")
                         .flex_1()
                         .min_h_0()
                         .flex()
                         .flex_col()
-                        .items_center()
-                        .justify_center()
-                        .px(px(24.))
+                        .overflow_hidden()
+                        .when(failed, |el| el.items_center().justify_center().px(px(24.)))
                         .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
                         .on_mouse_down(
                             gpui_kit::MouseButton::Right,
@@ -979,9 +983,7 @@ impl Workspace {
                             }),
                         )
                         .child(match ready {
-                            Some(image) => {
-                                img(image).max_w_full().max_h_full().object_fit(ObjectFit::Contain).into_any_element()
-                            }
+                            Some(image) => self.render_preview_image(key, image, tokens, cx),
                             None => div()
                                 .text_center()
                                 .text_xs()
@@ -1158,6 +1160,169 @@ impl Workspace {
                 .into_any_element(),
         };
         v_flex().flex_1().min_h_0().child(header).child(body).into_any_element()
+    }
+
+    /// `PreviewImageContent`: the image's size and zoom controls over the image, which scrolls
+    /// once it outgrows the panel and opens the image viewer on a click.
+    fn render_preview_image(
+        &mut self,
+        key: &FileKey,
+        image: std::sync::Arc<gpui_kit::Image>,
+        tokens: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::app::image_viewer::{self as viewer, Measured};
+        let measured = self.image_natural_size(&image, cx);
+        if measured == Measured::Failed {
+            return super::chrome::failure("Unable to load image.", None, tokens);
+        }
+        let Some(state) = self.files.previews.get(key) else { return div().into_any_element() };
+        let (zoom, viewport) = (state.image_zoom.zoom, state.image_zoom.viewport.clone());
+        // Sized once both the image and the panel are measured; until then it is contained.
+        let natural = measured.size();
+        let sized = natural.zip(viewport.get());
+        let scale =
+            zoom.unwrap_or_else(|| sized.map_or(1., |(natural, viewport)| viewer::preview_fit(natural, viewport)));
+        let label = match natural {
+            Some(natural) => {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "natural sides are whole pixels"
+                )]
+                let side = |value: f32| crate::app::git::group_thousands(value as u64);
+                format!("{} × {}", side(natural.width), side(natural.height))
+            }
+            None => "Loading image…".to_owned(),
+        };
+        let set_zoom = |id: &'static str,
+                        icon: IconName,
+                        label: &'static str,
+                        next: Option<f32>,
+                        disabled: bool,
+                        pressed: bool| {
+            let key = key.clone();
+            super::chrome::action(id, icon, label, tokens)
+                .tab_index(0)
+                .when(pressed, |el| el.bg(tokens.accent).text_color(tokens.foreground))
+                .when(disabled, |el| el.opacity(0.64).cursor_default())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if disabled {
+                        return;
+                    }
+                    if let Some(state) = this.files.previews.get_mut(&key) {
+                        state.image_zoom.zoom = next;
+                        cx.notify();
+                    }
+                }))
+        };
+        let known = natural.is_some();
+        let out = viewer::preview_zoom(scale, 1. / viewer::PREVIEW_ZOOM_STEP);
+        let r#in = viewer::preview_zoom(scale, viewer::PREVIEW_ZOOM_STEP);
+        let header = h_flex()
+            .flex_none()
+            .min_h(px(40.))
+            .flex_wrap()
+            .items_center()
+            .justify_between()
+            .gap(px(8.))
+            .border_b_1()
+            .border_color(tokens.border.opacity(0.6))
+            .px(px(12.))
+            .py(px(4.))
+            .text_xs()
+            .text_color(tokens.muted_foreground)
+            .child(div().child(label))
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(set_zoom(
+                        "image-zoom-out",
+                        IconName::Minus,
+                        "Zoom out",
+                        Some(out),
+                        !known || scale <= viewer::PREVIEW_MIN_ZOOM,
+                        false,
+                    ))
+                    .child(div().min_w(px(40.)).text_center().child(format!("{}%", (scale * 100.).round())))
+                    .child(set_zoom(
+                        "image-zoom-in",
+                        IconName::Plus,
+                        "Zoom in",
+                        Some(r#in),
+                        !known || scale >= viewer::PREVIEW_MAX_ZOOM,
+                        false,
+                    ))
+                    .child(set_zoom("image-fit", IconName::Scan, "Fit image", None, false, zoom.is_none()))
+                    .child(set_zoom(
+                        "image-actual-size",
+                        IconName::Maximize,
+                        "Actual image size",
+                        Some(1.),
+                        false,
+                        zoom == Some(1.),
+                    )),
+            );
+        let item = viewer::ViewerImage {
+            image: image.clone(),
+            name: logic::file_name(&key.path).to_owned().into(),
+            reference: Some(viewer::file_reference(
+                &logic::absolute_path(&key.checkout.cwd, &key.path),
+                Some(&key.checkout.cwd),
+            )),
+        };
+        let ring = tokens.ring;
+        let picture = img(image)
+            .id("workspace-image-zoom")
+            .flex_none()
+            .tab_index(0)
+            .cursor_pointer()
+            .focus_visible(move |style| style.border_2().border_color(ring))
+            .map(|el| match sized {
+                Some((natural, _)) => el.w(px(natural.width * scale)).h(px(natural.height * scale)),
+                None => el.max_w_full().object_fit(ObjectFit::Contain),
+            })
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.open_image_viewer(vec![item.clone()], 0, window, cx);
+            }));
+        let entity = cx.entity_id();
+        let measure = gpui_kit::canvas(
+            move |bounds, _, cx| {
+                let measured = gpui_kit::size(f32::from(bounds.size.width), f32::from(bounds.size.height));
+                if viewport.get() != Some(measured) {
+                    viewport.set(Some(measured));
+                    cx.notify(entity);
+                }
+            },
+            |_, (), _, _| {},
+        )
+        .absolute()
+        .size_full();
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .child(header)
+            .child(
+                div().relative().flex_1().min_h_0().child(measure).child(
+                    div().id("workspace-image-scroll").absolute().size_full().overflow_scroll().child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .p(px(16.))
+                            .min_w(gpui_kit::relative(1.))
+                            .min_h(gpui_kit::relative(1.))
+                            .when_some(sized, |el, (natural, _)| {
+                                el.w(px(natural.width * scale + 32.)).h(px(natural.height * scale + 32.))
+                            })
+                            .child(picture),
+                    ),
+                ),
+            )
+            .into_any_element()
     }
 
     /// An image file, fetched through `assets.createUrl` like the web's `WorkspaceImagePreview`.

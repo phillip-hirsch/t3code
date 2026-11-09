@@ -160,6 +160,15 @@ impl Workspace {
         view
     }
 
+    /// Expands the image at `url` in the message `key` into the viewer, with the message's other
+    /// images as its gallery.
+    fn open_markdown_image(&mut self, key: &str, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = self.markdown.0.get(key).map(|state| state.text.clone()) else { return };
+        if let Some((items, index)) = self.markdown_gallery(&text, url) {
+            self.open_image_viewer(items, index, window, cx);
+        }
+    }
+
     /// The markdown view kept for `key` (a message's id), if it has rendered.
     pub(super) fn markdown_view(&self, key: &str) -> Option<Entity<TextViewState>> {
         self.markdown.0.get(key).map(|state| state.view.clone())
@@ -1832,8 +1841,8 @@ fn markdown_view(
     let streaming = matches!(kind, MarkdownKind::Assistant { streaming: true });
     let inline_code = inline_code_style(t);
     let t = *t;
-    let (header_this, link_this, table_this) = (this.clone(), this.clone(), this.clone());
-    let table_key = key.clone();
+    let (header_this, link_this, table_this, image_this) = (this.clone(), this.clone(), this.clone(), this.clone());
+    let (table_key, image_key) = (key.clone(), key.clone());
     TextView::new(state)
         .style(markdown_style(&t, kind == MarkdownKind::User, wrap))
         .inline_code_style(inline_code)
@@ -1850,6 +1859,10 @@ fn markdown_view(
             })
         })
         .table_actions(move |table, _, cx| super::markdown_ui::table_actions(table, &table_this, &table_key, &t, cx))
+        .on_image_click(move |url, window, cx| {
+            let _ = image_this
+                .update(cx, |workspace, cx| workspace.open_markdown_image(&image_key, url.as_ref(), window, cx));
+        })
         .plugin(super::markdown_ui::SkillChips { workspace: this.clone() })
         .plugin(super::markdown_ui::ThreadChips { workspace: this.clone() })
         .plugin(super::markdown_ui::FileChips {
@@ -2506,11 +2519,38 @@ fn viewed_image(entry: &Entry, this: &WeakEntity<Workspace>, cx: &App) -> Option
     use gpui_kit::StyledImage as _;
     let workspace = this.upgrade()?;
     let workspace = workspace.read(cx);
-    let image = workspace.markdown_images.get(&workspace.viewed_image(entry)?)?;
+    let path = workspace.viewed_image(entry)?;
+    let image = workspace.markdown_images.get(&path)?;
+    let root = workspace.git_cwd();
+    let full = match super::markdown_images::classify(&path, root.as_deref()) {
+        super::markdown_images::Source::WorkspaceFile(full) => full,
+        _ => path.clone(),
+    };
+    // A click expands it (`ChatMarkdownAssetImage`'s `onImageExpand`).
+    let item = super::image_viewer::ViewerImage {
+        image: image.clone(),
+        name: path.rsplit(['/', '\\']).next().unwrap_or("image").to_owned().into(),
+        reference: Some(super::image_viewer::file_reference(&full, root.as_deref())),
+    };
+    let (this, ring) = (this.clone(), crate::theme::tokens(cx).ring);
     Some(
         div()
             .mt(px(4.))
-            .child(gpui_kit::img(image).max_w_full().max_h(px(256.)).object_fit(gpui_kit::ObjectFit::Contain))
+            .child(
+                gpui_kit::img(image)
+                    .id(ElementId::Name(format!("viewed-image:{}", entry.id).into()))
+                    .max_w_full()
+                    .max_h(px(256.))
+                    .object_fit(gpui_kit::ObjectFit::Contain)
+                    .tab_index(0)
+                    .cursor_pointer()
+                    .focus_visible(move |style| style.border_2().border_color(ring))
+                    .on_click(move |_, window, cx| {
+                        cx.stop_propagation();
+                        let item = item.clone();
+                        let _ = this.update(cx, |w, cx| w.open_image_viewer(vec![item], 0, window, cx));
+                    }),
+            )
             .into_any_element(),
     )
 }

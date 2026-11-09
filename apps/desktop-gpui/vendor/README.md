@@ -243,6 +243,19 @@ own width, so the row could span the block only when the caller knew its width. 
 the actions at the block's left edge too, so the row can fill it. `src/text/node.rs`: the
 `actions` container in `CodeBlock::render`.
 
+**Markdown images open on a click.** The web's chat markdown makes an image that is not inside a
+link a button (`role="button"`, `tabIndex={0}`) whose click, Enter or Space opens the expanded
+image viewer. 0.9.0's images are clickable only inside a link. The patch adds
+`TextView::on_image_click`: with a handler set, an image outside a link is a tab stop with a
+pointer cursor and a 2px ring on keyboard focus, and a left click, Enter or Space calls the handler
+with the image's URL. Linked images keep following their link. Files:
+
+- `src/text/text_view.rs`: `ImageClickHandlerFn`, `on_image_click` and `clickable_image`.
+- `src/text/state.rs`: the handler carried to each frame's `NodeContext`.
+- `src/text/node.rs`: `NodeContext::image_click_handler`, the plain image path in
+  `Paragraph::render`, and the image's URL on `InlineFlowItem::Image`.
+- `src/text/inline_flow.rs`: `InlineFlow::image_click_handler` and `image_element`.
+
 The crate's own tests need `--features test-support` and `include_str!` a `README.md` four levels
 above `src/text`, which this folder lacks: run them from a scratch copy laid out as
 `<dir>/crates/gpui-base` with a `<dir>/README.md`.
@@ -357,3 +370,6 @@ headers are sticky. The patch, in `src/diff/state.rs` and `src/diff/mod.rs`:
 - `DiffState::sticky_header` and `render_diff`'s `diff-sticky-header` overlay: once the list
   scrolls past a file's header, that header draws pinned over the top of the body, pushed up by
   the next file's header as it arrives; a canvas records its height for the push.
+
+**Markdown images open on a click.** `src/text/compat.rs`: `TextView::on_image_click`, passing
+through to gpui-base's (see its "Markdown images open on a click").

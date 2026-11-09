@@ -51,6 +51,7 @@ mod git;
 mod guest_share;
 mod header;
 mod host_picker;
+mod image_viewer;
 mod inspector;
 mod keep_alive;
 mod keymap;
@@ -338,6 +339,7 @@ pub struct Workspace {
     queue: queue::QueueUi,
     now: thread_now::NowUi,
     markdown_images: markdown_images::ImageCache,
+    image_viewer: image_viewer::ViewerUi,
     entry_kinds: Arc<markdown_ui::EntryKinds>,
     workflow: workflow::WorkflowUi,
     setup: worktree_setup::SetupWatch,
@@ -529,6 +531,7 @@ impl Workspace {
             queue: Default::default(),
             now: Default::default(),
             markdown_images: Default::default(),
+            image_viewer: Default::default(),
             entry_kinds: Default::default(),
             workflow: Default::default(),
             setup: Default::default(),
@@ -1018,6 +1021,8 @@ impl Workspace {
         self.entry_cache = timeline::EntryCache::default();
         self.markdown = chat::MarkdownStates::default();
         self.markdown_images = markdown_images::ImageCache::default();
+        // Leaving the thread drops its open image, as the web's thread overlay retention does.
+        self.image_viewer.dismiss();
         self.entry_kinds = Arc::default();
         self.details = inspector::Details::default();
         self._working_tick = None;
@@ -1264,6 +1269,10 @@ impl Render for Workspace {
                     cx.stop_propagation();
                     return;
                 }
+                // The image viewer sits over every other layer and takes its own Escape.
+                if this.image_viewer_open() {
+                    return;
+                }
                 // Escape closes the topmost layer: Settings, then the details popover.
                 if this.settings.is_some() && event.keystroke.key == "escape" {
                     if this.settings_escape(window, cx) {
@@ -1379,6 +1388,7 @@ impl Render for Workspace {
             .children(self.theme_editor.clone())
             .children(self.render_palette(window, cx))
             .children(self.render_file_overlay(window, cx))
+            .children(self.render_image_viewer(window, cx))
             .children(self.render_quit_hint(cx))
             .child(self.render_caption_overlay(window, cx))
             .children(titlebar::render_resize_edges(window, cx))

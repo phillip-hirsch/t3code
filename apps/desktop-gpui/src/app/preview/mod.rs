@@ -346,6 +346,7 @@ impl Workspace {
             || self.right_panel.profiles_menu_open
             || self.tab_menu_open()
             || self.files.menu_open
+            || self.image_viewer_open()
             || window.has_active_dialog(cx)
     }
 

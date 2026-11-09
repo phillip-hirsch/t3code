@@ -8445,6 +8445,7 @@ dependencies = [
  "uiautomation",
  "unicode-segmentation",
  "url",
+ "usvg 0.46.0",
  "uuid",
  "win32job",
  "windows 0.61.3",

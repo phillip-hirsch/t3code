@@ -2710,6 +2710,7 @@ pub(crate) struct NodeContext {
     pub(crate) table_actions: Option<Arc<TableActionsFn>>,
     pub(crate) image_source: Option<Arc<super::text_view::ImageSourceFn>>,
     pub(crate) link_click_handler: Option<Arc<LinkClickHandlerFn>>,
+    pub(crate) image_click_handler: Option<Arc<super::text_view::ImageClickHandlerFn>>,
     pub(crate) task_toggle_handler: Option<Arc<super::text_view::TaskToggleFn>>,
     pub(crate) markdown_extensions: Arc<MarkdownExtensions>,
     /// This frame's streamed fade-in, when any text is still fading.
@@ -2897,6 +2898,7 @@ impl Paragraph {
                 self.inline_flow_items(fade_key, fades, backgrounds, node_cx, cx),
                 node_cx.link_click_handler.clone(),
             )
+            .image_click_handler(node_cx.image_click_handler.clone())
             .editor_key(self.leaf_key())
             .into_any_element();
         }
@@ -2974,9 +2976,19 @@ impl Paragraph {
                     );
                 }
                 let link_click_handler = node_cx.link_click_handler.clone();
+                let element = img(node_cx.image_source(image)).id(ix);
+                let element = if image.link.is_none() {
+                    super::text_view::clickable_image(
+                        element,
+                        &image.url,
+                        node_cx.image_click_handler.as_ref(),
+                        cx,
+                    )
+                } else {
+                    element
+                };
                 child_nodes.push(
-                    img(node_cx.image_source(image))
-                        .id(ix)
+                    element
                         .object_fit(ObjectFit::Contain)
                         .max_w(relative(1.))
                         .when_some(image.width, |this, width| this.w(width))
@@ -3197,6 +3209,7 @@ impl Paragraph {
                 }
 
                 items.push(InlineFlowItem::Image {
+                    url: image.url.clone(),
                     source: node_cx.image_source(image),
                     link: image.link.clone(),
                     title: image.title(),
