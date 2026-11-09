@@ -12,6 +12,14 @@ it once upstream has an equivalent), and update the versions here and in `../Car
 gpui-kit's `gpui-pre-platform` pins). Each patch was committed separately from its unmodified
 copy, so `git log -p -- vendor/<name>` shows it.
 
+## Not vendored: libghostty-vt needs Zig 0.15.2
+
+The terminal links the crates.io `libghostty-vt` crate. Its `libghostty-vt-sys` build script
+clones Ghostty at the crate's pinned commit and builds it with `zig build`, so every platform needs
+Zig 0.15.2 on `PATH`, and the first build of a target directory needs network (a few minutes; later
+builds reuse it). On macOS 27 or newer, install Zig with Homebrew (the formula that provides
+0.15.2, such as `brew install zig@0.15`): the ziglang.org 0.15.2 download fails to link there.
+
 ## gpui-pre 0.3.11
 
 GPUI's core (Zed's `gpui`), which gpui-kit re-exports.
