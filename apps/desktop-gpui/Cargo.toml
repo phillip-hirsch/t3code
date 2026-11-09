@@ -57,6 +57,8 @@ markdown = "1"
 # Notebook HTML outputs are sanitized before they render; gpui-base's HTML view already builds both.
 html5ever = "0.27"
 markup5ever_rcdom = "0.3"
+# The types of files sent to an agent browser page's file picker; GPUI already builds this crate.
+mime_guess = "2"
 raw-window-handle = "0.6"
 rodio = { version = "0.23", default-features = false, features = ["playback", "mp3"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "form", "rustls"] }

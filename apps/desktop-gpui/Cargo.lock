@@ -8426,6 +8426,7 @@ dependencies = [
  "log",
  "markdown",
  "markup5ever_rcdom",
+ "mime_guess",
  "nix",
  "objc2-app-kit 0.3.2",
  "objc2-core-graphics",

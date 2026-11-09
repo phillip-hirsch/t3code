@@ -6,22 +6,23 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::ops::Range;
+use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use futures::{SinkExt as _, StreamExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
-
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{Disableable as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Bounds, ClickEvent, Context, ElementInputHandler, Entity, EntityInputHandler,
     FocusHandle, InteractiveElement as _, IntoElement, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement as _, Pixels, Point, RenderImage,
-    ScrollDelta, ScrollEvent, SharedString, Styled as _, StyledImage as _, Task, UTF16Selection, Window, canvas, div,
-    img, px, size,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement as _, PathPromptOptions, Pixels, Point,
+    RenderImage, ScrollDelta, ScrollEvent, SharedString, Styled as _, StyledImage as _, Task, UTF16Selection, Window,
+    canvas, div, img, px, size,
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -95,6 +96,47 @@ fn control_label(control: Option<&Control>) -> &'static str {
             "another-viewer" => "Another viewer has control",
             _ => "Watching",
         },
+    }
+}
+
+/// The page's open file picker, offered to this viewer (`PreviewStreamFileChooser`).
+#[derive(Clone, Debug, PartialEq)]
+struct FileChooser {
+    id: String,
+    multiple: bool,
+}
+
+#[derive(Debug, PartialEq)]
+enum ChooserMessage {
+    Offered(FileChooser),
+    Closed(String),
+}
+
+impl ChooserMessage {
+    /// `fileChooser` and `fileChooserClosed`; anything else, or a malformed one, is `None`.
+    fn parse(value: &Value) -> Option<Self> {
+        let id = value["id"].as_str()?.to_owned();
+        match value["type"].as_str()? {
+            // GPUI's system picker has no type filter for the input's `accept`; the page checks
+            // the files it gets, as it would a drop.
+            "fileChooser" if value["accept"].is_string() => {
+                Some(Self::Offered(FileChooser { id, multiple: value["multiple"].as_bool()? }))
+            }
+            "fileChooserClosed" => Some(Self::Closed(id)),
+            _ => None,
+        }
+    }
+
+    /// A closed picker withdraws only the offer it names; a newer one stays.
+    fn apply(self, chooser: &mut Option<FileChooser>) {
+        match self {
+            Self::Offered(offer) => *chooser = Some(offer),
+            Self::Closed(id) => {
+                if chooser.as_ref().is_some_and(|open| open.id == id) {
+                    *chooser = None;
+                }
+            }
+        }
     }
 }
 
@@ -221,6 +263,92 @@ fn leaves_page(keystroke: &Keystroke) -> bool {
     keystroke.key == "escape" && m.shift && !(m.control || m.alt || m.platform || m.function)
 }
 
+/// The server's `UPLOAD_MAX_FILE_BYTES` and `UPLOAD_MAX_FILES`: a larger answer is refused
+/// there anyway, so it is never read into memory here.
+const UPLOAD_MAX_BYTES: u64 = 100 * 1024 * 1024;
+const UPLOAD_MAX_FILES: usize = 20;
+const UPLOAD_REFUSED: &str = "The upload was refused.";
+
+/// `previewStreamUploadUrl`.
+fn upload_url(http_base: &str, tab: &TabRef, chooser: &str) -> String {
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("threadId", &tab.thread.thread_id)
+        .append_pair("tabId", &tab.tab_id)
+        .append_pair("chooser", chooser)
+        .finish();
+    format!("{http_base}/api/preview-stream/upload?{query}")
+}
+
+struct UploadFile {
+    name: String,
+    mime: String,
+    bytes: Vec<u8>,
+}
+
+/// A `multipart/form-data` body of `file` parts, as the web's `FormData`; no parts cancels the
+/// page's picker. Quotes and line breaks in names are percent-encoded, as browsers do.
+fn multipart_body(boundary: &str, files: &[UploadFile]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for file in files {
+        let name = file.name.replace('"', "%22").replace('\r', "%0D").replace('\n', "%0A");
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\nContent-Type: {}\r\n\r\n",
+                file.mime
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(&file.bytes);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    body
+}
+
+fn read_upload_files(paths: Vec<PathBuf>) -> Result<Vec<UploadFile>, String> {
+    if paths.len() > UPLOAD_MAX_FILES {
+        return Err(UPLOAD_REFUSED.to_owned());
+    }
+    let mut total = 0;
+    for path in &paths {
+        total += std::fs::metadata(path).map_err(|error| format!("{}: {error}", path.display()))?.len();
+    }
+    if total > UPLOAD_MAX_BYTES {
+        return Err(UPLOAD_REFUSED.to_owned());
+    }
+    paths
+        .into_iter()
+        .map(|path| {
+            let bytes = std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+            let name = path.file_name().map_or_else(|| "file".into(), |name| name.to_string_lossy().into_owned());
+            let mime = mime_guess::from_path(&path).first_or_octet_stream().to_string();
+            Ok(UploadFile { name, mime, bytes })
+        })
+        .collect()
+}
+
+/// `uploadPreviewStreamFiles`: answers the page's picker with `paths`, authenticated as the
+/// stream is, on the environment that owns the tab.
+async fn upload_files(url: String, token: String, paths: Vec<PathBuf>) -> Result<(), String> {
+    static UPLOADS: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
+    let files =
+        tokio::task::spawn_blocking(move || read_upload_files(paths)).await.map_err(|error| error.to_string())??;
+    let boundary = format!("t3-{}", uuid::Uuid::new_v4().simple());
+    let response = UPLOADS
+        .post(url)
+        .bearer_auth(token)
+        .header(reqwest::header::CONTENT_TYPE, format!("multipart/form-data; boundary={boundary}"))
+        .body(multipart_body(&boundary, &files))
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if response.status().is_success() {
+        return Ok(());
+    }
+    let text = response.text().await.unwrap_or_default();
+    Err(if text.is_empty() { UPLOAD_REFUSED.to_owned() } else { text })
+}
+
 /// What the stream's socket last told the view.
 enum Incoming {
     Connected(bool),
@@ -273,6 +401,7 @@ pub(super) struct ServerStream {
     buttons: u8,
     focus: FocusHandle,
     input: Entity<PageInput>,
+    file_chooser: Option<FileChooser>,
     /// A `prompt` dialog's response.
     prompt: Entity<InputState>,
     _task: Task<()>,
@@ -409,6 +538,7 @@ impl Workspace {
             buttons: 0,
             focus: cx.focus_handle(),
             input,
+            file_chooser: None,
             prompt: cx.new(|cx| InputState::new(window, cx)),
             _task: task,
         };
@@ -423,6 +553,8 @@ impl Workspace {
                 if !connected {
                     stream.control = None;
                     stream.buttons = 0;
+                    // The server offers a picker still open again, under a new id, on reconnect.
+                    stream.file_chooser = None;
                 }
             }
             Incoming::Frame(image, size) => {
@@ -434,8 +566,14 @@ impl Workspace {
                 stream.stopped = Some(stop);
                 stream.connected = false;
                 stream.control = None;
+                stream.file_chooser = None;
             }
             Incoming::Message(message) => match message["type"].as_str() {
+                Some("fileChooser" | "fileChooserClosed") => {
+                    if let Some(chooser) = ChooserMessage::parse(&message) {
+                        chooser.apply(&mut stream.file_chooser);
+                    }
+                }
                 Some("control") => {
                     let Some(control) = Control::parse(&message) else { return };
                     let previous = stream.control.as_ref().and_then(|c| c.dialog.as_ref());
@@ -552,6 +690,63 @@ impl Workspace {
             && self.active_surface() == Some(&Surface::Browser(tab.tab_id.clone()));
         let area = if in_panel { &self.areas.panel } else { &self.focus };
         area.focus(window, cx);
+    }
+
+    /// "Choose files": the system picker, then the upload, if the page still asks by then.
+    fn choose_server_files(&mut self, tab: &TabRef, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(stream) = self.preview.server.streams.get(tab) else { return };
+        let Some(chooser) = stream.file_chooser.clone().filter(|_| stream.live()) else { return };
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: chooser.multiple,
+            prompt: None,
+        });
+        let tab = tab.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            // A cancelled system picker leaves the page's picker waiting, as the web's does.
+            let Ok(Ok(Some(paths))) = paths.await else { return };
+            if paths.is_empty() {
+                return;
+            }
+            let _ =
+                this.update_in(cx, |this, window, cx| this.answer_file_chooser(&tab, &chooser.id, paths, window, cx));
+        })
+        .detach();
+    }
+
+    /// `answerFileChooser`: sends `paths` (none cancels) to the picker `id`, unless it closed or
+    /// control moved since it was offered.
+    fn answer_file_chooser(
+        &mut self,
+        tab: &TabRef,
+        id: &str,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(stream) = self.preview.server.streams.get_mut(tab) else { return };
+        if !stream.live() || stream.file_chooser.as_ref().is_none_or(|chooser| chooser.id != id) {
+            return;
+        }
+        stream.file_chooser = None;
+        cx.notify();
+        // The tab's own environment holds the picker.
+        let Some(endpoint) = self.env_endpoint(&tab.thread.environment) else { return };
+        let url = upload_url(&endpoint.http_base, tab, id);
+        let upload = crate::runtime().spawn(upload_files(url, endpoint.bearer_token.clone(), paths));
+        cx.spawn_in(window, async move |this, cx| {
+            let error = match upload.await {
+                Ok(Ok(())) => return,
+                Ok(Err(error)) => error,
+                Err(error) => error.to_string(),
+            };
+            log::warn!("server browser upload failed: {error}");
+            let _ = this.update_in(cx, |_, window, cx| {
+                window.push_notification(Notification::error(error).title("Could not send the files to the page"), cx);
+            });
+        })
+        .detach();
     }
 
     /// The agent tab's page: its latest frame with the control bar above it, or below it
@@ -789,6 +984,35 @@ impl Workspace {
             Some(Stop::Gone) | None => {}
         }
         let mut overlays = Vec::new();
+        if let Some(chooser) = stream.file_chooser.as_ref().filter(|_| stream.mine()) {
+            let id = chooser.id.clone();
+            let (cancel_tab, choose_tab) = (tab.clone(), tab.clone());
+            let what = if chooser.multiple { "files" } else { "a file" };
+            overlays.push(
+                card()
+                    .child(div().text_sm().child(format!("The page asks for {what}.")))
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(Button::new("server-chooser-cancel").outline().small().label("Cancel").on_click(
+                                cx.listener(move |this, _, window, cx| {
+                                    this.answer_file_chooser(&cancel_tab, &id, Vec::new(), window, cx);
+                                }),
+                            ))
+                            .child(
+                                Button::new("server-chooser-choose")
+                                    .primary()
+                                    .small()
+                                    .label(if chooser.multiple { "Choose files" } else { "Choose file" })
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.choose_server_files(&choose_tab, window, cx);
+                                    })),
+                            ),
+                    )
+                    .into_any_element(),
+            );
+        }
         let Some(dialog) = stream.control.as_ref().and_then(|control| control.dialog.as_ref()) else { return overlays };
         let is_prompt = dialog.kind == "prompt";
         let respond = |id: &'static str, label: &'static str, accept: bool, cx: &mut Context<Self>| {
@@ -1312,6 +1536,38 @@ mod tests {
         assert_eq!(key("space").text.as_deref(), Some(" "));
         assert!(dom_key(&Keystroke::parse("f13").ok().unwrap()).is_none());
         assert_eq!(modifier_bits(Modifiers { shift: true, control: true, ..Default::default() }), 10);
+    }
+
+    #[test]
+    fn file_chooser_messages_offer_and_withdraw_the_named_picker() {
+        let offer = |id: &str| json!({"type": "fileChooser", "id": id, "multiple": true, "accept": "image/*"});
+        let mut chooser = None;
+        ChooserMessage::parse(&offer("a")).unwrap().apply(&mut chooser);
+        assert_eq!(chooser, Some(FileChooser { id: "a".into(), multiple: true }));
+        ChooserMessage::parse(&offer("b")).unwrap().apply(&mut chooser);
+        ChooserMessage::parse(&json!({"type": "fileChooserClosed", "id": "a"})).unwrap().apply(&mut chooser);
+        assert_eq!(chooser.as_ref().map(|c| c.id.as_str()), Some("b"), "an older picker's close keeps the new one");
+        ChooserMessage::parse(&json!({"type": "fileChooserClosed", "id": "b"})).unwrap().apply(&mut chooser);
+        assert_eq!(chooser, None);
+        assert_eq!(ChooserMessage::parse(&json!({"type": "fileChooser", "id": "c", "multiple": false})), None);
+        assert_eq!(ChooserMessage::parse(&json!({"type": "fileChooserClosed"})), None);
+        assert_eq!(ChooserMessage::parse(&json!({"type": "popup", "id": "d"})), None);
+    }
+
+    #[test]
+    fn uploads_post_named_file_parts_to_the_tabs_picker() {
+        let tab = ThreadRef::new("env", "thread 1").tab("tab&1");
+        assert_eq!(
+            upload_url("http://host:3773", &tab, "c1"),
+            "http://host:3773/api/preview-stream/upload?threadId=thread+1&tabId=tab%261&chooser=c1"
+        );
+        let file = UploadFile { name: "a\"b\r\n.png".into(), mime: "image/png".into(), bytes: b"PNG".to_vec() };
+        assert_eq!(
+            String::from_utf8(multipart_body("X", &[file])).unwrap(),
+            "--X\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a%22b%0D%0A.png\"\r\n\
+             Content-Type: image/png\r\n\r\nPNG\r\n--X--\r\n"
+        );
+        assert_eq!(multipart_body("X", &[]), b"--X--\r\n", "no files cancels the picker");
     }
 
     #[test]
