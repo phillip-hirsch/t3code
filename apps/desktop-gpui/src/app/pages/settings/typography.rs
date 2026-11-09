@@ -531,9 +531,7 @@ fn terminal_preview(fonts: &Fonts, t: &Tokens) -> AnyElement {
     let theme = TerminalTheme::new(t);
     let ansi = |index: usize| theme.palette[index];
     let (red, green, yellow, blue, cyan) = (ansi(1), ansi(2), ansi(3), ansi(4), ansi(6));
-    // SGR 2, as the terminal grid dims its foreground.
-    let fg = theme.foreground;
-    let faint = gpui_kit::hsla(fg.h, fg.s, fg.l * 0.66, fg.a);
+    let faint = theme.faint_foreground();
     let prompt = [
         bold("→", Some(green)),
         plain(" "),
@@ -614,7 +612,7 @@ fn terminal_preview(fonts: &Fonts, t: &Tokens) -> AnyElement {
         .font_family(fonts.terminal)
         .text_size(px(fonts.terminal_size))
         .line_height(line_height)
-        .text_color(fg)
+        .text_color(theme.foreground)
         .children(lines.into_iter().map(|runs| {
             h_flex().whitespace_nowrap().min_h(line_height).children(runs.into_iter().map(|run| {
                 div()

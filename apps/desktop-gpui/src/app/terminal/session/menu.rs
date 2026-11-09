@@ -24,7 +24,7 @@ impl TerminalSession {
     /// Add to chat: the selection goes to the composer, then clears.
     pub fn add_selection_to_chat(&mut self, cx: &mut Context<Self>) {
         if let Some(selected) = self.selected() {
-            self.term.selection = None;
+            self.core.clear_selection();
             cx.emit(SessionEvent::AddToChat(selected));
             cx.notify();
         }

@@ -1,15 +1,18 @@
-//! Keystrokes to the bytes a PTY expects (xterm encoding). Plain printable
-//! characters are not handled here: they arrive through the input handler, so
-//! IME and dead keys work.
-
-use std::borrow::Cow;
+//! What a keystroke does in the terminal: the terminal's own shortcuts (copy, paste, select
+//! all, history), or a key for Ghostty's encoder (`onKeyDown` and `keyCodes.ts` in the web's
+//! Ghostty surface). Text the encoder would only type back arrives through the input handler
+//! instead, so IME and dead keys keep working.
 
 use gpui_kit::Keystroke;
 
+use super::core::{KeyAction as Press, KeyInput, Modifiers};
+
 /// What the key does in the terminal itself, before anything is sent.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum KeyAction {
-    Send(Cow<'static, str>),
+pub(super) enum KeyAction<'a> {
+    Send(&'static str),
+    /// A key for the encoder.
+    Encode(KeyInput<'a>),
     /// Ctrl+C or Ctrl+Insert over a selection; Shift keeps the selection.
     Copy {
         keep_selection: bool,
@@ -30,26 +33,25 @@ pub(super) enum History {
 }
 
 impl History {
-    pub fn scroll(self) -> alacritty_terminal::grid::Scroll {
-        use alacritty_terminal::grid::Scroll;
+    /// The scrollbar key that moves the same way.
+    pub fn key(self) -> &'static str {
         match self {
-            History::PageUp => Scroll::PageUp,
-            History::PageDown => Scroll::PageDown,
-            History::Top => Scroll::Top,
-            History::Bottom => Scroll::Bottom,
+            History::PageUp => "pageup",
+            History::PageDown => "pagedown",
+            History::Top => "home",
+            History::Bottom => "end",
         }
     }
 }
 
-/// `app_cursor` is DECCKM: arrows send SS3 instead of CSI. The alternate screen has no
-/// scrollback, so its history keys go to the app.
+/// The alternate screen has no scrollback, so its history keys go to the program.
 pub(super) fn key_action(
     keystroke: &Keystroke,
-    app_cursor: bool,
+    held: bool,
     alt_screen: bool,
     has_selection: bool,
-) -> Option<KeyAction> {
-    key_action_on(keystroke, app_cursor, alt_screen, has_selection, cfg!(target_os = "macos"))
+) -> Option<KeyAction<'_>> {
+    key_action_on(keystroke, held, alt_screen, has_selection, cfg!(target_os = "macos"))
 }
 
 /// [`key_action`] as on macOS, where ⌘ (not Ctrl) copies, pastes, selects all and jumps
@@ -57,11 +59,11 @@ pub(super) fn key_action(
 #[expect(clippy::fn_params_excessive_bools, reason = "the terminal's modes, and the platform as a test seam")]
 fn key_action_on(
     keystroke: &Keystroke,
-    app_cursor: bool,
+    held: bool,
     alt_screen: bool,
     has_selection: bool,
     mac: bool,
-) -> Option<KeyAction> {
+) -> Option<KeyAction<'_>> {
     let m = &keystroke.modifiers;
     let key = keystroke.key.as_str();
     if mac && m.platform && !m.control && !m.alt && !m.function {
@@ -73,10 +75,10 @@ fn key_action_on(
             ("home", true) if !alt_screen => Some(KeyAction::Scroll(History::Top)),
             ("end", true) if !alt_screen => Some(KeyAction::Scroll(History::Bottom)),
             // `isTerminalClearShortcut`, `terminalNavigationShortcutData`, `terminalDeleteShortcutData`.
-            ("k", false) => Some(KeyAction::Send("\x0c".into())),
-            ("left", false) => Some(KeyAction::Send("\x01".into())),
-            ("right", false) => Some(KeyAction::Send("\x05".into())),
-            ("backspace", false) => Some(KeyAction::Send("\x15".into())),
+            ("k", false) => Some(KeyAction::Send("\x0c")),
+            ("left", false) => Some(KeyAction::Send("\x01")),
+            ("right", false) => Some(KeyAction::Send("\x05")),
+            ("backspace", false) => Some(KeyAction::Send("\x15")),
             _ => None,
         };
     }
@@ -111,203 +113,213 @@ fn key_action_on(
     // `terminalNavigationShortcutData`: Alt+arrows move by word.
     if alt && !ctrl && !shift {
         match key {
-            "left" => return Some(KeyAction::Send("\x1bb".into())),
-            "right" => return Some(KeyAction::Send("\x1bf".into())),
+            "left" => return Some(KeyAction::Send("\x1bb")),
+            "right" => return Some(KeyAction::Send("\x1bf")),
             _ => {}
         }
     }
-    encode(key, ctrl, alt, shift, app_cursor, keystroke.key_char.as_deref()).map(KeyAction::Send)
+    // macOS Option composes the layout's characters, which arrive as text (`ghosttyConsumedMods`).
+    if mac && alt && !ctrl && produces_character(keystroke) {
+        return None;
+    }
+    // `isTerminalAltGraphText`: AltGr arrives as Ctrl+Alt; its character is text.
+    if ctrl && alt && keystroke.key_char.as_deref().is_some_and(|c| c != key) && produces_character(keystroke) {
+        return None;
+    }
+    Some(KeyAction::Encode(key_input(keystroke, if held { Press::Repeat } else { Press::Press }, mac)))
 }
 
-#[expect(clippy::fn_params_excessive_bools, reason = "xterm's modifier bits and cursor-key mode")]
-fn encode(
-    key: &str,
-    ctrl: bool,
-    alt: bool,
-    shift: bool,
-    app_cursor: bool,
-    key_char: Option<&str>,
-) -> Option<Cow<'static, str>> {
-    // xterm's modifier parameter: 1 + shift + 2·alt + 4·ctrl.
-    let modifier = 1 + u8::from(shift) + 2 * u8::from(alt) + 4 * u8::from(ctrl);
-    let alt_prefix = |s: &'static str| -> Cow<'static, str> { if alt { format!("\x1b{s}").into() } else { s.into() } };
-    let cursor = |letter: char| -> Cow<'static, str> {
-        match (modifier, app_cursor) {
-            (1, true) => format!("\x1bO{letter}").into(),
-            (1, false) => format!("\x1b[{letter}").into(),
-            _ => format!("\x1b[1;{modifier}{letter}").into(),
-        }
-    };
-    let tilde = |code: u8| -> Cow<'static, str> {
-        if modifier == 1 { format!("\x1b[{code}~").into() } else { format!("\x1b[{code};{modifier}~").into() }
-    };
-    let ss3 = |letter: char| -> Cow<'static, str> {
-        if modifier == 1 { format!("\x1bO{letter}").into() } else { format!("\x1b[1;{modifier}{letter}").into() }
-    };
-    Some(match key {
-        "enter" => alt_prefix("\r"),
-        "tab" if shift => "\x1b[Z".into(),
-        "tab" => alt_prefix("\t"),
-        "escape" => alt_prefix("\x1b"),
-        "backspace" if ctrl => alt_prefix("\x08"),
-        "backspace" => alt_prefix("\x7f"),
-        "up" => cursor('A'),
-        "down" => cursor('B'),
-        "right" => cursor('C'),
-        "left" => cursor('D'),
-        "home" => cursor('H'),
-        "end" => cursor('F'),
-        "insert" => tilde(2),
-        "delete" => tilde(3),
-        "pageup" => tilde(5),
-        "pagedown" => tilde(6),
-        "f1" => ss3('P'),
-        "f2" => ss3('Q'),
-        "f3" => ss3('R'),
-        "f4" => ss3('S'),
-        "f5" => tilde(15),
-        "f6" => tilde(17),
-        "f7" => tilde(18),
-        "f8" => tilde(19),
-        "f9" => tilde(20),
-        "f10" => tilde(21),
-        "f11" => tilde(23),
-        "f12" => tilde(24),
-        _ if ctrl && !alt => return control_code(key, shift).map(|byte| Cow::Owned(char::from(byte).to_string())),
-        _ if ctrl && alt => {
-            // AltGr on Windows arrives as Ctrl+Alt: let its character through as text.
-            if key_char.is_some_and(|c| c != key) {
-                return None;
-            }
-            let byte = control_code(key, shift)?;
-            format!("\x1b{}", char::from(byte)).into()
-        }
-        _ if alt && !ctrl => {
-            let text = key_char.filter(|c| !c.is_empty()).unwrap_or(key);
-            if text.chars().count() != 1 {
-                return None;
-            }
-            format!("\x1b{text}").into()
-        }
-        _ => return None,
-    })
+fn single_char(text: &str) -> Option<char> {
+    let mut chars = text.chars();
+    chars.next().filter(|_| chars.next().is_none())
 }
 
-/// The C0 byte Ctrl+`key` sends.
-fn control_code(key: &str, shift: bool) -> Option<u8> {
-    let mut chars = key.chars();
-    let (Some(c), None) = (chars.next(), chars.next()) else {
-        return (key == "space").then_some(0);
+/// The key types one printable character, or a dead key's base letter.
+fn produces_character(keystroke: &Keystroke) -> bool {
+    let text = keystroke.key_char.as_deref().filter(|c| !c.is_empty()).unwrap_or(&keystroke.key);
+    single_char(text).is_some_and(|c| !c.is_control())
+}
+
+/// The keystroke as Ghostty's encoder reads a `KeyboardEvent` (`encodeKey`).
+pub(super) fn key_input(keystroke: &Keystroke, action: Press, mac: bool) -> KeyInput<'_> {
+    let m = &keystroke.modifiers;
+    let mods = Modifiers { shift: m.shift, ctrl: m.control, alt: m.alt, meta: m.platform };
+    let base = single_char(&keystroke.key);
+    // `event.key`: the produced character, or the key's own one when the platform omits it.
+    let text = keystroke
+        .key_char
+        .as_deref()
+        .filter(|text| single_char(text).is_some_and(|c| !c.is_control()))
+        .or_else(|| base.filter(|_| !m.shift).map(|_| keystroke.key.as_str()));
+    // `ghosttyConsumedMods`: Shift that produced the character, and macOS Option that composed it.
+    let consumed = if m.control || m.platform || text.is_none() || (m.alt && !mac) {
+        Modifiers::default()
+    } else {
+        Modifiers { shift: m.shift, alt: m.alt, ..Modifiers::default() }
     };
-    Some(match c.to_ascii_lowercase() {
-        c @ 'a'..='z' => c as u8 - b'a' + 1,
-        '2' | '@' | '`' => 0,
-        '[' | '3' => 0x1b,
-        '\\' | '4' => 0x1c,
-        ']' | '5' => 0x1d,
-        '6' | '^' => 0x1e,
-        '-' | '_' | '7' | '/' => 0x1f,
-        '8' | '?' => 0x7f,
-        _ if shift => return None,
-        _ => return None,
-    })
+    KeyInput {
+        action,
+        key: &keystroke.key,
+        mods,
+        consumed,
+        text,
+        unshifted: base.map(|c| c.to_ascii_lowercase()).filter(|c| !c.is_control()),
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::core::Core;
+    use super::super::core::tests::core;
     use super::*;
 
     fn key(spec: &'static str) -> Keystroke {
         Keystroke::parse(spec).unwrap()
     }
 
-    /// Windows and Linux keys; [`macos_keys_use_command`] checks macOS.
-    fn key_action(keystroke: &Keystroke, app_cursor: bool, alt_screen: bool, has_selection: bool) -> Option<KeyAction> {
-        key_action_on(keystroke, app_cursor, alt_screen, has_selection, false)
+    /// A keystroke that outlives the test's closures, which return actions borrowing it.
+    fn held(spec: &'static str) -> &'static Keystroke {
+        Box::leak(Box::new(key(spec)))
+    }
+
+    fn typed(spec: &'static str, text: Option<&str>) -> Keystroke {
+        Keystroke { key_char: text.map(str::to_owned), ..key(spec) }
+    }
+
+    /// The bytes a keystroke sends on Windows and Linux (`mac` false) or macOS; `None` when
+    /// the terminal does nothing with it, or the input handler types it.
+    fn sent(core: &mut Core, keystroke: &Keystroke, mac: bool) -> Option<String> {
+        match key_action_on(keystroke, false, core.alt_screen(), false, mac)? {
+            KeyAction::Send(data) => Some(data.to_owned()),
+            KeyAction::Encode(input) => {
+                let data = core.encode_key(&input);
+                (!data.is_empty() && Some(data.as_str()) != input.text).then_some(data)
+            }
+            _ => None,
+        }
+    }
+
+    fn send(spec: &'static str) -> Option<String> {
+        sent(&mut core(80, 24), &key(spec), false)
     }
 
     #[test]
     fn macos_keys_use_command() {
-        let mac = |spec: &'static str, selection: bool| key_action_on(&key(spec), false, false, selection, true);
+        let mac = |spec: &'static str, selection: bool| key_action_on(held(spec), false, false, selection, true);
         assert_eq!(mac("cmd-c", true), Some(KeyAction::Copy { keep_selection: true }));
         assert_eq!(mac("cmd-c", false), None);
         assert_eq!(mac("cmd-v", false), Some(KeyAction::Paste));
         assert_eq!(mac("cmd-a", false), Some(KeyAction::SelectAll));
         assert_eq!(mac("cmd-shift-home", false), Some(KeyAction::Scroll(History::Top)));
-        assert_eq!(mac("cmd-k", false), Some(KeyAction::Send("\x0c".into())));
-        assert_eq!(mac("cmd-left", false), Some(KeyAction::Send("\x01".into())));
-        assert_eq!(mac("cmd-right", false), Some(KeyAction::Send("\x05".into())));
-        assert_eq!(mac("cmd-backspace", false), Some(KeyAction::Send("\x15".into())));
+        assert_eq!(mac("cmd-k", false), Some(KeyAction::Send("\x0c")));
+        assert_eq!(mac("cmd-left", false), Some(KeyAction::Send("\x01")));
+        assert_eq!(mac("cmd-right", false), Some(KeyAction::Send("\x05")));
+        assert_eq!(mac("cmd-backspace", false), Some(KeyAction::Send("\x15")));
         assert_eq!(mac("cmd-shift-left", false), None);
-        assert_eq!(mac("alt-left", false), Some(KeyAction::Send("\x1bb".into())));
+        assert_eq!(mac("alt-left", false), Some(KeyAction::Send("\x1bb")));
         assert_eq!(mac("cmd-j", false), None, "other ⌘ chords are the app's");
-        assert_eq!(mac("ctrl-c", true), Some(KeyAction::Send("".into())), "Ctrl+C interrupts even over a selection");
-        assert_eq!(mac("ctrl-v", false), Some(KeyAction::Send("".into())));
         assert_eq!(mac("shift-pageup", false), Some(KeyAction::Scroll(History::PageUp)));
+        let mut core = core(80, 24);
+        assert_eq!(sent(&mut core, &key("ctrl-c"), true).as_deref(), Some("\x03"), "Ctrl+C interrupts on macOS");
+        assert_eq!(sent(&mut core, &key("ctrl-v"), true).as_deref(), Some("\x16"));
     }
 
-    fn send(spec: &'static str) -> Option<String> {
-        match key_action(&key(spec), false, false, false) {
-            Some(KeyAction::Send(bytes)) => Some(bytes.into_owned()),
-            _ => None,
-        }
+    #[test]
+    fn macos_option_text_reaches_the_input_handler() {
+        let mut core = core(80, 24);
+        let mut mac = |keystroke: Keystroke| sent(&mut core, &keystroke, true);
+        assert_eq!(mac(typed("alt-l", Some("@"))), None);
+        assert_eq!(mac(typed("alt-shift-a", Some("Å"))), None);
+        assert_eq!(mac(typed("alt-space", Some("\u{a0}"))), None);
+        assert_eq!(mac(typed("alt-e", None)), None, "a dead key composes through the input handler");
+        assert_eq!(mac(typed("alt-enter", Some("\r"))).as_deref(), Some("\x1b\r"));
+        assert_eq!(mac(typed("alt-backspace", None)).as_deref(), Some("\x1b\x7f"));
+        assert_eq!(mac(typed("alt-left", None)).as_deref(), Some("\x1bb"));
+        assert_eq!(mac(typed("ctrl-alt-x", None)).as_deref(), Some("\x1b\x18"));
+        // Alt stays Meta off macOS.
+        assert_eq!(sent(&mut core, &typed("alt-l", Some("l")), false).as_deref(), Some("\x1bl"));
+        assert_eq!(sent(&mut core, &typed("ctrl-alt-q", Some("@")), false), None, "AltGr types its character");
+        assert_eq!(sent(&mut core, &typed("ctrl-alt-q", Some("q")), false).as_deref(), Some("\x1b\x11"));
     }
 
     #[test]
     fn control_and_navigation_keys() {
-        assert_eq!(send("ctrl-c").as_deref(), Some("\x03"));
-        assert_eq!(send("ctrl-l").as_deref(), Some("\x0c"));
-        assert_eq!(send("ctrl-space").as_deref(), Some("\x00"));
-        assert_eq!(send("ctrl-[").as_deref(), Some("\x1b"));
-        assert_eq!(send("enter").as_deref(), Some("\r"));
-        assert_eq!(send("backspace").as_deref(), Some("\x7f"));
-        assert_eq!(send("ctrl-backspace").as_deref(), Some("\x08"));
-        assert_eq!(send("shift-tab").as_deref(), Some("\x1b[Z"));
-        assert_eq!(send("up").as_deref(), Some("\x1b[A"));
-        assert_eq!(send("ctrl-right").as_deref(), Some("\x1b[1;5C"));
-        assert_eq!(send("shift-home").as_deref(), Some("\x1b[1;2H"));
-        assert_eq!(send("delete").as_deref(), Some("\x1b[3~"));
-        assert_eq!(send("ctrl-pagedown").as_deref(), Some("\x1b[6;5~"));
-        assert_eq!(send("f1").as_deref(), Some("\x1bOP"));
-        assert_eq!(send("f5").as_deref(), Some("\x1b[15~"));
-        assert_eq!(send("alt-left").as_deref(), Some("\x1bb"));
-        assert_eq!(send("alt-x").as_deref(), Some("\x1bx"));
-        assert_eq!(send("alt-enter").as_deref(), Some("\x1b\r"));
+        for (spec, bytes) in [
+            ("ctrl-a", "\x01"),
+            ("ctrl-c", "\x03"),
+            ("ctrl-l", "\x0c"),
+            ("ctrl-space", "\x00"),
+            // Ghostty, like Kitty, keeps Ctrl+[, Ctrl+I and Ctrl+M apart from Esc, Tab and Enter.
+            ("ctrl-[", "\x1b[91;5u"),
+            ("enter", "\r"),
+            ("tab", "\t"),
+            ("escape", "\x1b"),
+            ("backspace", "\x7f"),
+            ("ctrl-backspace", "\x08"),
+            ("shift-tab", "\x1b[Z"),
+            ("up", "\x1b[A"),
+            ("ctrl-right", "\x1b[1;5C"),
+            ("shift-home", "\x1b[1;2H"),
+            ("home", "\x1b[H"),
+            ("end", "\x1b[F"),
+            ("pageup", "\x1b[5~"),
+            ("pagedown", "\x1b[6~"),
+            ("delete", "\x1b[3~"),
+            ("ctrl-pagedown", "\x1b[6;5~"),
+            ("f1", "\x1bOP"),
+            ("f5", "\x1b[15~"),
+            ("alt-left", "\x1bb"),
+            ("alt-x", "\x1bx"),
+            ("alt-enter", "\x1b\r"),
+        ] {
+            assert_eq!(send(spec).as_deref(), Some(bytes), "{spec}");
+        }
         // Printable text goes through the input handler.
         assert_eq!(send("a"), None);
-        assert_eq!(send("shift-a"), None);
+        assert_eq!(sent(&mut core(80, 24), &typed("shift-a", Some("A")), false), None);
     }
 
     #[test]
     fn application_cursor_mode_uses_ss3() {
-        let up = key_action(&key("up"), true, false, false);
-        assert_eq!(up, Some(KeyAction::Send("\x1bOA".into())));
-        let ctrl_up = key_action(&key("ctrl-up"), true, false, false);
-        assert_eq!(ctrl_up, Some(KeyAction::Send("\x1b[1;5A".into())));
+        let mut core = core(80, 24);
+        core.write(b"\x1b[?1h");
+        assert_eq!(sent(&mut core, &key("up"), false).as_deref(), Some("\x1bOA"));
+        assert_eq!(sent(&mut core, &key("ctrl-up"), false).as_deref(), Some("\x1b[1;5A"));
+    }
+
+    #[test]
+    fn kitty_sessions_encode_text_presses_repeats_and_releases() {
+        let mut core = core(80, 24);
+        core.write(b"\x1b[>11u");
+        let a = typed("a", Some("a"));
+        assert_eq!(sent(&mut core, &a, false).as_deref(), Some("\x1b[97u"));
+        assert_eq!(core.encode_key(&key_input(&a, Press::Repeat, false)), "\x1b[97;1:2u");
+        assert_eq!(core.encode_key(&key_input(&a, Press::Release, false)), "\x1b[97;1:3u");
+        assert_eq!(sent(&mut core, &key("escape"), false).as_deref(), Some("\x1b[27u"));
+        core.write(b"\x1b[<u");
+        assert_eq!(sent(&mut core, &a, false), None, "popping the flags restores plain text");
     }
 
     #[test]
     fn copy_needs_a_selection_and_paste_always_works() {
-        assert_eq!(key_action(&key("ctrl-c"), false, false, true), Some(KeyAction::Copy { keep_selection: false }));
-        assert_eq!(
-            key_action(&key("ctrl-shift-c"), false, false, true),
-            Some(KeyAction::Copy { keep_selection: true })
-        );
-        assert_eq!(
-            key_action(&key("ctrl-insert"), false, false, true),
-            Some(KeyAction::Copy { keep_selection: false })
-        );
-        assert_eq!(key_action(&key("ctrl-v"), false, false, false), Some(KeyAction::Paste));
-        assert_eq!(key_action(&key("ctrl-shift-v"), false, false, false), Some(KeyAction::Paste));
-        assert_eq!(key_action(&key("shift-insert"), false, false, false), Some(KeyAction::Paste));
+        let action = |spec: &'static str, selection: bool| key_action_on(held(spec), false, false, selection, false);
+        assert_eq!(action("ctrl-c", true), Some(KeyAction::Copy { keep_selection: false }));
+        assert_eq!(action("ctrl-shift-c", true), Some(KeyAction::Copy { keep_selection: true }));
+        assert_eq!(action("ctrl-insert", true), Some(KeyAction::Copy { keep_selection: false }));
+        assert_eq!(action("ctrl-v", false), Some(KeyAction::Paste));
+        assert_eq!(action("ctrl-shift-v", false), Some(KeyAction::Paste));
+        assert_eq!(action("shift-insert", false), Some(KeyAction::Paste));
     }
 
     #[test]
-    fn select_all_and_history_keys() {
-        assert_eq!(key_action(&key("ctrl-shift-a"), false, false, false), Some(KeyAction::SelectAll));
-        assert_eq!(key_action(&key("shift-pageup"), false, false, false), Some(KeyAction::Scroll(History::PageUp)));
-        assert_eq!(key_action(&key("ctrl-shift-end"), false, false, false), Some(KeyAction::Scroll(History::Bottom)));
-        // Full-screen apps get the keys.
-        assert_eq!(key_action(&key("shift-pageup"), false, true, false), Some(KeyAction::Send("\x1b[5;2~".into())));
+    fn select_all_and_history_keys_stay_local_except_on_the_alternate_screen() {
+        let action = |spec: &'static str, alt_screen: bool| key_action_on(held(spec), false, alt_screen, false, false);
+        assert_eq!(action("ctrl-shift-a", false), Some(KeyAction::SelectAll));
+        assert_eq!(action("shift-pageup", false), Some(KeyAction::Scroll(History::PageUp)));
+        assert_eq!(action("ctrl-shift-end", false), Some(KeyAction::Scroll(History::Bottom)));
+        let mut core = core(80, 24);
+        core.write(b"\x1b[?1049h");
+        assert_eq!(sent(&mut core, &key("shift-pageup"), false).as_deref(), Some("\x1b[5;2~"));
+        assert_eq!(sent(&mut core, &key("ctrl-shift-end"), false).as_deref(), Some("\x1b[1;6F"));
     }
 }

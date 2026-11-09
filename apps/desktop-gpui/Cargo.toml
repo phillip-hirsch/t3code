@@ -11,7 +11,6 @@ path = "src/main.rs"
 [dependencies]
 # Seals saved secrets on macOS and Linux under a key kept in the OS keyring (`secure_storage`).
 aes-gcm = "0.10"
-alacritty_terminal = "0.26"
 anyhow = "1"
 async-channel = "2"
 # Decodes the user PATH the `t3` command installer reads through PowerShell.
@@ -51,6 +50,8 @@ hmac = "0.12"
 iana-time-zone = "0.1"
 # Agent browser tabs stream JPEG frames and SnapShots encode PNG; GPUI already builds both codecs.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+# The terminal emulator (Ghostty's VT core, as the web uses it); its build script needs Zig 0.15.2.
+libghostty-vt = "0.2.2"
 log = "0.4"
 # Notebook Markdown is made inert on the tree the chat renderer parses; gpui-base already builds it.
 markdown = "1"

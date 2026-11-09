@@ -16,6 +16,7 @@ fn main() {
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=assets/fonts/Inter-LICENSE.txt");
+    println!("cargo:rerun-if-changed=../../native/libghostty-vt/LICENSE");
     let out =
         Path::new(&std::env::var("OUT_DIR").expect("cargo sets OUT_DIR for build scripts")).join("rust-licenses.json");
     let manifest = match collect() {
@@ -107,6 +108,20 @@ fn collect() -> Result<Value, String> {
         "text": texts.len() - 1,
         "bundle": "assets",
     }));
+    // Ghostty's VT core, which `libghostty-vt-sys` builds at its own pin and links statically.
+    if let Ok(ghostty) =
+        std::fs::read_to_string(Path::new(&dir_of_manifest()).join("../../native/libghostty-vt/LICENSE"))
+    {
+        texts.push(ghostty.trim().replace("\r\n", "\n"));
+        entries.push(json!({
+            "name": "Ghostty",
+            "version": "a887df42c5",
+            "license": "MIT",
+            "sourceUrl": "https://github.com/ghostty-org/ghostty",
+            "text": texts.len() - 1,
+            "bundle": "desktop",
+        }));
+    }
     entries.sort_by(|a, b| {
         let key = |v: &Value| (v["name"].as_str().unwrap_or_default().to_lowercase(), v["version"].to_string());
         key(a).cmp(&key(b))
