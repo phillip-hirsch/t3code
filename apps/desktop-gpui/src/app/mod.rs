@@ -60,6 +60,7 @@ mod keymap;
 mod layout;
 pub mod main_window;
 mod markdown_images;
+mod markdown_media;
 mod markdown_ui;
 mod math;
 pub mod menu;
@@ -347,6 +348,7 @@ pub struct Workspace {
     /// Native pages laid into the layout: rendered HTML pages and chat media.
     embeds: embed::Embeds,
     html_pages: html_page::HtmlPages,
+    chat_media: markdown_media::ChatMediaUi,
     diagrams: mermaid::Diagrams,
     formulas: math::Formulas,
     entry_kinds: Arc<markdown_ui::EntryKinds>,
@@ -543,6 +545,7 @@ impl Workspace {
             image_viewer: Default::default(),
             embeds: Default::default(),
             html_pages: Default::default(),
+            chat_media: Default::default(),
             diagrams: Default::default(),
             formulas: Default::default(),
             entry_kinds: Default::default(),

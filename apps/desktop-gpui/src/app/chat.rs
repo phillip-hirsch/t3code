@@ -314,8 +314,15 @@ fn markdown_with(
         (state, source, wrap, workspace.markdown_images.clone(), math, chips)
     }) {
         Ok((state, source, wrap, images, math, chips)) => {
+            // A user message sits on its bubble; the media chip's page paints that around it.
+            let background = if kind == MarkdownKind::User { t.message_surface } else { t.background };
             markdown_view(&state, &source, kind, key_for_view.clone(), wrap, width, math, this, chips, t)
                 .image_source(images.resolver())
+                .plugin(super::markdown_media::MarkdownMedia {
+                    workspace: this.clone(),
+                    key: key_for_view.clone(),
+                    background,
+                })
                 .when(math, |view| {
                     let key = key_for_view;
                     view.plugin(super::markdown_ui::InlineMath { workspace: this.clone(), key: key.clone() })

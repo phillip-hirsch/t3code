@@ -432,6 +432,7 @@ impl super::Workspace {
             || (self.details_visibility().popover_open && !self.details_inline(window));
         self.embeds.begin_frame([over_layout, over_everything]);
         self.sync_html_pages(window, cx);
+        self.sync_chat_media(cx);
     }
 }
 

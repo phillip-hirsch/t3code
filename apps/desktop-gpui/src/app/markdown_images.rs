@@ -249,8 +249,10 @@ impl Workspace {
     /// that shows `key` to remeasure once it lands.
     pub(super) fn load_images(&mut self, key: &SharedString, destinations: Vec<String>, cx: &mut Context<Self>) {
         let root = self.git_cwd();
+        // Audio and video play in their own players (`super::markdown_media`), never as images.
         let sources = destinations
             .into_iter()
+            .filter(|destination| super::markdown_media::media_kind(destination).is_none())
             .map(|destination| {
                 let source = classify(&destination, root.as_deref());
                 (destination, source)
