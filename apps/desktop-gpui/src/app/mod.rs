@@ -43,6 +43,7 @@ mod context_strip;
 mod desktop;
 mod details;
 mod draft_picker;
+mod embed;
 pub(crate) mod environments;
 mod files;
 mod find;
@@ -51,6 +52,7 @@ mod git;
 mod guest_share;
 mod header;
 mod host_picker;
+mod html_page;
 mod image_viewer;
 mod inspector;
 mod keep_alive;
@@ -342,6 +344,9 @@ pub struct Workspace {
     now: thread_now::NowUi,
     markdown_images: markdown_images::ImageCache,
     image_viewer: image_viewer::ViewerUi,
+    /// Native pages laid into the layout: rendered HTML pages and chat media.
+    embeds: embed::Embeds,
+    html_pages: html_page::HtmlPages,
     diagrams: mermaid::Diagrams,
     formulas: math::Formulas,
     entry_kinds: Arc<markdown_ui::EntryKinds>,
@@ -536,6 +541,8 @@ impl Workspace {
             now: Default::default(),
             markdown_images: Default::default(),
             image_viewer: Default::default(),
+            embeds: Default::default(),
+            html_pages: Default::default(),
             diagrams: Default::default(),
             formulas: Default::default(),
             entry_kinds: Default::default(),
@@ -1248,6 +1255,7 @@ impl Render for Workspace {
         let mini_player = self.render_preview_mini_player(window, cx);
         self.sync_preview_views(window, cx);
         self.sync_document_views(window, cx);
+        self.begin_embed_frame(window, cx);
         let terminal_drawer = self.render_terminal_drawer(window, cx);
         let theme = cx.theme();
         div()
@@ -1394,7 +1402,9 @@ impl Render for Workspace {
             .children(self.theme_editor.clone())
             .children(self.render_palette(window, cx))
             .children(self.render_file_overlay(window, cx))
+            .children(self.render_html_dialog(window, cx))
             .children(self.render_image_viewer(window, cx))
+            .child(self.embeds.sweep())
             .children(self.render_quit_hint(cx))
             .child(self.render_caption_overlay(window, cx))
             .children(titlebar::render_resize_edges(window, cx))

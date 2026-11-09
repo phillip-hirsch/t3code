@@ -219,7 +219,7 @@ fn format_for(mime: &str) -> Option<ImageFormat> {
 }
 
 /// `data:image/png;base64,...`.
-fn data_url(url: &str) -> Option<(ImageFormat, Vec<u8>)> {
+pub(super) fn data_url(url: &str) -> Option<(ImageFormat, Vec<u8>)> {
     let (meta, payload) = url.strip_prefix("data:")?.split_once(',')?;
     let mime = meta.split(';').next()?;
     let format = format_for(mime)?;
@@ -462,6 +462,13 @@ fn sniff(bytes: &[u8]) -> Option<ImageFormat> {
         _ if bytes.starts_with(b"<svg") || bytes.starts_with(b"<?xml") => Some(ImageFormat::Svg),
         _ => None,
     }
+}
+
+/// The web image at `url`, decoded by its type or its bytes; `None` when it fails to load.
+pub(super) async fn fetch_image(url: String) -> Option<Arc<Image>> {
+    let (mime, bytes) = fetch(url).await?;
+    let format = mime.as_deref().and_then(format_for).or_else(|| sniff(&bytes))?;
+    Some(Arc::new(Image::from_bytes(format, bytes)))
 }
 
 /// The largest image a message loads: an agent can link any URL.

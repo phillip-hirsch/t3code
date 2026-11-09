@@ -96,25 +96,31 @@ impl Workspace {
                     .min_h_0()
                     .relative()
                     .child(
-                        MessageScroller::new("timeline", self.scroller.clone(), move |index, window, cx| {
-                            match rows.get(index) {
-                                Some(row) => render_row(row, &this, lane_width, window, cx),
-                                None => div().into_any_element(),
-                            }
-                        })
-                        // Top spacer `h-4`; rows carry their own bottom space.
-                        // The list's side padding becomes every row's inset: that is the lane.
-                        .with_list_style(
-                            StyleRefinement::default()
-                                .pt(px(16.))
-                                .pb(px(16. + composer))
-                                .pl(px(lane.left))
-                                .pr(px(lane.right)),
-                        )
-                        .with_row_style(StyleRefinement::default().pb(px(0.)))
-                        .with_jump_button_label("Scroll to end")
-                        .with_jump_button_style(jump_style)
-                        .with_jump_button_renderer(move |button| scroll_to_end_button(button, &t)),
+                        self.embeds.clip_scope(
+                            MessageScroller::new(
+                                "timeline",
+                                self.scroller.clone(),
+                                move |index, window, cx| match rows.get(index) {
+                                    Some(row) => render_row(row, &this, lane_width, window, cx),
+                                    None => div().into_any_element(),
+                                },
+                            )
+                            // Top spacer `h-4`; rows carry their own bottom space.
+                            // The list's side padding becomes every row's inset: that is the lane.
+                            .with_list_style(
+                                StyleRefinement::default()
+                                    .pt(px(16.))
+                                    .pb(px(16. + composer))
+                                    .pl(px(lane.left))
+                                    .pr(px(lane.right)),
+                            )
+                            .with_row_style(StyleRefinement::default().pb(px(0.)))
+                            .with_jump_button_label("Scroll to end")
+                            .with_jump_button_style(jump_style)
+                            .with_jump_button_renderer(move |button| scroll_to_end_button(button, &t)),
+                            // Embeds stop at the composer floating over the timeline's bottom.
+                            px(composer),
+                        ),
                     )
                     .children(minimap)
                     .children(self.render_chat_menu())
@@ -908,7 +914,16 @@ pub(super) fn render_row(
         Row::SubagentGroup { key, cards, expanded } => {
             lane(0., subagent_group(key, cards, *expanded, this, &t, cx)).into_any_element()
         }
-        Row::Embed(embed) => lane(8., embed_card(embed, this, &t)).into_any_element(),
+        // `HtmlRenderTimelineRow`: a rendered page draws inline; an MCP app keeps its card.
+        Row::Embed(embed) => match &embed.page {
+            Some(size) => {
+                let page = this
+                    .update(cx, |workspace, cx| workspace.render_html_page(embed, size, lane_width - 8., window, cx))
+                    .unwrap_or_else(|_| div().into_any_element());
+                lane(8., div().px(px(4.)).child(page)).into_any_element()
+            }
+            None => lane(8., embed_card(embed, this, &t)).into_any_element(),
+        },
         Row::CreatedThread { id, title, thread_id, .. } => {
             lane(8., created_thread_card(id, title.as_ref(), thread_id.as_ref(), this, &t)).into_any_element()
         }
@@ -1359,7 +1374,6 @@ fn subagent_group(
         .into_any_element()
 }
 
-/// A rendered page or MCP app. The web embeds it in a frame; here it opens in the browser.
 /// `V2LifecycleRow`'s `resourceSummary` card: a thread the turn created, with Open chat.
 fn created_thread_card(
     id: &SharedString,
@@ -1413,6 +1427,7 @@ fn created_thread_card(
         .into_any_element()
 }
 
+/// An MCP app (`McpAppFrame`): the web runs its bridge in a frame; here it opens in the browser.
 fn embed_card(embed: &Rc<timeline::Embed>, this: &WeakEntity<Workspace>, t: &Tokens) -> AnyElement {
     let open = {
         let (this, embed) = (this.clone(), embed.clone());
