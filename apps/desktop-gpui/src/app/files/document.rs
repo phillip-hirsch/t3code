@@ -1,6 +1,7 @@
 //! Files the web hands to the browser engine (`BrowserDocumentFrame`, `WorkspaceVideoPreview`,
-//! `WorkspaceAudioPreview`): PDFs, rendered HTML, video and audio play in a native WebView of
-//! the file's signed asset URL. Also "Open file in preview browser".
+//! `WorkspaceAudioPreview`): rendered HTML, video and audio play in a native WebView of the
+//! file's signed asset URL, and PDFs in the PDF.js viewer (`super::pdf`). Also "Open file in
+//! preview browser".
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -25,7 +26,7 @@ use crate::app::{Target, Workspace};
 /// Document views kept alive while not drawn, so switching tabs back keeps the page.
 const KEPT_VIEWS: usize = 2;
 
-struct DocView {
+pub(super) struct DocView {
     kind: FileKind,
     view: Option<Entity<WebView>>,
     failed: Option<String>,
@@ -40,9 +41,14 @@ struct DocView {
     content: u64,
     shown: bool,
     used: u64,
+    /// A PDF's resource, signed again for each read of the file, and the theme its page shows.
+    pdf_resource: Option<Value>,
+    pdf_theme: Option<super::pdf::PdfTheme>,
     _task: Option<Task<()>>,
     _links: Option<Task<()>>,
     _media: Option<Task<()>>,
+    /// A PDF viewer's protocol and report listeners.
+    _pdf: Vec<Task<()>>,
 }
 
 impl DocView {
@@ -58,9 +64,12 @@ impl DocView {
             content,
             shown: false,
             used: 0,
+            pdf_resource: None,
+            pdf_theme: None,
             _task: None,
             _links: None,
             _media: None,
+            _pdf: Vec::new(),
         }
     }
 }
@@ -120,6 +129,42 @@ impl Documents {
     pub(super) fn stale(&self, key: &FileKey, revision: u64) -> bool {
         self.views.get(key).is_none_or(|doc| doc.content != revision)
     }
+
+    /// Marks `key`'s PDF viewer as starting, with the resource it reads and its listeners.
+    pub(super) fn begin_pdf(&mut self, key: &FileKey, resource: Value, tasks: Vec<Task<()>>) {
+        if let Some(doc) = self.views.get_mut(key) {
+            doc.pdf_resource = Some(resource);
+            doc._pdf = tasks;
+            doc._task = Some(Task::ready(()));
+        }
+    }
+
+    pub(super) fn pdf_resource(&self, key: &FileKey) -> Option<&Value> {
+        self.views.get(key)?.pdf_resource.as_ref()
+    }
+
+    /// The `fileRevision` the viewer last read, which a workspace mutation compares against.
+    pub(super) fn set_revision(&mut self, key: &FileKey, revision: Option<String>) {
+        if let Some(doc) = self.views.get_mut(key) {
+            doc.revision = revision;
+        }
+    }
+
+    pub(super) fn set_pdf_theme(&mut self, key: &FileKey, theme: super::pdf::PdfTheme) {
+        if let Some(doc) = self.views.get_mut(key) {
+            doc.pdf_theme = Some(theme);
+        }
+    }
+
+    /// `key`'s view when its page shows a theme other than `theme`, which it now records.
+    pub(super) fn pdf_theme_changed(&mut self, key: &FileKey, theme: super::pdf::PdfTheme) -> Option<Entity<WebView>> {
+        let doc = self.views.get_mut(key)?;
+        if doc.pdf_theme.is_none_or(|shown| shown == theme) {
+            return None;
+        }
+        doc.pdf_theme = Some(theme);
+        doc.view.clone()
+    }
 }
 
 #[derive(Default)]
@@ -128,10 +173,12 @@ pub(super) struct Documents {
     /// The document drawn this frame.
     drawn: Option<FileKey>,
     frame: u64,
+    /// PDF reading positions, kept after a viewer closes.
+    pub(super) pdf_positions: super::pdf::Positions,
 }
 
 /// A colour as CSS: `#rrggbb`, or `rgba(...)` when translucent like many dark tokens.
-fn css_hex(color: Hsla) -> String {
+pub(super) fn css_hex(color: Hsla) -> String {
     let rgba = gpui_kit::Rgba::from(color);
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped to 0..=255 before the cast")]
     let byte = |v: f32| (v.clamp(0., 1.) * 255.).round() as u8;
@@ -143,26 +190,19 @@ fn escape_attribute(value: &str) -> String {
     value.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;")
 }
 
-/// The page a document's view opens: PDFs load their URL in the engine's own viewer
-/// (`#navpanes=0&view=FitH`, as `PdfDocumentRevision` does); HTML runs in a sandboxed frame with an
-/// opaque origin (`FileDocument`); media get the browser's controls on the panel's background.
-enum Page {
-    Url(String),
-    Html(String),
-}
-
-fn document_page(kind: FileKind, url: &str, background: &str, dark: bool) -> Page {
+/// The page a document's view opens: HTML runs in a sandboxed frame with an opaque origin
+/// (`FileDocument`); media get the browser's controls on the panel's background.
+fn document_page(kind: FileKind, url: &str, background: &str, dark: bool) -> String {
     let src = escape_attribute(url);
     let scheme = if dark { "dark" } else { "light" };
     let shell = |body_style: &str, body: String| {
-        Page::Html(format!(
+        format!(
             "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"color-scheme\" content=\"{scheme}\">\
              <style>html,body{{margin:0;height:100%;background:{background}}}body{{{body_style}}}</style></head>\
              <body>{body}</body></html>"
-        ))
+        )
     };
     match kind {
-        FileKind::Pdf => Page::Url(format!("{}#navpanes=0&view=FitH", url.split('#').next().unwrap_or(url))),
         FileKind::Video => shell(
             "display:flex;align-items:center;justify-content:center;padding:16px;box-sizing:border-box",
             format!(
@@ -343,10 +383,17 @@ impl Workspace {
         documents.drawn = Some(key.clone());
         let state = documents.views.entry(key.clone()).or_insert_with(|| DocView::new(kind, mutation.clone(), 0));
         if state.view.is_none() && state._task.is_none() && state.failed.is_none() {
-            self.start_document(key.clone(), kind, window, cx);
+            if kind == FileKind::Pdf {
+                self.start_pdf(key.clone(), window, cx);
+            } else {
+                self.start_document(key.clone(), kind, window, cx);
+            }
         } else if state.view.is_some() && state.mutation != mutation {
             state.mutation = mutation;
             self.refresh_document(key.clone(), kind, window, cx);
+        }
+        if kind == FileKind::Pdf {
+            self.sync_pdf_theme(key, cx);
         }
         let menu = (kind == FileKind::Video).then(|| self.render_media_menu()).flatten();
         let Some(state) = self.files.documents.views.get(key) else { return div().into_any_element() };
@@ -588,8 +635,7 @@ impl Workspace {
                                 })
                                 .with_url(FONT_PAGE_URL)
                         }
-                        (_, Page::Url(url)) => builder.with_url(url),
-                        (_, Page::Html(html)) => builder.with_html(html),
+                        (_, html) => builder.with_html(html),
                     };
                     Ok((builder, revision, loaded))
                 }
@@ -612,7 +658,7 @@ impl Workspace {
     }
 
     /// Builds `key`'s native view from a task: see [`build_view`](crate::app::preview::build_view).
-    fn build_view(
+    pub(super) fn build_view(
         &mut self,
         key: FileKey,
         builder: wry::WebViewBuilder<'static>,
@@ -737,13 +783,11 @@ impl Workspace {
                 if let Some(view) = &state.view {
                     let raw = view.read(cx).raw();
                     // Media keep playing what they play; the new bytes load once playback pauses.
-                    let _ = if matches!(kind, FileKind::Video | FileKind::Audio) {
-                        raw.evaluate_script(&media_adopt_script(&url))
-                    } else {
-                        match document_page(kind, &url, &background, dark) {
-                            Page::Url(url) => raw.load_url(&url),
-                            Page::Html(html) => raw.load_html(&html),
-                        }
+                    // A PDF reads the new revision from where the reader is.
+                    let _ = match kind {
+                        FileKind::Video | FileKind::Audio => raw.evaluate_script(&media_adopt_script(&url)),
+                        FileKind::Pdf => raw.evaluate_script(super::pdf::RELOAD_SCRIPT),
+                        _ => raw.load_html(&document_page(kind, &url, &background, dark)),
                     };
                     state.url = Some(url);
                 }
@@ -843,15 +887,13 @@ mod tests {
 
     #[test]
     fn document_pages_follow_the_web_frames() {
-        let Page::Url(pdf) = document_page(FileKind::Pdf, "http://h/a.pdf#x", "#000", true) else { panic!() };
-        assert_eq!(pdf, "http://h/a.pdf#navpanes=0&view=FitH");
-        let Page::Html(html) = document_page(FileKind::Html, "http://h/a?x=1&y=\"2\"", "#000", false) else { panic!() };
+        let html = document_page(FileKind::Html, "http://h/a?x=1&y=\"2\"", "#000", false);
         assert!(html.contains("sandbox=\"allow-scripts allow-forms allow-popups allow-downloads\""));
         assert!(html.contains("src=\"http://h/a?x=1&amp;y=&quot;2&quot;\""), "the URL is escaped");
-        let Page::Html(audio) = document_page(FileKind::Audio, "u", "#123456", true) else { panic!() };
+        let audio = document_page(FileKind::Audio, "u", "#123456", true);
         assert!(audio.contains("<audio id=\"m\" controls") && audio.contains("background:#123456"));
         assert!(audio.contains("window.t3Media") && !audio.contains("contextmenu"), "audio has no media actions");
-        let Page::Html(video) = document_page(FileKind::Video, "u", "#000", true) else { panic!() };
+        let video = document_page(FileKind::Video, "u", "#000", true);
         assert!(video.contains("window.t3Media") && video.contains("'contextmenu'"));
         assert_eq!(media_adopt_script("http://h/a\"b"), r#"window.t3Media&&window.t3Media.adopt("http://h/a\"b")"#);
         assert!(audio.contains("content=\"dark\""));
