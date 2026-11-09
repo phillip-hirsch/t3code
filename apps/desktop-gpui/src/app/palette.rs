@@ -1546,7 +1546,7 @@ impl Workspace {
     /// Scores every listed thread, then builds rows for the first [`THREAD_LIMIT`] only.
     fn score_threads(&self, tokens: &[Vec<char>], typos: bool, now: i64) -> RankedThreads {
         let current = self.route_thread();
-        let mut scored: Vec<(&crate::model::ThreadShell, f32, bool, f32)> = self
+        let mut scored: Vec<(&crate::model::ThreadShell, search::Match, f32)> = self
             .palette_threads()
             .filter_map(|thread| {
                 let found = self.match_thread_fields(thread, tokens, typos)?;
@@ -1555,25 +1555,20 @@ impl Workspace {
                 } else {
                     found.quality * self.thread_use(thread).boost(now)
                 };
-                Some((thread, found.quality, found.strong, rank))
+                Some((thread, found, rank))
             })
             .collect();
         scored.sort_by(|a, b| {
-            let (class_a, class_b) = (search::class(a.1), search::class(b.1));
-            (b.3 >= 0.)
-                .cmp(&(a.3 >= 0.))
-                .then(class_b.min(2).cmp(&class_a.min(2)))
-                .then(class_b.cmp(&class_a))
-                .then(b.3.total_cmp(&a.3))
+            (b.2 >= 0.).cmp(&(a.2 >= 0.)).then_with(|| search::compare_ranked((&a.1, a.2), (&b.1, b.2)))
         });
-        let strong = scored.iter().any(|(_, _, strong, _)| *strong);
+        let strong = scored.iter().any(|(_, found, _)| found.strong);
         let rows = scored
             .into_iter()
             .take(THREAD_LIMIT)
-            .map(|(thread, quality, strong, _)| {
+            .map(|(thread, found, _)| {
                 let mut row = self.thread_row(thread, now);
-                row.quality = quality;
-                (row, strong)
+                row.quality = found.quality;
+                (row, found.strong)
             })
             .collect();
         RankedThreads { rows, strong }

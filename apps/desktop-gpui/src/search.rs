@@ -3,6 +3,7 @@
 //! weights, typo fallback, ranking classes). Joined-word matches ("vscode" for
 //! "VS Code") and search "picks" are not ported.
 
+use std::cmp::Ordering;
 use std::ops::Range;
 
 /// A field folded for matching. Folding lowercases one char at a time, so
@@ -99,6 +100,12 @@ const WHOLE_NAME: f32 = 1.5;
 const MID_WORD: f32 = 0.3;
 const TYPO: f32 = 0.45;
 const FILLER: &[&str] = &["a", "an", "and", "for", "in", "of", "on", "the", "to", "with"];
+/// `PICK_PREFIX_MIN_LENGTH`: a shorter token never earns the whole-word tier.
+const WHOLE_WORD_MIN_LEN: usize = 3;
+
+fn is_filler(token: &[char]) -> bool {
+    FILLER.contains(&token.iter().collect::<String>().as_str())
+}
 
 #[derive(Clone, Copy)]
 struct TokenMatch {
@@ -202,6 +209,9 @@ impl<'a> Weighted<'a> {
 pub struct Match {
     /// About 0.3 (inside a word) to 1.5 (exact name).
     pub quality: f32,
+    /// Every non-filler token has three or more chars and matched a whole word at full weight,
+    /// before phrase bonuses. Optional filler counts neither way.
+    pub whole_words: bool,
     /// Every token matched at a word start without a typo.
     pub strong: bool,
     /// Char ranges matched in the first field.
@@ -214,9 +224,9 @@ pub fn match_fields(tokens: &[Vec<char>], fields: &[Weighted], typos: bool) -> O
     if tokens.is_empty() {
         return None;
     }
-    let filler_optional = tokens.iter().any(|t| !FILLER.contains(&t.iter().collect::<String>().as_str()));
+    let filler_optional = tokens.iter().any(|t| !is_filler(t));
     let mut ranges = Vec::new();
-    let (mut total, mut counted, mut strong) = (0., 0, true);
+    let (mut total, mut counted, mut strong, mut whole_words) = (0., 0, true, true);
     for token in tokens {
         let mut best = 0f32;
         let mut primary_hit = None;
@@ -243,7 +253,7 @@ pub fn match_fields(tokens: &[Vec<char>], fields: &[Weighted], typos: bool) -> O
             best = best.max(hit.score * weighted.weight);
         }
         if best == 0. {
-            if filler_optional && FILLER.contains(&token.iter().collect::<String>().as_str()) {
+            if filler_optional && is_filler(token) {
                 continue;
             }
             return None;
@@ -252,6 +262,9 @@ pub fn match_fields(tokens: &[Vec<char>], fields: &[Weighted], typos: bool) -> O
         ranges.extend(primary_hit.map(|h| h.start..h.end));
         total += best;
         counted += 1;
+        // A query of only filler never earns the whole-word tier.
+        whole_words &=
+            if is_filler(token) { filler_optional } else { token.len() >= WHOLE_WORD_MIN_LEN && best >= WHOLE_WORD };
     }
     let mut quality = total / counted.max(1) as f32;
     if let Some(primary) = fields.first() {
@@ -262,7 +275,7 @@ pub fn match_fields(tokens: &[Vec<char>], fields: &[Weighted], typos: bool) -> O
             quality += 0.25;
         }
     }
-    Some(Match { quality, strong, ranges: merge(ranges) })
+    Some(Match { quality, whole_words, strong, ranges: merge(ranges) })
 }
 
 fn merge(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
@@ -275,6 +288,13 @@ fn merge(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
         }
     }
     merged
+}
+
+/// `rankSearchGroups`' order without picks: word matches first, then the match class, then whole
+/// words above prefixes; use (each side's `score`) reorders only within that.
+pub fn compare_ranked((a, a_score): (&Match, f32), (b, b_score): (&Match, f32)) -> Ordering {
+    let tier = |m: &Match| (class(m.quality).min(2), class(m.quality), m.whole_words);
+    tier(b).cmp(&tier(a)).then(b_score.total_cmp(&a_score))
 }
 
 /// `matchClass`: whole words and prefixes share a class.
@@ -460,6 +480,7 @@ pub fn match_thread(tokens: &[Vec<char>], thread: &ThreadSubject, typos: bool) -
     let references = thread.pull_requests.iter().flat_map(|pr| pr.references.iter().map(String::as_str));
     matches_reference(&query, std::iter::once(thread.id).chain(references)).then(|| Match {
         quality: 0.6,
+        whole_words: false,
         strong: true,
         ranges: Vec::new(),
     })
@@ -624,6 +645,49 @@ mod tests {
         assert!(quality("githbu", "GitHub actions").is_some());
         assert_eq!(quality("cron", "Config"), None);
         assert_eq!(quality("ing", "Nightly"), None);
+    }
+
+    #[test]
+    fn whole_word_titles_stay_above_busy_prefixes() {
+        let rank = |query: &str, threads: &[(&'static str, f32)]| {
+            let tokens = fold_query(query);
+            let mut found: Vec<(&str, Match, f32)> = threads
+                .iter()
+                .filter_map(|&(title, boost)| {
+                    let subject = ThreadSubject {
+                        id: "t",
+                        title,
+                        branch: None,
+                        project: None,
+                        environment: None,
+                        pull_requests: &[],
+                    };
+                    let found = match_thread(&tokens, &subject, false)?;
+                    let score = found.quality * boost;
+                    Some((title, found, score))
+                })
+                .collect();
+            found.sort_by(|a, b| compare_ranked((&a.1, a.2), (&b.1, b.2)));
+            found.into_iter().map(|(title, ..)| title).collect::<Vec<_>>()
+        };
+        let busy = 2.5;
+        assert_eq!(
+            rank("share auth", &[("Share authentication cleanup", busy), ("Auth across worktrees to share", 1.)]),
+            ["Auth across worktrees to share", "Share authentication cleanup"]
+        );
+        assert_eq!(rank("ui", &[("Parse ui tokens", 1.), ("Polish UIs", busy)]), ["Polish UIs", "Parse ui tokens"]);
+        assert_eq!(
+            rank(
+                "fix in sidebar",
+                &[("Fix sidebar", 1.), ("Fix crash in sidebar", busy), ("Fix sidebar input focus", 2.)]
+            ),
+            ["Fix crash in sidebar", "Fix sidebar input focus", "Fix sidebar"]
+        );
+        assert_eq!(
+            rank("and", &[("Fix auth and sync", 1.), ("Android build", busy)]),
+            ["Android build", "Fix auth and sync"],
+            "a query of only filler earns no whole-word tier"
+        );
     }
 
     #[test]
