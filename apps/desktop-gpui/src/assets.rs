@@ -142,6 +142,8 @@ const LUCIDE_ICONS: &[(&str, &[u8])] = lucide![
     "layers",
     "list-checks",
     "link",
+    "link-2",
+    "unlink-2",
     "list-filter",
     "list-plus",
     "list-todo",

@@ -469,6 +469,11 @@ impl Workspace {
         });
     }
 
+    /// The CSS viewport `tab`'s stream last reported (`onViewport`).
+    pub(super) fn stream_viewport(&self, tab: &TabRef) -> Option<(f32, f32)> {
+        self.preview.server.streams.get(tab)?.viewport
+    }
+
     /// Connects `tab`'s stream, or keeps it connected through this frame.
     pub(super) fn keep_server_stream(&mut self, tab: &TabRef, window: &mut Window, cx: &mut Context<Self>) {
         self.ensure_server_stream(tab, window, cx);

@@ -152,17 +152,6 @@ impl Viewport {
             }
         }
     }
-
-    pub fn preset_id(&self) -> Option<&str> {
-        match self {
-            Viewport::Preset { preset_id, .. } => Some(preset_id),
-            _ => None,
-        }
-    }
-
-    pub fn preset(preset: &Preset) -> Value {
-        json!({"_tag": "preset", "presetId": preset.id, "width": preset.width, "height": preset.height})
-    }
 }
 
 pub struct Preset {
@@ -404,6 +393,29 @@ pub fn shortcut_update_script(chords: &str) -> String {
 pub fn shortcut_message(body: &str) -> Option<String> {
     let message: serde_json::Value = serde_json::from_str(body).ok()?;
     Some(message.get("t3Shortcut")?.as_str()?.to_owned())
+}
+
+/// Reports the pointer reaching the page's top-right corner, where the floating preview's
+/// handle sits: the native view covers it, so the mini player can't see the hover itself.
+/// The zone is a share of the page's width, so it matches at any zoom. While the pointer stays
+/// there it reports again now and then, as the mini player may have closed its pill meanwhile.
+pub const CORNER_SCRIPT: &str = r#"(() => {
+  if (window !== window.top || !window.ipc) return;
+  let inside = false, last = 0;
+  const post = (next) => window.ipc.postMessage(JSON.stringify({ t3Corner: next }));
+  addEventListener("pointermove", (event) => {
+    const zone = innerWidth * 0.12;
+    const next = innerWidth - event.clientX <= zone && event.clientY <= zone;
+    const now = Date.now();
+    if (next !== inside || (next && now - last > 250)) { inside = next; last = now; post(next); }
+  }, { capture: true, passive: true });
+  document.documentElement.addEventListener("mouseleave", () => { if (inside) { inside = false; post(false); } });
+})();"#;
+
+/// [`CORNER_SCRIPT`]'s message: whether the pointer is in the page's top-right corner.
+pub fn corner_message(body: &str) -> Option<bool> {
+    let message: serde_json::Value = serde_json::from_str(body).ok()?;
+    message.get("t3Corner")?.as_bool()
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -1029,7 +1041,7 @@ pub fn display_url(session: &Session) -> &str {
 /// `PREVIEW_VIEWPORT_{MIN,MAX}_DIMENSION` and `PREVIEW_VIEWPORT_MAX_AREA`.
 pub const VIEWPORT_MIN_DIMENSION: i64 = 240;
 pub const VIEWPORT_MAX_DIMENSION: i64 = 3840;
-const VIEWPORT_MAX_AREA: i64 = 3840 * 2160;
+pub const VIEWPORT_MAX_AREA: i64 = 3840 * 2160;
 /// The size "Responsive" starts at when switched to from "Fill panel" (`RESPONSIVE_SEED_SIZE`).
 const RESPONSIVE_SEED: (u32, u32) = (1280, 800);
 
@@ -1586,12 +1598,21 @@ mod tests {
     }
 
     #[test]
+    fn the_corner_script_posts_what_the_app_reads() {
+        assert!(CORNER_SCRIPT.contains("JSON.stringify({ t3Corner: next })"));
+        assert_eq!(corner_message(r#"{"t3Corner":true}"#), Some(true));
+        assert_eq!(corner_message(r#"{"t3Corner":false}"#), Some(false));
+        assert_eq!(corner_message(r#"{"t3Corner":1}"#), None);
+        assert_eq!(corner_message(r#"{"t3Shortcut":"x"}"#), None);
+    }
+
+    #[test]
     fn decodes_viewport_settings() {
         let fixed: Viewport =
             serde_json::from_value(json!({"_tag": "preset", "presetId": "ipad-air", "width": 820, "height": 1180}))
                 .unwrap();
         assert_eq!(fixed.size(), Some((820., 1180.)));
-        assert_eq!(fixed.preset_id(), Some("ipad-air"));
+        assert_eq!(fixed.choice(), "ipad-air");
         let fill: Viewport = serde_json::from_value(json!({"_tag": "fill"})).unwrap();
         assert_eq!(fill.size(), None);
     }

@@ -34,16 +34,16 @@ use crate::preview::{self, Appearance, NavStatus, PreviewThreads, Session, TabRe
 use crate::rpc::RpcClient;
 use crate::theme::{self, Tokens};
 
+mod device_toolbar;
 mod empty;
+mod mini_layout;
+mod mini_player;
 mod profiles;
 mod server;
+mod viewport;
 
 gpui_kit::actions!(preview, [TogglePreview]);
 
-/// `previewMiniPlayerLayout.ts`.
-const MINI_SIZE: f32 = 320.;
-const MINI_EDGE_GAP: f32 = 12.;
-const MINI_HEADER: f32 = 28.;
 /// The inline chrome row: `h-7` plus its `mb-3`.
 const CHROME_ROW: f32 = 28. + 12.;
 
@@ -68,6 +68,8 @@ pub(super) enum PageEvent {
     OpenLink(String),
     /// The focused page handed back a shell shortcut's command.
     Shortcut(String),
+    /// The pointer entered or left the page's top-right corner ([`preview::CORNER_SCRIPT`]).
+    Corner(bool),
 }
 
 /// The chords a focused page forwards (`setForwardedShortcuts`), and what they were resolved from.
@@ -115,8 +117,13 @@ pub(super) struct PreviewState {
     tabs: HashMap<TabRef, HostedTab>,
     /// Tabs whose native view is being built, with the URL it should end up on.
     starting: HashMap<TabRef, String>,
-    /// The tab each thread's mini player floats (`previewMiniPlayerStore`).
-    floating: HashMap<ThreadRef, String>,
+    /// The tab each thread's mini player floats, and where (`previewMiniPlayerStore`).
+    floating: HashMap<ThreadRef, mini_player::MiniPlayer>,
+    mini: mini_player::MiniPlayerUi,
+    toolbar: device_toolbar::DeviceToolbar,
+    /// The page area the panel last drew a tab in: "Show device toolbar" sizes to it, and a
+    /// fill tab floated from it keeps its layout.
+    panel_area: Option<(TabRef, (f32, f32))>,
     /// Agent reveals not yet shown, and whether each is forced.
     reveals: Vec<(TabRef, bool)>,
     /// The tabs drawn this frame, by the panel and the mini player, with their page scale.
@@ -165,6 +172,9 @@ impl PreviewState {
             tabs: HashMap::new(),
             starting: HashMap::new(),
             floating: HashMap::new(),
+            mini: mini_player::MiniPlayerUi::new(cx),
+            toolbar: device_toolbar::DeviceToolbar::new(window, cx),
+            panel_area: None,
             reveals: Vec::new(),
             panel_view: None,
             mini_view: None,
@@ -388,6 +398,7 @@ impl Workspace {
             || self.settings.is_some()
             || self.palette.is_some()
             || self.preview.menu_open
+            || self.preview.toolbar.menu_open
             || self.right_panel.add_menu_open
             || self.right_panel.profiles_menu_open
             || self.tab_menu_open()
@@ -483,7 +494,7 @@ impl Workspace {
         let threads = &self.preview.threads;
         let open = |tab: &TabRef| threads.get(&tab.thread).is_none_or(|p| p.get(&tab.tab_id).is_some());
         self.preview.tabs.retain(|tab, _| open(tab));
-        self.preview.floating.retain(|thread, tab| threads.get(thread).is_none_or(|p| p.get(tab).is_some()));
+        self.preview.floating.retain(|thread, mini| threads.get(thread).is_none_or(|p| p.get(&mini.tab_id).is_some()));
         let loaded: Vec<(ThreadRef, Vec<String>)> = threads
             .iter()
             .filter(|(_, previews)| previews.list_loaded)
@@ -514,7 +525,7 @@ impl Workspace {
                 continue;
             }
             if !self.reveal_browser_surface(&tab.thread, &tab.tab_id, force) {
-                self.preview.floating.insert(tab.thread, tab.tab_id);
+                self.float_tab(tab.thread, tab.tab_id);
             }
         }
     }
@@ -599,7 +610,7 @@ impl Workspace {
 
     /// Hiding the panel floats the tab it showed over the chat.
     pub(super) fn float_browser(&mut self, thread: ThreadRef, tab_id: String, cx: &mut Context<Self>) {
-        self.preview.floating.insert(thread, tab_id);
+        self.float_tab(thread, tab_id);
         cx.notify();
     }
 
@@ -884,6 +895,10 @@ impl Workspace {
                 self.page_shortcut(key, &command, window, cx);
                 return;
             }
+            PageEvent::Corner(inside) => {
+                self.page_corner(&key.thread, &key.tab_id, inside, cx);
+                return;
+            }
         }
         let status = tab.status.clone();
         self.record_title(&key.thread, &status);
@@ -1114,12 +1129,27 @@ impl Workspace {
                 return div().flex_1().min_h_0().child(empty).into_any_element();
             }
             let follow_size = session.viewport.size().is_none();
-            return self.render_server_page(tab, follow_size, false, &tokens, window, cx);
+            let setting = session.viewport.clone();
+            let page = self.render_server_page(tab, follow_size, false, &tokens, window, cx);
+            if follow_size {
+                return page;
+            }
+            let toolbar = self.render_device_toolbar(tab, &setting, available.0, window, cx);
+            return v_flex().flex_1().min_h_0().child(toolbar).child(page).into_any_element();
         }
-        let fixed = session.as_ref().and_then(|s| s.viewport.size()).map(|size| preview::fit_viewport(size, available));
-        self.preview.panel_view = Some((tab.clone(), fixed.map_or(1., |(_, scale)| scale)));
+        self.preview.panel_area = Some((tab.clone(), available));
+        let setting = session.as_ref().map(|s| s.viewport.clone()).unwrap_or_default();
         let view = self.preview.tabs.get(tab).map(|hosted| hosted.view.clone());
-        let Some(view) = view.filter(|_| !self.preview.menu_open) else {
+        // `resolveBrowserDeviceViewportLayout`: under the toolbar, inside the resize rails' margin.
+        let toolbar = view.is_some() && setting.size().is_some();
+        let area = if toolbar {
+            (available.0 - viewport::RAIL * 2., available.1 - viewport::TOOLBAR_HEIGHT - viewport::RAIL)
+        } else {
+            available
+        };
+        let fixed = setting.size().map(|size| preview::fit_viewport(size, area));
+        self.preview.panel_view = Some((tab.clone(), fixed.map_or(1., |(_, scale)| scale)));
+        let Some(view) = view else {
             let blank = session.as_ref().is_none_or(|s| matches!(s.nav_status, NavStatus::Idle));
             return div()
                 .flex_1()
@@ -1127,18 +1157,26 @@ impl Workspace {
                 .when(blank, |el| el.child(self.render_preview_empty_state(&tab.thread, &tokens, cx)))
                 .into_any_element();
         };
-        match fixed {
+        // A menu open over the page hides it, since the native view would cover the menu.
+        let hidden = self.preview.menu_open || self.preview.toolbar.menu_open;
+        let page = match fixed {
             Some(((width, height), _)) => div()
                 .flex_1()
                 .min_h_0()
                 .flex()
-                .items_start()
+                .items_center()
                 .justify_center()
-                .bg(tokens.muted)
-                .child(div().w(px(width)).h(px(height)).child(view))
-                .into_any_element(),
-            None => div().flex_1().min_h_0().child(view).into_any_element(),
+                .px(px(viewport::RAIL))
+                .pb(px(viewport::RAIL))
+                .bg(tokens.muted.opacity(0.35))
+                .when(!hidden, |el| el.child(div().w(px(width)).h(px(height)).child(view))),
+            None => div().flex_1().min_h_0().when(!hidden, |el| el.child(view)),
+        };
+        if !toolbar {
+            return page.into_any_element();
         }
+        let toolbar = self.render_device_toolbar(tab, &setting, available.0, window, cx);
+        v_flex().flex_1().min_h_0().child(toolbar).child(page).into_any_element()
     }
 
     /// `PreviewChromeRow`: back, forward, reload, the address bar and the menu.
@@ -1171,7 +1209,7 @@ impl Workspace {
         };
         // `onPictureInPicture`: float the tab over the chat, or stop floating it.
         let float = session.map(|s| {
-            let floating = self.preview.floating.get(thread) == Some(&s.tab_id);
+            let floating = self.floating_tab(thread) == Some(s.tab_id.as_str());
             (s.tab_id.clone(), floating, !unreachable && (server_tab.is_some() || hosted.is_some()))
         });
         let server_tab = server_tab.map(|s| thread.tab(&s.tab_id));
@@ -1287,7 +1325,7 @@ impl Workspace {
                                 this.preview.floating.remove(&thread);
                                 cx.notify();
                             } else {
-                                this.preview.floating.insert(thread.clone(), tab.clone());
+                                this.float_tab(thread.clone(), tab.clone());
                                 this.close_right_panel(cx);
                             }
                         }))
@@ -1317,7 +1355,6 @@ impl Workspace {
         let move_label = self.move_tab_label(thread, session);
         let moving = (thread.clone(), session.clone());
         let (_, appearance) = self.tab_look(&thread.tab(&session.tab_id), session);
-        let preset = session.viewport.preset_id().map(str::to_owned);
         let fill = session.viewport.size().is_none();
         let view = cx.entity();
         trigger
@@ -1356,6 +1393,11 @@ impl Workspace {
                         },
                     )));
                 }
+                // The viewport's size and presets are in the device toolbar this shows.
+                let toolbar = if fill { "Show device toolbar" } else { "Hide device toolbar" };
+                menu = menu.item(PopupMenuItem::new(toolbar).disabled(!has_page && !server).on_click(
+                    window.listener_for(&view, |this, _: &ClickEvent, _, cx| this.toggle_device_toolbar(cx)),
+                ));
                 menu = menu.separator().label("Appearance");
                 for option in Appearance::ALL {
                     menu = menu.item(
@@ -1372,21 +1414,7 @@ impl Workspace {
                     .item(
                         PopupMenuItem::element(move |window, cx| zoom_row(&zoom_view, &menu_focus, window, cx))
                             .disabled(true),
-                    )
-                    .separator()
-                    .label("Viewport")
-                    .item(
-                        PopupMenuItem::new("Fill panel")
-                            .checked(fill)
-                            .on_click(adjust("preview.resize", json!({"viewport": {"_tag": "fill"}}))),
                     );
-                for option in &preview::PRESETS {
-                    let label = format!("{} · {} × {}", option.label, option.width, option.height);
-                    menu =
-                        menu.item(PopupMenuItem::new(label).checked(preset.as_deref() == Some(option.id)).on_click(
-                            adjust("preview.resize", json!({"viewport": preview::Viewport::preset(option)})),
-                        ));
-                }
                 // The server's browser clears the tab's profile itself. wry clears a profile's cache
                 // only with all its other data, so this computer's tabs offer cookies alone.
                 if server {
@@ -1427,98 +1455,6 @@ impl Workspace {
     fn active_zoom(&self) -> f64 {
         let Some(tab) = self.active_tab() else { return 1. };
         self.preview.threads.session(&tab).map_or(1., |session| self.tab_look(&tab, session).0)
-    }
-
-    /// `ThreadPreviewMiniPlayer`: the floated tab over the chat's bottom-right corner, unless the
-    /// panel shows that same tab (`shouldRenderPreviewMiniPlayer`).
-    pub(super) fn render_preview_mini_player(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let thread = self.preview_thread()?;
-        let tab = thread.tab(self.preview.floating.get(&thread)?);
-        if self.page.is_some() || self.active_surface() == Some(&Surface::Browser(tab.tab_id.clone())) {
-            return None;
-        }
-        let tokens = *theme::tokens(cx);
-        let session = self.preview.threads.session(&tab)?.clone();
-        let body = (MINI_SIZE, MINI_SIZE - MINI_HEADER);
-        let fixed = session.viewport.size().map(|size| preview::fit_viewport(size, body));
-        // An agent's tab streams here as in the panel, with its control bar below the page.
-        let streamed = session.server_hosted().then(|| self.render_server_page(&tab, false, true, &tokens, window, cx));
-        if streamed.is_none() {
-            self.preview.mini_view = Some((tab.clone(), fixed.map_or(1., |(_, scale)| scale)));
-        }
-        let view = self.preview.tabs.get(&tab).map(|hosted| hosted.view.clone());
-        let title = self.browser_tab_title(&tab.tab_id);
-        let (expand_thread, expand_tab) = (thread.clone(), tab.tab_id);
-        let close_thread = thread;
-        Some(
-            v_flex()
-                .id("preview-mini-player")
-                .absolute()
-                .right(px(MINI_EDGE_GAP))
-                .bottom(px(MINI_EDGE_GAP))
-                .w(px(MINI_SIZE))
-                .h(px(MINI_SIZE))
-                .rounded(px(12.))
-                .overflow_hidden()
-                .border_1()
-                .border_color(tokens.border.opacity(0.8))
-                .bg(tokens.muted)
-                .shadow_2xl()
-                .occlude()
-                .child(
-                    h_flex()
-                        .h(px(MINI_HEADER))
-                        .flex_none()
-                        .pl_2()
-                        .pr_1()
-                        .gap_1()
-                        .bg(tokens.popover)
-                        .text_xs()
-                        .child(Icon::new(IconName::Globe).size(px(12.)).text_color(tokens.muted_foreground))
-                        .child(div().flex_1().min_w_0().truncate().child(title))
-                        .child(
-                            icon_button("mini-expand", IconName::PanelRight, true, &tokens, cx)
-                                .tooltip("Open in panel")
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.preview.floating.remove(&expand_thread);
-                                    this.open_surface(Surface::Browser(expand_tab.clone()), window, cx);
-                                })),
-                        )
-                        .child(
-                            icon_button("mini-close", IconName::X, true, &tokens, cx)
-                                .tooltip("Close floating preview")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.preview.floating.remove(&close_thread);
-                                    cx.notify();
-                                })),
-                        ),
-                )
-                .child(match (streamed, view, fixed) {
-                    (Some(page), _, _) => page,
-                    (None, Some(view), Some(((width, height), _))) => div()
-                        .flex_1()
-                        .min_h_0()
-                        .flex()
-                        .justify_center()
-                        .child(div().w(px(width)).h(px(height)).child(view))
-                        .into_any_element(),
-                    (None, Some(view), None) => div().flex_1().min_h_0().child(view).into_any_element(),
-                    (None, None, _) => div()
-                        .flex_1()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_xs()
-                        .text_color(tokens.muted_foreground)
-                        .child("No preview yet")
-                        .into_any_element(),
-                })
-                .into_any_element(),
-        )
     }
 }
 
@@ -1582,6 +1518,7 @@ fn page_builder<'a>(
         .with_devtools(true)
         .with_initialization_script(preview::HISTORY_SCRIPT)
         .with_initialization_script(preview::shortcut_script(chords, keymap::MAC))
+        .with_initialization_script(preview::CORNER_SCRIPT)
         .with_ipc_handler({
             let sender = sender.clone();
             move |request| {
@@ -1590,6 +1527,8 @@ fn page_builder<'a>(
                     let _ = sender.try_send(PageEvent::History(history));
                 } else if let Some(command) = preview::shortcut_message(body) {
                     let _ = sender.try_send(PageEvent::Shortcut(command));
+                } else if let Some(inside) = preview::corner_message(body) {
+                    let _ = sender.try_send(PageEvent::Corner(inside));
                 }
             }
         })
