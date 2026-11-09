@@ -1725,7 +1725,7 @@ impl Workspace {
                             .py(px(8.))
                             .border_b_1()
                             .border_color(row_border)
-                            .hover(|s| s.bg(Hsla { a: 0.5, ..t.muted }))
+                            .hover(|s| s.bg(t.muted.opacity(0.5)))
                             .child(div().w(relative(0.4)).pl(px(8.)).text_color(t.foreground).child(label))
                             .children(providers.iter().map(|p| {
                                 cell(logic::format_usd(period.value(p, false))).text_color(t.muted_foreground)
@@ -1766,7 +1766,7 @@ impl Workspace {
                         .border_b_1()
                         .border_color(row_border)
                         .text_color(t.muted_foreground)
-                        .hover(|s| s.bg(Hsla { a: 0.5, ..t.muted }))
+                        .hover(|s| s.bg(t.muted.opacity(0.5)))
                         .child(div().w(px(32.)).pl(px(8.)).py(px(10.)).text_xs().child((index + 1).to_string()))
                         .child(
                             v_flex()
