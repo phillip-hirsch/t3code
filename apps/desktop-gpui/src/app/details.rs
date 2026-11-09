@@ -31,7 +31,7 @@ const CARD_WIDTH: f32 = 280.;
 /// `quickActionDisabledReason` without `source-control:write`.
 const NO_SOURCE_CONTROL_WRITE: &str = "This connection cannot change source control.";
 const CARD_INSET: f32 = 12.;
-const ROW_HEIGHT: f32 = 32.;
+pub(super) const ROW_HEIGHT: f32 = 32.;
 const METER_ROW_HEIGHT: f32 = 24.;
 /// A section's 8px top and 10px bottom padding.
 const SECTION_PADDING: f32 = 18.;
@@ -41,12 +41,12 @@ const HEADING_HEIGHT: f32 = 36.;
 /// The card's opaque stand-ins for `dropdown-glass` (the popover at `--glass-opacity`
 /// over the canvas); GPUI has no backdrop blur.
 #[derive(Clone, Copy)]
-struct CardColors {
+pub(super) struct CardColors {
     background: Hsla,
     border: Hsla,
     divider: Hsla,
-    hover: Hsla,
-    label: Hsla,
+    pub(super) hover: Hsla,
+    pub(super) label: Hsla,
     muted: Hsla,
     track: Hsla,
     tick: Hsla,
@@ -283,7 +283,9 @@ impl Workspace {
     }
 
     pub(super) fn render_details_card(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.details_shown(window) {
+        let shown = self.details_shown(window);
+        self.follow_card_pull_requests(shown, window, cx);
+        if !shown {
             return None;
         }
         let tokens = *theme::tokens(cx);
@@ -793,11 +795,19 @@ impl Workspace {
     ) -> Option<Section> {
         self.vcs.cwd.as_ref()?;
         let status = self.vcs.status.as_ref();
-        let is_repo = status.is_none_or(|status| status.local.is_repo);
         // `BranchToolbarBranchSelector` as a select: a draft's base ("From main (remote)") or the branch.
-        let (branch, _, label) = self.branch_trigger();
+        let (_, _, label) = self.branch_trigger();
         let mut rows: Vec<AnyElement> = Vec::new();
-        if is_repo && self.details_item_shown("branch") && branch.is_some() {
+        // The pull request rows under the branch, past one row's height.
+        let mut extra = 0.;
+        let section = |rows: Vec<AnyElement>, extra: f32| {
+            (!rows.is_empty()).then(|| Section {
+                height: rows.len() as f32 * ROW_HEIGHT + extra,
+                element: v_flex().children(rows).into_any_element(),
+                min_density: Density::Essential,
+            })
+        };
+        if self.branch_row_shown() {
             let trigger = select_row("details-branch", tokens, colors, cx)
                 .disabled(!self.branch_picker_ready())
                 .child(
@@ -815,14 +825,12 @@ impl Workspace {
                     .child(self.branch_popover("details-branch-popover", trigger, true, tokens, cx))
                     .into_any_element(),
             );
+            if let Some((pull_requests, height)) = self.card_pull_request_rows(colors, tokens, cx) {
+                rows.push(pull_requests);
+                extra += height - ROW_HEIGHT;
+            }
         }
-        let Some(status) = status else {
-            return (!rows.is_empty()).then(|| Section {
-                height: rows.len() as f32 * ROW_HEIGHT,
-                element: v_flex().children(rows).into_any_element(),
-                min_density: Density::Essential,
-            });
-        };
+        let Some(status) = status else { return section(rows, extra) };
         let (actions_shown, changes_shown) =
             (self.details_item_shown("gitActions"), self.details_item_shown("changes"));
         if status.local.is_repo {
@@ -841,11 +849,7 @@ impl Workspace {
             }
         } else {
             if !actions_shown {
-                return (!rows.is_empty()).then(|| Section {
-                    height: rows.len() as f32 * ROW_HEIGHT,
-                    element: v_flex().children(rows).into_any_element(),
-                    min_density: Density::Essential,
-                });
+                return section(rows, extra);
             }
             let running = self.vcs.running().is_some();
             let enabled = !running && self.can_write_source_control();
@@ -861,11 +865,13 @@ impl Workspace {
                     .into_any_element(),
             );
         }
-        (!rows.is_empty()).then(|| Section {
-            height: rows.len() as f32 * ROW_HEIGHT,
-            element: v_flex().children(rows).into_any_element(),
-            min_density: Density::Essential,
-        })
+        section(rows, extra)
+    }
+
+    /// The branch select shows, and the thread's pull requests under it.
+    pub(super) fn branch_row_shown(&self) -> bool {
+        let is_repo = self.vcs.status.as_ref().is_none_or(|status| status.local.is_repo);
+        self.vcs.cwd.is_some() && is_repo && self.details_item_shown("branch") && self.branch_trigger().0.is_some()
     }
 
     /// The quick action with its menu, or the running action's progress.
@@ -1716,7 +1722,7 @@ fn field(label: &'static str, input: impl IntoElement) -> impl IntoElement {
 
 /// The statuses `ThreadRelationshipsControl.tsx` files under "Previous agents".
 /// `THREAD_DETAILS_PANEL_LOCKED_ROW_CLASS`: 32px, 10px inset and gap, 13px medium.
-fn row(colors: &CardColors) -> gpui_kit::Div {
+pub(super) fn row(colors: &CardColors) -> gpui_kit::Div {
     h_flex()
         .h(px(ROW_HEIGHT))
         .w_full()
@@ -1748,7 +1754,7 @@ fn action_row(
 
 /// `ThreadDetailsControl` as a keyboard button: a tab stop that Enter and Space click, with
 /// `focus-visible:ring-2 ring-inset`. The ring takes 2px of the row's 10px inset, so nothing moves.
-fn keyboard_button(
+pub(super) fn keyboard_button(
     element: gpui_kit::Stateful<gpui_kit::Div>,
     colors: &CardColors,
 ) -> gpui_kit::Stateful<gpui_kit::Div> {

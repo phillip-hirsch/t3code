@@ -5,6 +5,7 @@ mod pull_request_detail;
 mod pull_request_surface;
 mod pull_requests;
 pub(super) mod settings;
+mod thread_card_pull_requests;
 mod usage;
 
 use gpui_kit::{AnyElement, Context, SharedString, Window};

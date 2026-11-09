@@ -507,7 +507,7 @@ fn link_menu(mut menu: PopupMenu, item: &LinkMenu, view: &Entity<Workspace>, win
 impl Workspace {
     /// `useOpenPrLink`: in the thread's Pull request surface while "Open pull requests in T3
     /// Code" is on; Ctrl or Cmd, a middle click, or the setting off open the link instead.
-    fn open_linked_pull_request(
+    pub(super) fn open_linked_pull_request(
         &mut self,
         url: &str,
         reference: Reference,
@@ -526,7 +526,7 @@ impl Workspace {
     }
 
     /// `thread.pull-request.watch`: the agent wakes, or stops waking, on the change request.
-    fn watch_linked_pull_request(
+    pub(super) fn watch_linked_pull_request(
         &mut self,
         thread_id: &str,
         reference: &Reference,

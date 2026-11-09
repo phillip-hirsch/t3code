@@ -821,6 +821,78 @@ pub fn primary_control(detail: &Detail, checks_state: Option<&str>, stack: Stack
     (!stack.owns && can(detail, "merge")).then_some(Primary::Merge)
 }
 
+/// `isPullRequestConflicting`: open and conflicting with its base, draft or not.
+pub fn is_conflicting(detail: &Detail) -> bool {
+    detail.state == State::Open && detail.mergeability == "conflicting"
+}
+
+/// `classifyPullRequestChecks`: unlike [`checks_state`], checks that only skipped still pass.
+pub fn classify_checks(checks: &[Check]) -> &'static str {
+    let any = |statuses: &[&str]| checks.iter().any(|c| statuses.contains(&c.status.as_str()));
+    if checks.is_empty() {
+        "none"
+    } else if any(&["failure", "cancelled"]) {
+        "failing"
+    } else if any(&["pending", "action-required"]) {
+        "pending"
+    } else {
+        "passing"
+    }
+}
+
+/// `describePullRequestChecks`.
+pub fn describe_checks(checks: &[Check]) -> String {
+    let total = checks.len();
+    if total == 0 {
+        return "No checks reported".into();
+    }
+    let count = |statuses: &[&str]| checks.iter().filter(|c| statuses.contains(&c.status.as_str())).count();
+    let (failed, pending, awaiting, passed) =
+        (count(&["failure", "cancelled"]), count(&["pending"]), count(&["action-required"]), count(&["success"]));
+    let mut parts = Vec::new();
+    if pending > 0 {
+        parts.push(format!("{pending} of {total} running"));
+    }
+    if awaiting > 0 {
+        parts.push(format!("{awaiting} of {total} awaiting action"));
+    }
+    if failed > 0 {
+        parts.push(if parts.is_empty() { format!("{failed} of {total} failing") } else { format!("{failed} failed") });
+    }
+    if parts.is_empty() {
+        return if passed == total { "All checks passed".into() } else { format!("{passed} of {total} passing") };
+    }
+    parts.join(" · ")
+}
+
+/// The thread card's one action on a pull request (`ThreadPanelPullRequestAction`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CardAction {
+    Resolve,
+    Ready,
+    Fix,
+    Merge,
+}
+
+/// `resolveThreadPanelPullRequestAction`: conflicts first, then a draft's Ready, failing checks'
+/// Fix, and Merge once the checks have settled.
+pub fn card_action(detail: &Detail) -> Option<CardAction> {
+    if detail.state != State::Open {
+        return None;
+    }
+    if is_conflicting(detail) {
+        return Some(CardAction::Resolve);
+    }
+    if detail.is_draft {
+        return can(detail, "ready").then_some(CardAction::Ready);
+    }
+    match classify_checks(&detail.checks) {
+        "failing" => Some(CardAction::Fix),
+        "pending" => None,
+        _ => (can(detail, "merge") && !allowed_merge_methods(detail).is_empty()).then_some(CardAction::Merge),
+    }
+}
+
 /// The overflow menu's state actions (`showsDraftToggle`, `showsMergeNow`, ...).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MenuActions {
@@ -2772,6 +2844,42 @@ mod tests {
         );
         assert_eq!(check_status_label(&checks(&[("action-required", run)])[0]), "Awaiting approval");
         assert_eq!(summarize_checks(&checks(&[("success", None), ("skipped", None)])), "1 of 2 passing");
+
+        // The thread card reads them its own way: skipped-only passes, and each kind is counted.
+        assert_eq!(classify_checks(&[]), "none");
+        assert_eq!(classify_checks(&checks(&[("skipped", None)])), "passing");
+        assert_eq!(classify_checks(&checks(&[("pending", None), ("cancelled", None)])), "failing");
+        assert_eq!(classify_checks(&checks(&[("success", None), ("action-required", None)])), "pending");
+        assert_eq!(describe_checks(&[]), "No checks reported");
+        assert_eq!(describe_checks(&checks(&[("success", None), ("success", None)])), "All checks passed");
+        assert_eq!(describe_checks(&checks(&[("success", None), ("skipped", None)])), "1 of 2 passing");
+        assert_eq!(describe_checks(&checks(&[("failure", None), ("success", None)])), "1 of 2 failing");
+        assert_eq!(
+            describe_checks(&checks(&[("pending", None), ("action-required", None), ("failure", None)])),
+            "1 of 3 running · 1 of 3 awaiting action · 1 failed"
+        );
+    }
+
+    #[test]
+    fn the_thread_card_offers_one_action_by_what_the_pull_request_needs_next() {
+        let check = |status: &str| json!([{"name": "ci", "status": status}]);
+        let action = |patch: Value| card_action(&detail(patch));
+        assert_eq!(action(json!({"checks": check("success")})), Some(CardAction::Merge));
+        assert_eq!(action(json!({})), Some(CardAction::Merge), "no checks reported");
+        assert_eq!(action(json!({"checks": check("pending")})), None, "checks still running");
+        assert_eq!(action(json!({"checks": check("failure")})), Some(CardAction::Fix));
+        assert_eq!(action(json!({"isDraft": true, "checks": check("failure")})), Some(CardAction::Ready));
+        assert_eq!(
+            action(json!({"isDraft": true, "mergeability": "conflicting"})),
+            Some(CardAction::Resolve),
+            "conflicts first, even on a draft"
+        );
+        assert_eq!(action(json!({"state": "merged"})), None);
+        assert_eq!(action(json!({"state": "closed", "mergeability": "conflicting"})), None);
+        let no_ready = json!({"isDraft": true, "viewerPermissions": {"actions": ["merge"]}});
+        assert_eq!(action(no_ready), None, "the viewer may not mark it ready");
+        let no_method = json!({"mergeCapabilities": {"merge": false, "squash": false, "rebase": false}});
+        assert_eq!(action(no_method), None, "the repository allows no offered method");
     }
 
     #[test]

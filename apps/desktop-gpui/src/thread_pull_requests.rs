@@ -336,6 +336,50 @@ pub fn list_lines(links: &[PullRequestLink]) -> Vec<ListLine<'_>> {
         .collect()
 }
 
+/// The pull request the thread card leads with, under its branch (`ThreadDetailsPrRows`' current row).
+#[derive(Debug, PartialEq)]
+pub struct CardCurrent<'a> {
+    /// The link it comes from; a branch's pull request has none.
+    pub link: Option<&'a PullRequestLink>,
+    pub host: Option<String>,
+    pub repository: String,
+    pub number: u64,
+    pub url: String,
+}
+
+/// The current link, else the thread's branch pull request, else the one the checkout's branch
+/// has on its host (`branch`, as `(number, url)`).
+pub fn card_current<'a>(
+    links: &'a [PullRequestLink],
+    linked_branch: Option<&LinkedPullRequest>,
+    branch: Option<(u64, &str)>,
+) -> Option<CardCurrent<'a>> {
+    if let Some(link) = current(links) {
+        let (host, repository) = (Some(link.host.clone()), link.repository.clone());
+        return Some(CardCurrent { link: Some(link), host, repository, number: link.number, url: link.url.clone() });
+    }
+    if let Some(linked) = linked_branch {
+        let (host, repository, number, url) =
+            (url_host(&linked.url), linked.repository.clone(), linked.number, linked.url.clone());
+        return Some(CardCurrent { link: None, host, repository, number, url });
+    }
+    let (number, url) = branch?;
+    let parsed = crate::pull_request_detail::parse_change_request(url)?;
+    Some(CardCurrent {
+        link: None,
+        host: Some(parsed.host),
+        repository: parsed.repository,
+        number,
+        url: url.to_owned(),
+    })
+}
+
+/// `ThreadDetailsPrRows`' "Show N more": the other links in list order, only beside a current link.
+pub fn card_rest<'a>(links: &'a [PullRequestLink], current: &CardCurrent) -> Vec<&'a PullRequestLink> {
+    let Some(current) = current.link else { return Vec::new() };
+    list_lines(links).into_iter().map(|line| line.link).filter(|link| link.key() != current.key()).collect()
+}
+
 /// A change request a thread can link (`resolveLinkPullRequestInput`'s `link`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedLink {
@@ -705,5 +749,37 @@ mod tests {
         assert_eq!(chains.len(), 1);
         assert!(chains[0].native);
         assert_eq!(chains[0].layers.iter().map(|l| l.number).collect::<Vec<_>>(), vec![5, 4]);
+    }
+
+    #[test]
+    fn the_thread_card_leads_with_the_current_link_and_folds_the_others() {
+        let links = vec![
+            chained(2, "b", "a", "2026-01-01T00:00:00Z", None),
+            chained(1, "a", "main", "2026-01-02T00:00:00Z", None),
+            link(9, "manual", "merged", "2026-01-03T00:00:00Z"),
+            link(8, "stack-dismissed", "open", "2026-01-04T00:00:00Z"),
+        ];
+        let branch = LinkedPullRequest {
+            project_id: "p".into(),
+            repository: "o/r".into(),
+            number: 5,
+            url: "https://github.com/o/r/pull/5".into(),
+        };
+        let current = card_current(&links, Some(&branch), Some((6, "https://github.com/o/r/pull/6"))).unwrap();
+        assert_eq!((current.number, current.host.as_deref()), (2, Some("github.com")), "the top of the open chain");
+        let rest: Vec<u64> = card_rest(&links, &current).iter().map(|l| l.number).collect();
+        assert_eq!(rest, vec![9, 1], "in list order, without the current or a dismissed one");
+
+        // Without links: the thread's branch pull request, then the checkout branch's on its host.
+        let from_branch = card_current(&[], Some(&branch), Some((6, "https://github.com/o/r/pull/6"))).unwrap();
+        assert_eq!((from_branch.number, from_branch.link), (5, None));
+        assert!(card_rest(&links, &from_branch).is_empty(), "nothing folds under a branch pull request");
+        let from_status = card_current(&[], None, Some((6, "https://GitHub.com/O/R/pull/6"))).unwrap();
+        assert_eq!(
+            (from_status.host.as_deref(), from_status.repository.as_str(), from_status.number),
+            (Some("github.com"), "o/r", 6)
+        );
+        assert_eq!(card_current(&[], None, Some((6, "not a link"))), None);
+        assert_eq!(card_current(&[], None, None), None);
     }
 }

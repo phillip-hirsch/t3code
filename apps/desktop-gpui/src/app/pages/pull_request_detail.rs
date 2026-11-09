@@ -2815,7 +2815,7 @@ fn checks_glyph(state: &str, t: &Tokens) -> Option<(Lucide, Hsla, &'static str)>
 }
 
 /// `CHECK_STATUS_PRESENTATION`. A running check shows a still spinner glyph, not an animation.
-fn check_status_icon(status: &str, t: &Tokens) -> (Lucide, Hsla) {
+pub(super) fn check_status_icon(status: &str, t: &Tokens) -> (Lucide, Hsla) {
     let muted = Hsla { a: 0.7, ..t.muted_foreground };
     match status {
         "pending" => (Lucide::LoaderCircle, tone(t, 0xfe9a00, 0xfe9a00, 1.)),
