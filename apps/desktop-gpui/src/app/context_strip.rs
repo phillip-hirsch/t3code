@@ -189,7 +189,7 @@ impl Workspace {
         else {
             return;
         };
-        let has_threads = self.shell.threads.iter().any(|t| t.project_id == project_id);
+        let has_threads = self.shell.project_has_threads(project);
         let workspace = DraftWorkspace::new(self.server_info(), project, has_threads);
         self.draft_workspace.start_from_origin_default = workspace.start_from_origin();
         let cwd = project.workspace_root.clone();

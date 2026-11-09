@@ -8,6 +8,7 @@
 //! out, and the theme list has no environment-published themes.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -23,6 +24,7 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, div, prelude::FluentBuilder as _, px,
     relative, svg,
 };
+use serde::Deserialize as _;
 use serde_json::{Value, json};
 
 use super::keymap;
@@ -86,11 +88,45 @@ impl MessageMatch {
     }
 }
 
+/// How a search reaches environments whose shells leave older settled threads out
+/// (`ThreadSearchScope`); others ignore it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct SearchScope {
+    /// The sidebar filter's projects by environment; `None` searches every project.
+    pub(super) projects: Option<HashMap<SharedString, Vec<String>>>,
+    /// The caller's names for environments, which its own ranking also matches.
+    pub(super) labels: Option<HashMap<SharedString, SharedString>>,
+}
+
+/// `orchestration.searchThreads` for one environment, or `None` when it has nothing to search:
+/// messages need a word of three or more letters, while older settled titles below `before`
+/// (the environment's cut) match from two.
+fn search_input(query: &str, before: Option<&str>, scope: &SearchScope, environment: &str) -> Option<Value> {
+    let messages = search::has_long_token(query);
+    let Some(before) = before else { return messages.then(|| json!({"query": query})) };
+    if !messages && query.chars().count() < 2 {
+        return None;
+    }
+    let mut input = json!({"query": query, "olderSettledBefore": before});
+    if let Some(projects) = &scope.projects {
+        input["projectIds"] = json!(projects.get(environment).map_or(&[][..], Vec::as_slice));
+    }
+    if let Some(label) = scope.labels.as_ref().and_then(|labels| labels.get(environment)) {
+        input["environmentLabel"] = json!(label.as_ref());
+    }
+    if !messages {
+        input["titlesOnly"] = true.into();
+    }
+    Some(input)
+}
+
 /// Server message search for a query over every connected environment, debounced
-/// (`useThreadSearch`). Each environment's matches join as it answers.
+/// (`useThreadSearch`). Each environment's matches join as it answers, and the rows of its
+/// best older settled matches merge into the shell so the caller's own ranking finds them.
 #[derive(Default)]
 pub(super) struct MessageSearch {
     pub(super) query: String,
+    scope: SearchScope,
     pub(super) matches: Vec<MessageMatch>,
     /// Some environment has not answered yet.
     pub(super) pending: bool,
@@ -780,7 +816,17 @@ impl Workspace {
             }
         } else if palette.view == View::Root {
             let query = if actions_filter(&query).0 { String::new() } else { query };
-            self.search_messages(query, |this| this.palette.as_mut().map(|p| &mut p.messages), cx);
+            // The palette matches environment names when there are several; older rows must too.
+            let labels = (self.sessions().len() > 1).then(|| {
+                let ids = self.sessions().iter().filter_map(|session| session.id.clone());
+                ids.map(|id| {
+                    let label = self.location_label(&id);
+                    (id, label)
+                })
+                .collect()
+            });
+            let scope = SearchScope { projects: None, labels };
+            self.search_messages(query, scope, |this| this.palette.as_mut().map(|p| &mut p.messages), cx);
         }
         cx.notify();
     }
@@ -832,21 +878,30 @@ impl Workspace {
     pub(super) fn search_messages(
         &mut self,
         query: String,
+        scope: SearchScope,
         slot: fn(&mut Workspace) -> Option<&mut MessageSearch>,
         cx: &mut Context<Self>,
     ) {
-        // Every connected environment is searched, as `useThreadSearch` does over its ids.
-        let clients: Vec<(SharedString, crate::rpc::RpcClient)> =
-            self.sessions().iter().filter_map(|session| Some((session.id.clone()?, session.client.clone()?))).collect();
-        let Some(search) = slot(self) else { return };
         let query: String = query.trim().chars().take(200).collect::<String>().trim().to_owned();
-        if search.query == query {
+        // Every connected environment is searched, as `useThreadSearch` does over its ids. The
+        // generation keeps a read made under an earlier snapshot from merging rows.
+        let clients: Vec<(SharedString, crate::rpc::RpcClient, u64, Value)> = (self.sessions().iter())
+            .filter_map(|session| {
+                let id = session.id.clone()?;
+                let before = self.shell.older_settled(&id).map(|cut| cut.before.as_str());
+                let input = search_input(&query, before, &scope, &id)?;
+                Some((id.clone(), session.client.clone()?, self.shell.generation(&id), input))
+            })
+            .collect();
+        let Some(search) = slot(self) else { return };
+        if search.query == query && search.scope == scope {
             return;
         }
         search.query = query.clone();
+        search.scope = scope;
         search.matches.clear();
         search._task = None;
-        search.pending = search::has_long_token(&query) && !clients.is_empty();
+        search.pending = !clients.is_empty();
         if !search.pending {
             return;
         }
@@ -854,25 +909,32 @@ impl Workspace {
             use futures::StreamExt as _;
             cx.background_executor().timer(MESSAGE_DEBOUNCE).await;
             let mut answers: futures::stream::FuturesUnordered<_> = clients
-                .iter()
-                .map(|(env, client)| {
-                    let request = client.request("orchestration.searchThreads", json!({"query": query}));
-                    async move { (env, request.await) }
+                .into_iter()
+                .map(|(env, client, generation, input)| async move {
+                    let answer = client.request("orchestration.searchThreads", input).await;
+                    (env, generation, answer)
                 })
                 .collect();
             // Each environment's matches show as it answers; one that fails leaves the others'.
-            while let Some((env, answer)) = answers.next().await {
+            while let Some((env, generation, answer)) = answers.next().await {
                 let settled = answers.is_empty();
-                let matches: Vec<MessageMatch> = answer
-                    .inspect_err(|error| log::warn!("orchestration.searchThreads: {error}"))
-                    .ok()
+                let answer = answer.inspect_err(|error| log::warn!("orchestration.searchThreads: {error}")).ok();
+                let matches: Vec<MessageMatch> = (answer.as_ref())
                     .and_then(|value| {
                         let matches = value["matches"].as_array()?;
-                        Some(matches.iter().filter_map(|m| MessageMatch::from_json(env, m)).collect())
+                        Some(matches.iter().filter_map(|m| MessageMatch::from_json(&env, m)).collect())
                     })
                     .unwrap_or_default();
+                let rows = answer.and_then(|value| crate::model::ThreadRows::deserialize(&value).ok());
                 let updated = this.update(cx, |this, cx| {
-                    let Some(search) = slot(this).filter(|s| s.query == query) else { return };
+                    if slot(this).is_none_or(|s| s.query != query) {
+                        return;
+                    }
+                    // Older settled matches the shell left out join it, so their hits list too.
+                    if let Some(rows) = rows {
+                        this.shell.mount_rows(&env, generation, rows);
+                    }
+                    let Some(search) = slot(this) else { return };
                     search.pending = !settled;
                     search.matches.extend(matches);
                     search.generation += 1;
@@ -2924,6 +2986,32 @@ mod tests {
             base.extend(fields);
         }
         serde_json::from_value(value).expect("a thread shell")
+    }
+
+    #[test]
+    fn a_search_asks_environments_with_a_cut_for_their_older_settled_matches() {
+        const CUT: &str = "2024-02-01T00:00:00.000Z";
+        let open = SearchScope::default();
+        assert_eq!(search_input("fix bug", None, &open, "a"), Some(json!({"query": "fix bug"})));
+        assert_eq!(search_input("fx", None, &open, "a"), None, "messages need a word of three letters");
+        assert_eq!(search_input("f", Some(CUT), &open, "a"), None);
+        // Older settled titles match from two letters, without the message search.
+        assert_eq!(
+            search_input("fx", Some(CUT), &open, "a"),
+            Some(json!({"query": "fx", "olderSettledBefore": CUT, "titlesOnly": true}))
+        );
+        let scoped = SearchScope {
+            projects: Some(HashMap::from([("a".into(), vec!["p1".to_owned()])])),
+            labels: Some(HashMap::from([("a".into(), "Laptop".into())])),
+        };
+        assert_eq!(
+            search_input("fix bug", Some(CUT), &scoped, "a"),
+            Some(
+                json!({"query": "fix bug", "olderSettledBefore": CUT, "projectIds": ["p1"], "environmentLabel": "Laptop"})
+            )
+        );
+        // The filter keeps no project there, so no older rows come back from it.
+        assert_eq!(search_input("fix bug", Some(CUT), &scoped, "b").unwrap()["projectIds"], json!([]));
     }
 
     #[test]

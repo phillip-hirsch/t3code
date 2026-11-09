@@ -24,6 +24,7 @@ mod model;
 mod model_label;
 mod new_thread;
 mod notifications;
+mod older_settled;
 mod open_vsx;
 mod preview;
 mod project_groups;

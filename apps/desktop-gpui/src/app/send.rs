@@ -312,7 +312,7 @@ impl Workspace {
                 // Still loading the workspace controls: resolve it the same way at send.
                 let workspace = strategy.is_none().then(|| {
                     let project = self.shell.projects.iter().find(|p| p.id == project_id)?;
-                    let has_threads = self.shell.threads.iter().any(|t| t.project_id == project_id);
+                    let has_threads = self.shell.project_has_threads(project);
                     Some((
                         DraftWorkspace::new(self.server_info(), project, has_threads),
                         project.workspace_root.clone(),

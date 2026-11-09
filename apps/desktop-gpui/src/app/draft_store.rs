@@ -427,10 +427,14 @@ impl Workspace {
         self.notify_sidebar(cx);
     }
 
-    /// The shell lists the target's thread, or its draft's project.
+    /// The shell lists the target's thread, or its draft's project. A shell that leaves older
+    /// settled threads out can't prove a thread is gone, so its threads' drafts stay.
     fn lists(&self, target: &Target) -> bool {
         match target {
-            Target::Thread { env, id } => self.shell.threads.iter().any(|t| t.environment_id == *env && t.id == *id),
+            Target::Thread { env, id } => {
+                self.shell.older_settled(env).is_some()
+                    || self.shell.threads.iter().any(|t| t.environment_id == *env && t.id == *id)
+            }
             Target::Draft { env, project_id, .. } => {
                 self.shell.projects.iter().any(|p| p.environment_id == *env && p.id == *project_id)
             }

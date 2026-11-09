@@ -949,6 +949,7 @@ impl Workspace {
     }
 
     fn select_thread_in(&mut self, env: SharedString, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.mount_thread_family(&env, &thread_id, cx);
         let target = Target::Thread { env, id: thread_id.clone() };
         if self.target.as_ref() == Some(&target) {
             // `navigateToThread` closes the sheet even when the thread is already open.

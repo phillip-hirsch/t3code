@@ -637,8 +637,10 @@ impl Workspace {
                 .and_then(Value::as_bool)
                 == Some(true)
         });
-        // A shell that leaves idle subagent children out can't prove nobody else uses the worktree.
-        let ask_server = info.config.get("shellThreadFamilies").and_then(Value::as_bool) == Some(true);
+        // A shell that leaves idle subagent children or older settled threads out can't prove
+        // nobody else uses the worktree.
+        let ask_server = info.config.get("shellThreadFamilies").and_then(Value::as_bool) == Some(true)
+            || self.shell.older_settled(&environment).is_some();
         let has_runtime = Facts::new(thread, &std::collections::HashMap::new()).runtime_status().is_some();
         let project_root = removable.map(|p| p.workspace_root.clone());
         let key = key.clone();

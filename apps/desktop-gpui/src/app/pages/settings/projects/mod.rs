@@ -425,6 +425,12 @@ impl Workspace {
             &group.display_name,
             environment_label.as_deref(),
             &self.shell.threads,
+            refs.iter()
+                .map(|m| {
+                    let project = std::slice::from_ref(&m.project.id);
+                    self.shell.unloaded_older_settled(&m.project.environment_id, Some(project))
+                })
+                .sum(),
         );
         let clear_selection = whole_group && !scoped.has_other_members;
         let (title, description) = message.split_once('\n').unwrap_or((&message, ""));

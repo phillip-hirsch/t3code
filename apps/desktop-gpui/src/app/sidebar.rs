@@ -6,6 +6,7 @@ pub(super) use actions::{MenuOrigin, Renaming};
 mod custom_snooze;
 mod drafts;
 mod filter;
+mod older_settled;
 mod provider_update;
 mod scope_store;
 mod search_results;
@@ -62,6 +63,8 @@ pub(super) struct SidebarState {
     snoozed_expanded: bool,
     settled_expanded: bool,
     settled_visible: usize,
+    /// Older settled threads the shells left out, read in pages for the Settled shelf.
+    older: older_settled::Shelf,
     /// The card under the pointer. Its controls replace the status label, which
     /// changes layout, so it is state rather than a paint-time group hover.
     hovered: Option<ScopedId>,
@@ -196,6 +199,7 @@ impl SidebarState {
             snoozed_expanded: false,
             settled_expanded: false,
             settled_visible: SETTLED_INITIAL,
+            older: older_settled::Shelf::default(),
             hovered: None,
             hover_card: None,
             _hover_card_delay: None,
@@ -472,7 +476,12 @@ enum Item<'a> {
         expanded: bool,
         first: bool,
     },
-    ShowMore(usize),
+    /// "Show N more" under the Settled shelf, or its Loading and Retry states.
+    ShowMore {
+        count: usize,
+        loading: bool,
+        failed: bool,
+    },
 }
 
 impl Item<'_> {
@@ -495,7 +504,7 @@ impl Item<'_> {
             }
             Item::Folder { group, .. } => Some(NavRow::Folder(group.key.clone())),
             Item::Header { shelf, .. } => Some(NavRow::Shelf(*shelf)),
-            Item::ShowMore(_) => Some(NavRow::SettledMore),
+            Item::ShowMore { .. } => Some(NavRow::SettledMore),
             _ => None,
         }
     }
@@ -633,19 +642,33 @@ impl SidebarState {
             );
         }
         let expanded = self.settled_expanded;
-        items.push(Item::Header { shelf: Shelf::Settled, count: sections.settled.len(), expanded, first });
-        let total = sections.settled.len();
-        let mut settled: Vec<Facts<'_>> = sections.settled;
-        let hidden = total.saturating_sub(self.settled_visible);
-        if hidden > 0 {
-            let route_row = settled[self.settled_visible..].iter().position(|f| Some(f.thread.thread_ref()) == route);
-            let route_row = route_row.map(|i| settled[self.settled_visible + i]);
-            settled.truncate(self.settled_visible);
-            settled.extend(route_row);
+        // Older settled threads load in pages; the shelf lists them only as far as they are loaded.
+        let older_scopes = older_settled::scopes(shell, scope_ids.as_ref());
+        self.older.follow(shell, &older_scopes);
+        let frontier = self.older.frontier();
+        let listed: Vec<Facts<'_>> = (sections.settled.iter().copied())
+            .filter(|f| crate::older_settled::is_listed(f.thread, frontier))
+            .collect();
+        let unloaded: usize =
+            older_scopes.iter().map(|(env, projects)| shell.unloaded_older_settled(env, projects.as_deref())).sum();
+        let total = sections.settled.len() + unloaded;
+        if expanded {
+            self.older.grow(listed.len(), self.settled_visible);
         }
+        items.push(Item::Header { shelf: Shelf::Settled, count: total, expanded, first });
+        let mut settled = listed;
+        settled.truncate(self.settled_visible);
+        if let Some(route_row) = (sections.settled.iter())
+            .find(|f| Some(f.thread.thread_ref()) == route)
+            .filter(|f| !settled.iter().any(|s| s.thread.thread_ref() == f.thread.thread_ref()))
+        {
+            settled.push(*route_row);
+        }
+        let hidden = total.saturating_sub(settled.len());
         items.extend(route_only(settled, expanded, route).into_iter().map(|f| Item::Slim(f, Some(Shelf::Settled))));
         if expanded && hidden > 0 {
-            items.push(Item::ShowMore(hidden.min(SETTLED_PAGE)));
+            let (loading, failed) = (self.older.loading(), self.older.failed());
+            items.push(Item::ShowMore { count: hidden.min(SETTLED_PAGE), loading, failed });
         }
         items
     }
@@ -1279,7 +1302,7 @@ impl Workspace {
                 ("enter" | "space", NavRow::Shelf(shelf)) => self.toggle_shelf(shelf, cx),
                 ("right", NavRow::Shelf(shelf)) if !expanded(self, shelf) => self.toggle_shelf(shelf, cx),
                 ("left", NavRow::Shelf(shelf)) if expanded(self, shelf) => self.toggle_shelf(shelf, cx),
-                ("enter" | "space", NavRow::SettledMore) => self.sidebar.settled_visible += SETTLED_PAGE,
+                ("enter" | "space", NavRow::SettledMore) => self.show_more_settled(cx),
                 ("enter" | "space", NavRow::Thread(thread)) => self.select_thread_in(thread.env, thread.id, window, cx),
                 // `startRename` refuses a read-only connection.
                 ("f2", NavRow::Thread(thread)) => self.start_rename(&thread, MenuOrigin::Sidebar, window, cx),
@@ -1328,6 +1351,8 @@ impl Workspace {
         }
         self.sidebar.scope = scope;
         self.sidebar.settled_visible = SETTLED_INITIAL;
+        // The server's older matches are scoped to the filter's projects.
+        self.refresh_sidebar_search(cx);
         self.notify_sidebar(cx);
     }
 
@@ -1471,7 +1496,9 @@ impl Workspace {
                     Item::Header { shelf, count, expanded, first } => {
                         self.render_shelf_header(shelf, count, expanded, first, &tokens, cx)
                     }
-                    Item::ShowMore(count) => self.render_show_more(count, &tokens, cx),
+                    Item::ShowMore { count, loading, failed } => {
+                        self.render_show_more(count, loading, failed, &tokens, cx)
+                    }
                 };
                 list.push(if ring { focus_ring(element, &tokens) } else { element });
             }
@@ -1480,6 +1507,7 @@ impl Workspace {
         self.sidebar.nav_rows = nav_rows;
         self.sidebar.thread_order = thread_order;
         self.arm_sidebar_clock(clock, now, cx);
+        self.read_older_settled_pages(cx);
 
         let rail = div()
             .id("sidebar-rail")
@@ -1884,23 +1912,37 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn render_show_more(&self, count: usize, tokens: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+    fn render_show_more(
+        &self,
+        count: usize,
+        loading: bool,
+        failed: bool,
+        tokens: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let sb = tokens.sidebar;
+        let label: SharedString = if loading {
+            "Loading".into()
+        } else if failed {
+            "Could not load older threads. Retry".into()
+        } else {
+            format!("Show {count} more").into()
+        };
         keyboard_button(text_sm(h_flex()).id("sidebar-settled-more"), tokens.ring)
             .h(px(36.))
             .flex_none()
             .px(px(10.))
             .gap(px(10.))
             .rounded(px(6.))
-            .cursor_pointer()
             .text_color(sb.muted_foreground)
-            .hover(|s| s.bg(sb.row_hover).text_color(sb.foreground))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.sidebar.settled_visible += SETTLED_PAGE;
-                this.notify_sidebar(cx);
-            }))
+            // Disabled while a page loads, like the web's `disabled` button.
+            .when(!loading, |el| {
+                el.cursor_pointer()
+                    .hover(|s| s.bg(sb.row_hover).text_color(sb.foreground))
+                    .on_click(cx.listener(|this, _, _, cx| this.show_more_settled(cx)))
+            })
             .child(icon(IconName::ChevronDown, 16., sb.muted_foreground))
-            .child(format!("Show {count} more"))
+            .child(label)
             .into_any_element()
     }
 

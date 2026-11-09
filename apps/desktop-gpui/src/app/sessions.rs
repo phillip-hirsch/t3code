@@ -24,6 +24,8 @@ use crate::theme::Tokens;
 
 /// The primary session's index in `Workspace::sessions`; it is always there.
 const PRIMARY: usize = 0;
+/// How long a first connection's shell waits for the config before subscribing without it.
+const SHELL_CONFIG_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 #[derive(Default)]
 pub(super) struct EnvironmentSession {
@@ -41,6 +43,9 @@ pub(super) struct EnvironmentSession {
     /// See `OpenThread::snapshot_failed` / `OpenThread::retried`.
     shell_snapshot_failed: bool,
     shell_retried: bool,
+    /// The shell subscription waits for this connection's first config, which says whether it
+    /// may leave older settled threads out.
+    shell_waits_for_config: bool,
     /// Config, terminal, preview and device streams, and the session's grants.
     _streams: Vec<Task<()>>,
     _shell: Option<Task<()>>,
@@ -260,9 +265,13 @@ impl Workspace {
         let Some(session) = self.session_mut(&environment_id) else { return };
         let Some(client) = session.client.clone() else { return };
         session.shell_retried = false;
+        // A reconnect keeps the last config; only a first connection waits for one.
+        let config_known = !session.server_info.config.is_null();
+        session.shell_waits_for_config = !config_known;
         self.resume_file_saves(&environment_id, cx);
         let config = client.stream("subscribeServerConfig", json!({"workspaceSnapshotsOnDemand": true}));
         let id = environment_id.clone();
+        let config_id = environment_id.clone();
         let config_task = Self::pump(
             config,
             window,
@@ -278,6 +287,11 @@ impl Workspace {
                 }
             },
             move |this, window, cx| {
+                if let Some(session) = this.session_mut(&config_id)
+                    && mem::take(&mut session.shell_waits_for_config)
+                {
+                    this.subscribe_shell(config_id.clone(), window, cx);
+                }
                 if primary {
                     this.sync_keymap(cx);
                     this.show_reload_toast(window, cx);
@@ -298,6 +312,9 @@ impl Workspace {
             self.subscribe_previews(&environment_id, &client, window, cx),
             self.subscribe_device_state(environment_id.clone(), &client, window, cx),
         ];
+        if !config_known {
+            streams.push(self.subscribe_shell_without_config(environment_id.clone(), window, cx));
+        }
         if let Some(endpoint) = self.session(&environment_id).and_then(|s| s.endpoint.clone()) {
             let id = environment_id.clone();
             streams.push(check_session(endpoint, cx, move |this, grants, cx| {
@@ -321,8 +338,30 @@ impl Workspace {
             self.sync_worktree_setup(cx);
             self.sync_details(cx);
         }
-        self.subscribe_shell(environment_id, window, cx);
+        if config_known {
+            self.subscribe_shell(environment_id, window, cx);
+        }
         self.sync_pull_request_refreshes(cx);
+    }
+
+    /// A config that never comes must not keep the thread list away: the shell subscribes
+    /// without it after a while, keeping every settled thread.
+    fn subscribe_shell_without_config(
+        &mut self,
+        environment_id: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(SHELL_CONFIG_WAIT).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if let Some(session) = this.session_mut(&environment_id)
+                    && mem::take(&mut session.shell_waits_for_config)
+                {
+                    this.subscribe_shell(environment_id, window, cx);
+                }
+            });
+        })
     }
 
     /// Ends the open target's own streams (thread, worktree setup, tool output, side chat)
@@ -339,8 +378,16 @@ impl Workspace {
     fn subscribe_shell(&mut self, environment_id: SharedString, window: &mut Window, cx: &mut Context<Self>) {
         let Some(client) = self.env_client(&environment_id) else { return };
         let mut input = json!({"requestCompletionMarker": true});
+        // Older settled threads load on demand (the Settled shelf's pages, search, families).
+        let omit_older_settled = self
+            .session(&environment_id)
+            .is_some_and(|s| s.server_info.config.get("shellOlderSettled").and_then(Value::as_bool) == Some(true));
+        if omit_older_settled {
+            input["omitOlderSettled"] = true.into();
+        }
         let sequence = self.shell.sequence(&environment_id);
-        if sequence > 0 {
+        // Rows held under other omissions would resume incomplete or stale, so they reload.
+        if sequence > 0 && self.shell.older_settled(&environment_id).is_some() == omit_older_settled {
             input["afterSequence"] = sequence.into();
         }
         let stream = client.stream("orchestration.subscribeShell", input);
@@ -383,6 +430,7 @@ impl Workspace {
                 this.sync_now(cx);
                 this.sync_child_approvals(cx);
                 this.sync_lineage_titles(cx);
+                this.sync_older_settled_counts(&batch_id, cx);
             },
         );
         if let Some(session) = self.session_mut(&environment_id) {

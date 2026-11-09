@@ -12,7 +12,7 @@ use gpui_kit::{
 
 use super::{now_ms, project_icon, row_id, text_sm, text_xs};
 use crate::app::Workspace;
-use crate::app::palette::{MessageMatch, MessageSearch};
+use crate::app::palette::{MessageMatch, MessageSearch, SearchScope};
 use crate::inbox;
 use crate::model::{ScopedId, ThreadShell};
 use crate::search::{self, ThreadSubject};
@@ -50,9 +50,16 @@ impl Workspace {
     /// After a keystroke: no row is highlighted and the message search restarts.
     pub(super) fn on_search_changed(&mut self, cx: &mut Context<Self>) {
         self.sidebar.search_highlight = None;
-        let query = self.sidebar.search.read(cx).value().to_string();
-        self.search_messages(query, Self::sidebar_messages, cx);
+        self.refresh_sidebar_search(cx);
         self.notify_sidebar(cx);
+    }
+
+    /// Searches the server for the box's query in the filter's projects, unless that search
+    /// already ran.
+    pub(super) fn refresh_sidebar_search(&mut self, cx: &mut Context<Self>) {
+        let query = self.sidebar.search.read(cx).value().to_string();
+        let projects = self.scoped_projects().map(|scoped| super::older_settled::search_projects(&scoped));
+        self.search_messages(query, SearchScope { projects, labels: None }, Self::sidebar_messages, cx);
     }
 
     /// `searchSidebarThreads` over the scoped threads, then the message-only hits.
