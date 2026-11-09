@@ -8,6 +8,7 @@ mod parser;
 #[cfg(test)]
 mod parser_tests;
 mod presentation;
+mod search;
 mod selection;
 mod state;
 
@@ -61,13 +62,35 @@ mod actions {
             First,
             Last,
             ExtendUp,
-            ExtendDown
+            ExtendDown,
+            OpenSearch,
+            SearchNext,
+            SearchPrevious,
+            CloseSearch
         ]
     );
 }
 
 pub(crate) fn init(cx: &mut App) {
+    // Pierre's find keys use the primary modifier: Cmd on macOS, Ctrl elsewhere.
+    let mac = cx.platform_info().is_mac();
     cx.bind_keys([
+        KeyBinding::new(
+            if mac { "cmd-f" } else { "ctrl-f" },
+            OpenSearch,
+            Some("Diff"),
+        ),
+        KeyBinding::new(
+            if mac { "cmd-g" } else { "ctrl-g" },
+            SearchNext,
+            Some("Diff"),
+        ),
+        KeyBinding::new(
+            if mac { "cmd-shift-g" } else { "ctrl-shift-g" },
+            SearchPrevious,
+            Some("Diff"),
+        ),
+        KeyBinding::new("escape", CloseSearch, Some("Diff")),
         KeyBinding::new("up", ScrollUp, Some("Diff")),
         KeyBinding::new("down", ScrollDown, Some("Diff")),
         KeyBinding::new("left", ScrollLeft, Some("Diff")),
@@ -603,9 +626,13 @@ fn render_diff(
         selection: state.selection().clone(),
         selected_lines: state.selected_lines(),
         selected: state.selected_span(),
+        search: state.search_paint(),
         geometry: state.geometry().clone(),
         state: cx.entity(),
     });
+    if !soft_wrap && let Some(found) = state.take_search_reveal_x() {
+        reveal_match_horizontally(&found, state, &code, &font_family, lane_width, window, cx);
+    }
     let sticky = if props.header_visible && !state.rows().is_empty() {
         state.sticky_header()
     } else {
@@ -690,6 +717,11 @@ fn render_diff(
                 this.child(Scrollbar::horizontal(&horizontal))
             })
         })
+        .children(
+            state
+                .search()
+                .map(|search| search::render_panel(search, &cx.entity(), cx)),
+        )
         // A line-number drag may finish anywhere, including outside the body.
         .on_mouse_up(
             MouseButton::Left,
@@ -774,6 +806,29 @@ fn render_diff(
         .on_action(cx.listener(|this, _: &SelectAll, window, cx| {
             if body_focused(this, window, cx) {
                 this.select_all(window, cx);
+            }
+        }))
+        .on_action(cx.listener(|this, _: &OpenSearch, window, cx| this.open_search(window, cx)))
+        .on_action(cx.listener(|this, _: &SearchNext, _, cx| {
+            if this.is_search_open() {
+                this.step_search(true, cx)
+            } else {
+                cx.propagate()
+            }
+        }))
+        .on_action(cx.listener(|this, _: &SearchPrevious, _, cx| {
+            if this.is_search_open() {
+                this.step_search(false, cx)
+            } else {
+                cx.propagate()
+            }
+        }))
+        // The panel takes its own Escape; this one comes from the code body.
+        .on_action(cx.listener(|this, _: &CloseSearch, window, cx| {
+            if this.is_search_open() && this.focus_handle(cx).is_focused(window) {
+                this.close_search(window, cx)
+            } else {
+                cx.propagate()
             }
         }))
         .on_action(cx.listener(|this, _: &Copy, window, cx| {
@@ -882,6 +937,8 @@ struct CodePresentation {
     selection: gpui_base::TextSelectionHandle,
     selected_lines: Option<DiffLineRange>,
     selected: Option<SelectedLines>,
+    /// The open find panel's matches.
+    search: Option<search::SearchPaint>,
     geometry: Rc<std::cell::RefCell<selection::SelectionGeometry>>,
     state: Entity<DiffState>,
 }
@@ -978,6 +1035,85 @@ fn measure_code_width(
         })
         .fold(px(0.), Pixels::max);
     code_width(width, gutter_width, lane_width, window.rem_size(), mode)
+}
+
+/// Pierre's `revealSearchMatchHorizontally`: scrolls a wide diff so the
+/// current match clears the edges by 24px when lines do not wrap.
+fn reveal_match_horizontally(
+    found: &search::SearchMatch,
+    state: &DiffState,
+    code: &CodePresentation,
+    family: &SharedString,
+    lane_width: Pixels,
+    window: &mut Window,
+    cx: &App,
+) {
+    const PADDING: f32 = 24.;
+    let viewport = state.viewport().width;
+    let Some(file) = code.files.get(found.file) else {
+        return;
+    };
+    let line = &file.lines(found.side)[found.line];
+    let range = line.display_range(found.range.clone());
+    if viewport <= px(0.) || code.content_width <= viewport {
+        return;
+    }
+    let font = gpui::Font {
+        family: family.clone(),
+        ..Default::default()
+    };
+    let width = |text: &str, window: &mut Window| {
+        let text = SharedString::from(text.to_owned());
+        let run = TextRun {
+            len: text.len(),
+            font: font.clone(),
+            color: cx.theme().foreground,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        window
+            .text_system()
+            .shape_line(text, code.font_size, &[run], None)
+            .width
+    };
+    let display = line.display();
+    let before = width(&display[..range.start], window);
+    let matched = width(&display[range], window);
+    // A row: its px_2 padding, one number lane, the marker lane and the indicator.
+    let column = if code.mode == DiffMode::Split
+        && found.side == DiffSide::Modified
+        && !file.is_single_column()
+    {
+        code.column_width
+    } else {
+        px(0.)
+    };
+    let indicator = if code.change_indicator == DiffChangeIndicator::Signs {
+        code.rem
+    } else {
+        code.rem / 2.
+    };
+    let lane = if code.line_number {
+        code.gutter_width
+    } else {
+        px(0.)
+    };
+    let left = column + code.rem / 2. + lane + lane_width + indicator + before;
+    let right = left + matched;
+    let horizontal = state.horizontal_scroll();
+    let offset = horizontal.offset();
+    let scrolled = -offset.x;
+    let padding = px(PADDING);
+    let next = if left < scrolled + padding {
+        left - padding
+    } else if right > scrolled + viewport - padding {
+        right - viewport + padding
+    } else {
+        return;
+    };
+    let next = next.min(code.content_width - viewport).max(px(0.));
+    horizontal.set_offset(point(-next, offset.y));
 }
 
 fn render_row(
@@ -1768,6 +1904,18 @@ fn line_highlights(
             )
         }));
     }
+    if let Some(search) = &code.search {
+        let (matched, current) = search::match_colors(cx);
+        highlights.extend(search.line(file, side, ix).map(|(range, is_current)| {
+            (
+                line.display_range(range),
+                HighlightStyle {
+                    background_color: Some(if is_current { current } else { matched }),
+                    ..Default::default()
+                },
+            )
+        }));
+    }
     if selected {
         highlights.push((
             0..line.display().len(),
@@ -2195,6 +2343,8 @@ mod newline_tests;
 mod review_tests;
 #[cfg(test)]
 mod scroll_tests;
+#[cfg(test)]
+mod search_tests;
 #[cfg(test)]
 mod selection_tests;
 #[cfg(test)]

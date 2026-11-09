@@ -13,6 +13,7 @@ use gpui::{
     Task, Window, WindowId, point, px,
 };
 use gpui_base::{TextSelection, TextSelectionContentKey, TextSelectionEvent, TextSelectionHandle};
+use rust_i18n::t;
 
 use super::{
     DiffAnnotation, DiffConflictResolution, DiffFile, DiffFileStatus, DiffInlineUnit,
@@ -21,8 +22,10 @@ use super::{
     presentation::{
         DiffSyntaxHighlighter, FilePresentation, PresentationOptions, SyntaxHighlighters,
     },
+    search::{self, DiffSearch, PANEL_RESERVED_HEIGHT, SearchMatch, SearchOptions, SearchPaint},
     selection::SelectionGeometry,
 };
+use crate::input::{InputEvent, InputState};
 
 /// One virtualized row. Every row belongs to exactly one file.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -151,7 +154,8 @@ pub enum DiffEvent {
     SelectionChanged(Option<DiffLineRange>),
     /// A selection gesture finished; the range is ready to act on.
     SelectionEnded(DiffLineRange),
-    /// The user expanded a collapsed file from its header.
+    /// The user expanded a collapsed file from its header, or find moved to
+    /// a match in it.
     FileExpanded(SharedString),
     /// The user collapsed a file from its header.
     FileCollapsed(SharedString),
@@ -320,6 +324,8 @@ pub struct DiffState {
     presentation_generation: usize,
     preparing: Option<usize>,
     _presentation: Task<()>,
+    /// The open find panel.
+    search: Option<DiffSearch>,
     _selection_subscription: Subscription,
 }
 
@@ -456,6 +462,7 @@ impl DiffState {
             presentation_generation: 0,
             preparing: None,
             _presentation: Task::ready(()),
+            search: None,
             _selection_subscription,
         };
         state.rebuild(true);
@@ -775,6 +782,7 @@ impl DiffState {
         self.rebuild(true);
         self.horizontal_scroll.set_offset(point(px(0.), px(0.)));
         self.ensure_presentation(cx);
+        self.refresh_search(cx);
         cx.notify();
     }
 
@@ -876,6 +884,7 @@ impl DiffState {
             self.list.remeasure_items(start..end);
         }
         self.ensure_presentation(cx);
+        self.refresh_search(cx);
         cx.notify();
     }
 
@@ -1073,6 +1082,8 @@ impl DiffState {
             self.reveal_line(&anchor);
         }
         self.ensure_presentation(cx);
+        // Hydration fills in the gap lines, which the search must cover.
+        self.refresh_search(cx);
         cx.notify();
     }
 
@@ -1254,6 +1265,198 @@ impl DiffState {
     /// Moves to the previous changed group before the current viewport, across files.
     pub fn previous_change(&mut self, cx: &mut Context<Self>) {
         self.move_change(false, cx);
+    }
+
+    /// Whether the find panel is open.
+    pub fn is_search_open(&self) -> bool {
+        self.search.is_some()
+    }
+
+    /// Opens the find panel (Pierre's `openSearch`, Mod+F in the diff), or
+    /// focuses it and selects its query when it is open. A new panel starts
+    /// from selected text that stays on one line.
+    pub fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(search) = &self.search {
+            search.input.update(cx, |input, cx| {
+                input.focus(window, cx);
+                input.select_all(window, cx);
+            });
+            return;
+        }
+        let selected = self.selected_text(cx);
+        let query = if selected.contains('\n') {
+            String::new()
+        } else {
+            selected
+        };
+        let input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(t!("Diff.SearchPlaceholder").to_string())
+        });
+        let subscription = cx.subscribe_in(
+            &input,
+            window,
+            |state, _, event: &InputEvent, _, cx| match event {
+                InputEvent::Change => state.run_search(true, cx),
+                InputEvent::PressEnter { shift, .. } => state.step_search(!*shift, cx),
+                _ => {}
+            },
+        );
+        input.update(cx, |input, cx| {
+            input.set_value(query, window, cx);
+            input.focus(window, cx);
+            input.select_all(window, cx);
+        });
+        self.search = Some(DiffSearch::new(input, subscription));
+        self.run_search(true, cx);
+        cx.notify();
+    }
+
+    /// Closes the find panel and returns focus to the diff.
+    pub fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search.take().is_some() {
+            window.focus(&self.focus, cx);
+            cx.notify();
+        }
+    }
+
+    /// Moves to the next match, or the previous one, wrapping at either end.
+    pub(crate) fn step_search(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(next) = self
+            .search
+            .as_ref()
+            .and_then(|search| search::step(search.current, search.matches.len(), forward))
+        else {
+            return;
+        };
+        self.go_to_match(next, cx);
+    }
+
+    pub(crate) fn update_search_options(
+        &mut self,
+        update: fn(&mut SearchOptions),
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(search) = &mut self.search {
+            update(&mut search.options);
+            self.run_search(true, cx);
+        }
+    }
+
+    pub(crate) fn search(&self) -> Option<&DiffSearch> {
+        self.search.as_ref()
+    }
+
+    pub(crate) fn search_paint(&self) -> Option<SearchPaint> {
+        self.search.as_ref().map(DiffSearch::paint)
+    }
+
+    /// The match a step just moved to, to scroll into view horizontally.
+    pub(crate) fn take_search_reveal_x(&mut self) -> Option<SearchMatch> {
+        let search = self.search.as_mut()?;
+        let ix = search.reveal_x.take()?;
+        search.matches.get(ix).cloned()
+    }
+
+    /// Runs the panel's query over the files. With `reveal`, as after typing,
+    /// it moves to the match it kept or else the first at or below the top of
+    /// the viewport, and brings it into view; without, as after the files
+    /// change, the current match stays only where it survives.
+    fn run_search(&mut self, reveal: bool, cx: &mut Context<Self>) {
+        let Some(search) = &self.search else {
+            return;
+        };
+        let query = search.input.read(cx).value();
+        let matches = search::collect_matches(&self.files, &query, search.options);
+        let first_visible = self.first_visible_match(&matches);
+        let Some(search) = &mut self.search else {
+            return;
+        };
+        search.set_matches(&self.files, matches);
+        if reveal && !search.matches.is_empty() {
+            let current = search.current.unwrap_or(first_visible);
+            self.go_to_match(current, cx);
+        }
+        cx.notify();
+    }
+
+    fn refresh_search(&mut self, cx: &mut Context<Self>) {
+        self.run_search(false, cx);
+    }
+
+    /// Pierre's `getFirstVisibleSearchMatchIndex`: the first match on a row at
+    /// or below the top of the viewport, or the first when all are above it.
+    fn first_visible_match(&self, matches: &[SearchMatch]) -> usize {
+        let top = self.list.logical_scroll_top().item_ix;
+        matches
+            .iter()
+            .position(|found| self.match_row(found).is_some_and(|row| row >= top))
+            .unwrap_or(0)
+    }
+
+    /// The row showing a match, the disclosure hiding it, or its folded file's header.
+    fn match_row(&self, found: &SearchMatch) -> Option<usize> {
+        self.source_row(&match_position(found))
+            .or_else(|| self.header_rows.get(found.file).copied())
+    }
+
+    fn go_to_match(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(search) = &mut self.search else {
+            return;
+        };
+        let Some(found) = search.matches.get(ix).cloned() else {
+            return;
+        };
+        search.current = Some(ix);
+        search.reveal_x = Some(ix);
+        self.reveal_match(&found, cx);
+        cx.notify();
+    }
+
+    /// Brings a match on screen (Pierre's `revealSearchMatch`): unfolds its
+    /// file, reported as [`DiffEvent::FileExpanded`] since the owner may keep
+    /// folds, expands the context hiding it, and centers it in the space below
+    /// the sticky header and the panel unless it already shows there.
+    fn reveal_match(&mut self, found: &SearchMatch, cx: &mut Context<Self>) {
+        let unfolded = self.collapsed.remove(found.path.as_str());
+        if unfolded {
+            self.rebuild_at_anchor();
+            cx.emit(DiffEvent::FileExpanded(found.path.clone()));
+        }
+        let rows = self.rows.len();
+        let Some(row) = self.expand_line(&match_position(found)) else {
+            return;
+        };
+        let moved = unfolded || self.rows.len() != rows;
+        if moved || !self.row_in_search_view(row) {
+            self.center_row(row);
+        }
+    }
+
+    /// Whether a row is laid out wholly below the sticky header and the panel.
+    fn row_in_search_view(&self, row: usize) -> bool {
+        let Some(bounds) = self.list.bounds_for_item(row) else {
+            return false;
+        };
+        let viewport = self.list.viewport_bounds();
+        let reserved = self.sticky_height.get() + px(PANEL_RESERVED_HEIGHT);
+        bounds.top() >= viewport.top() + reserved && bounds.bottom() <= viewport.bottom()
+    }
+
+    fn center_row(&self, row: usize) {
+        let height = self.list.viewport_bounds().size.height;
+        let reserved = self.sticky_height.get() + px(PANEL_RESERVED_HEIGHT);
+        let row_height = self
+            .list
+            .bounds_for_item(row)
+            .map_or(self.row_height.unwrap_or(px(20.)), |bounds| {
+                bounds.size.height
+            });
+        let top = reserved + ((height - reserved - row_height) / 2.).max(px(0.));
+        self.list.scroll_to(ListOffset {
+            item_ix: row,
+            offset_in_item: px(0.),
+        });
+        self.list.scroll_by(-top);
     }
 
     /// Reveals part or all of a collapsed unchanged range.
@@ -1916,6 +2119,10 @@ fn range_between(anchor: &DiffLinePosition, cursor: &DiffLinePosition) -> DiffLi
         )
         .with_end_side(cursor.side())
     }
+}
+
+fn match_position(found: &SearchMatch) -> DiffLinePosition {
+    DiffLinePosition::new(found.path.clone(), found.side, found.line_number)
 }
 
 fn file_ixs(files: &[DiffFile]) -> HashMap<SharedString, usize> {

@@ -387,3 +387,22 @@ headers are sticky. The patch, in `src/diff/state.rs` and `src/diff/mod.rs`:
   the next file's header as it arrives; a canvas records its height for the push. The overlay
   renders inside the state's update, so file headers read whether their file is folded from
   `CodePresentation::collapsed`, not from the state.
+
+**A diff can be searched.** T3 Code patches Pierre diffs with a find panel (`CodeViewSearch`):
+Mod+F inside a diff opens it on the selected text, the query (with Match Case, Whole Word and
+Regexp) runs over every file's lines, including folded files, collapsed context and rows never
+laid out, matches paint orange with the current one in the modified colour, and Enter, Shift+Enter,
+Mod+G and Mod+Shift+G step through them, wrapping, unfolding the file and expanding the context
+that hides one and centering it below the sticky header and the panel. Escape closes it and
+focuses the diff. 0.9.0 has no find. The patch:
+
+- `src/diff/search.rs`: `collect_matches` (unified order: a run's deletions, then its additions),
+  `step`, the panel (`render_panel`) and the match colours.
+- `src/diff/state.rs`: `DiffState::open_search`, `close_search`, `is_search_open`,
+  `step_search`, `reveal_match` (a folded file reports `DiffEvent::FileExpanded`), and a search
+  that runs again, keeping its current match, after `set_files`, `update_files` and hydration.
+- `src/diff/mod.rs`: the `OpenSearch`, `SearchNext`, `SearchPrevious` and `CloseSearch` actions
+  and bindings, match highlights in `line_highlights`, the panel in `render_diff`, and
+  `reveal_match_horizontally`.
+- `locales/ui.yml`: the English `Diff.Search*` strings.
+- `src/diff/search_tests.rs`.
