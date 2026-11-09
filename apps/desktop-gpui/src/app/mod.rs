@@ -72,6 +72,7 @@ mod prompt_stash;
 mod queue;
 mod quit;
 mod recovery;
+mod remote_open;
 mod request_cards;
 mod right_panel;
 mod send;
@@ -276,6 +277,8 @@ pub struct Workspace {
     automations: details::automations::AutomationsWatch,
     /// The editor "Open in" launches, once picked.
     preferred_editor: Option<String>,
+    /// This machine's editors that open remote paths, for remote environments' Open in.
+    remote_editors: remote_open::RemoteEditors,
     right_panel: right_panel::RightPanel,
     /// The thread title's menu and inline rename.
     title: thread_menu::TitleState,
@@ -491,6 +494,7 @@ impl Workspace {
             servers: Default::default(),
             automations: Default::default(),
             preferred_editor: None,
+            remote_editors: Default::default(),
             right_panel: right_panel::RightPanel::new(cx),
             title: thread_menu::TitleState::new(cx),
             share_header: Default::default(),

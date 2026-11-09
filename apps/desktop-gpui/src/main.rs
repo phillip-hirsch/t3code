@@ -36,6 +36,7 @@ mod pull_request_reviewers;
 mod pull_requests;
 mod queue;
 mod quit_shortcut;
+mod remote_open;
 mod requests;
 mod rpc;
 mod search;

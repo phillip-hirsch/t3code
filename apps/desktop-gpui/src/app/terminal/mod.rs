@@ -807,9 +807,10 @@ impl Workspace {
                     None => cx.open_url(url),
                 }
             }
-            SessionEvent::OpenPath(path) => match self.preferred_editor_id() {
-                Some(editor) => {
-                    self.open_path_in_editor(path.clone(), editor, false, "Unable to open path".into(), window, cx);
+            SessionEvent::OpenPath(path) => match self.preferred_editor_id().zip(self.active_environment().cloned()) {
+                Some((editor, environment)) => {
+                    let failure = "Unable to open path".to_owned();
+                    self.open_path_in_editor(&environment, path.clone(), editor, false, failure, window, cx);
                 }
                 None => {
                     self.error = Some("No editor is available to open this path.".into());
