@@ -6,21 +6,22 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::Icon;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::NumberInput;
-use gpui_kit::component::{Disableable as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::notification::Notification;
+use gpui_kit::component::{Disableable as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, App, ClipboardItem, Context, ElementId, Entity, FontWeight, InteractiveElement as _, IntoElement,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Task, Window, div,
+    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Task, WeakEntity, Window, div,
     prelude::FluentBuilder as _, px,
 };
 use serde_json::{Value, json};
 
-use super::super::connections::logic::SETTINGS_WRITE;
+use super::super::connections::logic::{ENVIRONMENT_MAINTAIN, SETTINGS_WRITE};
 use super::super::widgets::{RowFrame, card, loose_section, note, settings_section};
 use super::{format_bytes, notify_error, now_ms, relative_label, text};
 use crate::app::Workspace;
 use crate::app::pages::settings::widgets::SettingsView;
 use crate::app::sessions::EnvironmentSession;
-use crate::rpc::{RpcClient, StreamEvent};
+use crate::rpc::{RpcClient, RpcError, StreamEvent};
 use crate::theme::{self, Tokens};
 
 /// `DATABASE_COMPACTION_RECOMMENDED_BYTES`.
@@ -37,6 +38,7 @@ enum Report {
 }
 
 /// What a selected, connected environment offers the storage sections.
+#[derive(Clone)]
 pub(super) struct MachineSpec {
     id: String,
     label: SharedString,
@@ -57,6 +59,8 @@ struct Machine {
     database: Option<Value>,
     /// The web keeps this per environment in local storage; this client keeps it while Settings is open.
     database_dismissed: bool,
+    /// `server.reclaimDatabaseSpace` was sent; the row waits for the restart until a failure reports back.
+    reclaim_requested: bool,
 }
 
 pub(super) struct StorageState {
@@ -102,9 +106,25 @@ impl StorageState {
                 report: Report::Loading,
                 database: None,
                 database_dismissed: false,
+                reclaim_requested: false,
             })
             .collect();
         Self { machines, running: false, last_run_open: false, _streams: streams }
+    }
+
+    /// Follows the new sockets after a reconnect (a reclaim restarts the server), keeping what
+    /// the user did on each machine.
+    fn reconnect(&mut self, specs: Vec<MachineSpec>, cx: &mut Context<Self>) {
+        let mut next = Self::new(specs, cx);
+        for machine in &mut next.machines {
+            if let Some(old) = self.machines.iter().find(|old| old.id == machine.id) {
+                machine.database_dismissed = old.database_dismissed;
+                machine.reclaim_requested = old.reclaim_requested;
+            }
+        }
+        next.last_run_open = self.last_run_open;
+        *self = next;
+        cx.notify();
     }
 
     fn follow(
@@ -244,10 +264,16 @@ impl Workspace {
             })
             .collect();
         let state = window.use_keyed_state(SharedString::from(format!("settings-storage:{key}")), cx, |_, cx| {
-            StorageState::new(specs, cx)
+            StorageState::new(specs.clone(), cx)
         });
+        let machines = &state.read(cx).machines;
+        let reconnected = machines.len() != specs.len()
+            || machines.iter().zip(&specs).any(|(machine, spec)| !machine.client.same_socket(&spec.client));
+        if reconnected {
+            state.update(cx, |state, cx| state.reconnect(specs, cx));
+        }
         let mut sections = Vec::new();
-        sections.extend(render_database_notice(&state, &t, cx));
+        sections.extend(self.render_database_notice(&state, &t, cx));
         if !cleanup {
             let notice = note(
                 "Update the selected environments to use storage cleanup, or choose a machine that supports it.",
@@ -388,6 +414,194 @@ impl Workspace {
         }
         loose_section("cleanup", "Cleanup", blocks)
     }
+
+    /// `DatabaseStorageNotice`: on each machine whose database holds a GiB or more of freed pages,
+    /// Reclaim where the server can restart itself and this connection may maintain it, else the
+    /// `t3 doctor` command to copy.
+    fn render_database_notice(
+        &self,
+        state: &Entity<StorageState>,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let workspace = cx.weak_entity();
+        let storage = state.read(cx);
+        let visible: Vec<(usize, &Machine, &Value, bool)> = storage
+            .machines
+            .iter()
+            .enumerate()
+            .filter(|(_, machine)| !machine.database_dismissed)
+            .filter_map(|(index, machine)| {
+                let status = machine.database.as_ref()?;
+                let recommended = status["incrementalVacuumEnabled"] != true
+                    && status["reclaimableBytes"].as_f64().unwrap_or(0.) >= COMPACTION_RECOMMENDED_BYTES;
+                let reclaimable =
+                    status["canReclaim"] == true && self.environment_grants(&machine.id, ENVIRONMENT_MAINTAIN);
+                recommended.then_some((index, machine, status, reclaimable))
+            })
+            .collect();
+        if visible.is_empty() {
+            return None;
+        }
+        let description = if visible.iter().all(|(.., reclaimable)| *reclaimable) {
+            "These databases still hold space freed by history cleanup."
+        } else {
+            "These databases still hold space freed by history cleanup. Run the command on each machine to reclaim it. It restarts the background service. Quit the desktop app first if it hosts the environment."
+        };
+        let mut rows = vec![
+            RowFrame::new("Reclaim freed database space").description(text(description)).render(t).into_any_element(),
+        ];
+        for (index, machine, status, reclaimable) in visible {
+            let amount = format_gib(status["reclaimableBytes"].as_f64().unwrap_or(0.));
+            let title = format!("{amount} on {}", machine.label);
+            let dismiss_state = state.downgrade();
+            let dismiss = Button::new(SharedString::from(format!("database-dismiss-{index}")))
+                .ghost()
+                .xsmall()
+                .label("Dismiss")
+                .on_click(move |_, _, cx| {
+                    let _ = dismiss_state.update(cx, |state, cx| {
+                        state.machines[index].database_dismissed = true;
+                        cx.notify();
+                    });
+                });
+            let row = if reclaimable {
+                let failure = status["reclaimFailure"].as_str();
+                let minutes = reclaim_minutes(status);
+                // A failed repair reports back after the restart, which ends the wait.
+                let restarting = machine.reclaim_requested && failure.is_none();
+                let description = failure.map_or_else(
+                    || format!("Restarts T3 Code there. It is offline for about {minutes} min."),
+                    |failure| format!("The last attempt failed: {failure}"),
+                );
+                let request = Reclaim {
+                    workspace: workspace.clone(),
+                    state: state.downgrade(),
+                    id: machine.id.clone(),
+                    label: machine.label.clone(),
+                    client: machine.client.clone(),
+                    amount,
+                    minutes,
+                };
+                let reclaim = Button::new(SharedString::from(format!("database-reclaim-{index}")))
+                    .outline()
+                    .xsmall()
+                    .label(if restarting { "Restarting…" } else { "Reclaim" })
+                    .disabled(restarting)
+                    .on_click(move |_, window, cx| confirm_reclaim(request.clone(), window, cx));
+                RowFrame::new(title)
+                    .description(text(description))
+                    .control(h_flex().flex_wrap().gap_1p5().child(reclaim).child(dismiss))
+            } else {
+                let command = status["compactCommand"].as_str().unwrap_or_default().to_owned();
+                let copied = command.clone();
+                let copy = Button::new(SharedString::from(format!("database-copy-{index}")))
+                    .outline()
+                    .xsmall()
+                    .label("Copy command")
+                    .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copied.clone())));
+                RowFrame::new(title)
+                    .description(div().font_family(t.fonts.mono).child(command))
+                    .control(h_flex().flex_wrap().gap_1p5().child(copy).child(dismiss))
+            };
+            rows.push(row.render(t).into_any_element());
+        }
+        Some(settings_section("database", "Database", rows, t))
+    }
+}
+
+/// `formatGiB`.
+fn format_gib(bytes: f64) -> String {
+    format!("{:.1} GiB", bytes / COMPACTION_RECOMMENDED_BYTES)
+}
+
+/// `databaseReclaimMinutes`: the repair is offline about half a minute per GiB of live data.
+fn reclaim_minutes(status: &Value) -> u64 {
+    const GIB: u64 = 1 << 30;
+    let bytes = |key: &str| status[key].as_u64().unwrap_or(0);
+    bytes("databaseBytes").saturating_sub(bytes("reclaimableBytes")).div_ceil(2 * GIB).max(1)
+}
+
+/// Why `server.reclaimDatabaseSpace` refused: a `DatabaseReclaimError` carries it as its `reason`.
+fn reclaim_error(error: &RpcError) -> String {
+    match error {
+        RpcError::Failure(failure) => failure["reason"].as_str().map_or_else(|| error.message(), str::to_owned),
+        _ => error.message(),
+    }
+}
+
+/// One machine's Reclaim, captured when its row rendered.
+#[derive(Clone)]
+struct Reclaim {
+    workspace: WeakEntity<Workspace>,
+    state: WeakEntity<StorageState>,
+    id: String,
+    label: SharedString,
+    client: RpcClient,
+    amount: String,
+    minutes: u64,
+}
+
+/// The `AlertDialog` before `server.reclaimDatabaseSpace`, which restarts the server.
+fn confirm_reclaim(request: Reclaim, window: &mut Window, cx: &mut App) {
+    window.open_alert_dialog(cx, move |dialog, _, _| {
+        let Reclaim { label, amount, minutes, .. } = &request;
+        let description = format!(
+            "T3 Code on {label} stops, rebuilds its database, and starts again. It is offline for about {minutes} min. Running agents stop when it restarts."
+        );
+        let request = request.clone();
+        dialog
+            .title(format!("Reclaim {amount} on {label}?"))
+            .description(description)
+            .show_cancel(true)
+            .ok_text("Restart and reclaim")
+            .on_ok(move |_, window, cx| {
+                start_reclaim(request.clone(), window, cx);
+                true
+            })
+    });
+}
+
+/// Sends the reclaim once per machine; the row waits for the restart unless it is refused.
+fn start_reclaim(request: Reclaim, window: &mut Window, cx: &mut App) {
+    let Reclaim { workspace, state, id, label, client, amount, minutes } = request;
+    // The grant can change on a reconnect while the dialog is open.
+    let allowed = workspace.upgrade().is_some_and(|w| w.read(cx).environment_grants(&id, ENVIRONMENT_MAINTAIN));
+    let started = state.update(cx, |state, cx| {
+        let Some(machine) = state.machines.iter_mut().find(|m| m.id == id && m.client.same_socket(&client)) else {
+            return false;
+        };
+        if !allowed || machine.reclaim_requested {
+            return false;
+        }
+        machine.reclaim_requested = true;
+        cx.notify();
+        true
+    });
+    if !matches!(started, Ok(true)) {
+        return;
+    }
+    window
+        .spawn(cx, async move |cx| {
+            let result = client.request("server.reclaimDatabaseSpace", json!({})).await;
+            let _ = cx.update(|window, cx| match result {
+                Ok(_) => window.push_notification(
+                    Notification::success(format!("T3 Code there restarts and is back in about {minutes} min."))
+                        .title(format!("Reclaiming {amount} on {label}")),
+                    cx,
+                ),
+                Err(error) => {
+                    let _ = state.update(cx, |state, cx| {
+                        if let Some(machine) = state.machines.iter_mut().find(|m| m.id == id) {
+                            machine.reclaim_requested = false;
+                            cx.notify();
+                        }
+                    });
+                    notify_error(window, cx, format!("Could not reclaim space on {label}"), reclaim_error(&error));
+                }
+            });
+        })
+        .detach();
 }
 
 /// A machine's line under Delete now.
@@ -411,71 +625,6 @@ fn last_run_summary(entries: &[(&str, String)], machine_count: usize) -> String 
         return format!("{first} on every machine");
     }
     entries.iter().map(|(label, counts)| format!("{label}: {counts}")).collect::<Vec<_>>().join(" · ")
-}
-
-/// `DatabaseStorageNotice`: suggests `t3 doctor` on each machine whose database holds a GiB or
-/// more of freed pages.
-fn render_database_notice(state: &Entity<StorageState>, t: &Tokens, cx: &App) -> Option<AnyElement> {
-    let storage = state.read(cx);
-    let visible: Vec<(usize, &Machine, &Value)> = storage
-        .machines
-        .iter()
-        .enumerate()
-        .filter(|(_, machine)| !machine.database_dismissed)
-        .filter_map(|(index, machine)| {
-            let status = machine.database.as_ref()?;
-            let reclaimable = status["reclaimableBytes"].as_f64().unwrap_or(0.);
-            let recommended = status["incrementalVacuumEnabled"] != true && reclaimable >= COMPACTION_RECOMMENDED_BYTES;
-            recommended.then_some((index, machine, status))
-        })
-        .collect();
-    if visible.is_empty() {
-        return None;
-    }
-    let mut rows = vec![
-        RowFrame::new("Reclaim freed database space")
-            .description(text(
-                "These databases still hold space freed by history cleanup. Run the command on each machine to reclaim it. It restarts the background service. Quit the desktop app first if it hosts the environment.",
-            ))
-            .render(t)
-            .into_any_element(),
-    ];
-    for (index, machine, status) in visible {
-        let reclaimable = status["reclaimableBytes"].as_f64().unwrap_or(0.);
-        let command = status["compactCommand"].as_str().unwrap_or_default().to_owned();
-        let dismiss = state.downgrade();
-        let copied = command.clone();
-        let controls = h_flex()
-            .flex_wrap()
-            .gap_1p5()
-            .child(
-                Button::new(SharedString::from(format!("database-copy-{index}")))
-                    .outline()
-                    .xsmall()
-                    .label("Copy command")
-                    .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()))),
-            )
-            .child(
-                Button::new(SharedString::from(format!("database-dismiss-{index}")))
-                    .ghost()
-                    .xsmall()
-                    .label("Dismiss")
-                    .on_click(move |_, _, cx| {
-                        let _ = dismiss.update(cx, |state, cx| {
-                            state.machines[index].database_dismissed = true;
-                            cx.notify();
-                        });
-                    }),
-            );
-        rows.push(
-            RowFrame::new(format!("{:.1} GiB on {}", reclaimable / COMPACTION_RECOMMENDED_BYTES, machine.label))
-                .description(div().font_family(t.fonts.mono).child(command))
-                .control(controls)
-                .render(t)
-                .into_any_element(),
-        );
-    }
-    Some(settings_section("database", "Database", rows, t))
 }
 
 /// `server.runStorageCleanup` on each target at once; failures come back as toasts, as the web
@@ -625,6 +774,21 @@ mod tests {
         assert!(has_rules(&project));
         project["projectSettingsOverrides"]["p"]["worktreeCleanup"]["mode"] = json!("off");
         assert!(!has_rules(&project), "only custom project rules count");
+    }
+
+    #[test]
+    fn reclaim_takes_half_a_minute_per_live_gib_and_reports_the_server_reason() {
+        let gib = 1u64 << 30;
+        let status =
+            |database: u64, reclaimable: u64| json!({"databaseBytes": database, "reclaimableBytes": reclaimable});
+        assert_eq!(reclaim_minutes(&status(3 * gib, 3 * gib)), 1, "at least a minute");
+        assert_eq!(reclaim_minutes(&status(6 * gib, 2 * gib)), 2);
+        assert_eq!(reclaim_minutes(&status(6 * gib + 1, 2 * gib)), 3);
+        assert_eq!(format_gib(1.5 * COMPACTION_RECOMMENDED_BYTES), "1.5 GiB");
+        let refused = RpcError::Failure(json!({"_tag": "DatabaseReclaimError", "reason": "Needs 2.0 GiB free."}));
+        assert_eq!(reclaim_error(&refused), "Needs 2.0 GiB free.");
+        let denied = RpcError::Failure(json!({"_tag": "EnvironmentAuthorizationError", "message": "Not allowed."}));
+        assert_eq!(reclaim_error(&denied), "Not allowed.");
     }
 
     #[test]
