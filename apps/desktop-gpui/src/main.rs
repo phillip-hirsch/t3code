@@ -43,7 +43,6 @@ mod secure_storage;
 mod settings;
 mod snap_shot;
 mod terminal_text;
-mod tex;
 mod theme;
 mod theme_color;
 mod theme_file;

@@ -308,9 +308,13 @@ fn markdown_with(
         (state, source, wrap, workspace.markdown_images.clone(), math, chips)
     }) {
         Ok((state, source, wrap, images, math, chips)) => {
-            markdown_view(&state, &source, kind, key_for_view, wrap, width, this, chips, t)
+            markdown_view(&state, &source, kind, key_for_view.clone(), wrap, width, math, this, chips, t)
                 .image_source(images.resolver())
-                .when(math, |view| view.plugin(super::markdown_ui::InlineMath).plugin(super::markdown_ui::DisplayMath))
+                .when(math, |view| {
+                    let key = key_for_view;
+                    view.plugin(super::markdown_ui::InlineMath { workspace: this.clone(), key: key.clone() })
+                        .plugin(super::markdown_ui::DisplayMath { workspace: this.clone(), key })
+                })
                 .into_any_element()
         }
         Err(_) => div().into_any_element(),
@@ -1846,6 +1850,7 @@ fn markdown_view(
     key: SharedString,
     wrap: bool,
     width: Option<f32>,
+    math: bool,
     this: &WeakEntity<Workspace>,
     (cwd, kinds): (Option<String>, Arc<super::markdown_ui::EntryKinds>),
     t: &Tokens,
@@ -1894,7 +1899,18 @@ fn markdown_view(
             )
         })
         // `MarkdownMermaidCodeBlock`: a closed Mermaid fence draws its diagram.
+        // A `math` fence is display math once it closes (`MarkdownMath`), when Render math is on.
         .code_block_renderer(move |block, window, cx| {
+            if math && block.lang().as_deref() == Some("math") {
+                let span = block.span.as_ref()?;
+                let closed = !streaming
+                    || diagram_source
+                        .get(span.start..span.end)
+                        .is_some_and(|fence| super::mermaid::fence_closed(fence, &block.code()));
+                return closed.then(|| {
+                    super::math::display_formula(&diagram_this, &diagram_key, &block.code(), span.start, window, cx)
+                });
+            }
             let fence = mermaid_fence(block, &diagram_source, streaming).filter(|fence| !fence.open)?;
             let code = block.code();
             if code.trim().is_empty() {

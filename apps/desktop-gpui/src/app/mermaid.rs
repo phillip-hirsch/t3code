@@ -1,7 +1,8 @@
 //! Mermaid diagrams as images (`MermaidDiagram`). One hidden WebView per window runs the
 //! bundled pele renderer and hands back each diagram as a standalone SVG, its colours and fonts
 //! written out so GPUI's SVG renderer draws it as the browser would. Results are cached by
-//! source and theme, so the chat and the file panel never hold a WebView per diagram.
+//! source and theme, so the chat and the file panel never hold a WebView per diagram. The
+//! same page typesets TeX formulas (`super::math`).
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -42,7 +43,8 @@ const LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// The page may run only its own scripts and load nothing else.
 const PAGE: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" \
 content=\"default-src 'none'; script-src 'self'; style-src 'unsafe-inline'\"></head>\
-<body><div id=\"d\" class=\"pele\"></div><script src=\"/pele.js\"></script><script src=\"/render.js\"></script></body></html>";
+<body><div id=\"d\" class=\"pele\"></div><script src=\"/pele.js\"></script><script src=\"/render.js\"></script>\
+<script src=\"/math.js\"></script></body></html>";
 
 /// `window.t3Render(id, source, colours, refuse)`: renders with links and images off, removes
 /// what the web's sanitizer forbids (links, images, `foreignObject`, styles, `href`s, handlers),
@@ -223,6 +225,16 @@ enum Message {
     Refused {
         id: u64,
     },
+    /// A formula typeset by `window.t3Math`.
+    Typeset {
+        id: u64,
+        svg: String,
+        metrics: super::math::Metrics,
+    },
+    /// A formula that does not parse, or the typesetter that did not load.
+    Untypeset {
+        id: u64,
+    },
 }
 
 fn message(body: &str) -> Option<Message> {
@@ -247,6 +259,20 @@ fn message(body: &str) -> Option<Message> {
             message: value["message"].as_str().filter(|m| !m.is_empty()).unwrap_or(RENDER_FAILED).to_owned(),
         }),
         "refused" => Some(Message::Refused { id: id()? }),
+        "typeset" => {
+            let id = id()?;
+            #[expect(clippy::cast_possible_truncation, reason = "formula lengths are a few em")]
+            let ascent = value["ascent"].as_f64().map(|v| v as f32).filter(|v| v.is_finite());
+            match (value["svg"].as_str(), side("width"), side("height"), ascent) {
+                (Some(svg), Some(width), Some(height), Some(ascent)) => Some(Message::Typeset {
+                    id,
+                    svg: svg.to_owned(),
+                    metrics: super::math::Metrics { width, height, ascent },
+                }),
+                _ => Some(Message::Untypeset { id }),
+            }
+        }
+        "untypeset" => Some(Message::Untypeset { id: id()? }),
         _ => None,
     }
 }
@@ -412,13 +438,18 @@ impl Workspace {
             diagrams.cache.retain(|_, diagram| matches!(diagram, Diagram::Pending));
         }
         diagrams.cache.insert(id, Diagram::Pending);
-        let call = render_call(id, source, palette, refuse);
-        match diagrams.renderer.phase {
+        self.render_in_page(id, render_call(id, source, palette, refuse), window, cx);
+    }
+
+    /// Runs `call`, which answers for `id`, in the renderer page, starting the page if needed.
+    pub(super) fn render_in_page(&mut self, id: u64, call: String, window: &mut Window, cx: &mut Context<Self>) {
+        let renderer = &mut self.diagrams.renderer;
+        match renderer.phase {
             Phase::Loaded => self.evaluate_render(id, &call, cx),
             Phase::Failed => {}
-            Phase::Starting => diagrams.renderer.queue.push((id, call)),
+            Phase::Starting => renderer.queue.push((id, call)),
             Phase::Idle => {
-                diagrams.renderer.queue.push((id, call));
+                renderer.queue.push((id, call));
                 self.start_diagram_renderer(window, cx);
             }
         }
@@ -428,7 +459,8 @@ impl Workspace {
         let Some(view) = &self.diagrams.renderer.view else { return };
         if let Err(error) = view.raw().evaluate_script(call) {
             log::warn!("mermaid: {error}");
-            let keys = self.diagrams.settle(id, Diagram::Failed(RENDER_FAILED.into()));
+            let mut keys = self.diagrams.settle(id, Diagram::Failed(RENDER_FAILED.into()));
+            keys.extend(self.formulas.settle(id, None));
             self.diagram_landed(&keys, cx);
         }
     }
@@ -442,6 +474,8 @@ impl Workspace {
                 let (body, content_type): (&'static [u8], &str) = match request.uri().path() {
                     "/pele.js" => (pele_script(), "text/javascript"),
                     "/render.js" => (RENDER_SCRIPT.as_bytes(), "text/javascript"),
+                    "/math.js" => (super::math::MATH_SCRIPT.as_bytes(), "text/javascript"),
+                    "/mathjax.js" => (super::math::mathjax_script(), "text/javascript"),
                     _ => (PAGE.as_bytes(), "text/html"),
                 };
                 wry::http::Response::builder()
@@ -489,6 +523,8 @@ impl Workspace {
         renderer.phase = Phase::Failed;
         renderer.view = None;
         renderer.queue.clear();
+        // Formulas keep showing their source, as the web's do when KaTeX fails to load.
+        self.formulas.abandon();
         let keys: Vec<SharedString> = self.diagrams.waiting.drain().flat_map(|(_, keys)| keys).collect();
         self.diagram_landed(&keys, cx);
     }
@@ -513,6 +549,16 @@ impl Workspace {
             }
             Message::Failed { id, message } => (id, Diagram::Failed(message.into())),
             Message::Refused { id } => (id, Diagram::Refused),
+            Message::Typeset { id, svg, metrics } => {
+                let keys = self.formulas.settle(id, Some(super::math::Typeset::new(svg, metrics)));
+                self.diagram_landed(&keys, cx);
+                return;
+            }
+            Message::Untypeset { id } => {
+                let keys = self.formulas.settle(id, None);
+                self.diagram_landed(&keys, cx);
+                return;
+            }
         };
         let keys = self.diagrams.settle(id, diagram);
         self.diagram_landed(&keys, cx);
@@ -530,6 +576,7 @@ impl Workspace {
     pub(super) fn retry_diagrams(&mut self, cx: &mut Context<Self>) {
         self.diagrams.renderer = Renderer::default();
         self.diagrams.cache.retain(|_, diagram| !matches!(diagram, Diagram::Pending));
+        self.formulas.abandon();
         cx.notify();
     }
 
@@ -771,6 +818,21 @@ mod tests {
             Some(Message::Failed { id: 10, message: RENDER_FAILED.into() })
         );
         assert_eq!(message(r#"{"type":"refused","id":"2"}"#), Some(Message::Refused { id: 2 }));
+        assert_eq!(
+            message(r#"{"type":"typeset","id":"b","svg":"<svg/>","width":1.5,"height":1.2,"ascent":-0.1}"#),
+            Some(Message::Typeset {
+                id: 11,
+                svg: "<svg/>".into(),
+                metrics: crate::app::math::Metrics { width: 1.5, height: 1.2, ascent: -0.1 },
+            }),
+            "a formula can sit wholly below the baseline"
+        );
+        assert_eq!(
+            message(r#"{"type":"typeset","id":"b","svg":"<svg/>","width":1.5,"height":1.2}"#),
+            Some(Message::Untypeset { id: 11 }),
+            "a formula without a baseline cannot be placed"
+        );
+        assert_eq!(message(r#"{"type":"untypeset","id":"c"}"#), Some(Message::Untypeset { id: 12 }));
         assert_eq!(message(r#"{"type":"rendered","id":42}"#), None, "ids travel as hex strings");
         assert_eq!(message("nope"), None);
     }

@@ -59,6 +59,7 @@ mod layout;
 pub mod main_window;
 mod markdown_images;
 mod markdown_ui;
+mod math;
 pub mod menu;
 mod mermaid;
 mod message_actions;
@@ -342,6 +343,7 @@ pub struct Workspace {
     markdown_images: markdown_images::ImageCache,
     image_viewer: image_viewer::ViewerUi,
     diagrams: mermaid::Diagrams,
+    formulas: math::Formulas,
     entry_kinds: Arc<markdown_ui::EntryKinds>,
     workflow: workflow::WorkflowUi,
     setup: worktree_setup::SetupWatch,
@@ -535,6 +537,7 @@ impl Workspace {
             markdown_images: Default::default(),
             image_viewer: Default::default(),
             diagrams: Default::default(),
+            formulas: Default::default(),
             entry_kinds: Default::default(),
             workflow: Default::default(),
             setup: Default::default(),
