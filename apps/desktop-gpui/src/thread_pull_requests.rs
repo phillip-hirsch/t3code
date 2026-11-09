@@ -270,6 +270,11 @@ fn project_change_request_url(identity: &crate::model::RepositoryIdentity, numbe
         .clone()
         .or_else(|| Some(format!("{}/{}", identity.owner.as_ref()?, identity.name.as_ref()?)))?;
     let (route, repository) = match identity.provider.as_deref()? {
+        // Origin's pages live on cursor.com whatever the remote names.
+        "cursor-origin" => {
+            let base = crate::pull_request_detail::CURSOR_ORIGIN_WEB_BASE_URL;
+            return Some(format!("{base}/{repository}/pull/{number}"));
+        }
         "github" => ("pull", repository),
         "gitlab" => ("-/merge_requests", repository),
         "forgejo" | "gitcafe" => ("pulls", repository),
@@ -283,13 +288,25 @@ fn project_change_request_url(identity: &crate::model::RepositoryIdentity, numbe
     })
 }
 
-/// `parsePullRequestReference`'s checkout commands: `gh pr checkout 12`, `glab mr checkout 12`.
+/// `parsePullRequestReference`'s checkout commands, in any case: `gh pr checkout 12`,
+/// `glab mr checkout 12`, `origin pr checkout 12`.
 fn checkout_argument(input: &str) -> Option<&str> {
-    let words: Vec<&str> = input.split_whitespace().collect();
-    match words.as_slice() {
-        ["gh", "pr", "checkout", argument] | ["glab", "mr", "checkout", argument] => Some(argument),
-        _ => None,
-    }
+    const COMMANDS: [[&str; 3]; 3] =
+        [["gh", "pr", "checkout"], ["glab", "mr", "checkout"], ["origin", "pr", "checkout"]];
+    COMMANDS.iter().find_map(|command| {
+        let mut rest = input;
+        for word in command {
+            let head = rest.get(..word.len()).filter(|head| head.eq_ignore_ascii_case(word))?;
+            rest = &rest[head.len()..];
+            let after = rest.trim_start();
+            if after.len() == rest.len() {
+                return None;
+            }
+            rest = after;
+        }
+        let argument = rest.trim_end();
+        (!argument.is_empty()).then_some(argument)
+    })
 }
 
 /// `resolveLinkPullRequestInput`: a change request URL, or `123` / `#123` in the thread's own
@@ -511,6 +528,27 @@ mod tests {
         let pull = Some(Ok(("github.com".into(), "acme/app".into(), 42, "https://github.com/acme/app/pull/42".into())));
         assert_eq!(resolved(" #42 ", Some(&identity)), pull);
         assert_eq!(resolved("gh pr checkout 42", Some(&identity)), pull);
+        assert_eq!(resolved("GH  PR checkout #42", Some(&identity)), pull, "any case and spacing");
+        assert_eq!(resolved("gh pr checkout", Some(&identity)), None);
+        assert_eq!(resolved("ghpr checkout 42", Some(&identity)), None);
+        let origin: crate::model::RepositoryIdentity = serde_json::from_value(json!({
+            "canonicalKey": "origin.cursor.com/Acme/Web", "displayName": "Acme/Web", "provider": "cursor-origin",
+            "webUrl": "https://origin.cursor.com/Acme/Web",
+        }))
+        .unwrap();
+        let origin_pull = Some(Ok((
+            "origin.cursor.com".into(),
+            "acme/web".into(),
+            7,
+            "https://cursor.com/codebase/Acme/Web/pull/7".into(),
+        )));
+        assert_eq!(resolved("7", Some(&origin)), origin_pull, "a number opens on cursor.com, not the git host");
+        assert_eq!(resolved("origin pr checkout 7", Some(&origin)), origin_pull);
+        assert_eq!(
+            resolved("origin pr checkout https://cursor.com/codebase/Acme/Web/pull/7", None),
+            origin_pull,
+            "a pasted Origin URL needs no project"
+        );
         assert!(matches!(resolved("42", None), Some(Err(e)) if e.starts_with("Paste the full pull request URL")));
         let unknown: crate::model::RepositoryIdentity =
             serde_json::from_value(json!({"canonicalKey": "git.example.com/a/b", "displayName": "a/b"})).unwrap();
