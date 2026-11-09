@@ -774,7 +774,7 @@ impl MarkdownPlugin for FileChips {
             .cursor_pointer()
             .child(icon.size(px(14.)).flex_none())
             .child(div().min_w_0().truncate().hover(gpui_kit::Styled::underline).child(chip.label.clone()))
-            .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx))
+            .tooltip(move |window, cx| code_tooltip(tooltip.clone(), window, cx))
             .on_click(move |event, window, cx| {
                 let editor = event.modifiers().secondary(cx);
                 let _ = open.update(cx, |w, cx| w.open_file_chip(&path, line, editor, window, cx));
@@ -794,6 +794,21 @@ impl MarkdownPlugin for FileChips {
         // The link's text flows before the chip as plain prose; only the chip opens the file.
         if chip.after_text { element.ml(px(4.)).into_any_element() } else { element.into_any_element() }
     }
+}
+
+/// `TooltipPopup variant="code"`: monospace 11px, relaxed leading, wrapping anywhere within
+/// `max-w-120` (480px, less the popup's `px-2` and border), so a long path keeps its file name.
+fn code_tooltip(text: SharedString, window: &mut Window, cx: &mut App) -> gpui_kit::AnyView {
+    let mono = crate::theme::tokens(cx).fonts.mono;
+    gpui_kit::component::tooltip::Tooltip::element(move |_, _| {
+        v_flex()
+            .max_w(px(480. - 18.))
+            .font_family(mono)
+            .text_size(px(11.))
+            .line_height(gpui_kit::relative(1.625))
+            .child(text.clone())
+    })
+    .build(window, cx)
 }
 
 impl Workspace {
