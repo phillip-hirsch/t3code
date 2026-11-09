@@ -22,7 +22,7 @@ pub(super) const CAPTURE_CONTEXT: &str = "KeybindingCapture";
 /// The browser surface and its chrome (`[data-preview-panel-mode]`).
 pub(super) const PREVIEW_CONTEXT: &str = "PreviewPanel";
 const TERMINAL_CONTEXT: &str = "Terminal";
-const INPUT_CONTEXT: &str = "Input";
+pub(super) const INPUT_CONTEXT: &str = "Input";
 /// An open combobox: the palette or a project picker (`[role="combobox"][aria-expanded="true"]`).
 pub(super) const COMBOBOX_CONTEXT: &str = "Combobox";
 pub(super) const MAC: bool = cfg!(target_os = "macos");

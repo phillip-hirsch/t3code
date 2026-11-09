@@ -1599,6 +1599,37 @@ pub fn readable_failure(message: &str, hint: &str) -> String {
     }
 }
 
+/// The success toast's title for an action (`actionSuccessLabels`).
+pub fn action_success(action: &str, term: &str) -> String {
+    match action {
+        "merge" => "Merge requested".into(),
+        "ready" => "Marked ready for review".into(),
+        "draft" => "Converted to draft".into(),
+        "close" => format!("{} closed", capitalize(term)),
+        "reopen" => format!("{} reopened", capitalize(term)),
+        "update-branch" => "Branch updated with the base branch".into(),
+        "enable-auto-merge" => "Auto-merge enabled".into(),
+        "disable-auto-merge" => "Auto-merge disabled".into(),
+        "revert" => format!("Revert {term} opened"),
+        "delete-branch" => "Branch deleted".into(),
+        "approve-workflows" => "Workflows approved".into(),
+        _ => "Done".into(),
+    }
+}
+
+/// A list row's quick merge (`runAction` with `resolveMergeMethod`): the method to send, from the
+/// detail read just before it, or why it cannot merge. A stack merges from its panel instead.
+pub fn quick_merge_method(detail: &Detail, project_default: Option<&str>, last: &str) -> Result<&'static str, String> {
+    if detail.state != State::Open || detail.is_draft || !can(detail, "merge") {
+        return Err("This pull request cannot be merged.".into());
+    }
+    let allowed = allowed_merge_methods(detail);
+    if allowed.is_empty() {
+        return Err("No merge method is available for this repository.".into());
+    }
+    Ok(resolve_merge_method(&allowed, None, project_default, last))
+}
+
 /// The failure toast's title and hint for an action (`actionFailureLabels`, `actionFailureHints`).
 pub fn action_failure(action: &str, term: &str) -> (String, String) {
     let write = "The host refused it. Check that you have write access to this repository.";
@@ -2311,6 +2342,22 @@ mod tests {
         assert_eq!(resolve_merge_method(&allowed, Some("rebase"), Some("rebase"), "squash"), "squash");
         assert_eq!(resolve_merge_method(&allowed, None, None, "rebase"), "merge", "falls back to the first allowed");
         assert_eq!(resolve_merge_method(&[], None, None, "squash"), "merge");
+    }
+
+    #[test]
+    fn a_quick_merge_checks_the_fresh_detail_before_choosing_a_method() {
+        assert_eq!(quick_merge_method(&detail(json!({})), Some("squash"), "merge"), Ok("squash"));
+        assert_eq!(quick_merge_method(&detail(json!({})), Some("rebase"), "squash"), Ok("squash"), "rebase is off");
+        let refused = Err("This pull request cannot be merged.".to_owned());
+        assert_eq!(quick_merge_method(&detail(json!({"isDraft": true})), None, "merge"), refused);
+        assert_eq!(quick_merge_method(&detail(json!({"state": "closed"})), None, "merge"), refused);
+        let viewer = json!({"viewerPermissions": {"actions": ["close"]}});
+        assert_eq!(quick_merge_method(&detail(viewer), None, "merge"), refused, "the viewer may not merge");
+        let none = json!({"mergeCapabilities": {"merge": false, "squash": false, "rebase": false}});
+        assert_eq!(
+            quick_merge_method(&detail(none), None, "merge"),
+            Err("No merge method is available for this repository.".to_owned())
+        );
     }
 
     #[test]

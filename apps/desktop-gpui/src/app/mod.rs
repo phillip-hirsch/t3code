@@ -1297,9 +1297,10 @@ impl Render for Workspace {
                 this.held_key = None;
                 this.quit_key_up(event, cx);
             }))
-            .on_modifiers_changed(cx.listener(|this, event: &gpui_kit::ModifiersChangedEvent, _, cx| {
+            .on_modifiers_changed(cx.listener(|this, event: &gpui_kit::ModifiersChangedEvent, window, cx| {
                 this.snap_shot_record_modifiers(event, cx);
                 this.quit_modifiers_changed(event, cx);
+                this.pull_request_modifiers_changed(event, window, cx);
             }))
             .child(
                 h_flex()

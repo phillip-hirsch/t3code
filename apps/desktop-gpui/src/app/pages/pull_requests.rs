@@ -5,6 +5,7 @@
 
 pub(super) mod facets;
 mod row_popovers;
+mod speed_actions;
 use facets::FacetKind;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -78,6 +79,10 @@ enum Row {
         stat: Option<(u64, u64)>,
         elsewhere: bool,
         first: bool,
+        /// Its display group, which a close sweep stays within.
+        group: usize,
+        /// The Shift quick actions its state and host offer.
+        quick: Rc<[&'static str]>,
     },
     /// The read failed but earlier rows are still shown.
     Stale(SharedString),
@@ -164,6 +169,8 @@ pub(in crate::app) struct PullRequestsState {
     /// The right-click menu on one of the panel's tabs, where it opened.
     pub(super) tab_menu:
         Option<(Entity<gpui_kit::component::menu::PopupMenu>, gpui_kit::Point<gpui_kit::Pixels>, Subscription)>,
+    /// Shift's quick actions on rows and the close sweep.
+    speed: speed_actions::SpeedActions,
 }
 
 impl PullRequestsState {
@@ -225,6 +232,7 @@ impl PullRequestsState {
             row_popover: None,
             tab_menu: None,
             tab_focus: std::collections::HashMap::new(),
+            speed: speed_actions::SpeedActions::default(),
         }
     }
 
@@ -280,6 +288,8 @@ impl PullRequestsState {
 impl Workspace {
     /// Reads the list the first time the page opens; later opens show what was read.
     pub(in crate::app) fn pull_requests_opened(&mut self, cx: &mut Context<Self>) {
+        // The page was away for a press's release or a Shift's.
+        self.pull_requests.speed.reset();
         if self.pull_requests.list.is_none() && !self.pull_requests.loading {
             self.read_pull_requests(false, cx);
         } else if std::mem::take(&mut self.pull_requests.stale) {
@@ -290,6 +300,7 @@ impl Workspace {
 
     /// Changes what the list asks for and reads it again from the first page.
     fn set_pull_request_scope(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut PullRequestsState)) {
+        self.cancel_close_sweep(cx);
         change(&mut self.pull_requests);
         self.pull_requests.page_size = PAGE_SIZE;
         self.read_pull_requests(false, cx);
@@ -747,6 +758,7 @@ impl Workspace {
                 answered_locally: state.typed == state.sent && !state.loading,
                 partitions: partitions.map(|p| logic::PartitionRows { authored: &p.authored, reviewing: &p.reviewing }),
             };
+            let host_actions = |entry: &Entry| logic::host_actions(&list.providers, entry);
             for (index, group) in logic::display_groups(list, &view, &state.stats).into_iter().enumerate() {
                 if !group.label.is_empty() {
                     rows.push(Row::Header {
@@ -771,6 +783,8 @@ impl Workspace {
                         stat: logic::diff_stat(&entry, &state.stats),
                         elsewhere: logic::matched_elsewhere(&entry, &text),
                         first: position == 0 && (index == 0 || !group.label.is_empty()),
+                        group: index,
+                        quick: Rc::from(logic::quick_actions(&entry, &host_actions(&entry))),
                         entry,
                     });
                 }
@@ -839,7 +853,8 @@ impl Workspace {
                 &tokens,
                 cx,
             )))
-            .child(div().flex_1().min_h_0().child(body));
+            .child(div().flex_1().min_h_0().child(body))
+            .children(self.close_sweep_tracker(cx));
         if !self.pull_request_panel_shown() {
             return column.into_any_element();
         }
@@ -908,6 +923,7 @@ impl Workspace {
             .child("Sort")
             .dropdown_menu(radio_menu(SORTS, sort, sort_icon, view.clone(), |this, value, cx| {
                 this.pull_requests.sort = value;
+                this.cancel_close_sweep(cx);
                 this.rebuild_pull_request_rows(cx);
                 cx.notify();
             }));
@@ -1289,15 +1305,16 @@ impl Workspace {
         list(self.pull_requests.list_state.clone(), move |index, window, cx| {
             let content = match &rows[index] {
                 Row::Header { key, label, count, first } => group_header(key, label, *count, *first, &t),
-                Row::Entry { entry, focus, stat, elsewhere, first } => {
+                Row::Entry { entry, focus, stat, elsewhere, first, quick, .. } => {
                     let selected = selected.as_ref().is_some_and(|r| *r == reference_of(entry));
                     let origin = RowOrigin {
                         show_provider,
                         environment: environment_labels.get(&entry.environment_id).cloned(),
                     };
+                    let speed = view.read(cx).row_speed(entry, quick, focus, window, cx);
                     pull_request_row(
-                        entry, focus, *stat, *elsewhere, *first, selected, &origin, meta_width, now, &view, &t, window,
-                        cx,
+                        entry, focus, *stat, *elsewhere, *first, selected, &origin, &speed, meta_width, now, &view, &t,
+                        window, cx,
                     )
                 }
                 Row::Stale(error) => stale_banner(error.clone(), &view, &t, window),
@@ -1715,6 +1732,7 @@ fn pull_request_row(
     first: bool,
     selected: bool,
     origin: &RowOrigin,
+    speed: &speed_actions::RowSpeed,
     meta_width: f32,
     now: i64,
     view: &Entity<Workspace>,
@@ -1886,13 +1904,18 @@ fn pull_request_row(
         .id(ElementId::Name(id("row").into()))
         .track_focus(focus)
         .when_some(ring, gpui_kit::Styled::shadow)
-        .on_key_down(window.listener_for(view, move |this, event: &gpui_kit::KeyDownEvent, _, cx| {
-            let key = event.keystroke.key.as_str();
-            if matches!(key, "enter" | "space") && !event.keystroke.modifiers.modified() {
-                cx.stop_propagation();
-                this.open_pull_request_panel(reference_of(&pressed), Some(pressed.clone()), cx);
-            }
-        }))
+        .on_key_down({
+            let focus = focus.clone();
+            window.listener_for(view, move |this, event: &gpui_kit::KeyDownEvent, window, cx| {
+                let key = event.keystroke.key.as_str();
+                // A quick action inside the row takes its own Enter and Space.
+                if matches!(key, "enter" | "space") && !event.keystroke.modifiers.modified() && focus.is_focused(window)
+                {
+                    cx.stop_propagation();
+                    this.open_pull_request_panel(reference_of(&pressed), Some(pressed.clone()), cx);
+                }
+            })
+        })
         .on_hover(window.listener_for(view, move |this, resting: &bool, _, cx| {
             // `onPointerLeave` keeps the intent of a row that still has focus.
             if *resting || !focused {
@@ -1928,6 +1951,7 @@ fn pull_request_row(
                 }),
         )
         .child(v_flex().flex_1().min_w_0().child(title_line).child(meta_line))
+        .children(speed_actions::speed_group(entry, speed, view, t, window))
         .on_click({
             let focus = focus.clone();
             window.listener_for(view, move |this, _, window, cx| {

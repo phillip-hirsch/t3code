@@ -294,11 +294,16 @@ fn is_not_found(error: &RpcError) -> bool {
     matches!(error, RpcError::Failure(value) if value["_tag"] == "PullRequestOperationError" && value["reason"] == "not-found")
 }
 
-fn toast_error(window: &mut Window, cx: &mut App, title: impl Into<SharedString>, message: impl Into<SharedString>) {
+pub(super) fn toast_error(
+    window: &mut Window,
+    cx: &mut App,
+    title: impl Into<SharedString>,
+    message: impl Into<SharedString>,
+) {
     window.push_notification(Notification::error(message).title(title), cx);
 }
 
-fn toast_success(window: &mut Window, cx: &mut App, title: impl Into<SharedString>) {
+pub(super) fn toast_success(window: &mut Window, cx: &mut App, title: impl Into<SharedString>) {
     window.push_notification(Notification::success("").title(title), cx);
 }
 
@@ -688,7 +693,13 @@ impl Workspace {
 
     /// Shows an action's reply in the panel and the list instead of reading them again; without
     /// one, as from an older server, both are read.
-    fn apply_pr_action_reply(&mut self, key: &str, reference: &Reference, reply: &Value, cx: &mut Context<Self>) {
+    pub(super) fn apply_pr_action_reply(
+        &mut self,
+        key: &str,
+        reference: &Reference,
+        reply: &Value,
+        cx: &mut Context<Self>,
+    ) {
         let Some(reply) = pull_request_reply::Reply::read(reply) else {
             self.read_pr_detail_of(key, cx);
             self.read_pull_requests(false, cx);
