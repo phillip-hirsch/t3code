@@ -610,6 +610,7 @@ impl Workspace {
         let ask_server = info.config.get("shellThreadFamilies").and_then(Value::as_bool) == Some(true);
         let has_runtime = Facts::new(thread, &std::collections::HashMap::new()).runtime_status().is_some();
         let project_root = removable.map(|p| p.workspace_root.clone());
+        let side_chats = self.listed_side_chats(&environment, thread_id);
         let thread_id = thread_id.to_owned();
         cx.spawn_in(window, async move |this, cx| {
             let mut orphan = orphan.filter(|_| !automatic);
@@ -654,6 +655,7 @@ impl Workspace {
                 if was_open {
                     this.land_after_delete(&thread_id, fallback, window, cx);
                 }
+                this.forget_deleted_thread(&environment, &thread_id, &side_chats, cx);
                 remove && this.env_grants(&environment, "source-control:write")
             });
             let (Some(path), Some(root), Ok(true)) = (orphan.filter(|_| remove), project_root, removing) else {

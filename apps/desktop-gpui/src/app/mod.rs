@@ -40,6 +40,7 @@ mod composer_meter;
 mod composer_plan;
 mod confirm;
 mod context_strip;
+mod deleted_thread;
 mod desktop;
 mod details;
 mod draft_picker;

@@ -230,6 +230,16 @@ impl Terminals {
         }));
     }
 
+    /// `clearTerminalUiState`: a deleted thread's drawer goes back to its default.
+    pub(super) fn forget_thread(&mut self, thread_id: &str, cx: &App) {
+        if self.drawers.remove(thread_id).is_some() {
+            self.drawers_changed = true;
+            self.persist(cx);
+        }
+        self.parked.retain(|(id, _)| id != thread_id);
+        self.focus_pending.take_if(|(id, _)| id == thread_id);
+    }
+
     /// The thread id the draft in `project_id` launches with, if its terminal drawer used one.
     pub(super) fn take_draft_thread(&mut self, project_id: &str) -> Option<String> {
         self.draft_threads.remove(project_id)

@@ -302,14 +302,18 @@ impl Workspace {
                 .iter()
                 .filter_map(|id| {
                     let command = Self::thread_command_value("thread.delete", id, json!({}));
-                    Some((id.clone(), this.thread_client(id)?, command))
+                    let environment = this.thread_environment(id)?;
+                    let (client, side_chats) =
+                        (this.env_client(&environment)?, this.listed_side_chats(&environment, id));
+                    Some((id.clone(), environment, side_chats, client, command))
                 })
                 .collect();
             cx.spawn(async move |this, cx| {
-                let (mut deleted, mut first_error) = (HashSet::new(), None);
-                for (id, client, command) in steps {
+                let (mut deleted, mut forget, mut first_error) = (HashSet::new(), Vec::new(), None);
+                for (id, environment, side_chats, client, command) in steps {
                     match client.request("orchestration.dispatchCommand", command).await {
                         Ok(_) => {
+                            forget.push((environment, id.clone(), side_chats));
                             deleted.insert(id);
                         }
                         Err(error) => {
@@ -318,6 +322,9 @@ impl Workspace {
                     }
                 }
                 let _ = this.update(cx, |this, cx| {
+                    for (environment, id, side_chats) in &forget {
+                        this.forget_deleted_thread(environment, id, side_chats, cx);
+                    }
                     if let Some(error) = first_error {
                         let message = super::actions::failure_message(Some("Failed to delete threads"), &error);
                         this.error = Some(message.into());

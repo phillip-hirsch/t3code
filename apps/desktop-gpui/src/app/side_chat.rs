@@ -63,6 +63,16 @@ impl SideChats {
         }
     }
 
+    /// Drops what this client keeps for a deleted side chat. A view still on screen goes without
+    /// saving its text, and the next sync shows the chat as deleted.
+    pub(super) fn forget(&mut self, thread_id: &str) {
+        self.drafts.remove(thread_id);
+        self.models.remove(thread_id);
+        if self.view.as_ref().is_some_and(|view| view.thread_id == thread_id) {
+            self.view = None;
+        }
+    }
+
     /// Releases the view on screen, keeping its unsent text for when it shows again.
     fn release_view(&mut self, cx: &App) {
         let Some(view) = self.view.take() else { return };
@@ -557,14 +567,14 @@ This permanently clears its conversation history."
             );
             super::confirm::confirm(&message, true, window, cx)
         });
-        let client = self.client();
+        let (client, environment) = (self.client(), self.active_environment().cloned());
         cx.spawn_in(window, async move |this, cx| {
             if let Some(answer) = answer
                 && answer.await != Ok(true)
             {
                 return;
             }
-            let Some(client) = client else { return };
+            let (Some(client), Some(environment)) = (client, environment) else { return };
             let _ = this.update(cx, |this, cx| {
                 this.side_chat.deleting = true;
                 cx.notify();
@@ -573,7 +583,11 @@ This permanently clears its conversation history."
             let _ = this.update_in(cx, |this, window, cx| {
                 this.side_chat.deleting = false;
                 match result {
-                    Ok(_) => this.close_side_chat_tab(&thread_id, window, cx),
+                    // Closing the tab keeps its unsent text, so the deleted chat's state goes after.
+                    Ok(_) => {
+                        this.close_side_chat_tab(&thread_id, window, cx);
+                        this.forget_deleted_thread(&environment, &thread_id, &[], cx);
+                    }
                     Err(error) => window.push_notification(
                         Notification::error(error.to_string()).title("Could not delete the side chat"),
                         cx,
