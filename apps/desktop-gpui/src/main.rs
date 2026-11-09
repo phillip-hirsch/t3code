@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod app;
+mod artifact_templates;
 mod assets;
 mod assistant_citations;
 mod backend;

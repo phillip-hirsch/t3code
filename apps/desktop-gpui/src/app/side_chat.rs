@@ -41,6 +41,13 @@ pub(super) struct SideChatView {
     _events: Vec<Subscription>,
 }
 
+impl SideChatView {
+    /// The composer, unless a message is being sent from it.
+    pub(super) fn ready_composer(&self) -> Option<&Entity<TextareaState>> {
+        (!self.sending).then_some(&self.composer)
+    }
+}
+
 #[derive(Default)]
 pub(super) struct SideChats {
     pub(super) view: Option<SideChatView>,

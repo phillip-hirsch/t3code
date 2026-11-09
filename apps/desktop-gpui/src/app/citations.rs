@@ -308,7 +308,7 @@ impl Workspace {
 
     /// The composer takes text: a target is open, no answer is being sent, and an open question
     /// takes a typed answer (`insertComposerText`).
-    fn composer_takes_citations(&self) -> bool {
+    pub(super) fn composer_takes_citations(&self) -> bool {
         self.target.is_some()
             && self.responding.is_none()
             && self

@@ -505,8 +505,13 @@ pub(super) fn assistant_meta(
             .text_color(t.muted_foreground)
             .child(status.to_owned())
     });
-    let copy = (!streaming && !text.trim().is_empty())
-        .then(|| copy_button(this, format!("copy:{id}").into(), text.clone(), "Copy message", IconName::Copy, t, cx));
+    // A template line copies as its card's text (`renderCodexDirectivesForCopy`).
+    let copy = (!streaming && !text.trim().is_empty()).then(|| {
+        let text = text.clone();
+        copy_button_with(this, format!("copy:{id}").into(), "Copy message", IconName::Copy, t, cx, move || {
+            Some(crate::artifact_templates::render_for_copy(&text))
+        })
+    });
     let fork = fork.map(|(thread, run)| {
         let (this, thread, run) = (this.clone(), thread.clone(), run.clone());
         icon_button(format!("fork:{id}").into(), Icon::new(IconName::GitFork), "Fork from this response", false, t)

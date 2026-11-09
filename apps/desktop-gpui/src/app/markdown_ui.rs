@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use super::Workspace;
+use crate::artifact_templates::{Kind as TemplateKind, Template};
 use crate::file_links;
 use crate::theme::Tokens;
 
@@ -1113,6 +1114,191 @@ pub(super) fn table_actions(
 
 /// `useCopyToClipboard({ timeout: 1200 })`.
 const TABLE_COPIED_FOR: std::time::Duration = std::time::Duration::from_millis(1200);
+
+/// `CodexArtifactTemplateCard`: a reply's `::artifact-template` line draws as a card with the
+/// template kind's artwork, its name and kind, and Use template, which drafts the template's
+/// prompt into the composer.
+pub(super) struct ArtifactTemplates {
+    pub workspace: WeakEntity<Workspace>,
+    /// The message the cards are in, which picks the composer Use template writes to.
+    pub key: SharedString,
+    /// Whether Use template shows (`onUseArtifactTemplate`): in replies, not in prompts.
+    pub usable: bool,
+}
+
+impl MarkdownPlugin for ArtifactTemplates {
+    fn is_block(&self) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "t3-artifact-template"
+    }
+
+    fn parse(
+        &self,
+        node: &gpui_kit::component::text::markdown_ast::Node,
+        cx: &MarkdownParseContext<'_>,
+    ) -> Option<MarkdownNode> {
+        let gpui_kit::component::text::markdown_ast::Node::Paragraph(_) = node else { return None };
+        let templates = crate::artifact_templates::parse_paragraph(cx.node_source(node)?)?;
+        let text = templates.iter().map(Template::copy_text).collect::<Vec<_>>().join("\n\n");
+        let label = templates.iter().map(|t| format!("{} template", t.display_name)).collect::<Vec<_>>().join(", ");
+        Some(
+            MarkdownNode::new("t3-artifact-template", templates)
+                .text(text.clone())
+                .markdown(text)
+                .accessibility_label(label),
+        )
+    }
+
+    fn render(&self, node: &MarkdownNode, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let t = crate::theme::tokens(cx);
+        let at = node.source_range().map_or(0, |range| range.start);
+        let templates = node.data::<Vec<Template>>().cloned().unwrap_or_default();
+        v_flex().w_full().min_w_0().gap(gpui_kit::rems(0.65)).children(templates.into_iter().enumerate().map(
+            |(ix, template)| {
+                let id = SharedString::from(format!("artifact-template:{}:{at}:{ix}", self.key));
+                artifact_template_card(id, template, self.usable.then(|| self.workspace.clone()), &self.key, t)
+            },
+        ))
+    }
+}
+
+/// `ARTIFACT_TEMPLATE_ICON_BY_KIND`.
+fn artifact_template_icon(kind: TemplateKind) -> IconName {
+    match kind {
+        TemplateKind::Document | TemplateKind::GoogleDocs => IconName::FileText,
+        TemplateKind::Presentation | TemplateKind::GoogleSlides => IconName::Presentation,
+        TemplateKind::Spreadsheet | TemplateKind::GoogleSheets => IconName::FileSpreadsheet,
+        TemplateKind::Site => IconName::Globe,
+        TemplateKind::Image => IconName::Image,
+        TemplateKind::Email => IconName::Mail,
+        TemplateKind::Slack => IconName::MessageSquare,
+    }
+}
+
+fn artifact_template_card(
+    id: SharedString,
+    template: Template,
+    workspace: Option<WeakEntity<Workspace>>,
+    key: &SharedString,
+    t: &Tokens,
+) -> AnyElement {
+    let shadow = vec![gpui_kit::BoxShadow::new(px(0.), px(1.), gpui_kit::hsla(0., 0., 0., 0.05)).blur_radius(px(2.))];
+    let artwork = div()
+        .relative()
+        .size(px(36.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(8.))
+        .border_1()
+        .border_color(Hsla { a: t.border.a * 0.7, ..t.border })
+        .bg(t.background)
+        .text_color(t.muted_foreground)
+        .shadow(shadow.clone())
+        .child(Icon::new(artifact_template_icon(template.kind)).size(px(20.)))
+        .child(
+            div()
+                .absolute()
+                .right(px(-4.))
+                .bottom(px(-4.))
+                .size(px(16.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .border_1()
+                .border_color(t.background)
+                .bg(t.primary)
+                .text_color(t.primary_foreground)
+                .shadow(shadow.clone())
+                .child(Icon::new(IconName::Sparkles).size(px(10.))),
+        );
+    let identity = v_flex()
+        .min_w_0()
+        .child(
+            div()
+                .truncate()
+                .text_sm()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(t.foreground)
+                .child(template.display_name.clone()),
+        )
+        .child(div().text_xs().text_color(t.muted_foreground).child(template.kind.label()));
+    let use_button = workspace.map(|workspace| {
+        let key = key.clone();
+        gpui_kit::component::button::Button::new(SharedString::from(format!("{id}:use")))
+            .outline()
+            .small()
+            .flex_none()
+            .h(px(t.breakpoint.pick(32., 28.)))
+            .px(px(9.))
+            .rounded(px(8.))
+            .border_color(t.input)
+            .bg(if t.dark { Hsla { a: t.input.a * 0.32, ..t.input } } else { t.popover })
+            .text_sm()
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(t.foreground)
+            .label("Use template")
+            .on_click(move |_, window, cx| {
+                let _ = workspace.update(cx, |w, cx| w.use_artifact_template(&key, &template, window, cx));
+            })
+    });
+    h_flex()
+        .id(id)
+        .w_full()
+        .min_w_0()
+        .gap(px(12.))
+        .px(px(12.))
+        .py(px(10.))
+        .rounded(px(12.))
+        .border_1()
+        .border_color(Hsla { a: t.border.a * 0.7, ..t.border })
+        .bg(Hsla { a: t.card.a * 0.6, ..t.card })
+        .text_color(t.foreground)
+        .shadow(shadow)
+        .child(h_flex().flex_1().min_w_0().gap(px(12.)).child(artwork).child(identity))
+        .children(use_button)
+        .into_any_element()
+}
+
+impl Workspace {
+    /// `insertArtifactTemplate`: the template's prompt goes at the end of the composer of the
+    /// chat its reply is in, after a space, unless the draft already ends with it; the composer
+    /// takes focus.
+    fn use_artifact_template(&mut self, key: &str, template: &Template, window: &mut Window, cx: &mut Context<Self>) {
+        let side = self
+            .side_chat
+            .view
+            .as_ref()
+            .filter(|_| !self.rows.iter().any(|row| super::chat::shows_markdown(row, key)))
+            .filter(|side| side.rows.iter().any(|row| super::chat::shows_markdown(row, key)));
+        let composer = match side {
+            Some(side) => side.ready_composer().cloned(),
+            None => self.composer_takes_citations().then(|| self.composer.clone()),
+        };
+        let Some(composer) = composer else {
+            let notification =
+                Notification::error("The composer is busy; try again once it is ready.").title("Unable to add to chat");
+            window.push_notification(notification, cx);
+            return;
+        };
+        let draft = composer.read(cx).value().to_string();
+        if let Some(prompt) = template.prompt_to_append(&draft) {
+            composer.update(cx, |state, cx| {
+                let end = draft.len();
+                let leading = !draft.is_empty() && !draft.ends_with(char::is_whitespace);
+                state.set_selected_range(end..end, cx);
+                state.replace(format!("{}{prompt}", if leading { " " } else { "" }), window, cx);
+            });
+            self.sync_composer_empty(cx);
+        }
+        composer.update(cx, |state, cx| state.focus(window, cx));
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -1838,6 +1838,11 @@ fn markdown_view(
     let t = *t;
     let (header_this, link_this, table_this) = (this.clone(), this.clone(), this.clone());
     let table_key = key.clone();
+    let templates = super::markdown_ui::ArtifactTemplates {
+        workspace: this.clone(),
+        key: key.clone(),
+        usable: kind != MarkdownKind::User,
+    };
     TextView::new(state)
         .style(markdown_style(&t, kind == MarkdownKind::User, wrap))
         .inline_code_style(inline_code)
@@ -1857,6 +1862,7 @@ fn markdown_view(
         .plugin(super::markdown_ui::SkillChips { workspace: this.clone() })
         .plugin(super::markdown_ui::CitationChips { workspace: this.clone() })
         .plugin(super::markdown_ui::ThreadChips { workspace: this.clone() })
+        .plugin(templates)
         .plugin(super::markdown_ui::FileChips {
             workspace: this.clone(),
             dark: t.dark,
