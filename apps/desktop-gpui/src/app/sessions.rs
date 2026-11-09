@@ -372,6 +372,7 @@ impl Workspace {
                 } else if sequence > 0 {
                     session.shell_retried = false;
                 }
+                this.verify_restored_drafts(cx);
                 this.land(window, cx);
                 this.open_pending_links(window, cx);
                 this.keep_running_threads(cx);
@@ -534,7 +535,7 @@ impl Workspace {
     }
 
     /// A removed project's drafts go with it, the open one too.
-    pub(super) fn forget_project_drafts(&mut self, project_id: &str) {
+    pub(super) fn forget_project_drafts(&mut self, project_id: &str, cx: &mut Context<Self>) {
         let Some(env) = self.project_environment(project_id) else { return };
         let of_project = |target: &Target| match target {
             Target::Draft { env: draft_env, project_id: draft_project, .. } => {
@@ -547,6 +548,7 @@ impl Workspace {
             self.target = None;
         }
         self.drafts.forget_project(&ScopedId::new(env, project_id));
+        self.drafts_changed(cx);
     }
 
     /// A listed thread as a target, on its environment.

@@ -44,6 +44,7 @@ mod desktop;
 mod details;
 mod draft_picker;
 mod draft_sessions;
+mod draft_store;
 pub(crate) mod environments;
 mod files;
 mod find;
@@ -236,6 +237,8 @@ pub struct Workspace {
     composer_drafts: HashMap<Target, composer::ComposerDraft>,
     /// Every draft's identity and the draft each project opens.
     drafts: draft_sessions::DraftSessions,
+    /// Drafts kept across restarts.
+    draft_store: draft_store::DraftStore,
     /// The model and permissions picks of the targets not on screen (`composerDraftStore`).
     composer_selections: HashMap<Target, composer::ComposerSelection>,
     /// The request whose response is in flight.
@@ -429,6 +432,12 @@ impl Workspace {
         let (desktop, desktop_subscriptions) = desktop::DesktopShell::new(window, cx);
         let mut subscriptions = subscriptions;
         subscriptions.extend(desktop_subscriptions);
+        // A window macOS closes takes its workspace with it; the next one reads these drafts.
+        subscriptions.push(cx.on_release(|this, cx| this.flush_drafts(cx)));
+        subscriptions.push(cx.on_app_quit(|this, cx| {
+            this.flush_drafts(cx);
+            async {}
+        }));
         let client_settings = crate::settings::ClientSettings::load();
         cx.set_global(crate::theme::Appearance::from_settings(&client_settings.values));
         crate::theme::set_preference(client_settings.theme_choice(), window, cx);
@@ -469,6 +478,7 @@ impl Workspace {
             composer_action_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             composer_drafts: HashMap::new(),
             drafts: Default::default(),
+            draft_store: Default::default(),
             composer_selections: HashMap::new(),
             responding: None,
             menu: Default::default(),
@@ -563,6 +573,7 @@ impl Workspace {
         };
         workspace.sync_snap_shot(window, cx);
         workspace.sync_saved_sessions(window, cx);
+        workspace.load_drafts(window, cx);
         workspace
     }
 
@@ -832,9 +843,12 @@ impl Workspace {
     }
 
     /// Electron always opens the index route, which starts a draft in the most
-    /// recently active project (`IndexDraftLanding`); this is that landing.
+    /// recently active project (`IndexDraftLanding`); this is that landing. It waits for the
+    /// saved drafts, so it opens the project's own.
     fn land(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.landed || !self.primary_environment().is_some_and(|id| self.shell.has_snapshot(id)) {
+        let ready =
+            self.draft_store.restored() && self.primary_environment().is_some_and(|id| self.shell.has_snapshot(id));
+        if self.landed || !ready {
             return;
         }
         self.landed = true;

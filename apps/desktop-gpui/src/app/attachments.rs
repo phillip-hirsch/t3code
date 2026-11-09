@@ -563,6 +563,7 @@ impl Workspace {
         let local_id = attachment.local_id.clone();
         self.attachments.push(attachment);
         self.upload(local_id, cx);
+        self.drafts_changed(cx);
         cx.notify();
     }
 
@@ -639,6 +640,7 @@ impl Workspace {
         let local_id = attachment.local_id.clone();
         kept.push(attachment);
         self.upload(local_id.clone(), cx);
+        self.drafts_changed(cx);
         Ok(local_id)
     }
 
@@ -725,6 +727,17 @@ impl Workspace {
         .detach();
     }
 
+    /// Attachments a restart brought back upload once their draft is on screen: nothing started them.
+    pub(super) fn start_restored_uploads(&mut self, cx: &mut Context<Self>) {
+        let waiting: Vec<String> = (self.attachments.iter())
+            .filter(|a| a.upload == Upload::Uploading && a.upload_env.is_none())
+            .map(|a| a.local_id.clone())
+            .collect();
+        for local_id in waiting {
+            self.upload(local_id, cx);
+        }
+    }
+
     /// The draft moved to another machine: what was uploaded elsewhere uploads its bytes again,
     /// since an upload id only works where it was taken (`startAttachmentUpload`).
     pub(super) fn sync_attachment_uploads(&mut self, cx: &mut Context<Self>) {
@@ -788,6 +801,7 @@ impl Workspace {
             }
         });
         self.sync_composer_empty(cx);
+        self.drafts_changed(cx);
         cx.notify();
     }
 

@@ -584,6 +584,7 @@ impl Workspace {
         if !reasons.is_empty() {
             toast(window, cx, Notification::warning(reasons.join(" ")).title("Some attachments were not restored"));
         }
+        self.drafts_changed(cx);
         cx.notify();
     }
 

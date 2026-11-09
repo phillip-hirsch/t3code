@@ -397,6 +397,7 @@ impl Workspace {
                             if let Some(draft) = origin.draft_id() {
                                 this.drafts.promote(draft);
                             }
+                            this.drafts_changed(cx);
                         }
                         let here = this.target.as_ref() == Some(&origin);
                         match (new_thread_id, background) {

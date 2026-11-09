@@ -112,6 +112,7 @@ impl Workspace {
                 None => return,
             }
         };
+        self.drafts_changed(cx);
         if prompt.trim().is_empty() && attachments.is_empty() {
             return;
         }
@@ -146,6 +147,7 @@ impl Workspace {
                 }
             }
         }
+        self.drafts_changed(cx);
         self.notify_sidebar(cx);
         cx.notify();
     }

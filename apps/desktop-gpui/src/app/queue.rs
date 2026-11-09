@@ -93,6 +93,11 @@ impl Workspace {
         self.queue.edit.as_ref().map_or(&[], |edit| edit.records.as_slice())
     }
 
+    /// The thread's own draft while a queued message holds the composer, left in place.
+    pub(super) fn queue_edit_draft(&self) -> Option<(&str, &[Attachment])> {
+        self.queue.edit.as_ref().map(|edit| (edit.saved.0.as_str(), edit.saved.1.as_slice()))
+    }
+
     /// The thread's draft, while a queued message holds the composer; see `stash_composer`.
     pub(super) fn take_queue_edit_draft(&mut self) -> Option<(String, Vec<Attachment>)> {
         self.queue.edit.take().map(|edit| edit.saved)

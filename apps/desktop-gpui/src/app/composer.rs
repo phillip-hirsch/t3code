@@ -107,7 +107,7 @@ fn merge_prompt(failed: String, newer: &str) -> String {
 }
 
 /// What a target keeps of the composer while another one is on screen, like
-/// the web's `composerDraftStore` (in memory only).
+/// the web's `composerDraftStore`; [`super::draft_store`] keeps it across restarts.
 pub(super) enum ComposerDraft {
     Prompt(String, Vec<Attachment>),
     /// An open question card; its prompt is the one it set aside.
@@ -163,6 +163,7 @@ impl Workspace {
         self.sync_attachment_chips(&previous, cx);
         self.sync_trigger(cx);
         self.sync_composer_marks(cx);
+        self.drafts_changed(cx);
     }
 
     /// Repaints the composer's Markdown (`composerRichTextEnabled`); off, the text is plain.
@@ -238,6 +239,7 @@ impl Workspace {
         self.sync_composer_empty(cx);
         self.sync_trigger(cx);
         self.sync_composer_marks(cx);
+        self.drafts_changed(cx);
     }
 
     /// Pasted file links, known skills and context links arrive as chips (`handlePaste`);
@@ -320,6 +322,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.drafts_changed(cx);
         if self.target.as_ref() == Some(origin) {
             match &mut self.question {
                 Some(question) => question.prompt = merge_prompt(text, &question.prompt),
@@ -357,6 +360,7 @@ impl Workspace {
                 self.question = None;
                 self.attachments = attachments;
                 self.set_composer_text(prompt, window, cx);
+                self.start_restored_uploads(cx);
             }
             None => {
                 self.question = None;
@@ -821,6 +825,7 @@ impl Workspace {
             }
             _ => self.runtime_mode_override = Some(mode.to_owned()),
         }
+        self.drafts_changed(cx);
         cx.notify();
     }
 

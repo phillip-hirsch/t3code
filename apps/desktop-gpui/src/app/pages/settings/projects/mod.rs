@@ -471,7 +471,7 @@ impl Workspace {
                         toast_error(window, cx, format!("Failed to remove \"{title}\""), error);
                         return true;
                     }
-                    this.forget_project_drafts(id);
+                    this.forget_project_drafts(id, cx);
                     false
                 });
                 if failed.unwrap_or(true) {

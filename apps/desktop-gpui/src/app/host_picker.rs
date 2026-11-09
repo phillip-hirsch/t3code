@@ -299,6 +299,7 @@ impl Workspace {
         self.sync_attachment_uploads(cx);
         self.model_override = None;
         self.model_explicit = false;
+        self.drafts_changed(cx);
         self.notify_sidebar(cx);
         cx.notify();
     }

@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use gpui_kit::SharedString;
+use serde::{Deserialize, Serialize};
 
 use super::Target;
 use crate::model::ScopedId;
@@ -17,6 +18,15 @@ pub(crate) struct DraftId(SharedString);
 impl DraftId {
     fn new() -> Self {
         Self(super::new_id().into())
+    }
+
+    pub(super) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// A draft saved by an earlier run.
+    pub(super) fn from_saved(id: String) -> Self {
+        Self(id.into())
     }
 
     #[cfg(test)]
@@ -33,8 +43,9 @@ impl fmt::Display for DraftId {
 
 struct Session {
     project: ScopedId,
-    /// Creation order (`createdAt`): the sidebar lists drafts newest first.
-    created: u64,
+    /// When it was made, in milliseconds and strictly increasing (`createdAt`): the sidebar
+    /// lists drafts newest first, across restarts too.
+    created: i64,
     /// It launched its thread (`promotedTo`), so no project opens it again.
     promoted: bool,
 }
@@ -42,7 +53,7 @@ struct Session {
 #[derive(Default)]
 pub(super) struct DraftSessions {
     sessions: HashMap<DraftId, Session>,
-    next: u64,
+    last_created: i64,
     /// The draft "New thread" opens in each project; a draft with content that lost its place
     /// stays a sidebar row.
     by_project: HashMap<ScopedId, DraftId>,
@@ -52,8 +63,8 @@ impl DraftSessions {
     /// A new draft in `project`, not yet its project's draft.
     pub(super) fn create(&mut self, project: ScopedId) -> DraftId {
         let id = DraftId::new();
-        self.next += 1;
-        self.sessions.insert(id.clone(), Session { project, created: self.next, promoted: false });
+        self.last_created = crate::timestamp::now_ms().max(self.last_created + 1);
+        self.sessions.insert(id.clone(), Session { project, created: self.last_created, promoted: false });
         id
     }
 
@@ -98,7 +109,7 @@ impl DraftSessions {
     }
 
     /// Where `draft` sorts among the sidebar's rows: newer drafts sort first.
-    pub(super) fn created(&self, draft: &DraftId) -> u64 {
+    pub(super) fn created(&self, draft: &DraftId) -> i64 {
         self.sessions.get(draft).map_or(0, |session| session.created)
     }
 
@@ -114,6 +125,69 @@ impl DraftSessions {
     pub(super) fn forget_project(&mut self, project: &ScopedId) {
         self.sessions.retain(|_, session| session.project != *project);
         self.by_project.remove(project);
+    }
+
+    /// A draft whose project is gone.
+    pub(super) fn forget(&mut self, draft: &DraftId) {
+        self.sessions.remove(draft);
+        self.by_project.retain(|_, mapped| mapped != draft);
+    }
+
+    /// The drafts worth keeping across a restart (`partializeComposerDraftStoreState`): unsent, and
+    /// either a project's draft or one `with_content`, oldest first.
+    pub(super) fn saved(&self, with_content: impl Fn(&DraftId) -> bool) -> Vec<SavedSession> {
+        let mapped = |id: &DraftId| self.by_project.values().any(|mapped| mapped == id);
+        let mut saved: Vec<SavedSession> = (self.sessions.iter())
+            .filter(|(id, session)| !session.promoted && (mapped(id) || with_content(id)))
+            .map(|(id, session)| SavedSession {
+                draft_id: id.to_string(),
+                environment_id: session.project.env.to_string(),
+                project_id: session.project.id.clone(),
+                created_at: session.created,
+                project_draft: mapped(id),
+            })
+            .collect();
+        saved.sort_by_key(|session| session.created_at);
+        saved
+    }
+
+    /// Brings back drafts an earlier run saved, beside any made since; a project keeps the draft it
+    /// opens now. Hands back the drafts it added.
+    pub(super) fn restore(&mut self, saved: Vec<SavedSession>) -> Vec<DraftId> {
+        let mut restored = Vec::new();
+        for saved in saved {
+            let id = DraftId::from_saved(saved.draft_id);
+            if self.sessions.contains_key(&id) {
+                continue;
+            }
+            let project = ScopedId::new(saved.environment_id, saved.project_id);
+            if saved.project_draft && self.of_project(&project).is_none() {
+                self.by_project.insert(project.clone(), id.clone());
+            }
+            self.last_created = self.last_created.max(saved.created_at);
+            self.sessions.insert(id.clone(), Session { project, created: saved.created_at, promoted: false });
+            restored.push(id);
+        }
+        restored
+    }
+}
+
+/// A draft's identity on disk (`draftThreadsByThreadKey` and its project mapping).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct SavedSession {
+    draft_id: String,
+    environment_id: String,
+    project_id: String,
+    created_at: i64,
+    /// The draft "New thread" opens in its project.
+    #[serde(default)]
+    project_draft: bool,
+}
+
+impl SavedSession {
+    pub(super) fn draft_id(&self) -> &str {
+        &self.draft_id
     }
 }
 
@@ -181,6 +255,50 @@ mod tests {
         drafts.promote(&draft);
         assert_eq!(drafts.of_project(&project("web")), None);
         assert!(!drafts.is_live(&draft));
+    }
+
+    #[test]
+    fn saved_drafts_come_back_older_than_new_ones_and_keep_their_project() {
+        let mut drafts = DraftSessions::default();
+        let mapped = drafts.create(project("web"));
+        drafts.assign(project("web"), &mapped);
+        let written = drafts.create(project("web"));
+        let empty = drafts.create(project("api"));
+        let launched = drafts.create(project("api"));
+        drafts.assign(project("api"), &launched);
+        drafts.promote(&launched);
+        let saved = drafts.saved(|id| *id == written);
+        let ids: Vec<String> = saved.iter().map(|s| s.draft_id.clone()).collect();
+        assert_eq!(ids, [mapped.to_string(), written.to_string()], "not the empty or launched ones");
+        assert!(!ids.contains(&empty.to_string()));
+
+        let mut next = DraftSessions::default();
+        let fresh = next.create(project("api"));
+        next.assign(project("api"), &fresh);
+        let restored = next.restore(saved.clone());
+        assert_eq!(restored, [mapped.clone(), written.clone()]);
+        assert_eq!(next.of_project(&project("web")), Some(&mapped));
+        assert!(next.created(&written) > next.created(&mapped));
+        assert_eq!(next.target(&written), Some(Target::draft("local".into(), "web".into(), written.clone())));
+        assert!(next.restore(saved).is_empty(), "a draft comes back once");
+        let newest = next.create(project("web"));
+        assert!(next.created(&newest) > next.created(&written), "new drafts sort first");
+        next.forget(&mapped);
+        assert_eq!(next.of_project(&project("web")), None);
+        assert!(!next.is_live(&mapped));
+    }
+
+    #[test]
+    fn a_restored_draft_does_not_displace_the_draft_a_project_opens_now() {
+        let mut earlier = DraftSessions::default();
+        let old = earlier.create(project("web"));
+        earlier.assign(project("web"), &old);
+        let mut drafts = DraftSessions::default();
+        let now = drafts.create(project("web"));
+        drafts.assign(project("web"), &now);
+        drafts.restore(earlier.saved(|_| false));
+        assert_eq!(drafts.of_project(&project("web")), Some(&now));
+        assert!(drafts.is_live(&old));
     }
 
     #[test]
