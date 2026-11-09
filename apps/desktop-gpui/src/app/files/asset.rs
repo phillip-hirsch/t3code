@@ -15,19 +15,21 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use super::logic::{self, FileKind, Office};
-use super::{FileKey, archive, chrome, document, notebook};
+use super::{FileKey, archive, chrome, database, document, notebook};
 use crate::app::{Target, Workspace};
 use crate::theme::Tokens;
 
 /// What a parsed file shows.
 pub(super) enum Viewer {
     Archive(archive::Archive),
+    Database(database::Database),
     Notebook(notebook::Notebook),
 }
 
 /// The parsed bytes, built off the UI thread; `Viewer` adds the UI's entities.
 enum Parsed {
     Archive(archive::Listing),
+    Database(crate::sqlite::Database),
     Notebook(notebook::NotebookData),
 }
 
@@ -65,7 +67,8 @@ impl Assets {
 /// The byte limit and its message for each viewer, or `None` when the file has no preview here.
 fn read_limit(kind: FileKind) -> Option<(u64, &'static str)> {
     match kind {
-        FileKind::Archive => Some((archive::MAX_BYTES, "Preview limited to files under 50 MB.")),
+        // `BINARY_PREVIEW_MAX_BYTES`.
+        FileKind::Archive | FileKind::Sqlite => Some((archive::MAX_BYTES, "Preview limited to files under 50 MB.")),
         FileKind::Office(Office::Ipynb) => Some((notebook::MAX_BYTES, "Notebook preview limited to files under 8 MB.")),
         _ => None,
     }
@@ -74,6 +77,7 @@ fn read_limit(kind: FileKind) -> Option<(u64, &'static str)> {
 fn parse(kind: FileKind, name: &str, bytes: &[u8]) -> Result<Parsed, String> {
     match kind {
         FileKind::Archive => archive::open_archive(name, bytes).map(Parsed::Archive),
+        FileKind::Sqlite => crate::sqlite::Database::from_bytes(bytes).map(Parsed::Database),
         FileKind::Office(Office::Ipynb) => notebook::open_notebook(bytes).map(Parsed::Notebook),
         _ => Err("Could not preview this file.".into()),
     }
@@ -151,17 +155,26 @@ impl Workspace {
                 Err(error) => Err(error),
             };
             let _ = this.update_in(cx, |this, _window, cx| {
+                let mut first_rows = false;
                 let Some(state) = this.files.assets.states.get_mut(&request_key) else { return };
                 state._task = None;
                 state.load = match parsed {
                     Ok((Parsed::Archive(listing), size)) => {
                         AssetLoad::Ready(Viewer::Archive(archive::Archive::new(listing, size)))
                     }
+                    Ok((Parsed::Database(opened), size)) => {
+                        first_rows = !opened.tables().is_empty();
+                        AssetLoad::Ready(Viewer::Database(database::Database::new(opened, size)))
+                    }
                     Ok((Parsed::Notebook(data), size)) => {
                         AssetLoad::Ready(Viewer::Notebook(notebook::Notebook::new(data, size)))
                     }
                     Err(error) => AssetLoad::Failed(error),
                 };
+                // `BinaryViewer` reads the first table's first page as the database opens.
+                if first_rows {
+                    this.load_database_rows(&request_key, 0, 0, cx);
+                }
                 cx.notify();
             });
         });
@@ -297,6 +310,7 @@ impl Workspace {
                 chrome::failure(message.clone(), Some(button), tokens)
             }
             Some(AssetLoad::Ready(Viewer::Archive(_))) => self.render_archive_listing(key, tokens, cx),
+            Some(AssetLoad::Ready(Viewer::Database(_))) => self.render_database(key, tokens, cx),
             Some(AssetLoad::Ready(Viewer::Notebook(_))) => self.render_notebook(key, tokens, window, cx),
         }
     }

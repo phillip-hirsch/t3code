@@ -6,6 +6,7 @@ mod archive;
 mod asset;
 mod chrome;
 mod crumbs;
+mod database;
 mod document;
 mod logic;
 mod media;

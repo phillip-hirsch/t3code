@@ -83,6 +83,9 @@ uuid = { version = "1", features = ["v4"] }
 zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 # Office documents' XML parts; GPUI's SVG renderer already builds it.
 roxmltree = "0.21"
+# SQLite databases read from bytes, read only (`sqlite`). The bundled SQLite builds from source with the
+# platform's C compiler, so no system library is needed.
+rusqlite = { version = "0.41", features = ["bundled", "serialize"] }
 wry = { version = "0.53.3", package = "lb-wry", features = ["devtools"] }
 # SnapShots: the screen capture.
 xcap = "0.9"

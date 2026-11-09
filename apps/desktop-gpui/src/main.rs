@@ -42,6 +42,7 @@ mod search;
 mod secure_storage;
 mod settings;
 mod snap_shot;
+mod sqlite;
 mod terminal_text;
 mod tex;
 mod theme;

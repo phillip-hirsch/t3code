@@ -370,7 +370,7 @@ impl Workspace {
     fn archive_mut(&mut self, key: &super::FileKey) -> Option<&mut Archive> {
         match self.files.assets.viewer_mut(key)? {
             super::asset::Viewer::Archive(archive) => Some(archive),
-            super::asset::Viewer::Notebook(_) => None,
+            _ => None,
         }
     }
 
