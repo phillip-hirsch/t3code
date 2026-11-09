@@ -17,7 +17,7 @@ use super::{Target, Workspace};
 use crate::backend::Endpoint;
 use crate::device::DeviceState;
 use crate::environments::Presented;
-use crate::model::ServerInfo;
+use crate::model::{ScopedId, ServerInfo};
 use crate::project_groups::ScratchRoot;
 use crate::rpc::RpcClient;
 use crate::theme::Tokens;
@@ -76,6 +76,14 @@ impl Target {
     pub(super) fn environment(&self) -> &SharedString {
         match self {
             Target::Thread { env, .. } | Target::Draft { env, .. } => env,
+        }
+    }
+
+    /// The open thread's id on its environment.
+    pub(super) fn thread_key(&self) -> Option<ScopedId> {
+        match self {
+            Target::Thread { env, id } => Some(ScopedId::new(env.clone(), id.clone())),
+            Target::Draft { .. } => None,
         }
     }
 }
@@ -298,7 +306,9 @@ impl Workspace {
                     session.grants = grants;
                 }
                 this.apply_pr_write_grant(&id, before, cx);
+                this.drop_unoperable_renames();
                 this.notify_sidebar(cx);
+                cx.notify();
             }));
         }
         let Some(session) = self.session_mut(&environment_id) else { return };
@@ -516,6 +526,11 @@ impl Workspace {
             Some(Target::Thread { id, .. }) => Some(id),
             _ => None,
         }
+    }
+
+    /// Whether `key` is the open thread, on its environment.
+    pub(super) fn is_open_thread(&self, key: &ScopedId) -> bool {
+        matches!(&self.target, Some(Target::Thread { env, id }) if *env == key.env && *id == key.id)
     }
 
     /// A project's draft as a target, on the project's environment.

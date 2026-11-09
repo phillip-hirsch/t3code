@@ -30,7 +30,7 @@ use super::pages::Page;
 use super::palette_actions::github_repository;
 use super::{Target, Workspace, new_id, project_name};
 use crate::inbox;
-use crate::model::ProjectShell;
+use crate::model::{ProjectShell, ScopedId};
 use crate::search::{self, Field, Weighted};
 use crate::theme::Tokens;
 
@@ -43,6 +43,8 @@ const MESSAGE_DEBOUNCE: Duration = Duration::from_millis(120);
 /// One message hit from `orchestration.searchThreads`.
 #[derive(Clone)]
 pub(super) struct MessageMatch {
+    /// The environment that answered: thread ids repeat across environments.
+    pub(super) environment_id: SharedString,
     pub(super) thread_id: String,
     pub(super) user: bool,
     pub(super) snippet: String,
@@ -55,10 +57,11 @@ pub(super) struct MessageMatch {
 }
 
 impl MessageMatch {
-    fn from_json(value: &Value) -> Option<Self> {
+    fn from_json(environment_id: &SharedString, value: &Value) -> Option<Self> {
         #[expect(clippy::cast_possible_truncation, reason = "a match quality near 1")]
         let quality = value["quality"].as_f64().map(|q| q as f32);
         Some(Self {
+            environment_id: environment_id.clone(),
             thread_id: value["threadId"].as_str()?.to_owned(),
             user: value["source"] == "user",
             snippet: value["snippet"].as_str()?.to_owned(),
@@ -117,7 +120,7 @@ enum Run {
     /// One setting: its section, scrolled to its row.
     Setting(&'static crate::settings::SearchItem),
     /// Settings › Projects with this project's group picked.
-    ProjectSettings(String),
+    ProjectSettings(ScopedId),
     Page(Page),
     /// Browse into this directory (the query becomes it).
     BrowseTo(String),
@@ -138,7 +141,7 @@ enum Run {
     CopyThread,
     RestartSession,
     /// Pins (`true`) or unpins these projects, a group's members.
-    PinProjects(Vec<String>, bool),
+    PinProjects(Vec<ScopedId>, bool),
     Theme(crate::themes::CardId),
     Appearance(crate::settings::ThemePreference),
     /// `themeEditor.toggle`.
@@ -212,7 +215,7 @@ struct Row {
     command: Option<SharedString>,
     chevron: bool,
     /// `ProjectPinButton`: the group's project ids and whether it is pinned.
-    pin: Option<(Vec<String>, bool)>,
+    pin: Option<(Vec<ScopedId>, bool)>,
     run: Run,
     /// Keywords that match besides the title (`searchTerms`).
     terms: &'static [&'static str],
@@ -815,8 +818,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         // Every connected environment is searched, as `useThreadSearch` does over its ids.
-        let clients: Vec<crate::rpc::RpcClient> =
-            self.sessions().iter().filter_map(|session| session.client.clone()).collect();
+        let clients: Vec<(SharedString, crate::rpc::RpcClient)> =
+            self.sessions().iter().filter_map(|session| Some((session.id.clone()?, session.client.clone()?))).collect();
         let Some(search) = slot(self) else { return };
         let query: String = query.trim().chars().take(200).collect::<String>().trim().to_owned();
         if search.query == query {
@@ -834,16 +837,20 @@ impl Workspace {
             cx.background_executor().timer(MESSAGE_DEBOUNCE).await;
             let mut answers: futures::stream::FuturesUnordered<_> = clients
                 .iter()
-                .map(|client| client.request("orchestration.searchThreads", json!({"query": query})))
+                .map(|(env, client)| {
+                    let request = client.request("orchestration.searchThreads", json!({"query": query}));
+                    async move { (env, request.await) }
+                })
                 .collect();
             // Each environment's matches show as it answers; one that fails leaves the others'.
-            while let Some(answer) = answers.next().await {
+            while let Some((env, answer)) = answers.next().await {
                 let settled = answers.is_empty();
                 let matches: Vec<MessageMatch> = answer
                     .inspect_err(|error| log::warn!("orchestration.searchThreads: {error}"))
                     .ok()
                     .and_then(|value| {
-                        value["matches"].as_array().map(|m| m.iter().filter_map(MessageMatch::from_json).collect())
+                        let matches = value["matches"].as_array()?;
+                        Some(matches.iter().filter_map(|m| MessageMatch::from_json(env, m)).collect())
                     })
                     .unwrap_or_default();
                 let updated = this.update(cx, |this, cx| {
@@ -959,7 +966,9 @@ impl Workspace {
         let location = self.location_label(&p.environment_id);
         row.description = Some(Description::Location(machine, location, p.workspace_root.clone().into()));
         row.data_terms = vec![p.title.clone().into(), p.workspace_root.clone().into()];
-        row.pin = Some((group.project_ids.clone(), group.pinned));
+        // `projectPin`: only where this connection may pin every member.
+        let members = group.member_refs();
+        row.pin = self.can_pin_projects(&members).then_some((members, group.pinned));
         row
     }
 
@@ -1156,11 +1165,13 @@ impl Workspace {
         row.terms = &["settings", "preferences", "configuration", "keybindings"];
         rows.push(row);
         let groups = self.project_groups();
-        if let Some(group) = self.current_project().and_then(|p| groups.iter().find(|g| g.contains_project(p))) {
+        let pinnable = |g: &&crate::project_groups::ProjectGroup| self.can_pin_projects(&g.member_refs());
+        if let Some(group) =
+            self.current_project().and_then(|p| groups.iter().find(|g| g.contains_project(p))).filter(pinnable)
+        {
             let (title, icon) =
                 if group.pinned { ("Unpin project", IconName::PinOff) } else { ("Pin project", IconName::Pin) };
-            let ids = group.members.iter().map(|m| m.project.id.clone()).collect();
-            let mut row = lucide("project-pin", icon, title, Run::PinProjects(ids, !group.pinned));
+            let mut row = lucide("project-pin", icon, title, Run::PinProjects(group.member_refs(), !group.pinned));
             row.description = Some(Description::Text(group.display_name.clone().into()));
             row.terms = &["pin", "unpin", "project", "favorite"];
             rows.push(row);
@@ -1170,7 +1181,7 @@ impl Workspace {
             self.current_project().and_then(|p| Some((groups.iter().find(|g| g.contains_project(p))?, p)));
         let contextual = current_group.or_else(|| groups.first().map(|g| (g, g.representative())));
         if let Some((group, project)) = contextual {
-            let run = Run::ProjectSettings(project.id.clone());
+            let run = Run::ProjectSettings(ScopedId::of_project(project));
             let mut row = lucide("project-settings", IconName::Folder, "Project settings", run);
             row.description = Some(Description::Text(group.display_name.clone().into()));
             row.terms = &[
@@ -3002,6 +3013,7 @@ mod tests {
         const DAY: i64 = 86_400_000;
         let now = 100 * DAY;
         let hit = |thread_id: &str, quality: f32, hits: u32| MessageMatch {
+            environment_id: "env".into(),
             thread_id: thread_id.into(),
             user: true,
             snippet: String::new(),

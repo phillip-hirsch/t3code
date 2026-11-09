@@ -224,12 +224,12 @@ impl Workspace {
             return cx.notify();
         }
         if self.target.is_none() {
-            let Some(project_id) = self.new_thread_project() else {
+            let Some(project) = self.new_thread_project() else {
                 let toast = Notification::error("Add a project, then capture the window again.")
                     .title("Snapshot taken, but no project is available");
                 return window.push_notification(toast, cx);
             };
-            self.start_draft(project_id, window, cx);
+            self.start_draft_in(project.env, project.id, window, cx);
         }
         if !self.can_attach() {
             return fail("The captured window could not be saved to the draft.", window, cx);

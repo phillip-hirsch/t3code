@@ -8,6 +8,7 @@ use gpui_kit::{Context, Window};
 use serde_json::json;
 
 use super::Workspace;
+use crate::model::ScopedId;
 use crate::new_thread::{EnvMode, WorkspaceChoice};
 
 /// The draft's workspace for "New thread on `branch`": the thread's worktree, else its branch locally.
@@ -30,15 +31,10 @@ fn branch_choice(branch: Option<String>, worktree_path: Option<String>) -> Works
 
 impl Workspace {
     /// A draft in the thread's project on its checkout: its worktree, else its branch locally.
-    pub(in crate::app) fn new_thread_on_branch(
-        &mut self,
-        thread_id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(thread) = self.shell.threads.iter().find(|t| t.id == thread_id) else { return };
+    pub(in crate::app) fn new_thread_on_branch(&mut self, key: &ScopedId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(thread) = self.shell.thread(key) else { return };
         let choice = branch_choice(thread.branch.clone(), thread.worktree_path.clone());
-        self.start_draft(thread.project_id.clone(), window, cx);
+        self.start_draft_in(key.env.clone(), thread.project_id.clone(), window, cx);
         self.sync_draft_workspace(cx);
         self.draft_workspace.choice = choice;
         cx.notify();
@@ -47,13 +43,13 @@ impl Workspace {
     /// `projects.createFromThread`: the thread's folder becomes a project.
     pub(in crate::app) fn turn_thread_into_project(
         &mut self,
-        thread_id: &str,
+        key: &ScopedId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.thread_client(thread_id) else { return };
-        let title = self.shell.threads.iter().find(|t| t.id == thread_id).map(|t| t.title.clone()).unwrap_or_default();
-        let input = json!({"threadId": thread_id});
+        let Some(client) = self.env_client(&key.env) else { return };
+        let title = self.shell.thread(key).map(|t| t.title.clone()).unwrap_or_default();
+        let input = json!({"threadId": key.id});
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("projects.createFromThread", input).await;
             let _ = this.update_in(cx, |_, window, cx| {

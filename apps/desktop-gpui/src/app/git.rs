@@ -716,7 +716,7 @@ impl Workspace {
             BranchOwner::Thread { id, env, branch: had } => {
                 let fields = branch_metadata_patch(&branch, had.as_deref());
                 if let Some(fields) = fields.filter(|_| self.can_operate(&env)) {
-                    self.thread_command("thread.metadata.update", &id, fields, cx);
+                    self.thread_command("thread.metadata.update", &crate::model::ScopedId::new(env, id), fields, cx);
                 }
             }
             BranchOwner::Draft(project_id) => self.set_draft_branch(&project_id, branch, cx),

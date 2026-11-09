@@ -227,9 +227,13 @@ impl Workspace {
         }
     }
 
+    /// Pins or unpins the entry's project where this connection may (`canPinProjectGroup`).
     fn toggle_draft_entry_pin(&mut self, key: &str, cx: &mut Context<Self>) {
         if let Some(group) = self.draft_picker_groups().into_iter().find(|g| g.key == key) {
-            self.set_projects_pinned(&group.project_ids, !group.pinned, cx);
+            let members = group.member_refs();
+            if self.can_pin_projects(&members) {
+                self.set_projects_pinned(&members, !group.pinned, cx);
+            }
         }
     }
 
@@ -299,7 +303,7 @@ impl Workspace {
             let tip = name.clone();
             // `ProjectPinButton`: a pinned project always shows its pin, which turns into PinOff
             // while hovered; an unpinned one shows it on the highlighted row and keeps its room.
-            let pin = group.map(|g| {
+            let pin = group.filter(|g| self.can_pin_projects(&g.member_refs())).map(|g| {
                 let (pinned, key) = (g.pinned, g.key.clone());
                 let action = format!("{} {}", if pinned { "Unpin" } else { "Pin" }, g.display_name);
                 let title: SharedString = match &pin_shortcut {

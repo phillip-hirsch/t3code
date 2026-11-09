@@ -10,10 +10,10 @@ use gpui_kit::{
 };
 
 use super::actions::UndoAction;
-use super::{ROW_GROUP, icon, project_icon, text_sm, text_xs, tooltip};
+use super::{ROW_GROUP, icon, project_icon, row_id, text_sm, text_xs, tooltip};
 use crate::app::composer::ComposerDraft;
 use crate::app::{Target, Workspace};
-use crate::model::ProjectShell;
+use crate::model::{ProjectShell, ScopedId, ThreadShell};
 use crate::theme::Tokens;
 
 /// What a discard took, for its undo.
@@ -56,7 +56,7 @@ fn preview(prompt: &str, attachments: usize) -> String {
 
 /// Keeps `order` to the `live` drafts, newest first: a draft joins at the top when it first
 /// appears and keeps its place after, like the web's sort by `createdAt`.
-pub(super) fn order_drafts(order: &mut Vec<String>, live: &[String]) {
+pub(super) fn order_drafts<T: PartialEq + Clone>(order: &mut Vec<T>, live: &[T]) {
     order.retain(|id| live.contains(id));
     for id in live.iter().rev() {
         if !order.contains(id) {
@@ -65,9 +65,9 @@ pub(super) fn order_drafts(order: &mut Vec<String>, live: &[String]) {
     }
 }
 
-/// One draft row: its project and its preview.
+/// One draft row: its project on its environment, and its preview.
 pub(super) struct DraftRow {
-    pub(super) project_id: String,
+    pub(super) project: ScopedId,
     pub(super) preview: SharedString,
     /// The draft on screen.
     pub(super) active: bool,
@@ -79,34 +79,34 @@ impl Workspace {
     /// content while open stays out of the list until it is left.
     pub(super) fn draft_rows(&mut self) -> Vec<DraftRow> {
         let route = match &self.target {
-            Some(Target::Draft { project_id, .. }) => {
-                self.sidebar.open_draft_preview.clone().map(|p| (project_id.clone(), p))
+            Some(Target::Draft { env, project_id }) => {
+                self.sidebar.open_draft_preview.clone().map(|p| (ScopedId::new(env.clone(), project_id.as_str()), p))
             }
             _ => None,
         };
-        let mut rows: Vec<(String, SharedString)> = self
+        let mut rows: Vec<(ScopedId, SharedString)> = self
             .composer_drafts
             .iter()
             .filter(|(_, draft)| has_content(draft))
             .filter_map(|(target, draft)| match target {
-                Target::Draft { project_id, .. } => {
+                Target::Draft { env, project_id } => {
                     let (prompt, attachments) = content(draft);
-                    Some((project_id.clone(), preview(prompt, attachments).into()))
+                    Some((ScopedId::new(env.clone(), project_id.as_str()), preview(prompt, attachments).into()))
                 }
                 Target::Thread { .. } => None,
             })
             .collect();
-        let active = route.as_ref().map(|(id, _)| id.clone());
+        let active = route.as_ref().map(|(project, _)| project.clone());
         rows.extend(route);
-        let live: Vec<String> = rows.iter().map(|(id, _)| id.clone()).collect();
+        let live: Vec<ScopedId> = rows.iter().map(|(project, _)| project.clone()).collect();
         order_drafts(&mut self.sidebar.draft_order, &live);
         self.sidebar
             .draft_order
             .iter()
-            .filter_map(|project_id| {
-                let at = rows.iter().position(|(id, _)| id == project_id)?;
+            .filter_map(|project| {
+                let at = rows.iter().position(|(key, _)| key == project)?;
                 let preview = rows.swap_remove(at).1;
-                Some(DraftRow { project_id: project_id.clone(), preview, active: active.as_ref() == Some(project_id) })
+                Some(DraftRow { project: project.clone(), preview, active: active.as_ref() == Some(project) })
             })
             .collect()
     }
@@ -125,11 +125,12 @@ impl Workspace {
     }
 
     /// `useThreadHasUnsentDraft`, for a thread that is not on screen.
-    pub(super) fn has_unsent_draft(&self, thread_id: &str) -> bool {
+    pub(super) fn has_unsent_draft(&self, thread: &ThreadShell) -> bool {
         // Drafts are few; scanning them saves building a key per sidebar row.
-        self.composer_drafts
-            .iter()
-            .any(|(target, draft)| matches!(target, Target::Thread { id, .. } if id == thread_id) && has_content(draft))
+        self.composer_drafts.iter().any(|(target, draft)| {
+            matches!(target, Target::Thread { env, id } if *env == thread.environment_id && *id == thread.id)
+                && has_content(draft)
+        })
     }
 
     /// `discardComposerDraft`: clears the draft and offers to undo it.
@@ -193,14 +194,14 @@ impl Workspace {
     fn draft_menu(
         &self,
         project: Option<&ProjectShell>,
-        project_id: &str,
+        key: &ScopedId,
         cx: &mut Context<Self>,
     ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
         let view = cx.weak_entity();
         let path = project.map(|p| p.workspace_root.clone());
         let has_project = project.is_some();
-        let settings_project = project_id.to_owned();
-        let draft = self.draft_target(project_id);
+        let settings_project = key.clone();
+        let draft = draft_target(key);
         move |menu, window, cx| {
             let path = path.clone();
             let mut menu =
@@ -230,11 +231,7 @@ impl Workspace {
             let (view, target) = (view.clone(), draft.clone());
             menu.separator().item(PopupMenuItem::new("Discard draft").icon(Icon::new(IconName::Trash)).on_click(
                 move |_, window, cx| {
-                    let _ = view.update(cx, |this, cx| {
-                        if let Some(target) = target.clone() {
-                            this.discard_draft(target, window, cx);
-                        }
-                    });
+                    let _ = view.update(cx, |this, cx| this.discard_draft(target.clone(), window, cx));
                 },
             ))
         }
@@ -250,10 +247,10 @@ impl Workspace {
     ) -> AnyElement {
         let sb = tokens.sidebar;
         let active = row.active;
-        let project_id = row.project_id.clone();
-        let target = self.draft_target(&project_id);
+        let key = row.project.clone();
+        let target = draft_target(&key);
         let discard = div()
-            .id(SharedString::from(format!("draft-discard-{project_id}")))
+            .id(row_id("draft-discard", &key.env, &key.id))
             .flex()
             .items_center()
             .px(px(4.))
@@ -266,22 +263,22 @@ impl Workspace {
             .tooltip(tooltip("Discard draft"))
             .on_click(cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
-                if let Some(target) = target.clone() {
-                    this.discard_draft(target, window, cx);
-                }
+                this.discard_draft(target.clone(), window, cx);
             }))
             .child(Icon::new(IconName::X).size(px(12.)));
-        let open_id = project_id.clone();
+        let open = key.clone();
         div()
             .py(px(2.))
             .child(
                 div()
-                    .id(SharedString::from(format!("draft-{project_id}")))
+                    .id(row_id("draft", &key.env, &key.id))
                     .group(ROW_GROUP)
                     .rounded(px(6.))
                     .cursor_pointer()
                     .map(|el| if active { el.bg(sb.row_active) } else { draft_surface(el, tokens) })
-                    .on_click(cx.listener(move |this, _, window, cx| this.start_draft(open_id.clone(), window, cx)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.start_draft_in(open.env.clone(), open.id.clone(), window, cx);
+                    }))
                     .child(
                         v_flex()
                             .h(px(78.))
@@ -313,7 +310,7 @@ impl Workspace {
                                     .child(row.preview.clone()),
                             ),
                     )
-                    .context_menu(self.draft_menu(project, &row.project_id, cx)),
+                    .context_menu(self.draft_menu(project, &row.project, cx)),
             )
             .into_any_element()
     }
@@ -325,10 +322,15 @@ pub(super) fn draft_surface<E: gpui_kit::Styled + InteractiveElement>(el: E, tok
     el.bg(warning.opacity(0.04)).hover(move |s| s.bg(warning.opacity(0.08)))
 }
 
+/// A project's draft as a target, on the project's environment.
+fn draft_target(project: &ScopedId) -> Target {
+    Target::Draft { env: project.env.clone(), project_id: project.id.clone() }
+}
+
 /// The "Unsent draft" pen before a row's title (`draftIndicator`).
-pub(super) fn unsent_draft_marker(thread_id: &str, tokens: &Tokens) -> AnyElement {
+pub(super) fn unsent_draft_marker(thread: &ThreadShell, tokens: &Tokens) -> AnyElement {
     div()
-        .id(SharedString::from(format!("unsent-draft-{thread_id}")))
+        .id(row_id("unsent-draft", &thread.environment_id, &thread.id))
         .flex_none()
         .tooltip(tooltip("Unsent draft"))
         .child(icon(IconName::SquarePen, 12., tokens.warning_foreground))
@@ -349,12 +351,12 @@ mod tests {
     #[test]
     fn drafts_join_at_the_top_and_keep_their_place() {
         let mut order = Vec::new();
-        order_drafts(&mut order, &["a".into()]);
-        order_drafts(&mut order, &["a".into(), "b".into()]);
+        order_drafts(&mut order, &["a"]);
+        order_drafts(&mut order, &["a", "b"]);
         assert_eq!(order, ["b", "a"]);
-        order_drafts(&mut order, &["a".into(), "b".into()]);
+        order_drafts(&mut order, &["a", "b"]);
         assert_eq!(order, ["b", "a"]);
-        order_drafts(&mut order, &["a".into()]);
+        order_drafts(&mut order, &["a"]);
         assert_eq!(order, ["a"]);
     }
 }

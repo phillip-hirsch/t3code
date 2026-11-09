@@ -36,7 +36,7 @@ use super::pages::settings::code::projects::icon as project_icons;
 use super::titlebar::{self, TITLEBAR_HEIGHT};
 use super::{Connection, Target, Workspace};
 use crate::inbox::{self, Facts, FolderDot, Status};
-use crate::model::{ProjectShell, ShellState, ThreadShell};
+use crate::model::{ProjectShell, ScopedId, ShellState, ThreadRef, ThreadShell};
 use crate::project_groups::{self, GroupingSettings, ProjectGroup, ScratchRoot, SortOrder};
 use crate::theme::Tokens;
 
@@ -64,9 +64,9 @@ pub(super) struct SidebarState {
     settled_visible: usize,
     /// The card under the pointer. Its controls replace the status label, which
     /// changes layout, so it is state rather than a paint-time group hover.
-    hovered: Option<String>,
+    hovered: Option<ScopedId>,
     /// The row whose hover card shows, after the web's 150 ms delay.
-    hover_card: Option<String>,
+    hover_card: Option<ScopedId>,
     _hover_card_delay: Option<Task<()>>,
     /// Where the rows were drawn last frame; `hovered` and `hover_card` belong to those rows.
     rows_surface: super::sidebar_sheet::RowsSurface,
@@ -74,41 +74,42 @@ pub(super) struct SidebarState {
     menu: Option<OpenMenu>,
     /// The row whose right-click menu is open. Electron's menu is native and leaves the page's
     /// hover on the row, so its Snooze and Settle controls stay up until the menu closes.
-    context_menu: Option<String>,
+    context_menu: Option<ScopedId>,
     /// By environment, workspace root, then favicon path, so a lookup needs no key built.
     favicons: HashMap<SharedString, HashMap<String, HashMap<Option<String>, Favicon>>>,
     renaming: Option<actions::Renaming>,
     /// The row the last single click opened, for double-click rename.
-    clicked: Option<String>,
+    clicked: Option<ScopedId>,
     undo: Option<actions::UndoNotice>,
     /// The project filter: project group keys, empty for all projects.
     scope: Vec<String>,
     /// The thread route last seen, and the one whose row still waits to scroll into view
     /// (`SidebarRouteReveal`).
-    route_seen: Option<String>,
-    reveal: Option<String>,
+    route_seen: Option<ScopedId>,
+    reveal: Option<ScopedId>,
     scroll: ScrollHandle,
     groups: RefCell<GroupsCache>,
     search_ranking: RefCell<Option<search_results::Ranking>>,
     /// Boring sidebar folders the user closed, by group key; folders start open.
     collapsed_folders: HashSet<String>,
-    /// Inbox (pinned, active, working) thread ids in sidebar order, as last drawn.
-    inbox_order: Vec<String>,
+    /// Inbox (pinned, active, working) threads in sidebar order, as last drawn.
+    inbox_order: Vec<ScopedId>,
     /// Every thread row in sidebar order, as last drawn, for Shift-click ranges.
-    thread_order: Vec<String>,
+    thread_order: Vec<ScopedId>,
     selection: selection::Selection,
     /// Draft rows by project, newest first.
-    draft_order: Vec<String>,
+    draft_order: Vec<ScopedId>,
     /// The open draft's row as it was when opened; `None` when it had no content then
     /// (`SidebarDraftBlock`'s `frozenActive`).
     open_draft_preview: Option<SharedString>,
     provider_pill: provider_update::PillState,
-    /// Each local checkout's current branch, read when a hover card opens, by workspace root.
-    checkout_branches: HashMap<String, String>,
+    /// Each local checkout's current branch, read when a hover card opens, by environment and
+    /// workspace root.
+    checkout_branches: HashMap<SharedString, HashMap<String, String>>,
     filter: Option<filter::FilterMenu>,
     filter_closed_at: Option<std::time::Instant>,
     /// The search result Up/Down or the pointer picked; `None` paints none.
-    search_highlight: Option<String>,
+    search_highlight: Option<ScopedId>,
     messages: super::palette::MessageSearch,
     /// Keyboard navigation of the rows (`sidebarTree.ts`).
     pub(super) list_focus: FocusHandle,
@@ -118,9 +119,9 @@ pub(super) struct SidebarState {
     pub(super) sheet_toggle: FocusHandle,
     /// The chrome row's brand ("T3 Code home"), Go back and Go forward.
     chrome_focus: [FocusHandle; 3],
-    /// The keyboard row (`thread:<id>`, `shelf:<name>`, `settled:more`), and the rows in order.
-    cursor: Option<SharedString>,
-    nav_rows: Vec<SharedString>,
+    /// The keyboard row, and the rows in order.
+    cursor: Option<NavRow>,
+    nav_rows: Vec<NavRow>,
     search: Entity<InputState>,
     returns: inbox::ReturnTracker,
     /// When `_clock` wakes the sidebar: its next visible label, snooze or hold deadline.
@@ -165,8 +166,11 @@ impl SidebarState {
     }
 
     /// The thread rows as last drawn, top to bottom (the web's `orderedThreadKeys`).
-    pub(super) fn ordered_thread_ids(&self) -> impl Iterator<Item = &str> {
-        self.nav_rows.iter().filter_map(|key| key.strip_prefix("thread:"))
+    pub(super) fn ordered_threads(&self) -> impl Iterator<Item = &ScopedId> {
+        self.nav_rows.iter().filter_map(|row| match row {
+            NavRow::Thread(key) => Some(key),
+            _ => None,
+        })
     }
 
     pub(super) fn new(window: &mut Window, cx: &mut Context<Workspace>) -> Self {
@@ -259,12 +263,20 @@ fn reveal_widens_scope(thread: &ThreadShell, groups: &[ProjectGroup], scope: &[S
         && thread.is_listed()
         && thread.archived_at.is_none()
         && thread.deleted_at.is_none()
-        && !scoped.iter().any(|g| g.project_ids.contains(&thread.project_id))
+        && !scoped.iter().any(|g| g.contains_ref(thread.project_ref()))
 }
 
 /// The filter's groups that still exist and are open, in sidebar order; empty is all projects.
 fn scoped_groups<'g>(groups: &'g [ProjectGroup], scope: &[String]) -> Vec<&'g ProjectGroup> {
     project_groups::pickable(groups).into_iter().filter(|g| scope.contains(&g.key)).collect()
+}
+
+/// The open thread of a target, on its environment.
+fn target_thread_ref(target: &Target) -> Option<ThreadRef<'_>> {
+    match target {
+        Target::Thread { env, id } => Some((env, id)),
+        Target::Draft { .. } => None,
+    }
 }
 
 /// `resolveSidebarStageBackdropVariant`: the stage art behind the sidebar header and on the
@@ -405,12 +417,27 @@ struct OpenMenu {
     position: Point<Pixels>,
     anchor: Anchor,
     /// The row that opened it; its hover controls stay up while it is open.
-    owner: Option<String>,
+    owner: Option<ScopedId>,
     _dismiss: Subscription,
 }
 
 /// Drag payload for the resize rail.
 struct SidebarResize;
+
+/// A row the list's keyboard cursor rests on (`sidebarTree.ts`).
+#[derive(Clone, PartialEq, Eq)]
+enum NavRow {
+    Thread(ScopedId),
+    /// A boring sidebar folder, by group key.
+    Folder(String),
+    Shelf(Shelf),
+    SettledMore,
+}
+
+/// A row element's id: thread ids repeat across environments, so it names both.
+fn row_id(prefix: &str, env: &str, id: &str) -> SharedString {
+    format!("{prefix}:{env}:{id}").into()
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Shelf {
@@ -452,22 +479,26 @@ enum Item<'a> {
 }
 
 impl Item<'_> {
-    fn thread_id(&self) -> Option<String> {
+    fn thread(&self) -> Option<&ThreadShell> {
         match self {
-            Item::Card(facts) | Item::Slim(facts, _) | Item::FolderRow(facts) => Some(facts.thread.id.clone()),
+            Item::Card(facts) | Item::Slim(facts, _) | Item::FolderRow(facts) => Some(facts.thread),
             _ => None,
         }
     }
 
+    fn thread_key(&self) -> Option<ScopedId> {
+        self.thread().map(ScopedId::of_thread)
+    }
+
     /// The keyboard-navigation key of a focusable row.
-    fn nav_key(&self) -> Option<SharedString> {
+    fn nav_key(&self) -> Option<NavRow> {
         match self {
             Item::Card(facts) | Item::Slim(facts, _) | Item::FolderRow(facts) => {
-                Some(format!("thread:{}", facts.thread.id).into())
+                Some(NavRow::Thread(ScopedId::of_thread(facts.thread)))
             }
-            Item::Folder { group, .. } => Some(format!("folder:{}", group.key).into()),
-            Item::Header { shelf, .. } => Some(format!("shelf:{}", shelf.label()).into()),
-            Item::ShowMore(_) => Some("settled:more".into()),
+            Item::Folder { group, .. } => Some(NavRow::Folder(group.key.clone())),
+            Item::Header { shelf, .. } => Some(NavRow::Shelf(*shelf)),
+            Item::ShowMore(_) => Some(NavRow::SettledMore),
             _ => None,
         }
     }
@@ -545,24 +576,22 @@ impl SidebarState {
         boring: bool,
         now: i64,
     ) -> Vec<Item<'a>> {
-        fn route_only<'a>(list: Vec<Facts<'a>>, expanded: bool, route: Option<&str>) -> Vec<Facts<'a>> {
-            if expanded { list } else { list.into_iter().filter(|f| Some(f.thread.id.as_str()) == route).collect() }
+        fn route_only<'a>(list: Vec<Facts<'a>>, expanded: bool, route: Option<ThreadRef>) -> Vec<Facts<'a>> {
+            if expanded { list } else { list.into_iter().filter(|f| Some(f.thread.thread_ref()) == route).collect() }
         }
-        let route = match target {
-            Some(Target::Thread { id, .. }) => Some(id.as_str()),
-            _ => None,
-        };
+        let route = target.and_then(target_thread_ref);
         let scoped = scoped_groups(groups, &self.scope);
-        let scope_ids: Option<HashSet<&str>> = (!scoped.is_empty())
-            .then(|| scoped.iter().flat_map(|g| g.project_ids.iter().map(String::as_str)).collect());
-        let in_scope = |project_id: &str| scope_ids.as_ref().is_none_or(|ids| ids.contains(project_id));
+        let scope_ids: Option<HashSet<ThreadRef>> = (!scoped.is_empty()).then(|| {
+            scoped.iter().flat_map(|g| g.project_refs.iter().map(|(env, id)| (env.as_ref(), id.as_str()))).collect()
+        });
+        let in_scope = |project: ThreadRef| scope_ids.as_ref().is_none_or(|ids| ids.contains(&project));
         // Folders already separate the work, so boring mode has no Working shelf.
         let sections =
             inbox::partition(&shell.threads, now, working_shelf && !boring, boring, &mut self.returns, |t| {
-                in_scope(&t.project_id)
+                in_scope(t.project_ref())
             });
         let mut items: Vec<Item> =
-            drafts.into_iter().filter(|row| in_scope(&row.project_id)).map(Item::Draft).collect();
+            drafts.into_iter().filter(|row| in_scope(row.project.pair())).map(Item::Draft).collect();
         if !items.is_empty() {
             items.push(Item::DraftDivider);
         }
@@ -575,13 +604,12 @@ impl SidebarState {
                 scoped.clone()
             };
             let keep_empty = |g: &ProjectGroup| !scoped.is_empty() || (g.pinned && !g.archived);
-            let folders =
-                project_groups::folders(&folders, sections.active, |f| f.thread.project_id.as_str(), keep_empty);
+            let folders = project_groups::folders(&folders, sections.active, |f| f.thread.project_ref(), keep_empty);
             for (group, threads) in folders {
                 let collapsed = self.collapsed_folders.contains(&group.key);
                 // A closed folder still shows the open thread, and hints at the rest.
                 let (shown, hidden): (Vec<Facts>, Vec<Facts>) = if collapsed {
-                    threads.into_iter().partition(|f| Some(f.thread.id.as_str()) == route)
+                    threads.into_iter().partition(|f| Some(f.thread.thread_ref()) == route)
                 } else {
                     (threads, Vec::new())
                 };
@@ -613,7 +641,7 @@ impl SidebarState {
         let mut settled: Vec<Facts<'_>> = sections.settled;
         let hidden = total.saturating_sub(self.settled_visible);
         if hidden > 0 {
-            let route_row = settled[self.settled_visible..].iter().position(|f| Some(f.thread.id.as_str()) == route);
+            let route_row = settled[self.settled_visible..].iter().position(|f| Some(f.thread.thread_ref()) == route);
             let route_row = route_row.map(|i| settled[self.settled_visible + i]);
             settled.truncate(self.settled_visible);
             settled.extend(route_row);
@@ -720,11 +748,13 @@ impl Workspace {
         cache.groups.clone()
     }
 
-    /// The project ids the filter keeps, or `None` for all projects.
-    fn scoped_project_ids(&self) -> Option<HashSet<String>> {
+    /// The projects the filter keeps, on their environments, or `None` for all projects.
+    fn scoped_projects(&self) -> Option<HashSet<ScopedId>> {
         let groups = self.project_groups();
         let scoped = scoped_groups(&groups, &self.sidebar.scope);
-        (!scoped.is_empty()).then(|| scoped.iter().flat_map(|g| g.project_ids.iter().cloned()).collect())
+        (!scoped.is_empty()).then(|| {
+            scoped.iter().flat_map(|g| g.project_refs.iter().map(|(env, id)| ScopedId::new(env.clone(), id))).collect()
+        })
     }
 
     /// The boring sidebar (Labs), also on for users of the removed legacy sidebar.
@@ -775,6 +805,11 @@ impl Workspace {
             Some(Target::Thread { id, .. }) => Some(id),
             _ => None,
         }
+    }
+
+    /// The open thread on its environment.
+    pub(super) fn route_key(&self) -> Option<ThreadRef<'_>> {
+        self.target.as_ref().and_then(target_thread_ref)
     }
 
     /// Wakes the sidebar after `delay` ms, replacing a pending wake for another time.
@@ -839,44 +874,44 @@ impl Workspace {
     }
 
     /// A row click opens the thread; the second click of a double-click renames it.
-    fn click_row(&mut self, thread_id: &str, event: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn click_row(&mut self, key: &ScopedId, event: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
         let modifiers = event.modifiers();
         let toggle = if cfg!(target_os = "macos") { modifiers.platform } else { modifiers.control };
         if toggle {
-            self.sidebar.selection.toggle(thread_id);
+            self.sidebar.selection.toggle(key);
             self.notify_sidebar(cx);
             return;
         }
         if modifiers.shift {
             let order = std::mem::take(&mut self.sidebar.thread_order);
-            self.sidebar.selection.range_to(thread_id, &order);
+            self.sidebar.selection.range_to(key, &order);
             self.sidebar.thread_order = order;
             self.notify_sidebar(cx);
             return;
         }
         if event.click_count() >= 2 {
             // Opening a thread can move the rows, so the second click may land on another one.
-            let same_row = self.sidebar.clicked.as_deref() == Some(thread_id);
+            let same_row = self.sidebar.clicked.as_ref() == Some(key);
             if same_row && !event.modifiers().modified() && self.sidebar.renaming.is_none() {
-                self.start_rename(thread_id, MenuOrigin::Sidebar, window, cx);
+                self.start_rename(key, MenuOrigin::Sidebar, window, cx);
             }
             return;
         }
-        self.sidebar.clicked = Some(thread_id.to_owned());
+        self.sidebar.clicked = Some(key.clone());
         self.sidebar.selection.clear();
-        self.sidebar.selection.set_anchor(thread_id);
-        self.select_thread(thread_id.to_owned(), window, cx);
+        self.sidebar.selection.set_anchor(key);
+        self.select_thread_in(key.env.clone(), key.id.clone(), window, cx);
         self.notify_sidebar(cx);
     }
 
     /// The right-click menu builder for a row.
     fn row_menu(
         &self,
-        thread_id: &str,
+        thread: &ThreadShell,
         cx: &mut Context<Self>,
     ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
         let view = cx.weak_entity();
-        let thread_id = thread_id.to_owned();
+        let thread_id = ScopedId::of_thread(thread);
         move |menu, window, cx| {
             let Some(workspace) = view.upgrade() else { return menu };
             workspace.update(cx, |this, cx| {
@@ -904,11 +939,16 @@ impl Workspace {
         }
     }
 
-    /// The pinned card's pin, a button that unpins (`Pin` swaps to `PinOff` on hover).
-    fn render_unpin(&self, thread_id: &str, tokens: &Tokens, cx: &mut Context<Self>) -> AnyElement {
-        let group = SharedString::from(format!("unpin-{thread_id}"));
-        let id = thread_id.to_owned();
+    /// The pinned card's pin, a button that unpins (`Pin` swaps to `PinOff` on hover). A
+    /// connection that can't unpin it, or a machine whose config hasn't loaded, shows the pin.
+    fn render_unpin(&self, thread: &ThreadShell, tokens: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let muted = tokens.muted_foreground.opacity(0.65);
+        let loaded = self.env_info(&thread.environment_id).is_some_and(|info| info.environment_id.is_some());
+        if !loaded || !self.can_operate(&thread.environment_id) {
+            return div().flex_none().child(icon(IconName::Pin, 12., muted)).into_any_element();
+        }
+        let group = row_id("unpin", &thread.environment_id, &thread.id);
+        let id = ScopedId::of_thread(thread);
         let fg = tokens.sidebar.foreground;
         div()
             .id(group.clone())
@@ -940,12 +980,12 @@ impl Workspace {
     fn with_rename<E: gpui_kit::ParentElement + gpui_kit::Styled>(
         &self,
         el: E,
-        thread_id: &str,
+        thread: &ThreadShell,
         left: f32,
         tokens: &Tokens,
         cx: &mut Context<Self>,
     ) -> E {
-        let Some(renaming) = self.sidebar.renaming.as_ref().filter(|r| r.thread_id == thread_id) else { return el };
+        let Some(renaming) = self.sidebar.renaming.as_ref().filter(|r| r.thread.is_thread(thread)) else { return el };
         el.relative().child(
             div()
                 .id("sidebar-rename")
@@ -978,25 +1018,25 @@ impl Workspace {
 
     /// Tracks the row under the pointer and opens its hover card after 150 ms
     /// (`Sidebar.tsx` row tooltip delay).
-    fn hover_row(&mut self, thread_id: &str, hovered: bool, cx: &mut Context<Self>) {
+    fn hover_row(&mut self, key: &ScopedId, hovered: bool, cx: &mut Context<Self>) {
         if hovered {
-            if self.sidebar.hovered.as_deref() == Some(thread_id) {
+            if self.sidebar.hovered.as_ref() == Some(key) {
                 return;
             }
-            self.sidebar.hovered = Some(thread_id.to_owned());
+            self.sidebar.hovered = Some(key.clone());
             self.sidebar.hover_card = None;
-            let thread_id = thread_id.to_owned();
+            let key = key.clone();
             self.sidebar._hover_card_delay = Some(cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(Duration::from_millis(150)).await;
                 let _ = this.update(cx, |this, cx| {
-                    if this.sidebar.hovered.as_ref() == Some(&thread_id) {
-                        this.read_checkout_branch(&thread_id, cx);
-                        this.sidebar.hover_card = Some(thread_id);
+                    if this.sidebar.hovered.as_ref() == Some(&key) {
+                        this.read_checkout_branch(&key, cx);
+                        this.sidebar.hover_card = Some(key);
                         this.notify_sidebar(cx);
                     }
                 });
             }));
-        } else if self.sidebar.hovered.as_deref() == Some(thread_id) {
+        } else if self.sidebar.hovered.as_ref() == Some(key) {
             self.sidebar.hovered = None;
             self.sidebar.hover_card = None;
             self.sidebar._hover_card_delay = None;
@@ -1028,23 +1068,23 @@ impl Workspace {
 
     /// A local thread's checkout may have moved to another branch since; the hover card warns
     /// then (`resolveLocalCheckoutBranchMismatch`). Read fresh each time a card opens.
-    fn read_checkout_branch(&mut self, thread_id: &str, cx: &mut Context<Self>) {
-        let Some(thread) = self.shell.threads.iter().find(|t| t.id == thread_id) else { return };
+    fn read_checkout_branch(&mut self, key: &ScopedId, cx: &mut Context<Self>) {
+        let Some(thread) = self.shell.thread(key) else { return };
         if thread.worktree_path.is_some() || thread.branch.is_none() {
             return;
         }
-        let Some(cwd) =
-            self.shell.projects.iter().find(|p| p.id == thread.project_id).map(|p| p.workspace_root.clone())
-        else {
+        let Some(cwd) = self.shell.project(&ScopedId::thread_project(thread)).map(|p| p.workspace_root.clone()) else {
             return;
         };
-        let Some(client) = self.thread_client(&thread.id) else { return };
+        let Some(client) = self.env_client(&key.env) else { return };
+        let env = key.env.clone();
         cx.spawn(async move |this, cx| {
             let Ok(status) = client.request("vcs.refreshStatus", json!({"cwd": cwd})).await else { return };
             let Some(branch) = status["refName"].as_str().map(str::to_owned) else { return };
             let _ = this.update(cx, |this, cx| {
-                if this.sidebar.checkout_branches.get(&cwd) != Some(&branch) {
-                    this.sidebar.checkout_branches.insert(cwd, branch);
+                let branches = this.sidebar.checkout_branches.entry(env).or_default();
+                if branches.get(&cwd) != Some(&branch) {
+                    branches.insert(cwd, branch);
                     this.notify_sidebar(cx);
                 }
             });
@@ -1055,7 +1095,7 @@ impl Workspace {
     /// The row's hover card, drawn to the right of the row (`SidebarThreadTooltip`).
     fn render_hover_card(&self, facts: &Facts, project: Option<&ProjectShell>, tokens: &Tokens) -> Option<AnyElement> {
         let thread = facts.thread;
-        if self.sidebar.hover_card.as_deref() != Some(thread.id.as_str())
+        if !self.sidebar.hover_card.as_ref().is_some_and(|key| key.is_thread(thread))
             || self.sidebar.menu.is_some()
             || self.sidebar.renaming.is_some()
         {
@@ -1104,7 +1144,7 @@ impl Workspace {
             });
         let mismatch = thread.worktree_path.is_none()
             && project
-                .and_then(|p| self.sidebar.checkout_branches.get(&p.workspace_root))
+                .and_then(|p| self.sidebar.checkout_branches.get(&p.environment_id)?.get(&p.workspace_root))
                 .is_some_and(|current| thread.branch.as_ref().is_some_and(|branch| branch != current));
         let mismatch = mismatch.then(|| {
             h_flex()
@@ -1220,12 +1260,6 @@ impl Workspace {
         let last = rows.len() - 1;
         let at = self.sidebar.cursor.as_ref().and_then(|key| rows.iter().position(|r| r == key));
         let key = at.map(|i| rows[i].clone());
-        let shelf_of = |key: &str| match key.strip_prefix("shelf:")? {
-            "Working" => Some(Shelf::Working),
-            "Snoozed" => Some(Shelf::Snoozed),
-            "Settled" => Some(Shelf::Settled),
-            _ => None,
-        };
         let expanded = |this: &Self, shelf| match shelf {
             Shelf::Working => this.sidebar.working_expanded,
             Shelf::Snoozed => this.sidebar.snoozed_expanded,
@@ -1240,7 +1274,7 @@ impl Workspace {
         };
         if let Some(index) = move_to {
             self.sidebar.cursor = Some(rows[index].clone());
-        } else if let Some(folder) = key.as_deref().and_then(|key| key.strip_prefix("folder:")) {
+        } else if let Some(NavRow::Folder(folder)) = &key {
             let collapsed = self.sidebar.collapsed_folders.contains(folder);
             match event.keystroke.key.as_str() {
                 "enter" | "space" => {}
@@ -1248,27 +1282,17 @@ impl Workspace {
                 "left" if !collapsed => {}
                 _ => return,
             }
-            let folder = folder.to_owned();
-            self.toggle_folder(&folder, cx);
+            self.toggle_folder(folder, cx);
         } else {
             let Some(key) = key else { return };
-            match (event.keystroke.key.as_str(), shelf_of(&key)) {
-                ("enter" | "space", Some(shelf)) => self.toggle_shelf(shelf, cx),
-                ("right", Some(shelf)) if !expanded(self, shelf) => self.toggle_shelf(shelf, cx),
-                ("left", Some(shelf)) if expanded(self, shelf) => self.toggle_shelf(shelf, cx),
-                ("enter" | "space", None) if key.as_ref() == "settled:more" => {
-                    self.sidebar.settled_visible += SETTLED_PAGE;
-                }
-                ("enter" | "space", None) => {
-                    if let Some(id) = key.strip_prefix("thread:") {
-                        self.select_thread(id.to_owned(), window, cx);
-                    }
-                }
-                ("f2", None) => {
-                    if let Some(id) = key.strip_prefix("thread:") {
-                        self.start_rename(id, MenuOrigin::Sidebar, window, cx);
-                    }
-                }
+            match (event.keystroke.key.as_str(), key) {
+                ("enter" | "space", NavRow::Shelf(shelf)) => self.toggle_shelf(shelf, cx),
+                ("right", NavRow::Shelf(shelf)) if !expanded(self, shelf) => self.toggle_shelf(shelf, cx),
+                ("left", NavRow::Shelf(shelf)) if expanded(self, shelf) => self.toggle_shelf(shelf, cx),
+                ("enter" | "space", NavRow::SettledMore) => self.sidebar.settled_visible += SETTLED_PAGE,
+                ("enter" | "space", NavRow::Thread(thread)) => self.select_thread_in(thread.env, thread.id, window, cx),
+                // `startRename` refuses a read-only connection.
+                ("f2", NavRow::Thread(thread)) => self.start_rename(&thread, MenuOrigin::Sidebar, window, cx),
                 _ => return,
             }
         }
@@ -1276,10 +1300,11 @@ impl Workspace {
         self.notify_sidebar(cx);
     }
 
-    /// `/projects/$projectKey`: Settings › Projects with the group holding `project_id` picked,
+    /// `/projects/$projectKey`: Settings › Projects with the group holding `project` picked,
     /// on every environment (`getSidebarProjectSettingsKey`, resolved as Settings groups them).
-    pub(in crate::app) fn open_project_settings(&mut self, project_id: &str, cx: &mut Context<Self>) {
-        let project = self.settings_project_groups().into_iter().find(|g| g.contains(project_id)).map(|g| g.key);
+    pub(in crate::app) fn open_project_settings(&mut self, project: &ScopedId, cx: &mut Context<Self>) {
+        let project =
+            self.settings_project_groups().into_iter().find(|g| g.contains_ref(project.pair())).map(|g| g.key);
         self.settings_ui.scope = crate::settings::scope::ScopeSearch { project, machine: None };
         self.open_settings("projects", cx);
     }
@@ -1287,14 +1312,15 @@ impl Workspace {
     /// A new thread route that the filter hides widens it to every project, like the web's
     /// route reveal, so history, links and the palette never open a thread with no row.
     fn reveal_route(&mut self, groups: &[ProjectGroup], searching: bool) {
-        let Some(route) = self.route_thread().map(str::to_owned) else { return };
-        if self.sidebar.route_seen.as_ref() != Some(&route) {
+        let Some(route) = self.route_key() else { return };
+        if self.sidebar.route_seen.as_ref().is_none_or(|seen| seen.pair() != route) {
+            let route = ScopedId::new(route.0.to_owned(), route.1);
             self.sidebar.route_seen = Some(route.clone());
             self.sidebar.reveal = Some(route);
         }
         // Search results replace the thread list; the reveal waits for it to return.
-        let Some(pending) = self.sidebar.reveal.as_deref().filter(|_| !searching) else { return };
-        let Some(thread) = self.shell.threads.iter().find(|t| t.id == pending) else { return };
+        let Some(pending) = self.sidebar.reveal.as_ref().filter(|_| !searching) else { return };
+        let Some(thread) = self.shell.thread(pending) else { return };
         if reveal_widens_scope(thread, groups, &self.sidebar.scope) {
             self.sidebar.selection.clear();
             self.sidebar.scope.clear();
@@ -1325,16 +1351,16 @@ impl Workspace {
         self.notify_sidebar(cx);
     }
 
-    /// New thread in the open thread's project, else the first project.
-    pub(super) fn new_thread_project(&self) -> Option<String> {
+    /// New thread in the open thread's project, else the first project, on its environment.
+    pub(super) fn new_thread_project(&self) -> Option<ScopedId> {
         let current = match &self.target {
-            Some(Target::Thread { id, .. }) => {
-                self.shell.threads.iter().find(|t| &t.id == id).map(|t| t.project_id.clone())
+            Some(Target::Thread { env, id }) => {
+                self.shell.thread(&ScopedId::new(env.clone(), id.as_str())).map(ScopedId::thread_project)
             }
-            Some(Target::Draft { project_id, .. }) => Some(project_id.clone()),
+            Some(Target::Draft { env, project_id }) => Some(ScopedId::new(env.clone(), project_id.as_str())),
             None => None,
         };
-        current.or_else(|| self.shell.projects.iter().find(|p| p.archived_at.is_none()).map(|p| p.id.clone()))
+        current.or_else(|| self.shell.projects.iter().find(|p| p.archived_at.is_none()).map(ScopedId::of_project))
     }
 
     /// Re-renders the sidebar. It is a cached view: the workspace re-rendering
@@ -1365,6 +1391,7 @@ impl Workspace {
 
     pub(super) fn render_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.load_favicons(cx);
+        self.drop_unoperable_renames();
         let tokens = *crate::theme::tokens(cx);
         let sb = tokens.sidebar;
         let now = now_ms();
@@ -1378,26 +1405,29 @@ impl Workspace {
         let draft_rows = self.draft_rows();
         let items =
             self.sidebar.items(&self.shell, &groups, self.target.as_ref(), draft_rows, working_shelf, boring, now);
-        let revealed = (self.sidebar.reveal.as_deref())
+        let revealed = (self.sidebar.reveal.as_ref())
             .filter(|_| query.is_empty())
-            .and_then(|id| items.iter().position(|item| item.thread_id().as_deref() == Some(id)));
+            .and_then(|key| items.iter().position(|item| item.thread().is_some_and(|t| key.is_thread(t))));
         if let Some(index) = revealed {
             self.sidebar.reveal = None;
             self.sidebar.scroll.scroll_to_item(index);
         }
         let clock = self.sidebar.next_clock_change(&items, &self.shell.threads, now);
-        let projects: HashMap<&str, &ProjectShell> = self.shell.projects.iter().map(|p| (p.id.as_str(), p)).collect();
-        let route = self.route_thread();
-        let label_of: HashMap<&str, &str> = groups
+        let projects: HashMap<ThreadRef, &ProjectShell> =
+            self.shell.projects.iter().map(|p| (p.project_ref(), p)).collect();
+        let route = self.route_key();
+        let label_of: HashMap<ThreadRef, &str> = groups
             .iter()
-            .flat_map(|g| g.project_ids.iter().map(move |id| (id.as_str(), g.display_name.as_str())))
+            .flat_map(|g| {
+                g.project_refs.iter().map(move |(env, id)| ((env.as_ref(), id.as_str()), g.display_name.as_str()))
+            })
             .collect();
-        let inbox_order: Vec<String> = items
+        let inbox_order: Vec<ScopedId> = items
             .iter()
-            .filter_map(|item| matches!(item, Item::Card(_) | Item::FolderRow(_)).then(|| item.thread_id()).flatten())
+            .filter_map(|item| matches!(item, Item::Card(_) | Item::FolderRow(_)).then(|| item.thread_key()).flatten())
             .collect();
-        let nav_rows: Vec<SharedString> = items.iter().filter_map(Item::nav_key).collect();
-        let thread_order: Vec<String> = items.iter().filter_map(Item::thread_id).collect();
+        let nav_rows: Vec<NavRow> = items.iter().filter_map(Item::nav_key).collect();
+        let thread_order: Vec<ScopedId> = items.iter().filter_map(Item::thread_key).collect();
         let list_focused = self.sidebar.list_focus.is_focused(window);
         let cursor = self.sidebar.cursor.clone().filter(|_| list_focused);
         let has_rows = items.iter().any(|item| {
@@ -1417,30 +1447,30 @@ impl Workspace {
                 let ring = cursor.as_ref().is_some_and(|cursor| item.nav_key().as_ref() == Some(cursor));
                 let element = match item {
                     Item::Draft(row) => {
-                        self.render_draft(&row, projects.get(row.project_id.as_str()).copied(), &tokens, cx)
+                        self.render_draft(&row, projects.get(&row.project.pair()).copied(), &tokens, cx)
                     }
                     Item::DraftDivider => {
                         div().mx(px(10.)).my(px(6.)).h(px(1.)).bg(sb.border.opacity(0.6)).into_any_element()
                     }
                     Item::Card(facts) => {
-                        let active = route == Some(facts.thread.id.as_str());
-                        let project_id = facts.thread.project_id.as_str();
-                        let label = label_of.get(project_id).map(|name| SharedString::from(name.to_string()));
-                        self.render_card(facts, projects.get(project_id).copied(), label, active, now, &tokens, cx)
+                        let active = route == Some(facts.thread.thread_ref());
+                        let project = facts.thread.project_ref();
+                        let label = label_of.get(&project).map(|name| SharedString::from(name.to_string()));
+                        self.render_card(facts, projects.get(&project).copied(), label, active, now, &tokens, cx)
                     }
                     Item::Folder { group, collapsed, hidden, dot } => {
                         self.render_folder(group, collapsed, hidden, dot, index == 0, &tokens, cx)
                     }
                     Item::FolderRow(facts) => {
-                        let active = route == Some(facts.thread.id.as_str());
-                        let project = projects.get(facts.thread.project_id.as_str()).copied();
+                        let active = route == Some(facts.thread.thread_ref());
+                        let project = projects.get(&facts.thread.project_ref()).copied();
                         self.render_folder_row(facts, project, multiline, active, now, &tokens, cx)
                     }
                     Item::Slim(facts, shelf) => {
-                        let active = route == Some(facts.thread.id.as_str());
+                        let active = route == Some(facts.thread.thread_ref());
                         self.render_slim(
                             facts,
-                            projects.get(facts.thread.project_id.as_str()).copied(),
+                            projects.get(&facts.thread.project_ref()).copied(),
                             shelf,
                             active,
                             now,
@@ -1913,8 +1943,8 @@ impl Workspace {
         let status = facts.status();
         let unread = facts.is_unread();
         let woke = facts.is_woke(now);
-        let selected = !active && self.sidebar.selection.contains(&thread.id);
-        let draft = !active && self.has_unsent_draft(&thread.id);
+        let selected = !active && self.sidebar.selection.has(thread);
+        let draft = !active && self.has_unsent_draft(thread);
         let recede = inbox::recedes(status, unread, woke, active || selected);
         let top = top_status(status, woke, unread, thread.goal.as_ref().is_some_and(|g| g.status == "active"), tokens);
         let woke_status = top.is_some_and(|(_, label, _)| label == "Woke");
@@ -1931,20 +1961,22 @@ impl Workspace {
                 .child(icon(name, 16., color))
                 .child(label)
                 .children(duration_from.map(|from| inbox::format_duration(now - from)))
-                .map(|el| if woke_status { self.woke_dismiss(el, &thread.id, cx) } else { el.into_any_element() }),
+                .map(|el| if woke_status { self.woke_dismiss(el, thread, cx) } else { el.into_any_element() }),
             None => div()
                 .text_color(sb.secondary_label)
                 .children(facts.activity_timestamp().map(|at| inbox::format_relative(now - at)))
                 .into_any_element(),
         };
-        let menu_open = self.sidebar.menu.as_ref().is_some_and(|m| m.owner.as_deref() == Some(thread.id.as_str()))
-            || self.sidebar.context_menu.as_deref() == Some(thread.id.as_str());
-        let hovered = self.sidebar.hovered.as_deref() == Some(thread.id.as_str());
-        let thread_id = thread.id.clone();
-        let snooze = facts.can_snooze(now).then(|| {
-            let thread_id = thread.id.clone();
+        let is_row = |key: &Option<ScopedId>| key.as_ref().is_some_and(|key| key.is_thread(thread));
+        let menu_open =
+            self.sidebar.menu.as_ref().is_some_and(|m| is_row(&m.owner)) || is_row(&self.sidebar.context_menu);
+        let hovered = is_row(&self.sidebar.hovered);
+        let thread_id = ScopedId::of_thread(thread);
+        // `showSnoozeButton`: only where this connection may change the thread.
+        let snooze = (facts.can_snooze(now) && self.can_operate(&thread.environment_id)).then(|| {
+            let thread_id = thread_id.clone();
             div()
-                .id(SharedString::from(format!("snooze-{}", thread.id)))
+                .id(row_id("snooze", &thread.environment_id, &thread.id))
                 .flex()
                 .h_full()
                 .items_center()
@@ -1961,7 +1993,7 @@ impl Workspace {
                 .child(Icon::new(IconName::Clock).size(px(12.)))
         });
         let settle = div()
-            .id(SharedString::from(format!("settle-{}", thread.id)))
+            .id(row_id("settle", &thread.environment_id, &thread.id))
             .flex()
             .items_center()
             .gap(px(4.))
@@ -1979,9 +2011,9 @@ impl Workspace {
             .child(Icon::new(IconName::Check).size(px(14.)))
             .child("Settle");
         let discard = draft.then(|| {
-            let target = self.thread_target(&thread.id);
+            let target = Target::Thread { env: thread.environment_id.clone(), id: thread.id.clone() };
             div()
-                .id(SharedString::from(format!("discard-{}", thread.id)))
+                .id(row_id("discard", &thread.environment_id, &thread.id))
                 .flex()
                 .h_full()
                 .items_center()
@@ -1993,9 +2025,7 @@ impl Workspace {
                 .tooltip(tooltip("Discard draft"))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
-                    if let Some(target) = target.clone() {
-                        this.discard_draft(target, window, cx);
-                    }
+                    this.discard_draft(target.clone(), window, cx);
                 }))
                 .child(Icon::new(IconName::X).size(px(14.)))
         });
@@ -2023,8 +2053,8 @@ impl Workspace {
             sb.foreground
         };
         let regenerating = thread.title_regeneration.is_some();
-        let open_id = thread.id.clone();
-        let hover_id = thread.id.clone();
+        let open_id = ScopedId::of_thread(thread);
+        let hover_id = open_id.clone();
         let has_meta = meta.is_some();
         let receding_run = recede && matches!(status, Status::Working | Status::Preparing);
         // `align="start"` against the row, inside the list item's `py-0.5`.
@@ -2037,7 +2067,7 @@ impl Workspace {
             .children(hover_card)
             .child(
                 div()
-                    .id(SharedString::from(format!("thread-{}", thread.id)))
+                    .id(row_id("thread", &thread.environment_id, &thread.id))
                     .group(ROW_GROUP)
                     .on_hover(cx.listener(move |this, hovered: &bool, _, cx| this.hover_row(&hover_id, *hovered, cx)))
                     .rounded(px(6.))
@@ -2067,10 +2097,10 @@ impl Workspace {
                                     .h(px(20.))
                                     .min_w_0()
                                     .gap(px(6.))
-                                    .when(draft, |el| el.child(drafts::unsent_draft_marker(&thread.id, tokens)))
+                                    .when(draft, |el| el.child(drafts::unsent_draft_marker(thread, tokens)))
                                     .children(project.map(|p| project_icon(p, tokens, false, 16., self.favicon(p))))
                                     .when(thread.pinned_at.is_some(), |el| {
-                                        el.child(self.render_unpin(&thread.id, tokens, cx))
+                                        el.child(self.render_unpin(thread, tokens, cx))
                                     })
                                     .child(
                                         text_xs(div())
@@ -2101,12 +2131,12 @@ impl Workspace {
                                             .child(thread.title.clone()),
                                     )
                                     .children(title_icons)
-                                    .map(|el| self.with_rename(el, &thread.id, 0., tokens, cx)),
+                                    .map(|el| self.with_rename(el, thread, 0., tokens, cx)),
                             )
                             .children(meta),
                     )
                     .on_mouse_down(gpui_kit::MouseButton::Right, cx.listener(|this, _, _, cx| this.hide_hover_card(cx)))
-                    .context_menu(self.row_menu(&thread.id, cx)),
+                    .context_menu(self.row_menu(thread, cx)),
             )
             .into_any_element()
     }
@@ -2166,7 +2196,7 @@ impl Workspace {
             div().size(px(6.)).flex_none().rounded_full().bg(color)
         });
         let key = group.key.clone();
-        let project_id = representative.id.clone();
+        let project = ScopedId::of_project(representative);
         let new_thread_label: SharedString = format!("New thread in {}", group.display_name).into();
         let new_thread = div()
             .id(SharedString::from(format!("folder-new-{}", group.key)))
@@ -2192,7 +2222,7 @@ impl Workspace {
                     .tooltip(move |window, cx| Tooltip::new(new_thread_label.clone()).build(window, cx))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
-                        this.start_draft(project_id.clone(), window, cx);
+                        this.start_draft_in(project.env.clone(), project.id.clone(), window, cx);
                     }))
                     .child(Icon::new(IconName::SquarePen).size(px(14.))),
             );
@@ -2239,36 +2269,42 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// The folder's right-click menu (`handleProjectFolderContextMenu`).
+    /// The folder's right-click menu (`handleProjectFolderContextMenu`). Pinning shows only
+    /// where this connection may change every member (`canPinProjectGroup`), read on open.
     fn folder_menu(
         &self,
         group: &ProjectGroup,
         cx: &mut Context<Self>,
     ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
         let workspace = cx.weak_entity();
-        let project_id = group.representative().id.clone();
+        let project = ScopedId::of_project(group.representative());
         let root = group.representative().workspace_root.clone();
-        let member_ids: Vec<String> = group.members.iter().map(|m| m.project.id.clone()).collect();
+        let members = group.member_refs();
         let pinned = group.pinned;
-        move |menu, _, _| {
-            let (new_in, pin) = (workspace.clone(), workspace.clone());
-            let settings = workspace.clone();
-            let (project_id, root, member_ids) = (project_id.clone(), root.clone(), member_ids.clone());
-            let settings_project = project_id.clone();
-            menu.item(PopupMenuItem::new("New thread").on_click(move |_, window, cx| {
-                let _ = new_in.update(cx, |this, cx| this.start_draft(project_id.clone(), window, cx));
-            }))
-            .item(PopupMenuItem::new("Copy path").on_click(move |_, _, cx| {
-                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(root.clone()));
-            }))
-            .item(
-                PopupMenuItem::new(if pinned { "Unpin project" } else { "Pin project" })
-                    .icon(Icon::new(if pinned { IconName::PinOff } else { IconName::Pin }))
-                    .on_click(move |_, _, cx| {
-                        let _ = pin.update(cx, |this, cx| this.set_projects_pinned(&member_ids, !pinned, cx));
-                    }),
-            )
-            .item(PopupMenuItem::new("Project settings").icon(Icon::new(IconName::Settings)).on_click(
+        move |mut menu, _, cx| {
+            let (new_in, settings) = (workspace.clone(), workspace.clone());
+            let (project, settings_project, root) = (project.clone(), project.clone(), root.clone());
+            let can_pin = workspace.upgrade().is_some_and(|w| w.read(cx).can_pin_projects(&members));
+            menu = menu
+                .item(PopupMenuItem::new("New thread").on_click(move |_, window, cx| {
+                    let _ = new_in.update(cx, |this, cx| {
+                        this.start_draft_in(project.env.clone(), project.id.clone(), window, cx);
+                    });
+                }))
+                .item(PopupMenuItem::new("Copy path").on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(root.clone()));
+                }));
+            if can_pin {
+                let (pin, members) = (workspace.clone(), members.clone());
+                menu = menu.item(
+                    PopupMenuItem::new(if pinned { "Unpin project" } else { "Pin project" })
+                        .icon(Icon::new(if pinned { IconName::PinOff } else { IconName::Pin }))
+                        .on_click(move |_, _, cx| {
+                            let _ = pin.update(cx, |this, cx| this.set_projects_pinned(&members, !pinned, cx));
+                        }),
+                );
+            }
+            menu.item(PopupMenuItem::new("Project settings").icon(Icon::new(IconName::Settings)).on_click(
                 move |_, _, cx| {
                     let _ = settings.update(cx, |this, cx| this.open_project_settings(&settings_project, cx));
                 },
@@ -2293,8 +2329,8 @@ impl Workspace {
         let status = facts.status();
         let unread = facts.is_unread();
         let woke = facts.is_woke(now);
-        let selected = !active && self.sidebar.selection.contains(&thread.id);
-        let draft = !active && self.has_unsent_draft(&thread.id);
+        let selected = !active && self.sidebar.selection.has(thread);
+        let draft = !active && self.has_unsent_draft(thread);
         let recede = inbox::recedes(status, unread, woke, active || selected);
         let goal = thread.goal.as_ref().is_some_and(|g| g.status == "active");
         let top = top_status(status, woke, unread, goal, tokens);
@@ -2307,19 +2343,20 @@ impl Workspace {
                 .text_color(color)
                 .child(icon(name, 12., color))
                 .child(label)
-                .map(|el| if woke_status { self.woke_dismiss(el, &thread.id, cx) } else { el.into_any_element() }),
+                .map(|el| if woke_status { self.woke_dismiss(el, thread, cx) } else { el.into_any_element() }),
             None => div()
                 .text_color(sb.secondary_label)
                 .children(facts.activity_timestamp().map(|at| inbox::format_relative(now - at)))
                 .into_any_element(),
         };
-        let thread_id = thread.id.clone();
-        let hovered = self.sidebar.hovered.as_deref() == Some(thread.id.as_str());
+        let thread_id = ScopedId::of_thread(thread);
+        let is_row = |key: &Option<ScopedId>| key.as_ref().is_some_and(|key| key.is_thread(thread));
+        let hovered = is_row(&self.sidebar.hovered);
         // Beside a Woke label the action takes its own place (`isWoke && ...:static`).
         let beside = woke_status && hovered;
-        let menu_open = self.sidebar.context_menu.as_deref() == Some(thread.id.as_str());
+        let menu_open = is_row(&self.sidebar.context_menu);
         let settle = h_flex()
-            .id(SharedString::from(format!("folder-settle-{}", thread.id)))
+            .id(row_id("folder-settle", &thread.environment_id, &thread.id))
             .when(!beside, |el| el.absolute().top_0().bottom_0().right_0().invisible())
             .h_full()
             .px(px(8.))
@@ -2371,16 +2408,17 @@ impl Workspace {
             .when(!multiline, gpui_kit::Styled::size_full)
             .min_w_0()
             .gap(px(10.))
-            .when(draft, |el| el.child(drafts::unsent_draft_marker(&thread.id, tokens)))
+            .when(draft, |el| el.child(drafts::unsent_draft_marker(thread, tokens)))
             .child(title)
-            .map(|el| self.with_rename(el, &thread.id, 36., tokens, cx))
+            .map(|el| self.with_rename(el, thread, 36., tokens, cx))
             .children(title_icons);
         let line = if multiline { line } else { line.children(self.render_running_terminals(&thread.id, cx)) };
         let line = line.child(time_slot);
         let receding_run = recede && matches!(status, Status::Working | Status::Preparing);
-        let (open_id, hover_id) = (thread.id.clone(), thread.id.clone());
+        let open_id = ScopedId::of_thread(thread);
+        let hover_id = open_id.clone();
         v_flex()
-            .id(SharedString::from(format!("thread-{}", thread.id)))
+            .id(row_id("thread", &thread.environment_id, &thread.id))
             .group(ROW_GROUP)
             .relative()
             .flex_none()
@@ -2411,7 +2449,7 @@ impl Workspace {
             .child(line)
             .children(meta)
             .on_mouse_down(gpui_kit::MouseButton::Right, cx.listener(|this, _, _, cx| this.hide_hover_card(cx)))
-            .context_menu(self.row_menu(&thread.id, cx))
+            .context_menu(self.row_menu(thread, cx))
             .into_any_element()
     }
 
@@ -2430,8 +2468,8 @@ impl Workspace {
         let status = facts.status();
         let unread = facts.is_unread();
         let woke = facts.is_woke(now);
-        let selected = !active && self.sidebar.selection.contains(&thread.id);
-        let draft = !active && self.has_unsent_draft(&thread.id);
+        let selected = !active && self.sidebar.selection.has(thread);
+        let draft = !active && self.has_unsent_draft(thread);
         let recede = inbox::recedes(status, unread, woke, active || selected);
         let settled = shelf == Some(Shelf::Settled);
         let title_color = if (settled && !active) || recede {
@@ -2458,7 +2496,7 @@ impl Workspace {
                     .text_color(color)
                     .child(icon(IconName::AlarmClock, 12., color))
                     .child("Woke");
-                self.woke_dismiss(label, &thread.id, cx)
+                self.woke_dismiss(label, thread, cx)
             }
             _ => {
                 let at = if settled { facts.settled_timestamp() } else { facts.activity_timestamp() };
@@ -2473,13 +2511,14 @@ impl Workspace {
             Some(Shelf::Snoozed) => Some((Shelf::Snoozed, IconName::AlarmClockOff, 12., "Wake thread now")),
             _ => None,
         };
-        let hovered = self.sidebar.hovered.as_deref() == Some(thread.id.as_str());
+        let is_row = |key: &Option<ScopedId>| key.as_ref().is_some_and(|key| key.is_thread(thread));
+        let hovered = is_row(&self.sidebar.hovered);
         let beside = woke && hovered;
-        let menu_open = self.sidebar.context_menu.as_deref() == Some(thread.id.as_str());
+        let menu_open = is_row(&self.sidebar.context_menu);
         let action = action.map(|(action_shelf, name, size, label)| {
-            let thread_id = thread.id.clone();
+            let thread_id = ScopedId::of_thread(thread);
             h_flex()
-                .id(SharedString::from(format!("{}-{}", action_shelf.label(), thread.id)))
+                .id(row_id(action_shelf.label(), &thread.environment_id, &thread.id))
                 .when(!beside, |el| el.absolute().top_0().bottom_0().right(px(-4.)).invisible())
                 .h_full()
                 .px(px(6.))
@@ -2497,10 +2536,10 @@ impl Workspace {
         });
         let muted_icon = !active || settled;
         let hover_card = self.render_hover_card(&facts, project, tokens);
-        let open_id = thread.id.clone();
-        let hover_id = thread.id.clone();
+        let open_id = ScopedId::of_thread(thread);
+        let hover_id = open_id.clone();
         h_flex()
-            .id(SharedString::from(format!("thread-{}", thread.id)))
+            .id(row_id("thread", &thread.environment_id, &thread.id))
             .group(ROW_GROUP)
             .relative()
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| this.hover_row(&hover_id, *hovered, cx)))
@@ -2531,7 +2570,7 @@ impl Workspace {
                     .when(muted_icon, |el| el.opacity(0.4).group_hover(ROW_GROUP, |s| s.opacity(1.)))
                     .child(project_icon(p, tokens, muted_icon && !hovered, 16., self.favicon(p)))
             }))
-            .when(draft, |el| el.child(drafts::unsent_draft_marker(&thread.id, tokens)))
+            .when(draft, |el| el.child(drafts::unsent_draft_marker(thread, tokens)))
             .child(
                 text_sm(div())
                     .min_w_0()
@@ -2542,7 +2581,7 @@ impl Workspace {
                     .group_hover(ROW_GROUP, |s| s.text_color(sb.foreground))
                     .child(thread.title.clone()),
             )
-            .map(|el| self.with_rename(el, &thread.id, 36., tokens, cx))
+            .map(|el| self.with_rename(el, thread, 36., tokens, cx))
             .children(self.render_running_terminals(&thread.id, cx))
             .child(
                 text_xs(h_flex())
@@ -2563,7 +2602,7 @@ impl Workspace {
                     .children(action),
             )
             .on_mouse_down(gpui_kit::MouseButton::Right, cx.listener(|this, _, _, cx| this.hide_hover_card(cx)))
-            .context_menu(self.row_menu(&thread.id, cx))
+            .context_menu(self.row_menu(thread, cx))
             .into_any_element()
     }
 }
@@ -2598,10 +2637,10 @@ fn row_selected(tokens: &Tokens) -> Hsla {
 
 impl Workspace {
     /// Makes a Woke label the button that dismisses it (`handleAcknowledgeWokeClick`).
-    fn woke_dismiss(&self, label: impl IntoElement, thread_id: &str, cx: &mut Context<Self>) -> AnyElement {
-        let id = thread_id.to_owned();
+    fn woke_dismiss(&self, label: impl IntoElement, thread: &ThreadShell, cx: &mut Context<Self>) -> AnyElement {
+        let id = ScopedId::of_thread(thread);
         div()
-            .id(SharedString::from(format!("woke-{thread_id}")))
+            .id(row_id("woke", &thread.environment_id, &thread.id))
             .cursor_pointer()
             .hover(gpui_kit::Styled::underline)
             .tooltip(tooltip("Dismiss Woke notification"))
@@ -2778,7 +2817,9 @@ mod tests {
                 "lineage": {"rootThreadId": "t"},
             });
             value.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-            serde_json::from_value(value).unwrap()
+            let mut thread: ThreadShell = serde_json::from_value(value).unwrap();
+            thread.environment_id = "env".into();
+            thread
         };
         let groups = [group("a", false), group("b", false), group("gone", true)];
         let scope = ["a".to_owned()];
@@ -2790,6 +2831,9 @@ mod tests {
         assert!(!reveal_widens_scope(&archived, &groups, &scope));
         let sub = thread("b", json!({"lineage": {"rootThreadId": "p", "relationshipToParent": "subagent"}}));
         assert!(!reveal_widens_scope(&sub, &groups, &scope), "listed under its parent");
+        // Project `a` on another machine is not in the filter.
+        let elsewhere = ThreadShell { environment_id: "copy".into(), ..thread("a", json!({})) };
+        assert!(reveal_widens_scope(&elsewhere, &groups, &scope));
     }
 
     #[test]

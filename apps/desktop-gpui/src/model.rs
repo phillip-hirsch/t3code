@@ -612,6 +612,11 @@ pub struct ProjectShell {
 }
 
 impl ProjectShell {
+    /// The project's identity across environments, borrowed.
+    pub fn project_ref(&self) -> ThreadRef<'_> {
+        (&self.environment_id, &self.id)
+    }
+
     pub fn scope_project(&self) -> crate::settings::scope::Project {
         crate::settings::scope::Project {
             id: self.id.clone(),
@@ -957,10 +962,60 @@ impl ThreadShell {
     pub fn is_listed(&self) -> bool {
         self.lineage.relationship_to_parent.as_deref() != Some("subagent") && self.lineage.side_chat != Some(true)
     }
+
+    /// The thread's identity across environments, borrowed.
+    pub fn thread_ref(&self) -> ThreadRef<'_> {
+        (&self.environment_id, &self.id)
+    }
+
+    /// The thread's project's identity across environments, borrowed.
+    pub fn project_ref(&self) -> ThreadRef<'_> {
+        (&self.environment_id, &self.project_id)
+    }
 }
 
 /// `(environment id, thread id)`, a thread's identity across environments.
 pub type ThreadRef<'a> = (&'a str, &'a str);
+
+/// A thread's or project's id on its environment (`ScopedThreadRef`, `ScopedProjectRef`): ids
+/// repeat across environments, so a bare id can name the wrong record.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ScopedId {
+    pub env: SharedString,
+    pub id: String,
+}
+
+impl ScopedId {
+    pub fn new(env: impl Into<SharedString>, id: impl Into<String>) -> Self {
+        Self { env: env.into(), id: id.into() }
+    }
+
+    pub fn of_thread(thread: &ThreadShell) -> Self {
+        Self::new(thread.environment_id.clone(), thread.id.clone())
+    }
+
+    pub fn of_project(project: &ProjectShell) -> Self {
+        Self::new(project.environment_id.clone(), project.id.clone())
+    }
+
+    /// The thread's project on the thread's environment.
+    pub fn thread_project(thread: &ThreadShell) -> Self {
+        Self::new(thread.environment_id.clone(), thread.project_id.clone())
+    }
+
+    pub fn is_thread(&self, thread: &ThreadShell) -> bool {
+        self.env == thread.environment_id && self.id == thread.id
+    }
+
+    pub fn is_project(&self, project: &ProjectShell) -> bool {
+        self.env == project.environment_id && self.id == project.id
+    }
+
+    /// `(environment, id)`, borrowed.
+    pub fn pair(&self) -> ThreadRef<'_> {
+        (&self.env, &self.id)
+    }
+}
 
 /// `hiddenThreadTagsAtom`: the tags an environment's tag filter hides, `None` while it is off.
 pub fn hidden_thread_tags(settings: &crate::settings::Settings) -> Option<Vec<String>> {
@@ -1073,6 +1128,16 @@ impl ShellState {
     /// Some environment's subscription caught up with its server.
     pub fn live(&self) -> bool {
         self.cursors.values().any(|cursor| cursor.live)
+    }
+
+    /// The thread with this id on this environment.
+    pub fn thread(&self, key: &ScopedId) -> Option<&ThreadShell> {
+        self.threads.iter().find(|t| key.is_thread(t))
+    }
+
+    /// The project with this id on this environment.
+    pub fn project(&self, key: &ScopedId) -> Option<&ProjectShell> {
+        self.projects.iter().find(|p| key.is_project(p))
     }
 
     /// The environment a thread lives on.
@@ -2259,6 +2324,26 @@ mod tests {
         let ids: Vec<_> = shell.threads.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ids, ["u"]);
         assert_eq!(shell.sequence(ENV), 7);
+    }
+
+    #[test]
+    fn a_scoped_lookup_tells_equal_ids_on_two_environments_apart() {
+        let mut shell = ShellState::default();
+        let (a, b): (SharedString, SharedString) = ("env-a".into(), "env-b".into());
+        let snapshot = |title: &str| {
+            let mut thread = thread("t", "1");
+            thread["title"] = json!(title);
+            json!({"kind":"snapshot","snapshot":{"snapshotSequence":1,"projects":[project("/r", None)],"threads":[thread]}})
+        };
+        shell.apply(&a, &snapshot("on a")).unwrap();
+        shell.apply(&b, &snapshot("on b")).unwrap();
+        let title = |env: &SharedString| shell.thread(&ScopedId::new(env.clone(), "t")).map(|t| t.title.as_str());
+        assert_eq!((title(&a), title(&b)), (Some("on a"), Some("on b")));
+        assert!(shell.thread(&ScopedId::new("env-c", "t")).is_none());
+        let on_b = shell.project(&ScopedId::new(b.clone(), "/r")).map(|p| &p.environment_id);
+        assert_eq!(on_b, Some(&b));
+        let key = ScopedId::of_thread(&shell.threads[1]);
+        assert_eq!((key.env.as_ref(), key.is_thread(&shell.threads[0])), ("env-b", false));
     }
 
     #[test]
