@@ -271,7 +271,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        if matches!(kind, FileKind::Font | FileKind::Office(Office::Docx | Office::Xlsx | Office::Pptx)) {
+        if kind == FileKind::Font || matches!(kind, FileKind::Office(office) if office != Office::Ipynb) {
             return self.render_document(key, kind, window, cx);
         }
         if read_limit(kind).is_none() {

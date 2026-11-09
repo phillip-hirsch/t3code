@@ -1,9 +1,11 @@
-//! Office Open XML files (`OpenXmlOfficeViewer.tsx` and `office/*`): Word documents, slide
-//! decks and Excel workbooks laid out and painted by the web's own engines in a viewer page
-//! (`super::viewer`). `assets/vendor/office-engine.zip` holds the web's Office workers with the
+//! Office files (`OfficeViewer.tsx`, `OpenXmlOfficeViewer.tsx` and `office/*`) in a viewer page
+//! (`super::viewer`): Word documents, slide decks and Excel workbooks laid out and painted by the
+//! web's own engines, and `OpenDocument`, rich text and EPUB files read by its preparation worker
+//! into pages and sheets. `assets/vendor/office-engine.zip` holds the web's Office workers with the
 //! @betteroffice engines (Apache-2.0), their wasm modules and fonts, built by
 //! `tools/office_engine.mjs`; `assets/office-viewer` ports the viewers' pages, selection and
-//! navigation around them.
+//! navigation around them. The extended documents' markup passes `DOMPurify` 3.4.17 (Apache-2.0,
+//! `assets/vendor/dompurify-LICENSE`), as `DocumentPages` does.
 
 use std::borrow::Cow;
 
@@ -20,6 +22,8 @@ const VIEWER_HTML: &str = include_str!("../../../assets/office-viewer/viewer.htm
 const VIEWER_JS: &str = include_str!("../../../assets/office-viewer/viewer.mjs");
 const PAGES_JS: &str = include_str!("../../../assets/office-viewer/pages.mjs");
 const SPREADSHEET_JS: &str = include_str!("../../../assets/office-viewer/spreadsheet.mjs");
+const EXTENDED_JS: &str = include_str!("../../../assets/office-viewer/extended.mjs");
+const PURIFY_GZ: &[u8] = include_bytes!("../../../assets/vendor/purify-3.4.17.es.mjs.gz");
 const VIEWER_CSS: &str = include_str!("../../../assets/office-viewer/viewer.css");
 
 pub(super) static VIEWER: ViewerSpec = ViewerSpec {
@@ -74,11 +78,16 @@ fn office_message(body: &str) -> Option<OfficeMessage> {
     valid.then_some(message)
 }
 
-/// The kind the page opens the file as.
+/// The kind the page opens the file as (`officePreviewKind`).
 fn office_kind(path: &str) -> &'static str {
     match super::logic::file_kind(path) {
         FileKind::Office(Office::Docx) => "docx",
         FileKind::Office(Office::Xlsx) => "xlsx",
+        FileKind::Office(Office::Odt) => "odt",
+        FileKind::Office(Office::Ods) => "ods",
+        FileKind::Office(Office::Odp) => "odp",
+        FileKind::Office(Office::Rtf) => "rtf",
+        FileKind::Office(Office::Epub) => "epub",
         _ => "pptx",
     }
 }
@@ -96,6 +105,12 @@ fn static_file(path: &str) -> Option<Cow<'static, [u8]>> {
         "/viewer.mjs" => borrowed(VIEWER_JS),
         "/pages.mjs" => borrowed(PAGES_JS),
         "/spreadsheet.mjs" => borrowed(SPREADSHEET_JS),
+        "/extended.mjs" => borrowed(EXTENDED_JS),
+        "/purify.mjs" => {
+            let mut script = Vec::new();
+            std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(PURIFY_GZ), &mut script).ok()?;
+            Some(Cow::Owned(script))
+        }
         "/viewer.css" => borrowed(VIEWER_CSS),
         _ => archive_file(ENGINE_ZIP, path),
     }
@@ -137,6 +152,9 @@ mod tests {
         assert_eq!(office_kind("a/Report.docx"), "docx");
         assert_eq!(office_kind("Book.XLSX"), "xlsx");
         assert_eq!(office_kind("deck.pptx"), "pptx");
+        for kind in ["odt", "ods", "odp", "rtf", "epub"] {
+            assert_eq!(office_kind(&format!("a/Notes.{}", kind.to_uppercase())), kind);
+        }
     }
 
     /// The bundle's scripts name their workers, wasm modules and fonts as `` `/assets/<file>` ``.
@@ -146,9 +164,22 @@ mod tests {
 
     #[test]
     fn the_protocol_serves_the_viewer_and_every_engine_file() {
-        for path in ["/viewer.mjs", "/pages.mjs", "/spreadsheet.mjs", "/viewer.css", "/engine.js", "/inter.ttf"] {
+        for path in [
+            "/viewer.mjs",
+            "/pages.mjs",
+            "/spreadsheet.mjs",
+            "/extended.mjs",
+            "/viewer.css",
+            "/engine.js",
+            "/inter.ttf",
+        ] {
             assert!(static_file(path).is_some_and(|body| !body.is_empty()), "{path}");
         }
+        let purify = String::from_utf8(static_file("/purify.mjs").expect("purify").into_owned()).expect("utf-8");
+        assert!(
+            purify.starts_with("/*! @license DOMPurify 3.4.17")
+                && purify.contains("export { purify_default as default }")
+        );
         let engine = String::from_utf8(static_file("/engine.js").expect("engine").into_owned()).expect("utf-8");
         let workers = named_assets(&engine);
         for worker in ["officePreview.worker", "document.worker", "presentation.worker", "spreadsheet.worker"] {

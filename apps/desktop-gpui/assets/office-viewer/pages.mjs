@@ -98,7 +98,7 @@ export function withTooltip(node, text) {
 }
 
 /** `FileSurfaceAction`: a ghost icon button with its label as tooltip. */
-function action(label, paths, onPress) {
+export function action(label, paths, onPress) {
   const button = icon(h("button", { type: "button", class: "action", "aria-label": label }), paths);
   button.addEventListener("click", onPress);
   return withTooltip(button, label);
@@ -424,8 +424,8 @@ function textLayer(engine, index, follow, signal) {
   return layer;
 }
 
-const CHEVRON_LEFT = '<path d="m15 18-6-6 6-6" />';
-const CHEVRON_RIGHT = '<path d="m9 18 6-6-6-6" />';
+export const CHEVRON_LEFT = '<path d="m15 18-6-6 6-6" />';
+export const CHEVRON_RIGHT = '<path d="m9 18 6-6-6-6" />';
 
 /** `Presentation`: slides painted by the deck's worker, their notes, and slide navigation. */
 export function presentation(bytes, { onDetails, onError, signal }) {

@@ -48,6 +48,7 @@ pub(super) struct ViewerTheme {
     muted_foreground: Hsla,
     accent: Hsla,
     border: Hsla,
+    card: Hsla,
     input: Hsla,
     ring: Hsla,
     popover: Hsla,
@@ -71,6 +72,7 @@ impl ViewerTheme {
             muted_foreground: tokens.muted_foreground,
             accent: tokens.accent,
             border: tokens.border,
+            card: tokens.card,
             input: tokens.input,
             ring: tokens.ring,
             popover: tokens.popover,
@@ -100,7 +102,7 @@ impl ViewerTheme {
         format!(
             "{font}:root{{color-scheme:{scheme};font-size:{size}px;--font-sans:{family};--background:{background};\
              --foreground:{foreground};--muted:{muted};--muted-foreground:{muted_foreground};--placeholder:{muted_foreground};\
-             --accent:{accent};--border:{border};--input:{input};--input-background:{input_background};--ring:{ring};\
+             --accent:{accent};--border:{border};--card:{card};--input:{input};--input-background:{input_background};--ring:{ring};\
              --popover:{popover};--primary:{primary};--destructive:{destructive};--warning:{warning};\
              --warning-foreground:{warning_foreground};--scrollbar-thumb:{thumb};--scrollbar-thumb-hover:{thumb_hover}}}",
             font = if bundled { "@font-face{font-family:\"Inter\";src:url(\"/inter.ttf\")}" } else { "" },
@@ -112,6 +114,7 @@ impl ViewerTheme {
             muted_foreground = css_hex(self.muted_foreground),
             accent = css_hex(self.accent),
             border = css_hex(self.border),
+            card = css_hex(self.card),
             input = css_hex(self.input),
             ring = css_hex(self.ring),
             popover = css_hex(self.popover),

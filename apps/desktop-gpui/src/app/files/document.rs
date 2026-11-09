@@ -185,9 +185,8 @@ pub(super) struct Documents {
 fn viewer_of(kind: FileKind) -> Option<(&'static super::viewer::ViewerSpec, &'static str)> {
     match kind {
         FileKind::Pdf => Some((&super::pdf::VIEWER, super::pdf::GLOBAL)),
-        FileKind::Office(Office::Docx | Office::Xlsx | Office::Pptx) => {
-            Some((&super::office::VIEWER, super::office::GLOBAL))
-        }
+        // Notebooks render natively (`super::notebook`).
+        FileKind::Office(office) if office != Office::Ipynb => Some((&super::office::VIEWER, super::office::GLOBAL)),
         _ => None,
     }
 }
