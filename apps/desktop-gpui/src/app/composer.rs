@@ -1503,16 +1503,17 @@ impl Workspace {
     /// `ComposerBanner.Dock`: the banners tucked under the composer, with the stash tab
     /// on their right.
     fn render_banner_dock(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let banners: Vec<AnyElement> = (self.render_environment_banner(t, cx).into_iter())
-            .chain(self.render_fallback_banner(t, cx))
-            .chain(self.render_recovery_banner(t, cx))
-            .chain(self.render_extension_status_banner(t))
-            .chain(self.render_fresh_session_banner(t, cx))
-            .chain(self.render_branch_banner(t, cx))
-            .chain(self.render_runtime_mode_ceiling_banner(t, cx))
-            .chain(self.render_question(t, cx).or_else(|| self.render_plan_ready(t)))
-            .chain(self.render_child_approvals(t, cx))
-            .collect();
+        // Each card after the first joins the one above it.
+        let mut banners: Vec<AnyElement> = self.render_environment_banner(t, cx).into_iter().collect();
+        banners.extend(self.render_fallback_banner(!banners.is_empty(), t, cx));
+        banners.extend(self.render_recovery_banner(!banners.is_empty(), t, cx));
+        banners.extend(self.render_extension_status_banner(!banners.is_empty(), t));
+        banners.extend(self.render_fresh_session_banner(!banners.is_empty(), t, cx));
+        banners.extend(self.render_branch_banner(!banners.is_empty(), t, cx));
+        banners.extend(self.render_runtime_mode_ceiling_banner(!banners.is_empty(), t, cx));
+        let joined = !banners.is_empty();
+        banners.extend(self.render_question(joined, t, cx).or_else(|| self.render_plan_ready(joined, t)));
+        banners.extend(self.render_child_approvals(t, cx));
         let badge = self.render_stash_badge(t, cx);
         if banners.is_empty() && badge.is_none() {
             return None;
@@ -1529,7 +1530,7 @@ impl Workspace {
     }
 
     /// `modelFallbackBannerItem`: "Using X", why, and a way back to the default.
-    fn render_fallback_banner(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_fallback_banner(&self, joined: bool, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
         let Some(Target::Draft { project_id, .. }) = &self.target else { return None };
         let project = self.shell.projects.iter().find(|p| &p.id == project_id);
         let default = self.server_info().new_thread_model(project)?;
@@ -1567,8 +1568,8 @@ impl Workspace {
                         // 5px padding plus the 17px the composer covers.
                         .pb(px(22.))
                         .gap(px(4.))
-                        .rounded_t(px(16.))
                         .border_1()
+                        .map(|el| if joined { el.border_t_0() } else { el.rounded_t(px(16.)) })
                         .border_color(outline)
                         .bg(t.card.opacity(t.glass))
                         .text_xs()
@@ -1613,7 +1614,7 @@ impl Workspace {
                                         cx.listener(move |this, _, _, cx| this.pick_model(default.clone(), cx)),
                                     ),
                                 )
-                                .child(
+                                .child(super::banners::corner_action(
                                     Button::new("fallback-dismiss")
                                         .ghost()
                                         .xsmall()
@@ -1623,14 +1624,15 @@ impl Workspace {
                                             this.composer_ui.dismissed_fallback = Some(window.clone());
                                             cx.notify();
                                         })),
-                                ),
+                                    joined,
+                                )),
                         ),
                 )
                 .into_any_element(),
         )
     }
 
-    fn render_question(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_question(&self, joined: bool, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
         let draft = self.question.as_ref()?;
         let (request, item) = self.pending_question_request()?;
         let question = &draft.questions[draft.index];
@@ -1744,11 +1746,11 @@ impl Workspace {
                     },
                 )))
         });
-        Some(top_drawer(v_flex().child(header).children(body), t))
+        Some(top_drawer(v_flex().child(header).children(body), joined, t))
     }
 
     /// `ComposerPlanFollowUpBanner`: the plan the next send refines or implements.
-    fn render_plan_ready(&self, t: &Tokens) -> Option<AnyElement> {
+    fn render_plan_ready(&self, joined: bool, t: &Tokens) -> Option<AnyElement> {
         let (_, markdown) = self.active_plan_follow_up()?;
         let title = crate::proposed_plan::title(markdown).map(str::to_owned);
         let row = h_flex()
@@ -1761,12 +1763,12 @@ impl Workspace {
                     div().flex_1().min_w_0().truncate().text_color(t.foreground.opacity(0.85)).child(title)
                 }),
             );
-        Some(top_drawer(row, t))
+        Some(top_drawer(row, joined, t))
     }
 }
 
 /// `ComposerBanner.Root variant="info"` in the top drawer, its bottom tucked under the composer.
-fn top_drawer(content: impl IntoElement, t: &Tokens) -> AnyElement {
+fn top_drawer(content: impl IntoElement, joined: bool, t: &Tokens) -> AnyElement {
     let outline = if t.dark { white(0.05) } else { black(0.08) };
     div()
         .mb(px(-17.))
@@ -1776,8 +1778,8 @@ fn top_drawer(content: impl IntoElement, t: &Tokens) -> AnyElement {
                 .pt(px(4.))
                 // 4px padding plus the 17px the composer covers.
                 .pb(px(21.))
-                .rounded_t(px(16.))
                 .border_1()
+                .map(|el| if joined { el.border_t_0() } else { el.rounded_t(px(16.)) })
                 .border_color(outline)
                 .bg(t.card.opacity(t.glass))
                 .text_xs()
