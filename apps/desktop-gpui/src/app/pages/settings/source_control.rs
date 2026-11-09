@@ -30,12 +30,13 @@ use serde_json::{Map, Value, json};
 
 use super::super::fields::textarea_body;
 use super::super::model_select::{generates_text, muted, resolve_text_generation};
+use super::super::providers::writing_providers;
 use super::super::widgets::{
     ROW_SELECT_MIN_WIDTH, SelectWidth, SettingRow, SettingsView, section_with_action, settings_section, switch,
 };
 use crate::app::Workspace;
 use crate::app::pages::settings::connections::logic::SETTINGS_WRITE;
-use crate::model::ModelSelection;
+use crate::model::{ModelSelection, Provider};
 use crate::rpc::RpcClient;
 use crate::theme::{Tokens, tokens};
 
@@ -1740,25 +1741,47 @@ impl Workspace {
             },
         );
 
-        let providers = &self.settings_info().providers;
-        let usable: Vec<&crate::model::Provider> =
-            providers.iter().filter(|p| p.is_selectable() && generates_text(p)).collect();
         let stored_text: Option<ModelSelection> =
             serde::Deserialize::deserialize(view.value("textGenerationModelSelection")).ok();
-        let default_selection = resolve_text_generation(stored_text.as_ref(), providers);
         let writer: Option<ModelSelection> =
             serde::Deserialize::deserialize(view.value("sourceControlWriterModelSelection")).ok();
-        let writer_usable = writer.as_ref().filter(|w| usable.iter().any(|p| p.instance_id == w.instance_id));
-        let active = resolve_text_generation(writer_usable.or(stored_text.as_ref()), providers);
-        let can_dedicate =
-            default_selection.as_ref().is_some_and(|s| usable.iter().any(|p| p.instance_id == s.instance_id));
+        // Text generators may write source control text, but never review guides.
+        let generators = self.text_generation_targets(
+            self.settings_environment().as_ref(),
+            &[writer.as_ref(), stored_text.as_ref()],
+            cx,
+        );
+        let generator_config = |id: &str| self.settings_info().settings.get("textGenerators").get(id).cloned();
+        let providers = &self.settings_info().providers;
+        let writer_providers = writing_providers(providers, &generators);
+        let runs = |list: &[&Provider], s: &ModelSelection| {
+            list.iter().any(|p| p.instance_id == s.instance_id && p.is_selectable() && generates_text(p))
+        };
+        let default_selection = resolve_text_generation(stored_text.as_ref(), &writer_providers);
+        let writer_usable = writer.as_ref().filter(|w| runs(&writer_providers, w));
+        let active = resolve_text_generation(writer_usable.or(stored_text.as_ref()), &writer_providers);
+        let can_dedicate = default_selection.as_ref().is_some_and(|s| runs(&writer_providers, s));
         let guides = view.bool("reviewGuidesEnabled");
         let guide_control = (guides && connected).then(|| {
             let guide: Option<ModelSelection> =
                 serde::Deserialize::deserialize(view.value("reviewGuideModelSelection")).ok();
             let mixed = view.mixed(&["reviewGuideModelSelection"]);
-            let guide_usable = guide.as_ref().filter(|g| usable.iter().any(|p| p.instance_id == g.instance_id));
-            let guide_selection = guide_usable.cloned().or_else(|| active.clone());
+            // `resolveReviewGuideModelSelection` over the coding agents: the guide's own agent, else
+            // the writer while it runs, else the text generation model, each kept only if an agent.
+            let agents: Vec<&Provider> = providers.iter().collect();
+            let guide_agent = guide.as_ref().filter(|g| generator_config(&g.instance_id).is_none() && runs(&agents, g));
+            let writer_runs = writer.as_ref().filter(|w| match generator_config(&w.instance_id) {
+                Some(generator) => generator["enabled"] != false,
+                None => runs(&agents, w),
+            });
+            let guide_selection =
+                resolve_text_generation(guide_agent.or(writer_runs).or(stored_text.as_ref()), &agents);
+            let can_guide = guide_selection.as_ref().is_some_and(|s| runs(&agents, s));
+            // Turning it on starts from the writer, unless that is a text generator.
+            let seed = match &active {
+                Some(active) if generator_config(&active.instance_id).is_some() => guide_selection.clone(),
+                active => active.clone(),
+            };
             self.dedicated_model_control(
                 DedicatedModel {
                     id: "review-guide-model",
@@ -1767,11 +1790,12 @@ impl Workspace {
                     on: guide.is_some(),
                     mixed,
                     switch_mixed: mixed,
-                    selection: guide_selection.filter(|_| (guide.is_some() || mixed) && can_dedicate),
-                    enable_with: active.clone(),
+                    selection: guide_selection.filter(|_| (guide.is_some() || mixed) && can_guide),
+                    enable_with: seed,
                     check_enable: true,
-                    dimmed: guide.is_none() && !can_dedicate,
+                    dimmed: guide.is_none() && !can_guide,
                     note: None,
+                    extra: Rc::default(),
                 },
                 cx,
             )
@@ -1792,6 +1816,7 @@ impl Workspace {
                     check_enable: false,
                     dimmed: false,
                     note,
+                    extra: generators.clone(),
                 },
                 cx,
             )
@@ -1825,7 +1850,7 @@ impl Workspace {
             rows.push(row(
                 self,
                 SettingRow::new("review-guide-model")
-                    .description("Model that reads a pull request to write its review guide. It reads the change itself over many steps, so a stronger model helps. Off uses the source control writer model.")
+                    .description("Must be a coding agent: it reads the pull request over many steps. Off uses the writer model, or Codex or Claude if that model is a text generator.")
                     .setting("reviewGuideModelSelection")
                     .control(control),
             ));
@@ -1941,6 +1966,7 @@ impl Workspace {
             check_enable,
             dimmed,
             note,
+            extra,
         } = row;
         let set = move |this: &mut Self, value: Value, window: &mut Window, cx: &mut Context<Self>| {
             this.update_settings(json!({ key: value }), window, cx);
@@ -1959,11 +1985,12 @@ impl Workspace {
             .gap(px(8.))
             .children(note)
             .when_some(selection, |el, selection| {
-                el.child(self.model_picker(
+                el.child(self.model_picker_among(
                     id,
                     Some(&selection),
                     mixed.then_some("Mixed"),
                     generates_text,
+                    extra,
                     cx,
                     move |this, pick, window, cx| {
                         let pick = ModelSelection { options: None, ..pick };
@@ -2107,6 +2134,8 @@ struct DedicatedModel {
     check_enable: bool,
     dimmed: bool,
     note: Option<gpui_kit::Div>,
+    /// Text generators the picker offers beside the coding agents.
+    extra: Rc<[Provider]>,
 }
 
 /// `styleFieldMixed`: the selected targets differ in one writing-style field.

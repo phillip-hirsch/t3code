@@ -45,6 +45,9 @@ pub(in crate::app) struct PickHost {
     pub environment: Option<SharedString>,
     pub current: Option<ModelSelection>,
     pub include: fn(&Provider) -> bool,
+    /// Listed after the environment's providers, replacing instances with the same id: the
+    /// text generators a settings writing picker offers (`useTextGenerationTargets`).
+    pub extra: Rc<[Provider]>,
     pub on_pick: OnPick,
 }
 
@@ -240,7 +243,7 @@ impl Workspace {
 
     /// The driver of `current`'s provider in the open picker's environment.
     fn picker_driver(&self, current: Option<&ModelSelection>) -> &str {
-        let provider = current.and_then(|s| self.picker_info()?.provider(&s.instance_id));
+        let provider = current.and_then(|s| self.picker_provider(&s.instance_id));
         provider.map_or("", |p| p.driver.as_str())
     }
 
@@ -266,6 +269,18 @@ impl Workspace {
             Some(environment) => self.env_info(environment),
             None => Some(self.server_info()),
         }
+    }
+
+    /// The open picker's environment's providers, with its host's extra ones in place of
+    /// instances sharing their ids.
+    fn picker_providers(&self) -> impl Iterator<Item = &Provider> {
+        let extra: &[Provider] = self.picker.host.as_ref().map_or(&[], |host| &host.extra);
+        let listed = self.picker_info().into_iter().flat_map(|info| info.providers.iter());
+        listed.filter(move |p| !extra.iter().any(|e| e.instance_id == p.instance_id)).chain(extra)
+    }
+
+    fn picker_provider(&self, instance_id: &str) -> Option<&Provider> {
+        self.picker_providers().find(|p| p.instance_id == instance_id)
     }
 
     /// The providers the open picker offers: its host's, else those the open thread may continue on.
@@ -476,7 +491,7 @@ impl Workspace {
                 .filter(move |m| !Self::model_hidden(info, p, m) && (ready || kept_unavailable(p, m)))
                 .map(move |m| (p, m))
         };
-        let providers = info.providers.iter().filter(|p| self.picker_includes(p));
+        let providers = self.picker_providers().filter(|p| self.picker_includes(p));
         if !self.picker.query.is_empty() {
             let mut scored: Vec<(i64, bool, usize, Row)> = providers
                 .flat_map(models)
@@ -580,9 +595,7 @@ impl Workspace {
         let tab = self.picker_tab(current.as_ref());
         let tabs: Vec<Tab> = std::iter::once(Tab::Favorites)
             .chain(
-                self.picker_info()
-                    .into_iter()
-                    .flat_map(|info| info.providers.iter())
+                self.picker_providers()
                     .filter(|p| p.enabled && self.picker_includes(p))
                     .filter(|p| p.availability.as_deref() != Some("unavailable") && p.status == "ready")
                     .map(|p| Tab::Provider(p.instance_id.clone())),
@@ -952,7 +965,7 @@ impl Workspace {
 
     /// `ChatGptSharingControl`: why a managed ChatGPT connection has no Fast or Ultrafast.
     fn render_chatgpt_sharing(&self, current: Option<&ModelSelection>, t: &Tokens) -> Option<AnyElement> {
-        let provider = current.and_then(|s| self.picker_info()?.provider(&s.instance_id))?;
+        let provider = current.and_then(|s| self.picker_provider(&s.instance_id))?;
         if !super::pages::settings::uses_chatgpt_sharing(&provider.auth) {
             return None;
         }
@@ -1005,8 +1018,7 @@ impl Workspace {
                 this.picker.highlighted = None;
                 cx.notify();
             }));
-        let listed = self.picker_info().into_iter().flat_map(|info| info.providers.iter());
-        let providers = listed.filter(|p| p.enabled && self.picker_includes(p)).map(|p| {
+        let providers = self.picker_providers().filter(|p| p.enabled && self.picker_includes(p)).map(|p| {
             let ready = p.availability.as_deref() != Some("unavailable") && p.status == "ready";
             // A provider needing setup opens its tab, which offers the setup.
             let selectable = ready || (self.picker.host.is_none() && offers_setup(p));

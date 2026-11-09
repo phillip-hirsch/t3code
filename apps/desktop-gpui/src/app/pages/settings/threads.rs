@@ -22,6 +22,7 @@ use serde_json::{Value, json};
 
 use super::super::fields::resolve_pasted_path;
 use super::super::model_select::{generates_text, muted, resolve_text_generation, trigger};
+use super::super::providers::writing_providers;
 use super::super::widgets::{ROW_SELECT_MIN_WIDTH, SelectWidth, SettingRow, SettingsView, settings_section, switch};
 use crate::app::Workspace;
 use crate::model::{ModelSelection, Provider, ServerInfo};
@@ -177,6 +178,13 @@ fn offers_model(
             && crate::settings::scope::provider_instance_enabled(settings, project_id, &pick.instance_id)
             && provider.models.iter().any(|m| m.slug == pick.model && !m.is_unavailable)
     })
+}
+
+/// Whether a target's text generator `theirs` is on and reaches the API `shown` does
+/// (`useScopedModelDisabledReason`).
+fn same_generator(shown: Option<&Value>, theirs: Option<&Value>) -> bool {
+    let (Some(shown), Some(theirs)) = (shown, theirs) else { return false };
+    theirs["enabled"] != false && theirs["kind"] == shown["kind"] && theirs["baseUrl"] == shown["baseUrl"]
 }
 
 /// The days the inactivity switch turns back on with (`AUTO_SETTLE_DEFAULT_DAYS`).
@@ -442,10 +450,17 @@ impl Workspace {
         pick: &ModelSelection,
     ) -> Option<String> {
         let driver = self.settings_info().provider(&pick.instance_id).map(|p| p.driver.as_str());
+        let shown_generator = self.settings_info().settings.get("textGenerators").get(&pick.instance_id);
         view.targets.iter().find_map(|target| {
-            let info = &self.session(&target.environment_id).filter(|s| s.is_connected())?.server_info;
-            let project = target.project_id.as_deref();
-            (!offers_model(info, &target.settings, project, driver, pick)).then(|| {
+            let generator = target.settings.get("textGenerators").get(&pick.instance_id);
+            let offered = if shown_generator.is_some() || generator.is_some() {
+                // Only the shown environment's model list is loaded; elsewhere it must reach the same API.
+                same_generator(shown_generator, generator)
+            } else {
+                let session = self.session(&target.environment_id).filter(|s| s.is_connected())?;
+                offers_model(&session.server_info, &target.settings, target.project_id.as_deref(), driver, pick)
+            };
+            (!offered).then(|| {
                 let label = view.label_of(&target.environment_id);
                 format!("This model is unavailable on {label}. Select that environment to choose its model separately.")
             })
@@ -628,18 +643,33 @@ impl Workspace {
         let t = *tokens(cx);
         let stored: Option<ModelSelection> =
             serde::Deserialize::deserialize(view.value("textGenerationModelSelection")).ok();
-        let selection = resolve_text_generation(stored.as_ref(), &self.settings_info().providers);
+        // Text generators from Providers can write this text too (`useTextGenerationTargets`).
+        let generators = self.text_generation_targets(self.settings_environment().as_ref(), &[stored.as_ref()], cx);
+        let selection =
+            resolve_text_generation(stored.as_ref(), &writing_providers(&self.settings_info().providers, &generators));
         let connected = self.settings_client().is_some();
-        let save = |this: &mut Self, pick: ModelSelection, window: &mut Window, cx: &mut Context<Self>| {
-            let resolved = resolve_text_generation(Some(&pick), &this.settings_info().providers).unwrap_or(pick);
-            this.save_scoped_model("textGenerationModelSelection", resolved, window, cx);
+        let save = {
+            let generators = generators.clone();
+            move |this: &mut Self, pick: ModelSelection, window: &mut Window, cx: &mut Context<Self>| {
+                let providers = writing_providers(&this.settings_info().providers, &generators);
+                let resolved = resolve_text_generation(Some(&pick), &providers).unwrap_or(pick);
+                this.save_scoped_model("textGenerationModelSelection", resolved, window, cx);
+            }
         };
         let control: AnyElement = match (&selection, connected) {
             (_, false) => muted("Connect an environment to choose its text generation model.", &t).into_any_element(),
             (None, true) => muted("No text generation providers available.", &t).into_any_element(),
             (Some(selection), true) => h_flex()
                 .gap(px(6.))
-                .child(self.model_picker("text-generation-model", Some(selection), None, generates_text, cx, save))
+                .child(self.model_picker_among(
+                    "text-generation-model",
+                    Some(selection),
+                    None,
+                    generates_text,
+                    generators,
+                    cx,
+                    save.clone(),
+                ))
                 .children(self.traits_picker("text-generation-traits", selection, cx, save))
                 .into_any_element(),
         };
@@ -648,7 +678,7 @@ impl Workspace {
         let model = row(
             self,
             SettingRow::new("text-generation-model")
-                .description("Used for thread titles and other generated text on connected devices with this provider. Source control can override it.")
+                .description("For thread titles and other generated text. Source control has its own setting. Text generators from Providers also appear here.")
                 .setting("textGenerationModelSelection")
                 .control(control),
         );
@@ -1059,6 +1089,14 @@ mod tests {
         assert!(!offers_model(&env, &settings, None, Some("claudeAgent"), &pick("codex", "gpt")), "another driver");
         assert!(!offers_model(&env, &settings, None, Some("grok"), &pick("grok", "g")), "unavailable");
         assert!(!offers_model(&env, &settings, None, Some("codex"), &pick("missing", "gpt")));
+
+        let generator = |enabled: bool, base_url: &str| json!({"kind": "openaiCompatible", "baseUrl": base_url, "enabled": enabled});
+        let shown = generator(true, "https://openrouter.ai/api/v1");
+        assert!(same_generator(Some(&shown), Some(&shown)));
+        assert!(!same_generator(Some(&shown), Some(&generator(false, "https://openrouter.ai/api/v1"))), "turned off");
+        assert!(!same_generator(Some(&shown), Some(&generator(true, "http://localhost:11434/v1"))), "another API");
+        assert!(!same_generator(Some(&shown), None), "missing there");
+        assert!(!same_generator(None, Some(&shown)), "a provider instance here");
     }
 
     #[test]
