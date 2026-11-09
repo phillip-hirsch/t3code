@@ -244,7 +244,7 @@ impl Terminals {
         self.summaries.as_ref().and_then(|all| all.get(thread_id)).map_or(&[], Vec::as_slice)
     }
 
-    fn running(&self, thread_id: &str) -> Vec<&str> {
+    pub(in crate::app) fn running(&self, thread_id: &str) -> Vec<&str> {
         self.summaries(thread_id).iter().filter(|s| s.running_subprocess).map(|s| s.terminal_id.as_str()).collect()
     }
 

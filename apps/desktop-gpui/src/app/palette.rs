@@ -224,6 +224,8 @@ struct Row {
     disabled: bool,
     /// Listed after the other rows of its group (`secondary`).
     secondary: bool,
+    /// The thread a thread result names, whose status slots it draws.
+    thread: Option<String>,
 }
 
 impl Row {
@@ -246,8 +248,16 @@ impl Row {
             quality: 0.,
             disabled: false,
             secondary: false,
+            thread: None,
         }
     }
+}
+
+/// A thread result's status slots (`renderLeadingContent`, `renderTrailingContent`).
+#[derive(Default)]
+struct ThreadSlots {
+    leading: Option<AnyElement>,
+    trailing: Option<AnyElement>,
 }
 
 struct Group {
@@ -1240,6 +1250,7 @@ impl Workspace {
             thread.title.clone(),
             Run::Thread(thread.id.clone()),
         );
+        row.thread = Some(thread.id.clone());
         let project = self.shell.projects.iter().find(|p| p.id == thread.project_id);
         let project = project.map(|p| p.title.trim()).filter(|title| !title.is_empty());
         // `runtime?.providerInstanceId ?? modelSelection.instanceId`.
@@ -1502,6 +1513,49 @@ impl Workspace {
             return None;
         }
         Some(super::host_picker::machine_icon(self.env_info(environment_id).map_or("server", |i| i.machine_kind())))
+    }
+
+    /// A thread result's leading status, and its trailing pull request number, running terminal
+    /// (`ThreadRowTrailingStatus`) and remote machine.
+    fn palette_thread_slots(
+        &self,
+        row: &Row,
+        query: &str,
+        requests: &std::collections::HashMap<&str, inbox::ChildRequest>,
+        tokens: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> ThreadSlots {
+        let Some(thread) = row.thread.as_ref().and_then(|id| self.palette_threads().find(|t| &t.id == id)) else {
+            return ThreadSlots::default();
+        };
+        let leading = self.render_thread_leading_status(thread, requests, cx);
+        let number = self.render_thread_search_number(thread, query, cx);
+        let key = format!("{}-{}", thread.environment_id, thread.id);
+        let terminal = (!self.terminals.running(&thread.id).is_empty()).then(|| {
+            let color = super::pages::terminal_running_color(tokens);
+            div()
+                .id(SharedString::from(format!("palette-terminal-{key}")))
+                .flex_none()
+                .flex()
+                .child(Icon::new(IconName::Terminal).size(px(12.)).text_color(color))
+                .tooltip(|window, cx| {
+                    gpui_kit::component::tooltip::Tooltip::new("Terminal process running").build(window, cx)
+                })
+        });
+        let remote = self.location_machine(&thread.environment_id).map(|machine| {
+            let label = self.location_label(&thread.environment_id);
+            div()
+                .id(SharedString::from(format!("palette-remote-{key}")))
+                .flex_none()
+                .flex()
+                .child(Icon::new(machine).size(px(12.)).text_color(tokens.muted_foreground.opacity(0.6)))
+                .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(label.clone()).build(window, cx))
+        });
+        let status = (terminal.is_some() || remote.is_some())
+            .then(|| h_flex().flex_none().gap(px(6.)).children(terminal).children(remote));
+        let trailing = (number.is_some() || status.is_some())
+            .then(|| h_flex().flex_none().gap(px(8.)).children(number).children(status).into_any_element());
+        ThreadSlots { leading, trailing }
     }
 
     /// Ranks the root view's threads for `query` unless the last ranking still holds.
@@ -2058,6 +2112,7 @@ impl Workspace {
         // The list's direct children, so the scroll handle can reveal the highlighted row by position.
         let mut list: Vec<AnyElement> = Vec::new();
         let total_rows: usize = groups.iter().map(|g| g.rows.len()).sum();
+        let requests = inbox::child_requests(&self.shell.threads);
         for (gi, group) in groups.iter().enumerate() {
             if group.rows.is_empty() {
                 continue;
@@ -2081,12 +2136,13 @@ impl Workspace {
                     list.push(self.render_disabled_palette_row(row, &tokens));
                     continue;
                 }
+                let slots = self.palette_thread_slots(row, &query, &requests, &tokens, cx);
                 let highlighted = highlight == Some(index);
                 if highlighted && reveal {
                     palette.scroll.scroll_to_item(list.len());
                 }
                 let mark = RowMark { highlighted, marked: marked == Some(index) };
-                list.push(self.render_palette_row(row, index, mark, &tokens, cx));
+                list.push(self.render_palette_row(row, index, mark, slots, &tokens, cx));
                 index += 1;
             }
         }
@@ -2348,6 +2404,7 @@ impl Workspace {
         row: &Row,
         index: usize,
         RowMark { highlighted, marked }: RowMark,
+        slots: ThreadSlots,
         tokens: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -2423,6 +2480,7 @@ impl Workspace {
                                 .text_sm()
                                 .line_height(px(20.))
                                 .text_color(tokens.foreground)
+                                .children(slots.leading.map(|leading| div().flex_none().mr(px(6.)).child(leading)))
                                 .child(
                                     div()
                                         .when(row.strong.is_none(), |el| el.min_w_0().truncate())
@@ -2454,6 +2512,7 @@ impl Workspace {
                             .map(|d| div().text_xs().line_height(px(16.)).text_color(muted.opacity(0.7)).child(d)),
                     ),
             )
+            .children(slots.trailing)
             .children(row.pin.clone().filter(|(_, pinned)| *pinned || marked).map(|(ids, pinned)| {
                 // `ProjectPinButton`: shown while pinned or highlighted; a pinned one offers to unpin on hover.
                 let group: SharedString = format!("pin-{}", row.key).into();

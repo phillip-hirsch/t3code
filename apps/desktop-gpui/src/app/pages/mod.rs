@@ -6,11 +6,13 @@ mod pull_request_surface;
 mod pull_requests;
 pub(super) mod settings;
 mod thread_card_pull_requests;
+mod thread_pull_request_badge;
 mod usage;
 
 use gpui_kit::{AnyElement, Context, SharedString, Window};
 
 pub(super) use pull_requests::PullRequestsState;
+pub(super) use thread_pull_request_badge::terminal_running_color;
 pub(super) use usage::UsageState;
 
 use super::{Target, Workspace};

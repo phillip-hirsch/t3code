@@ -175,6 +175,8 @@ pub(in crate::app) struct PullRequestsState {
     pub(super) linked_focus: std::collections::HashMap<String, FocusHandle>,
     /// The thread card's pull request rows: their reads, actions and unfolded list.
     pub(super) card: super::thread_card_pull_requests::CardPullRequests,
+    /// The host reads of thread rows that have no synced link, by pull request key.
+    pub(super) row_reads: super::thread_pull_request_badge::RowReads,
 }
 
 impl PullRequestsState {
@@ -239,6 +241,7 @@ impl PullRequestsState {
             speed: speed_actions::SpeedActions::default(),
             linked_focus: std::collections::HashMap::new(),
             card: Default::default(),
+            row_reads: Default::default(),
         }
     }
 

@@ -64,6 +64,10 @@ pub struct ChangeRequest {
     pub number: u64,
     pub url: String,
     pub state: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub is_draft: bool,
 }
 
 /// `VcsStatusRemoteResult`; a missing remote part reads as all zeros (`mergeGitStatusParts`).

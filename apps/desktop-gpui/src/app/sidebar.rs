@@ -2116,8 +2116,9 @@ impl Workspace {
     fn render_meta_line(&self, facts: &Facts, tokens: &Tokens, cx: &mut Context<Self>) -> Option<gpui_kit::Div> {
         let sb = tokens.sidebar;
         let thread = facts.thread;
+        let pull_request = self.render_row_pull_request_badge(thread, cx);
         let terminals = self.render_running_terminals(&thread.id, cx);
-        (thread.branch.is_some() || terminals.is_some()).then(|| {
+        (thread.branch.is_some() || terminals.is_some() || pull_request.is_some()).then(|| {
             text_xs(h_flex())
                 .mt(px(2.))
                 .gap(px(6.))
@@ -2136,6 +2137,7 @@ impl Workspace {
                         .children(thread.branch.clone()),
                 )
                 .children(terminals)
+                .children(pull_request)
                 .children(self.provider_mark(facts, sb.foreground))
         })
     }

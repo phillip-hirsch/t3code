@@ -285,7 +285,7 @@ pub fn chains<'a>(links: &'a [PullRequestLink]) -> Vec<Chain<'a>> {
 
 /// `resolveThreadCurrentPullRequestLink`: the only open link; else the top open layer of the
 /// newest open chain; else the top of a lone chain; else the most recently updated link.
-fn current(links: &[PullRequestLink]) -> Option<&PullRequestLink> {
+pub fn current(links: &[PullRequestLink]) -> Option<&PullRequestLink> {
     let visible: Vec<&PullRequestLink> = visible(links).collect();
     let open: Vec<&PullRequestLink> = visible.iter().copied().filter(|l| l.is_open()).collect();
     if let [only] = open.as_slice() {
@@ -553,6 +553,262 @@ pub fn search_entries(thread: &crate::model::ThreadShell) -> Vec<SearchPullReque
     entries
 }
 
+/// `PULL_REQUEST_STATE_PRESENTATION`'s keys: a draft is an open change request marked so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tone {
+    Draft,
+    Open,
+    Closed,
+    Merged,
+}
+
+impl Tone {
+    /// `resolvePullRequestState`.
+    pub fn of(state: &str, is_draft: bool) -> Self {
+        match state {
+            "merged" => Self::Merged,
+            "closed" => Self::Closed,
+            _ if is_draft => Self::Draft,
+            _ => Self::Open,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Draft => "Draft",
+            Self::Open => "Open",
+            Self::Closed => "Closed",
+            Self::Merged => "Merged",
+        }
+    }
+}
+
+/// `ThreadPullRequestBadge`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Badge {
+    /// The links form one chain of this many layers.
+    Stack { layers: usize, tone: Tone },
+    /// The current change request, and how many more the thread links.
+    PullRequest { others: usize, tone: Tone },
+}
+
+/// `resolveThreadPullRequestBadge`: every visible link a draft, else any open, else all merged,
+/// else closed; several links in one chain are a stack.
+pub fn badge(links: &[PullRequestLink]) -> Option<Badge> {
+    fn state(link: &PullRequestLink) -> &str {
+        link.snapshot.as_ref().map_or("open", |s| s.state.as_str())
+    }
+    let visible: Vec<&PullRequestLink> = visible(links).collect();
+    if visible.is_empty() {
+        return None;
+    }
+    let tone = if visible.iter().all(|l| l.snapshot.as_ref().is_some_and(|s| s.state == "open" && s.is_draft)) {
+        Tone::Draft
+    } else if visible.iter().any(|l| state(l) == "open") {
+        Tone::Open
+    } else if visible.iter().all(|l| state(l) == "merged") {
+        Tone::Merged
+    } else {
+        Tone::Closed
+    };
+    if visible.len() > 1 && chains(links).len() == 1 {
+        return Some(Badge::Stack { layers: visible.len(), tone });
+    }
+    Some(Badge::PullRequest { others: visible.len() - 1, tone })
+}
+
+fn provider_of(url: &str) -> &'static str {
+    crate::pull_request_detail::parse_change_request(url).map_or("", |link| link.provider)
+}
+
+/// What a thread row shows of its change request (`LinkedThreadPullRequestStatus`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Shown {
+    pub number: u64,
+    pub url: String,
+    pub title: String,
+    pub tone: Tone,
+    /// `SourceControlProviderKind`, which names it a PR or an MR.
+    pub provider: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Summary {
+    #[serde(default)]
+    provider: String,
+    number: u64,
+    url: String,
+    title: String,
+    state: String,
+    #[serde(default)]
+    is_draft: bool,
+}
+
+impl Shown {
+    /// `linkedPullRequestSnapshotStatus`: `None` until the link syncs with its host.
+    pub fn of_link(link: &PullRequestLink) -> Option<Self> {
+        let snapshot = link.snapshot.as_ref()?;
+        Some(Self {
+            number: link.number,
+            url: link.url.clone(),
+            title: snapshot.title.clone(),
+            tone: Tone::of(&snapshot.state, snapshot.is_draft),
+            provider: provider_of(&link.url).to_owned(),
+        })
+    }
+
+    /// A `pullRequests.summary` answer.
+    pub fn of_summary(value: &serde_json::Value) -> Option<Self> {
+        let summary = Summary::deserialize(value).ok()?;
+        let tone = Tone::of(&summary.state, summary.is_draft);
+        Some(Self { number: summary.number, url: summary.url, title: summary.title, tone, provider: summary.provider })
+    }
+
+    /// `prStatusIndicator`'s tooltip lead: `PR #12 - Open`.
+    pub fn lead(&self) -> String {
+        let short = crate::pull_request_detail::terminology(&self.provider).1;
+        format!("{short} #{} - {}", self.number, self.tone.label())
+    }
+
+    pub fn tooltip(&self) -> String {
+        format!("{}: {}", self.lead(), self.title)
+    }
+}
+
+/// Where `useLinkedThreadPullRequest` finds a thread row's change request.
+#[derive(Debug, PartialEq)]
+pub enum Source<'a> {
+    /// The current link, shown from its snapshot once synced.
+    Link(&'a PullRequestLink),
+    /// No current link: the branch's pull request (before it, an older server's single link),
+    /// read from its host.
+    Read(&'a LinkedPullRequest),
+}
+
+/// `useLinkedThreadPullRequest`'s subject; `supports_links` is `useSupportsMultiplePullRequests`.
+pub fn source(thread: &crate::model::ThreadShell, supports_links: bool) -> Option<Source<'_>> {
+    if let Some(link) = current(&thread.pull_requests).filter(|_| supports_links) {
+        return Some(Source::Link(link));
+    }
+    let legacy = thread.linked_pull_request.as_ref().filter(|_| !supports_links);
+    legacy.or(thread.branch_pull_request.as_ref()).map(Source::Read)
+}
+
+/// `ThreadPullRequestBadgePresentation`'s icon.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Glyph {
+    Stack(Tone),
+    State(Tone),
+    /// The change request's state is not known yet.
+    Pending,
+}
+
+/// `ThreadPullRequestBadgePresentation`, and whether it opens the linked list instead of the
+/// change request.
+#[derive(Debug, PartialEq)]
+pub struct BadgeView {
+    pub glyph: Glyph,
+    /// Its accessible name and tooltip line.
+    pub label: String,
+    pub text: String,
+    pub opens_list: bool,
+}
+
+/// `resolveThreadPullRequestBadgePresentation`: `None` without a stack or a known change request.
+pub fn badge_view(
+    badge: Option<Badge>,
+    number: Option<u64>,
+    url: Option<&str>,
+    shown: Option<&Shown>,
+) -> Option<BadgeView> {
+    let (term, short) = crate::pull_request_detail::terminology(url.map_or("", provider_of));
+    if let Some(Badge::Stack { layers, tone }) = badge {
+        let label = format!("Stack of {layers} {term}s, {}", tone.label().to_lowercase());
+        return Some(BadgeView { glyph: Glyph::Stack(tone), label, text: layers.to_string(), opens_list: true });
+    }
+    let (Some(number), Some(_)) = (number, url) else { return None };
+    let tooltip = shown.map_or_else(|| format!("{short} #{number}, status pending"), Shown::tooltip);
+    if let Some(Badge::PullRequest { others, tone }) = badge
+        && others > 0
+    {
+        let label = format!("{tooltip}, and {others} more linked; overall {}", tone.label().to_lowercase());
+        return Some(BadgeView {
+            glyph: Glyph::State(tone),
+            label,
+            text: format!("+{}", others + 1),
+            opens_list: true,
+        });
+    }
+    let glyph = shown.map_or(Glyph::Pending, |shown| Glyph::State(shown.tone));
+    Some(BadgeView { glyph, label: tooltip, text: number.to_string(), opens_list: false })
+}
+
+/// The sidebar row's badge (`ThreadPullRequestBadgeControl`): a stack, the read change request,
+/// or the current link while its state is pending.
+pub fn row_badge(thread: &crate::model::ThreadShell, supports_links: bool, shown: Option<&Shown>) -> Option<BadgeView> {
+    let links = &thread.pull_requests;
+    let badge = badge(links).filter(|_| supports_links);
+    let current = current(links).filter(|_| supports_links);
+    let number = shown.map(|s| s.number).or(current.map(|l| l.number));
+    let url = shown.map(|s| s.url.as_str()).or(current.map(|l| l.url.as_str()));
+    badge_view(badge, number, url, shown)
+}
+
+/// The query's words all appear among `terms` (`pullRequestMatchesSearchQuery`).
+fn terms_match(terms: impl IntoIterator<Item = String>, query: &str) -> bool {
+    let tokens = crate::search::fold_query(query);
+    if tokens.is_empty() {
+        return false;
+    }
+    let terms: Vec<String> = terms.into_iter().collect();
+    let haystack: Vec<char> = crate::search::fold_query(&terms.join(" ")).join(&' ');
+    tokens.iter().all(|token| haystack.windows(token.len()).any(|window| window == token.as_slice()))
+}
+
+fn entry_terms(entry: SearchPullRequest) -> impl Iterator<Item = String> {
+    let [reference, url] = entry.references;
+    [Some(format!("#{}", entry.number)), Some(reference), Some(url), entry.title].into_iter().flatten()
+}
+
+/// `pullRequestMatchesSearchQuery` over every pull request thread search matches the thread by.
+pub fn matches_search(thread: &crate::model::ThreadShell, query: &str) -> bool {
+    terms_match(search_entries(thread).into_iter().flat_map(entry_terms), query)
+}
+
+/// `ThreadSearchPullRequestNumber`'s badge, once the query names one of the thread's pull
+/// requests. A stored reference gives the number before its read lands.
+pub fn search_badge(
+    thread: &crate::model::ThreadShell,
+    query: &str,
+    supports_links: bool,
+    shown: Option<&Shown>,
+) -> Option<BadgeView> {
+    if !matches_search(thread, query) {
+        return None;
+    }
+    let links = &thread.pull_requests;
+    let badge = badge(links).filter(|_| supports_links);
+    let stored = current(links).filter(|_| supports_links).map(|l| (l.number, l.url.as_str())).or_else(|| {
+        let matches = |reference: &&LinkedPullRequest| {
+            let entry = SearchPullRequest {
+                number: reference.number,
+                title: None,
+                references: [format!("{}#{}", reference.repository, reference.number), reference.url.clone()],
+            };
+            terms_match(entry_terms(entry), query)
+        };
+        [thread.linked_pull_request.as_ref(), thread.branch_pull_request.as_ref()]
+            .into_iter()
+            .flatten()
+            .find(matches)
+            .map(|reference| (reference.number, reference.url.as_str()))
+    });
+    let number = shown.map(|s| s.number).or(stored.map(|s| s.0));
+    let url = shown.map(|s| s.url.as_str()).or(stored.map(|s| s.1));
+    badge_view(badge, number, url, shown)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -749,6 +1005,107 @@ mod tests {
         assert_eq!(chains.len(), 1);
         assert!(chains[0].native);
         assert_eq!(chains[0].layers.iter().map(|l| l.number).collect::<Vec<_>>(), vec![5, 4]);
+    }
+
+    fn shell(links: &[PullRequestLink], branch: Option<serde_json::Value>) -> crate::model::ThreadShell {
+        serde_json::from_value(json!({
+            "id": "t", "projectId": "p", "title": "t", "status": "idle",
+            "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z", "lineage": {"rootThreadId": "t"},
+            "pullRequests": serde_json::to_value(links.iter().map(|l| json!({
+                "host": l.host, "repository": l.repository, "number": l.number, "url": l.url, "source": l.source,
+                "linkedAt": l.linked_at, "snapshot": l.snapshot.as_ref().map(|s| json!({"state": s.state, "title": s.title,
+                    "headBranch": s.head_branch, "baseBranch": s.base_branch, "isDraft": s.is_draft, "updatedAt": s.updated_at})),
+            })).collect::<Vec<_>>()).unwrap(),
+            "branchPullRequest": branch,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_badge_aggregates_states_and_tells_a_stack_from_several_links() {
+        let state = |link: &mut PullRequestLink, state: &str, draft: bool| {
+            let snapshot = link.snapshot.as_mut().unwrap();
+            (snapshot.state, snapshot.is_draft) = (state.into(), draft);
+        };
+        let mut draft = link(1, "agent", "open", "2026-01-01T00:00:00Z");
+        state(&mut draft, "open", true);
+        assert_eq!(badge(std::slice::from_ref(&draft)), Some(Badge::PullRequest { others: 0, tone: Tone::Draft }));
+        let mut merged = link(2, "agent", "merged", "2026-01-02T00:00:00Z");
+        merged.snapshot.as_mut().unwrap().head_branch = "other".into();
+        let mut closed = link(3, "agent", "closed", "2026-01-03T00:00:00Z");
+        closed.snapshot.as_mut().unwrap().head_branch = "third".into();
+        let tone = |links: &[PullRequestLink]| match badge(links) {
+            Some(Badge::PullRequest { tone, .. } | Badge::Stack { tone, .. }) => Some(tone),
+            None => None,
+        };
+        assert_eq!(tone(&[draft, merged.clone()]), Some(Tone::Open), "a draft is still open");
+        assert_eq!(tone(&[merged.clone(), merged.clone()]), Some(Tone::Merged));
+        assert_eq!(tone(&[merged.clone(), closed.clone()]), Some(Tone::Closed));
+        assert_eq!(badge(&[]), None);
+        assert_eq!(badge(&[link(4, "stack-dismissed", "open", "2026-01-01T00:00:00Z")]), None);
+
+        // Two links on unrelated branches; then a chain by base branch.
+        let pair = vec![merged.clone(), closed.clone()];
+        assert_eq!(badge(&pair), Some(Badge::PullRequest { others: 1, tone: Tone::Closed }));
+        let stacked = vec![
+            chained(5, "a", "main", "2026-01-01T00:00:00Z", None),
+            chained(6, "b", "a", "2026-01-02T00:00:00Z", None),
+        ];
+        assert_eq!(badge(&stacked), Some(Badge::Stack { layers: 2, tone: Tone::Open }));
+        let view = row_badge(&shell(&stacked, None), true, None).unwrap();
+        assert_eq!(
+            (view.label.as_str(), view.text.as_str(), view.opens_list),
+            ("Stack of 2 pull requests, open", "2", true)
+        );
+        assert_eq!(view.glyph, Glyph::Stack(Tone::Open));
+
+        let several = row_badge(&shell(&pair, None), true, Shown::of_link(&pair[1]).as_ref()).unwrap();
+        assert_eq!(several.label, "PR #3 - Closed: T, and 1 more linked; overall closed");
+        assert_eq!((several.text.as_str(), several.opens_list), ("+2", true));
+    }
+
+    #[test]
+    fn a_row_shows_its_current_link_or_reads_its_branch_pull_request() {
+        let branch = json!({"projectId": "p", "repository": "o/r", "number": 9, "url": "https://gitlab.com/o/r/-/merge_requests/9"});
+        let mut unsynced = link(2, "agent", "open", "2026-01-01T00:00:00Z");
+        unsynced.snapshot = None;
+        let thread = shell(std::slice::from_ref(&unsynced), Some(branch.clone()));
+        assert!(matches!(source(&thread, true), Some(Source::Link(l)) if l.number == 2));
+        let pending = row_badge(&thread, true, None).unwrap();
+        assert_eq!(
+            (pending.label.as_str(), pending.glyph, pending.opens_list),
+            ("PR #2, status pending", Glyph::Pending, false)
+        );
+
+        // Without links, or on a server that predates them, the branch's pull request is read.
+        let thread = shell(&[], Some(branch));
+        assert!(matches!(source(&thread, true), Some(Source::Read(r)) if r.number == 9));
+        assert_eq!(row_badge(&thread, true, None), None, "nothing to show until the read lands");
+        let read = Shown::of_summary(&json!({"provider": "gitlab", "projectId": "p", "repository": "o/r", "number": 9,
+            "title": "Fix", "url": "https://gitlab.com/o/r/-/merge_requests/9", "state": "open", "isDraft": true,
+            "headBranch": "h", "baseBranch": "main", "updatedAt": "2026-01-01T00:00:00Z"}))
+        .unwrap();
+        assert_eq!(read.tooltip(), "MR #9 - Draft: Fix");
+        let view = row_badge(&thread, true, Some(&read)).unwrap();
+        assert_eq!((view.text.as_str(), view.glyph), ("9", Glyph::State(Tone::Draft)));
+        assert_eq!(source(&shell(&[], None), true), None);
+    }
+
+    #[test]
+    fn the_search_badge_shows_only_when_the_query_names_a_pull_request() {
+        let links = vec![link(42, "agent", "open", "2026-01-01T00:00:00Z")];
+        let thread = shell(&links, None);
+        for query in ["#42", "o/r#42", "github.com/o/r/pull/42", "t"] {
+            assert!(search_badge(&thread, query, true, None).is_some(), "{query}");
+        }
+        assert!(search_badge(&thread, "#43", true, None).is_none());
+        assert!(search_badge(&thread, "", true, None).is_none());
+        // A stored branch reference gives the number before the read lands.
+        let branch =
+            json!({"projectId": "p", "repository": "o/r", "number": 9, "url": "https://github.com/o/r/pull/9"});
+        let thread = shell(&[], Some(branch));
+        let view = search_badge(&thread, "#9", true, None).unwrap();
+        assert_eq!((view.text.as_str(), view.glyph), ("9", Glyph::Pending));
     }
 
     #[test]
