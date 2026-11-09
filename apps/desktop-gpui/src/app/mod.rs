@@ -36,7 +36,6 @@ mod commands;
 mod composer;
 mod composer_fit;
 mod composer_menu;
-mod composer_meter;
 mod composer_plan;
 mod confirm;
 mod context_strip;
@@ -215,7 +214,7 @@ pub struct Workspace {
     typing_guard: crate::composer_guard::TypingGuard,
     _typing_idle: Option<Task<()>>,
     /// Tab stops of the composer's attach, stop and primary (send, resume, submit) controls.
-    composer_action_focus: [gpui_kit::FocusHandle; 4],
+    composer_action_focus: [gpui_kit::FocusHandle; 3],
     /// Composer text and question drafts of the targets not on screen.
     composer_drafts: HashMap<Target, composer::ComposerDraft>,
     /// The model and permissions picks of the targets not on screen (`composerDraftStore`).

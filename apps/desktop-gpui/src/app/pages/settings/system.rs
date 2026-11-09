@@ -34,9 +34,6 @@ use crate::app::Workspace;
 use crate::app::pages::settings::widgets::SettingsView;
 use crate::theme::{self, Tokens};
 
-/// `TOOL_CALL_VISIBILITY_LABELS`.
-const TOOL_CALL_VISIBILITIES: &[(&str, &str)] =
-    &[("showAll", "Show all"), ("hideSuccessful", "Hide successful"), ("hideAll", "Hide all"), ("zen", "Zen")];
 const GUEST_LINKS: &[Part] = &[
     Part::Text(
         "Share a thread with a guest who watches it live in a browser and sends messages you approve. Needs T3 Connect: sign in and link this machine in ",
@@ -141,40 +138,31 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = *theme::tokens(cx);
-        // The web also shows this on while the removed legacy sidebar's opt-in
-        // (`legacySidebarEnabled`) is set, and its toggle clears that opt-in.
-        let boring = view.bool("boringSidebarEnabled") || view.bool("legacySidebarEnabled");
-        let boring_switch = super::widgets::switch(&"boring-sidebar".into(), boring, false).on_click(cx.listener(
-            move |this, _, window, cx| {
-                let patch = json!({ "boringSidebarEnabled": !boring, "legacySidebarEnabled": false });
-                this.update_settings(patch, window, cx);
-            },
-        ));
         let workspace = cx.weak_entity();
         let described = |id: &'static str, parts: &'static [Part]| rich_text(id, parts, workspace.clone());
         let mut row = |this: &mut Self, row: SettingRow| this.setting_row(view, row, window, cx);
-        let beta = [
-            row(
-                self,
-                SettingRow::new("boring-sidebar")
-                    .description("Group sidebar threads into project folders. Pinned threads stay on top, and Snoozed and Settled stay below the folders.")
-                    .setting("boringSidebarEnabled")
-                    .control(boring_switch),
-            ),
-            row(
+        let multiline = view.bool("boringSidebarEnabled").then(|| {
+            let nested = row(
                 self,
                 SettingRow::new("boring-sidebar-multiline")
-                    .description("In the boring sidebar, show folder threads on two lines: the title, then the branch, pull request, and agent.")
+                    .description(
+                        "Show folder threads on two lines: the title, then the branch, pull request, and agent.",
+                    )
                     .setting("boringSidebarMultilineRows")
-                    .switch(),
-            ),
-            row(
-                self,
-                SettingRow::new("tool-call-visibility")
-                    .description("Hide the commands, edits, and searches agents run, so a thread reads like a conversation. Hide successful keeps calls that fail. Zen also hides the agent's in-between messages and shows only final answers. Approvals, questions, and errors always show.")
-                    .setting("toolCallVisibility")
-                    .select(TOOL_CALL_VISIBILITIES, 160.),
-            ),
+                    .switch()
+                    .nested(),
+            );
+            div().my(px(8.)).pl(px(12.)).border_l_2().border_color(t.border.opacity(0.6)).child(nested)
+        });
+        let mut boring = SettingRow::new("boring-sidebar")
+            .description("Group sidebar threads into project folders. Pinned threads stay on top, and Snoozed and Settled stay below the folders.")
+            .setting("boringSidebarEnabled")
+            .switch();
+        if let Some(multiline) = multiline {
+            boring = boring.body(multiline);
+        }
+        let beta = [
+            row(self, boring),
             // The web hides the switch behind "Sign in" while signed out of T3 Connect; this client has
             // no T3 Connect sign-in, which the web treats as a build without it (`GuestLinksRow`).
             row(
@@ -199,24 +187,7 @@ impl Workspace {
                     .switch(),
             ),
         ];
-        let legacy = [
-            row(
-                self,
-                SettingRow::new("legacy-plan-mode")
-                    .description("Restore Build/Plan, /plan, /default, and Shift+Tab. Off uses build mode.")
-                    .setting("planModeEnabled")
-                    .switch(),
-            ),
-            row(
-                self,
-                SettingRow::new("legacy-context-window-indicator")
-                    .description("Shows context window usage as a circular indicator in the composer.")
-                    .setting("contextWindowMeterEnabled")
-                    .switch(),
-            ),
-        ];
-        let sections = [settings_section("beta", "Beta", beta, &t), settings_section("legacy", "Legacy", legacy, &t)];
-        self.settings_page("labs", view, sections, cx)
+        self.settings_page("labs", view, [settings_section("beta", "Beta", beta, &t)], cx)
     }
 
     pub(super) fn render_settings_about(

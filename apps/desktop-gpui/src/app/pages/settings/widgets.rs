@@ -215,6 +215,8 @@ pub(in crate::app) struct SettingRow {
     server_scoped: bool,
     /// Dot paths inside a setting an administrator can lock (`managedPaths`).
     managed_paths: Vec<String>,
+    /// Drawn inside another row's body, flush with it (`px-0 py-2`).
+    nested: bool,
 }
 
 enum Control {
@@ -265,7 +267,14 @@ impl SettingRow {
             reset: None,
             server_scoped: false,
             managed_paths: Vec::new(),
+            nested: false,
         }
+    }
+
+    /// The row sits inside another row's body, without its own horizontal inset.
+    pub(in crate::app) fn nested(mut self) -> Self {
+        self.nested = true;
+        self
     }
 
     /// The row edits server settings (`serverScoped`), so it needs a connected, writable target.
@@ -1200,7 +1209,9 @@ impl Workspace {
         // Values set right here explain nothing new, so their marker waits for hover.
         let quiet_marker = overriding.is_empty();
         let reset = self.render_reset(view, &row, &scoped_keys, mixed, lock.is_some(), cx);
-        let SettingRow { id, title, description, status, tip, body, control, control_beside, unavailable, .. } = row;
+        let SettingRow {
+            id, title, description, status, tip, body, control, control_beside, unavailable, nested, ..
+        } = row;
         let (state, summary) = match view.environment() {
             Some(environment) => scope::row_inheritance(&view.scope, &view.targets, &environment, &keys),
             None => (InheritanceState::Default, "Built-in default".to_owned()),
@@ -1272,6 +1283,7 @@ impl Workspace {
         frame.body = body.map(|body| if inert_body { inert_part("body-", body) } else { body });
         frame
             .render(&t)
+            .when(nested, |el| el.px(px(0.)).py(px(8.)))
             .id(group.clone())
             .group(group)
             .relative()

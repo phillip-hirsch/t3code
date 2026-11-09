@@ -70,7 +70,6 @@ pub(super) fn editor_scrollbar() -> gpui_kit::base::input::EditorScrollbarRender
 pub(super) struct FooterText {
     picker: super::model_picker::TriggerText,
     chip: Option<&'static str>,
-    toggle: Option<&'static str>,
     font: gpui_kit::Font,
     size: gpui_kit::Pixels,
     scale: f32,
@@ -89,14 +88,8 @@ impl FooterText {
             };
             f32::from(window.text_system().shape_line(text.to_owned().into(), self.size, &[run], None).width)
         };
-        // The layouts below: `ps-1.5`/8px sides, 1px borders, 16-17px icons, 6px gaps, 4px apart.
-        let chip_widths = self.chip.map(|label| (32. + 6. + measure(label), 32.));
-        let toggle_widths = self.toggle.map(|label| (35. + 6. + measure(label), 35.));
-        let both = if chip_widths.is_some() && toggle_widths.is_some() { 4. } else { 0. };
-        let (block, block_icon_only) = [chip_widths, toggle_widths]
-            .into_iter()
-            .flatten()
-            .fold((both, both), |(natural, icon), (n, i)| (natural + n, icon + i));
+        // The chip: `ps-1.5`/8px sides, 1px borders, a 16px icon and a 6px gap.
+        let (block, block_icon_only) = self.chip.map_or((0., 0.), |label| (32. + 6. + measure(label), 32.));
         ControlsWidths { picker: self.picker.natural_width(measure), block, block_icon_only, overflow: 34., gap: 2. }
     }
 }
@@ -358,7 +351,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> bool {
         // The permissions popover nests in the model picker's footer, so it takes the keys first.
-        if self.permissions_key(keystroke, window, cx) || self.context_meter_key(keystroke, cx) {
+        if self.permissions_key(keystroke, window, cx) {
             return true;
         }
         if self.model_picker_open() {
@@ -369,7 +362,6 @@ impl Workspace {
             || (self.composer.focus_handle(cx).is_focused(window)
                 && (self.code_key(keystroke, window, cx)
                     || self.list_outdent_key(keystroke, window, cx)
-                    || self.plan_toggle_key(keystroke, window, cx)
                     || self.menu_key(keystroke, window, cx)))
     }
 
@@ -511,16 +503,6 @@ impl Workspace {
             return true;
         }
         self.composer.update(cx, |state, cx| state.insert(text, window, cx));
-        true
-    }
-
-    /// Shift+Tab switches between Build and Plan (`composerCommandKey.ts`).
-    fn plan_toggle_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let m = keystroke.modifiers;
-        if keystroke.key != "tab" || !m.shift || m.control || m.alt || m.platform || !self.interaction_mode().0 {
-            return false;
-        }
-        self.toggle_interaction_mode(window, cx);
         true
     }
 
@@ -824,9 +806,6 @@ impl Workspace {
                 "Choose an option above"
             };
         }
-        if self.has_plan_follow_up() {
-            return "Add feedback to refine the plan, or leave this blank to implement it";
-        }
         if self.target.is_none() {
             return "Choose a project above to start a thread";
         }
@@ -1013,21 +992,18 @@ impl Workspace {
     }
 
     /// `resolveComposerControlsOwnership` plus the width check: the permissions chip (off the
-    /// default only) and the Build/Plan toggle, labelled, icons only, or in the overflow menu.
+    /// default only), labelled, icon only, or in the overflow menu.
     fn render_mode_block(&self, window: &Window, t: &Tokens, cx: &mut Context<Self>) -> (Option<AnyElement>, ModeFit) {
         let mode = self.runtime_mode();
         // Drafts name their permissions in the row under the composer instead.
         let strip_owns_mode = matches!(self.target, Some(Target::Draft { .. }));
-        let (plan_ui, interaction) = self.interaction_mode();
-        let chip = (!strip_owns_mode && mode != self.default_runtime_mode())
-            .then(|| runtime_modes().into_iter().find(|(id, ..)| *id == mode).unwrap_or(runtime_modes()[3]));
-        if chip.is_none() && !plan_ui {
+        if strip_owns_mode || mode == self.default_runtime_mode() {
             return (None, ModeFit::Label);
         }
+        let (_, label, icon) = runtime_modes().into_iter().find(|(id, ..)| *id == mode).unwrap_or(runtime_modes()[3]);
         let text = FooterText {
             picker: self.model_trigger_text(),
-            chip: chip.map(|(_, label, _)| label),
-            toggle: plan_ui.then_some(if interaction == "plan" { "Plan" } else { "Build" }),
+            chip: Some(label),
             font: gpui_kit::Font { weight: FontWeight::MEDIUM, ..window.text_style().font() },
             size: gpui_kit::rems(0.875).to_pixels(window.rem_size()),
             scale: window.scale_factor(),
@@ -1048,21 +1024,15 @@ impl Workspace {
             .footer_host
             .map_or(ModeFit::Label, |host| resolve_mode_fit(widths, host, self.composer_ui.mode_fit));
         let element = match fit {
-            ModeFit::Hidden if plan_ui => self.render_mode_overflow_menu(interaction, t, cx),
-            // Without the Plan toggle the overflow menu holds Permissions alone.
+            // The overflow menu holds Permissions alone.
             ModeFit::Hidden => {
-                let (_, label, icon) = chip.unwrap_or(runtime_modes()[3]);
                 self.render_permissions_control("footer-permissions", icon, label, PermissionsForm::Overflow, t, cx)
             }
-            ModeFit::Label | ModeFit::Icon => h_flex()
-                .flex_none()
-                .gap(px(4.))
-                .children(chip.map(|(_, label, icon)| {
-                    let form = PermissionsForm::Chip { label: fit == ModeFit::Label };
-                    self.render_permissions_control("footer-permissions", icon, label, form, t, cx)
-                }))
-                .when(plan_ui, |el| el.child(self.render_interaction_toggle(interaction, fit == ModeFit::Label, t, cx)))
-                .into_any_element(),
+            ModeFit::Label | ModeFit::Icon => {
+                let form = PermissionsForm::Chip { label: fit == ModeFit::Label };
+                let chip = self.render_permissions_control("footer-permissions", icon, label, form, t, cx);
+                h_flex().flex_none().child(chip).into_any_element()
+            }
         };
         (Some(element), fit)
     }
@@ -1125,7 +1095,6 @@ impl Workspace {
                             None => el.child(self.render_model_picker(t, cx)).children(mode_block),
                         }
                     }))
-                    .children(self.render_context_meter(t, cx))
                     .child(self.render_primary_action(t, cx)),
             )
     }
@@ -1203,9 +1172,6 @@ impl Workspace {
         }
         let sendable = !self.composer_empty || self.has_attachments();
         let can_resume = self.can_resume();
-        if self.has_plan_follow_up() && (!self.composer_empty || !can_resume) {
-            return self.render_plan_follow_up_action(t, cx);
-        }
         let editing = self.editing_queued();
         if running && !sendable && !editing {
             return stop().into_any_element();
@@ -1510,7 +1476,7 @@ impl Workspace {
             .chain(self.render_fresh_session_banner(t, cx))
             .chain(self.render_branch_banner(t, cx))
             .chain(self.render_runtime_mode_ceiling_banner(t, cx))
-            .chain(self.render_question(t, cx).or_else(|| self.render_plan_ready(t)))
+            .chain(self.render_question(t, cx))
             .chain(self.render_child_approvals(t, cx))
             .collect();
         let badge = self.render_stash_badge(t, cx);
@@ -1745,23 +1711,6 @@ impl Workspace {
                 )))
         });
         Some(top_drawer(v_flex().child(header).children(body), t))
-    }
-
-    /// `ComposerPlanFollowUpBanner`: the plan the next send refines or implements.
-    fn render_plan_ready(&self, t: &Tokens) -> Option<AnyElement> {
-        let (_, markdown) = self.active_plan_follow_up()?;
-        let title = crate::proposed_plan::title(markdown).map(str::to_owned);
-        let row = h_flex()
-            .min_h(px(24.))
-            .gap(px(4.))
-            .child(div().w(px(24.)).flex_none())
-            .child(div().flex_none().font_weight(FontWeight::MEDIUM).text_color(t.muted_foreground).child("Plan ready"))
-            .children(
-                title.map(|title| {
-                    div().flex_1().min_w_0().truncate().text_color(t.foreground.opacity(0.85)).child(title)
-                }),
-            );
-        Some(top_drawer(row, t))
     }
 }
 
@@ -2071,7 +2020,6 @@ pub(super) fn control_button(id: &'static str, t: &Tokens) -> Button {
 const ATTACH: usize = 0;
 const STOP: usize = 1;
 pub(super) const PRIMARY: usize = 2;
-pub(super) const METER: usize = 3;
 
 /// A `<button>`: a tab stop that Enter and Space press, ringed while keyboard-focused, which a
 /// click leaves the composer focused past (`preventPointerFocus`).

@@ -171,8 +171,6 @@
     "providerModelPreferences": {},
     "pullRequestMergeMethodOverrides": {},
     "pullRequestLinksOpenInApp": true,
-    "planModeEnabled": false,
-    "contextWindowMeterEnabled": false,
     "composerRichTextEnabled": true,
     "sendShortcut": "enter",
     "followUpBehavior": "steer",
@@ -183,7 +181,6 @@
     "toolCallVisibility": "showAll",
     "threadDetailsUsageEnabled": false,
     "threadDetailsItems": {},
-    "legacySidebarEnabled": false,
     "sidebarWorkingShelfEnabled": true,
     "sidebarProjectGroupingMode": "repository",
     "sidebarProjectGroupingOverrides": {},
@@ -481,20 +478,21 @@
       "id": "boring-sidebar",
       "title": "Boring sidebar (group by project)",
       "to": "labs",
-      "searchTerms": ["beta folders project tree legacy old classic sidebar"]
+      "searchTerms": ["beta folders project tree classic sidebar"]
     },
     {
       "id": "boring-sidebar-multiline",
       "title": "Two-line folder rows",
       "to": "labs",
+      "targetId": "boring-sidebar",
       "searchTerms": ["beta boring sidebar folder rows multiline branch pull request details"]
     },
     {
       "id": "tool-call-visibility",
       "title": "Tool calls in chat",
-      "to": "labs",
+      "to": "chat",
       "searchTerms": [
-        "beta hide tool calls commands edits searches work log activity quiet chat zen final answers only"
+        "hide tool calls commands edits searches work log activity quiet chat zen final answers only"
       ]
     },
     {
@@ -787,18 +785,6 @@
       "id": "open-source-licenses",
       "title": "Open source licenses",
       "to": "about"
-    },
-    {
-      "id": "legacy-plan-mode",
-      "title": "Plan mode (legacy)",
-      "to": "labs",
-      "searchTerms": ["build plan composer old"]
-    },
-    {
-      "id": "legacy-context-window-indicator",
-      "title": "Context window indicator (legacy)",
-      "to": "labs",
-      "searchTerms": ["composer meter usage tokens circle old"]
     },
     {
       "id": "keybindings",

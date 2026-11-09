@@ -385,7 +385,7 @@ const RESTORE: &[(&str, &[&str])] = &[
     ("Rich text composer", &["composerRichTextEnabled"]),
     ("Send shortcut", &["sendShortcut"]),
     ("Follow-up behavior", &["followUpBehavior"]),
-    ("Context window indicator", &["contextWindowMeterEnabled"]),
+    ("Tool calls in chat", &["toolCallVisibility"]),
     ("Response streaming", &["responseStreamingMode"]),
     ("Provider update checks", &["enableProviderUpdateChecks"]),
     ("Continue threads after restarts", &["continueThreadsAfterServerUpdate"]),

@@ -727,10 +727,9 @@ impl Workspace {
         (!scoped.is_empty()).then(|| scoped.iter().flat_map(|g| g.project_ids.iter().cloned()).collect())
     }
 
-    /// The boring sidebar (Labs), also on for users of the removed legacy sidebar.
+    /// The boring sidebar (Labs).
     fn boring_sidebar(&self) -> bool {
-        let values = &self.client_settings.values;
-        values.bool("boringSidebarEnabled") || values.bool("legacySidebarEnabled")
+        self.client_settings.values.bool("boringSidebarEnabled")
     }
 
     /// Whether times read on a 12-hour clock (`timestampFormat`, "System default" by the OS).
