@@ -131,8 +131,8 @@ impl Workspace {
         if let Some(cursor) = &cursor {
             input["cursor"] = json!(cursor);
         }
-        let project_id = panel.reference.project_id.clone();
-        let endpoint = self.project_endpoint(&project_id).cloned();
+        let reference = panel.reference.clone();
+        let endpoint = self.env_endpoint(&reference.environment_id).cloned();
         let Some(panel) = self.pull_requests.panel.as_mut() else { return };
         let head = head.to_owned();
         panel.guide_diff.loading = true;

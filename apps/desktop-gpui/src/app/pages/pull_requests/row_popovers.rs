@@ -69,7 +69,7 @@ impl Workspace {
         let mut popover = RowPopover { key: key.clone(), read: Read::Loading, show_all: false, _task: None };
         if let Some(detail) = prefetched {
             popover.read = Read::Checks(detail.checks.clone().into());
-        } else if let Some(client) = self.project_client(&entry.project_id) {
+        } else if let Some(client) = self.env_client(&entry.environment_id) {
             let input = entry.reference();
             let method = match kind {
                 Kind::Checks => "pullRequests.detail",

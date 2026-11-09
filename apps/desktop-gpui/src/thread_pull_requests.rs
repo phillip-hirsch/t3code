@@ -329,14 +329,17 @@ fn url_host(url: &str) -> Option<String> {
     url::Url::parse(url).ok()?.host_str().map(str::to_lowercase)
 }
 
-/// `threadPullRequestPanelTarget`: the pull request the Pull request surface opens.
+/// `threadPullRequestPanelTarget`: the pull request the Pull request surface opens, read on
+/// the thread's environment.
 pub fn panel_target(
+    environment_id: &str,
     project_id: &str,
     links: &[PullRequestLink],
     linked: Option<&LinkedPullRequest>,
     branch: Option<&LinkedPullRequest>,
 ) -> Option<Reference> {
     let from_linked = |linked: &LinkedPullRequest| Reference {
+        environment_id: environment_id.to_owned(),
         project_id: linked.project_id.clone(),
         host: url_host(&linked.url),
         repository: linked.repository.clone(),
@@ -351,6 +354,7 @@ pub fn panel_target(
     }
     if let Some(current) = current {
         return Some(Reference {
+            environment_id: environment_id.to_owned(),
             project_id: project_id.to_owned(),
             host: Some(current.host.clone()),
             repository: current.repository.clone(),
@@ -442,7 +446,7 @@ mod tests {
             link(2, "agent", "open", "2026-01-01T00:00:00Z"),
             link(3, "stack-dismissed", "open", "2026-01-05T00:00:00Z"),
         ];
-        let target = panel_target("p", &links, None, None).unwrap();
+        let target = panel_target("e", "p", &links, None, None).unwrap();
         assert_eq!((target.number, target.host.as_deref(), target.project_id.as_str()), (2, Some("github.com"), "p"));
         assert_eq!(visible(&links).count(), 2);
         assert!(links_url(&links, "https://GitHub.com/O/R/pull/2/files"), "the thread links #2");
@@ -451,7 +455,7 @@ mod tests {
             link(1, "manual", "closed", "2026-01-03T00:00:00Z"),
             link(4, "manual", "merged", "2026-01-04T00:00:00Z"),
         ];
-        assert_eq!(panel_target("p", &closed, None, None).unwrap().number, 4, "else the latest update");
+        assert_eq!(panel_target("e", "p", &closed, None, None).unwrap().number, 4, "else the latest update");
     }
 
     #[test]
@@ -463,10 +467,10 @@ mod tests {
             url: "https://github.com/O/R/pull/2".into(),
         };
         let links = vec![link(2, "agent", "open", "2026-01-01T00:00:00Z")];
-        assert_eq!(panel_target("p", &links, Some(&linked), None).unwrap().project_id, "other");
+        assert_eq!(panel_target("e", "p", &links, Some(&linked), None).unwrap().project_id, "other");
         let branch = LinkedPullRequest { number: 9, ..linked };
-        assert_eq!(panel_target("p", &[], None, Some(&branch)).unwrap().number, 9);
-        assert!(panel_target("p", &[], None, None).is_none());
+        assert_eq!(panel_target("e", "p", &[], None, Some(&branch)).unwrap().number, 9);
+        assert!(panel_target("e", "p", &[], None, None).is_none());
     }
 
     #[test]
@@ -541,7 +545,7 @@ mod tests {
             chained(1, "a", "main", "2026-01-02T00:00:00Z", None),
             chained(3, "c", "a", "2026-01-01T00:00:00Z", None),
         ];
-        assert_eq!(panel_target("p", &links, None, None).unwrap().number, 3, "the later sibling tops the chain");
+        assert_eq!(panel_target("e", "p", &links, None, None).unwrap().number, 3, "the later sibling tops the chain");
         let lines: Vec<_> = list_lines(&links).iter().map(|l| (l.link.number, l.depth, l.stack)).collect();
         assert_eq!(lines, vec![(1, 0, Some((false, 3))), (2, 1, None), (3, 1, None)]);
 
@@ -551,7 +555,7 @@ mod tests {
             chained(4, "x", "main", "2026-01-03T00:00:00Z", Some(stack.clone())),
             chained(5, "y", "main", "2026-01-01T00:00:00Z", Some(stack)),
         ];
-        assert_eq!(panel_target("p", &links, None, None).unwrap().number, 4);
+        assert_eq!(panel_target("e", "p", &links, None, None).unwrap().number, 4);
         let chains = chains(&links);
         assert_eq!(chains.len(), 1);
         assert!(chains[0].native);

@@ -25,14 +25,15 @@ use crate::thread_pull_requests::{self as links, PullRequestLink};
 
 impl Workspace {
     fn open_thread_shell(&self) -> Option<&crate::model::ThreadShell> {
-        let Some(super::super::Target::Thread { id, .. }) = &self.target else { return None };
-        self.shell.threads.iter().find(|t| &t.id == id)
+        let Some(super::super::Target::Thread { env, id }) = &self.target else { return None };
+        self.shell.threads.iter().find(|t| &t.id == id && &t.environment_id == env)
     }
 
     /// `pullRequestPanelTarget`: the open thread's pull request, if it has one.
     pub(in crate::app) fn thread_pull_request_target(&self) -> Option<Reference> {
         let shell = self.open_thread_shell()?;
         links::panel_target(
+            &shell.environment_id,
             &shell.project_id,
             &shell.pull_requests,
             shell.linked_pull_request.as_ref(),
@@ -136,8 +137,10 @@ impl Workspace {
                 .into_any_element();
         }
         let open = visible.iter().filter(|l| l.snapshot.as_ref().is_none_or(|s| s.state == "open")).count();
-        let rows: Vec<AnyElement> =
-            links::list_lines(&shell.pull_requests).iter().map(|line| linked_row(line, &project_id, &t, cx)).collect();
+        let rows: Vec<AnyElement> = links::list_lines(&shell.pull_requests)
+            .iter()
+            .map(|line| linked_row(line, &shell.environment_id, &project_id, &t, cx))
+            .collect();
         v_flex()
             .flex_1()
             .min_h_0()
@@ -370,12 +373,19 @@ fn stack_tip(link: &PullRequestLink, native: bool, size: usize) -> String {
 
 /// A `LinkRow`: state, number, title and repository, indented by its depth in its chain; it
 /// opens in the Pull request surface.
-fn linked_row(line: &links::ListLine, project_id: &str, t: &Tokens, cx: &mut Context<Workspace>) -> AnyElement {
+fn linked_row(
+    line: &links::ListLine,
+    environment_id: &str,
+    project_id: &str,
+    t: &Tokens,
+    cx: &mut Context<Workspace>,
+) -> AnyElement {
     let link = line.link;
     let (glyph, color) = state_glyph(link, t);
     let title: SharedString =
         link.snapshot.as_ref().map_or_else(|| link.repository.clone(), |s| s.title.clone()).into();
     let reference = Reference {
+        environment_id: environment_id.to_owned(),
         project_id: project_id.to_owned(),
         host: Some(link.host.clone()),
         repository: link.repository.clone(),

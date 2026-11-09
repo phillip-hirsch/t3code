@@ -43,6 +43,7 @@ const PREFETCH_FRESH: Duration = Duration::from_mins(1);
 
 fn reference_of(entry: &Entry) -> Reference {
     Reference {
+        environment_id: entry.environment_id.clone(),
         project_id: entry.project_id.clone(),
         host: Some(entry.host.clone()),
         repository: entry.repository.clone(),
@@ -370,7 +371,9 @@ impl Workspace {
             connected.retain(|(id, _)| *id == environment);
         }
         if let Some(project) = &self.pull_requests.project {
-            let environment = self.shell.project_environment(project);
+            // Picking a project names its server too; a project id alone may repeat across servers.
+            let environment =
+                self.pull_requests.environment.as_ref().or_else(|| self.shell.project_environment(project));
             connected.retain(|(id, _)| Some(*id) == environment);
             return connected.into_iter().map(|(id, client)| (id.clone(), client, None)).collect();
         }
@@ -632,7 +635,7 @@ impl Workspace {
         if self.pull_requests.prefetched.as_ref().is_some_and(fresh) {
             return;
         }
-        let Some(client) = self.project_client(&reference.project_id) else { return };
+        let Some(client) = self.env_client(&entry.environment_id) else { return };
         let mut input = reference.to_json();
         input["allowStale"] = json!(false);
         let landed = key.clone();
@@ -659,35 +662,41 @@ impl Workspace {
     /// Asks each pull request's own machine for the diff sizes the listing left at zero.
     fn read_pull_request_stats(&mut self, cx: &mut Context<Self>) {
         let stats = &self.pull_requests.stats;
-        let mut by_environment: Vec<(&SharedString, Vec<Value>)> = Vec::new();
+        let mut by_environment: Vec<(&str, Vec<Value>)> = Vec::new();
         let mut asked = std::collections::HashSet::new();
         let missing = self.pull_requests.held_entries().filter(|e| {
             e.additions + e.deletions == 0 && !stats.contains_key(&e.stat_key()) && asked.insert(e.stat_key())
         });
         for entry in missing.take(500) {
-            let Some(environment) = self.shell.project_environment(&entry.project_id) else { continue };
+            let environment = entry.environment_id.as_str();
             match by_environment.iter_mut().find(|(held, _)| *held == environment) {
                 Some((_, refs)) => refs.push(entry.reference()),
                 None => by_environment.push((environment, vec![entry.reference()])),
             }
         }
-        let reads: Vec<(RpcClient, Vec<Value>)> = by_environment
+        let reads: Vec<(String, RpcClient, Vec<Value>)> = by_environment
             .into_iter()
-            .filter_map(|(environment, refs)| Some((self.env_client(environment)?, refs)))
+            .filter_map(|(environment, refs)| Some((environment.to_owned(), self.env_client(environment)?, refs)))
             .collect();
-        for (client, refs) in reads {
-            self.read_pull_request_stats_from(client, refs, cx);
+        for (environment, client, refs) in reads {
+            self.read_pull_request_stats_from(environment, client, refs, cx);
         }
     }
 
-    fn read_pull_request_stats_from(&mut self, client: RpcClient, refs: Vec<Value>, cx: &mut Context<Self>) {
+    fn read_pull_request_stats_from(
+        &mut self,
+        environment: String,
+        client: RpcClient,
+        refs: Vec<Value>,
+        cx: &mut Context<Self>,
+    ) {
         cx.spawn(async move |this, cx| {
             let Ok(answer) = client.request("pullRequests.listStats", json!({"refs": refs})).await else { return };
             let _ = this.update(cx, |this, cx| {
                 for stat in answer.get("stats").and_then(Value::as_array).into_iter().flatten() {
                     let field = |key: &str| stat.get(key).and_then(Value::as_str).unwrap_or_default();
                     let count = |key: &str| stat.get(key).and_then(Value::as_u64).unwrap_or_default();
-                    let key = logic::stat_key(field("projectId"), field("repository"), count("number"));
+                    let key = logic::stat_key(&environment, field("projectId"), count("number"));
                     this.pull_requests.stats.insert(key, (count("additions"), count("deletions")));
                 }
                 this.rebuild_pull_request_rows(cx);
@@ -1190,12 +1199,17 @@ impl Workspace {
             let project_view = view.clone();
             let project_choices = projects.clone();
             let picked_project = project.clone();
-            let project_label = picked_project
-                .as_ref()
-                .and_then(|id| project_choices.iter().find(|p| &p.0 == id))
+            let picked_environment = environment.clone();
+            let is_picked = move |id: &String, environment: &SharedString| {
+                picked_project.as_ref() == Some(id) && picked_environment.as_ref() == Some(environment)
+            };
+            let project_label = project_choices
+                .iter()
+                .find(|p| is_picked(&p.0, &p.3))
                 .map_or("All projects".to_owned(), |p| p.1.clone());
+            let any_picked = project.is_some();
             root.submenu(format!("Project  {project_label}"), window, cx, move |mut menu, window, _| {
-                menu = menu.item(PopupMenuItem::new("All projects").checked(picked_project.is_none()).on_click(
+                menu = menu.item(PopupMenuItem::new("All projects").checked(!any_picked).on_click(
                     window.listener_for(&project_view, |this, _, _, cx| {
                         this.set_pull_request_scope(cx, |state| state.project = None);
                     }),
@@ -1208,7 +1222,7 @@ impl Workspace {
                         PopupMenuItem::new(label)
                             .icon(Lucide::FolderGit2)
                             .disabled(*unavailable)
-                            .checked(picked_project.as_ref() == Some(id))
+                            .checked(is_picked(id, &environment))
                             .on_click(window.listener_for(&project_view, move |this, _, _, cx| {
                                 let project = value.clone();
                                 let environment = environment.clone();
@@ -1751,7 +1765,7 @@ fn pull_request_row(
             .child(div().text_color(addition).child(format!("+{additions}")))
             .child(div().text_color(t.error).child(format!("-{deletions}")));
         let subject = breakdown::Subject {
-            project_id: entry.project_id.clone(),
+            environment_id: entry.environment_id.clone(),
             reference: entry.reference(),
             additions,
             deletions,

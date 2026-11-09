@@ -513,9 +513,11 @@ impl Activity {
     }
 }
 
-/// `PullRequestRef`: where a pull request is read from.
+/// `PullRequestRef`: where a pull request is read from, and the environment that reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Reference {
+    /// The environment that reads it: project ids repeat across environments.
+    pub environment_id: String,
     pub project_id: String,
     pub host: Option<String>,
     pub repository: String,
@@ -523,6 +525,7 @@ pub struct Reference {
 }
 
 impl Reference {
+    /// The wire `PullRequestRef`, which the environment it is sent to scopes.
     pub fn to_json(&self) -> Value {
         let mut value = json!({"projectId": self.project_id, "repository": self.repository, "number": self.number});
         if let Some(host) = &self.host {
@@ -531,9 +534,16 @@ impl Reference {
         value
     }
 
-    /// `pullRequestRefKey`.
+    /// `pullRequestRefKey`, scoped to its environment as `pullRequestSurfaceId` is.
     pub fn key(&self) -> String {
-        format!("{}:{}:{}#{}", self.project_id, self.host.as_deref().unwrap_or(""), self.repository, self.number)
+        format!(
+            "{}:{}:{}:{}#{}",
+            self.environment_id,
+            self.project_id,
+            self.host.as_deref().unwrap_or(""),
+            self.repository,
+            self.number
+        )
     }
 }
 
@@ -1535,6 +1545,7 @@ pub enum CheckoutMode {
 /// the thread opened on it gets in its composer.
 #[derive(Clone, Debug)]
 pub struct CheckoutRequest {
+    pub environment_id: String,
     pub project_id: String,
     pub url: String,
     /// The host's word for it, from [`terminology`].
@@ -2253,11 +2264,11 @@ pub fn parse_change_request_url(url: &str) -> Option<(String, String, u64)> {
 }
 
 /// The project whose repository holds the change request: its repository key is `host/repository`.
-pub fn project_for_link<'a>(
-    projects: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+pub fn project_for_link<'a, P>(
+    projects: impl IntoIterator<Item = (P, Option<&'a str>)>,
     host: &str,
     repository: &str,
-) -> Option<&'a str> {
+) -> Option<P> {
     let wanted = format!("{host}/{repository}").to_lowercase();
     projects.into_iter().find(|(_, key)| key.is_some_and(|k| k.to_lowercase() == wanted)).map(|(id, _)| id)
 }
@@ -2886,6 +2897,7 @@ mod tests {
     #[test]
     fn a_checkout_asks_for_the_pull_request_in_the_chosen_place() {
         let request = CheckoutRequest {
+            environment_id: "e1".into(),
             project_id: "p1".into(),
             url: "https://github.com/acme/app/pull/7".into(),
             term: "pull request",

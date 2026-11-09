@@ -367,7 +367,7 @@ impl Workspace {
             return;
         }
         if let Some(environment) = environment
-            && self.project_environment(&panel.reference.project_id).as_deref() != Some(environment)
+            && panel.reference.environment_id != environment
         {
             return;
         }
@@ -467,7 +467,7 @@ impl Workspace {
     pub(super) fn follow_pr_checks(&mut self, key: &str, cx: &mut Context<Self>) {
         let Some(panel) = self.pr_panel_ref(key) else { return };
         if panel._checks_poll.is_some()
-            || !self.pull_request_info(&panel.reference.project_id).is_some_and(|i| i.capability("pullRequestChecks"))
+            || !self.pull_request_info(&panel.reference).is_some_and(|i| i.capability("pullRequestChecks"))
         {
             return;
         }

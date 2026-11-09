@@ -110,14 +110,15 @@ pub struct Entry {
 }
 
 impl Entry {
-    /// `pullRequestEntryKey`: unique across hosts and repositories.
+    /// `pullRequestEntryKey`: unique across environments, hosts and repositories.
     pub fn key(&self) -> String {
-        format!("{}:{}#{}", self.host, self.repository, self.number)
+        let scope = if self.environment_id.is_empty() { String::new() } else { format!("{}:", self.environment_id) };
+        format!("{scope}{}:{}#{}", self.host, self.repository, self.number)
     }
 
     /// `pullRequestDiffStatKey`, which `pullRequests.listStats` answers by.
     pub fn stat_key(&self) -> String {
-        stat_key(&self.project_id, &self.repository, self.number)
+        stat_key(&self.environment_id, &self.project_id, self.number)
     }
 
     pub fn reference(&self) -> Value {
@@ -125,8 +126,9 @@ impl Entry {
     }
 }
 
-pub fn stat_key(project_id: &str, repository: &str, number: u64) -> String {
-    format!("{project_id}\u{0}{}#{number}", repository.to_lowercase())
+/// `pullRequestDiffStatKey`: a project id names a project only within its environment.
+pub fn stat_key(environment_id: &str, project_id: &str, number: u64) -> String {
+    format!("{environment_id} {project_id} {number}")
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1080,6 +1082,17 @@ mod tests {
         assert_eq!(merged.entries.iter().map(|e| e.environment_id.as_str()).collect::<Vec<_>>(), ["b", "a"]);
         assert_eq!(merged.next_cursors, *json!({"a": {"github.com": "c1"}}).as_object().unwrap());
         assert_eq!(merged.providers.len(), 1);
+    }
+
+    #[test]
+    fn one_pull_request_listed_by_two_machines_stays_two_rows() {
+        let answer = |environment: &str| {
+            (environment.to_owned(), ListResult { entries: vec![entry(1, json!({}))], ..Default::default() })
+        };
+        let merged = merge_lists(vec![answer("a"), answer("b")]);
+        let keys: HashSet<String> = merged.entries.iter().map(|e| e.key()).collect();
+        let stat_keys: HashSet<String> = merged.entries.iter().map(|e| e.stat_key()).collect();
+        assert_eq!((keys.len(), stat_keys.len()), (2, 2), "the same project id names a project per machine");
     }
 
     #[test]

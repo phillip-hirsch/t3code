@@ -44,6 +44,7 @@ pub(super) enum LinkPage {
     /// for the user (`PullRequestLinkCheckout`).
     PullRequestCheckout {
         pull_request: links::PullRequest,
+        environment_id: SharedString,
         project_id: String,
         prompt: Option<String>,
         checking: bool,
@@ -308,7 +309,7 @@ impl Workspace {
                     self.show_link_page(LinkPage::MissingRepository { link, repository }, cx);
                     return;
                 }
-                let project_id = found[0].id.clone();
+                let (environment_id, project_id) = (found[0].environment_id.clone(), found[0].id.clone());
                 // Each project asks the machine it lives on.
                 let projects: Vec<_> = found
                     .iter()
@@ -349,6 +350,7 @@ impl Workspace {
                                 this.show_link_page(
                                     LinkPage::PullRequestCheckout {
                                         pull_request: pull_request.clone(),
+                                        environment_id,
                                         project_id,
                                         prompt: prompt.as_ref().map(|p| p.text.clone()),
                                         checking: false,
@@ -525,7 +527,7 @@ impl Workspace {
     /// `PullRequestLinkCheckout`'s Check out: a worktree of the pull request with a draft on it,
     /// the link's prompt in its composer.
     fn check_out_linked_pull_request(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(LinkPage::PullRequestCheckout { pull_request, project_id, prompt, checking }) =
+        let Some(LinkPage::PullRequestCheckout { pull_request, environment_id, project_id, prompt, checking }) =
             &mut self.desktop.link_page
         else {
             return;
@@ -535,6 +537,7 @@ impl Workspace {
         }
         *checking = true;
         let request = CheckoutRequest {
+            environment_id: environment_id.to_string(),
             project_id: project_id.clone(),
             url: pull_request.url(),
             term: terminology("github").0,

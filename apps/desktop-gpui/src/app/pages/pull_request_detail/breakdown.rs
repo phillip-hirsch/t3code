@@ -26,7 +26,7 @@ pub(in crate::app) enum Breakdown {
 
 /// The pull request and totals a split belongs to: new totals read it again.
 pub(in crate::app) struct Subject {
-    pub(in crate::app) project_id: String,
+    pub(in crate::app) environment_id: String,
     pub(in crate::app) reference: Value,
     pub(in crate::app) additions: u64,
     pub(in crate::app) deletions: u64,
@@ -34,7 +34,7 @@ pub(in crate::app) struct Subject {
 
 impl Subject {
     fn key(&self) -> String {
-        format!("{}:{}:{}:{}", self.project_id, self.reference, self.additions, self.deletions)
+        format!("{}:{}:{}:{}", self.environment_id, self.reference, self.additions, self.deletions)
     }
 }
 
@@ -45,7 +45,7 @@ impl Workspace {
         if self.pull_requests.breakdowns.contains_key(&key) {
             return;
         }
-        let Some(client) = self.project_client(&subject.project_id) else { return };
+        let Some(client) = self.env_client(&subject.environment_id) else { return };
         self.pull_requests.breakdowns.insert(key.clone(), Breakdown::Loading);
         let reference = subject.reference.clone();
         cx.spawn(async move |this, cx| {
