@@ -151,6 +151,8 @@ enum Run {
     LinkPullRequest(String),
     /// "Show linked pull requests": the right panel's Linked pull requests surface.
     LinkedPullRequests,
+    /// "Use T3 Code in another app (MCP)" for this environment, else the one Sharing & access picks.
+    UseInAnotherApp(Option<SharedString>),
 }
 
 impl Run {
@@ -1143,6 +1145,27 @@ impl Workspace {
             lucide("pull-requests", IconName::GitPullRequestArrow, "Open pull requests", Run::Page(Page::PullRequests));
         row.terms = &["pull requests", "prs", "pr", "review", "merge", "branch"];
         rows.push(row);
+        let environment = self.target.as_ref().map(|target| target.environment().clone());
+        let mut row = lucide(
+            "use-in-another-app",
+            IconName::Plug,
+            "Use T3 Code in another app (MCP)",
+            Run::UseInAnotherApp(environment),
+        );
+        row.terms = &[
+            "mcp",
+            "connector",
+            "another app",
+            "poke",
+            "claude",
+            "chatgpt",
+            "grok",
+            "muse",
+            "instinct",
+            "openclaw",
+            "hermes",
+        ];
+        rows.push(row);
         let mut usage = lucide("usage", IconName::ChartNoAxesColumn, "Open usage", Run::Page(Page::Usage));
         usage.terms = &["usage", "use", "tokens", "cost", "spend", "limits", "stats", "analytics"];
         usage.shortcut = self.shortcut("usage.open");
@@ -1725,6 +1748,7 @@ impl Workspace {
             Run::WorkspaceFocus(forward) => self.move_workspace_focus(forward, window, cx),
             Run::LinkPullRequest(thread_id) => self.open_link_pull_request(thread_id, window, cx),
             Run::LinkedPullRequests => self.open_surface(super::right_panel::Surface::PullRequests, window, cx),
+            Run::UseInAnotherApp(environment) => self.open_use_in_another_app(environment.as_deref(), window, cx),
             Run::FindIn { thread_id, query, message_id } => {
                 self.select_thread(thread_id, window, cx);
                 self.open_thread_find_on(&query, message_id, window, cx);

@@ -59,6 +59,7 @@ mod layout;
 pub mod main_window;
 mod markdown_images;
 mod markdown_ui;
+mod mcp_setup;
 pub mod menu;
 mod message_actions;
 mod minimap;

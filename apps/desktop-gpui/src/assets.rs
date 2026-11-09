@@ -170,6 +170,7 @@ const LUCIDE_ICONS: &[(&str, &[u8])] = lucide![
     "rotate-ccw",
     "rotate-cw",
     "scan",
+    "plug",
     "plug-2",
     "refresh-cw",
     "search",

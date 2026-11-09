@@ -572,7 +572,7 @@ impl Workspace {
 }
 
 /// `resolveAccessEnvironmentId`: the picked environment while it is listed, else the primary.
-fn access_session_index(sessions: &[EnvironmentSession], selected: Option<&str>) -> usize {
+pub(super) fn access_session_index(sessions: &[EnvironmentSession], selected: Option<&str>) -> usize {
     selected.and_then(|id| sessions.iter().position(|session| session.is(id))).unwrap_or(PRIMARY)
 }
 
