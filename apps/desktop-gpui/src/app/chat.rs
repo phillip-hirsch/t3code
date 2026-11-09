@@ -2040,7 +2040,7 @@ pub(super) fn inline_code_style(t: &Tokens) -> StyleRefinement {
 
 /// `.chat-markdown` (`index.css:1866-2280`) and `MarkdownCodeBlock.tsx`.
 /// The code block fill: `input/32` in dark mode, `secondary` in light.
-fn code_background(t: &Tokens) -> Hsla {
+pub(super) fn code_background(t: &Tokens) -> Hsla {
     if t.dark { alpha(t.input, 0.32) } else { t.secondary }
 }
 
@@ -2168,6 +2168,11 @@ fn pierre_theme(dark: bool) -> Arc<HighlightTheme> {
         "style": { "editor.foreground": fg, "syntax": syntax },
     });
     Arc::new(serde_json::from_value(theme).expect("valid highlight theme"))
+}
+
+/// The Pierre highlight theme for the appearance, which the composer's code blocks use too.
+pub(super) fn highlight_theme(dark: bool) -> Arc<HighlightTheme> {
+    if dark { PIERRE_DARK.clone() } else { PIERRE_LIGHT.clone() }
 }
 
 /// Shared so every text view reuses one highlighter cache.

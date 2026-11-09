@@ -5,6 +5,7 @@ mod assets;
 mod backend;
 mod browser_history;
 mod caret;
+mod composer_code;
 mod composer_edit;
 mod composer_guard;
 mod composer_markdown;

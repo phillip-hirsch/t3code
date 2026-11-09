@@ -8,17 +8,16 @@ use std::time::Duration;
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{InlineToken, InlineTokenContext, InputContent, TextDecoration, Textarea};
+use gpui_kit::component::input::{InlineToken, InlineTokenContext, InputContent, Textarea};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, BoxShadow, ClickEvent, Context, ElementId, Focusable as _, FontStyle, FontWeight, HighlightStyle, Hsla,
-    InteractiveElement as _, IntoElement, Keystroke, ModifiersChangedEvent, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, StrikethroughStyle, Styled as _, Window, div, prelude::FluentBuilder as _, px,
-    rgb, svg,
+    AnyElement, BoxShadow, ClickEvent, Context, ElementId, Focusable as _, FontWeight, Hsla, InteractiveElement as _,
+    IntoElement, Keystroke, ModifiersChangedEvent, ParentElement as _, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Window, div, prelude::FluentBuilder as _, px, rgb, svg,
 };
 use serde_json::{Value, json};
 
@@ -149,33 +148,6 @@ impl Workspace {
         self.sync_composer_marks(cx);
     }
 
-    /// Repaints the composer's Markdown (`composerRichTextEnabled`); off, the text is plain.
-    /// Runs per text or theme change, never per frame; the editor slides ranges in between.
-    pub(super) fn sync_composer_marks(&mut self, cx: &mut Context<Self>) {
-        let enabled = self.client_settings.values.bool("composerRichTextEnabled");
-        if !enabled && self.composer_marks.is_none() {
-            return;
-        }
-        let decorations = if enabled {
-            let t = tokens(cx);
-            let state = self.composer.read(cx);
-            let chips: Vec<_> = state.tokens().iter().map(gpui_kit::base::input::InlineTokenSpan::range).collect();
-            crate::composer_markdown::spans(&state.value(), &chips)
-                .into_iter()
-                .map(|span| TextDecoration::new(span.range, mark_style(span.style, t)))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        match &self.composer_marks {
-            Some(marks) => marks.set(decorations, cx),
-            None => {
-                let marks = self.composer.update(cx, |state, cx| state.create_decorations_collection(decorations, cx));
-                self.composer_marks = Some(marks);
-            }
-        }
-    }
-
     pub(super) fn sync_composer_empty(&mut self, cx: &mut Context<Self>) {
         let empty = self.composer.read(cx).text().len() == 0;
         let triage = !empty && super::palette_actions::is_triage_prompt(&self.composer.read(cx).value());
@@ -286,6 +258,7 @@ impl Workspace {
         };
         self.prompt_history = None;
         self.menu = Default::default();
+        self.composer_ui.rich.picker = None;
         self.prompt_stash.open = false;
         self.picker.dismiss();
         if matches!(&draft, ComposerDraft::Prompt(prompt, attachments) if prompt.is_empty() && attachments.is_empty()) {
@@ -368,6 +341,7 @@ impl Workspace {
             || self.draft_workspace_key(keystroke, window, cx)
             || (self.composer.focus_handle(cx).is_focused(window)
                 && (self.code_key(keystroke, window, cx)
+                    || self.block_backspace_key(keystroke, window, cx)
                     || self.list_outdent_key(keystroke, window, cx)
                     || self.plan_toggle_key(keystroke, window, cx)
                     || self.menu_key(keystroke, window, cx)))
@@ -455,7 +429,7 @@ impl Workspace {
         edit.is_some_and(|edit| self.apply_composer_edit(edit, window, cx))
     }
 
-    fn apply_composer_edit(
+    pub(super) fn apply_composer_edit(
         &mut self,
         edit: crate::composer_edit::Edit,
         window: &mut Window,
@@ -1006,6 +980,7 @@ impl Workspace {
                         .relative()
                         .children(self.render_command_menu(&t, cx))
                         .children(self.render_stash_menu(f32::from(window.viewport_size().height) * 0.4, &t, cx))
+                        .children(self.render_language_picker(&t, window, cx))
                         .child(surface),
                 )
                 .children(self.render_context_strip(&t, cx)),
@@ -1877,30 +1852,6 @@ fn render_option(
 }
 
 /// A chip in the editor (`ContextChip`): icon and label in the kind's accent ink.
-/// The web's `strong`, `em`, `s` and inline `code` (`index.css` `.composer-tiptap`), and its
-/// shown delimiters (`.composer-rich-marker`). Highlights can't change the font family or size
-/// or hide text, so code keeps the prompt font and headings their size, and markers stay visible.
-fn mark_style(style: u8, t: &Tokens) -> HighlightStyle {
-    use crate::composer_markdown::{BOLD, CODE, HEADING, ITALIC, MARKER, STRIKE};
-    if style & MARKER != 0 {
-        return HighlightStyle {
-            color: Some(t.muted_foreground),
-            fade_out: Some(0.25),
-            font_weight: Some(FontWeight::NORMAL),
-            ..Default::default()
-        };
-    }
-    let weight =
-        if style & BOLD != 0 { Some(FontWeight::BOLD) } else { (style & HEADING != 0).then_some(FontWeight::SEMIBOLD) };
-    HighlightStyle {
-        font_weight: weight,
-        font_style: (style & ITALIC != 0).then_some(FontStyle::Italic),
-        strikethrough: (style & STRIKE != 0).then_some(StrikethroughStyle { thickness: px(1.), color: None }),
-        background_color: (style & CODE != 0).then(|| t.muted_foreground.opacity(0.12)),
-        ..Default::default()
-    }
-}
-
 fn render_chip(
     token: &InlineTokenContext,
     pull_requests: &HashMap<String, PullRequestContext>,

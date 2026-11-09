@@ -38,6 +38,7 @@ mod composer_fit;
 mod composer_menu;
 mod composer_meter;
 mod composer_plan;
+mod composer_rich;
 mod confirm;
 mod context_strip;
 mod desktop;
@@ -375,8 +376,11 @@ impl Workspace {
                 InputEvent::Blur => this.release_typing_hold(true, window, cx),
                 InputEvent::PressEnter { .. } => {}
             }),
-            // Caret moves re-read the completion trigger.
-            cx.observe(&composer, |this, _, cx| this.sync_trigger(cx)),
+            // Caret moves re-read the completion trigger and what the rich editor shows as source.
+            cx.observe(&composer, |this, _, cx| {
+                this.sync_trigger(cx);
+                this.sync_composer_look(false, cx);
+            }),
             // Ahead of GPUI's bindings, the terminal and text fields: the composer's menus, then the keymap.
             cx.intercept_keystrokes({
                 let this = weak;
