@@ -161,6 +161,8 @@ gpui-pre = { path = "vendor/gpui-pre" }
 gpui-pre-windows = { path = "vendor/gpui-pre-windows" }
 # gpui-pre-linux 0.3.11: X11 client-side decorations without a compositor.
 gpui-pre-linux = { path = "vendor/gpui-pre-linux" }
+# lb-wry 0.53.3: a handler for failed navigations.
+lb-wry = { path = "vendor/lb-wry" }
 
 # BeautifulRust's lint set (github.com/morganlinton/BeautifulRust), trimmed for an application:
 # no library-API lints (missing_docs, missing_*_doc, exhaustive_enums, unreachable_pub, print_*).

@@ -53,7 +53,7 @@ pub use web_context::WebContextImpl;
 
 use crate::{
   proxy::ProxyConfig, web_context::WebContext, Error, NewWindowFeatures, NewWindowOpener,
-  NewWindowResponse, PageLoadEvent, Rect, Result, WebViewAttributes, RGBA,
+  NewWindowResponse, PageLoadError, PageLoadEvent, Rect, Result, WebViewAttributes, RGBA,
 };
 
 use self::web_context::WebContextExt;
@@ -493,6 +493,21 @@ impl InnerWebView {
           on_page_load_handler(PageLoadEvent::Finished, webview.uri().unwrap().to_string());
         }
         _ => (),
+      });
+    }
+
+    // Page load error handler
+    if let Some(on_page_load_error_handler) = attributes.on_page_load_error_handler.take() {
+      webview.connect_load_failed(move |_, _, failing_uri, error| {
+        on_page_load_error_handler(PageLoadError {
+          url: failing_uri.to_string(),
+          domain: error.domain().as_str().to_string(),
+          code: load_error_code(error),
+          description: error.message().to_string(),
+          http_status: None,
+        });
+        // Handled: WebKit's own error page would load as a page of its own.
+        true
       });
     }
 
@@ -1144,6 +1159,20 @@ impl InnerWebView {
 
     Ok(())
   }
+}
+
+/// A failed load's code within its domain, read through the domains a load reports, or -1.
+fn load_error_code(error: &glib::Error) -> i64 {
+  use glib::error::ErrorDomain;
+  use gtk::gio::{IOErrorEnum, ResolverError, TlsError};
+  error
+    .kind::<webkit2gtk::NetworkError>()
+    .map(ErrorDomain::code)
+    .or_else(|| error.kind::<webkit2gtk::PolicyError>().map(ErrorDomain::code))
+    .or_else(|| error.kind::<IOErrorEnum>().map(ErrorDomain::code))
+    .or_else(|| error.kind::<ResolverError>().map(ErrorDomain::code))
+    .or_else(|| error.kind::<TlsError>().map(ErrorDomain::code))
+    .map_or(-1, i64::from)
 }
 
 pub fn platform_webview_version() -> Result<String> {

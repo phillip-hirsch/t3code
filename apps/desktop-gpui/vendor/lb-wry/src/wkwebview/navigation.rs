@@ -1,5 +1,5 @@
 use objc2::DeclaredClass;
-use objc2_foundation::{NSObjectProtocol, NSString};
+use objc2_foundation::{NSError, NSObjectProtocol, NSString, NSURL, NSURLErrorFailingURLErrorKey};
 use objc2_web_kit::{
   WKNavigation, WKNavigationAction, WKNavigationActionPolicy, WKNavigationResponse,
   WKNavigationResponsePolicy,
@@ -10,7 +10,7 @@ use crate::wkwebview::ios::WKWebView::WKWebView;
 #[cfg(target_os = "macos")]
 use objc2_web_kit::WKWebView;
 
-use crate::PageLoadEvent;
+use crate::{PageLoadError, PageLoadEvent};
 
 use super::class::wry_navigation_delegate::WryNavigationDelegate;
 
@@ -44,6 +44,29 @@ pub(crate) fn did_finish_navigation(
   if let Some(on_page_load) = &this.ivars().on_page_load_handler {
     on_page_load(PageLoadEvent::Finished);
   }
+}
+
+pub(crate) fn did_fail_navigation(
+  this: &WryNavigationDelegate,
+  webview: &WKWebView,
+  error: &NSError,
+) {
+  let Some(on_page_load_error) = &this.ivars().on_page_load_error_handler else {
+    return;
+  };
+  let failing_url = error
+    .userInfo()
+    .objectForKey(unsafe { NSURLErrorFailingURLErrorKey })
+    .and_then(|url| url.downcast_ref::<NSURL>().and_then(|url| url.absoluteString()));
+  // A first load that fails leaves the view without a URL.
+  let url = failing_url.or_else(|| unsafe { webview.URL() }.and_then(|url| url.absoluteString()));
+  on_page_load_error(PageLoadError {
+    url: url.map(|url| url.to_string()).unwrap_or_default(),
+    domain: error.domain().to_string(),
+    code: error.code() as i64,
+    description: error.localizedDescription().to_string(),
+    http_status: None,
+  });
 }
 
 // Navigation handler

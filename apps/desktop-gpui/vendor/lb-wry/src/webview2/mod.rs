@@ -30,7 +30,8 @@ use self::drag_drop::DragDropController;
 use super::Theme;
 use crate::{
   proxy::ProxyConfig, Error, MemoryUsageLevel, NewWindowFeatures, NewWindowOpener,
-  NewWindowResponse, PageLoadEvent, Rect, RequestAsyncResponder, Result, WebViewAttributes, RGBA,
+  NewWindowResponse, PageLoadError, PageLoadEvent, Rect, RequestAsyncResponder, Result,
+  WebViewAttributes, RGBA,
 };
 
 type EventRegistrationToken = i64;
@@ -863,6 +864,44 @@ impl InnerWebView {
           };
 
           document_title_changed_handler(title);
+          Ok(())
+        })),
+        token,
+      )?;
+    }
+
+    // Page load error handler, ahead of the load handler's `Finished` for the same navigation
+    if let Some(on_page_load_error_handler) = attributes.on_page_load_error_handler.take() {
+      webview.add_NavigationCompleted(
+        &NavigationCompletedEventHandler::create(Box::new(move |webview, args| {
+          let (Some(webview), Some(args)) = (webview, args) else {
+            return Ok(());
+          };
+
+          let mut success = BOOL::default();
+          args.IsSuccess(&mut success)?;
+          if success.as_bool() {
+            return Ok(());
+          }
+          let mut status = COREWEBVIEW2_WEB_ERROR_STATUS::default();
+          args.WebErrorStatus(&mut status)?;
+          let http_status = args
+            .cast::<ICoreWebView2NavigationCompletedEventArgs2>()
+            .ok()
+            .and_then(|args| {
+              let mut code = 0;
+              args.HttpStatusCode(&mut code).ok()?;
+              (code > 0).then_some(code)
+            });
+
+          on_page_load_error_handler(PageLoadError {
+            url: Self::url_from_webview(&webview)?,
+            domain: "COREWEBVIEW2_WEB_ERROR_STATUS".to_string(),
+            code: status.0.into(),
+            description: String::new(),
+            http_status,
+          });
+
           Ok(())
         })),
         token,

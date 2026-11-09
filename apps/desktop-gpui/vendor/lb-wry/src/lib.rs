@@ -757,6 +757,9 @@ pub struct WebViewAttributes<'a> {
   /// Set a handler closure to process page load events.
   pub on_page_load_handler: Option<Box<dyn Fn(PageLoadEvent, String)>>,
 
+  /// Set a handler closure to process failed main-frame navigations.
+  pub on_page_load_error_handler: Option<Box<dyn Fn(PageLoadError)>>,
+
   /// Set a proxy configuration for the webview. Supports HTTP CONNECT and SOCKSv5 proxies
   ///
   /// - **macOS**: Requires macOS 14.0+ and the `mac-proxy` feature flag to be enabled.
@@ -826,6 +829,7 @@ impl Default for WebViewAttributes<'_> {
       incognito: false,
       autoplay: true,
       on_page_load_handler: None,
+      on_page_load_error_handler: None,
       proxy_config: None,
       focused: true,
       bounds: Some(Rect {
@@ -1349,6 +1353,20 @@ impl<'a> WebViewBuilder<'a> {
     handler: impl Fn(PageLoadEvent, String) + 'static,
   ) -> Self {
     self.attrs.on_page_load_handler = Some(Box::new(handler));
+    self
+  }
+
+  /// Set a handler to process failed main-frame navigations, with the platform's own error.
+  ///
+  /// ## Platform-specific:
+  ///
+  /// - **Windows**: WebView2's `NavigationCompleted` when it is not a success.
+  /// - **macOS / iOS**: `webView:didFailProvisionalNavigation:withError:` and
+  ///   `webView:didFailNavigation:withError:`.
+  /// - **Linux**: WebKitGTK's `load-failed`.
+  /// - **Android:** Unsupported.
+  pub fn with_on_page_load_error_handler(mut self, handler: impl Fn(PageLoadError) + 'static) -> Self {
+    self.attrs.on_page_load_error_handler = Some(Box::new(handler));
     self
   }
 
@@ -2464,6 +2482,22 @@ pub enum PageLoadEvent {
   Started,
   /// Indicates that the page content has finished loading
   Finished,
+}
+
+/// A main-frame navigation that failed, as the platform reported it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageLoadError {
+  /// The URL the navigation was for.
+  pub url: String,
+  /// The error's domain: `COREWEBVIEW2_WEB_ERROR_STATUS` on Windows (whose values `code` holds),
+  /// the `NSError` domain on Apple platforms, the `GError` domain on Linux.
+  pub domain: String,
+  /// The error's code within `domain`.
+  pub code: i64,
+  /// The platform's description of the error.
+  pub description: String,
+  /// Windows only: the response's HTTP status, when a server answered.
+  pub http_status: Option<i32>,
 }
 
 /// Background throttling policy
