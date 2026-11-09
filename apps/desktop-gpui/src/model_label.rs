@@ -4,7 +4,7 @@
 
 use serde_json::{Value, json};
 
-use crate::model::{ModelSelection, OptionDescriptor, ProviderModel};
+use crate::model::{ModelSelection, OptionDescriptor, Provider, ProviderModel};
 
 const FAMILY_PREFIXES: [&str; 6] = ["Claude ", "GPT-", "GPT ", "Gemini ", "Muse ", "Grok "];
 
@@ -329,6 +329,80 @@ pub fn search_score(
     Some(if favorite { total - 24 } else { total })
 }
 
+/// `COMPOSER_MODEL_MENTION_LIMIT`.
+const MENTION_LIMIT: usize = 8;
+
+/// The provider name a picker or mention shows: its display name, else its instance id.
+pub fn provider_name(provider: &Provider) -> &str {
+    provider.display_name.as_deref().unwrap_or(&provider.instance_id)
+}
+
+/// `rankComposerModelMentions`: the models an `@` query names, best first. Every word must start
+/// a word of the model's names, so fuzzy hits can't push files out of the menu; `:`, `/` and `-`
+/// join words, since a mention has no spaces. A bare or one-letter query names none.
+pub fn rank_mentions<'a>(
+    candidates: &[(&'a Provider, &'a ProviderModel)],
+    query: &str,
+) -> Vec<(&'a Provider, &'a ProviderModel)> {
+    for words in mention_queries(query) {
+        let tokens: Vec<String> = words.to_lowercase().split_whitespace().map(str::to_owned).collect();
+        let mut ranked: Vec<_> = (candidates.iter().enumerate())
+            .filter_map(|(order, &(provider, model))| {
+                let haystack = [
+                    model.name.as_deref().unwrap_or(&model.slug),
+                    model.short_name.as_deref().unwrap_or_default(),
+                    model.sub_provider.as_deref().unwrap_or_default(),
+                    provider.driver.as_str(),
+                    provider_name(provider),
+                ]
+                .join(" ")
+                .to_lowercase();
+                if !tokens.iter().all(|token| starts_a_word(&haystack, token)) {
+                    return None;
+                }
+                let score = search_score(model, &provider.driver, provider_name(provider), false, &words)?;
+                Some((score, order, (provider, model)))
+            })
+            .collect();
+        if !ranked.is_empty() {
+            ranked.sort_by_key(|(score, order, _)| (*score, *order));
+            return ranked.into_iter().take(MENTION_LIMIT).map(|(.., candidate)| candidate).collect();
+        }
+    }
+    Vec::new()
+}
+
+/// `mentionSearchQueries`: the query with `:` and `/` as spaces, then with `-` too.
+fn mention_queries(query: &str) -> Vec<String> {
+    let spaced = collapse_to_spaces(query, &[':', '/']);
+    let unhyphenated = collapse_to_spaces(&spaced, &['-']);
+    if unhyphenated.chars().filter(|c| !c.is_whitespace()).count() < 2 {
+        return Vec::new();
+    }
+    if unhyphenated == spaced { vec![spaced] } else { vec![spaced, unhyphenated] }
+}
+
+/// Each run of `separators` as one space, trimmed.
+fn collapse_to_spaces(text: &str, separators: &[char]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_run = false;
+    for c in text.chars() {
+        let separator = separators.contains(&c);
+        if !separator {
+            out.push(c);
+        } else if !in_run {
+            out.push(' ');
+        }
+        in_run = separator;
+    }
+    out.trim().to_owned()
+}
+
+/// `(?:^|[^\p{L}\p{N}])token`: `token` starts the text or follows a non-alphanumeric.
+fn starts_a_word(haystack: &str, token: &str) -> bool {
+    haystack.match_indices(token).any(|(at, _)| haystack[..at].chars().next_back().is_none_or(|c| !c.is_alphanumeric()))
+}
+
 /// `scoreQueryMatch` with `ignorePosition`.
 fn token_score(value: &str, token: &str, base: i64) -> Option<i64> {
     if value.is_empty() {
@@ -407,6 +481,48 @@ mod tests {
 
     fn model(name: &str) -> ProviderModel {
         serde_json::from_value(json!({"slug": "s", "name": name})).unwrap()
+    }
+
+    #[test]
+    fn mentions_need_every_word_to_start_a_name_word() {
+        let provider = |id: &str, driver: &str, name: &str| -> Provider {
+            serde_json::from_value(json!({"instanceId": id, "driver": driver, "displayName": name})).unwrap()
+        };
+        let named = |slug: &str, name: &str, sub: Option<&str>| -> ProviderModel {
+            serde_json::from_value(json!({"slug": slug, "name": name, "subProvider": sub})).unwrap()
+        };
+        let (traex, opencode, claude) = (
+            provider("traex", "codex", "Traex"),
+            provider("opencode", "opencode", "OpenCode"),
+            provider("claude", "claudeAgent", "Claude"),
+        );
+        let models = [
+            named("gpt", "GPT-6.1", None),
+            named("traex-gpt", "GPT-6.1", Some("Traex")),
+            named("opus", "Claude Opus 5.5", Some("Anthropic")),
+            named("opus", "Claude Opus 5.5", None),
+        ];
+        let candidates =
+            [(&traex, &models[0]), (&opencode, &models[1]), (&opencode, &models[2]), (&claude, &models[3])];
+        let rank = |query: &str| {
+            let mut ids: Vec<String> = rank_mentions(&candidates, query)
+                .into_iter()
+                .map(|(p, m)| format!("{}:{}", p.instance_id, m.slug))
+                .collect();
+            ids.sort();
+            ids
+        };
+        for query in ["", "-", "---", ":/-/:", "g"] {
+            assert_eq!(rank(query), Vec::<String>::new(), "a bare or one-letter @{query}");
+        }
+        assert_eq!(rank("gpt"), ["opencode:traex-gpt", "traex:gpt"], "every provider that serves it");
+        for query in ["opencode:traex", "opencode/gpt", "opencode-gpt"] {
+            assert_eq!(rank(query), ["opencode:traex-gpt"], "{query} joins words");
+        }
+        assert_eq!(rank("gpt-6.1"), ["opencode:traex-gpt", "traex:gpt"], "a hyphenated name stays whole");
+        for query in ["src", "agent", "pus"] {
+            assert_eq!(rank(query), Vec::<String>::new(), "words that only contain @{query}");
+        }
     }
 
     #[test]

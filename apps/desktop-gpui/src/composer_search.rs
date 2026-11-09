@@ -3,7 +3,7 @@
 //! (`components/chat/composerSlashCommandSearch.ts`) and `scoreQueryMatch`
 //! (`packages/shared/src/searchRanking.ts`).
 
-use crate::model::{Provider, ProviderSkill, SlashCommand};
+use crate::model::{Provider, ProviderModel, ProviderSkill, SlashCommand};
 
 /// One row of the `@` / `$` / `/` menu.
 #[derive(Clone, Debug, PartialEq)]
@@ -41,6 +41,12 @@ pub enum MenuAction {
     Environment {
         environment_id: String,
         machine: String,
+    },
+    /// `@` a model: names it for the agent, as `model:<instance>/<model>`.
+    ModelMention {
+        instance_id: String,
+        model: String,
+        driver: String,
     },
 }
 
@@ -309,8 +315,30 @@ pub fn slash_items(
             MenuAction::Skill { name, .. } => format!("2\0{name}"),
             MenuAction::File { path, .. } => path.clone(),
             MenuAction::Environment { environment_id, .. } => environment_id.clone(),
+            MenuAction::ModelMention { instance_id, model, .. } => format!("{instance_id}/{model}"),
         },
     )
+}
+
+/// `matchComposerModelItems`: the models an `@` query names, labelled as the picker names them
+/// and described by their sub-provider, else their provider.
+pub fn model_items(candidates: &[(&Provider, &ProviderModel)], query: &str) -> Vec<MenuItem> {
+    crate::model_label::rank_mentions(candidates, query)
+        .into_iter()
+        .map(|(provider, model)| MenuItem {
+            id: format!("model:{}:{}", provider.instance_id, model.slug),
+            label: crate::model_label::display_model_name(model),
+            description: model
+                .sub_provider
+                .clone()
+                .unwrap_or_else(|| crate::model_label::provider_name(provider).to_owned()),
+            action: MenuAction::ModelMention {
+                instance_id: provider.instance_id.clone(),
+                model: model.slug.clone(),
+                driver: provider.driver.clone(),
+            },
+        })
+        .collect()
 }
 
 /// A `projects.searchEntries` result as menu rows: basename, then parent folder.

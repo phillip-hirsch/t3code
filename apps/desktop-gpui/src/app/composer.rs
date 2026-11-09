@@ -198,7 +198,7 @@ impl Workspace {
     }
 
     /// `set_value` emits no `Change`, so this keeps `composer_empty` in step.
-    /// File links, known skills and context links in `text` come back as chips.
+    /// File links, known skills and models, and context links in `text` come back as chips.
     pub(super) fn set_composer_text(
         &mut self,
         text: impl Into<SharedString>,
@@ -208,7 +208,12 @@ impl Workspace {
         let text: SharedString = text.into();
         let skills = self.skill_names();
         let mut content = InputContent::new(text.clone());
-        for (range, chip) in composer_text::chips(&text, |name| skills.iter().any(|s| s == name)) {
+        let chips = composer_text::chips_with_models(
+            &text,
+            |name| skills.iter().any(|s| s == name),
+            |instance_id, model| self.model_mention(instance_id, model).map(|m| m.label),
+        );
+        for (range, chip) in chips {
             let token = InlineToken::new(chip.id(), &text[range.clone()]).with_label(chip.label().to_owned());
             content = match content.clone().with_token(range, token) {
                 Ok(next) => next,
@@ -224,7 +229,7 @@ impl Workspace {
         self.sync_composer_marks(cx);
     }
 
-    /// Pasted file links, known skills and context links arrive as chips (`handlePaste`);
+    /// Pasted file links, known skills and models, and context links arrive as chips (`handlePaste`);
     /// `false` leaves a paste without any, or one into code, to the editor.
     pub(super) fn paste_chips(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let state = self.composer.read(cx);
@@ -235,9 +240,12 @@ impl Workspace {
         }
         let after_space = value[..selection.start].chars().next_back().is_none_or(char::is_whitespace);
         let skills = self.skill_names();
-        let Some((text, found)) =
-            composer_text::pasted_chips(text, after_space, |name| skills.iter().any(|s| s == name))
-        else {
+        let Some((text, found)) = composer_text::pasted_chips(
+            text,
+            after_space,
+            |name| skills.iter().any(|s| s == name),
+            |instance_id, model| self.model_mention(instance_id, model).map(|m| m.label),
+        ) else {
             return false;
         };
         let at = selection.start;
@@ -252,6 +260,19 @@ impl Workspace {
             state.set_selected_range(end..end, cx);
         });
         true
+    }
+
+    /// The model a `model:` reference names, as its chip shows it (`modelMentionPresentationAtom`):
+    /// any provider of this environment that offers it, ready or not.
+    pub(super) fn model_mention(&self, instance_id: &str, model: &str) -> Option<ModelMention> {
+        let provider = self.server_info().provider(instance_id)?;
+        let option = provider.models.iter().find(|m| m.slug == model)?;
+        Some(ModelMention {
+            label: crate::model_label::display_model_name(option),
+            provider_label: (option.sub_provider.clone())
+                .unwrap_or_else(|| crate::model_label::provider_name(provider).to_owned()),
+            driver: provider.driver.clone(),
+        })
     }
 
     /// The user-invocable skills of the composer's provider, by name.
@@ -877,6 +898,16 @@ impl Workspace {
                 Some((s.id.as_ref()?.to_string(), super::host_picker::machine_icon(s.server_info.machine_kind())))
             })
             .collect();
+        let models: Rc<HashMap<String, ModelMention>> = Rc::new(
+            (self.composer.read(cx).tokens().iter())
+                .filter_map(|span| {
+                    let Some(Chip::Model { instance_id, model, .. }) = Chip::from_id(span.token().id()) else {
+                        return None;
+                    };
+                    Some((span.token().id().to_string(), self.model_mention(&instance_id, &model)?))
+                })
+                .collect(),
+        );
         let editor = Textarea::new(&self.composer)
             .appearance(false)
             .xsmall()
@@ -885,7 +916,7 @@ impl Workspace {
             .line_height(px(t.fonts.prompt_size * PROMPT_LEADING))
             .mx(px(-4.))
             .disabled(self.target.is_none())
-            .token(move |token, _, _| render_chip(token, &pull_requests, &machines, &t))
+            .token(move |token, _, _| render_chip(token, &pull_requests, &machines, &models, &t))
             // A pull request chip shows its details while hovered (`PullRequestContextDetails`).
             .on_token_hover(move |event, _, cx| {
                 let hovered = event.is_hovered().then(|| (event.token().id().to_string(), event.bounds()));
@@ -1905,10 +1936,61 @@ fn mark_style(style: u8, t: &Tokens) -> HighlightStyle {
     }
 }
 
+/// What a `model:` chip shows of the model it names (`ModelMentionPresentation`).
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ModelMention {
+    pub label: String,
+    /// Its sub-provider, else its provider.
+    pub provider_label: String,
+    pub driver: String,
+}
+
+/// `--context-chip-model`: `oklch(0.62 0.13 105)`.
+const MODEL_CHIP_ACCENT: crate::theme_color::Oklch = crate::theme_color::Oklch { l: 0.62, c: 0.13, h: 105. };
+
+/// `logoAccent`: the model chip's lightness with the hue and chroma of the provider logo's own
+/// color, for logos that keep one color in both themes; else the model chip's own accent.
+#[expect(clippy::cast_possible_truncation, reason = "colour channels; f32 is plenty")]
+pub(super) fn model_chip_accent(driver: &str) -> Hsla {
+    use crate::theme_color::{Oklch, Rgb, oklch_to_rgb, rgb_to_oklch};
+    // `BUNDLED_LOGO_COLOR_BY_PROVIDER` also colors Antigravity, whose logo isn't bundled here.
+    let logo = match driver {
+        "antigravity" => Some(Hsla::from(rgb(0x5b87bf))),
+        _ => crate::assets::provider_icon(driver).and_then(|(_, tint)| tint),
+    };
+    let color = logo.map_or(MODEL_CHIP_ACCENT, |logo| {
+        let logo = logo.to_rgb();
+        let [r, g, b] = [logo.r, logo.g, logo.b].map(|channel| f64::from(channel) * 255.);
+        Oklch { l: MODEL_CHIP_ACCENT.l, ..rgb_to_oklch(Rgb { r, g, b }) }
+    });
+    let rgb = oklch_to_rgb(color, false);
+    gpui_kit::Rgba { r: (rgb.r / 255.) as f32, g: (rgb.g / 255.) as f32, b: (rgb.b / 255.) as f32, a: 1. }.into()
+}
+
+/// The provider logo a model chip leads with, in the logo's own color or else `accent`.
+pub(super) fn model_chip_icon(driver: &str, accent: Hsla) -> Icon {
+    match crate::assets::provider_icon(driver) {
+        Some((asset, tint)) => Icon::empty().path(asset).text_color(tint.unwrap_or(accent)),
+        None => Icon::new(Lucide::Bot).text_color(accent),
+    }
+}
+
+/// `ModelMentionChip`'s details: the model, its provider, and the reference the prompt holds.
+pub(super) fn model_mention_details(mention: &ModelMention, source: &str, t: &Tokens) -> gpui_kit::Div {
+    v_flex()
+        .gap(px(4.))
+        .max_w(px(320.))
+        .text_sm()
+        .child(div().font_weight(FontWeight::MEDIUM).text_color(t.foreground).child(mention.label.clone()))
+        .child(div().text_color(t.muted_foreground).child(mention.provider_label.clone()))
+        .child(div().font_family(t.fonts.mono).text_xs().text_color(t.muted_foreground).child(source.to_owned()))
+}
+
 fn render_chip(
     token: &InlineTokenContext,
     pull_requests: &HashMap<String, PullRequestContext>,
     machines: &[(String, Lucide)],
+    models: &HashMap<String, ModelMention>,
     t: &Tokens,
 ) -> AnyElement {
     let id = token.token().id();
@@ -1918,6 +2000,9 @@ fn render_chip(
         Some(Chip::File { path }) => Some(SharedString::from(path.clone())),
         _ => None,
     };
+    if matches!(chip, Some(Chip::Model { .. })) {
+        return render_model_chip(token, models.get(id.as_ref()), t);
+    }
     let (accent, icon) = match chip {
         Some(Chip::Skill { .. }) => (rgb(0xb261be), Lucide::Box),
         Some(Chip::Context { kind, id, .. })
@@ -1948,6 +2033,33 @@ fn render_chip(
         .child(div().min_w_0().truncate().child(token.token().label().clone()))
         .id(ElementId::Name(format!("chip-{}-{id}", token.range().start).into()))
         .when_some(path, |el, path| el.tooltip(move |window, cx| Tooltip::new(path.clone()).build(window, cx)))
+        .into_any_element()
+}
+
+/// A `model:` chip: the provider's logo and the model's name, its details while hovered. A model
+/// the environment no longer offers keeps the name it was picked with.
+fn render_model_chip(token: &InlineTokenContext, mention: Option<&ModelMention>, t: &Tokens) -> AnyElement {
+    let id = token.token().id();
+    let accent = mention.map_or_else(|| model_chip_accent(""), |m| model_chip_accent(&m.driver));
+    let icon = model_chip_icon(mention.map_or("", |m| m.driver.as_str()), accent);
+    let details = mention.cloned().map(|mention| (mention, token.token().text().clone(), *t));
+    h_flex()
+        .h(token.line_height())
+        .max_w(token.available_width())
+        .gap(px(3.))
+        .rounded(px(4.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(accent)
+        .when(token.is_selected(), |el| el.bg(t.primary.opacity(0.25)))
+        .child(icon.with_size(px(14.)).flex_none())
+        .child(div().min_w_0().truncate().child(token.token().label().clone()))
+        .id(ElementId::Name(format!("chip-{}-{id}", token.range().start).into()))
+        .when_some(details, |el, (mention, source, t)| {
+            el.tooltip(move |window, cx| {
+                let (mention, source) = (mention.clone(), source.clone());
+                Tooltip::element(move |_, _| model_mention_details(&mention, &source, &t)).build(window, cx)
+            })
+        })
         .into_any_element()
 }
 

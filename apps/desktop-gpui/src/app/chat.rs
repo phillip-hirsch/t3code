@@ -1851,6 +1851,7 @@ fn markdown_view(
         })
         .table_actions(move |table, _, cx| super::markdown_ui::table_actions(table, &table_this, &table_key, &t, cx))
         .plugin(super::markdown_ui::SkillChips { workspace: this.clone() })
+        .plugin(super::markdown_ui::ModelChips { workspace: this.clone() })
         .plugin(super::markdown_ui::ThreadChips { workspace: this.clone() })
         .plugin(super::markdown_ui::FileChips {
             workspace: this.clone(),

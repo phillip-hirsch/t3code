@@ -1,4 +1,4 @@
-//! The `@` files, `$` skills and `/` commands menu above the composer
+//! The `@` files, machines and models, `$` skills and `/` commands menu above the composer
 //! (`ComposerCommandMenu.tsx`, `ComposerCommandMenuLayer.tsx`,
 //! `useComposerMenuItems.ts`).
 
@@ -19,6 +19,7 @@ use serde_json::json;
 use super::{Target, Workspace};
 use crate::composer_search::{self, MenuAction, MenuItem};
 use crate::composer_text::{self, Chip, Trigger, TriggerKind};
+use crate::model::Provider;
 use crate::theme::Tokens;
 
 /// `useComposerPathSearch` waits this long after the last keystroke.
@@ -102,8 +103,9 @@ impl Workspace {
         };
         let cwd = self.composer_cwd();
         if trigger.kind == TriggerKind::Path {
-            let machines = self.machine_items(&trigger.query);
-            self.search_files(trigger.query.trim().to_owned(), cwd, machines, cx);
+            let mut leading = self.machine_items(&trigger.query);
+            leading.extend(self.model_items(&trigger.query));
+            self.search_files(trigger.query.trim().to_owned(), cwd, leading, cx);
             return;
         }
         self.menu._search = None;
@@ -179,11 +181,25 @@ impl Workspace {
         composer_search::environment_items(machines, here, query)
     }
 
-    fn search_files(&mut self, query: String, cwd: Option<String>, machines: Vec<MenuItem>, cx: &mut Context<Self>) {
+    /// `@` names the models of this environment's ready providers that the picker would list,
+    /// leaving out legacy and unavailable ones so they don't fill the cap.
+    fn model_items(&self, query: &str) -> Vec<MenuItem> {
+        let info = self.server_info();
+        let ready =
+            |p: &&Provider| p.enabled && p.availability.as_deref() != Some("unavailable") && p.status == "ready";
+        let candidates: Vec<_> = (info.providers.iter().filter(ready))
+            .flat_map(|p| p.models.iter().map(move |m| (p, m)))
+            .filter(|(p, m)| !m.is_legacy && !m.is_unavailable && !Self::model_hidden(info, p, m))
+            .collect();
+        composer_search::model_items(&candidates, query)
+    }
+
+    /// Fetches files after the `leading` rows (machines, then models) the query already matched.
+    fn search_files(&mut self, query: String, cwd: Option<String>, leading: Vec<MenuItem>, cx: &mut Context<Self>) {
         let (Some(cwd), Some(client), false) = (cwd, self.client(), query.is_empty()) else {
             self.menu._search = None;
             self.menu.loading = false;
-            self.menu.items = Rc::from(machines);
+            self.menu.items = Rc::from(leading);
             return;
         };
         self.menu.loading = true;
@@ -204,7 +220,7 @@ impl Workspace {
                         Vec::new()
                     }
                 };
-                this.menu.items = machines.into_iter().chain(files).collect();
+                this.menu.items = leading.into_iter().chain(files).collect();
                 this.menu.highlighted = 0;
                 cx.notify();
             });
@@ -264,6 +280,11 @@ impl Workspace {
                 let link = composer_text::context_link("environment", &id, &item.label);
                 (link, Some(Chip::Context { kind: "environment".into(), id, label: item.label.clone() }))
             }
+            // It names the model for the agent; the thread's own model stays.
+            MenuAction::ModelMention { instance_id, model, .. } => (
+                composer_text::model_mention(instance_id, model),
+                Some(Chip::Model { instance_id: instance_id.clone(), model: model.clone(), label: item.label.clone() }),
+            ),
         };
         self.menu.trigger = None;
         self.composer.update(cx, |state, cx| {
@@ -392,6 +413,11 @@ fn menu_row(item: &MenuItem, kind: TriggerKind, active: bool, t: &Tokens) -> gpu
             let (asset, color) = crate::file_icons::file_icon(path, t.dark);
             Some(Icon::empty().path(asset).text_color(color))
         }
+        // `ProviderInstanceIcon`: the provider's logo, in its own color where it has one.
+        MenuAction::ModelMention { driver, .. } => Some(match crate::assets::provider_icon(driver) {
+            Some((asset, tint)) => Icon::empty().path(asset).text_color(tint.unwrap_or(t.foreground)),
+            None => Icon::new(Lucide::Bot).text_color(t.muted_foreground),
+        }),
         _ => None,
     };
     let badge = match (&item.action, kind) {

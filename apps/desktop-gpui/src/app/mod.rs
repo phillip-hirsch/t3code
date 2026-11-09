@@ -1185,6 +1185,7 @@ fn new_id() -> String {
 }
 
 fn draft_title(text: &str) -> String {
+    let text = crate::composer_text::model_mentions_as_slugs(text);
     let line = text.lines().next().unwrap_or_default().trim();
     match line.char_indices().nth(60) {
         Some((end, _)) => format!("{}…", &line[..end]),

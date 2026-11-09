@@ -135,6 +135,12 @@ pub enum Chip {
         id: String,
         label: String,
     },
+    /// `model:<instance>/<model>`: a model named for the agent; `label` is its display name.
+    Model {
+        instance_id: String,
+        model: String,
+        label: String,
+    },
 }
 
 impl Chip {
@@ -143,6 +149,7 @@ impl Chip {
             Chip::File { path } => format!("file:{path}"),
             Chip::Skill { name } => format!("skill:{name}"),
             Chip::Context { kind, id, .. } => format!("context:{kind}/{id}"),
+            Chip::Model { instance_id, model, .. } => model_mention(instance_id, model),
         }
     }
 
@@ -150,17 +157,24 @@ impl Chip {
         match self {
             Chip::File { path } => basename(path),
             Chip::Skill { name } => name,
-            Chip::Context { label, .. } => label,
+            Chip::Context { label, .. } | Chip::Model { label, .. } => label,
         }
     }
 
-    /// The chip an editor token id names; context chips come back without their label.
+    /// The chip an editor token id names; context and model chips come back without their label.
     pub fn from_id(id: &str) -> Option<Self> {
         if let Some(path) = id.strip_prefix("file:") {
             return Some(Chip::File { path: path.to_owned() });
         }
         if let Some(name) = id.strip_prefix("skill:") {
             return Some(Chip::Skill { name: name.to_owned() });
+        }
+        if let Some((instance_id, model)) = id.strip_prefix(MODEL_PREFIX).and_then(|rest| rest.split_once('/')) {
+            return Some(Chip::Model {
+                instance_id: instance_id.to_owned(),
+                model: model.to_owned(),
+                label: String::new(),
+            });
         }
         let (kind, id) = id.strip_prefix("context:")?.split_once('/')?;
         Some(Chip::Context { kind: kind.to_owned(), id: id.to_owned(), label: String::new() })
@@ -217,24 +231,148 @@ pub fn chips(text: &str, is_skill: impl Fn(&str) -> bool) -> Vec<(Range<usize>, 
     found
 }
 
+/// [`chips`], plus the `model:` references `model_label` knows, labelled by it. Like a
+/// `$skill`, a reference chips only once whitespace follows it, so `gpt-6` cannot chip on the
+/// way to `gpt-6.1` (`collectModelTokens`).
+pub fn chips_with_models(
+    text: &str,
+    is_skill: impl Fn(&str) -> bool,
+    model_label: impl Fn(&str, &str) -> Option<String>,
+) -> ChipSpans {
+    let mut found = chips(text, is_skill);
+    let taken = found.len();
+    for mention in model_mentions(text) {
+        let range = mention.range;
+        if !text[range.end..].starts_with(char::is_whitespace)
+            || found[..taken].iter().any(|(other, _)| other.start < range.end && range.start < other.end)
+        {
+            continue;
+        }
+        let Some(label) = model_label(&mention.instance_id, &mention.model) else { continue };
+        found.push((range, Chip::Model { instance_id: mention.instance_id, model: mention.model, label }));
+    }
+    found.sort_by_key(|(range, _)| range.start);
+    found
+}
+
+const MODEL_PREFIX: &str = "model:";
+
+/// `formatComposerModelMention`: the prompt text naming a provider instance's model for the
+/// agent. No `@`, which would read as a file mention.
+pub fn model_mention(instance_id: &str, model: &str) -> String {
+    format!("{MODEL_PREFIX}{instance_id}/{model}")
+}
+
+/// A `model:<instance>/<model>` reference and where it sits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelMention {
+    pub instance_id: String,
+    pub model: String,
+    pub range: Range<usize>,
+}
+
+/// `collectComposerModelMentions`: the references [`model_mention`] writes, at the start of the
+/// text or after whitespace, `,`, `(`, `[`, `"` or `'`. Model slugs may hold `/` and balanced
+/// brackets; sentence punctuation and an unbalanced closing bracket after one are prose.
+pub fn model_mentions(text: &str) -> Vec<ModelMention> {
+    let mut found = Vec::new();
+    let mut scanned = 0;
+    for (start, _) in text.match_indices(MODEL_PREFIX) {
+        let after_boundary =
+            text[..start].chars().next_back().is_none_or(|c| c.is_whitespace() || ",([\"'".contains(c));
+        if start < scanned || !after_boundary {
+            continue;
+        }
+        let rest = &text[start + MODEL_PREFIX.len()..];
+        // `ProviderInstanceId`: a letter, then letters, digits, `_` or `-`.
+        let instance_len =
+            rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-')).unwrap_or(rest.len());
+        let instance_id = &rest[..instance_len];
+        let Some(slug_text) = rest[instance_len..].strip_prefix('/') else { continue };
+        if !instance_id.starts_with(|c: char| c.is_ascii_alphabetic()) {
+            continue;
+        }
+        let slug_len = slug_text.find(|c: char| c.is_whitespace() || ",\"'".contains(c)).unwrap_or(slug_text.len());
+        if slug_len == 0 {
+            continue;
+        }
+        let head = MODEL_PREFIX.len() + instance_len + 1;
+        scanned = start + head + slug_len;
+        let model = trim_model_slug(&slug_text[..slug_len]);
+        if model.is_empty() {
+            continue;
+        }
+        found.push(ModelMention {
+            instance_id: instance_id.to_owned(),
+            model: model.to_owned(),
+            range: start..start + head + model.len(),
+        });
+    }
+    found
+}
+
+/// `trimModelSlug`: `foo(bar)` keeps its brackets; `(model:a/b).` drops the `).`.
+fn trim_model_slug(slug: &str) -> &str {
+    let mut trimmed = slug;
+    while let Some(last) = trimmed.chars().next_back() {
+        let opening = match last {
+            ')' => Some('('),
+            ']' => Some('['),
+            _ => None,
+        };
+        let count = |c: char| trimmed.matches(c).count();
+        let unbalanced = opening.is_some_and(|open| count(open) < count(last));
+        if !".;:!?".contains(last) && !unbalanced {
+            break;
+        }
+        trimmed = &trimmed[..trimmed.len() - last.len_utf8()];
+    }
+    trimmed
+}
+
+/// `threadTitleTextFromPrompt`'s `modelMentionsAsSlugs`: a title names a mentioned model by its
+/// slug, without the reference syntax.
+pub fn model_mentions_as_slugs(text: &str) -> std::borrow::Cow<'_, str> {
+    let mentions = model_mentions(text);
+    if mentions.is_empty() {
+        return text.into();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for mention in mentions {
+        out.push_str(&text[cursor..mention.range.start]);
+        out.push_str(&mention.model);
+        cursor = mention.range.end;
+    }
+    out.push_str(&text[cursor..]);
+    out.into()
+}
+
 /// Chips with their byte ranges in the text they came from.
 pub type ChipSpans = Vec<(Range<usize>, Chip)>;
 
-/// `handlePaste`: the chips in pasted `text`, with a space after a mention or skill that ends it
-/// and before one that starts it unless the caret follows whitespace; `None` when it has none.
-pub fn pasted_chips(text: &str, after_space: bool, is_skill: impl Fn(&str) -> bool) -> Option<(String, ChipSpans)> {
+/// `handlePaste`: the chips in pasted `text`, with a space after a mention, skill or model that
+/// ends it and before one that starts it unless the caret follows whitespace; `None` when it has
+/// none.
+pub fn pasted_chips(
+    text: &str,
+    after_space: bool,
+    is_skill: impl Fn(&str) -> bool,
+    model_label: impl Fn(&str, &str) -> Option<String>,
+) -> Option<(String, ChipSpans)> {
     // A trailing line break lets a mention that ends the paste parse, as the web's does.
-    let mut found: Vec<_> = chips(
+    let mut found: Vec<_> = chips_with_models(
         &format!(
             "{text}
 "
         ),
         is_skill,
+        model_label,
     )
     .into_iter()
     .filter(|(range, _)| range.end <= text.len())
     .collect();
-    let spaced = |chip: &Chip| matches!(chip, Chip::File { .. } | Chip::Skill { .. });
+    let spaced = |chip: &Chip| matches!(chip, Chip::File { .. } | Chip::Skill { .. } | Chip::Model { .. });
     let mut padded = text.to_owned();
     if found.last().is_some_and(|(range, chip)| range.end == text.len() && spaced(chip)) {
         padded.push(' ');
@@ -476,13 +614,80 @@ mod tests {
     #[test]
     fn pasted_mentions_and_skills_become_chips_kept_apart_from_their_neighbours() {
         let skill = |name: &str| name == "review";
-        assert_eq!(pasted_chips("plain words", false, skill), None);
-        let (text, found) = pasted_chips("[a.rs](src/a.rs)", false, skill).unwrap();
+        let none = |_: &str, _: &str| None;
+        assert_eq!(pasted_chips("plain words", false, skill, none), None);
+        let (text, found) = pasted_chips("[a.rs](src/a.rs)", false, skill, none).unwrap();
         assert_eq!(text, " [a.rs](src/a.rs) ");
         assert_eq!(found, [(1..17, Chip::File { path: "src/a.rs".into() })]);
-        let (text, found) = pasted_chips("see $review", true, skill).unwrap();
+        let (text, found) = pasted_chips("see $review", true, skill, none).unwrap();
         assert_eq!((text.as_str(), found), ("see $review ", vec![(4..11, Chip::Skill { name: "review".into() })]));
-        assert_eq!(pasted_chips("$unknown", true, skill), None, "only a skill the provider offers");
+        assert_eq!(pasted_chips("$unknown", true, skill, none), None, "only a skill the provider offers");
+        let (text, found) = pasted_chips("model:codex/gpt-6.1", false, skill, codex_model).unwrap();
+        assert_eq!(text, " model:codex/gpt-6.1 ", "a model chip is spaced like a mention");
+        assert_eq!(found, [(1..20, gpt_chip())]);
+    }
+
+    fn codex_model(instance_id: &str, model: &str) -> Option<String> {
+        (instance_id == "codex" && model == "gpt-6.1").then(|| "GPT-6.1".to_owned())
+    }
+
+    fn gpt_chip() -> Chip {
+        Chip::Model { instance_id: "codex".into(), model: "gpt-6.1".into(), label: "GPT-6.1".into() }
+    }
+
+    fn mentions(text: &str) -> Vec<String> {
+        model_mentions(text).into_iter().map(|m| format!("{}/{}", m.instance_id, m.model)).collect()
+    }
+
+    #[test]
+    fn model_references_read_back_what_a_pick_writes_inside_prose() {
+        let text = format!("use {}, then model:codex/gpt-5.4.", model_mention("opencode", "anthropic/opus"));
+        let found = model_mentions(&text);
+        assert_eq!(
+            found.iter().map(|m| (m.instance_id.as_str(), m.model.as_str(), m.range.clone())).collect::<Vec<_>>(),
+            [("opencode", "anthropic/opus", 4..33), ("codex", "gpt-5.4", 40..59)]
+        );
+        assert_eq!(&text[found[0].range.clone()], "model:opencode/anthropic/opus");
+        for (text, expected) in [
+            ("(model:codex/gpt-6.1).", vec!["codex/gpt-6.1"]),
+            ("\"model:codex/gpt-6.1\"", vec!["codex/gpt-6.1"]),
+            ("model:codex/gpt-6.1,model:claudeAgent/sonnet", vec!["codex/gpt-6.1", "claudeAgent/sonnet"]),
+            ("model:codex/gpt-6.1's output", vec!["codex/gpt-6.1"]),
+            ("model:opencode/foo(bar)", vec!["opencode/foo(bar)"]),
+            ("model:codex/GPT-6.1-Sol[1m]", vec!["codex/GPT-6.1-Sol[1m]"]),
+        ] {
+            assert_eq!(mentions(text), expected, "{text}");
+        }
+        for text in ["remodel:codex/gpt", "model:codex", "model:/gpt", "model:codex/.", "model:1x/gpt", "é model:a"] {
+            assert_eq!(mentions(text), Vec::<String>::new(), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_known_model_reference_chips_once_whitespace_follows_it() {
+        let found = |text: &str| chips_with_models(text, |_| false, codex_model);
+        assert_eq!(found("Ask model:codex/gpt-6.1 now"), [(4..23, gpt_chip())]);
+        assert_eq!(found("Ask model:openai/gpt-4o now"), [], "only a model the environment offers");
+        assert_eq!(found("Ask model:codex/gpt-6.1"), [], "still being typed");
+        let both = chips_with_models("$review model:codex/gpt-6.1 x", |name| name == "review", codex_model);
+        assert_eq!(both, [(0..7, Chip::Skill { name: "review".into() }), (8..27, gpt_chip())]);
+        assert_eq!(gpt_chip().id(), "model:codex/gpt-6.1");
+        assert_eq!(
+            Chip::from_id(&gpt_chip().id()),
+            Some(Chip::Model { instance_id: "codex".into(), model: "gpt-6.1".into(), label: String::new() })
+        );
+    }
+
+    #[test]
+    fn titles_name_a_mentioned_model_by_its_slug() {
+        assert_eq!(
+            model_mentions_as_slugs("Delegate to model:codex/gpt-6.1-sol and report back"),
+            "Delegate to gpt-6.1-sol and report back"
+        );
+        assert_eq!(
+            model_mentions_as_slugs("model:opencode/anthropic/opus, then model:codex/gpt-5.4."),
+            "anthropic/opus, then gpt-5.4."
+        );
     }
 
     #[test]

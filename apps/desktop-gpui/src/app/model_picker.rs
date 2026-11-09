@@ -488,7 +488,7 @@ impl Workspace {
     }
 
     /// `providerModelPreferences[id].hiddenModels`, never hiding custom models.
-    fn model_hidden(info: &ServerInfo, provider: &Provider, model: &ProviderModel) -> bool {
+    pub(super) fn model_hidden(info: &ServerInfo, provider: &Provider, model: &ProviderModel) -> bool {
         !model.is_custom
             && info.settings.get("providerModelPreferences")[provider.instance_id.as_str()]["hiddenModels"]
                 .as_array()
