@@ -137,6 +137,7 @@ impl Workspace {
         }
         self.save_custom_answer(cx);
         self.sync_composer_empty(cx);
+        self.drop_orphan_citation_comment(cx);
         self.reveal_branch_banner();
         let state = self.composer.read(cx);
         if self.prompt_history.as_ref().is_some_and(|h| *h.recalled != *state.value()) {
@@ -220,6 +221,7 @@ impl Workspace {
         self.release_retained_attachments(cx);
         self.composer.update(cx, |composer, cx| composer.set_value(content, window, cx));
         self.sync_composer_empty(cx);
+        self.drop_orphan_citation_comment(cx);
         self.sync_trigger(cx);
         self.sync_composer_marks(cx);
     }
@@ -278,11 +280,15 @@ impl Workspace {
             self.composer_selections.remove(&target);
         }
         let attachments = std::mem::take(&mut self.attachments);
+        let commented = self.stash_citation_comment(cx);
         let draft = match (self.question.take(), self.take_queue_edit_draft()) {
             (Some(question), _) => ComposerDraft::Question(question),
             // A queued message's edit ends here; the thread keeps its own draft.
             (None, Some((prompt, attachments))) => ComposerDraft::Prompt(prompt, attachments),
-            (None, None) => ComposerDraft::Prompt(self.composer.read(cx).value().to_string(), attachments),
+            (None, None) => ComposerDraft::Prompt(
+                commented.unwrap_or_else(|| self.composer.read(cx).value().to_string()),
+                attachments,
+            ),
         };
         self.prompt_history = None;
         self.menu = Default::default();
@@ -911,6 +917,12 @@ impl Workspace {
                         trimmed.len() == 2 && trimmed.ends_with(':') && trimmed.as_bytes()[0].is_ascii_alphabetic();
                     let path = if trimmed.is_empty() || drive_root { path.clone() } else { trimmed.to_owned() };
                     let _ = chip_view.update(cx, |this, cx| this.open_file_surface(path, window, cx));
+                }
+                Some(Chip::Citation { .. }) => {
+                    let (id, range, bounds) = (event.token().id().to_string(), event.range(), event.bounds());
+                    let _ = chip_view.update(cx, |this, cx| {
+                        this.citation_chip_clicked(id, range, bounds, event.click(), window, cx);
+                    });
                 }
                 _ => {}
             })
@@ -1909,6 +1921,13 @@ fn render_chip(
 ) -> AnyElement {
     let id = token.token().id();
     let chip = Chip::from_id(id);
+    if let Some(Chip::Citation { .. }) = chip {
+        let label = token.token().label().clone();
+        return super::citations::citation_chip(label, t.fonts.prompt_size, token.is_selected(), t)
+            .h(token.line_height())
+            .max_w(token.available_width())
+            .into_any_element();
+    }
     // `WorkspaceEntryTooltip`: a mention names its workspace path.
     let path = match &chip {
         Some(Chip::File { path }) => Some(SharedString::from(path.clone())),

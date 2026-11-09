@@ -32,6 +32,7 @@ mod attachments;
 mod banners;
 mod changed_files;
 mod chat;
+mod citations;
 mod commands;
 mod composer;
 mod composer_fit;
@@ -342,6 +343,7 @@ pub struct Workspace {
     workflow: workflow::WorkflowUi,
     setup: worktree_setup::SetupWatch,
     chat_menu: Option<markdown_ui::ChatMenu>,
+    citations: citations::CitationUi,
     requests: request_cards::RequestUi,
     subagents: subagents::SubagentUi,
     banners: banners::BannerUi,
@@ -533,6 +535,7 @@ impl Workspace {
             workflow: Default::default(),
             setup: Default::default(),
             chat_menu: None,
+            citations: Default::default(),
             requests: Default::default(),
             subagents: Default::default(),
             banners: Default::default(),
@@ -907,6 +910,7 @@ impl Workspace {
         if self.open_projection().is_some() {
             self.restore_position(cx);
         }
+        self.reveal_pending_citation(cx);
     }
 
     /// Opens a listed thread on the environment it lives on.
@@ -1185,6 +1189,7 @@ fn new_id() -> String {
 }
 
 fn draft_title(text: &str) -> String {
+    let text = crate::assistant_citations::to_plain_text(text);
     let line = text.lines().next().unwrap_or_default().trim();
     match line.char_indices().nth(60) {
         Some((end, _)) => format!("{}…", &line[..end]),
@@ -1331,6 +1336,7 @@ impl Render for Workspace {
                                         match self.target.clone() {
                                             Some(Target::Draft { project_id, .. }) => el
                                                 .child(self.render_draft_stage(&project_id, window, cx))
+                                                .children(self.render_citation_comment(cx))
                                                 .children(self.render_details_card(window, cx)),
                                             _ => el
                                                 .child(
@@ -1346,11 +1352,27 @@ impl Render for Workspace {
                                                                     gpui_kit::MouseButton::Left,
                                                                     |_, window, cx| window.blur(cx),
                                                                 )
+                                                                // The Cite button follows selections the text
+                                                                // views make, so it listens ahead of them.
+                                                                .capture_any_mouse_down(cx.listener(
+                                                                    |this, _: &gpui_kit::MouseDownEvent, _, cx| {
+                                                                        this.chat_mouse_down(cx);
+                                                                    },
+                                                                ))
+                                                                .capture_any_mouse_up(cx.listener(
+                                                                    |this, event: &gpui_kit::MouseUpEvent, window, cx| {
+                                                                        if event.button == gpui_kit::MouseButton::Left {
+                                                                            this.chat_mouse_up(event.position, window, cx);
+                                                                        }
+                                                                    },
+                                                                ))
                                                                 .child(self.render_body(window, cx)),
                                                         )
                                                         .child(self.render_floating_composer(window, cx)),
                                                 )
                                                 .children(self.render_find_bar(cx))
+                                                .children(self.render_cite_toolbar(cx))
+                                                .children(self.render_citation_comment(cx))
                                                 .children(self.render_details_card(window, cx)),
                                         }
                                     })

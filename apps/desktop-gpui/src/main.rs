@@ -2,6 +2,7 @@
 
 mod app;
 mod assets;
+mod assistant_citations;
 mod backend;
 mod browser_history;
 mod caret;

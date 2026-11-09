@@ -37,9 +37,12 @@ const GUEST: u32 = 0xe12afb;
 const COLLAPSE_CHARS: usize = 600;
 const COLLAPSE_LINES: usize = 8;
 
-/// `shouldCollapseUserMessage`; it stops counting at the limits.
+/// `shouldCollapseUserMessage`, measuring the text as it reads: links and citations as their labels.
 pub(super) fn should_collapse(text: &str) -> bool {
-    text.chars().nth(COLLAPSE_CHARS).is_some() || text.lines().nth(COLLAPSE_LINES).is_some()
+    let visible = crate::assistant_citations::visible_prompt_text(text);
+    !visible.trim().is_empty()
+        && (crate::assistant_citations::js_len(&visible) > COLLAPSE_CHARS
+            || visible.split('\n').nth(COLLAPSE_LINES).is_some())
 }
 
 impl Workspace {
@@ -152,6 +155,7 @@ impl Workspace {
                 side.scroller.update(cx, |scroller, cx| scroller.remeasure_items(index..index + 1, cx));
             }
             this.paint_find(&row_key, cx);
+            this.paint_citation(&row_key, cx);
         });
         self.markdown
             .0
@@ -1851,6 +1855,7 @@ fn markdown_view(
         })
         .table_actions(move |table, _, cx| super::markdown_ui::table_actions(table, &table_this, &table_key, &t, cx))
         .plugin(super::markdown_ui::SkillChips { workspace: this.clone() })
+        .plugin(super::markdown_ui::CitationChips { workspace: this.clone() })
         .plugin(super::markdown_ui::ThreadChips { workspace: this.clone() })
         .plugin(super::markdown_ui::FileChips {
             workspace: this.clone(),
@@ -2835,6 +2840,18 @@ fn detail_entry(detail: &DetailEntry, this: &WeakEntity<Workspace>, t: &Tokens, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_messages_fold_by_the_text_they_show() {
+        assert!(should_collapse(&"a".repeat(601)));
+        assert!(!should_collapse(&"a".repeat(600)));
+        assert!(should_collapse(&"a\n".repeat(8)));
+        assert!(!should_collapse(&"a\n".repeat(7)));
+        assert!(!should_collapse(&" \n".repeat(20)));
+        // A long link destination reads as its short label.
+        let link = format!("[file]({})", "a/".repeat(400));
+        assert!(!should_collapse(&link));
+    }
 
     #[test]
     fn only_single_visible_shell_commands_run() {

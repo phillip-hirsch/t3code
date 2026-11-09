@@ -6,6 +6,8 @@
 use std::fmt::Write as _;
 use std::ops::Range;
 
+use crate::assistant_citations::AssistantCitation;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TriggerKind {
     Path,
@@ -135,6 +137,11 @@ pub enum Chip {
         id: String,
         label: String,
     },
+    /// `[Assistant quote](t3-citation://v1/…)`: a quote of an assistant reply, with its label.
+    Citation {
+        citation: Box<AssistantCitation>,
+        label: String,
+    },
 }
 
 impl Chip {
@@ -143,14 +150,21 @@ impl Chip {
             Chip::File { path } => format!("file:{path}"),
             Chip::Skill { name } => format!("skill:{name}"),
             Chip::Context { kind, id, .. } => format!("context:{kind}/{id}"),
+            Chip::Citation { citation, .. } => format!("{CITATION_ID}{}", citation.href()),
         }
+    }
+
+    /// The chip for a citation.
+    pub fn citation(citation: AssistantCitation) -> Self {
+        let label = citation.label();
+        Chip::Citation { citation: Box::new(citation), label }
     }
 
     pub fn label(&self) -> &str {
         match self {
             Chip::File { path } => basename(path),
             Chip::Skill { name } => name,
-            Chip::Context { label, .. } => label,
+            Chip::Context { label, .. } | Chip::Citation { label, .. } => label,
         }
     }
 
@@ -161,6 +175,9 @@ impl Chip {
         }
         if let Some(name) = id.strip_prefix("skill:") {
             return Some(Chip::Skill { name: name.to_owned() });
+        }
+        if let Some(href) = id.strip_prefix(CITATION_ID) {
+            return crate::assistant_citations::parse_href(href).map(Chip::citation);
         }
         let (kind, id) = id.strip_prefix("context:")?.split_once('/')?;
         Some(Chip::Context { kind: kind.to_owned(), id: id.to_owned(), label: String::new() })
@@ -177,14 +194,25 @@ pub fn context_link(kind: &str, id: &str, label: &str) -> String {
 }
 
 const CONTEXT_PREFIX: &str = "t3-context://v1/";
+const CITATION_ID: &str = "citation:";
 
 /// The file links and known skills in `text` that render as chips: each must
 /// start the text or follow whitespace, and be followed by whitespace
-/// (`FILE_LINK_TOKEN_REGEX`, `SKILL_TOKEN_REGEX`).
+/// (`FILE_LINK_TOKEN_REGEX`, `SKILL_TOKEN_REGEX`). Citations are chips wherever they
+/// stand, ahead of any other token they overlap (`collectComposerPromptInlineTokens`).
 pub fn chips(text: &str, is_skill: impl Fn(&str) -> bool) -> Vec<(Range<usize>, Chip)> {
+    let mut citations = crate::assistant_citations::collect(text).into_iter().peekable();
     let mut found = Vec::new();
     let mut i = 0;
     while i < text.len() {
+        if citations.peek().is_some_and(|(range, _)| range.start == i)
+            && let Some((range, citation)) = citations.next()
+        {
+            i = range.end;
+            found.push((range, Chip::citation(citation)));
+            continue;
+        }
+        let next_citation = citations.peek().map_or(text.len(), |(range, _)| range.start);
         let at_word_start = i == 0 || text[..i].ends_with(is_space);
         let rest = &text[i..];
         let next = rest.chars().next().map_or(1, char::len_utf8);
@@ -205,8 +233,9 @@ pub fn chips(text: &str, is_skill: impl Fn(&str) -> bool) -> Vec<(Range<usize>, 
         };
         match parsed {
             Some((len, chip))
-                if text[i + len..].starts_with(is_space)
-                    || (matches!(chip, Chip::Context { .. }) && i + len == text.len()) =>
+                if i + len <= next_citation
+                    && (text[i + len..].starts_with(is_space)
+                        || (matches!(chip, Chip::Context { .. }) && i + len == text.len())) =>
             {
                 found.push((i..i + len, chip));
                 i += len;
@@ -403,9 +432,12 @@ fn group_thousands(n: usize) -> String {
     out
 }
 
-/// `getComposerPromptLengthValidationMessage`.
+/// `getComposerPromptLengthValidationMessage`: the prompt, or what the provider reads once its
+/// citations expand, whichever is longer.
 pub fn prompt_length_error(prompt: &str) -> Option<String> {
-    let excess = js_length(prompt.trim()).checked_sub(MAX_INPUT_CHARS).filter(|e| *e > 0)?;
+    let prompt = prompt.trim();
+    let length = js_length(prompt).max(js_length(&crate::assistant_citations::expand_for_provider(prompt)));
+    let excess = length.checked_sub(MAX_INPUT_CHARS).filter(|e| *e > 0)?;
     let label = if excess == 1 { "character" } else { "characters" };
     Some(format!(
         "Prompt is {} {label} over the {}-character limit. Shorten or split it before sending.",
@@ -498,6 +530,53 @@ mod tests {
         assert!(super::chips("[a](https://x/a) [b](c/b)", |_| true).is_empty(), "urls and trailing links stay text");
         assert!(super::chips("$unknown ", |_| false).is_empty());
         assert_eq!(file_link("C:\\x\\[a].md"), "[\\[a\\].md](C:%5Cx%5C%5Ba%5D.md)");
+    }
+
+    #[test]
+    fn citations_are_chips_wherever_they_stand_and_round_trip_their_ids() {
+        let citation = crate::assistant_citations::AssistantCitation {
+            environment_id: "env".into(),
+            thread_id: "thread".into(),
+            message_id: "message".into(),
+            text: "a [b.rs](b.rs) quote".into(),
+            comment: Some("why".into()),
+            start: 0,
+            end: 20,
+            prefix: String::new(),
+            suffix: String::new(),
+        };
+        let marker = citation.markdown();
+        let text = format!("see{marker} [a.rs](a.rs) ");
+        let found = chips(&text, |_| false);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found[0], (3..3 + marker.len(), Chip::citation(citation.clone())));
+        assert_eq!(found[0].1.label(), "why");
+        assert_eq!(Chip::from_id(&found[0].1.id()), Some(Chip::citation(citation)));
+        assert!(matches!(found[1].1, Chip::File { .. }), "a mention after a citation still parses");
+        // An unfinished link can't swallow a citation.
+        let open = format!("[x]({marker} ");
+        assert!(matches!(&chips(&open, |_| false)[..], [(_, Chip::Citation { .. })]));
+    }
+
+    #[test]
+    fn the_prompt_limit_counts_expanded_citations() {
+        let citation = crate::assistant_citations::AssistantCitation {
+            environment_id: "env".into(),
+            thread_id: "thread".into(),
+            message_id: "message".into(),
+            text: "q".repeat(8_000),
+            comment: None,
+            start: 0,
+            end: 8_000,
+            prefix: String::new(),
+            suffix: String::new(),
+        };
+        let marker = citation.markdown();
+        // The prompt fits, but the provider also reads the quote's JSON and its framing.
+        let at_limit = format!("{}{marker}", "a".repeat(super::MAX_INPUT_CHARS - marker.len()));
+        assert_eq!(super::js_length(&at_limit), super::MAX_INPUT_CHARS);
+        assert!(super::prompt_length_error(&at_limit).is_some());
+        assert_eq!(super::prompt_length_error(&format!("short {marker}")), None);
     }
 
     #[test]

@@ -35,7 +35,7 @@ pub(super) struct ChatMenu {
 
 impl Workspace {
     /// Opens `build`'s menu at `position` (window coordinates) until it dismisses.
-    fn open_chat_menu(
+    pub(super) fn open_chat_menu(
         &mut self,
         position: Point<Pixels>,
         window: &mut Window,
@@ -548,6 +548,53 @@ impl MarkdownPlugin for SkillChips {
                 let position = event.position();
                 let _ = workspace.update(cx, |w, cx| w.open_skill_menu(&name, position, window, cx));
             })
+    }
+}
+
+/// `AssistantCitationChip`: a citation link draws as its quote chip; a click opens the quote
+/// with Go to source. Copying keeps the citation's Markdown.
+pub(super) struct CitationChips {
+    pub workspace: WeakEntity<Workspace>,
+}
+
+impl MarkdownPlugin for CitationChips {
+    fn name(&self) -> &'static str {
+        "t3-citation"
+    }
+
+    fn parse(
+        &self,
+        node: &gpui_kit::component::text::markdown_ast::Node,
+        cx: &MarkdownParseContext<'_>,
+    ) -> Option<MarkdownNode> {
+        let gpui_kit::component::text::markdown_ast::Node::Link(link) = node else { return None };
+        let citation = crate::assistant_citations::parse_href(&link.url)?;
+        let label = citation.label();
+        let markdown = cx.node_source(node).map_or_else(|| citation.markdown(), str::to_owned);
+        Some(MarkdownNode::new("t3-citation", citation).text(label).markdown(markdown))
+    }
+
+    fn render(&self, node: &MarkdownNode, _: &mut Window, _: &mut App) -> impl IntoElement {
+        let Some(citation) = node.data::<crate::assistant_citations::AssistantCitation>().cloned() else {
+            return div().into_any_element();
+        };
+        let workspace = self.workspace.clone();
+        let id = format!("citation-chip:{}:{}:{}", citation.message_id, citation.start, citation.end);
+        h_flex()
+            .id(SharedString::from(id))
+            .max_w_full()
+            .gap(px(3.))
+            .rounded(px(4.))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(rgb(super::citations::CITATION_ACCENT))
+            .cursor_pointer()
+            .child(Icon::new(IconName::Quote).size(px(14.)).flex_none())
+            .child(div().min_w_0().truncate().hover(gpui_kit::Styled::underline).child(node.as_text().to_owned()))
+            .on_click(move |event, window, cx| {
+                let (citation, position) = (citation.clone(), event.position());
+                let _ = workspace.update(cx, |w, cx| w.open_citation_menu(citation, position, window, cx));
+            })
+            .into_any_element()
     }
 }
 
