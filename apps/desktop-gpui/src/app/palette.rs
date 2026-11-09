@@ -179,8 +179,9 @@ enum Description {
     Text(SharedString),
     /// "You:" / "Agent:" and the snippet in highlighted runs.
     Snippet(bool, Vec<(String, bool)>),
-    /// `ProjectLocationDescription`: a remote machine's icon, where the project lives, and its path.
-    Location(Option<IconName>, SharedString, SharedString),
+    /// `ProjectLocationDescription`: a remote machine's icon, where the project lives, its path,
+    /// and whether it leads with "Current".
+    Location(Option<IconName>, SharedString, SharedString, bool),
     Thread(ThreadSubtitle),
 }
 
@@ -902,6 +903,9 @@ impl Workspace {
                 let start = contextual.filter(|p| g.contains(&p.id)).unwrap_or(target);
                 let run = Run::NewThread(start.id.clone());
                 let mut row = self.project_row(format!("new-in-{}", target.id), g, target, run);
+                if let Some(Description::Location(.., current)) = &mut row.description {
+                    *current = self.current_project().is_some_and(|p| g.contains_project(p));
+                }
                 // `buildNewThreadInProjectItems`: every member's name and path, and the machine.
                 row.data_terms.extend(
                     g.members
@@ -957,7 +961,7 @@ impl Workspace {
         let mut row = Row::new(key, RowIcon::Project(p.id.clone()), group.display_name.clone(), run);
         let machine = self.location_machine(&p.environment_id);
         let location = self.location_label(&p.environment_id);
-        row.description = Some(Description::Location(machine, location, p.workspace_root.clone().into()));
+        row.description = Some(Description::Location(machine, location, p.workspace_root.clone().into(), false));
         row.data_terms = vec![p.title.clone().into(), p.workspace_root.clone().into()];
         row.pin = Some((group.project_ids.clone(), group.pinned));
         row
@@ -2355,14 +2359,20 @@ impl Workspace {
         let icon = self.palette_row_icon(row, tokens);
         let description: Option<AnyElement> = row.description.as_ref().map(|d| match d {
             Description::Text(text) => div().truncate().child(text.clone()).into_any_element(),
-            Description::Location(machine, label, path) => h_flex()
-                .min_w_0()
-                .gap(px(4.))
-                .children(machine.map(|icon| Icon::new(icon).size(px(12.)).flex_none().text_color(muted.opacity(0.7))))
-                .child(div().min_w_0().truncate().child(label.clone()))
-                .child(div().flex_none().text_color(muted.opacity(0.5)).child("·"))
-                .child(div().min_w_0().truncate().child(path.clone()))
-                .into_any_element(),
+            Description::Location(machine, label, path, current) => {
+                let dot = || div().flex_none().text_color(muted.opacity(0.5)).child("·");
+                h_flex()
+                    .min_w_0()
+                    .gap(px(4.))
+                    .when(*current, |el| el.child(div().flex_none().child("Current")).child(dot()))
+                    .children(
+                        machine.map(|icon| Icon::new(icon).size(px(12.)).flex_none().text_color(muted.opacity(0.7))),
+                    )
+                    .child(div().min_w_0().truncate().child(label.clone()))
+                    .child(dot())
+                    .child(div().min_w_0().flex_1().truncate().child(path.clone()))
+                    .into_any_element()
+            }
             Description::Snippet(user, parts) => h_flex()
                 .min_w_0()
                 .overflow_hidden()
