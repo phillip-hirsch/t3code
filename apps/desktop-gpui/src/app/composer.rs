@@ -1611,7 +1611,9 @@ impl Workspace {
                                 .gap(px(2.))
                                 .child(
                                     Button::new("fallback-use-default").ghost().xsmall().label(use_default).on_click(
-                                        cx.listener(move |this, _, _, cx| this.pick_model(default.clone(), cx)),
+                                        cx.listener(move |this, _, window, cx| {
+                                            this.pick_model(default.clone(), window, cx);
+                                        }),
                                     ),
                                 )
                                 .child(super::banners::corner_action(

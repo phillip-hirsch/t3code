@@ -530,7 +530,7 @@ fn secret_card(
                     el.child(div().text_sm().text_color(t.muted_foreground).child(card.reason.clone()))
                 }),
         )
-        .children(secret_request_link(url.map(|url| url.as_ref()), &card.reason).map(|(href, host)| {
+        .children(secret_request_link(url.map(AsRef::as_ref), &card.reason).map(|(href, host)| {
             v_flex()
                 .min_w_0()
                 .items_start()

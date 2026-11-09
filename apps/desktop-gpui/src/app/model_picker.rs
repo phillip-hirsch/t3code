@@ -11,9 +11,10 @@ use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{Disableable as _, Icon, Selectable as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{Disableable as _, Icon, Selectable as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
     Anchor, AnyElement, AppContext as _, Context, ElementId, Entity, FocusHandle, Focusable as _, FontWeight, Hsla,
     InteractiveElement as _, IntoElement, Keystroke, ParentElement as _, SharedString, StatefulInteractiveElement as _,
@@ -282,7 +283,7 @@ impl Workspace {
     fn pick_row(&mut self, selection: ModelSelection, window: &mut Window, cx: &mut Context<Self>) {
         match self.picker.host.as_ref().map(|host| host.on_pick.clone()) {
             None => {
-                self.pick_model(selection, cx);
+                self.pick_model(selection, window, cx);
                 self.focus_effort(false, window, cx);
             }
             Some(on_pick) => {
@@ -292,7 +293,7 @@ impl Workspace {
         }
     }
 
-    pub(super) fn pick_model(&mut self, selection: ModelSelection, cx: &mut Context<Self>) {
+    pub(super) fn pick_model(&mut self, selection: ModelSelection, window: &mut Window, cx: &mut Context<Self>) {
         let key = (selection.instance_id.clone(), selection.model.clone());
         let options = self.picker.remembered.get(&key).cloned();
         self.model_override = Some(ModelSelection { options, ..selection });
@@ -301,6 +302,62 @@ impl Workspace {
         self.refresh_menu_items(cx);
         // A pick on another harness shows its pending handoff at the timeline's end.
         self.refresh_rows(cx);
+        self.apply_thread_model_pick(window, cx);
+        cx.notify();
+    }
+
+    /// `useApplyThreadModelPick`: an open thread's pick goes on the thread at once, so the next
+    /// turn runs on it wherever it starts. Once the server has it, the thread's model shows again.
+    fn apply_thread_model_pick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self.target.clone() else { return };
+        let super::Target::Thread { env, id } = &target else { return };
+        let thread_model = self
+            .thread
+            .as_ref()
+            .filter(|thread| &thread.id == id)
+            .and_then(|thread| thread.state.projection.as_ref())
+            .and_then(|projection| projection.thread.model_selection.as_ref());
+        let Some(pick) = thread_pick(self.model_override.as_ref(), self.model_explicit, thread_model) else { return };
+        if !self.can_operate(env) {
+            pick_failed(window, cx, "This connection cannot change threads or projects.");
+            return;
+        }
+        let command = json!({"type": "thread.model-selection.set", "commandId": super::new_id(), "threadId": id,
+            "modelSelection": pick.to_json()});
+        let Some(client) = self.command_client(&command) else { return };
+        cx.spawn_in(window, async move |this, cx| {
+            let result = client.request("orchestration.dispatchCommand", command).await;
+            let _ = this.update_in(cx, |this, window, cx| match result {
+                Ok(_) => this.release_model_pick(&target, &pick, cx),
+                Err(error) => pick_failed(window, cx, &error.message()),
+            });
+        })
+        .detach();
+    }
+
+    /// `releaseModelSelection`: the thread took `pick`, so its composer stops holding it. A newer
+    /// pick, even of the same model, still waits for its own reply.
+    fn release_model_pick(&mut self, target: &super::Target, pick: &ModelSelection, cx: &mut Context<Self>) {
+        if self.target.as_ref() == Some(target) {
+            if self.model_override.as_ref() != Some(pick) {
+                return;
+            }
+            // Shown at once; the thread's own update carries the same selection.
+            if let Some(projection) = self.thread.as_mut().and_then(|thread| thread.state.projection.as_mut()) {
+                projection.thread.model_selection = Some(pick.clone());
+            }
+            self.model_override = None;
+            self.model_explicit = false;
+        } else if let Some(saved) = self.composer_selections.get_mut(target)
+            && saved.model.as_ref() == Some(pick)
+        {
+            if saved.runtime_mode.is_none() {
+                self.composer_selections.remove(target);
+            } else {
+                saved.model = None;
+                saved.explicit = false;
+            }
+        }
         cx.notify();
     }
 
@@ -344,9 +401,9 @@ impl Workspace {
                 if owned {
                     self.strip_ultrathink_prefix(window, cx);
                 }
-                self.set_model_option(&id, value, cx);
+                self.set_model_option(&id, value, window, cx);
             }
-            EffortStop::Toggle { id, on } => self.set_model_option(&id, Value::Bool(!on), cx),
+            EffortStop::Toggle { id, on } => self.set_model_option(&id, Value::Bool(!on), window, cx),
         }
     }
 
@@ -383,7 +440,7 @@ impl Workspace {
         })
     }
 
-    fn set_model_option(&mut self, id: &str, value: Value, cx: &mut Context<Self>) {
+    fn set_model_option(&mut self, id: &str, value: Value, window: &mut Window, cx: &mut Context<Self>) {
         let Some(current) = self.composer_model() else { return };
         let next = model_label::with_option(&current, id, value);
         let key = (next.instance_id.clone(), next.model.clone());
@@ -391,6 +448,7 @@ impl Workspace {
         self.sticky_model = Some(next.clone());
         self.model_override = Some(next);
         self.model_explicit = true;
+        self.apply_thread_model_pick(window, cx);
         cx.notify();
     }
 
@@ -1261,9 +1319,9 @@ impl Workspace {
                                     .child(div().flex_1().child(if on { "On" } else { "Off" }))
                                     .child(switch(on, t)),
                             )
-                            .on_click(
-                                cx.listener(move |this, _, _, cx| this.set_model_option(&id, Value::Bool(!on), cx)),
-                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.set_model_option(&id, Value::Bool(!on), window, cx);
+                            }))
                             .into_any_element()
                     } else {
                         let label = descriptor
@@ -1301,8 +1359,8 @@ impl Workspace {
                                     menu = menu.item(
                                         PopupMenuItem::new(text)
                                             .checked(current.as_deref() == Some(option.as_str()))
-                                            .on_click(window.listener_for(&view, move |this, _, _, cx| {
-                                                this.set_model_option(&id, Value::String(option.clone()), cx);
+                                            .on_click(window.listener_for(&view, move |this, _, window, cx| {
+                                                this.set_model_option(&id, Value::String(option.clone()), window, cx);
                                             })),
                                     );
                                 }
@@ -1419,7 +1477,9 @@ impl Workspace {
                         .when_some(description.filter(|d| !d.is_empty()), |el, description| {
                             el.tooltip(move |window, cx| Tooltip::new(description.clone()).build(window, cx))
                         })
-                        .on_click(cx.listener(move |this, _, _, cx| this.set_model_option(option, value.clone(), cx)))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.set_model_option(option, value.clone(), window, cx);
+                        }))
                 },
             ))
         });
@@ -1440,9 +1500,9 @@ impl Workspace {
                     .when(on, |el| el.bg(t.foreground.opacity(0.079)))
                     .child(Icon::new(Lucide::Workflow).with_size(px(12.)))
                     .child(descriptor.label.clone())
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| this.set_model_option("ultracode", Value::Bool(!on), cx)),
-                    ),
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.set_model_option("ultracode", Value::Bool(!on), window, cx);
+                    })),
             )
         });
         let mode = self.runtime_mode();
@@ -1643,9 +1703,41 @@ fn set_favorite(info: &mut ServerInfo, key: &(String, String), favorite: bool) {
     }
 }
 
+/// The composer pick an open thread takes now. One on another instance replaces the live
+/// session, which may hold an open question, so it still waits for a sent message.
+fn thread_pick(
+    pick: Option<&ModelSelection>,
+    explicit: bool,
+    thread_model: Option<&ModelSelection>,
+) -> Option<ModelSelection> {
+    let (pick, thread_model) = (pick.filter(|_| explicit)?, thread_model?);
+    (pick.instance_id == thread_model.instance_id).then(|| pick.clone())
+}
+
+fn pick_failed(window: &mut Window, cx: &mut gpui_kit::App, reason: &str) {
+    let message = format!("This model pick was not saved. {reason}");
+    window.push_notification(Notification::error(message).title("Could not apply model selection"), cx);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_open_threads_pick_on_its_own_instance_is_saved_at_once() {
+        let selection = |instance: &str, model: &str| ModelSelection {
+            instance_id: instance.into(),
+            model: model.into(),
+            options: None,
+        };
+        let thread = selection("codex", "gpt-5");
+        let same = selection("codex", "gpt-5-mini");
+        assert_eq!(thread_pick(Some(&same), true, Some(&thread)), Some(same.clone()));
+        assert_eq!(thread_pick(Some(&selection("claude", "opus")), true, Some(&thread)), None, "waits for a send");
+        assert_eq!(thread_pick(Some(&same), false, Some(&thread)), None, "an inherited model is not a pick");
+        assert_eq!(thread_pick(Some(&same), true, None), None, "the thread has not loaded");
+        assert_eq!(thread_pick(None, true, Some(&thread)), None);
+    }
 
     #[test]
     fn a_thread_that_cannot_hand_off_keeps_its_provider_and_continuation_group() {
