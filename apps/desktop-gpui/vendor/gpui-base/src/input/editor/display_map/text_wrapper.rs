@@ -9,7 +9,8 @@ use std::rc::Rc;
 use wrap_width::{MeasuredWrap, WidthRange};
 
 use gpui::{
-    App, Font, LineFragment, Pixels, Point, ShapedLine, Size, TextAlign, Window, point, px, size,
+    App, Font, LineFragment, Pixels, Point, ShapedLine, SharedString, Size, TextAlign, Window,
+    point, px, size,
 };
 use ropey::Rope;
 use smallvec::SmallVec;
@@ -338,6 +339,17 @@ impl<'a> sum_tree::Dimension<'a, LineSummary> for WrapRows {
     }
 }
 
+/// A buffer line wrapped in another font family or size, or narrowed by an indent: a
+/// textarea presentation's line style.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct WrapLineStyle {
+    /// The line's first byte.
+    pub(crate) start: usize,
+    pub(crate) family: Option<SharedString>,
+    pub(crate) scale: f32,
+    pub(crate) indent: Pixels,
+}
+
 /// Used to prepare the text with soft wrap to be get lines to displayed in the Editor.
 ///
 /// After use lines to calculate the scroll size of the Editor.
@@ -354,6 +366,8 @@ pub(crate) struct TextWrapper {
     pub(crate) lines: SumTree<LineItem>,
 
     inline_metrics: Rc<[(Range<usize>, Pixels)]>,
+    /// Ascending by `start`.
+    line_styles: Rc<[WrapLineStyle]>,
     /// Exact native widths avoid reshaping the same prefix when a drag crosses wrap thresholds.
     width_measurements: Rc<std::cell::RefCell<WidthMeasurements>>,
     _initialized: bool,
@@ -371,6 +385,7 @@ impl TextWrapper {
             tab_size: TabSize::default().tab_size,
             lines: SumTree::new(&()),
             inline_metrics: Rc::from([]),
+            line_styles: Rc::from([]),
             width_measurements: Rc::default(),
             _initialized: false,
         }
@@ -537,6 +552,8 @@ impl TextWrapper {
             .text_system()
             .line_wrapper(self.font.clone(), self.font_size);
         let metrics = self.inline_metrics.clone();
+        let styles = self.line_styles.clone();
+        let shared_text_system = cx.text_system().clone();
         let measurements = self.width_measurements.clone();
         if !reuse_widths {
             measurements.borrow_mut().clear();
@@ -552,6 +569,10 @@ impl TextWrapper {
             new_text,
             reuse_widths,
             &mut |line_str, wrap_width, line_start| {
+                let style = styles
+                    .binary_search_by_key(&line_start, |style| style.start)
+                    .ok()
+                    .map(|ix| &styles[ix]);
                 let mut fragments = Vec::new();
                 let mut offset = 0;
                 let first = metrics.partition_point(|(r, _)| r.end <= line_start);
@@ -574,7 +595,7 @@ impl TextWrapper {
                     fragments.push(LineFragment::element(*width, range.len()));
                     offset = range.end;
                 }
-                if fragments.is_empty() {
+                if fragments.is_empty() && style.is_none() {
                     return measured_wrap(line_str, wrap_width, wrapping_indent, |text| {
                         measurements.borrow_mut().measure(text, || {
                             let layout = text_system.layout_line(
@@ -597,6 +618,19 @@ impl TextWrapper {
                 if offset < line_str.len() {
                     fragments.push(LineFragment::text(&line_str[offset..]));
                 }
+                if let Some(style) = style {
+                    let mut font = font.clone();
+                    if let Some(family) = &style.family {
+                        font.family = family.clone();
+                    }
+                    let mut styled = shared_text_system.line_wrapper(font, font_size * style.scale);
+                    let width = (wrap_width - style.indent).max(px(1.));
+                    return MeasuredWrap::uncached(
+                        styled
+                            .wrap_line(&fragments, width, gpui::IndentAdjustment::SameIndent)
+                            .collect(),
+                    );
+                }
                 // Inline element widths retain the original wrapper; no safe interval is inferred.
                 MeasuredWrap::uncached(
                     line_wrapper
@@ -608,6 +642,26 @@ impl TextWrapper {
     }
 
     pub(crate) fn adjust_inline_metrics(&mut self, range: &Range<usize>, new_len: usize) {
+        if !self.line_styles.is_empty() {
+            let shift = new_len as isize - range.len() as isize;
+            self.line_styles = self
+                .line_styles
+                .iter()
+                .filter_map(|style| {
+                    if style.start <= range.start {
+                        return Some(style.clone());
+                    }
+                    if style.start < range.end {
+                        return None;
+                    }
+                    let start = style.start.checked_add_signed(shift)?;
+                    Some(WrapLineStyle {
+                        start,
+                        ..style.clone()
+                    })
+                })
+                .collect();
+        }
         if self.inline_metrics.is_empty() {
             return;
         }
@@ -669,6 +723,38 @@ impl TextWrapper {
         let mut rows: Vec<usize> = affected
             .iter()
             .map(|r| text.offset_to_point(r.start.min(text.len())).row)
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        for row in rows {
+            let start = text.line_start_offset(row);
+            let end = text.line_end_offset(row);
+            self.update(
+                &text,
+                &(start..end),
+                &Rope::from(text.slice(start..end).to_string()),
+                cx,
+            );
+        }
+    }
+
+    /// Rewraps the lines whose style changed.
+    pub(crate) fn set_line_styles(&mut self, styles: Rc<[WrapLineStyle]>, cx: &mut App) {
+        if self.line_styles == styles {
+            return;
+        }
+        let mut starts: Vec<usize> = self
+            .line_styles
+            .iter()
+            .filter(|style| !styles.contains(style))
+            .chain(styles.iter().filter(|style| !self.line_styles.contains(style)))
+            .map(|style| style.start)
+            .collect();
+        self.line_styles = styles;
+        let text = self.text.clone();
+        let mut rows: Vec<usize> = starts
+            .drain(..)
+            .map(|start| text.offset_to_point(start.min(text.len())).row)
             .collect();
         rows.sort_unstable();
         rows.dedup();
@@ -950,6 +1036,8 @@ pub(crate) struct LineLayout {
     /// Extra left offset applied to continuation wrapped lines, used to reserve the first line's
     /// indentation when [`WrappingIndent::Same`] is used.
     pub(crate) wrap_indent: Pixels,
+    /// Left offset of every visual line, from the presentation's line style.
+    indent: Pixels,
     pub(crate) longest_width: Pixels,
     pub(crate) whitespace_indicators: Option<WhitespaceIndicators>,
     /// Whitespace indicators: (line_index, x_position, is_tab)
@@ -966,6 +1054,7 @@ impl LineLayout {
             longest_width: px(0.),
             wrapped_lines: SmallVec::new(),
             wrap_indent: px(0.),
+            indent: px(0.),
             whitespace_chars: Vec::new(),
             whitespace_indicators: None,
             has_background: false,
@@ -984,14 +1073,20 @@ impl LineLayout {
         self
     }
 
-    /// The pixel indent applied to the given visual line, relative to the line's
-    /// leading text. Only continuation lines (index > 0) are indented.
+    /// Set the left offset of every visual line.
+    pub(crate) fn indent(mut self, indent: Pixels) -> Self {
+        self.indent = indent;
+        self
+    }
+
+    /// The pixel indent applied to the given visual line: the line's own indent, plus
+    /// the wrap indent on continuation lines (index > 0).
     #[inline]
     fn line_indent(&self, line_index: usize) -> Pixels {
         if line_index == 0 {
-            px(0.)
+            self.indent
         } else {
-            self.wrap_indent
+            self.indent + self.wrap_indent
         }
     }
 

@@ -235,6 +235,16 @@ impl DisplayMap {
         self.rebuild_fold_projection();
     }
 
+    /// Lines a textarea presentation sets in another font or indents.
+    pub(crate) fn set_line_styles(
+        &mut self,
+        styles: std::rc::Rc<[super::WrapLineStyle]>,
+        cx: &mut App,
+    ) {
+        self.wrap_map.set_line_styles(styles, cx);
+        self.rebuild_fold_projection();
+    }
+
     pub fn on_layout_changed(&mut self, wrap_width: Option<Pixels>, cx: &mut App) {
         self.wrap_map.on_layout_changed(wrap_width, cx);
         self.rebuild_fold_projection();
