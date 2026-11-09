@@ -195,6 +195,7 @@ const LUCIDE_ICONS: &[(&str, &[u8])] = lucide![
     "square-terminal",
     "route",
     "grip-vertical",
+    "qr-code",
     "terminal",
     "trash-2",
     "trending-down",

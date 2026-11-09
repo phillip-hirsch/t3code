@@ -17,6 +17,7 @@ mod environments;
 mod exposure;
 mod load_balancing;
 pub(in crate::app) mod logic;
+mod pairing;
 mod routes;
 mod saved;
 mod secrets;

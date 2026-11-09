@@ -2,7 +2,9 @@
 //! `AuthorizedClientsSettings.tsx`): this environment's card, the session's
 //! permissions, and its authorized clients and pairing links.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::Duration;
 
 use crate::app::pages::settings::widgets::Switch;
@@ -25,6 +27,7 @@ use super::super::widgets::{RowFrame, card, hairlines, section_with_action};
 use super::logic::{
     self, ACCESS_READ, ACCESS_WRITE, AccessSnapshot, ClientSession, ENVIRONMENT_MAINTAIN, PairingLink, SETTINGS_WRITE,
 };
+use super::pairing::{self, AdvertisedEndpoint, Qr};
 use super::ui::{self, Size, Variant, WebButton, text_2xs, text_sm, text_xs};
 use super::{SessionLoad, auth_request, check_session, error_toast, success_toast, update_settings};
 use crate::app::Workspace;
@@ -50,6 +53,12 @@ pub(super) struct AccessState {
     revoking_link: Option<String>,
     revoking_session: Option<String>,
     revoking_others: bool,
+    /// Pairing links whose Share panel was toggled, by id; the newest one opens by default.
+    share_open: HashMap<String, bool>,
+    /// The endpoint each link's panel shows, once picked.
+    share_endpoint: HashMap<String, String>,
+    /// Encoded QR codes by URL, so a repaint does not encode them again.
+    qr_codes: RefCell<HashMap<String, Option<Rc<Qr>>>>,
     clients_open: bool,
     permissions_open: bool,
     _session_task: Option<Task<()>>,
@@ -134,6 +143,26 @@ impl AccessState {
     fn grants(&self, scope: &str) -> bool {
         self.session.grants(scope)
     }
+
+    fn share_open(&self, link_id: &str) -> bool {
+        self.share_open.get(link_id).copied().unwrap_or(self.newest_link.as_deref() == Some(link_id))
+    }
+
+    fn qr(&self, url: &str) -> Option<Rc<Qr>> {
+        let mut codes = self.qr_codes.borrow_mut();
+        // Links come and go; a handful of URLs is all a page shows at once.
+        if codes.len() > 16 {
+            codes.clear();
+        }
+        codes.entry(url.to_owned()).or_insert_with(|| pairing::qr(url)).clone()
+    }
+}
+
+/// Where the shown environment's pairing URLs point: the local server's advertised
+/// endpoints and its LAN address, or nothing for a server this app did not start.
+struct ShareTargets {
+    endpoints: Vec<AdvertisedEndpoint>,
+    endpoint_url: Option<String>,
 }
 
 /// One of the three access writes, with its failure toast title and fallback message.
@@ -437,7 +466,13 @@ impl Workspace {
         let sessions = snapshot.sorted_sessions();
         let open = s.clients_open;
         let endpoint = self.settings_endpoint().cloned();
-        let link_row = |link: &PairingLink| pairing_link_row(state, s, link, can_write, endpoint.clone(), now, t);
+        let local = self.desktop.exposure.as_ref().filter(|_| self.access_is_primary() && !self.environment_remote);
+        let targets = ShareTargets {
+            endpoints: local.map(pairing::desktop_endpoints).unwrap_or_default(),
+            endpoint_url: local.and_then(|view| view.exposure.endpoint_url.clone()),
+        };
+        let link_row =
+            |link: &PairingLink| pairing_link_row(state, s, link, can_write, endpoint.clone(), &targets, now, t);
 
         let toggle = {
             let state = state.clone();
@@ -709,19 +744,33 @@ fn scope_summary(id: ElementId, scopes: &[String], t: &Tokens) -> AnyElement {
         .into_any_element()
 }
 
+#[expect(clippy::too_many_arguments, reason = "one row's parts, passed once from authorized_clients")]
 fn pairing_link_row(
     state: &Entity<AccessState>,
     s: &AccessState,
     link: &PairingLink,
     can_revoke: bool,
     endpoint: Option<Endpoint>,
+    targets: &ShareTargets,
     now: i64,
     t: &Tokens,
 ) -> AnyElement {
     let credential = s.credentials.get(&link.id).cloned();
     let id = &link.id;
+    let share = credential.as_deref().map(|credential| {
+        let picked = s.share_endpoint.get(id).map(String::as_str);
+        pairing::share(&targets.endpoints, targets.endpoint_url.as_deref(), credential, picked)
+    });
+    let shareable = share.as_ref().is_some_and(|share| share.url.is_some());
     let created = SharedString::from(format!("Link created at {}", logic::format_timestamp(&link.created_at)));
     let expires_tip = logic::format_timestamp(&link.expires_at);
+    let guidance = if credential.is_none() {
+        Some("Create a new link to share from this client.")
+    } else if !shareable {
+        Some("Copy the token and pair from another client using this backend\u{2019}s reachable host.")
+    } else {
+        None
+    };
     let details = v_flex()
         .gap(px(4.))
         .child(
@@ -745,21 +794,32 @@ fn pairing_link_row(
                 .child("\u{a0}·\u{a0}")
                 .child(scope_summary(ElementId::Name(format!("link-scopes-{id}").into()), &link.scopes, t)),
         )
-        .child(text_2xs(div().text_color(t.muted_foreground.opacity(0.7))).child(if credential.is_none() {
-            "Create a new link to share from this client."
-        } else {
-            "Copy the token and pair from another client using this backend\u{2019}s reachable host."
-        }));
+        .when_some(guidance, |el, text| {
+            el.child(text_2xs(div().text_color(t.muted_foreground.opacity(0.7))).child(text))
+        });
     let revoking = s.revoking_link.as_ref() == Some(id);
+    let open = shareable && s.share_open(id);
     let actions = h_flex()
         .gap(px(8.))
-        .when_some(credential, |el, credential| {
-            el.child(WebButton::new(ElementId::Name(format!("link-copy-{id}").into()), "Copy code").on_click(
-                move |_, window, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(credential.clone()));
-                    success_toast(window, cx, "Pairing code copied", "Paste it into another client to finish pairing.");
-                },
-            ))
+        .when(shareable, |el| {
+            let (state, id) = (state.clone(), id.clone());
+            el.child(
+                WebButton::new(ElementId::Name(format!("link-share-{id}").into()), "Share")
+                    .icon_path("icons/qr-code.svg")
+                    .on_click(move |_, _, cx| {
+                        state.update(cx, |s, cx| {
+                            let open = s.share_open(&id);
+                            s.share_open.insert(id.clone(), !open);
+                            cx.notify();
+                        });
+                    }),
+            )
+        })
+        .when_some(credential.clone().filter(|_| !shareable), |el, credential| {
+            el.child(
+                WebButton::new(ElementId::Name(format!("link-copy-{id}").into()), "Copy code")
+                    .on_click(move |_, window, cx| copy_pairing_value(&credential, CopyKind::Code, window, cx)),
+            )
         })
         .child(
             WebButton::new(
@@ -773,7 +833,159 @@ fn pairing_link_row(
                 move |_, window, cx| revoke(&state, endpoint.clone(), Revoke::Link(id.clone()), window, cx)
             }),
         );
-    ui::item_row(details, Some(actions.into_any_element())).into_any_element()
+    let panel = match (share, credential) {
+        (Some(share), Some(credential)) if open => share_panel(state, s, id, &share, credential, t),
+        _ => None,
+    };
+    ui::item_row(details, Some(actions.into_any_element())).children(panel).into_any_element()
+}
+
+/// What was copied, for its toast (`useCopyToClipboard`'s `kind`).
+#[derive(Clone, Copy)]
+enum CopyKind {
+    Code,
+    HostedLink,
+    Link,
+}
+
+impl CopyKind {
+    fn for_url(url: &str) -> Self {
+        if pairing::is_hosted_app_pairing_url(url) { Self::HostedLink } else { Self::Link }
+    }
+}
+
+fn copy_pairing_value(value: &str, kind: CopyKind, window: &mut Window, cx: &mut App) {
+    cx.write_to_clipboard(ClipboardItem::new_string(value.to_owned()));
+    let (title, description) = match kind {
+        CopyKind::HostedLink => ("Hosted app link copied", "Open it in the browser on the device you want to connect."),
+        CopyKind::Link => ("Pairing URL copied", "Open it in the client you want to pair to this environment."),
+        CopyKind::Code => ("Pairing code copied", "Paste it into another client to finish pairing."),
+    };
+    success_toast(window, cx, title, description);
+}
+
+/// The Share panel: the endpoint that reaches this machine, the full URL, and its QR code.
+fn share_panel(
+    state: &Entity<AccessState>,
+    s: &AccessState,
+    link_id: &str,
+    share: &pairing::Share,
+    credential: String,
+    t: &Tokens,
+) -> Option<AnyElement> {
+    let url = share.qr_url()?.to_owned();
+    let selected = share.selected.map(|index| share.options[index].id.clone());
+    let choices = (share.options.len() > 1).then(|| {
+        v_flex()
+            .gap(px(6.))
+            .child(text_2xs(div().text_color(t.muted_foreground.opacity(0.7))).child("Reach this machine via"))
+            .children(share.options.iter().map(|option| {
+                let is_selected = selected.as_deref() == Some(option.id.as_str());
+                let (state, link_id, option_id) = (state.clone(), link_id.to_owned(), option.id.clone());
+                let ring = t.ring;
+                let hover = t.muted.opacity(0.2);
+                h_flex()
+                    .id(ElementId::Name(format!("link-endpoint-{link_id}-{option_id}").into()))
+                    .w_full()
+                    .min_w_0()
+                    .gap(px(8.))
+                    .px(px(10.))
+                    .py(px(6.))
+                    .rounded(px(8.))
+                    .border_1()
+                    .cursor_pointer()
+                    .map(|el| {
+                        if is_selected {
+                            el.border_color(t.foreground.opacity(0.6)).bg(t.muted.opacity(0.3))
+                        } else {
+                            el.border_color(t.border.opacity(0.5)).hover(move |style| style.bg(hover))
+                        }
+                    })
+                    .tab_index(0)
+                    .focus_visible(move |style| {
+                        style.shadow(vec![gpui_kit::BoxShadow::new(px(0.), px(0.), ring).spread_radius(px(2.))])
+                    })
+                    .on_click(move |_, _, cx| {
+                        state.update(cx, |s, cx| {
+                            s.share_endpoint.insert(link_id.clone(), option_id.clone());
+                            cx.notify();
+                        });
+                    })
+                    .child(
+                        text_xs(div().flex_none().font_weight(FontWeight::MEDIUM))
+                            .text_color(if is_selected { t.foreground } else { t.muted_foreground })
+                            .child(option.label),
+                    )
+                    .child(
+                        text_2xs(div().min_w_0().truncate().text_color(t.muted_foreground.opacity(0.7)))
+                            .child(option.detail),
+                    )
+            }))
+    });
+    let copy_url = url.clone();
+    let url_row = h_flex()
+        .min_w_0()
+        .gap(px(8.))
+        .px(px(10.))
+        .py(px(6.))
+        .rounded(px(8.))
+        .border_1()
+        .border_color(t.border.opacity(0.6))
+        .bg(t.muted.opacity(0.3))
+        .child(
+            text_2xs(div().id(ElementId::Name(format!("link-url-{link_id}").into())).flex_1().min_w_0().truncate())
+                .font_family(t.fonts.mono)
+                .text_color(t.muted_foreground)
+                .tooltip(ui::tooltip(url.clone()))
+                .child(url.clone()),
+        )
+        .child(
+            WebButton::new(ElementId::Name(format!("link-copy-url-{link_id}").into()), "Copy link")
+                .variant(Variant::Ghost)
+                .on_click(move |_, window, cx| copy_pairing_value(&copy_url, CopyKind::for_url(&copy_url), window, cx)),
+        );
+    let copy_code = WebButton::new(ElementId::Name(format!("link-copy-code-{link_id}").into()), "Copy code only")
+        .variant(Variant::Ghost)
+        .on_click(move |_, window, cx| copy_pairing_value(&credential, CopyKind::Code, window, cx));
+    let qr = share.qr_shareable().then(|| s.qr(&url)).flatten();
+    let code = match qr {
+        Some(qr) => div()
+            .flex_none()
+            .p(px(12.))
+            .rounded(px(12.))
+            .bg(gpui_kit::rgb(0xffffff))
+            .child(pairing::qr_element(qr, 168., 1, gpui_kit::rgb(0x000000).into()))
+            .into_any_element(),
+        None => div()
+            .flex_none()
+            .size(px(192.))
+            .p(px(16.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(12.))
+            .border_1()
+            .border_color(t.border.opacity(0.5))
+            .child(text_2xs(div().text_center().text_color(t.muted_foreground.opacity(0.7))).child(
+                "No QR for this endpoint. Another device scanning a loopback link would dial itself; copy the URL for use on this machine instead.",
+            ))
+            .into_any_element(),
+    };
+    let links =
+        v_flex().flex_1().min_w_0().gap(px(12.)).children(choices).child(url_row).child(h_flex().child(copy_code));
+    Some(
+        h_flex()
+            .mt(px(12.))
+            .pt(px(12.))
+            .border_t_1()
+            .border_color(t.border.opacity(0.5))
+            .items_start()
+            .justify_between()
+            .gap(px(16.))
+            .child(links)
+            .child(code)
+            .into_any_element(),
+    )
 }
 
 fn client_session_row(

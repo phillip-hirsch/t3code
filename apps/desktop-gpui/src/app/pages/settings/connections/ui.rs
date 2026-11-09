@@ -92,6 +92,8 @@ pub(in crate::app::pages::settings) struct WebButton {
     id: ElementId,
     label: SharedString,
     icon: Option<gpui_kit::assets::IconName>,
+    /// An icon outside gpui-kit's catalog, by asset path.
+    icon_path: Option<&'static str>,
     variant: Variant,
     size: Size,
     disabled: bool,
@@ -105,6 +107,7 @@ impl WebButton {
             id: id.into(),
             label: label.into(),
             icon: None,
+            icon_path: None,
             variant: Variant::Outline,
             size: Size::Xs,
             disabled: false,
@@ -125,6 +128,11 @@ impl WebButton {
 
     pub fn icon(mut self, icon: gpui_kit::assets::IconName) -> Self {
         self.icon = Some(icon);
+        self
+    }
+
+    pub fn icon_path(mut self, path: &'static str) -> Self {
+        self.icon_path = Some(path);
         self
     }
 
@@ -187,8 +195,10 @@ impl RenderOnce for WebButton {
             Size::Xs => text_xs(base),
             Size::Default => text_sm(base),
         };
-        base.when_some(self.icon, |el, icon| el.child(Icon::new(icon).size(px(icon_size)))).child(self.label).map(
-            |el| match (self.disabled, self.on_click) {
+        base.when_some(self.icon, |el, icon| el.child(Icon::new(icon).size(px(icon_size))))
+            .when_some(self.icon_path, |el, path| el.child(Icon::empty().path(path).size(px(icon_size))))
+            .child(self.label)
+            .map(|el| match (self.disabled, self.on_click) {
                 (true, _) | (_, None) => el.opacity(0.64),
                 // A tab stop that Enter and Space click, with `focus-visible:ring-2`.
                 (false, Some(handler)) => el
@@ -199,7 +209,6 @@ impl RenderOnce for WebButton {
                         style.shadow(vec![gpui_kit::BoxShadow::new(px(0.), px(0.), t.ring).spread_radius(px(2.))])
                     })
                     .on_click(move |event, window, cx| handler(event, window, cx)),
-            },
-        )
+            })
     }
 }
