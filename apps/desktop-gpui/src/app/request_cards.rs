@@ -12,12 +12,17 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, FontWeight, IntoElement, ParentElement as _, Render,
-    SharedString, Styled as _, Subscription, WeakEntity, Window, div, prelude::FluentBuilder as _, px,
+    AnyElement, App, AppContext as _, Context, Entity, FocusHandle, FontWeight, InteractiveElement as _, IntoElement,
+    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, WeakEntity,
+    Window, div, prelude::FluentBuilder as _, px, svg,
 };
 use serde_json::{Value, json};
 
 use super::Workspace;
+use super::pages::settings::connections::linking::{
+    ANOTHER_ADDRESS, LinkableMachine, initial_machine, machine_badge, mint_link_code, rank_machines_by_hint,
+};
+use super::pages::settings::machine_icon;
 use crate::rpc::{RpcClient, RpcError};
 use crate::theme::{self, Tokens};
 use crate::timeline::{self, RequestCard, RequestKind};
@@ -261,7 +266,8 @@ impl Workspace {
     }
 
     fn decline_link(&mut self, card: &RequestCard, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
+        let Some(host) = self.thread_environment(&card.thread_id) else { return };
+        let Some(client) = self.env_client(&host).filter(|_| self.manages_access(&host)) else { return };
         let id = card.item_id.clone();
         if !self.requests.busy.insert(id.clone()) {
             return;
@@ -443,7 +449,8 @@ fn link_card(card: &Rc<RequestCard>, workspace: &Entity<Workspace>, t: &Tokens, 
     let state = workspace.read(cx);
     let busy = state.requests.busy.contains(&card.item_id);
     let error = state.requests.errors.get(&card.item_id).cloned();
-    let client = state.client();
+    let host = state.thread_environment(&card.thread_id);
+    let can_answer = host.as_deref().is_some_and(|host| state.manages_access(host));
     let RequestKind::Link { label, url, .. } = &card.kind else { return div().into_any_element() };
     let title = if card.picks_machine() {
         "Link a machine to this environment".to_owned()
@@ -451,6 +458,39 @@ fn link_card(card: &Rc<RequestCard>, workspace: &Entity<Workspace>, t: &Tokens, 
         format!("Link {} to this environment", card.link_target())
     };
     let (decline_card, review_card, view) = (card.clone(), card.clone(), workspace.downgrade());
+    let review_view = view.clone();
+    let actions = if can_answer {
+        h_flex()
+            .min_w_0()
+            .justify_end()
+            .gap(px(8.))
+            .child(
+                Button::new("link-decline")
+                    .ghost()
+                    .xsmall()
+                    .text_color(t.muted_foreground)
+                    .label("Decline")
+                    .disabled(busy)
+                    .on_click(move |_, _, cx| {
+                        let _ = view.update(cx, |w, cx| w.decline_link(&decline_card, cx));
+                    }),
+            )
+            .child(
+                Button::new("link-review")
+                    .primary()
+                    .xsmall()
+                    .label(if card.picks_machine() { "Choose machine…" } else { "Review link…" })
+                    .disabled(busy)
+                    .on_click(move |_, window, cx| open_link_dialog(&review_card, &review_view, window, cx)),
+            )
+            .into_any_element()
+    } else {
+        div()
+            .text_xs()
+            .text_color(t.muted_foreground)
+            .child("Only a session that manages access here can answer this.")
+            .into_any_element()
+    };
     card_frame(t)
         .child(
             v_flex()
@@ -465,93 +505,261 @@ fn link_card(card: &Rc<RequestCard>, workspace: &Entity<Workspace>, t: &Tokens, 
                 }),
         )
         .children(error.map(|e| div().text_xs().text_color(t.error).child(e)))
-        .child(
-            h_flex()
-                .min_w_0()
-                .justify_end()
-                .gap(px(8.))
-                .child(
-                    Button::new("link-decline")
-                        .ghost()
-                        .xsmall()
-                        .text_color(t.muted_foreground)
-                        .label("Decline")
-                        .disabled(busy)
-                        .on_click(move |_, _, cx| {
-                            let _ = view.update(cx, |w, cx| w.decline_link(&decline_card, cx));
-                        }),
-                )
-                .child(
-                    Button::new("link-review")
-                        .primary()
-                        .xsmall()
-                        .label(if card.picks_machine() { "Choose machine…" } else { "Review link…" })
-                        .disabled(busy)
-                        .on_click(move |_, window, cx| open_link_dialog(&review_card, client.clone(), window, cx)),
-                ),
-        )
+        .child(actions)
         .into_any_element()
 }
 
-/// `LinkRequestDialog`, single-environment: this client knows no other machines, so the
-/// link goes to the address the agent gave or one the user types, with a pairing code.
+/// `DialogTarget`: a machine from this client's catalog, an address, or nothing picked yet.
+/// A machine's `urls` is empty when this client knows no direct address for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LinkTarget {
+    None,
+    Machine { environment_id: String, label: String, urls: Vec<String>, linked: bool },
+    Address,
+}
+
+/// `resolveTarget`: what the dialog links, from the request and the user's pick.
+fn resolve_target(card: &RequestCard, machines: &[LinkableMachine], choice: Option<&str>) -> LinkTarget {
+    let RequestKind::Link { url, environment_id, .. } = &card.kind else { return LinkTarget::None };
+    if environment_id.is_none() && url.is_some() {
+        return LinkTarget::Address;
+    }
+    let Some(chosen) = environment_id.as_deref().or(choice) else { return LinkTarget::None };
+    if chosen == ANOTHER_ADDRESS {
+        return LinkTarget::Address;
+    }
+    let machine = machines.iter().find(|machine| machine.environment_id == chosen);
+    let mut urls = machine.map(|m| m.urls.clone()).unwrap_or_default();
+    if let Some(url) = url.as_deref().filter(|url| !urls.iter().any(|u| u == url)) {
+        urls.push(url.to_owned());
+    }
+    LinkTarget::Machine {
+        environment_id: machine.map_or_else(|| chosen.to_owned(), |m| m.environment_id.clone()),
+        label: machine.map_or_else(|| card.link_target(), |m| m.label.clone()),
+        urls,
+        linked: machine.is_some_and(|m| m.linked),
+    }
+}
+
+/// The dialog's steps: where to link, then what agents may do there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinkStep {
+    Machine,
+    Access,
+}
+
+/// What the dialog shows and allows for a target, before any pairing code is known.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LinkPlan {
+    target: LinkTarget,
+    /// The machine's own name, else the request's.
+    target_name: String,
+    needs_address: bool,
+    /// The address must be typed: the agent gave none for the target.
+    asks_address: bool,
+    /// The environment links to the machine already, so that link is used as it is.
+    use_existing: bool,
+    /// The machine step comes first: the machine is the user's pick or needs an address.
+    two_steps: bool,
+    machine_ready: bool,
+}
+
+fn link_plan(card: &RequestCard, machines: &[LinkableMachine], selected: Option<&str>, address: &str) -> LinkPlan {
+    let target = resolve_target(card, machines, selected);
+    let given_url = matches!(&card.kind, RequestKind::Link { url: Some(_), environment_id: None, .. });
+    let target_name = match &target {
+        LinkTarget::Machine { label, .. } => label.clone(),
+        _ => card.link_target(),
+    };
+    let needs_address = match &target {
+        LinkTarget::Address => true,
+        LinkTarget::Machine { urls, .. } => urls.is_empty(),
+        LinkTarget::None => false,
+    };
+    let asks_address = needs_address && !given_url;
+    let use_existing = matches!(target, LinkTarget::Machine { linked: true, .. });
+    let machine_ready = target != LinkTarget::None && (use_existing || !needs_address || !address.trim().is_empty());
+    LinkPlan {
+        two_steps: card.picks_machine() || asks_address,
+        target,
+        target_name,
+        needs_address,
+        asks_address,
+        use_existing,
+        machine_ready,
+    }
+}
+
+/// `linkRequestAnswerInput`: use the existing link, or link the target with the code. `None`
+/// while the answer is incomplete, since the server rejects it.
+fn link_answer(card: &RequestCard, plan: &LinkPlan, address: &str, access: &str, code: &str) -> Option<Value> {
+    let base = |answer: Value| json!({"threadId": card.thread_id, "turnItemId": card.item_id, "answer": answer});
+    if let LinkTarget::Machine { environment_id, linked: true, .. } = &plan.target {
+        return Some(base(json!({"type": "use-existing", "environmentId": environment_id})));
+    }
+    let code = code.trim();
+    let address = address.trim();
+    if code.is_empty() {
+        return None;
+    }
+    let answer = match &plan.target {
+        LinkTarget::None => return None,
+        LinkTarget::Address if address.is_empty() => return None,
+        LinkTarget::Address => json!({"type": "link", "urls": [address], "access": access, "pairingCode": code}),
+        LinkTarget::Machine { environment_id, label, urls, .. } => {
+            let urls: Vec<&str> =
+                if plan.needs_address { vec![address] } else { urls.iter().map(String::as_str).collect() };
+            if urls.first().is_none_or(|url| url.is_empty()) {
+                return None;
+            }
+            json!({
+                "type": "link",
+                "environmentId": environment_id,
+                "label": label,
+                "urls": urls,
+                "access": access,
+                "pairingCode": code,
+            })
+        }
+    };
+    Some(base(answer))
+}
+
+/// `LinkRequestDialog`: the machine (picked, or the one the agent named), its address when
+/// this client knows none, then the access and, unless one can be minted there, a pairing code.
 struct LinkDialog {
     card: Rc<RequestCard>,
+    workspace: WeakEntity<Workspace>,
+    /// The environment the request was made in, which the link is made from.
+    host: SharedString,
+    client: Option<RpcClient>,
+    /// `peerLinks.list` on the host, for the machines it links to already.
+    links: Vec<Value>,
+    /// `None` until the user picks; until then the hint's best match is picked.
+    choice: Option<String>,
     address: Entity<InputState>,
     code: Entity<InputState>,
-    /// The address must be typed: the agent named no URL.
-    asks_address: bool,
     access: &'static str,
-    /// `peerLinks.list` says this environment already links to the machine named.
-    linked: bool,
+    step: LinkStep,
     busy: bool,
     error: Option<SharedString>,
-    client: Option<RpcClient>,
-    _subscriptions: [Subscription; 2],
+    /// Machines whose minting failed, so the dialog asks for a code instead.
+    mint_failed: HashSet<String>,
+    /// Each machine option's focus, for the arrow keys.
+    options: HashMap<String, FocusHandle>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl LinkDialog {
-    fn ready(&self, cx: &App) -> bool {
-        self.linked
-            || ((!self.asks_address || !self.address.read(cx).value().trim().is_empty())
-                && !self.code.read(cx).value().trim().is_empty())
+    fn machines(&self, cx: &App) -> Vec<LinkableMachine> {
+        let Some(workspace) = self.workspace.upgrade() else { return Vec::new() };
+        let RequestKind::Link { hint, .. } = &self.card.kind else { return Vec::new() };
+        let listed = workspace.read(cx).linkable_machines(&self.host, &self.links, cx);
+        rank_machines_by_hint(listed, hint.as_deref())
     }
 
-    /// `linkRequestAnswerInput`: use the existing link, or link the address with the code.
-    fn answer(&self, cx: &App) -> Option<Value> {
-        let RequestKind::Link { url, environment_id, .. } = &self.card.kind else { return None };
-        let base =
-            |answer: Value| json!({"threadId": self.card.thread_id, "turnItemId": self.card.item_id, "answer": answer});
-        if let (true, Some(id)) = (self.linked, environment_id) {
-            return Some(base(json!({"type": "use-existing", "environmentId": id})));
-        }
-        let code = self.code.read(cx).value().trim().to_owned();
-        let address = if self.asks_address {
-            Some(self.address.read(cx).value().trim().to_owned())
-        } else {
-            url.as_ref().map(|u| u.trim().to_owned())
-        };
-        let address = address.filter(|a| !a.is_empty())?;
-        if code.is_empty() {
+    fn selected(&self, machines: &[LinkableMachine]) -> Option<String> {
+        let RequestKind::Link { environment_id, hint, .. } = &self.card.kind else { return None };
+        self.choice.clone().or_else(|| initial_machine(environment_id.as_deref(), hint.as_deref(), machines))
+    }
+
+    fn plan(&self, machines: &[LinkableMachine], cx: &App) -> LinkPlan {
+        let selected = self.selected(machines);
+        link_plan(&self.card, machines, selected.as_deref(), &self.address.read(cx).value())
+    }
+
+    /// Where a code can be minted for the target, unless minting there failed already.
+    fn mint_endpoint(&self, plan: &LinkPlan, cx: &App) -> Option<crate::backend::Endpoint> {
+        let LinkTarget::Machine { environment_id, .. } = &plan.target else { return None };
+        if self.mint_failed.contains(environment_id) {
             return None;
         }
-        let mut answer = json!({"type": "link", "urls": [address], "access": self.access, "pairingCode": code});
-        if let Some(id) = environment_id {
-            answer["environmentId"] = id.to_string().into();
-            answer["label"] = self.card.link_target().into();
-        }
-        Some(base(answer))
+        self.workspace.upgrade()?.read(cx).mint_endpoint(environment_id)
     }
 
-    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(client), Some(input)) = (self.client.clone(), self.answer(cx)) else { return };
-        if self.busy {
+    fn ready(&self, plan: &LinkPlan, cx: &App) -> bool {
+        plan.machine_ready
+            && (plan.use_existing
+                || self.mint_endpoint(plan, cx).is_some()
+                || !self.code.read(cx).value().trim().is_empty())
+    }
+
+    fn current_step(&self, plan: &LinkPlan) -> LinkStep {
+        if plan.two_steps { self.step } else { LinkStep::Access }
+    }
+
+    /// The machine step ends the dialog when the machine is linked here already.
+    fn finishes_here(&self, plan: &LinkPlan) -> bool {
+        self.current_step(plan) == LinkStep::Access || plan.use_existing
+    }
+
+    fn pick(&mut self, choice: String, cx: &mut Context<Self>) {
+        self.choice = Some(choice);
+        self.error = None;
+        cx.notify();
+    }
+
+    fn set_step(&mut self, step: LinkStep, window: &mut Window, cx: &mut Context<Self>) {
+        self.step = step;
+        self.error = None;
+        if step == LinkStep::Access {
+            self.code.update(cx, |input, cx| input.focus(window, cx));
+        }
+        cx.notify();
+    }
+
+    /// Enter or the primary button: the next step, or the answer.
+    fn advance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let machines = self.machines(cx);
+        let plan = self.plan(&machines, cx);
+        if self.finishes_here(&plan) {
+            self.submit(&plan, window, cx);
+        } else if plan.machine_ready {
+            self.set_step(LinkStep::Access, window, cx);
+        }
+    }
+
+    fn submit(&mut self, plan: &LinkPlan, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else { return };
+        if self.busy || !self.ready(plan, cx) {
             return;
         }
+        let mint = (!plan.use_existing).then(|| self.mint_endpoint(plan, cx)).flatten();
+        let target_id = match &plan.target {
+            LinkTarget::Machine { environment_id, .. } => Some(environment_id.clone()),
+            _ => None,
+        };
+        let address = self.address.read(cx).value().to_string();
+        let typed = self.code.read(cx).value().to_string();
+        let access = self.access;
+        let card = self.card.clone();
+        let plan = plan.clone();
         self.busy = true;
         self.error = None;
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
+            let code = match mint {
+                Some(endpoint) => match mint_link_code(endpoint, access).await {
+                    Ok(code) => code,
+                    Err(message) => {
+                        let _ = this.update(cx, |this, cx| {
+                            this.busy = false;
+                            this.mint_failed.extend(target_id);
+                            this.error = Some(message.into());
+                            cx.notify();
+                        });
+                        return;
+                    }
+                },
+                None => typed,
+            };
+            let Some(input) = link_answer(&card, &plan, &address, access, &code) else {
+                let _ = this.update(cx, |this, cx| {
+                    this.busy = false;
+                    cx.notify();
+                });
+                return;
+            };
             let result = client.request("peerLinks.answerRequest", input).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.busy = false;
@@ -565,28 +773,222 @@ impl LinkDialog {
         })
         .detach();
     }
-}
 
-impl Render for LinkDialog {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = *theme::tokens(cx);
-        let busy = self.busy;
-        let target = self.card.link_target();
-        let field = |label: &'static str, input: &Entity<InputState>, help: Option<String>| {
-            v_flex()
-                .gap(px(6.))
-                .child(div().text_xs().font_weight(FontWeight::MEDIUM).child(label))
-                .child(Input::new(input).disabled(busy))
-                .children(help.map(|h| div().text_xs().text_color(t.muted_foreground).child(h)))
+    fn title(&self, cx: &App) -> SharedString {
+        if self.card.picks_machine() {
+            return "Link a machine".into();
+        }
+        let machines = self.machines(cx);
+        format!("Link {}", self.plan(&machines, cx).target_name).into()
+    }
+
+    /// Up and Down move the machine pick and its focus, as a radio group's arrows do.
+    fn move_pick(&mut self, ids: &[String], forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let machines = self.machines(cx);
+        let current = self.selected(&machines);
+        let len = ids.len();
+        let next = match current.and_then(|id| ids.iter().position(|candidate| *candidate == id)) {
+            Some(i) if forward => (i + 1) % len,
+            Some(i) => (i + len - 1) % len,
+            None => 0,
         };
+        let Some(id) = ids.get(next).cloned() else { return };
+        if let Some(handle) = self.options.get(&id) {
+            handle.focus(window, cx);
+        }
+        self.pick(id, cx);
+    }
+
+    fn option_focus(&mut self, id: &str, cx: &mut Context<Self>) -> FocusHandle {
+        self.options.entry(id.to_owned()).or_insert_with(|| cx.focus_handle().tab_stop(true)).clone()
+    }
+
+    /// `MachinePicker`: the user's other machines, best match for the hint first, then an address.
+    fn machine_picker(
+        &mut self,
+        machines: &[LinkableMachine],
+        selected: Option<&str>,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let busy = self.busy;
+        let ids: Rc<[String]> =
+            machines.iter().map(|m| m.environment_id.clone()).chain([ANOTHER_ADDRESS.to_owned()]).collect();
+        let mut rows = Vec::new();
+        for (index, id) in ids.iter().enumerate() {
+            let machine = machines.get(index);
+            let checked = selected == Some(id.as_str());
+            let focus = self.option_focus(id, cx);
+            let ring = t.ring;
+            let radio = div()
+                .size(px(16.))
+                .flex_none()
+                .rounded_full()
+                .border_1()
+                .border_color(if checked { t.primary } else { t.input })
+                .flex()
+                .items_center()
+                .justify_center()
+                .when(checked, |el| el.bg(t.primary).child(div().size(px(6.)).rounded_full().bg(t.primary_foreground)));
+            let (pick_id, move_ids) = (id.clone(), ids.clone());
+            let row = h_flex()
+                .id(SharedString::from(format!("link-machine-{id}")))
+                .track_focus(&focus)
+                .min_w_0()
+                .gap(px(10.))
+                .px(px(12.))
+                .py(px(8.))
+                .rounded(px(8.))
+                .border_1()
+                .border_color(t.border)
+                .text_sm()
+                .focus_visible(move |style| {
+                    style.shadow(vec![gpui_kit::BoxShadow::new(px(0.), px(0.), ring).spread_radius(px(2.))])
+                })
+                .when(!busy, |el| {
+                    el.cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| this.pick(pick_id.clone(), cx)))
+                        .on_key_down(cx.listener(move |this, event: &gpui_kit::KeyDownEvent, window, cx| {
+                            let forward = match event.keystroke.key.as_str() {
+                                "down" | "right" => true,
+                                "up" | "left" => false,
+                                _ => return,
+                            };
+                            cx.stop_propagation();
+                            this.move_pick(&move_ids, forward, window, cx);
+                        }))
+                })
+                .when(busy, |el| el.opacity(0.64))
+                .child(radio)
+                .map(|el| match machine {
+                    Some(machine) => el
+                        .child(
+                            svg()
+                                .path(machine_icon(&machine.machine))
+                                .size(px(16.))
+                                .flex_none()
+                                .text_color(t.muted_foreground),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(machine.label.clone()),
+                        )
+                        .children(machine_badge(machine, t)),
+                    None => {
+                        el.child(div().flex_1().min_w_0().font_weight(FontWeight::MEDIUM).child("Another address…"))
+                    }
+                });
+            rows.push(row);
+        }
+        v_flex()
+            .gap(px(8.))
+            .child(div().text_xs().font_weight(FontWeight::MEDIUM).child("Machine"))
+            .children(rows)
+            .into_any_element()
+    }
+
+    fn steps(&self, plan: &LinkPlan, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+        let current = self.current_step(plan);
+        let summary = (plan.target != LinkTarget::None).then(|| plan.target_name.clone());
+        let busy = self.busy;
+        let machine_ready = plan.machine_ready;
+        let frame = if t.dark { gpui_kit::hsla(0., 0., 1., 0.05) } else { gpui_kit::hsla(0., 0., 0., 0.05) };
+        let ring = t.ring;
+        h_flex()
+            .gap(px(4.))
+            .p(px(4.))
+            .rounded(px(12.))
+            .bg(if t.dark { gpui_kit::hsla(0., 0., 1., 0.04) } else { t.background })
+            .border_1()
+            .border_color(frame)
+            .children([(LinkStep::Machine, "Machine", 0usize), (LinkStep::Access, "Access", 1)].map(
+                |(step, label, index)| {
+                    let is_current = step == current;
+                    let done = current == LinkStep::Access && step == LinkStep::Machine;
+                    let disabled = busy || (step == LinkStep::Access && !machine_ready);
+                    let text = match (&summary, done) {
+                        (Some(summary), true) => format!("{label}: {summary}"),
+                        _ => label.to_owned(),
+                    };
+                    let badge = div()
+                        .size(px(20.))
+                        .flex_none()
+                        .rounded_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .border_1()
+                        .map(|badge| {
+                            if done {
+                                badge
+                                    .bg(t.primary)
+                                    .border_color(t.primary)
+                                    .child(Icon::new(IconName::Check).size(px(14.)).text_color(t.primary_foreground))
+                            } else if is_current {
+                                badge
+                                    .bg(t.primary.opacity(0.1))
+                                    .border_color(t.primary.opacity(0.3))
+                                    .text_color(t.primary)
+                                    .child((index + 1).to_string())
+                            } else {
+                                badge
+                                    .bg(t.card)
+                                    .border_color(frame)
+                                    .text_color(t.muted_foreground)
+                                    .child((index + 1).to_string())
+                            }
+                        });
+                    h_flex()
+                        .id(SharedString::from(format!("link-step-{label}")))
+                        .flex_1()
+                        .min_w_0()
+                        .gap(px(8.))
+                        .px(px(10.))
+                        .py(px(8.))
+                        .rounded(px(8.))
+                        .when(is_current, |el| el.bg(t.card).border_1().border_color(frame))
+                        .when(!disabled, |el| {
+                            el.cursor_pointer()
+                                .when(!is_current, |el| el.hover(|style| style.bg(t.card)))
+                                .tab_index(0)
+                                .focus_visible(move |style| {
+                                    style.shadow(vec![
+                                        gpui_kit::BoxShadow::new(px(0.), px(0.), ring).spread_radius(px(2.)),
+                                    ])
+                                })
+                                .on_click(cx.listener(move |this, _, window, cx| this.set_step(step, window, cx)))
+                        })
+                        .child(badge)
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(if is_current { t.foreground } else { t.muted_foreground })
+                                .child(text),
+                        )
+                },
+            ))
+            .into_any_element()
+    }
+
+    fn access_picker(&self, cx: &mut Context<Self>) -> AnyElement {
         let form = cx.entity().downgrade();
-        let access_label = timeline::access_label(self.access);
+        let t = theme::tokens(cx);
+        let description = ACCESS.iter().find(|(value, _)| *value == self.access).map_or("", |(_, d)| *d);
         let picker = Button::new("link-request-access")
             .outline()
             .small()
             .w_full()
-            .label(access_label)
-            .disabled(busy)
+            .label(timeline::access_label(self.access))
+            .disabled(self.busy)
             .dropdown_menu(move |mut menu, _, _| {
                 for (value, description) in ACCESS {
                     let form = form.clone();
@@ -615,53 +1017,132 @@ impl Render for LinkDialog {
                 }
                 menu
             });
-        let url = match &self.card.kind {
-            RequestKind::Link { url: Some(url), .. } if !self.asks_address && !self.card.picks_machine() => {
-                Some(url.clone())
-            }
-            _ => None,
+        v_flex()
+            .gap(px(6.))
+            .child(div().text_xs().font_weight(FontWeight::MEDIUM).child("What agents here may do there"))
+            .child(picker)
+            .child(div().text_xs().text_color(t.muted_foreground).child(format!(
+                "{description} An agent never gets more access there than its own mode here. Below full access, it can change only threads this link started, not that machine's own threads, projects or settings."
+            )))
+            .into_any_element()
+    }
+}
+
+impl Render for LinkDialog {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = *theme::tokens(cx);
+        let busy = self.busy;
+        let machines = self.machines(cx);
+        let selected = self.selected(&machines);
+        let plan = self.plan(&machines, cx);
+        let current = self.current_step(&plan);
+        let can_mint = self.mint_endpoint(&plan, cx).is_some();
+        let ready = self.ready(&plan, cx);
+        let finishes_here = self.finishes_here(&plan);
+        let field = |label: &'static str, input: &Entity<InputState>, help: Option<String>| {
+            v_flex()
+                .gap(px(6.))
+                .child(div().text_xs().font_weight(FontWeight::MEDIUM).child(label))
+                .child(Input::new(input).disabled(busy))
+                .children(help.map(|h| div().text_xs().text_color(t.muted_foreground).child(h)))
         };
+        let mut body: Vec<AnyElement> = Vec::new();
+        if current == LinkStep::Machine {
+            if self.card.picks_machine() {
+                body.push(self.machine_picker(&machines, selected.as_deref(), &t, cx));
+            }
+            if plan.asks_address {
+                let help = match &plan.target {
+                    LinkTarget::Machine { label, .. } => Some(format!(
+                        "This app has no address for {label} that another machine can reach. Enter its https or Tailscale address."
+                    )),
+                    _ => None,
+                };
+                body.push(field("Address", &self.address, help).into_any_element());
+            }
+        } else {
+            if let RequestKind::Link { url: Some(url), .. } = &self.card.kind
+                && !self.card.picks_machine()
+            {
+                body.push(
+                    div().truncate().text_xs().text_color(t.muted_foreground).child(url.clone()).into_any_element(),
+                );
+            }
+            if !plan.use_existing {
+                if !can_mint {
+                    let help = format!(
+                        "Create a link on {}: Settings → Connections → Create link, then paste its code here.",
+                        plan.target_name
+                    );
+                    body.push(field("Pairing code", &self.code, Some(help)).into_any_element());
+                }
+                body.push(self.access_picker(cx));
+            }
+        }
+        if plan.use_existing {
+            body.push(
+                div()
+                    .text_xs()
+                    .text_color(t.muted_foreground)
+                    .child(format!(
+                        "This environment is already linked to {}. The agent can use that link as it is; change its access in Settings → Connections.",
+                        plan.target_name
+                    ))
+                    .into_any_element(),
+            );
+        }
+        if let Some(error) = self.error.clone() {
+            body.push(div().text_xs().text_color(t.error).child(error).into_any_element());
+        }
+        let back = current == LinkStep::Access && plan.two_steps;
+        let secondary = if back {
+            Button::new("link-request-back")
+                .outline()
+                .label("Back")
+                .disabled(busy)
+                .on_click(cx.listener(|this, _, window, cx| this.set_step(LinkStep::Machine, window, cx)))
+        } else {
+            Button::new("link-request-cancel")
+                .outline()
+                .label("Cancel")
+                .disabled(busy)
+                .on_click(|_, window, cx| window.close_dialog(cx))
+        };
+        let label = if busy {
+            "Linking…"
+        } else if plan.use_existing {
+            "Use this link"
+        } else if finishes_here {
+            "Link"
+        } else {
+            "Continue"
+        };
+        let enabled = if finishes_here { ready } else { plan.machine_ready };
         v_flex()
             .gap(px(16.))
-            .children(url.map(|url| div().truncate().text_xs().text_color(t.muted_foreground).child(url)))
-            .when(self.linked, |el| {
-                el.child(div().text_xs().text_color(t.muted_foreground).child(format!(
-                    "This environment is already linked to {target}. The agent can use that link as it is; change its access in Settings → Connections."
-                )))
-            })
-            .when(!self.linked, |el| {
-                el.when(self.asks_address, |el| el.child(field("Address", &self.address, None)))
-                    .child(field(
-                        "Pairing code",
-                        &self.code,
-                        Some(format!("Create a link on {target}: Settings → Connections → Create link, then paste its code here.")),
-                    ))
-                    .child(
-                        v_flex()
-                            .gap(px(6.))
-                            .child(div().text_xs().font_weight(FontWeight::MEDIUM).child("What agents here may do there"))
-                            .child(picker),
-                    )
-            })
-            .children(self.error.clone().map(|e| div().text_xs().text_color(t.error).child(e)))
+            .when(plan.two_steps && !plan.use_existing, |el| el.child(self.steps(&plan, &t, cx)))
+            .children(body)
             .child(
-                h_flex()
-                    .justify_end()
-                    .gap(px(8.))
-                    .child(Button::new("link-request-cancel").outline().label("Cancel").disabled(busy).on_click(|_, window, cx| window.close_dialog(cx)))
-                    .child(
-                        Button::new("link-request-submit")
-                            .primary()
-                            .label(if busy { "Linking…" } else if self.linked { "Use this link" } else { "Link" })
-                            .disabled(busy || !self.ready(cx))
-                            .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
-                    ),
+                h_flex().justify_end().gap(px(8.)).child(secondary).child(
+                    Button::new("link-request-submit")
+                        .primary()
+                        .label(label)
+                        .disabled(busy || !enabled)
+                        .on_click(cx.listener(|this, _, window, cx| this.advance(window, cx))),
+                ),
             )
     }
 }
 
-fn open_link_dialog(card: &Rc<RequestCard>, client: Option<RpcClient>, window: &mut Window, cx: &mut App) {
-    let RequestKind::Link { url, environment_id, requested_access, .. } = &card.kind else { return };
+fn open_link_dialog(card: &Rc<RequestCard>, workspace: &WeakEntity<Workspace>, window: &mut Window, cx: &mut App) {
+    let Some(entity) = workspace.upgrade() else { return };
+    let RequestKind::Link { url, requested_access, .. } = &card.kind else { return };
+    let (host, client) = {
+        let state = entity.read(cx);
+        let Some(host) = state.thread_environment(&card.thread_id) else { return };
+        let client = state.env_client(&host);
+        (host, client)
+    };
     let address = cx.new(|cx| {
         let state = InputState::new(window, cx).placeholder("https://machine.tailnet.ts.net");
         match url {
@@ -670,8 +1151,6 @@ fn open_link_dialog(card: &Rc<RequestCard>, client: Option<RpcClient>, window: &
         }
     });
     let code = cx.new(|cx| InputState::new(window, cx).placeholder("Paste the code"));
-    let asks_address = url.is_none();
-    if asks_address { &address } else { &code }.update(cx, |input, cx| input.focus(window, cx));
     let access = ACCESS
         .iter()
         .map(|(value, _)| *value)
@@ -683,44 +1162,61 @@ fn open_link_dialog(card: &Rc<RequestCard>, client: Option<RpcClient>, window: &
                         event: &InputEvent,
                         window: &mut Window,
                         cx: &mut Context<LinkDialog>| match event {
-            InputEvent::PressEnter { .. } if this.ready(cx) => this.submit(window, cx),
+            InputEvent::PressEnter { .. } => this.advance(window, cx),
             InputEvent::Change => cx.notify(),
             _ => {}
         };
         LinkDialog {
-            _subscriptions: [cx.subscribe_in(&address, window, on_input), cx.subscribe_in(&code, window, on_input)],
+            _subscriptions: vec![
+                cx.subscribe_in(&address, window, on_input),
+                cx.subscribe_in(&code, window, on_input),
+                // Machines connect, disconnect and change their grants while the dialog is open.
+                cx.observe(&entity, |_, _, cx| cx.notify()),
+            ],
             card: card.clone(),
+            workspace: workspace.clone(),
+            host: host.clone(),
+            client: client.clone(),
+            links: Vec::new(),
+            choice: None,
             address,
             code,
-            asks_address,
             access,
-            linked: false,
+            step: LinkStep::Machine,
             busy: false,
             error: None,
-            client: client.clone(),
+            mint_failed: HashSet::new(),
+            options: HashMap::new(),
         }
     });
-    // A machine this environment already links to is answered with that link.
-    if let (Some(client), Some(id)) = (client, environment_id.clone()) {
+    // The machines the host links to already are answered with that link.
+    if let Some(client) = client {
         let weak = dialog.downgrade();
         cx.spawn(async move |cx| {
             let Ok(links) = client.request("peerLinks.list", json!({})).await else { return };
-            let linked = links["links"].as_array().or(links.as_array()).is_some_and(|links| {
-                links.iter().any(|l| l["environmentId"].as_str() == Some(id.as_ref()) && l["status"] != "expired")
-            });
+            let links = links["links"].as_array().cloned().unwrap_or_default();
             let _ = weak.update(cx, |dialog, cx| {
-                dialog.linked = linked;
+                dialog.links = links;
                 cx.notify();
             });
         })
         .detach();
     }
-    let title: SharedString =
-        if card.picks_machine() { "Link a machine".into() } else { format!("Link {}", card.link_target()).into() };
+    // The first field to fill: the address when it must be typed, else the code.
+    dialog.update(cx, |dialog, cx| {
+        let machines = dialog.machines(cx);
+        let plan = dialog.plan(&machines, cx);
+        if plan.asks_address && !dialog.card.picks_machine() {
+            dialog.address.update(cx, |input, cx| input.focus(window, cx));
+        } else if !plan.two_steps {
+            dialog.code.update(cx, |input, cx| input.focus(window, cx));
+        }
+    });
     window.open_dialog(cx, move |d, _, cx| {
         let t = theme::tokens(cx);
+        let title = dialog.read(cx).title(cx);
         d.entrance(DialogEntrance::None)
-            .title(title.clone())
+            .title(title)
             .w(px(448.))
             .child(
                 div()
@@ -746,6 +1242,86 @@ mod tests {
         });
         assert_eq!(secret_sources(true, &providers), [SecretSource { id: "work".into(), label: "Work".into() }]);
         assert!(secret_sources(false, &providers).is_empty(), "older servers drop references");
+    }
+
+    fn link_request(environment_id: Option<&str>, url: Option<&str>, label: Option<&str>) -> RequestCard {
+        RequestCard {
+            item_id: "item".into(),
+            thread_id: "thread".into(),
+            reason: SharedString::default(),
+            kind: RequestKind::Link {
+                label: label.map(SharedString::from),
+                url: url.map(SharedString::from),
+                environment_id: environment_id.map(SharedString::from),
+                requested_access: None,
+                hint: None,
+            },
+        }
+    }
+
+    fn machine(id: &str, urls: &[&str], linked: bool) -> LinkableMachine {
+        LinkableMachine {
+            environment_id: id.into(),
+            label: format!("Machine {id}"),
+            machine: "server".into(),
+            connected: true,
+            linked,
+            urls: urls.iter().map(|u| (*u).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_picked_machine_with_an_address_links_over_its_urls() {
+        let card = link_request(None, None, None);
+        let machines = [machine("vps", &["https://vps.ts.net/", "http://10.0.0.2:3773"], false)];
+        let none = link_plan(&card, &machines, None, "");
+        assert_eq!((none.target, none.two_steps, none.machine_ready), (LinkTarget::None, true, false));
+        let plan = link_plan(&card, &machines, Some("vps"), "");
+        assert!(plan.machine_ready && !plan.needs_address && plan.two_steps);
+        assert_eq!(plan.target_name, "Machine vps");
+        assert_eq!(link_answer(&card, &plan, "", "auto", "  "), None, "a blank code is never sent");
+        assert_eq!(
+            link_answer(&card, &plan, "", "auto", " CODE "),
+            Some(json!({"threadId": "thread", "turnItemId": "item", "answer": {
+                "type": "link", "environmentId": "vps", "label": "Machine vps",
+                "urls": ["https://vps.ts.net/", "http://10.0.0.2:3773"], "access": "auto", "pairingCode": "CODE",
+            }}))
+        );
+    }
+
+    #[test]
+    fn a_machine_without_an_address_asks_for_one_and_a_linked_one_is_reused() {
+        let card = link_request(None, None, None);
+        let machines = [machine("ssh-only", &[], false), machine("linked", &["https://l/"], true)];
+        let plan = link_plan(&card, &machines, Some("ssh-only"), " ");
+        assert!(plan.asks_address && !plan.machine_ready, "an SSH-only machine needs an address");
+        let typed = link_plan(&card, &machines, Some("ssh-only"), "https://box.ts.net");
+        let answer = link_answer(&card, &typed, "https://box.ts.net", "read-only", "CODE").expect("complete");
+        assert_eq!(answer["answer"]["urls"], json!(["https://box.ts.net"]));
+        let reused = link_plan(&card, &machines, Some("linked"), "");
+        assert!(reused.use_existing && reused.machine_ready);
+        assert_eq!(
+            link_answer(&card, &reused, "", "auto", "").map(|a| a["answer"].clone()),
+            Some(json!({"type": "use-existing", "environmentId": "linked"}))
+        );
+    }
+
+    #[test]
+    fn a_named_machine_or_address_skips_the_machine_step() {
+        let machines = [machine("vps", &["https://vps.ts.net/"], false)];
+        let named = link_request(Some("vps"), Some("https://agent.example/"), Some("VPS"));
+        let plan = link_plan(&named, &machines, None, "https://agent.example/");
+        assert!(!plan.two_steps, "a named machine with an address has nothing to pick");
+        assert!(matches!(&plan.target, LinkTarget::Machine { urls, .. } if urls.len() == 2));
+        let unknown = link_plan(&link_request(Some("gone"), None, Some("Old box")), &machines, None, "");
+        assert_eq!(unknown.target_name, "Old box");
+        assert!(unknown.asks_address && unknown.two_steps, "this client knows no address for it");
+        let address = link_request(None, Some("https://agent.example/"), None);
+        let plan = link_plan(&address, &machines, None, "https://agent.example/");
+        assert_eq!(plan.target, LinkTarget::Address);
+        assert!(!plan.asks_address && !plan.two_steps, "the agent's address is already filled in");
+        let picked = link_plan(&link_request(None, None, None), &machines, Some(ANOTHER_ADDRESS), "");
+        assert!(picked.target == LinkTarget::Address && picked.asks_address && !picked.machine_ready);
     }
 
     #[test]

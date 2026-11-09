@@ -279,6 +279,8 @@ pub enum RequestKind {
         url: Option<SharedString>,
         environment_id: Option<SharedString>,
         requested_access: Option<SharedString>,
+        /// How the agent described the machine (`my box`), to rank the user's machines.
+        hint: Option<SharedString>,
     },
 }
 
@@ -316,6 +318,7 @@ fn request_card(item: &TurnItem) -> RequestCard {
             url: text("url"),
             environment_id: text("environmentId"),
             requested_access: text("requestedAccess"),
+            hint: text("hint"),
         },
     };
     RequestCard {

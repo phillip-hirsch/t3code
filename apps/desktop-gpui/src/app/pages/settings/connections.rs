@@ -15,6 +15,7 @@ mod access;
 mod add_environment;
 mod environments;
 mod exposure;
+pub(in crate::app) mod linking;
 mod load_balancing;
 pub(in crate::app) mod logic;
 mod pairing;
