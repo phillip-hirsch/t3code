@@ -151,6 +151,13 @@ type parameter (default `EditorMode`, so editor code is unaffected), and its met
 - `src/input/mod.rs`: exports `TextareaExtras`.
 - `src/input/base/state.rs`: one test, `test_textarea_decorations_follow_edits_beside_tokens`.
 
+**Copies can carry clipboard metadata.** Copying a composer selection that holds context chips
+also copies their records (the web's custom context clipboard format), so a paste into another
+draft brings them back. 0.9.0's `Copy` and `Cut` always write plain text. The patch, in
+`src/input/base/state.rs`: `InputBaseState::set_copy_metadata` takes a function from the copied
+text to the entry's metadata, and `copy` and `cut` write `ClipboardItem::new_string_with_metadata`
+when it returns some. One test, `test_copy_and_cut_carry_the_copy_metadata`.
+
 **Toasts above dialogs.** Dialogs paint in a deferred pass (priority `10 + layer`), but 0.9.0's
 `ToastStack` paints in the normal pass, so a toast raised while a dialog is open (an error from
 the dialog itself) is hidden under it; the web app's toasts draw above dialogs. The patch paints

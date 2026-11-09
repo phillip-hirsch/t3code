@@ -1649,7 +1649,7 @@ fn bounded(value: &str) -> String {
     }
 }
 
-fn bounded_field(value: &str) -> String {
+pub fn bounded_field(value: &str) -> String {
     bounded(&value.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 

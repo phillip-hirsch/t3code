@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 
 use super::attachments::{ATTACHMENT_ONLY_PROMPT, Attachment, MAX_ATTACHMENTS};
 use super::{Target, Workspace, new_id};
+use crate::composer_context::ContextRecords;
 use crate::queue::{self, QueueState, QueuedMessage};
 use crate::theme::Tokens;
 use crate::timeline::Row;
@@ -43,8 +44,9 @@ pub(super) struct QueueEdit {
     /// The attachments it keeps; removals stay local until the save (`existingAttachments`).
     attachments: Vec<Value>,
     removed_attachment: bool,
+    /// The message's context records as queued; a save keeps them (`keptRecords`).
     records: Vec<Value>,
-    saved: (String, Vec<Attachment>),
+    saved: (String, Vec<Attachment>, ContextRecords),
     saving: bool,
 }
 
@@ -88,13 +90,8 @@ impl Workspace {
         self.queue.edit.as_ref().is_some_and(|edit| edit.saving)
     }
 
-    /// The context records of the queued message open in the composer, which its chips name.
-    pub(super) fn queue_edit_records(&self) -> &[Value] {
-        self.queue.edit.as_ref().map_or(&[], |edit| edit.records.as_slice())
-    }
-
     /// The thread's draft, while a queued message holds the composer; see `stash_composer`.
-    pub(super) fn take_queue_edit_draft(&mut self) -> Option<(String, Vec<Attachment>)> {
+    pub(super) fn take_queue_edit_draft(&mut self) -> Option<(String, Vec<Attachment>, ContextRecords)> {
         self.queue.edit.take().map(|edit| edit.saved)
     }
 
@@ -174,9 +171,17 @@ impl Workspace {
             item.and_then(|i| i.raw.pointer("/context/records")).and_then(Value::as_array).cloned().unwrap_or_default();
         let saved = match self.queue.edit.take() {
             Some(edit) => edit.saved,
-            None => (self.composer.read(cx).value().to_string(), std::mem::take(&mut self.attachments)),
+            None => (
+                self.composer.read(cx).value().to_string(),
+                std::mem::take(&mut self.attachments),
+                self.take_context_records(),
+            ),
         };
         self.attachments.clear();
+        // Its chips show and copy from the records it was queued with.
+        let mut held = ContextRecords::default();
+        held.extend(records.iter().filter(|record| record.get("attachmentId").is_none()).cloned());
+        self.context.records = held;
         let text = queue::edit_text(&message.text).to_owned();
         self.queue.edit = Some(QueueEdit {
             thread_id,
@@ -196,8 +201,9 @@ impl Workspace {
     }
 
     fn cancel_queue_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some((text, attachments)) = self.take_queue_edit_draft() {
+        if let Some((text, attachments, records)) = self.take_queue_edit_draft() {
             self.attachments = attachments;
+            self.context.records = records;
             self.set_composer_text(text, window, cx);
             self.focus_composer(window, cx);
         }
@@ -225,6 +231,7 @@ impl Workspace {
             "runId": edit.run_id,
         });
         let mut has_attachments = !edit.attachments.is_empty();
+        let mut added_records = self.message_context_records(&text);
         // Absent attachments keep the queued ones, so only an added or removed one sends the set.
         if self.has_attachments() || edit.removed_attachment {
             let (added, context) = match self.attachment_payload(&text) {
@@ -236,10 +243,12 @@ impl Workspace {
                 }
             };
             has_attachments |= !added.is_empty();
-            let added_records = context.as_ref().and_then(|c| c["records"].as_array()).cloned().unwrap_or_default();
-            let kept_records = retained_records(&edit.records, &edit.attachments);
+            added_records = context.as_ref().and_then(|c| c["records"].as_array()).cloned().unwrap_or_default();
             command["attachments"] = edit.attachments.iter().cloned().chain(added).collect::<Vec<_>>().into();
-            command["context"] = json!({"version": 1, "records": merge_records(&kept_records, added_records)});
+        }
+        let records = merge_records(&retained_records(&edit.records, &edit.attachments), added_records);
+        if !records.is_empty() {
+            command["context"] = json!({"version": 1, "records": records});
         }
         command["text"] =
             if text.is_empty() && has_attachments { ATTACHMENT_ONLY_PROMPT.to_owned() } else { text }.into();
@@ -352,6 +361,7 @@ impl Workspace {
         let Some(edit) = self.queue.edit.take() else { return };
         if !keep {
             self.attachments = edit.saved.1;
+            self.context.records = edit.saved.2;
             self.set_composer_text(edit.saved.0, window, cx);
         }
         if changed {

@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 use super::composer::ComposerDraft;
 use super::snap_shot::SnapShotSource;
 use super::{Target, Workspace, new_id};
-use crate::composer_text::{self, Chip};
+use crate::composer_text;
 use crate::theme::Tokens;
 
 pub(super) const MAX_ATTACHMENTS: usize = 100;
@@ -138,8 +138,25 @@ impl Attachment {
         self.upload == Upload::Uploading && self.upload_env.as_deref() == Some(environment)
     }
 
-    fn context_id(&self) -> String {
+    /// The context id its chip and record carry.
+    pub(super) fn context_id(&self) -> String {
         format!("{}_{}", self.kind.as_str(), self.local_id)
+    }
+
+    /// The server's id for its finished upload.
+    pub(super) fn upload_id(&self) -> Option<&str> {
+        match &self.upload {
+            Upload::Ready(id) => Some(id),
+            _ => None,
+        }
+    }
+
+    /// Its `context.records` entry, bound to the upload `attachment_id` (`attachmentContextRecord`).
+    pub(super) fn context_record(&self, attachment_id: &str) -> Value {
+        json!({
+            "version": 1, "kind": self.kind.as_str(), "contextId": self.context_id(), "label": self.name,
+            "attachmentId": attachment_id, "name": self.name, "mimeType": self.mime, "sizeBytes": self.bytes.len(),
+        })
     }
 
     /// The id of its inline chip, as [`composer_text::Chip::id`] spells it.
@@ -164,17 +181,12 @@ It is referenced in your text; removing it also removes every reference.",
     /// The message's attachment entry for the upload `id`, plus its `context.records` entry
     /// when `text` links its chip.
     fn wire(&self, id: &str, text: &str) -> (Value, Option<Value>) {
-        let (kind, context_id, size) = (self.kind.as_str(), self.context_id(), self.bytes.len());
+        let (kind, size) = (self.kind.as_str(), self.bytes.len());
         let mut sent = json!({"type": kind, "id": id, "name": self.name, "mimeType": self.mime, "sizeBytes": size});
         if let Some(source) = &self.source {
             sent["source"] = source.value.clone();
         }
-        let record = text.contains(&format!("/{kind}/{context_id})")).then(|| {
-            json!({
-                "version": 1, "kind": kind, "contextId": context_id, "label": self.name, "attachmentId": id,
-                "name": self.name, "mimeType": self.mime, "sizeBytes": size,
-            })
-        });
+        let record = text.contains(&format!("/{kind}/{})", self.context_id())).then(|| self.context_record(id));
         (sent, record)
     }
 }
@@ -187,7 +199,7 @@ fn find_attachment<'a>(
     local_id: &str,
 ) -> Option<(Option<&'a Target>, &'a mut Attachment)> {
     let stashed = drafts.iter_mut().filter_map(|(target, draft)| match draft {
-        ComposerDraft::Prompt(_, kept) => Some((Some(target), kept.as_mut_slice())),
+        ComposerDraft::Prompt(_, kept, _) => Some((Some(target), kept.as_mut_slice())),
         ComposerDraft::Question(_) => None,
     });
     std::iter::once((None, active))
@@ -350,13 +362,17 @@ impl Workspace {
         }
     }
 
-    /// The composer's paste hook: images and copied files attach, text pastes as usual.
+    /// The composer's paste hook: copied context comes back with its records, images and
+    /// copied files attach, text pastes as usual.
     pub(super) fn paste_attachments(
         &mut self,
         item: &gpui_kit::ClipboardItem,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.paste_context(item, window, cx) {
+            return true;
+        }
         if !self.can_attach() {
             return item.text().is_some_and(|text| self.paste_chips(&text, window, cx));
         }
@@ -621,9 +637,8 @@ impl Workspace {
             return Err(error);
         }
         let full = || format!("You can attach up to {MAX_ATTACHMENTS} files per message.");
-        let draft =
-            self.composer_drafts.entry(target).or_insert_with(|| ComposerDraft::Prompt(String::new(), Vec::new()));
-        let ComposerDraft::Prompt(prompt, kept) = draft else { return Err(full()) };
+        let draft = self.composer_drafts.entry(target).or_insert_with(ComposerDraft::empty);
+        let ComposerDraft::Prompt(prompt, kept, _) = draft else { return Err(full()) };
         if kept.len() >= MAX_ATTACHMENTS {
             return Err(full());
         }
@@ -826,8 +841,7 @@ impl Workspace {
             return Err("Retry or remove failed uploads before sending.".into());
         }
         let mut attachments = Vec::new();
-        let mut records = self.terminal_context_records(text);
-        records.extend(environment_context_records(text));
+        let mut records = self.message_context_records(text);
         for attachment in &self.attachments {
             let Upload::Ready(id) = &attachment.upload else { continue };
             let (sent, record) = attachment.wire(id, text);
@@ -1064,37 +1078,9 @@ fn ghost_icon(id: ElementId, icon: Lucide, t: &Tokens) -> gpui_kit::Stateful<gpu
         .child(Icon::new(icon).with_size(px(14.)))
 }
 
-/// `environmentContextRecord` for each machine the prompt mentions, once.
-fn environment_context_records(text: &str) -> Vec<Value> {
-    let mut records: Vec<Value> = Vec::new();
-    for (_, chip) in composer_text::chips(text, |_| false) {
-        let Chip::Context { kind, id, label } = chip else { continue };
-        let Some(environment_id) = id.strip_prefix("environment_").filter(|_| kind == "environment") else { continue };
-        if records.iter().all(|record| record["contextId"] != id.as_str()) {
-            let record = json!({"version": 1, "kind": "environment", "contextId": id, "label": label, "environmentId": environment_id});
-            records.push(record);
-        }
-    }
-    records
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_machine_mention_sends_its_environment_record_once() {
-        let link = composer_text::context_link("environment", "environment_e2", "Build box");
-        let records = environment_context_records(&format!("run on {link} and {link}"));
-        assert_eq!(
-            records,
-            [
-                json!({"version": 1, "kind": "environment", "contextId": "environment_e2", "label": "Build box", "environmentId": "e2"})
-            ]
-        );
-        let terminal = composer_text::context_link("terminal", "terminal_t1", "Shell");
-        assert!(environment_context_records(&format!("see {terminal}")).is_empty());
-    }
 
     #[test]
     fn a_deleted_chip_keeps_its_attachment_until_undo_brings_it_back() {
@@ -1187,12 +1173,14 @@ It is referenced in your text; removing it also removes every reference."
         };
         let stashed_in = Target::Thread { env: "e".into(), id: "t1".into() };
         let mut active = vec![attachment("on-screen")];
-        let mut drafts =
-            HashMap::from([(stashed_in.clone(), ComposerDraft::Prompt("hi".into(), vec![attachment("stashed")]))]);
+        let mut drafts = HashMap::from([(
+            stashed_in.clone(),
+            ComposerDraft::Prompt("hi".into(), vec![attachment("stashed")], Default::default()),
+        )]);
         let (target, found) = find_attachment(&mut active, &mut drafts, "stashed").unwrap();
         assert_eq!(target, Some(&stashed_in), "a stashed attachment uploads to its draft's environment");
         found.upload = Upload::Ready("srv".into());
-        let Some(ComposerDraft::Prompt(_, kept)) = drafts.get(&stashed_in) else { panic!() };
+        let Some(ComposerDraft::Prompt(_, kept, _)) = drafts.get(&stashed_in) else { panic!() };
         assert_eq!(kept[0].upload, Upload::Ready("srv".into()));
         assert!(find_attachment(&mut active, &mut drafts, "on-screen").is_some_and(|(target, _)| target.is_none()));
         assert!(find_attachment(&mut active, &mut drafts, "removed").is_none());

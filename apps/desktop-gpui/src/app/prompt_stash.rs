@@ -422,7 +422,7 @@ impl Workspace {
             return;
         }
         let created_at = crate::timestamp::iso(crate::timestamp::now_ms()).unwrap_or_default();
-        let records = self.terminal_context_records(&prompt);
+        let records = self.context.records.referenced(&prompt);
         let pending = match self.prompt_stash.store.prepare(prompt, &self.attachments, records, created_at) {
             Ok(pending) => pending,
             Err(error) => return stash_failed(&error, window, cx),
@@ -534,10 +534,8 @@ impl Workspace {
             let message = "The stash file could not be updated, so this entry could still be there after a restart.";
             toast(window, cx, Notification::warning(message).title("Restored prompt may reappear in the stash"));
         }
-        for record in &entry.records {
-            if let Some(id) = record["contextId"].as_str().filter(|_| record["kind"] == "terminal") {
-                self.terminals.contexts.entry(id.to_owned()).or_insert_with(|| record.clone());
-            }
+        if self.question.is_none() {
+            self.context.records.extend(entry.records.iter().cloned());
         }
         let mut unreadable = Vec::new();
         let mut over_limit = Vec::new();
