@@ -935,6 +935,11 @@ impl Workspace {
                 .min_h_0()
                 .w_full()
                 .bg(tokens.terminal.background)
+                .relative()
+                .children(super::theme_inspect::probe(
+                    &["terminalBackground", "terminalForeground", "terminalCursor", "terminalSelection"],
+                    cx,
+                ))
                 .when(has_sidebar, |el| el.gap(px(6.)))
                 .child(self.render_terminal_panes(drawer, &tokens))
                 .when(has_sidebar, |el| {

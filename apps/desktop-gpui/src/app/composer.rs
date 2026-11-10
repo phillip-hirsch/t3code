@@ -922,6 +922,8 @@ impl Workspace {
         let subagent = subagent_bar.is_some();
         let surface = v_flex()
             .w_full()
+            .relative()
+            .children(super::theme_inspect::probe(&["surfaceRaised", "toolbarBorder", "input"], cx))
             .rounded(px(16.))
             .border_1()
             .border_color(outline)
@@ -975,6 +977,7 @@ impl Workspace {
                                             .text_size(px(t.fonts.prompt_size))
                                             .line_height(px(t.fonts.prompt_size * PROMPT_LEADING))
                                             .text_color(t.placeholder)
+                                            .children(super::theme_inspect::probe(&["placeholder"], cx))
                                             .child(placeholder),
                                     )
                                 }),
@@ -1298,7 +1301,8 @@ impl Workspace {
             }
             _ => None,
         };
-        let send = round_button("send", fill, t.primary, t);
+        let send = round_button("send", fill, t.primary, t)
+            .children(super::theme_inspect::probe(&["messageAction", "messageActionForeground"], cx));
         let send = if can_send { action_control(send, &self.composer_action_focus[PRIMARY], t) } else { send };
         send.when_some(stage, |el, art| {
             el.relative().when(!can_send, |el| el.opacity(0.64)).child(super::sidebar::stage_button_art(art, t.dark))

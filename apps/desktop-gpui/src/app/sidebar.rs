@@ -1344,9 +1344,14 @@ impl Workspace {
     }
 
     /// The sidebar view, reused from the last frame unless it was notified or resized.
-    pub(super) fn render_cached_sidebar(&self) -> impl IntoElement {
-        AnyView::from(self.sidebar_view.clone())
-            .cached(StyleRefinement::default().flex_none().h_full().w(self.sidebar_width()))
+    pub(super) fn render_cached_sidebar(&self, cx: &App) -> AnyElement {
+        let style = StyleRefinement::default().flex_none().h_full().w(self.sidebar_width());
+        let view = AnyView::from(self.sidebar_view.clone());
+        // A cached view replays its last paint, which would skip the theme inspector's probes.
+        if super::theme_inspect::active(cx) {
+            return div().flex_none().h_full().w(self.sidebar_width()).child(view).into_any_element();
+        }
+        view.cached(style).into_any_element()
     }
 
     pub(super) fn sidebar_width(&self) -> Pixels {
@@ -1517,6 +1522,7 @@ impl Workspace {
 
         v_flex()
             .id("sidebar")
+            .children(super::theme_inspect::probe(&["sidebar", "sidebarForeground", "sidebarBorder"], cx))
             .relative()
             .h_full()
             .when(!sheet, |el| el.w(self.sidebar_width()))
@@ -1814,6 +1820,7 @@ impl Workspace {
         let surface = sb.control_surface;
         let tip = Self::provider_update_summary(&plan);
         keyboard_button(div().id("sidebar-update"), tokens.ring)
+            .children(super::theme_inspect::probe(&["sidebarControlSurface", "sidebarForeground"], cx))
             .ml_auto()
             .size(px(32.))
             .flex_none()
@@ -2031,6 +2038,7 @@ impl Workspace {
         let hover_card = self
             .render_hover_card(&facts, project, tokens)
             .map(|card| div().absolute().top(px(CARD_ITEM_INSET)).left_0().right_0().child(card));
+        let fill_probe = row_probe(active, selected, cx);
         div()
             .relative()
             .py(px(CARD_ITEM_INSET))
@@ -2038,6 +2046,7 @@ impl Workspace {
             .child(
                 div()
                     .id(SharedString::from(format!("thread-{}", thread.id)))
+                    .children(fill_probe)
                     .group(ROW_GROUP)
                     .on_hover(cx.listener(move |this, hovered: &bool, _, cx| this.hover_row(&hover_id, *hovered, cx)))
                     .rounded(px(6.))
@@ -2381,6 +2390,7 @@ impl Workspace {
         let (open_id, hover_id) = (thread.id.clone(), thread.id.clone());
         v_flex()
             .id(SharedString::from(format!("thread-{}", thread.id)))
+            .children(row_probe(active, selected, cx))
             .group(ROW_GROUP)
             .relative()
             .flex_none()
@@ -2501,6 +2511,7 @@ impl Workspace {
         let hover_id = thread.id.clone();
         h_flex()
             .id(SharedString::from(format!("thread-{}", thread.id)))
+            .children(row_probe(active, selected, cx))
             .group(ROW_GROUP)
             .relative()
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| this.hover_row(&hover_id, *hovered, cx)))
@@ -2737,6 +2748,16 @@ pub(in crate::app) fn project_icon(
                 .children(glyphs.into_iter().map(|glyph| SharedString::from(glyph.to_string()))),
         )
         .into_any_element()
+}
+
+/// A thread row's theme roles for the inspector: its fill when active or selected.
+fn row_probe(active: bool, selected: bool, cx: &App) -> Option<AnyElement> {
+    let roles: &'static [&'static str] = match (selected, active) {
+        (true, _) => &["sidebarRowSelected"],
+        (false, true) => &["sidebarRowActive"],
+        (false, false) => return None,
+    };
+    super::theme_inspect::probe(roles, cx)
 }
 
 #[cfg(test)]

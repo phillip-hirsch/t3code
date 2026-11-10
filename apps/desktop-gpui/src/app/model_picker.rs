@@ -1127,6 +1127,8 @@ impl Workspace {
                                 .line_height(px(10.))
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(t.update_foreground)
+                                .relative()
+                                .children(super::theme_inspect::probe(&["update", "updateForeground"], cx))
                                 .child("NEW"),
                         )
                     }),

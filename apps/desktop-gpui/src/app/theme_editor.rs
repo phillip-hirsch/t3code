@@ -1,7 +1,7 @@
 //! The floating theme editor (`ThemeEditorPanel.tsx`, `ThemeColorPicker.tsx`, `ThemeEditorHost.tsx`):
 //! guided (background + accent) and advanced (every color family) editing, a live preview of
-//! the draft over the whole app, and saving into the theme library. The web's "Inspect"
-//! picker and usage counts read the DOM; this client has no equivalent and leaves them out.
+//! the draft over the whole app, and saving into the theme library. Inspect and the usage
+//! spotlight live in `theme_inspect`.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -17,8 +17,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Bounds, Context, DispatchPhase, Entity, Focusable as _, FontWeight, Hsla,
     InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement as _, Pixels, Point, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Subscription, WeakEntity, Window, canvas, div, linear_color_stop, linear_gradient, px, rems,
+    ParentElement as _, Pixels, Point, Render, ScrollHandle, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Subscription, WeakEntity, Window, canvas, div, linear_color_stop, linear_gradient, px, rems,
 };
 use serde_json::{Map, Value, json};
 
@@ -161,6 +161,11 @@ fn families() -> impl Iterator<Item = &'static Family> {
     GROUPS.iter().flat_map(|(_, families)| families.iter())
 }
 
+/// `getThemeEditorColorFamily(role)?.label ?? getThemeRoleLabel(role)`.
+pub(in crate::app) fn family_label(role: &str) -> String {
+    families().find(|family| family.roles.contains(&role)).map_or_else(|| role_label(role), |f| f.label.to_owned())
+}
+
 /// `getThemeRoleLabel`.
 pub(in crate::app) fn role_label(role: &str) -> String {
     let named = match role {
@@ -191,6 +196,21 @@ pub(in crate::app) fn role_label(role: &str) -> String {
         label.push(if i == 0 { c.to_ascii_uppercase() } else { c });
     }
     label
+}
+
+/// `selectedHighlightRoles` for a selected role.
+fn highlight_roles(selected: &'static str, advanced: bool, colors: &Roles) -> Vec<&'static str> {
+    if advanced {
+        return families()
+            .find(|family| family.roles.contains(&selected))
+            .map_or_else(|| vec![selected], |family| family.roles.to_vec());
+    }
+    if !SIMPLE_ROLES.contains(&selected) {
+        return vec![selected];
+    }
+    let normalized = |value: &str| value.trim().to_lowercase();
+    let value = normalized(colors.get(selected));
+    colors.iter().filter(|(_, color)| normalized(color) == value).map(|(role, _)| role).collect()
 }
 
 /// What a filter matches: the family's label and its roles' labels.
@@ -273,6 +293,11 @@ pub(in crate::app) struct ThemeEditor {
     error: Option<String>,
     minimized: bool,
     selected: Option<&'static str>,
+    /// Inspect mode: the next click on the app picks the role it paints with.
+    inspecting: bool,
+    /// A field to scroll into view once it lays out (`selectThemeRole`'s `reveal`).
+    reveal: Rc<Cell<Option<&'static str>>>,
+    body_scroll: ScrollHandle,
     /// The merge target whose appearances last moved the draft (`appliedMergeKey`).
     merge_key: Option<String>,
     fields: HashMap<&'static str, Entity<InputState>>,
@@ -341,7 +366,7 @@ impl ThemeEditor {
                         let value = input.read(cx).value().to_string();
                         this.update_color(role, &value, window, cx);
                     }
-                    InputEvent::Focus => this.select_role(role, cx),
+                    InputEvent::Focus => this.select_role(role, false, window, cx),
                     _ => {}
                 }
             }));
@@ -362,6 +387,9 @@ impl ThemeEditor {
             error: None,
             minimized: false,
             selected: None,
+            inspecting: false,
+            reveal: Rc::default(),
+            body_scroll: ScrollHandle::new(),
             merge_key: None,
             fields,
             picker: None,
@@ -479,14 +507,56 @@ impl ThemeEditor {
         cx.notify();
     }
 
-    /// `selectThemeRole`: a role outside the guided pair opens the advanced editor.
-    fn select_role(&mut self, role: &'static str, cx: &mut Context<Self>) {
+    /// `selectThemeRole`: a role outside the guided pair opens the advanced editor, unfiltered;
+    /// `reveal` scrolls its field into view.
+    fn select_role(&mut self, role: &'static str, reveal: bool, window: &mut Window, cx: &mut Context<Self>) {
         let visible = families().find(|family| family.roles.contains(&role)).map_or(role, |family| family.role);
         self.selected = Some(visible);
-        if !SIMPLE_ROLES.contains(&visible) && !self.advanced {
+        if !SIMPLE_ROLES.contains(&visible) {
             self.advanced = true;
+            if !self.filter.read(cx).value().is_empty() {
+                self.filter.update(cx, |filter, cx| filter.set_value("", window, cx));
+            }
+        }
+        if reveal {
+            self.reveal.set(Some(visible));
         }
         cx.notify();
+    }
+
+    /// Inspect picked `role` from the app: select it and leave inspect mode.
+    pub(in crate::app) fn pick_from_app(&mut self, role: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        self.inspecting = false;
+        self.select_role(role, true, window, cx);
+    }
+
+    /// `clearInspectorSelection`: Cancel and Escape.
+    pub(in crate::app) fn clear_inspector_selection(&mut self, cx: &mut Context<Self>) {
+        self.selected = None;
+        self.inspecting = false;
+        cx.notify();
+    }
+
+    pub(in crate::app) fn inspecting(&self) -> bool {
+        self.inspecting
+    }
+
+    /// The app records which surfaces paint which roles while this is on.
+    pub(in crate::app) fn inspector_active(&self) -> bool {
+        self.inspecting || self.selected.is_some()
+    }
+
+    /// The panel's bounds as last painted; the inspector leaves the pointer alone over it.
+    pub(in crate::app) fn panel_bounds(&self) -> Bounds<Pixels> {
+        self.bounds.get()
+    }
+
+    /// `selectedHighlightRoles`: the selected family's roles; in the guided editor, every role
+    /// that shares a guided color's value. None while inspecting.
+    pub(in crate::app) fn highlight_roles(&self) -> Vec<&'static str> {
+        let selected = self.selected.filter(|_| !self.inspecting);
+        selected
+            .map_or_else(Vec::new, |role| highlight_roles(role, self.advanced, &self.colors[usize::from(self.dark)]))
     }
 
     /// `handleAdvancedChange`: leaving advanced mode regenerates from the two seeds once
@@ -524,7 +594,7 @@ impl ThemeEditor {
 
     fn open_picker(&mut self, role: &'static str, label: String, window: &mut Window, cx: &mut Context<Self>) {
         self.snapshot = Some((self.colors.clone(), self.simple_dirty, self.regenerate));
-        self.select_role(role, cx);
+        self.select_role(role, false, window, cx);
         self.selected = Some(role);
         let hex =
             theme_color::to_hex(self.colors[usize::from(self.dark)].get(role)).unwrap_or_else(|| "#000000".into());
@@ -791,13 +861,32 @@ impl Render for ThemeEditor {
         let height = self.size.map(|(_, h)| h.min(viewport.1 - MARGIN * 2.).max(MIN_HEIGHT));
         let position =
             self.position.map(|(x, y, w)| clamp_position(viewport, x, y, if self.size.is_some() { width } else { w }));
-        let subtitle: Option<String> = (!self.minimized).then(|| match self.selected {
-            Some(role) if self.advanced => {
-                families().find(|f| f.role == role).map_or_else(|| role_label(role), |f| f.label.to_owned())
-            }
-            Some(role) => role_label(role),
-            None => "Select a color below".to_owned(),
+        let subtitle: Option<String> = (!self.minimized).then(|| {
+            let label = match self.selected {
+                _ if self.inspecting => return "Select an element · Esc to cancel".to_owned(),
+                Some(role) if self.advanced => family_label(role),
+                Some(role) => role_label(role),
+                None => return "Select a color below".to_owned(),
+            };
+            let uses = super::theme_inspect::uses(cx);
+            format!("{label} · {uses} {}", if uses == 1 { "use" } else { "uses" })
         });
+        let inspecting = self.inspecting;
+        let inspect = Button::new("theme-editor-inspect")
+            .xsmall()
+            .map(|button| if inspecting { button.secondary() } else { button.ghost() })
+            .icon(Icon::new(IconName::MousePointer2))
+            .label(if inspecting { "Cancel" } else { "Inspect" })
+            .toggled(inspecting)
+            .tooltip(if inspecting { "Cancel and clear the selection" } else { "Pick a color from the app" })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if inspecting {
+                    this.clear_inspector_selection(cx);
+                } else {
+                    this.inspecting = true;
+                    cx.notify();
+                }
+            }));
         let header =
             h_flex()
                 .id("theme-editor-header")
@@ -832,6 +921,7 @@ impl Render for ThemeEditor {
                             div().min_w_0().truncate().text_xs().text_color(t.muted_foreground).child(text)
                         })),
                 )
+                .child(inspect)
                 .child(
                     Button::new("theme-editor-minimize")
                         .ghost()
@@ -1092,6 +1182,7 @@ impl ThemeEditor {
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
+            .track_scroll(&self.body_scroll)
             .gap(px(12.))
             .pt(px(12.))
             .pb(px(12.))
@@ -1156,8 +1247,33 @@ impl ThemeEditor {
                 .flex_none()
                 .child(Input::new(input).xsmall().font_family(t.fonts.mono).when(!valid, |el| el.border_color(t.error)))
         });
+        // `scrollIntoView({ block: "nearest" })` once the field has laid out.
+        let reveal = (self.reveal.get() == Some(role)).then(|| {
+            let (reveal, scroll) = (self.reveal.clone(), self.body_scroll.clone());
+            canvas(
+                move |bounds, window, _| {
+                    reveal.set(None);
+                    let viewport = scroll.bounds();
+                    let offset = scroll.offset();
+                    let delta = if bounds.top() < viewport.top() {
+                        viewport.top() - bounds.top()
+                    } else if bounds.bottom() > viewport.bottom() {
+                        (viewport.bottom() - bounds.bottom()).max(viewport.top() - bounds.top())
+                    } else {
+                        return;
+                    };
+                    scroll.set_offset(gpui_kit::point(offset.x, offset.y + delta));
+                    window.on_next_frame(|window, _| window.refresh());
+                },
+                |_, (), _, _| {},
+            )
+            .absolute()
+            .size_full()
+        });
         h_flex()
             .id(SharedString::from(format!("theme-field-{role}")))
+            .relative()
+            .children(reveal)
             .min_h(px(44.))
             .min_w_0()
             .gap(px(8.))
@@ -1359,6 +1475,18 @@ impl Workspace {
         }
     }
 
+    /// Escape in inspect mode (`cancelInspection`) leaves it and clears the selection.
+    pub(in crate::app) fn theme_inspect_escape(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        let Some(editor) = self.theme_editor.as_ref().filter(|editor| editor.read(cx).inspecting()) else {
+            return false;
+        };
+        if event.keystroke.key != "escape" {
+            return false;
+        }
+        editor.update(cx, ThemeEditor::clear_inspector_selection);
+        true
+    }
+
     /// `themeEditor.toggle` (`toggleThemeEditorForTheme`): closes an open editor, else opens
     /// one seeded from the theme the current appearance uses.
     pub(in crate::app) fn toggle_theme_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1448,6 +1576,25 @@ mod tests {
         assert!(family_matches(border, "toolbar border") && family_matches(border, ""));
         assert!(!family_matches(border, "terminal"));
         assert_eq!(families().count(), 22);
+        assert_eq!(family_label("toolbarBorder"), "Border");
+        assert_eq!(family_label("chrome"), "Background");
+    }
+
+    #[test]
+    fn a_selection_spotlights_its_family_or_every_role_sharing_a_guided_color() {
+        let mut colors = themes::standard_roles(false).clone();
+        let border = families().find(|f| f.role == "border").unwrap();
+        assert_eq!(highlight_roles("border", true, &colors), border.roles);
+        assert_eq!(highlight_roles("border", false, &colors), ["border"]);
+        // The guided accent lights up every role painted with its value, case and spacing aside.
+        let accent = colors.get("accent").to_owned();
+        colors.set("focus", format!(" {} ", accent.to_uppercase()));
+        colors.set("messageAction", "#123456".into());
+        let lit = highlight_roles("accent", false, &colors);
+        assert!(lit.contains(&"accent") && lit.contains(&"focus"));
+        assert!(!lit.contains(&"messageAction"));
+        let same = |value: &str| value.trim().eq_ignore_ascii_case(&accent);
+        assert_eq!(lit, colors.iter().filter(|(_, value)| same(value)).map(|(role, _)| role).collect::<Vec<_>>());
     }
 
     #[test]

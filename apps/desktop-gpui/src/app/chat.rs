@@ -776,6 +776,7 @@ pub(super) fn render_row(
                     expanded,
                     attribution: attribution.as_ref(),
                     fold,
+                    probe: super::theme_inspect::probe(&["messageSurface", "messageForeground"], cx),
                 },
                 this,
                 &t,
@@ -1547,6 +1548,8 @@ struct UserRowLook<'a> {
     expanded: bool,
     attribution: Option<&'a timeline::Attribution>,
     fold: Option<FoldedMessage>,
+    /// The theme inspector's mark for the bubble.
+    probe: Option<AnyElement>,
 }
 
 /// An agent's or an automation's message folds to one line: who sent it, then a summary
@@ -1631,7 +1634,7 @@ fn user_row(
     this: &WeakEntity<Workspace>,
     t: &Tokens,
 ) -> AnyElement {
-    let UserRowLook { grouped_with_previous, grouped_with_next, expanded, attribution, fold } = look;
+    let UserRowLook { grouped_with_previous, grouped_with_next, expanded, attribution, fold, probe } = look;
     let steer_label = steer.map(|_| {
         h_flex()
             .mr(px(4.))
@@ -1661,6 +1664,7 @@ fn user_row(
         .rounded(px(16.))
         .bg(surface)
         .text_color(t.message_foreground)
+        .children(probe)
         .text_size(px(TEXT))
         .line_height(px(LINE))
         .when(grouped_with_previous, |this| this.rounded_tr(px(6.)))
@@ -1991,6 +1995,8 @@ pub(super) fn code_block_header(
     let copy = message_actions::code_copy_button(this, id, code, t, cx);
     let fill = t.background.blend(code_background(t));
     h_flex()
+        .relative()
+        .children(super::theme_inspect::probe(&["codeBackground", "codeForeground"], cx))
         .map(|row| match width {
             Some(width) => row.w(px(width - 8.)),
             None => row.w_full(),

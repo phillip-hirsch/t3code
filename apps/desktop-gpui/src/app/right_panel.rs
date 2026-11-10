@@ -1769,6 +1769,7 @@ impl Workspace {
                 .h_full()
                 .flex_none()
                 .bg(tokens.background)
+                .children(super::theme_inspect::probe(&["canvas", "border"], cx))
                 .border_l_1()
                 .border_color(tokens.border)
                 .on_drag_move(cx.listener(|this, event: &DragMoveEvent<RightPanelResize>, window, cx| {
@@ -2821,6 +2822,8 @@ impl Workspace {
                         .flex_1()
                         .min_h_0()
                         .items_start()
+                        .relative()
+                        .children(super::theme_inspect::probe(&["codeBackground", "codeForeground"], cx))
                         .child({
                             // `--diffs-font-size`, the Code font size.
                             let stats = self.right_panel.patches.as_ref().map(|patches| patches.stats.clone());
