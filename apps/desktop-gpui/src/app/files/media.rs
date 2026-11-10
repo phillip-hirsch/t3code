@@ -7,8 +7,8 @@ use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::{
-    AnyElement, App, ClipboardItem, Context, DismissEvent, Entity, Focusable as _, Image, IntoElement as _,
-    ParentElement as _, Pixels, Point, Subscription, Window, anchored, deferred, px,
+    AnyElement, App, ClipboardItem, Context, DismissEvent, ElementId, Entity, Focusable as _, Image, IntoElement as _,
+    ParentElement as _, Pixels, Point, Subscription, WeakEntity, Window, anchored, deferred, px,
 };
 
 use super::{FileKey, logic};
@@ -29,10 +29,16 @@ impl MediaKind {
     }
 }
 
+/// The open media menu. Its surface's element state holds it from the first frame that draws it,
+/// so it is released, and the native views it hid show again, once that surface stops drawing it.
 pub(super) struct MediaMenu {
-    view: Entity<PopupMenu>,
+    key: FileKey,
+    view: WeakEntity<PopupMenu>,
+    /// The menu until its surface first draws it.
+    pending: Option<Entity<PopupMenu>>,
     position: Point<Pixels>,
     _dismiss: Subscription,
+    _release: Subscription,
 }
 
 /// `isWindowsAbsolutePath`: a drive path or a UNC share.
@@ -71,6 +77,7 @@ impl Workspace {
         }
         let (full, relative) = clipboard_paths(&key.checkout.cwd, &key.path);
         let view = cx.weak_entity();
+        let owner = key.clone();
         let key = key.clone();
         let noun = kind.noun();
         let menu = PopupMenu::build(window, cx, move |mut menu, _, _| {
@@ -103,6 +110,14 @@ impl Workspace {
             menu
         });
         let previous = window.focused(cx);
+        let released = menu.entity_id();
+        let release = cx.observe_release(&menu, move |this, _, cx| {
+            if this.files.media_menu.as_ref().is_some_and(|menu| menu.view.entity_id() == released) {
+                this.files.media_menu = None;
+                this.files.menu_open = false;
+                cx.notify();
+            }
+        });
         menu.focus_handle(cx).focus(window, cx);
         let dismiss = cx.subscribe_in(&menu, window, move |this, _, _: &DismissEvent, window, cx| {
             this.files.media_menu = None;
@@ -114,14 +129,31 @@ impl Workspace {
         });
         // Native document views hide so the menu shows over them.
         self.files.menu_open = true;
-        self.files.media_menu = Some(MediaMenu { view: menu, position, _dismiss: dismiss });
+        self.files.media_menu = Some(MediaMenu {
+            key: owner,
+            view: menu.downgrade(),
+            pending: Some(menu),
+            position,
+            _dismiss: dismiss,
+            _release: release,
+        });
         cx.notify();
     }
 
-    pub(super) fn render_media_menu(&self) -> Option<AnyElement> {
-        let menu = self.files.media_menu.as_ref()?;
+    /// The media menu `key`'s surface opened, which the surface keeps alive while it draws it.
+    pub(super) fn render_media_menu(
+        &mut self,
+        key: &FileKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let menu = self.files.media_menu.as_mut().filter(|menu| menu.key == *key)?;
+        let pending = menu.pending.take();
+        let view = pending.clone().or_else(|| menu.view.upgrade())?;
+        let id = ElementId::NamedInteger("files-media-menu".into(), view.entity_id().as_u64());
+        window.use_keyed_state(id, cx, |_, _| pending.unwrap_or_else(|| view.clone()));
         Some(
-            deferred(anchored().position(menu.position).snap_to_window_with_margin(px(8.)).child(menu.view.clone()))
+            deferred(anchored().position(menu.position).snap_to_window_with_margin(px(8.)).child(view))
                 .with_priority(3)
                 .into_any_element(),
         )

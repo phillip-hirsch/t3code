@@ -147,6 +147,16 @@ impl Documents {
         }
     }
 
+    /// `key`'s view while it shows.
+    pub(super) fn shown_view(&self, key: &FileKey) -> Option<&Entity<WebView>> {
+        self.views.get(key).filter(|doc| doc.shown)?.view.as_ref()
+    }
+
+    /// The open viewer pages' views.
+    pub(super) fn viewer_views(&self) -> impl Iterator<Item = &Entity<WebView>> {
+        self.views.values().filter(|doc| viewer_of(doc.kind).is_some()).filter_map(|doc| doc.view.as_ref())
+    }
+
     pub(super) fn viewer_resource(&self, key: &FileKey) -> Option<&Value> {
         self.views.get(key)?.resource.as_ref()
     }
@@ -190,6 +200,8 @@ pub(super) struct Documents {
     frame: u64,
     /// PDF reading positions, kept after a viewer closes.
     pub(super) pdf_positions: super::pdf::Positions,
+    /// The shell chords viewer pages hand back.
+    pub(super) chords: super::viewer::ViewerChords,
 }
 
 /// The viewer page that shows `kind`, and its global API's name.
@@ -377,7 +389,7 @@ impl Workspace {
         if let Some((_, global)) = viewer_of(kind) {
             self.sync_viewer_theme(key, global, cx);
         }
-        let menu = (kind == FileKind::Video).then(|| self.render_media_menu()).flatten();
+        let menu = if kind == FileKind::Video { self.render_media_menu(key, window, cx) } else { None };
         let Some(state) = self.files.documents.views.get(key) else { return div().into_any_element() };
         match (&state.view, &state.failed) {
             (Some(view), _) => {
@@ -788,6 +800,7 @@ impl Workspace {
     /// drew; like the browser's views, a GPUI overlay hides it. Views not drawn lately close.
     pub(in crate::app) fn sync_document_views(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settle_file_menu(window, cx);
+        self.sync_viewer_chords(cx);
         let covered = self.browser_covered(window, cx);
         let dialog_open = window.has_active_dialog(cx);
         let menu_open = self.files.menu_open;
