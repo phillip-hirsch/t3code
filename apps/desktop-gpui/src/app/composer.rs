@@ -982,7 +982,7 @@ impl Workspace {
         let attached = |id: &str| self.question_attached(pane, id);
         let Some(answers) = requests::answers(&draft.questions, &draft.drafts, attached) else { return };
         let request_id = draft.request_id.clone();
-        if self.responding.is_some() || !self.pane_can_operate(pane) {
+        if self.pane_responding(pane, &request_id) || !self.pane_can_operate(pane) {
             return;
         }
         let mut response = json!({"answers": answers});
@@ -1010,8 +1010,7 @@ impl Workspace {
     }
 
     fn pick_option(&mut self, pane: ChatPane, value: String, window: &mut Window, cx: &mut Context<Self>) {
-        let responding = self.question(pane).is_some_and(|q| self.responding.as_ref() == Some(&q.request_id));
-        if responding || !self.pane_can_operate(pane) {
+        if self.question_responding(pane) || !self.pane_can_operate(pane) {
             return;
         }
         let shown = self.pane_thread(pane);
@@ -1463,7 +1462,7 @@ impl Workspace {
                 .when(operate, |el| el.on_click(cx.listener(|this, _, _, cx| this.stop(cx))))
         };
         if let Some(draft) = &self.question {
-            let responding = self.responding.as_ref() == Some(&draft.request_id);
+            let responding = self.pane_responding(ChatPane::Main, &draft.request_id);
             let can_respond = self
                 .pending_question_request(ChatPane::Main)
                 .is_some_and(|(r, _)| r.capability() != Some("not_resumable"));
@@ -1687,7 +1686,7 @@ impl Workspace {
                         .collect()
                 },
             );
-        let enabled = request.is_live() && self.responding.as_ref() != Some(&request.id) && self.pane_can_operate(pane);
+        let enabled = request.is_live() && !self.pane_responding(pane, &request.id) && self.pane_can_operate(pane);
         let inline =
             |decision: &str, label: &str, warning: Option<SharedString>, tone: Hsla, cx: &mut Context<Self>| {
                 let request_id = request.id.clone();
@@ -1966,7 +1965,7 @@ impl Workspace {
         let (request, item) = self.pending_question_request(pane)?;
         let question = &draft.questions[draft.index];
         let disabled = request.capability() == Some("not_resumable")
-            || self.responding.as_ref() == Some(&request.id)
+            || self.pane_responding(pane, &request.id)
             || !self.pane_can_operate(pane);
         let dismissible = item.str("responseMode") == Some("message") || request.capability() == Some("message");
         let collapsed = draft.collapsed;

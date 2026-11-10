@@ -871,7 +871,7 @@ This permanently clears its conversation history."
         stop: Button,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let responding = self.responding.as_ref() == Some(&draft.request_id);
+        let responding = self.pane_responding(ChatPane::Side, &draft.request_id);
         let can_respond = self
             .pending_question_request(ChatPane::Side)
             .is_some_and(|(request, _)| request.capability() != Some("not_resumable"));
@@ -989,6 +989,17 @@ impl Workspace {
             return None;
         }
         Some((self.env_client(&env)?, env, thread_id))
+    }
+
+    /// An answer to `request_id` in the pane's thread is on its way (`respondingRequestIds`).
+    pub(super) fn pane_responding(&self, pane: ChatPane, request_id: &str) -> bool {
+        self.pane_thread(pane)
+            .is_some_and(|(env, thread_id)| self.responding.contains(&(env, thread_id, request_id.to_owned())))
+    }
+
+    /// The pane's open question is being answered.
+    pub(super) fn question_responding(&self, pane: ChatPane) -> bool {
+        self.question(pane).is_some_and(|question| self.pane_responding(pane, &question.request_id))
     }
 
     /// `canOperateThread` for the pane's thread, on the environment it lives on.

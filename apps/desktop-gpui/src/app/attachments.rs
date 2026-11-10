@@ -472,7 +472,7 @@ impl Workspace {
     fn question_refuses_attachments(&self) -> bool {
         self.question.as_ref().is_some_and(|question| {
             !question.active().allows_custom()
-                || self.responding.as_ref() == Some(&question.request_id)
+                || self.pane_responding(ChatPane::Main, &question.request_id)
                 || self
                     .pending_question_request(ChatPane::Main)
                     .is_none_or(|(request, _)| request.capability() == Some("not_resumable"))
@@ -1094,7 +1094,7 @@ impl Workspace {
 
     pub(super) fn remove_attachment(&mut self, local_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         // An answer being sent keeps what it carries.
-        if self.question.as_ref().is_some_and(|question| self.responding.as_ref() == Some(&question.request_id)) {
+        if self.question_responding(ChatPane::Main) {
             return;
         }
         let Some(index) = self.attachments.iter().position(|a| a.local_id == local_id) else { return };

@@ -269,8 +269,8 @@ pub struct Workspace {
     draft_store: draft_store::DraftStore,
     /// The model and permissions picks of the targets not on screen (`composerDraftStore`).
     composer_selections: HashMap<Target, composer::ComposerSelection>,
-    /// The request whose response is in flight.
-    responding: Option<String>,
+    /// Responses in flight, by environment, thread and request: request ids repeat across them.
+    responding: HashSet<(SharedString, String, String)>,
     /// The `@` / `$` / `/` menu.
     menu: composer_menu::MenuState,
     picker: model_picker::PickerState,
@@ -546,7 +546,7 @@ impl Workspace {
             drafts: Default::default(),
             draft_store: Default::default(),
             composer_selections: HashMap::new(),
-            responding: None,
+            responding: HashSet::new(),
             menu: Default::default(),
             picker: Default::default(),
             draft_workspace: Default::default(),
@@ -1321,13 +1321,14 @@ impl Workspace {
     fn respond(&mut self, pane: side_chat::ChatPane, request_id: String, response: Value, cx: &mut Context<Self>) {
         let Some((client, env, thread_id)) = self.pane_client(pane, cx) else { return };
         let command = respond_value(&thread_id, &request_id, response);
-        self.responding = Some(request_id.clone());
+        let key = (env.clone(), thread_id.clone(), request_id);
+        if !self.responding.insert(key.clone()) {
+            return;
+        }
         cx.spawn(async move |this, cx| {
             let result = client.request("orchestration.dispatchCommand", command).await;
             let _ = this.update(cx, |this, cx| {
-                if this.responding.as_ref() == Some(&request_id) {
-                    this.responding = None;
-                }
+                this.responding.remove(&key);
                 if let Err(error) = result
                     && this.pane_shows(pane, &env, &thread_id)
                 {

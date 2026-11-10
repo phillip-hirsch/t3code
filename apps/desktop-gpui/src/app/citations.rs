@@ -310,7 +310,7 @@ impl Workspace {
     /// takes a typed answer (`insertComposerText`).
     pub(super) fn composer_takes_citations(&self) -> bool {
         self.target.is_some()
-            && self.responding.is_none()
+            && !self.question_responding(super::side_chat::ChatPane::Main)
             && self
                 .question
                 .as_ref()
