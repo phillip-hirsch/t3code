@@ -533,11 +533,11 @@ impl MarkdownPlugin for SkillChips {
         Some(MarkdownNode::new("t3-skill", name.clone()).text(label).markdown(format!("${name}")))
     }
 
-    fn render(&self, node: &MarkdownNode, _: &mut Window, _: &mut App) -> impl IntoElement {
+    fn render(&self, node: &MarkdownNode, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let name = node.data::<String>().cloned().unwrap_or_default();
         let workspace = self.workspace.clone();
-        h_flex()
-            .id(SharedString::from(format!("skill-chip:{name}")))
+        let tokens = crate::theme::tokens(cx);
+        super::chat::focusable(h_flex().id(SharedString::from(format!("skill-chip:{name}"))), tokens)
             .gap(px(3.))
             .rounded(px(4.))
             .font_weight(FontWeight::MEDIUM)
@@ -575,14 +575,13 @@ impl MarkdownPlugin for CitationChips {
         Some(MarkdownNode::new("t3-citation", citation).text(label).markdown(markdown))
     }
 
-    fn render(&self, node: &MarkdownNode, _: &mut Window, _: &mut App) -> impl IntoElement {
+    fn render(&self, node: &MarkdownNode, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let Some(citation) = node.data::<crate::assistant_citations::AssistantCitation>().cloned() else {
             return div().into_any_element();
         };
         let workspace = self.workspace.clone();
         let id = format!("citation-chip:{}:{}:{}", citation.message_id, citation.start, citation.end);
-        h_flex()
-            .id(SharedString::from(id))
+        super::chat::focusable(h_flex().id(SharedString::from(id)), crate::theme::tokens(cx))
             .max_w_full()
             .gap(px(3.))
             .rounded(px(4.))
@@ -804,33 +803,35 @@ impl MarkdownPlugin for FileChips {
         let (open, menu) = (self.workspace.clone(), self.workspace.clone());
         let menu_path = path.clone();
         let tooltip: SharedString = path.clone().into();
-        let element = h_flex()
-            .id(SharedString::from(format!("file-chip:{path}")))
-            .max_w_full()
-            .gap(px(3.))
-            .rounded(px(4.))
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(ink)
-            .cursor_pointer()
-            .child(icon.size(px(14.)).flex_none())
-            .child(div().min_w_0().truncate().hover(gpui_kit::Styled::underline).child(chip.label.clone()))
-            .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx))
-            .on_click(move |event, window, cx| {
-                let editor = event.modifiers().secondary(cx);
-                let _ = open.update(cx, |w, cx| w.open_file_chip(&path, line, editor, window, cx));
-            })
-            .on_mouse_down(gpui_kit::MouseButton::Right, move |event, window, cx| {
-                cx.stop_propagation();
-                let position = event.position;
-                let _ = menu.update(cx, |w, cx| {
-                    let target = file_links::resolve_target(&menu_path, w.git_cwd().as_deref());
-                    if let Some(target) = target {
-                        w.with_workspace_match(&menu_path, target, window, cx, move |w, target, window, cx| {
-                            w.open_file_menu(target, position, window, cx);
-                        });
-                    }
-                });
+        let element = super::chat::focusable(
+            h_flex().id(SharedString::from(format!("file-chip:{path}"))),
+            crate::theme::tokens(cx),
+        )
+        .max_w_full()
+        .gap(px(3.))
+        .rounded(px(4.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(ink)
+        .cursor_pointer()
+        .child(icon.size(px(14.)).flex_none())
+        .child(div().min_w_0().truncate().hover(gpui_kit::Styled::underline).child(chip.label.clone()))
+        .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx))
+        .on_click(move |event, window, cx| {
+            let editor = event.modifiers().secondary(cx);
+            let _ = open.update(cx, |w, cx| w.open_file_chip(&path, line, editor, window, cx));
+        })
+        .on_mouse_down(gpui_kit::MouseButton::Right, move |event, window, cx| {
+            cx.stop_propagation();
+            let position = event.position;
+            let _ = menu.update(cx, |w, cx| {
+                let target = file_links::resolve_target(&menu_path, w.git_cwd().as_deref());
+                if let Some(target) = target {
+                    w.with_workspace_match(&menu_path, target, window, cx, move |w, target, window, cx| {
+                        w.open_file_menu(target, position, window, cx);
+                    });
+                }
             });
+        });
         // The link's text flows before the chip as plain prose; only the chip opens the file.
         if chip.after_text { element.ml(px(4.)).into_any_element() } else { element.into_any_element() }
     }
@@ -959,7 +960,8 @@ pub(super) fn thread_chip(
     };
     let (environment, thread_id) = (thread.environment_id.clone(), thread.id.clone());
     let open = workspace.downgrade();
-    row.text_color(rgb(0x009c96))
+    super::chat::focusable(row, &tokens)
+        .text_color(rgb(0x009c96))
         .cursor_pointer()
         .child(div().flex_none().child(icon))
         .child(div().min_w_0().truncate().hover(gpui_kit::Styled::underline).child(title))

@@ -737,6 +737,17 @@ fn alpha(color: Hsla, factor: f32) -> Hsla {
     Hsla { a: color.a * factor, ..color }
 }
 
+/// A `<button>`, or a `role="button"` row: a tab stop that Enter and Space click, with
+/// `focus-visible:ring-2 ring-inset ring-ring/70`, an inset shadow so nothing moves.
+pub(super) fn focusable(element: gpui_kit::Stateful<gpui_kit::Div>, t: &Tokens) -> gpui_kit::Stateful<gpui_kit::Div> {
+    let ring = focus_ring(t);
+    element.tab_index(0).focus_visible(move |style| style.shadow(vec![ring]))
+}
+
+pub(super) fn focus_ring(t: &Tokens) -> gpui_kit::BoxShadow {
+    gpui_kit::BoxShadow::new(px(0.), px(0.), alpha(t.ring, 0.7)).spread_radius(px(2.)).inset()
+}
+
 fn toggle(this: &WeakEntity<Workspace>, key: SharedString) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
     let this = this.clone();
     move |_, _, cx| {
@@ -769,7 +780,16 @@ pub(super) fn render_row(
             let expanded =
                 this.upgrade().is_some_and(|workspace| workspace.read(cx).expanded.contains(&timeline::entry_key(id)));
             let fold = folded_message(attribution.as_ref(), &crate::user_message::plain_text(text), this, cx);
-            let actions = message_actions::user_actions(this, id, text, created_at, revert.as_ref(), &t, cx);
+            let actions = message_actions::user_actions(
+                this,
+                id,
+                text,
+                created_at,
+                revert.as_ref(),
+                Some("timeline-row"),
+                &t,
+                cx,
+            );
             // A folded agent message and a guest's keep their attachments inside the bubble.
             let guest = matches!(attribution, Some(timeline::Attribution::Guest { .. }));
             let layout = crate::user_message::layout(content, text, fold.is_none() && !guest);
@@ -806,10 +826,18 @@ pub(super) fn render_row(
             )
         }
         Row::AssistantMeta { id, text, updated_at, status, fork } => {
-            let meta =
-                message_actions::assistant_meta(this, id, text, false, updated_at, status, fork.as_ref(), &t, cx)
-                    .opacity(0.)
-                    .group_hover("timeline-meta", |style| style.opacity(1.));
+            let meta = message_actions::assistant_meta(
+                this,
+                id,
+                text,
+                false,
+                updated_at,
+                status,
+                fork.as_ref(),
+                Some("timeline-meta"),
+                &t,
+                cx,
+            );
             lane(16., v_flex().group("timeline-meta").child(meta)).into_any_element()
         }
         Row::Assistant { id, text, streaming, terminal, updated_at, status, fork, changes, .. } => {
@@ -831,9 +859,18 @@ pub(super) fn render_row(
                 ));
             // The finished reply's actions (`AssistantMessageMeta`) hold their space while hidden.
             let meta = terminal.then(|| {
-                message_actions::assistant_meta(this, id, text, *streaming, updated_at, status, fork.as_ref(), &t, cx)
-                    .opacity(0.)
-                    .group_hover("timeline-row", |style| style.opacity(1.))
+                message_actions::assistant_meta(
+                    this,
+                    id,
+                    text,
+                    *streaming,
+                    updated_at,
+                    status,
+                    fork.as_ref(),
+                    Some("timeline-row"),
+                    &t,
+                    cx,
+                )
             });
             let changes = changes.as_ref().map(|c| super::changed_files::card(c, this, lane_width - 8., &t, cx));
             lane(
@@ -858,11 +895,11 @@ pub(super) fn render_row(
         }
         Row::TurnFold { key, label, expanded, created_at } => {
             let chevron = if *expanded { IconName::ChevronDown } else { IconName::ChevronRight };
-            let button = h_flex()
-                .id(ElementId::Name(key.clone()))
+            let button = focusable(h_flex().id(ElementId::Name(key.clone())), &t)
                 .h(px(24.))
                 .px(px(4.))
                 .gap(px(4.))
+                .rounded(px(6.))
                 .cursor_pointer()
                 .text_color(t.muted_foreground)
                 .hover(|style| style.text_color(t.foreground))
@@ -915,8 +952,7 @@ pub(super) fn render_row(
         }
         Row::AttemptFold { key, expanded } => {
             let chevron = if *expanded { IconName::ChevronDown } else { IconName::ChevronRight };
-            let button = h_flex()
-                .id(ElementId::Name(key.clone()))
+            let button = focusable(h_flex().id(ElementId::Name(key.clone())), &t)
                 .w_full()
                 .gap(px(8.))
                 .px(px(10.))
@@ -1080,7 +1116,7 @@ fn system_divider(divider: &timeline::SystemDivider, this: &WeakEntity<Workspace
     let center = match &divider.action {
         Some((label, thread_id)) => {
             let (this, thread_id, label) = (this.clone(), thread_id.clone(), label.clone());
-            content(div().id(ElementId::Name(format!("divider:{}", divider.id).into())))
+            focusable(content(div().id(ElementId::Name(format!("divider:{}", divider.id).into()))), t)
                 .px(px(10.))
                 .py(px(4.))
                 .rounded_full()
@@ -1119,9 +1155,9 @@ fn entry_open_link(entry: &Entry, this: &WeakEntity<Workspace>, t: &Tokens) -> O
     };
     let (this, thread_id) = (this.clone(), thread_id.to_owned());
     Some(
-        div()
-            .id(ElementId::Name(format!("open-thread:{}", entry.id).into()))
+        focusable(div().id(ElementId::Name(format!("open-thread:{}", entry.id).into())), t)
             .flex_none()
+            .rounded(px(4.))
             .font_weight(FontWeight::MEDIUM)
             .text_color(color)
             .cursor_pointer()
@@ -1228,7 +1264,8 @@ pub(super) fn subagent_card(
     match target {
         Some((env, thread_id)) => {
             let this = this.clone();
-            row.cursor_pointer()
+            focusable(row, t)
+                .cursor_pointer()
                 .hover(|style| style.bg(alpha(t.accent, 0.2)))
                 .child(Icon::new(IconName::ChevronRight).size(px(14.)).text_color(alpha(muted, 0.6)))
                 .on_click(move |_, window, cx| {
@@ -1278,8 +1315,7 @@ fn subagent_group(
             })
     };
     let more = cards.len().saturating_sub(3);
-    let header = h_flex()
-        .id(ElementId::Name(key.clone()))
+    let header = focusable(h_flex().id(ElementId::Name(key.clone())), t)
         .w_full()
         .min_w_0()
         .gap(px(10.))
@@ -1447,8 +1483,7 @@ fn embed_card(embed: &Rc<timeline::Embed>, this: &WeakEntity<Workspace>, t: &Tok
                 })),
         )
         .child(
-            h_flex()
-                .id(ElementId::Name(format!("embed-open:{}", embed.id).into()))
+            focusable(h_flex().id(ElementId::Name(format!("embed-open:{}", embed.id).into())), t)
                 .flex_none()
                 .h(px(24.))
                 .px(px(7.))
@@ -1713,8 +1748,7 @@ fn user_row(
         )));
     }
     let toggle_button = collapsible.then(|| {
-        h_flex()
-            .id(ElementId::Name(format!("user-collapse:{id}").into()))
+        focusable(h_flex().id(ElementId::Name(format!("user-collapse:{id}").into())), t)
             .mt(px(6.))
             .h(px(24.))
             .px(px(7.))
@@ -1727,14 +1761,7 @@ fn user_row(
             .on_click(toggle(this, timeline::entry_key(id)))
     });
     // Hover actions under the bubble keep their 24px row while hidden.
-    let actions = h_flex()
-        .w_full()
-        .max_w(relative(0.8))
-        .justify_end()
-        .pr(px(4.))
-        .opacity(0.)
-        .group_hover("timeline-row", |style| style.opacity(1.))
-        .child(actions);
+    let actions = h_flex().w_full().max_w(relative(0.8)).justify_end().pr(px(4.)).child(actions);
     // `text-2xs`: 0.6875rem.
     let attribution = match (attribution, guest) {
         (Some(timeline::Attribution::T3Code), _) => Some(
@@ -1777,8 +1804,7 @@ fn folded_row(
     t: &Tokens,
 ) -> AnyElement {
     let muted = t.muted_foreground;
-    let header = h_flex()
-        .id(ElementId::Name(format!("agent-fold:{id}").into()))
+    let header = focusable(h_flex().id(ElementId::Name(format!("agent-fold:{id}").into())), t)
         .w_full()
         .min_w_0()
         .gap(px(6.))
@@ -1824,35 +1850,30 @@ fn folded_row(
             FoldLink::Thread(_) => "Open thread",
             FoldLink::Automation { .. } => "Open automation",
         };
-        div()
-            .id(ElementId::Name(format!("agent-open-thread:{id}").into()))
-            .text_xs()
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(muted)
-            .cursor_pointer()
-            .hover(|s| s.text_color(t.foreground).underline())
-            .child(label)
-            .on_click(move |_, window, cx| {
-                let _ = this.update(cx, |workspace, cx| match &link {
-                    FoldLink::Thread(sender) => workspace.select_thread(sender.to_string(), window, cx),
-                    FoldLink::Automation { environment: Some(environment), task_id } => {
-                        workspace.open_scheduled_task(environment.clone(), task_id.clone(), cx);
-                    }
-                    FoldLink::Automation { environment: None, .. } => workspace.open_settings("scheduled-tasks", cx),
-                });
-            })
+        message_actions::control(
+            div().id(ElementId::Name(format!("agent-open-thread:{id}").into())),
+            Some("timeline-row"),
+            t,
+        )
+        .rounded(px(4.))
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(muted)
+        .cursor_pointer()
+        .hover(|s| s.text_color(t.foreground).underline())
+        .child(label)
+        .on_click(move |_, window, cx| {
+            let _ = this.update(cx, |workspace, cx| match &link {
+                FoldLink::Thread(sender) => workspace.select_thread(sender.to_string(), window, cx),
+                FoldLink::Automation { environment: Some(environment), task_id } => {
+                    workspace.open_scheduled_task(environment.clone(), task_id.clone(), cx);
+                }
+                FoldLink::Automation { environment: None, .. } => workspace.open_settings("scheduled-tasks", cx),
+            });
+        })
     });
     let actions = (fold.actions_when_folded || expanded).then(|| {
-        h_flex()
-            .w_full()
-            .max_w(relative(0.8))
-            .justify_end()
-            .gap(px(8.))
-            .pr(px(4.))
-            .opacity(0.)
-            .group_hover("timeline-row", |style| style.opacity(1.))
-            .children(link)
-            .child(actions)
+        h_flex().w_full().max_w(relative(0.8)).justify_end().gap(px(8.)).pr(px(4.)).children(link).child(actions)
     });
     let column =
         v_flex().group("timeline-row").items_end().gap(px(4.)).children(steer_label).child(bubble).children(actions);
@@ -2003,8 +2024,7 @@ pub(super) fn code_block_header(
     let at = block.span.as_ref().map_or_else(|| fnv1a(&code), |span| span.start as u64);
     let id: SharedString = format!("code:{key}:{at:x}").into();
     let wrap_this = this.clone();
-    let wrap_button = div()
-        .id("wrap")
+    let wrap_button = focusable(div().id("wrap"), t)
         .size(px(24.))
         .flex()
         .items_center()
@@ -2027,8 +2047,7 @@ pub(super) fn code_block_header(
         .filter(|_| run && !streaming && this.upgrade().is_some_and(|w| w.read(cx).git_cwd().is_some()))
         .map(|command| {
             let this = this.clone();
-            div()
-                .id("run")
+            focusable(div().id("run"), t)
                 .size(px(24.))
                 .flex()
                 .items_center()
@@ -2290,8 +2309,7 @@ fn plan_card(
     }
     let toggle_button = collapsible.then(|| {
         h_flex().w_full().justify_center().mt(px(16.)).child(
-            div()
-                .id(ElementId::Name(format!("plan-toggle:{id}").into()))
+            focusable(div().id(ElementId::Name(format!("plan-toggle:{id}").into())), t)
                 .h(px(32.))
                 .px(px(12.))
                 .flex()
@@ -2422,19 +2440,20 @@ fn work_row(work: &WorkRow, this: &WeakEntity<Workspace>, t: &Tokens, cx: &mut A
     let row = div().w_full().min_w_0().rounded(px(6.)).px(px(2.)).py(px(2.));
     let content: AnyElement = match &work.kind {
         WorkRowKind::Single { entry, label, expanded } => single_entry(entry, label, *expanded, this, t, cx),
-        WorkRowKind::Toggle { group, summary, icon, created_at, .. } => row
-            .id(ElementId::Name(work.id.clone()))
-            .group("timeline-row")
-            .cursor_pointer()
-            .child(work_line(
-                *icon,
-                icon_color(t),
-                summary.clone(),
-                muted,
-                hover_timestamp(this, format!("time:{}", work.id), created_at, t, cx),
-            ))
-            .on_click(toggle(this, group.clone()))
-            .into_any_element(),
+        WorkRowKind::Toggle { group, summary, icon, created_at, .. } => {
+            focusable(row.id(ElementId::Name(work.id.clone())), t)
+                .group("timeline-row")
+                .cursor_pointer()
+                .child(work_line(
+                    *icon,
+                    icon_color(t),
+                    summary.clone(),
+                    muted,
+                    hover_timestamp(this, format!("time:{}", work.id), created_at, t, cx),
+                ))
+                .on_click(toggle(this, group.clone()))
+                .into_any_element()
+        }
         WorkRowKind::Details { entries } => v_flex()
             .id(ElementId::Name(work.id.clone()))
             .max_h(px(288.))
@@ -2468,7 +2487,7 @@ fn work_row(work: &WorkRow, this: &WeakEntity<Workspace>, t: &Tokens, cx: &mut A
             v_flex()
                 .children(thought_line)
                 .child(
-                    row.id(ElementId::Name(work.id.clone()))
+                    focusable(row.id(ElementId::Name(work.id.clone())), t)
                         .cursor_pointer()
                         .child(work_line(
                             entry.icon(),
@@ -2485,8 +2504,7 @@ fn work_row(work: &WorkRow, this: &WeakEntity<Workspace>, t: &Tokens, cx: &mut A
             let label = preview.clone().unwrap_or_else(|| "Thinking".into());
             let line = work_line(WorkIcon::Brain, icon_color(t), label, muted, None);
             match group {
-                Some(group) => row
-                    .id(ElementId::Name(work.id.clone()))
+                Some(group) => focusable(row.id(ElementId::Name(work.id.clone())), t)
                     .cursor_pointer()
                     .child(line)
                     .on_click(toggle(this, group.clone()))
@@ -2705,8 +2723,8 @@ fn thread_read_label(
     let title = div().min_w_0().truncate().child(SharedString::from(title.to_owned()));
     let title = if linked {
         let (this, env, id) = (this.clone(), thread.environment_id.clone(), thread.id.clone());
-        title
-            .id(ElementId::Name(format!("read-thread:{}", entry.id).into()))
+        focusable(title.id(ElementId::Name(format!("read-thread:{}", entry.id).into())), t)
+            .rounded(px(4.))
             .text_color(t.foreground)
             .cursor_pointer()
             .hover(gpui_kit::Styled::underline)
@@ -2759,7 +2777,8 @@ fn question_history(
         match file.id.clone() {
             Some(attachment_id) => {
                 let this = this.clone();
-                link.cursor_pointer()
+                focusable(link, t)
+                    .cursor_pointer()
                     .on_click(move |_, _, cx| {
                         let _ = this.update(cx, |workspace, cx| workspace.open_answer_attachment(&attachment_id, cx));
                     })
@@ -2852,7 +2871,7 @@ fn single_entry(
     let line = work_line(entry.icon(), color, label_text, label_color, Some(trailing.into_any_element()));
     let row = row.id(ElementId::Name(entry.id.clone())).child(line).children(details);
     if expandable {
-        row.cursor_pointer().on_click(toggle(this, timeline::entry_key(&entry.id))).into_any_element()
+        focusable(row, t).cursor_pointer().on_click(toggle(this, timeline::entry_key(&entry.id))).into_any_element()
     } else {
         row.into_any_element()
     }
@@ -2890,7 +2909,7 @@ fn detail_entry(detail: &DetailEntry, this: &WeakEntity<Workspace>, t: &Tokens, 
             ),
         ))
         .children(details)
-        .when(expandable, |row| row.on_click(toggle(this, timeline::entry_key(&entry.id))))
+        .when(expandable, |row| focusable(row, t).on_click(toggle(this, timeline::entry_key(&entry.id))))
         .into_any_element()
 }
 
