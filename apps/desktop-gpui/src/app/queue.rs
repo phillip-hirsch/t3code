@@ -400,10 +400,8 @@ impl Workspace {
             added_records = context.as_ref().and_then(|c| c["records"].as_array()).cloned().unwrap_or_default();
             command["attachments"] = kept.into_iter().chain(added).collect::<Vec<_>>().into();
         }
-        let records = merge_records(&kept_records, added_records);
-        if !records.is_empty() {
-            command["context"] = json!({"version": 1, "records": records});
-        }
+        // Always the full set, even empty: an absent context keeps the queued message's old records.
+        command["context"] = json!({"version": 1, "records": merge_records(&kept_records, added_records)});
         command["text"] =
             if text.is_empty() && has_attachments { ATTACHMENT_ONLY_PROMPT.to_owned() } else { text }.into();
         if let Some(edit) = self.queue_ui_mut(pane).and_then(|ui| ui.edit.as_mut()) {

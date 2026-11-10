@@ -696,40 +696,36 @@ impl Workspace {
     /// `shouldTypeToFocusComposer` and `usePasteToFocusComposer`: with nothing focused (a
     /// click on the timeline blurs the editor), typing and pasting land at the composer's end.
     fn redirect_to_composer(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if !self.focus.is_focused(window)
-            || self.target.is_none()
-            || self.palette.is_some()
-            || self.page.is_some()
-            || self.settings.is_some()
-        {
-            return false;
-        }
-        let m = keystroke.modifiers;
-        let paste = keystroke.key == "v" && (m.control || m.platform) && !m.alt;
-        let text = if paste {
-            let item = cx.read_from_clipboard();
-            let only_text = item
-                .as_ref()
-                .is_some_and(|item| item.entries().iter().all(|e| matches!(e, gpui_kit::ClipboardEntry::String(_))));
-            match item.and_then(|item| item.text()).filter(|text| only_text && !text.is_empty()) {
-                Some(text) => text,
-                None => return false,
+        let gate = RedirectGate {
+            resting: self.focus.is_focused(window),
+            open: self.target.is_some()
+                && self.palette.is_none()
+                && self.page.is_none()
+                && self.settings.is_none()
+                && !window.has_active_dialog(cx),
+            inert: self.saving_queue_edit(),
+            question_options: self.shortcut_question().map_or(0, |(_, draft)| draft.active().options.len()),
+        };
+        let Some(redirect) = focus_redirect(keystroke, gate) else { return false };
+        let (text, fold) = match redirect {
+            FocusRedirect::Type(text) => (text, false),
+            FocusRedirect::Paste { as_text } => {
+                let item = cx.read_from_clipboard();
+                let only_text = item.as_ref().is_some_and(|item| {
+                    item.entries().iter().all(|e| matches!(e, gpui_kit::ClipboardEntry::String(_)))
+                });
+                match item.and_then(|item| item.text()).filter(|text| only_text && !text.is_empty()) {
+                    Some(text) => (text, !as_text),
+                    None => return false,
+                }
             }
-        } else if !m.control && !m.alt && !m.platform && !m.function {
-            match keystroke.key_char.as_ref().filter(|c| c.chars().count() == 1 && !c.chars().any(char::is_control)) {
-                Some(c) => c.clone(),
-                None => return false,
-            }
-        } else {
-            return false;
         };
         self.composer.update(cx, |state, cx| {
             let end = state.value().len();
             state.set_selected_range(end..end, cx);
         });
         self.composer.read(cx).focus_handle(cx).focus(window, cx);
-        // Ctrl+Shift+V pastes as text even when it is long (`isPasteAsTextShortcut`).
-        if paste && !m.shift && self.fold_pasted_text(&text, window, cx) {
+        if fold && self.fold_pasted_text(&text, window, cx) {
             return true;
         }
         self.composer.update(cx, |state, cx| state.insert(text, window, cx));
@@ -796,24 +792,18 @@ impl Workspace {
 
     /// 1-9 pick an option on an open question card while no text field, terminal or preview has focus.
     fn question_option_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let m = keystroke.modifiers;
-        if m.control || m.platform || m.alt || self.page.is_some() || self.settings.is_some() {
+        if self.page.is_some() || self.settings.is_some() {
             return false;
         }
-        let Some(digit) = keystroke.key.parse::<usize>().ok().filter(|d| (1..=9).contains(d)) else { return false };
+        let Some(digit) = option_digit(keystroke) else { return false };
         // The web skips keys aimed at any text field; here that is any focus but the workspace's own
         // (composer, find bar, side chat, terminal, preview), and an open palette or dialog.
         let resting = self.focus.is_focused(window) || window.focused(cx).is_none();
         if !resting || self.palette.is_some() || window.has_active_dialog(cx) {
             return false;
         }
-        // The open thread's card first, else the side chat's.
-        let pane = if self.question.is_some() { ChatPane::Main } else { ChatPane::Side };
-        let Some(draft) = self.question(pane) else { return false };
-        if draft.collapsed || !self.question_answerable(pane) {
-            return false;
-        }
-        let Some(option) = draft.questions[draft.index].options.get(digit - 1) else { return false };
+        let Some((pane, draft)) = self.shortcut_question() else { return false };
+        let Some(option) = draft.active().options.get(digit - 1) else { return false };
         let value = option.value().to_owned();
         self.pick_option(pane, value, window, cx);
         true
@@ -1000,6 +990,14 @@ impl Workspace {
             && self.pending_question_request(pane).is_some_and(|(r, _)| r.capability() != Some("not_resumable"))
     }
 
+    /// The question whose options 1-9 pick: the open thread's card first, else the side chat's,
+    /// while it is expanded and takes answers.
+    fn shortcut_question(&self) -> Option<(ChatPane, &QuestionDraft)> {
+        let pane = if self.question.is_some() { ChatPane::Main } else { ChatPane::Side };
+        let draft = self.question(pane)?;
+        (!draft.collapsed && self.question_answerable(pane)).then_some((pane, draft))
+    }
+
     /// Next question, or submit on the last; a no-op while the active one is unanswered.
     pub(super) fn advance_question(&mut self, pane: ChatPane, window: &mut Window, cx: &mut Context<Self>) {
         if !self.question_answerable(pane) {
@@ -1083,24 +1081,25 @@ impl Workspace {
         );
     }
 
-    /// Sending while an approval waits declines it: with the text as its
-    /// feedback when the provider takes feedback (the text is then used up and
-    /// `true` comes back), else every live approval is declined before the
-    /// message goes out.
-    pub(super) fn approval_declines(&self, text: &str) -> (Vec<Value>, bool) {
-        // Approvals the typing guard holds stay unseen and pending.
-        let live: Vec<_> =
-            self.shown_approvals().into_iter().map(|(request, _)| request).filter(|r| r.is_live()).collect();
+    /// Sending from the pane while an approval waits declines it: with the text
+    /// as its feedback when the provider takes feedback (the text is then used
+    /// up and `true` comes back), else every live approval is declined before
+    /// the message goes out.
+    pub(super) fn approval_declines(&self, pane: ChatPane, text: &str) -> (Vec<Value>, bool) {
+        let Some((_, thread_id)) = self.pane_thread(pane) else { return (Vec::new(), false) };
+        // Approvals the open thread's typing guard holds stay unseen and pending.
+        let shown = match pane {
+            ChatPane::Main => self.shown_approvals(),
+            ChatPane::Side => self.side_chat_projection().map(|p| p.pending_approvals()).unwrap_or_default(),
+        };
+        let live: Vec<_> = shown.into_iter().map(|(request, _)| request).filter(|r| r.is_live()).collect();
+        let decline = |id: &str, response| super::respond_value(&thread_id, id, response);
         match live.first() {
             None => (Vec::new(), false),
             Some(first) if first.supports_feedback() => {
-                let decline = self.respond_command(&first.id, json!({"decision": "decline", "feedback": text}));
-                (decline.into_iter().collect(), true)
+                (vec![decline(&first.id, json!({"decision": "decline", "feedback": text}))], true)
             }
-            Some(_) => (
-                live.iter().filter_map(|r| self.respond_command(&r.id, json!({"decision": "decline"}))).collect(),
-                false,
-            ),
+            Some(_) => (live.iter().map(|r| decline(&r.id, json!({"decision": "decline"}))).collect(), false),
         }
     }
 
@@ -2614,6 +2613,57 @@ fn black(alpha: f32) -> Hsla {
     gpui_kit::hsla(0., 0., 0., alpha)
 }
 
+/// What a key pressed with only the workspace focused puts in the composer
+/// (`shouldTypeToFocusComposer`, `usePasteToFocusComposer`).
+#[derive(Debug, PartialEq, Eq)]
+enum FocusRedirect {
+    /// A printable character, typed at the composer's end.
+    Type(String),
+    /// Ctrl+V (⌘V) pastes the clipboard's text there; with Shift, as text even when long (`isPasteAsTextShortcut`).
+    Paste { as_text: bool },
+}
+
+/// Why keys stay off the composer.
+#[derive(Clone, Copy, Default)]
+struct RedirectGate {
+    /// Only the workspace's own focus: a focused text field, side chat, terminal or preview keeps its keys
+    /// (`isInSideChatPane`, the editable and interactive selectors).
+    resting: bool,
+    /// A thread is open and no palette, dialog, page or settings covers it (the floating-layer selector).
+    open: bool,
+    /// The composer host is `inert` while a queued edit saves.
+    inert: bool,
+    /// Options the open question's digits pick (`ComposerPendingUserInputPanel`), 0 without one.
+    question_options: usize,
+}
+
+fn focus_redirect(keystroke: &Keystroke, gate: RedirectGate) -> Option<FocusRedirect> {
+    if !gate.resting || !gate.open || gate.inert {
+        return None;
+    }
+    if option_digit(keystroke).is_some_and(|digit| digit <= gate.question_options) {
+        return None;
+    }
+    let m = keystroke.modifiers;
+    if keystroke.key == "v" && (m.control || m.platform) && !m.alt {
+        return Some(FocusRedirect::Paste { as_text: m.shift });
+    }
+    if m.control || m.alt || m.platform || m.function {
+        return None;
+    }
+    let typed = keystroke.key_char.as_ref().filter(|c| c.chars().count() == 1 && !c.chars().any(char::is_control));
+    typed.map(|c| FocusRedirect::Type(c.clone()))
+}
+
+/// 1-9 without a command modifier: an open question's option shortcut.
+fn option_digit(keystroke: &Keystroke) -> Option<usize> {
+    let m = keystroke.modifiers;
+    if m.control || m.platform || m.alt {
+        return None;
+    }
+    keystroke.key.parse::<usize>().ok().filter(|d| (1..=9).contains(d))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2715,6 +2765,38 @@ mod tests {
         assert_eq!((draft.noun(), draft.state().1), ("Pull request", "Draft"));
         let merged = &contexts["rc-3"];
         assert_eq!((merged.noun(), merged.state().1), ("Merge request", "Merged"));
+    }
+
+    #[test]
+    fn only_resting_printable_keys_and_pastes_reach_the_composer() {
+        let key = |text: &'static str| Keystroke::parse(text).unwrap();
+        let typed = |text: &'static str, c: &str| Keystroke { key_char: Some(c.into()), ..key(text) };
+        let open = RedirectGate { resting: true, open: true, ..RedirectGate::default() };
+        let redirect = |keystroke: &Keystroke, gate| focus_redirect(keystroke, gate);
+        assert_eq!(redirect(&typed("a", "a"), open), Some(FocusRedirect::Type("a".into())));
+        assert_eq!(redirect(&typed("shift-a", "A"), open), Some(FocusRedirect::Type("A".into())));
+        assert_eq!(redirect(&typed("1", "1"), open), Some(FocusRedirect::Type("1".into())), "no question");
+        assert_eq!(redirect(&key("ctrl-v"), open), Some(FocusRedirect::Paste { as_text: false }));
+        assert_eq!(redirect(&key("cmd-shift-v"), open), Some(FocusRedirect::Paste { as_text: true }));
+        assert_eq!(redirect(&key("ctrl-alt-v"), open), None);
+        assert_eq!(redirect(&typed("ctrl-a", "a"), open), None, "a chord");
+        assert_eq!(redirect(&typed("alt-a", "å"), open), None);
+        assert_eq!(redirect(&key("enter"), open), None, "no character");
+        assert_eq!(redirect(&key("f2"), open), None);
+        let elsewhere = RedirectGate { resting: false, ..open };
+        assert_eq!(redirect(&typed("a", "a"), elsewhere), None, "a text field or the side chat has focus");
+        let covered = RedirectGate { open: false, ..open };
+        assert_eq!(redirect(&key("ctrl-v"), covered), None, "a palette or dialog is open");
+        // A queued edit saving makes the composer inert, so neither typing nor pasting edits it.
+        let inert = RedirectGate { inert: true, ..open };
+        assert_eq!(redirect(&typed("a", "a"), inert), None);
+        assert_eq!(redirect(&key("ctrl-v"), inert), None);
+        // An open question's digits pick its options; the rest still type.
+        let asking = RedirectGate { question_options: 2, ..open };
+        assert_eq!(redirect(&typed("1", "1"), asking), None);
+        assert_eq!(redirect(&typed("2", "2"), asking), None);
+        assert_eq!(redirect(&typed("3", "3"), asking), Some(FocusRedirect::Type("3".into())), "no third option");
+        assert_eq!(redirect(&typed("a", "a"), asking), Some(FocusRedirect::Type("a".into())));
     }
 
     #[test]

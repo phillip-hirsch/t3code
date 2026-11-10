@@ -1363,11 +1363,6 @@ impl Workspace {
         self.dispatch_in_order(client, vec![command], cx);
     }
 
-    /// `runtime-request.respond` for the open thread; `response` holds `decision`, `feedback` or `answers`.
-    fn respond_command(&self, request_id: &str, response: Value) -> Option<Value> {
-        Some(respond_value(&self.thread.as_ref()?.id, request_id, response))
-    }
-
     /// Answers a runtime request in the pane's thread; `response` holds `decision`, `feedback` or `answers`.
     fn respond(&mut self, pane: side_chat::ChatPane, request_id: String, response: Value, cx: &mut Context<Self>) {
         self.dispatch_response(

@@ -685,14 +685,23 @@ impl Workspace {
         let key = (view.env.clone(), view.thread_id.clone());
         let model = self.side_chat.models.get(&key);
         let command = turn_command(&view.thread_id, &text, running, follow_up, model);
+        let (declines, text_is_feedback) = self.approval_declines(ChatPane::Side, &text);
         let Some((client, ..)) = self.pane_client(ChatPane::Side, cx) else { return };
         let origin = self.target.clone();
         self.side_chat.sending.insert(key.clone());
         self.set_pane_text(ChatPane::Side, String::new(), window, cx);
         cx.spawn_in(window, async move |this, cx| {
-            let result = client.request("orchestration.dispatchCommand", command).await;
+            // Declines land first; a failed one keeps the text and sends nothing more. Feedback
+            // answers the approval in place of a message.
+            let mut result = Ok(Value::Null);
+            for command in declines.into_iter().chain((!text_is_feedback).then_some(command)) {
+                result = client.request("orchestration.dispatchCommand", command).await;
+                if result.is_err() {
+                    break;
+                }
+            }
             let _ = this.update_in(cx, |this, window, cx| {
-                if result.is_ok() {
+                if result.is_ok() && !text_is_feedback {
                     this.side_chat.models.remove(&key);
                 }
                 this.side_chat.sending.remove(&key);
