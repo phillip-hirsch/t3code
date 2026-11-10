@@ -35,6 +35,7 @@ use serde_json::{Value, json};
 use self::layout::{DrawerLayout, Place, Split};
 pub(in crate::app) use self::session::{Launch, SessionEvent, TerminalSession};
 use super::draft_sessions::{DraftId, DraftSessions};
+use super::right_panel::Surface;
 use super::titlebar::icon;
 use super::{Target, Workspace};
 use crate::model::ScopedId;
@@ -1541,7 +1542,8 @@ impl Workspace {
         )
     }
 
-    /// `revealThreadTerminal`: open the thread with that terminal shown.
+    /// `revealThreadTerminal`: open the thread with that terminal shown, in the panel tab holding
+    /// it, else in the drawer.
     pub(super) fn reveal_thread_terminal(
         &mut self,
         env: SharedString,
@@ -1552,7 +1554,14 @@ impl Workspace {
     ) {
         let key = DrawerKey::new(&env, &thread_id);
         self.select_thread_in(env, thread_id, window, cx);
-        self.terminals.drawer(&key).ensure(&terminal_id);
+        let tab = self.terminals.panel_tab(&key, &terminal_id).map(|surface| Surface::Terminal(surface.clone()));
+        match tab.filter(|tab| self.panel_has_surface(tab)) {
+            Some(tab) => {
+                self.terminals.activate_in_panel(&key, &terminal_id);
+                self.open_surface(tab, window, cx);
+            }
+            None => self.terminals.drawer(&key).ensure(&terminal_id),
+        }
         self.terminals.focus_later(&key, &terminal_id);
         cx.notify();
     }
@@ -1831,6 +1840,8 @@ mod tests {
         terminals.panel.insert("a-split".into(), panel_group("a", "t", &["term-2", "term-1"]));
         terminals.panel.insert("b-tab".into(), panel_group("b", "t", &["term-1", "term-2"]));
 
+        assert_eq!(terminals.panel_tab(&b, "term-1").map(String::as_str), Some("b-tab"), "reveal finds B's own tab");
+        assert_eq!(terminals.panel_tab(&b, "term-3"), None);
         assert_eq!(terminals.remove_from_panel(&b, "term-1", true), Vec::<String>::new());
         assert_eq!(terminals.panel["b-tab"].terminal_ids, ["term-2"]);
         assert_eq!(terminals.panel["a-tab"].terminal_ids, ["term-1"], "A's tab keeps its terminal");

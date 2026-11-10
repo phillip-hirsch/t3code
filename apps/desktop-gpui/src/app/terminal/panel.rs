@@ -29,6 +29,12 @@ impl super::Terminals {
         self.panel.values().filter(|g| g.key == *key).flat_map(|g| g.terminal_ids.clone()).collect()
     }
 
+    /// `key`'s tab holding `terminal_id`.
+    pub(super) fn panel_tab(&self, key: &DrawerKey, terminal_id: &str) -> Option<&String> {
+        let mut tabs = self.panel.iter().filter(|(_, g)| g.key == *key);
+        tabs.find(|(_, g)| g.terminal_ids.iter().any(|id| id == terminal_id)).map(|(surface, _)| surface)
+    }
+
     /// Makes `terminal_id` active in `key`'s tab holding it; whether a tab changed.
     pub(super) fn activate_in_panel(&mut self, key: &DrawerKey, terminal_id: &str) -> bool {
         let mut changed = false;
