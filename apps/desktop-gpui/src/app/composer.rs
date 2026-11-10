@@ -800,10 +800,7 @@ impl Workspace {
         // The open thread's card first, else the side chat's.
         let pane = if self.question.is_some() { ChatPane::Main } else { ChatPane::Side };
         let Some(draft) = self.question(pane) else { return false };
-        if draft.collapsed
-            || !self.pane_can_operate(pane)
-            || self.pending_question_request(pane).is_none_or(|(r, _)| r.capability() == Some("not_resumable"))
-        {
+        if draft.collapsed || !self.question_answerable(pane) {
             return false;
         }
         let Some(option) = draft.questions[draft.index].options.get(digit - 1) else { return false };
@@ -966,8 +963,19 @@ impl Workspace {
         self.set_pane_text(pane, text, window, cx);
     }
 
+    /// The pane's question takes answers now: its request still waits and can resume, no answer
+    /// is on its way, and the connection may operate the thread (`responseDisabled`).
+    pub(super) fn question_answerable(&self, pane: ChatPane) -> bool {
+        !self.question_responding(pane)
+            && self.pane_can_operate(pane)
+            && self.pending_question_request(pane).is_some_and(|(r, _)| r.capability() != Some("not_resumable"))
+    }
+
     /// Next question, or submit on the last; a no-op while the active one is unanswered.
     pub(super) fn advance_question(&mut self, pane: ChatPane, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.question_answerable(pane) {
+            return;
+        }
         let Some(draft) = self.question(pane) else { return };
         let question = draft.active();
         let attached = self.question_attached(pane, &question.id);
@@ -982,9 +990,6 @@ impl Workspace {
         let attached = |id: &str| self.question_attached(pane, id);
         let Some(answers) = requests::answers(&draft.questions, &draft.drafts, attached) else { return };
         let request_id = draft.request_id.clone();
-        if self.pane_responding(pane, &request_id) || !self.pane_can_operate(pane) {
-            return;
-        }
         let mut response = json!({"answers": answers});
         if pane == ChatPane::Main {
             match self.question_attachments_payload() {
@@ -1010,7 +1015,7 @@ impl Workspace {
     }
 
     fn pick_option(&mut self, pane: ChatPane, value: String, window: &mut Window, cx: &mut Context<Self>) {
-        if self.question_responding(pane) || !self.pane_can_operate(pane) {
+        if !self.question_answerable(pane) {
             return;
         }
         let shown = self.pane_thread(pane);
