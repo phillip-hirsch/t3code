@@ -432,7 +432,6 @@ fn media_playable(destination: &str, cwd: Option<&str>, thread_id: &str) -> Opti
 }
 
 impl Workspace {
-
     #[expect(clippy::too_many_arguments, reason = "the plugin's render context, passed through")]
     fn render_chat_media(
         &mut self,
@@ -940,7 +939,8 @@ mod tests {
     fn media_image_references_play_their_definitions() {
         use gpui_base::text::editor_host::{BlockNode, parse_markdown};
         use gpui_kit::component::text::MarkdownExtensions;
-        let plugin = MarkdownMedia { workspace: WeakEntity::new_invalid(), key: "m".into(), background: Hsla::default() };
+        let plugin =
+            MarkdownMedia { workspace: WeakEntity::new_invalid(), key: "m".into(), background: Hsla::default() };
         let extensions = std::sync::Arc::new(MarkdownExtensions::default().plugin(plugin));
         let source = "![clip][V] ![shot][p]\n\n[v]: https://example.com/clip.mp4\n[p]: shot.png";
         let blocks = parse_markdown(source, extensions).unwrap();
