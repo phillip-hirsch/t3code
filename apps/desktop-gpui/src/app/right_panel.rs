@@ -1813,14 +1813,14 @@ impl Workspace {
         super::titlebar::drag_region(tab_bar)
             .when(add_menu_open, |el| el.on_key_down(cx.listener(Self::add_surface_for_key)))
             .child(
-                h_flex()
-                    .id("right-panel-tabs")
-                    .min_w_0()
-                    .h_full()
-                    .gap_1()
-                    .overflow_x_scroll()
-                    .track_scroll(&self.right_panel.tabs_scroll)
-                    .children(tabs),
+                super::history_swipe::horizontal_scroller(
+                    h_flex().id("right-panel-tabs"),
+                    &self.right_panel.tabs_scroll,
+                )
+                .min_w_0()
+                .h_full()
+                .gap_1()
+                .children(tabs),
             )
             .child(
                 Button::new("right-panel-add")

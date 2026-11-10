@@ -9,7 +9,7 @@ use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, Context, ElementId, FontWeight, InteractiveElement as _, IntoElement, ListAlignment, ListState,
-    ParentElement as _, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, div, list, px,
+    ParentElement as _, ScrollHandle, SharedString, Styled as _, div, list, px,
 };
 
 use crate::app::Workspace;
@@ -263,12 +263,10 @@ impl Workspace {
             }),
         )
         .flex_1();
-        div()
-            .id(ElementId::Name(format!("table-scroll:{id}").into()))
+        let scroller = div().id(ElementId::Name(format!("table-scroll:{id}").into()));
+        crate::app::history_swipe::horizontal_scroller(scroller, &table.scroll)
             .flex_1()
             .min_h_0()
-            .overflow_x_scroll()
-            .track_scroll(&table.scroll)
             .text_xs()
             .child(v_flex().w(px(table_width)).h_full().child(header).child(list))
             .into_any_element()
