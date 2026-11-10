@@ -1087,7 +1087,7 @@ impl Workspace {
     /// Opens a thread on `env`; ids repeat across environments, so callers name the one they show.
     fn select_thread_in(&mut self, env: SharedString, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
         self.mount_thread_family(&env, &thread_id, cx);
-        let target = Target::Thread { env, id: thread_id.clone() };
+        let target = Target::Thread { env: env.clone(), id: thread_id.clone() };
         if self.target.as_ref() == Some(&target) {
             // `navigateToThread` closes the sheet even when the thread is already open.
             self.page = None;
@@ -1102,7 +1102,7 @@ impl Workspace {
         if let (Some(old), Some(leaving)) = (self.thread.take(), leaving) {
             self.retire_thread(leaving.environment(), old.id, old.state, cx);
         }
-        let state = self.take_warm_thread(&thread_id).unwrap_or_default();
+        let state = self.take_warm_thread(&ScopedId::new(env, thread_id.as_str())).unwrap_or_default();
         let resumed = state.projection.is_some();
         self.thread = Some(OpenThread {
             id: thread_id.clone(),
