@@ -606,14 +606,26 @@ impl Workspace {
         }
     }
 
-    /// Up/Down/Enter/Escape while the picker is open, Right into the docked effort column;
-    /// Ctrl+1-9 are `modelPicker.jump.N`.
+    /// Up/Down/Enter/Escape while the picker's search has focus, Right into the docked effort
+    /// column; Ctrl+1-9 are `modelPicker.jump.N`. Escape closes from anywhere in the popover.
     pub(super) fn picker_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if keystroke.modifiers.modified() {
             return false;
         }
-        if let Some(index) = self.picker.effort_focus {
-            return self.effort_key(index, keystroke, window, cx);
+        let effort_focused = self.picker.effort_handle.as_ref().is_some_and(|handle| handle.is_focused(window));
+        let search_focused = self
+            .picker
+            .search
+            .as_ref()
+            .is_some_and(|search| gpui_kit::Focusable::focus_handle(search.read(cx), cx).is_focused(window));
+        match picker_keys(self.picker.effort_focus, effort_focused, search_focused) {
+            PickerKeys::Effort(index) => return self.effort_key(index, keystroke, window, cx),
+            PickerKeys::Search => {}
+            PickerKeys::Elsewhere if keystroke.key == "escape" => {
+                self.close_model_picker(window, cx);
+                return true;
+            }
+            PickerKeys::Elsewhere => return false,
         }
         let current = self.picker_current();
         let (rows, _) = self.picker_rows(current.as_ref());
@@ -1668,6 +1680,23 @@ fn effort_stops(controls: &EffortControls, selection: &ModelSelection) -> Vec<Ef
     levels.chain(toggles).collect()
 }
 
+/// What takes a key in the open picker: the effort column or the search, each only while it
+/// has focus, so a focused footer segment keeps its own Enter and Space.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PickerKeys {
+    Effort(usize),
+    Search,
+    Elsewhere,
+}
+
+fn picker_keys(effort_focus: Option<usize>, effort_focused: bool, search_focused: bool) -> PickerKeys {
+    match effort_focus {
+        Some(index) if effort_focused => PickerKeys::Effort(index),
+        _ if search_focused => PickerKeys::Search,
+        _ => PickerKeys::Elsewhere,
+    }
+}
+
 /// `focusEffort`: the selected level, else the first level; with `any`, else the first stop.
 fn effort_entry(stops: &[EffortStop], any: bool) -> Option<usize> {
     let level = |selected_only: bool| {
@@ -1858,6 +1887,14 @@ mod tests {
         assert_eq!(effort_entry(&switches, false), None, "a pick lands only on levels");
         assert_eq!(effort_entry(&switches, true), Some(0), "ArrowRight takes any stop");
         assert_eq!(effort_entry(&[], true), None);
+        assert_eq!(picker_keys(Some(1), true, false), PickerKeys::Effort(1));
+        assert_eq!(
+            picker_keys(Some(1), false, false),
+            PickerKeys::Elsewhere,
+            "Tab left the column for a footer segment"
+        );
+        assert_eq!(picker_keys(None, false, false), PickerKeys::Elsewhere, "Tab left the search for a footer segment");
+        assert_eq!(picker_keys(Some(1), false, true), PickerKeys::Search);
     }
 
     #[test]
