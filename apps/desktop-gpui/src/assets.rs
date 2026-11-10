@@ -30,6 +30,8 @@ const APP_ICONS: &[(&str, &[u8])] = &[
     ("icons/app/empty-media-back-border.svg", include_bytes!("../assets/icons/empty-media-back-border.svg")),
     ("icons/app/browser.svg", include_bytes!("../assets/icons/browser.svg")),
     ("icons/app/screen-rotation.svg", include_bytes!("../assets/icons/screen-rotation.svg")),
+    ("icons/app/viewport-resize-southeast.svg", include_bytes!("../assets/icons/viewport-resize-southeast.svg")),
+    ("icons/app/viewport-resize-southwest.svg", include_bytes!("../assets/icons/viewport-resize-southwest.svg")),
     ("icons/app/apple.svg", include_bytes!("../assets/icons/apple.svg")),
     ("icons/app/android.svg", include_bytes!("../assets/icons/android.svg")),
     ("icons/app/linux.svg", include_bytes!("../assets/icons/linux.svg")),

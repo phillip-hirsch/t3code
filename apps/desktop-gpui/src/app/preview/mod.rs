@@ -42,6 +42,7 @@ mod empty;
 mod mini_layout;
 mod mini_player;
 mod profiles;
+mod resize_handles;
 mod separate;
 mod server;
 mod viewport;
@@ -168,6 +169,7 @@ pub(super) struct PreviewState {
     /// Tabs whose page is in its separate window.
     separate: HashMap<TabRef, separate::Separate>,
     toolbar: device_toolbar::DeviceToolbar,
+    resize: resize_handles::ViewportResize,
     /// The page area the panel last drew a tab in: "Show device toolbar" sizes to it, and a
     /// fill tab floated from it keeps its layout.
     panel_area: Option<(TabRef, (f32, f32))>,
@@ -228,6 +230,7 @@ impl PreviewState {
             mini: mini_player::MiniPlayerUi::new(cx),
             separate: HashMap::new(),
             toolbar: device_toolbar::DeviceToolbar::new(window, cx),
+            resize: resize_handles::ViewportResize::new(cx),
             panel_area: None,
             reveals: Vec::new(),
             panel_view: None,
@@ -1317,7 +1320,8 @@ impl Workspace {
             return v_flex().flex_1().min_h_0().child(toolbar).child(page).into_any_element();
         }
         self.preview.panel_area = Some((tab.clone(), available));
-        let setting = session.as_ref().map(|s| s.viewport.clone()).unwrap_or_default();
+        let source = session.as_ref().map(|s| s.viewport.clone()).unwrap_or_default();
+        let setting = self.resized_viewport(tab, &source);
         let view = self.preview.tabs.get(tab).map(|hosted| hosted.view.clone());
         // `resolveBrowserDeviceViewportLayout`: under the toolbar, inside the resize rails' margin.
         let toolbar = view.is_some() && setting.size().is_some();
@@ -1342,6 +1346,9 @@ impl Workspace {
         };
         // A menu open over the page hides it, since the native view would cover the menu.
         let hidden = self.preview.menu_open || self.preview.toolbar.menu_open;
+        let handles = fixed
+            .filter(|_| toolbar && !separated)
+            .map(|(size, scale)| self.render_resize_handles(tab, &source, size, scale, zoom, area, window, cx));
         let page = match fixed {
             _ if separated => div().flex_1().min_h_0().child(self.render_separated(tab, false, &tokens, cx)),
             Some(((width, height), _)) => div()
@@ -1353,7 +1360,14 @@ impl Workspace {
                 .px(px(viewport::RAIL))
                 .pb(px(viewport::RAIL))
                 .bg(tokens.muted.opacity(0.35))
-                .when(!hidden, |el| el.child(div().w(px(width)).h(px(height)).child(view))),
+                .child(
+                    div()
+                        .relative()
+                        .w(px(width))
+                        .h(px(height))
+                        .when(!hidden, |el| el.child(view))
+                        .children(handles.into_iter().flatten()),
+                ),
             None => div().flex_1().min_h_0().when(!hidden, |el| el.child(view)),
         };
         if !toolbar {
