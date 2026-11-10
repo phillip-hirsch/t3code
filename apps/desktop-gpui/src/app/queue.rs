@@ -81,9 +81,23 @@ impl QueueUi {
         self.edit.as_mut().filter(|edit| edit.id == id)
     }
 
-    /// The draft an open edit set aside, which a failed send rejoins.
+    /// The draft an open edit set aside; see `draft_holder`.
     pub(super) fn edit_draft_mut(&mut self) -> Option<&mut (String, Vec<Attachment>, ContextRecords)> {
         self.edit.as_mut().map(|edit| &mut edit.saved)
+    }
+
+    pub(super) fn edit_draft(&self) -> Option<&(String, Vec<Attachment>, ContextRecords)> {
+        self.edit.as_ref().map(|edit| &edit.saved)
+    }
+
+    /// The open edit's own id, which changes with each begin.
+    pub(super) fn edit_id(&self) -> Option<&str> {
+        self.edit.as_ref().map(|edit| edit.id.as_str())
+    }
+
+    /// Nothing in flight and no edit open, so nothing is lost when it goes.
+    pub(super) fn idle(&self) -> bool {
+        self.busy.is_none() && self.edit.is_none()
     }
 }
 
@@ -91,14 +105,22 @@ impl Workspace {
     fn queue_ui(&self, pane: ChatPane) -> Option<&QueueUi> {
         match pane {
             ChatPane::Main => Some(&self.queue),
-            ChatPane::Side => self.side_chat.view.as_ref().map(|view| &view.queue),
+            ChatPane::Side => self.side_chat.queue(),
         }
     }
 
     fn queue_ui_mut(&mut self, pane: ChatPane) -> Option<&mut QueueUi> {
         match pane {
             ChatPane::Main => Some(&mut self.queue),
-            ChatPane::Side => self.side_chat.view.as_mut().map(|view| &mut view.queue),
+            ChatPane::Side => self.side_chat.queue_mut(),
+        }
+    }
+
+    /// The queue of the pane's chat `(env, thread_id)`, whether or not the pane still shows it.
+    fn queue_ui_of(&mut self, pane: ChatPane, env: &SharedString, thread_id: &str) -> Option<&mut QueueUi> {
+        match pane {
+            ChatPane::Main => Some(&mut self.queue),
+            ChatPane::Side => self.side_chat.queue_of(env, thread_id),
         }
     }
 
@@ -127,11 +149,6 @@ impl Workspace {
 
     pub(super) fn saving_queue_edit(&self) -> bool {
         self.queue.edit.as_ref().is_some_and(|edit| edit.saving)
-    }
-
-    /// The thread's own draft while a queued message holds the composer, left in place.
-    pub(super) fn queue_edit_draft(&self) -> Option<(&str, &[Attachment], &ContextRecords)> {
-        self.queue.edit.as_ref().map(|edit| (edit.saved.0.as_str(), edit.saved.1.as_slice(), &edit.saved.2))
     }
 
     /// The thread's draft, while a queued message holds the composer; see `stash_composer`.
@@ -201,8 +218,10 @@ impl Workspace {
         cx.spawn(async move |this, cx| {
             let result = client.request("orchestration.dispatchCommand", command).await;
             let _ = this.update(cx, |this, cx| {
-                // Run ids are unique, so this frees only the pane that sent it.
-                if let Some(ui) = this.queue_ui_mut(pane).filter(|ui| ui.busy.as_ref() == Some(&run_id)) {
+                // Run ids are unique, so this frees only the chat that sent it.
+                if let Some(ui) =
+                    this.queue_ui_of(pane, &env, &thread_id).filter(|ui| ui.busy.as_ref() == Some(&run_id))
+                {
                     ui.busy = None;
                 }
                 if let Err(error) = result
@@ -280,12 +299,8 @@ impl Workspace {
     }
 
     fn cancel_queue_edit(&mut self, pane: ChatPane, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some((text, attachments, records)) = self.queue_ui_mut(pane).and_then(QueueUi::take_edit_draft) {
-            if pane == ChatPane::Main {
-                self.attachments = attachments;
-                self.context.records = records;
-            }
-            self.set_pane_text(pane, text, window, cx);
+        if let Some(saved) = self.queue_ui_mut(pane).and_then(QueueUi::take_edit_draft) {
+            self.put_editor_content(pane, saved, window, cx);
             self.focus_pane_composer(pane, window, cx);
         }
         cx.notify();
@@ -354,7 +369,7 @@ impl Workspace {
             let result = client.request("orchestration.dispatchCommand", command).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 // The edit was cancelled, begun again, or its pane moved on while this save ran.
-                let current = this.queue_ui_mut(pane).and_then(|ui| ui.begun_edit(&id));
+                let current = this.queue_ui_of(pane, &env, &thread_id).and_then(|ui| ui.begun_edit(&id));
                 match (result, current) {
                     (Ok(_), Some(_)) => this.cancel_queue_edit(pane, window, cx),
                     (Err(error), current) => {
@@ -449,23 +464,15 @@ impl Workspace {
         if ui.state.queued.iter().any(|q| q.run_id == edit.run_id) || self.pane_projection(pane).is_none() {
             return;
         }
-        let text = self.pane_text(pane, cx);
-        let attached = pane == ChatPane::Main && self.has_attachments();
+        // Under a question card the edit's text waits parked; the editor shows the answer.
+        let (text, attached) = self.editor_content(pane, cx);
         let thread_draft_empty = edit.saved.0.trim().is_empty() && edit.saved.1.is_empty();
         let exit = edit_exit(&text, &edit.original, edit.removed_attachment, attached, thread_draft_empty);
         let (changed, keep) = (exit != EditExit::Clean, exit == EditExit::Kept);
         let title = self.pane_projection(pane).map(|p| p.thread.title.clone());
-        let Some((saved_text, saved_attachments, saved_records)) =
-            self.queue_ui_mut(pane).and_then(QueueUi::take_edit_draft)
-        else {
-            return;
-        };
+        let Some(saved) = self.queue_ui_mut(pane).and_then(QueueUi::take_edit_draft) else { return };
         if !keep {
-            if pane == ChatPane::Main {
-                self.attachments = saved_attachments;
-                self.context.records = saved_records;
-            }
-            self.set_pane_text(pane, saved_text, window, cx);
+            self.put_editor_content(pane, saved, window, cx);
         }
         if changed {
             let place = title.map(|title| format!(" in “{title}”")).unwrap_or_default();

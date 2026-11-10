@@ -24,9 +24,12 @@ use serde_json::{Value, json};
 
 use super::attachments::QuestionDraft;
 use super::composer::merge_prompt;
+use super::draft_holder::PromptHolder;
+use super::queue::QueueUi;
 use super::right_panel::Surface;
 use super::titlebar::icon;
 use super::{Target, Workspace, new_id};
+use crate::composer_context::ContextRecords;
 use crate::model::{ModelSelection, Run, ScopedId, ThreadProjection, ThreadShell, ThreadState};
 use crate::rpc::RpcClient;
 use crate::theme::{self, Tokens};
@@ -67,7 +70,6 @@ pub(super) struct SideChatView {
     composer: Entity<TextareaState>,
     /// Tracked so typing only re-renders when Send and Stop trade places.
     empty: bool,
-    pub(super) queue: super::queue::QueueUi,
     pub(super) now: super::thread_now::NowFooter,
     /// The question card's drafts for the side chat's first pending question; the editor holds
     /// its custom answer meanwhile.
@@ -98,6 +100,9 @@ pub(super) struct SideChats {
     deleting: HashSet<Key>,
     /// What side chats not on screen keep of their composer. Ids repeat across environments.
     drafts: HashMap<Key, SideDraft>,
+    /// Each side chat's queue controls: what is in flight and the edit open, which outlive a
+    /// view rebuilt on reconnect.
+    queues: HashMap<Key, QueueUi>,
     /// The parent composer's model pick for a side chat that started without a question; its
     /// first message runs on it (`setModelSelection` on the side chat's draft).
     models: HashMap<Key, ModelSelection>,
@@ -114,11 +119,21 @@ enum SideDraft {
 }
 
 impl SideDraft {
-    /// What a released view keeps: its open question, else its composer's text.
-    fn kept(question: Option<QuestionDraft>, text: String) -> Option<Self> {
+    /// What a released view keeps: its open question, else its composer's text. A queued
+    /// message's edit that `ended` gives back the side chat's own text it set aside, in place of
+    /// the edit's text in the composer or parked under the question.
+    fn kept(question: Option<QuestionDraft>, text: String, ended: Option<String>) -> Option<Self> {
         match question {
-            Some(question) => Some(Self::Question(Box::new(question))),
-            None => (!text.is_empty()).then_some(Self::Prompt(text)),
+            Some(mut question) => {
+                if let Some(own) = ended {
+                    question.set_parked((own, Vec::new(), ContextRecords::default()));
+                }
+                Some(Self::Question(Box::new(question)))
+            }
+            None => {
+                let text = ended.unwrap_or(text);
+                (!text.is_empty()).then_some(Self::Prompt(text))
+            }
         }
     }
 
@@ -159,6 +174,7 @@ impl SideChats {
         let key = (env.clone(), thread_id.to_owned());
         self.drafts.remove(&key);
         self.models.remove(&key);
+        self.queues.remove(&key);
         if self.view.as_ref().is_some_and(|view| view.is(env, thread_id)) {
             self.view = None;
         }
@@ -173,21 +189,48 @@ impl SideChats {
     }
 
     /// Releases the view on screen, keeping its unsent text for when it shows again, and says
-    /// which chat it showed. A queued message's edit ends here; the side chat keeps its own draft.
-    fn release_view(&mut self, cx: &App) -> Option<Key> {
+    /// which chat it showed. A queued message's edit ends unless `next` shows the same chat
+    /// again (a reconnect); the side chat keeps its own draft.
+    fn release_view(&mut self, next: Option<&Key>, cx: &App) -> Option<Key> {
         let mut view = self.view.take()?;
-        let question = view.question.take();
-        let text = match (&question, view.queue.take_edit_draft()) {
-            (Some(_), _) => String::new(),
-            (None, Some((text, ..))) => text,
-            (None, None) => view.composer.read(cx).value().to_string(),
-        };
         let key = (view.env, view.thread_id);
-        match SideDraft::kept(question, text) {
+        let question = view.question.take();
+        let text = match &question {
+            Some(_) => String::new(),
+            None => view.composer.read(cx).value().to_string(),
+        };
+        let mut ended = None;
+        if next != Some(&key)
+            && let Some(queue) = self.queues.get_mut(&key)
+        {
+            ended = queue.take_edit_draft().map(|(own, ..)| own);
+            if queue.idle() {
+                self.queues.remove(&key);
+            }
+        }
+        match SideDraft::kept(question, text, ended) {
             Some(draft) => self.drafts.insert(key.clone(), draft),
             None => self.drafts.remove(&key),
         };
         Some(key)
+    }
+
+    fn view_key(&self) -> Option<Key> {
+        self.view.as_ref().map(|view| (view.env.clone(), view.thread_id.clone()))
+    }
+
+    /// The queue of the side chat on screen.
+    pub(super) fn queue(&self) -> Option<&QueueUi> {
+        self.queues.get(&self.view_key()?)
+    }
+
+    pub(super) fn queue_mut(&mut self) -> Option<&mut QueueUi> {
+        let key = self.view_key()?;
+        self.queues.get_mut(&key)
+    }
+
+    pub(super) fn queue_of(&mut self, env: &SharedString, thread_id: &str) -> Option<&mut QueueUi> {
+        self.queues.get_mut(&(env.clone(), thread_id.to_owned()))
     }
 }
 
@@ -480,8 +523,9 @@ impl Workspace {
             return;
         }
         self.stash_side_citation_comment(window, cx);
+        let next = shown.zip(client.as_ref()).zip(env.clone()).map(|((id, _), env)| (env, id.to_owned()));
         // A chat that left takes its cards' typed answers; one resubscribing keeps them.
-        let released = self.side_chat.release_view(cx);
+        let released = self.side_chat.release_view(next.as_ref(), cx);
         self.markdown_images.release_side();
         self.diagrams.forget_sources(ChatPane::Side);
         self.sync_side_markdown();
@@ -491,6 +535,7 @@ impl Workspace {
         let (Some(thread_id), Some(client), Some(env)) = (shown, client, env) else { return };
         let kept = self.side_chat.drafts.remove(&(env.clone(), thread_id.to_owned()));
         let (draft, question) = kept.map(SideDraft::restore).unwrap_or_default();
+        self.side_chat.queues.entry((env.clone(), thread_id.to_owned())).or_default();
         let empty = draft.trim().is_empty();
         let composer = cx.new(|cx| {
             let mut state =
@@ -547,7 +592,6 @@ impl Workspace {
             scroller,
             composer,
             empty,
-            queue: Default::default(),
             now: Default::default(),
             question,
             question_advance: None,
@@ -660,11 +704,13 @@ impl Workspace {
             self.side_chat.give_back(key, text);
             return;
         };
-        if let Some(question) = &mut view.question {
-            question.prompt = merge_prompt(text, &question.prompt);
-            return;
-        }
-        if let Some((prompt, ..)) = view.queue.edit_draft_mut() {
+        let saved = self.side_chat.queues.get_mut(&key).and_then(QueueUi::edit_draft_mut);
+        let prompt = match PromptHolder::of(true, saved.is_some(), view.question.is_some()) {
+            PromptHolder::QueueEdit => saved.map(|(prompt, ..)| prompt),
+            PromptHolder::Question => view.question.as_mut().map(|question| &mut question.prompt),
+            PromptHolder::Editor | PromptHolder::OffScreen => None,
+        };
+        if let Some(prompt) = prompt {
             *prompt = merge_prompt(text, prompt);
             return;
         }
@@ -1467,12 +1513,25 @@ mod tests {
     }
 
     #[test]
+    fn a_side_chat_left_mid_edit_keeps_its_own_text_not_the_edits() {
+        // A question asked during the edit parked the edit's text.
+        let mut card = answered_card();
+        card.prompt = "edit".into();
+        let (text, card) = SideDraft::kept(Some(card), String::new(), Some("own".into())).expect("kept").restore();
+        assert_eq!((text.as_str(), card.expect("the card comes back").prompt.as_str()), ("typed", "own"));
+        let kept = SideDraft::kept(None, "edit".into(), Some("own".into())).map(|draft| draft.restore().0);
+        assert_eq!(kept.as_deref(), Some("own"));
+        let rebuilt = SideDraft::kept(None, "edit".into(), None).map(|draft| draft.restore().0);
+        assert_eq!(rebuilt.as_deref(), Some("edit"), "a reconnect keeps the edit, and its text in the composer");
+    }
+
+    #[test]
     fn a_released_side_chat_keeps_its_question_answers_and_progress() {
-        let (text, card) = SideDraft::kept(Some(answered_card()), String::new()).expect("kept").restore();
+        let (text, card) = SideDraft::kept(Some(answered_card()), String::new(), None).expect("kept").restore();
         assert_eq!(text, "typed", "the editor shows the question on screen's typed answer");
         let card = card.expect("the card comes back");
         assert_eq!((card.index, card.prompt.as_str()), (1, "parked prompt"));
         assert_eq!(card.drafts["a"].selected, ["Red"]);
-        assert_eq!(SideDraft::kept(None, String::new()).map(|draft| draft.restore().0), None);
+        assert_eq!(SideDraft::kept(None, String::new(), None).map(|draft| draft.restore().0), None);
     }
 }

@@ -432,12 +432,16 @@ impl Workspace {
         let attachments = std::mem::take(&mut self.attachments);
         let records = self.take_context_records();
         let commented = self.stash_citation_comment(cx);
+        // A queued message's edit ends here, taking its text; the thread keeps its own draft.
         let draft = match (self.question.take(), self.take_queue_edit_draft()) {
-            (Some(mut question), _) => {
+            (Some(mut question), own) => {
                 question.park(attachments);
+                // The card parked the edit's text.
+                if let Some(own) = own {
+                    question.set_parked(own);
+                }
                 ComposerDraft::Question(question)
             }
-            // A queued message's edit ends here; the thread keeps its own draft.
             (None, Some((prompt, attachments, records))) => ComposerDraft::Prompt(prompt, attachments, records),
             (None, None) => ComposerDraft::Prompt(
                 commented.unwrap_or_else(|| self.composer.read(cx).value().to_string()),
@@ -859,7 +863,7 @@ impl Workspace {
         }
     }
 
-    fn question_mut(&mut self, pane: ChatPane) -> Option<&mut QuestionDraft> {
+    pub(super) fn question_mut(&mut self, pane: ChatPane) -> Option<&mut QuestionDraft> {
         self.question_slot(pane)?.as_mut()
     }
 

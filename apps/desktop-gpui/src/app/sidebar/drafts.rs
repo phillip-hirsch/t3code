@@ -142,14 +142,10 @@ impl Workspace {
         let Discarded { target, prompt, attachments, records } = discarded;
         let on_screen = self.target.as_ref() == Some(&target);
         let held = on_screen && !self.composer_holds_prompt(&target);
-        let set_aside = match &self.question {
-            Some(question) => Some((question.prompt.as_str(), question.prompt_attachments.as_slice())),
-            None => self.queue_edit_draft().map(|(prompt, attachments, _)| (prompt, attachments)),
-        };
-        let fresh = match set_aside.filter(|_| held) {
-            Some((prompt, attachments)) => !prompt.trim().is_empty() || !attachments.is_empty(),
+        let fresh = match self.set_aside_prompt_ref(&target) {
+            Some((prompt, attachments, _)) => !prompt.trim().is_empty() || !attachments.is_empty(),
             None if on_screen => !self.composer.read(cx).value().trim().is_empty() || !self.attachments.is_empty(),
-            None => self.composer_drafts.get(&target).is_some_and(ComposerDraft::has_content),
+            None => false,
         };
         if fresh {
             self.error = Some("Failed to restore draft: The draft has new content.".into());

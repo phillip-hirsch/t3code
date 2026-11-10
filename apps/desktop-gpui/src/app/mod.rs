@@ -48,6 +48,7 @@ mod context_strip;
 mod deleted_thread;
 mod desktop;
 mod details;
+mod draft_holder;
 mod draft_picker;
 mod draft_sessions;
 mod draft_store;

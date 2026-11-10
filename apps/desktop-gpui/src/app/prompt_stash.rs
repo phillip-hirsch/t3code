@@ -429,7 +429,7 @@ impl Workspace {
             Err(error) => return stash_failed(&error, window, cx),
         };
         self.prompt_stash.busy = true;
-        let origin = self.target.clone();
+        let origin = self.editor_draft();
         let local_ids: Vec<String> = self.attachments.iter().map(|a| a.local_id().to_owned()).collect();
         cx.spawn_in(window, async move |this, cx| {
             let (pending, written) = cx
@@ -444,7 +444,7 @@ impl Workspace {
                 let prompt = pending.prompt().to_owned();
                 match this.prompt_stash.store.commit(pending, written) {
                     Ok(evicted) => {
-                        if this.target == origin {
+                        if this.editor_draft() == origin {
                             this.clear_stashed_prompt(&prompt, &local_ids, window, cx);
                         }
                         if evicted.is_some() {
@@ -514,13 +514,14 @@ impl Workspace {
         }
         self.prompt_stash.busy = true;
         cx.notify();
-        let (id, origin) = (id.to_owned(), self.target.clone());
+        // The composer's draft, down to a queued message's edit: the restore lands only there.
+        let (id, origin) = (id.to_owned(), self.editor_draft());
         cx.spawn_in(window, async move |this, cx| {
             let bytes = cx.background_executor().spawn(async move { read_blobs(paths) }).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.prompt_stash.busy = false;
                 // Moved on meanwhile: the entry stays in the stash.
-                if this.target == origin {
+                if this.editor_draft() == origin {
                     this.finish_restore(&id, bytes, window, cx);
                 }
                 cx.notify();
