@@ -752,7 +752,7 @@ impl Workspace {
                         }
                         _ => {}
                     },
-                    StreamEvent::End(Err(error)) => outcome = Err(error.to_string()),
+                    StreamEvent::End(Err(error)) => outcome = Err(error.message()),
                     StreamEvent::End(Ok(())) => break,
                 }
             }

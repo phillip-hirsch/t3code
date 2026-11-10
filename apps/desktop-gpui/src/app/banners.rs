@@ -511,6 +511,7 @@ impl Workspace {
         let instance = provider.instance_id.clone();
         let key = provider_banner_key(provider);
         let refreshing = self.banners.refreshing_provider;
+        let can_refresh = self.can_refresh_provider_status();
         let tooltip: SharedString = message.clone().into();
         let body = v_flex()
             .gap(px(8.))
@@ -551,7 +552,7 @@ impl Workspace {
                             .xsmall()
                             .icon(Icon::new(IconName::RefreshCw))
                             .label(if refreshing { "Refreshing..." } else { "Refresh" })
-                            .disabled(refreshing)
+                            .disabled(refreshing || !can_refresh)
                             .tooltip(format!("Refresh {name} provider status"))
                             .on_click(cx.listener(move |this, _, _, cx| this.refresh_provider_status(&instance, cx))),
                     ),
@@ -569,11 +570,16 @@ impl Workspace {
         alert(variant, icon, Some(title.into()), body.into_any_element(), dismiss.into_any_element(), px(f32::MAX), t)
     }
 
+    /// `refreshProviders.permissionAtom` on the banner's environment.
+    fn can_refresh_provider_status(&self) -> bool {
+        self.active_environment().is_some_and(|env| self.env_permits(env, "server.refreshProviders", &Value::Null))
+    }
+
     fn refresh_provider_status(&mut self, instance_id: &str, cx: &mut Context<Self>) {
         // The reply is this environment's, even if the user switches meanwhile.
         let Some(environment) = self.active_environment().cloned() else { return };
         let Some(client) = self.env_client(&environment) else { return };
-        if self.banners.refreshing_provider {
+        if self.banners.refreshing_provider || !self.can_refresh_provider_status() {
             return;
         }
         self.banners.refreshing_provider = true;

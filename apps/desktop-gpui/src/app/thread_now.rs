@@ -164,12 +164,18 @@ impl Workspace {
         }
     }
 
+    /// `canForceStop`: the environment supports it and this connection may operate there.
+    fn can_force_stop(&self, environment: &str) -> bool {
+        self.server_info().capability("threadForceStop")
+            && self.env_permits(environment, "orchestration.forceStopThread", &Value::Null)
+    }
+
     /// `useForceStopThread`: for an agent that no longer answers Stop.
     fn force_stop(&mut self, pane: ChatPane, run_id: SharedString, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.server_info().capability("threadForceStop") {
+        let Some((client, env, thread_id)) = self.pane_client(pane, cx) else { return };
+        if !self.can_force_stop(&env) {
             return;
         }
-        let Some((client, env, thread_id)) = self.pane_client(pane, cx) else { return };
         let key = (env, thread_id.clone());
         if !self.now.force_stopping.insert(key.clone()) {
             return;
@@ -511,7 +517,7 @@ pub(super) fn now_row(
         }
         NowLine::RunStop(stop) => {
             actions.push(clock(stop.requested_at_ms, &mut texts));
-            if stop.unresponsive && workspace.server_info().capability("threadForceStop") {
+            if stop.unresponsive && workspace.can_force_stop(&key.0) {
                 let stopping = workspace.now.force_stopping.contains(&key);
                 let run_id = stop.run_id.clone();
                 let this = this.clone();
