@@ -12,7 +12,8 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
-use super::Workspace;
+use super::{Target, Workspace};
+use crate::model::ScopedId;
 use crate::rpc::StreamEvent;
 use crate::theme::Tokens;
 use crate::timeline::{self, Row, SubagentCard};
@@ -22,7 +23,8 @@ use crate::workflow::{self, Member, WorkflowRow};
 /// (`useQuietThreadProjection` on the parent).
 #[derive(Default)]
 pub(super) struct WorkflowUi {
-    parent: Option<String>,
+    /// On the workflow thread's environment: thread ids repeat across environments.
+    parent: Option<ScopedId>,
     subagents: Option<Rc<[Value]>>,
     /// The parent's `orchestration.subscribeThread`; dropping it unsubscribes.
     _stream: Option<Task<()>>,
@@ -102,11 +104,13 @@ impl Workspace {
 
     fn try_workflow_opening(&mut self, rows: &mut [Row], cx: &mut Context<Self>) -> bool {
         let Some(projection) = self.open_projection() else { return false };
-        let thread_id = projection.thread.id.clone();
-        let Some(shell) = self.shell.threads.iter().find(|t| t.id == thread_id) else { return false };
+        let Some(key) = self.target.as_ref().and_then(Target::thread_key) else { return false };
+        let thread_id = key.id.clone();
+        let Some(shell) = self.shell.thread(&key) else { return false };
         let native = shell.lineage.relationship_to_parent.as_deref() == Some("subagent")
             && shell.creation_source.as_deref() == Some("provider");
         let Some(parent) = shell.lineage.parent_thread_id.clone().filter(|_| native) else { return false };
+        let parent = ScopedId::new(key.env, parent);
         let Some(index) = rows.iter().position(|row| matches!(row, Row::User { .. })) else { return false };
         let Row::User { id, text, .. } = &rows[index] else { return false };
         let mark = projection
@@ -144,13 +148,13 @@ impl Workspace {
 
     /// Subscribes to the parent on the thread's environment, so a member that changes only on
     /// the parent updates the opening block; a stream that ends is opened again on the next rebuild.
-    fn load_workflow_parent(&mut self, parent: String, cx: &mut Context<Self>) {
-        if self.workflow.parent.as_deref() == Some(parent.as_str()) {
+    fn load_workflow_parent(&mut self, parent: ScopedId, cx: &mut Context<Self>) {
+        if self.workflow.parent.as_ref() == Some(&parent) {
             return;
         }
-        let Some(client) = self.client() else { return };
+        let Some(client) = self.env_client(&parent.env) else { return };
         self.workflow = WorkflowUi { parent: Some(parent.clone()), subagents: None, _stream: None };
-        let stream = client.stream("orchestration.subscribeThread", json!({"threadId": parent}));
+        let stream = client.stream("orchestration.subscribeThread", json!({"threadId": parent.id}));
         self.workflow._stream = Some(cx.spawn(async move |this, cx| {
             let mut subagents: Option<Vec<Value>> = None;
             while let Some(first) = stream.next().await {
@@ -165,7 +169,7 @@ impl Workspace {
                 let current = subagents.clone().filter(|_| changed);
                 let alive = this.update(cx, |this, cx| {
                     // A late batch for a parent the view has moved past changes nothing.
-                    if this.workflow.parent.as_deref() != Some(parent.as_str()) {
+                    if this.workflow.parent.as_ref() != Some(&parent) {
                         return false;
                     }
                     if let Some(current) = current {
