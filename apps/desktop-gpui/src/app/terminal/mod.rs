@@ -15,8 +15,9 @@ mod scrollbar;
 mod session;
 
 pub(in crate::app) use self::grid::TerminalTheme;
+pub(in crate::app) use self::panel::StoredGroup;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -34,9 +35,11 @@ use serde_json::{Value, json};
 
 use self::layout::{DrawerLayout, Place, Split};
 pub(in crate::app) use self::session::{Launch, SessionEvent, TerminalSession};
-use super::draft_sessions::DraftId;
+use super::draft_sessions::{DraftId, DraftSessions};
+use super::right_panel::Surface;
 use super::titlebar::icon;
 use super::{Target, Workspace};
+use crate::model::ScopedId;
 use crate::rpc::RpcClient;
 use crate::theme::{self, Tokens};
 
@@ -140,16 +143,17 @@ pub(super) struct Terminals {
     parked: Vec<(DrawerKey, HashMap<String, Pane>)>,
     /// The drawer whose sessions `panes` holds.
     mounted: Option<DrawerKey>,
-    /// By thread, in server order; `None` until the first snapshot.
-    summaries: Option<HashMap<String, Vec<Summary>>>,
-    /// The environment whose metadata stream reported each thread's terminals.
-    summary_environments: HashMap<String, SharedString>,
-    /// The id a draft's thread will launch with, so its terminals carry over.
-    draft_threads: HashMap<DraftId, String>,
-    /// The terminal to focus once it mounts, by thread: another thread's request never lands.
-    focus_pending: Option<(String, String)>,
-    /// Right-panel terminal tabs, by surface id.
+    /// By environment, then thread, in server order; `None` until the first snapshot. Thread ids
+    /// repeat across environments, and each environment's stream reports only its own.
+    summaries: Option<HashMap<String, HashMap<String, Vec<Summary>>>>,
+    /// Environments whose current metadata stream has sent its snapshot.
+    listed_now: HashSet<String>,
+    /// The terminal to focus once it mounts, by drawer: another thread's request never lands.
+    focus_pending: Option<(DrawerKey, String)>,
+    /// Right-panel terminal tabs, by surface id. A change sets `panel_changed`, so the panel layout
+    /// saves them.
     panel: HashMap<String, panel::PanelGroup>,
+    panel_changed: bool,
 }
 
 /// `COMPOSER_CONTEXT_TERMINAL_TEXT_MAX_CHARS`.
@@ -208,13 +212,13 @@ impl Terminals {
         Self { persisted: stored_drawers(&drawers), drawers, ..Self::default() }
     }
 
-    fn focus_later(&mut self, thread_id: &str, terminal_id: &str) {
-        self.focus_pending = Some((thread_id.to_owned(), terminal_id.to_owned()));
+    fn focus_later(&mut self, key: &DrawerKey, terminal_id: &str) {
+        self.focus_pending = Some((key.clone(), terminal_id.to_owned()));
     }
 
-    /// The pending focus when it is `thread_id`'s; another thread's is dropped.
-    fn take_focus(&mut self, thread_id: &str) -> Option<String> {
-        self.focus_pending.take().filter(|(pending, _)| pending == thread_id).map(|(_, terminal_id)| terminal_id)
+    /// The pending focus when it is `key`'s; another drawer's is dropped.
+    fn take_focus(&mut self, key: &DrawerKey) -> Option<String> {
+        self.focus_pending.take().filter(|(pending, _)| pending == key).map(|(_, terminal_id)| terminal_id)
     }
 
     /// `key`'s drawer, else the one an older build saved for its thread.
@@ -263,10 +267,25 @@ impl Terminals {
         }));
     }
 
-    /// `clearTerminalUiState`: a deleted thread's drawer goes back to its default.
+    /// `clearTerminalUiState`: a deleted thread's drawer goes back to its default, and its panel
+    /// tabs' groups go with the tabs.
     pub(super) fn forget_thread(&mut self, env: &str, thread_id: &str, cx: &App) {
-        if self.remove_drawer(&DrawerKey::new(env, thread_id)) {
+        let key = DrawerKey::new(env, thread_id);
+        self.groups_mut().retain(|_, group| group.key != key);
+        if self.remove_drawer(&key) {
             self.persist(cx);
+        }
+    }
+
+    /// Drops a closed terminal from `key`'s drawer. Only a shown drawer that held it hands focus
+    /// on, as the web's `visible` guard does; a panel tab's close focuses within its tab.
+    fn close_in_drawer(&mut self, key: &DrawerKey, terminal_id: &str, shown: bool) {
+        let Some(drawer) = self.drawer_mut(key) else { return };
+        let held = drawer.terminal_ids.iter().any(|id| id == terminal_id);
+        drawer.close(terminal_id);
+        if drawer.open && shown && held {
+            let active = drawer.active_id.clone();
+            self.focus_later(key, &active);
         }
     }
 
@@ -290,27 +309,27 @@ impl Terminals {
         let fallback = shown.filter(|key| !self.drawers.contains_key(key));
         let keys: Vec<DrawerKey> = self.drawers.keys().cloned().collect();
         for key in keys {
-            // An unreported thread's list is empty, which never changes a drawer.
-            let Some(reporter) = self.summary_environments.get(&key.thread_id) else { continue };
-            let owner = DrawerKey::new(reporter, &key.thread_id);
             let open = self.drawers[&key].open;
-            let reconciled = match key.env {
-                Some(_) => key == owner && (open || shown == Some(&key)),
-                // An older build's drawer stands in for the reporter's until a change adopts it.
+            // The drawer whose environment's list this one follows.
+            let owner = match key.env {
+                Some(_) => (open || shown == Some(&key)).then(|| key.clone()),
+                // An older build's drawer stands in for the viewer's, else for the one environment
+                // listing the thread without a drawer of its own, until a change adopts it.
                 None => match fallback.filter(|viewer| viewer.thread_id == key.thread_id) {
-                    Some(viewer) => *viewer == owner,
-                    None => open && !self.drawers.contains_key(&owner),
+                    Some(viewer) => Some(viewer.clone()),
+                    None if open => {
+                        self.sole_reporter(&key.thread_id).filter(|owner| !self.drawers.contains_key(owner))
+                    }
+                    None => None,
                 },
             };
-            if !reconciled {
-                continue;
-            }
+            // An unreported thread's list is empty, which never changes a drawer.
+            let Some(owner) = owner.filter(|owner| self.reported(owner)) else { continue };
             // A panel tab's terminals stay out of the drawer.
-            let in_panel = |id: &str| {
-                self.panel.values().any(|g| g.thread_id == key.thread_id && g.terminal_ids.iter().any(|t| t == id))
-            };
+            let in_panel =
+                |id: &str| self.panel.values().any(|g| g.key == owner && g.terminal_ids.iter().any(|t| t == id));
             let ids: Vec<String> = self
-                .summaries(&key.thread_id)
+                .summaries(&owner)
                 .iter()
                 .filter(|s| !in_panel(&s.terminal_id))
                 .map(|s| s.terminal_id.clone())
@@ -325,50 +344,87 @@ impl Terminals {
         self.drawers_changed = true;
     }
 
-    /// The thread id `draft` launches with, if its terminal drawer used one.
-    pub(super) fn take_draft_thread(&mut self, draft: &DraftId) -> Option<String> {
-        self.draft_threads.remove(draft)
+    /// Where `key`'s terminals and panel tabs belong: the unsent draft that launches with its
+    /// thread, else that thread on its environment.
+    fn owner(&self, drafts: &DraftSessions, key: &DrawerKey) -> Option<Target> {
+        match drafts.launching_with(&key.thread_id) {
+            Some(draft) => drafts.target(draft),
+            None => Some(Target::Thread { env: key.env.clone()?.into(), id: key.thread_id.clone() }),
+        }
     }
 
-    /// The unsent draft that launches with `thread_id`.
-    fn draft_of(&self, thread_id: &str) -> Option<&DraftId> {
-        self.draft_threads.iter().find(|(_, id)| *id == thread_id).map(|(draft, _)| draft)
+    /// `key`'s terminals as its environment's stream lists them.
+    fn summaries(&self, key: &DrawerKey) -> &[Summary] {
+        self.listed(key.env.as_deref(), &key.thread_id)
     }
 
-    fn summaries(&self, thread_id: &str) -> &[Summary] {
-        self.summaries.as_ref().and_then(|all| all.get(thread_id)).map_or(&[], Vec::as_slice)
+    fn listed(&self, env: Option<&str>, thread_id: &str) -> &[Summary] {
+        let list = env.and_then(|env| self.summaries.as_ref()?.get(env)?.get(thread_id));
+        list.map_or(&[], Vec::as_slice)
     }
 
-    pub(in crate::app) fn running(&self, thread_id: &str) -> Vec<&str> {
-        self.summaries(thread_id).iter().filter(|s| s.running_subprocess).map(|s| s.terminal_id.as_str()).collect()
+    /// Whether `key`'s environment has listed its thread.
+    fn reported(&self, key: &DrawerKey) -> bool {
+        let threads = key.env.as_deref().and_then(|env| self.summaries.as_ref()?.get(env));
+        threads.is_some_and(|threads| threads.contains_key(&key.thread_id))
+    }
+
+    /// The one environment listing `thread_id`; `None` when none or several do.
+    fn sole_reporter(&self, thread_id: &str) -> Option<DrawerKey> {
+        let mut reporters = self.summaries.iter().flatten().filter(|(_, threads)| threads.contains_key(thread_id));
+        let (env, _) = reporters.next()?;
+        reporters.next().is_none().then(|| DrawerKey::new(env, thread_id))
+    }
+
+    /// `thread_id`'s terminals on `env` with a process running.
+    pub(in crate::app) fn running(&self, env: Option<&str>, thread_id: &str) -> Vec<&str> {
+        let list = self.listed(env, thread_id);
+        list.iter().filter(|s| s.running_subprocess).map(|s| s.terminal_id.as_str()).collect()
     }
 
     /// The server terminal an empty drawer opens on: a running one first, never a panel tab's.
-    fn drawer_reuse(&self, thread_id: &str) -> Option<String> {
-        let panel = self.panel_ids(thread_id);
+    fn drawer_reuse(&self, key: &DrawerKey) -> Option<String> {
+        let panel = self.panel_ids(key);
         let free = |id: &&str| !panel.iter().any(|p| p == id);
-        let known = self.summaries(thread_id).iter().map(|s| s.terminal_id.as_str());
-        self.running(thread_id).into_iter().find(free).or_else(|| known.into_iter().find(free)).map(str::to_owned)
+        let known = self.summaries(key).iter().map(|s| s.terminal_id.as_str());
+        let running = self.running(key.env.as_deref(), &key.thread_id);
+        running.into_iter().find(free).or_else(|| known.into_iter().find(free)).map(str::to_owned)
     }
 
-    fn label(&self, thread_id: &str, terminal_id: &str) -> String {
-        let summary = self.summaries(thread_id).iter().find(|s| s.terminal_id == terminal_id);
+    fn label(&self, key: &DrawerKey, terminal_id: &str) -> String {
+        let summary = self.summaries(key).iter().find(|s| s.terminal_id == terminal_id);
         layout::terminal_label(terminal_id, summary.map(|s| s.label.as_str()))
+    }
+
+    /// A terminal id no drawer, panel tab or server session of the thread uses yet. Until a
+    /// readable environment's current stream lists its terminals, the id gets a UUID suffix so it
+    /// cannot land on an unseen session (`allocateTerminalId`).
+    fn next_id(&self, key: &DrawerKey, readable: bool) -> String {
+        let drawer_ids = self.drawer_ref(key).map(|d| d.terminal_ids.clone()).unwrap_or_default();
+        let panel_ids = self.panel_ids(key);
+        let known = self.summaries(key).iter().map(|s| s.terminal_id.as_str());
+        let listed = readable && key.env.as_deref().is_some_and(|env| self.listed_now.contains(env));
+        let suffix = (!listed).then(super::new_id);
+        let taken = known.chain(drawer_ids.iter().map(String::as_str)).chain(panel_ids.iter().map(String::as_str));
+        layout::next_terminal_id(taken, suffix.as_deref())
+    }
+
+    /// `environment`'s metadata stream (re)started: its old list may miss terminals made since.
+    fn metadata_restarted(&mut self, environment: &str) {
+        self.listed_now.remove(environment);
     }
 
     /// Applies one element of `environment`'s `subscribeTerminalMetadata`; a snapshot replaces
     /// only that environment's threads.
     fn apply_metadata(&mut self, environment: &SharedString, event: &Value) {
-        let all = self.summaries.get_or_insert_default();
-        let owners = &mut self.summary_environments;
+        let all = self.summaries.get_or_insert_default().entry(environment.to_string()).or_default();
         match event["type"].as_str() {
             Some("snapshot") => {
-                all.retain(|thread_id, _| owners.get(thread_id) != Some(environment));
-                owners.retain(|_, owner| owner != environment);
+                self.listed_now.insert(environment.to_string());
+                all.clear();
                 for (thread_id, summary) in
                     event["terminals"].as_array().into_iter().flatten().filter_map(Summary::parse)
                 {
-                    owners.insert(thread_id.clone(), environment.clone());
                     all.entry(thread_id).or_default().push(summary);
                 }
                 for list in all.values_mut() {
@@ -377,7 +433,6 @@ impl Terminals {
             }
             Some("upsert") => {
                 let Some((thread_id, summary)) = Summary::parse(&event["terminal"]) else { return };
-                owners.insert(thread_id.clone(), environment.clone());
                 let list = all.entry(thread_id).or_default();
                 match list.iter_mut().find(|s| s.terminal_id == summary.terminal_id) {
                     Some(existing) => *existing = summary,
@@ -420,42 +475,45 @@ fn tooltip(text: SharedString) -> impl Fn(&mut Window, &mut App) -> AnyView {
 }
 
 impl Workspace {
-    /// The thread terminals belong to now: the open thread, or the id the
-    /// draft's thread will launch with (created on first use).
-    pub(in crate::app) fn terminal_thread(&mut self, create: bool) -> Option<String> {
-        match self.target.as_ref()? {
-            Target::Thread { id, .. } => Some(id.clone()),
-            Target::Draft { draft, .. } => match self.terminals.draft_threads.get(draft) {
-                Some(id) => Some(id.clone()),
-                None if create => {
-                    let id = super::new_id();
-                    self.terminals.draft_threads.insert(draft.clone(), id.clone());
-                    Some(id)
-                }
-                None => None,
-            },
+    /// The thread terminals belong to now: the open thread, or the id the draft's thread will
+    /// launch with.
+    pub(in crate::app) fn terminal_thread(&mut self, cx: &mut Context<Self>) -> Option<String> {
+        match self.target.clone()? {
+            Target::Thread { id, .. } => Some(id),
+            Target::Draft { draft, .. } => self.draft_thread(&draft, cx),
         }
+    }
+
+    /// The id `draft`'s thread launches with, assigned on first use and saved with the draft.
+    pub(in crate::app) fn draft_thread(&mut self, draft: &DraftId, cx: &mut Context<Self>) -> Option<String> {
+        let (id, assigned) = self.drafts.reserve_thread(draft)?;
+        if assigned {
+            self.drafts_changed(cx);
+        }
+        Some(id)
     }
 
     fn shown_terminal_thread(&self) -> Option<&str> {
         match self.target.as_ref()? {
             Target::Thread { id, .. } => Some(id),
-            Target::Draft { draft, .. } => self.terminals.draft_threads.get(draft).map(String::as_str),
+            Target::Draft { draft, .. } => self.drafts.thread_id(draft),
         }
     }
 
-    /// `thread_id`'s drawer key: on the open target's environment when it shows the thread, else
-    /// on the environment that lists it.
-    fn drawer_key(&self, thread_id: &str) -> DrawerKey {
-        let env = match &self.target {
-            Some(target) if self.shown_terminal_thread() == Some(thread_id) => Some(target.environment().clone()),
-            _ => self.thread_environment(thread_id),
-        };
-        DrawerKey { env: env.map(|env| env.to_string()), thread_id: thread_id.to_owned() }
+    /// The drawer terminal commands act on: the open target's thread (a draft's, assigned on first
+    /// use) on the target's environment.
+    fn terminal_key(&mut self, cx: &mut Context<Self>) -> Option<DrawerKey> {
+        let thread_id = self.terminal_thread(cx)?;
+        Some(DrawerKey::new(self.target.as_ref()?.environment(), &thread_id))
+    }
+
+    /// The target owning a drawer's terminals: a draft until it launches, else its thread.
+    fn drawer_target(&self, key: &DrawerKey) -> Option<Target> {
+        self.terminals.owner(&self.drafts, key)
     }
 
     fn shown_drawer_key(&self) -> Option<DrawerKey> {
-        self.shown_terminal_thread().map(|thread_id| self.drawer_key(thread_id))
+        Some(DrawerKey::new(self.target.as_ref()?.environment(), self.shown_terminal_thread()?))
     }
 
     /// The shown thread's drawer, if it has one.
@@ -463,26 +521,16 @@ impl Workspace {
         self.terminals.drawer_ref(&self.shown_drawer_key()?)
     }
 
-    fn terminal_drawer(&mut self, thread_id: &str) -> &mut DrawerLayout {
-        let key = self.drawer_key(thread_id);
-        self.terminals.drawer(&key)
-    }
-
-    fn terminal_drawer_mut(&mut self, thread_id: &str) -> Option<&mut DrawerLayout> {
-        let key = self.drawer_key(thread_id);
-        self.terminals.drawer_mut(&key)
-    }
-
     /// Where new terminals start: the thread's worktree, else its project root.
     fn terminal_launch(&self) -> Option<Launch> {
-        let (project_id, worktree_path) = match self.target.as_ref()? {
-            Target::Thread { id, .. } => {
-                let thread = self.shell.threads.iter().find(|t| &t.id == id)?;
-                (thread.project_id.as_str(), thread.worktree_path.clone())
+        let (env, project_id, worktree_path) = match self.target.as_ref()? {
+            Target::Thread { env, id } => {
+                let thread = self.shell.thread(&ScopedId::new(env.clone(), id.clone()))?;
+                (env, thread.project_id.as_str(), thread.worktree_path.clone())
             }
-            Target::Draft { project_id, .. } => (project_id.as_str(), None),
+            Target::Draft { env, project_id, .. } => (env, project_id.as_str(), None),
         };
-        let project = self.shell.projects.iter().find(|p| p.id == project_id)?;
+        let project = self.shell.project(&ScopedId::new(env.clone(), project_id))?;
         Some(Launch {
             cwd: worktree_path.clone().unwrap_or_else(|| project.workspace_root.clone()),
             worktree_path,
@@ -491,10 +539,15 @@ impl Workspace {
         })
     }
 
-    /// `canOperateTerminal`: the thread's environment lets this client start, type into, resize
-    /// and close its terminals.
-    pub(super) fn terminal_operable(&self, thread_id: &str) -> bool {
-        self.terminals_operable_on(self.thread_environment(thread_id).as_deref())
+    /// `canOperateTerminal`: the environment of `key`'s drawer lets this client start, type into,
+    /// resize and close its terminals.
+    fn drawer_operable(&self, key: &DrawerKey) -> bool {
+        self.terminals_operable_on(key.env.as_deref())
+    }
+
+    /// The socket of the environment a drawer's terminals run on.
+    fn drawer_client(&self, key: &DrawerKey) -> Option<RpcClient> {
+        self.env_client(key.env.as_deref()?)
     }
 
     /// `canOperateTerminal` on `env`, which a drawer's key names.
@@ -519,6 +572,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<()> {
+        self.terminals.metadata_restarted(&environment);
         let stream = client.stream("subscribeTerminalMetadata", json!({}));
         let apply_environment = environment.clone();
         let task = Self::pump(
@@ -551,83 +605,83 @@ impl Workspace {
 
     /// `toggleTerminalVisibility`.
     pub(super) fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(thread_id) = self.terminal_thread(true) else { return };
-        let drawer = self.terminal_drawer(&thread_id);
+        let Some(key) = self.terminal_key(cx) else { return };
+        let drawer = self.terminals.drawer(&key);
         if drawer.open {
             drawer.open = false;
             self.focus_composer(window, cx);
         } else if drawer.terminal_ids.is_empty() {
             // A setup or agent-started shell already runs: show it instead of starting another.
-            match self.terminals.drawer_reuse(&thread_id) {
+            match self.terminals.drawer_reuse(&key) {
                 Some(id) => {
-                    self.terminal_drawer(&thread_id).ensure(&id);
-                    self.terminals.focus_later(&thread_id, &id);
+                    self.terminals.drawer(&key).ensure(&id);
+                    self.terminals.focus_later(&key, &id);
                 }
                 // Without the grant the drawer opens on its empty state.
-                None if !self.terminal_operable(&thread_id) => {
-                    self.terminal_drawer(&thread_id).open = true;
+                None if !self.drawer_operable(&key) => {
+                    self.terminals.drawer(&key).open = true;
                 }
-                None => self.launch_terminal(thread_id, Place::New, cx),
+                None => self.launch_terminal(key, Place::New, cx),
             }
         } else {
             drawer.open = true;
             let active = drawer.active_id.clone();
-            self.terminals.focus_later(&thread_id, &active);
+            self.terminals.focus_later(&key, &active);
         }
         cx.notify();
     }
 
-    fn open_drawer_for_action(&mut self) -> Option<String> {
-        let thread_id = self.terminal_thread(true)?;
-        self.terminal_drawer(&thread_id).open = true;
-        Some(thread_id)
+    fn open_drawer_for_action(&mut self, cx: &mut Context<Self>) -> Option<DrawerKey> {
+        let key = self.terminal_key(cx)?;
+        self.terminals.drawer(&key).open = true;
+        Some(key)
     }
 
     fn split_terminal(&mut self, split: Split, cx: &mut Context<Self>) {
-        let Some(thread_id) = self.open_drawer_for_action() else { return };
-        if self.terminals.drawer_ref(&self.drawer_key(&thread_id)).is_some_and(DrawerLayout::split_limit_reached) {
+        let Some(key) = self.open_drawer_for_action(cx) else { return };
+        if self.terminals.drawer_ref(&key).is_some_and(DrawerLayout::split_limit_reached) {
             return;
         }
-        self.launch_terminal(thread_id, Place::Split(split), cx);
+        self.launch_terminal(key, Place::Split(split), cx);
         cx.notify();
     }
 
     fn new_terminal(&mut self, cx: &mut Context<Self>) {
-        let Some(thread_id) = self.open_drawer_for_action() else { return };
-        self.launch_terminal(thread_id, Place::New, cx);
+        let Some(key) = self.open_drawer_for_action(cx) else { return };
+        self.launch_terminal(key, Place::New, cx);
         cx.notify();
     }
 
     /// Places a new terminal, then opens its shell (`launchTerminal`).
-    fn launch_terminal(&mut self, thread_id: String, place: Place, cx: &mut Context<Self>) {
+    fn launch_terminal(&mut self, key: DrawerKey, place: Place, cx: &mut Context<Self>) {
         let Some(launch) = self.terminal_launch() else { return };
-        self.launch_terminal_with(thread_id, place, launch, None, cx).detach();
+        self.launch_terminal_with(key, place, launch, None, cx).detach();
     }
 
     /// `runProjectScript`: types the command into an idle drawer terminal, or a new one opened in
     /// its cwd. A script that stops when the thread settles always gets a terminal of its own.
     /// Once the command is written, a script with `autoOpenPreview` opens its preview URL.
     fn run_in_terminal(&mut self, run: &super::RunInTerminal, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(thread_id) = self.open_drawer_for_action() else { return };
+        let Some(key) = self.open_drawer_for_action(cx) else { return };
         let Some(mut launch) = self.terminal_launch() else { return };
         launch.cwd.clone_from(&run.cwd);
         launch.stop_on_settle = Some(run.stop_on_settle);
         let input = format!(" {}\r", run.command);
-        let running: Vec<String> = self.terminals.running(&thread_id).into_iter().map(str::to_owned).collect();
-        let drawer = self.terminal_drawer(&thread_id);
+        let running: Vec<String> =
+            self.terminals.running(key.env.as_deref(), &key.thread_id).into_iter().map(str::to_owned).collect();
+        let drawer = self.terminals.drawer(&key);
         let idle: Vec<&String> = drawer.terminal_ids.iter().filter(|id| !running.contains(id)).collect();
         let reuse = idle.iter().find(|id| ***id == drawer.active_id).or(idle.first()).map(|id| (*id).clone());
         let written = match reuse.filter(|_| !run.stop_on_settle) {
             // Reopening a live terminal only updates its launch flags, as the web's launch does.
             Some(terminal_id) => {
                 drawer.set_active(&terminal_id);
-                self.open_terminal_session(thread_id.clone(), terminal_id, launch, Some(input), cx)
+                self.open_terminal_session(key.clone(), terminal_id, launch, Some(input), cx)
             }
-            None => self.launch_terminal_with(thread_id.clone(), Place::New, launch, Some(input), cx),
+            None => self.launch_terminal_with(key.clone(), Place::New, launch, Some(input), cx),
         };
-        let environment = self.thread_environment(&thread_id);
-        let preview = self.preview_thread_of(&thread_id);
-        match run.preview_url.clone().map(|url| self.resolve_server_url(environment.as_deref(), url)).zip(preview) {
+        let preview = key.env.clone().map(|env| crate::preview::ThreadRef::new(env, key.thread_id.clone()));
+        match run.preview_url.clone().map(|url| self.resolve_server_url(key.env.as_deref(), url)).zip(preview) {
             Some((url, thread)) => cx
                 .spawn_in(window, async move |this, cx| {
                     if written.await {
@@ -644,54 +698,45 @@ impl Workspace {
 
     fn launch_terminal_with(
         &mut self,
-        thread_id: String,
+        key: DrawerKey,
         place: Place,
         launch: Launch,
         then_write: Option<String>,
         cx: &mut Context<Self>,
     ) -> Task<bool> {
-        if self.thread_client(&thread_id).is_none() || !self.terminal_operable(&thread_id) {
+        if self.drawer_client(&key).is_none() || !self.drawer_operable(&key) {
             return Task::ready(false);
         }
-        let terminal_id = self.next_terminal_id(&thread_id);
-        if !self.terminal_drawer(&thread_id).place(&terminal_id, place) {
+        let terminal_id = self.next_terminal_id(&key);
+        if !self.terminals.drawer(&key).place(&terminal_id, place) {
             return Task::ready(false);
         }
-        self.open_terminal_session(thread_id, terminal_id, launch, then_write, cx)
+        self.open_terminal_session(key, terminal_id, launch, then_write, cx)
     }
 
-    /// A terminal id no drawer, panel tab or server session of the thread uses yet.
-    fn next_terminal_id(&self, thread_id: &str) -> String {
-        let drawer_ids =
-            self.terminals.drawer_ref(&self.drawer_key(thread_id)).map(|d| d.terminal_ids.clone()).unwrap_or_default();
-        let panel_ids = self.terminals.panel_ids(thread_id);
-        let known = self.terminals.summaries(thread_id).iter().map(|s| s.terminal_id.as_str());
-        let suffix = self.terminals.summaries.is_none().then(super::new_id);
-        let taken = known.chain(drawer_ids.iter().map(String::as_str)).chain(panel_ids.iter().map(String::as_str));
-        layout::next_terminal_id(taken, suffix.as_deref())
+    fn next_terminal_id(&self, key: &DrawerKey) -> String {
+        let readable = key.env.as_deref().is_some_and(|env| self.env_grants(env, "terminal:read"));
+        self.terminals.next_id(key, readable)
     }
 
     /// `terminal.open` (then an optional write) for a terminal already placed; resolves to
     /// whether both succeeded.
     fn open_terminal_session(
         &mut self,
-        thread_id: String,
+        key: DrawerKey,
         terminal_id: String,
         launch: Launch,
         then_write: Option<String>,
         cx: &mut Context<Self>,
     ) -> Task<bool> {
-        // A terminal runs on its thread's environment (a draft's is the open one).
-        let Some(client) = self.thread_client(&thread_id).filter(|_| self.terminal_operable(&thread_id)) else {
+        // A terminal runs on its drawer's environment (a draft's is the open one).
+        let Some(client) = self.drawer_client(&key).filter(|_| self.drawer_operable(&key)) else {
             return Task::ready(false);
         };
-        self.terminals.focus_later(&thread_id, &terminal_id);
-        let payload = launch.payload(&thread_id, &terminal_id);
-        let origin = match self.terminals.draft_of(&thread_id) {
-            Some(draft) => self.drafts.target(draft),
-            None => self.thread_target(&thread_id),
-        }
-        .or_else(|| self.target.clone());
+        self.terminals.focus_later(&key, &terminal_id);
+        let payload = launch.payload(&key.thread_id, &terminal_id);
+        let origin = self.drawer_target(&key).or_else(|| self.target.clone());
+        let thread_id = key.thread_id;
         cx.spawn(async move |this, cx| {
             let mut result = client.request("terminal.open", payload).await.map(drop);
             if let (Ok(()), Some(data)) = (&result, then_write) {
@@ -712,10 +757,10 @@ impl Workspace {
     }
 
     fn activate_terminal(&mut self, terminal_id: &str, cx: &mut Context<Self>) {
-        let Some(thread_id) = self.shown_terminal_thread().map(str::to_owned) else { return };
-        if let Some(drawer) = self.terminal_drawer_mut(&thread_id) {
+        let Some(key) = self.shown_drawer_key() else { return };
+        if let Some(drawer) = self.terminals.drawer_mut(&key) {
             drawer.set_active(terminal_id);
-            self.terminals.focus_later(&thread_id, terminal_id);
+            self.terminals.focus_later(&key, terminal_id);
             cx.notify();
         }
     }
@@ -723,10 +768,10 @@ impl Workspace {
     /// `confirmTerminalClose`, then [`Self::close_terminal`].
     fn request_close_terminal(&mut self, terminal_id: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(key) = self.shown_drawer_key() else { return };
-        if !self.terminal_operable(&key.thread_id) {
+        if !self.drawer_operable(&key) {
             return;
         }
-        let label = self.terminals.label(&key.thread_id, &terminal_id);
+        let label = self.terminals.label(&key, &terminal_id);
         let workspace = cx.weak_entity();
         window.open_alert_dialog(cx, move |alert, _, _| {
             let (workspace, key, terminal_id) = (workspace.clone(), key.clone(), terminal_id.clone());
@@ -744,7 +789,7 @@ impl Workspace {
                     window.defer(cx, move |_, cx| {
                         // The grant is read again: it may have changed while the dialog was open.
                         let _ = workspace.update(cx, |this, cx| {
-                            if this.terminal_operable(&key.thread_id) {
+                            if this.drawer_operable(&key) {
                                 this.close_terminal(&key, &terminal_id, cx);
                             }
                         });
@@ -757,17 +802,10 @@ impl Workspace {
     /// Ends the session and deletes its history; a failed close types `exit`.
     fn close_terminal(&mut self, key: &DrawerKey, terminal_id: &str, cx: &mut Context<Self>) {
         let thread_id = key.thread_id.as_str();
-        self.close_panel_terminal(thread_id, terminal_id);
-        // Only a shown drawer hands focus on, as the web's `visible` guard does.
+        self.close_panel_terminal(key, terminal_id);
         let shown = self.shown_drawer_key().as_ref() == Some(key);
-        if let Some(drawer) = self.terminals.drawer_mut(key) {
-            drawer.close(terminal_id);
-            if drawer.open && shown {
-                let active = drawer.active_id.clone();
-                self.terminals.focus_later(thread_id, &active);
-            }
-        }
-        if let Some(client) = self.thread_client(thread_id) {
+        self.terminals.close_in_drawer(key, terminal_id, shown);
+        if let Some(client) = self.drawer_client(key) {
             let (thread_id, terminal_id) = (thread_id.to_owned(), terminal_id.to_owned());
             cx.background_spawn(async move {
                 let close = json!({"threadId": thread_id, "terminalId": terminal_id, "deleteHistory": true});
@@ -819,7 +857,7 @@ impl Workspace {
                 .map(|group| group.terminal_ids.clone())
                 .unwrap_or_default()
                 .into_iter()
-                .chain(self.shown_panel_terminals(&key.thread_id))
+                .chain(self.shown_panel_terminals(key))
                 .collect(),
             _ => Vec::new(),
         };
@@ -838,7 +876,7 @@ impl Workspace {
             let Some(owner) = key.clone() else { continue };
             let Some(mut launch) = self.terminal_launch() else { continue };
             // A known terminal reattaches where it was started.
-            if let Some(summary) = self.terminals.summaries(&thread_id).iter().find(|s| &s.terminal_id == terminal_id)
+            if let Some(summary) = self.terminals.summaries(&owner).iter().find(|s| &s.terminal_id == terminal_id)
                 && !summary.cwd.is_empty()
             {
                 launch.cwd = summary.cwd.clone();
@@ -856,7 +894,9 @@ impl Workspace {
         for pane in self.terminals.panes.values() {
             pane.session.update(cx, |session, cx| session.set_read_only(read_only, cx));
         }
-        if let Some(pending) = self.terminals.take_focus(&thread_id) {
+        if let Some(key) = &key
+            && let Some(pending) = self.terminals.take_focus(key)
+        {
             match self.terminals.panes.get(&pending) {
                 Some(pane) => {
                     let focus = pane.session.read(cx).focus.clone();
@@ -864,7 +904,7 @@ impl Workspace {
                 }
                 // Not mounted yet (another group or a closed drawer): keep the request.
                 None if shown.is_empty() => {}
-                None => self.terminals.focus_later(&thread_id, &pending),
+                None => self.terminals.focus_later(key, &pending),
             }
         }
     }
@@ -889,12 +929,12 @@ impl Workspace {
         let thread_id = key.thread_id.as_str();
         match event {
             // `handleSessionExited`: only a client that may operate the terminal cleans it up.
-            SessionEvent::Exited if self.terminal_operable(thread_id) => {
+            SessionEvent::Exited if self.drawer_operable(key) => {
                 self.close_terminal(key, terminal_id, cx);
             }
             SessionEvent::Exited => {}
             SessionEvent::Activated => {
-                self.activate_panel_terminal(thread_id, terminal_id, cx);
+                self.activate_panel_terminal(key, terminal_id, cx);
                 // Only a focus that changes the drawer adopts one an older build saved: not the
                 // active terminal again, and not a panel tab's terminal the drawer does not hold.
                 if self.terminals.drawer_ref(key).is_some_and(|d| d.activates(terminal_id))
@@ -905,11 +945,13 @@ impl Workspace {
                 }
             }
             SessionEvent::AddToChat(selected) => {
-                self.add_terminal_context(thread_id, terminal_id, selected, window, cx);
+                self.add_terminal_context(key, terminal_id, selected, window, cx);
             }
             // `openTerminalLinkInPreview`: the in-app browser when links open there, else the system's.
             SessionEvent::OpenUrl { url, force_browser } => {
-                let thread = self.preview_thread().filter(|thread| thread.thread_id == *thread_id);
+                let thread = self.preview_thread().filter(|thread| {
+                    thread.thread_id == *thread_id && key.env.as_deref() == Some(thread.environment.as_ref())
+                });
                 let in_app = crate::preview::link_opens_in_app(
                     url,
                     *force_browser,
@@ -921,7 +963,7 @@ impl Workspace {
                     None => cx.open_url(url),
                 }
             }
-            SessionEvent::OpenPath(path) => match self.preferred_editor_id().zip(self.active_environment().cloned()) {
+            SessionEvent::OpenPath(path) => match self.preferred_editor_id().zip(key.env.clone()) {
                 Some((editor, environment)) => {
                     let failure = "Unable to open path".to_owned();
                     self.open_path_in_editor(&environment, path.clone(), editor, false, failure, window, cx);
@@ -940,14 +982,14 @@ impl Workspace {
     /// goes with the message that keeps the chip.
     fn add_terminal_context(
         &mut self,
-        thread_id: &str,
+        key: &DrawerKey,
         terminal_id: &str,
         selected: &session::Selected,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(target) = self.target.clone() else { return };
-        let terminal_label = self.terminals.label(thread_id, terminal_id);
+        let terminal_label = self.terminals.label(key, terminal_id);
         let id = format!("terminal_{}", super::new_id());
         let record = context_record(&id, terminal_id, &terminal_label, selected);
         if self.add_context_record(&target, record, window, cx).is_some() {
@@ -975,7 +1017,7 @@ impl Workspace {
     /// The drawer under the chat while the shown thread's drawer is open.
     pub(super) fn render_terminal_drawer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         self.sync_terminal_panes(window, cx);
-        let thread_id = self.shown_terminal_thread()?.to_owned();
+        let key = self.shown_drawer_key()?;
         let drawer = self.shown_drawer().filter(|d| d.open)?;
         let tokens = *theme::tokens(cx);
         let border = tokens.border.opacity(0.8);
@@ -1012,7 +1054,7 @@ impl Workspace {
                         .outline()
                         .xsmall()
                         .label(self.with_terminal_shortcut("New Terminal", "terminal.new"))
-                        .disabled(!self.terminal_operable(&thread_id))
+                        .disabled(!self.drawer_operable(&key))
                         .on_click(cx.listener(|this, _, _, cx| this.new_terminal(cx))),
                 )
                 .into_any_element()
@@ -1031,7 +1073,7 @@ impl Workspace {
                 .child(self.render_terminal_panes(drawer, &tokens))
                 .when(has_sidebar, |el| {
                     let sidebar = SidebarModel {
-                        thread_id: &thread_id,
+                        key: &key,
                         groups: drawer
                             .sorted_groups()
                             .into_iter()
@@ -1058,9 +1100,9 @@ impl Workspace {
                 .border_t_1()
                 .border_color(border)
                 .on_drag_move(cx.listener(move |this, event: &DragMoveEvent<DrawerResize>, _, cx| {
-                    let Some(thread_id) = this.shown_terminal_thread().map(str::to_owned) else { return };
+                    let Some(key) = this.shown_drawer_key() else { return };
                     let height = f32::from(event.bounds.bottom() - event.event.position.y).round();
-                    if let Some(drawer) = this.terminal_drawer_mut(&thread_id) {
+                    if let Some(drawer) = this.terminals.drawer_mut(&key) {
                         drawer.height = height.clamp(MIN_DRAWER_HEIGHT, max);
                         cx.notify();
                     }
@@ -1232,13 +1274,13 @@ impl Workspace {
     }
 
     fn shown_terminal_operable(&self) -> bool {
-        self.shown_terminal_thread().is_none_or(|thread_id| self.terminal_operable(thread_id))
+        self.shown_drawer_key().is_none_or(|key| self.drawer_operable(&key))
     }
 
     /// Shows `terminal_id` in the drawer, or in its panel tab when the sidebar is a tab's.
     fn activate_sidebar_terminal(
         &mut self,
-        thread_id: &str,
+        key: &DrawerKey,
         terminal_id: &str,
         panel: Option<&str>,
         cx: &mut Context<Self>,
@@ -1247,8 +1289,8 @@ impl Workspace {
             self.activate_terminal(terminal_id, cx);
             return;
         }
-        self.activate_panel_terminal(thread_id, terminal_id, cx);
-        self.terminals.focus_later(thread_id, terminal_id);
+        self.activate_panel_terminal(key, terminal_id, cx);
+        self.terminals.focus_later(key, terminal_id);
         cx.notify();
     }
 
@@ -1260,10 +1302,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let SidebarModel { thread_id, groups, active, limit, panel } = sidebar;
-        let (thread_id, active, limit) = (*thread_id, *active, *limit);
+        let SidebarModel { key, groups, active, limit, panel } = sidebar;
+        let (key, active, limit) = (*key, *active, *limit);
         let border = tokens.border.opacity(0.7);
-        let operable = self.terminal_operable(thread_id);
+        let operable = self.drawer_operable(key);
         let scope = panel.clone().unwrap_or_else(|| "drawer".into());
         let mut header_button = |id: &'static str, path: &'static str, disabled: bool, first: bool| {
             let el = action_button(id, path, disabled || !operable, tokens)
@@ -1299,7 +1341,7 @@ impl Workspace {
                 };
                 let target = if group_active { active.to_owned() } else { ids[0].clone() };
                 let color = if group_active { tokens.foreground } else { tokens.muted_foreground };
-                let (thread, panel) = (thread_id.to_owned(), panel.clone());
+                let (key, panel) = (key.clone(), panel.clone());
                 let el = h_flex()
                     .id(SharedString::from(format!("terminal-group-{group_id}")))
                     .h(px(22.))
@@ -1319,7 +1361,7 @@ impl Workspace {
                         }
                     })
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.activate_sidebar_terminal(&thread, &target, panel.as_deref(), cx);
+                        this.activate_sidebar_terminal(&key, &target, panel.as_deref(), cx);
                     }))
                     .child(icon(path).with_size(px(12.)).flex_none())
                     .child(div().flex_1().min_w_0().truncate().child(label))
@@ -1335,7 +1377,7 @@ impl Workspace {
             let rows: Vec<_> = ids
                 .iter()
                 .map(|terminal_id| {
-                    let row = RowModel { thread_id, terminal_id, active: terminal_id == active, scope: &scope };
+                    let row = RowModel { key, terminal_id, active: terminal_id == active, scope: &scope };
                     self.render_terminal_row(&row, panel.as_deref(), tokens, window, cx)
                 })
                 .collect();
@@ -1362,8 +1404,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
-        let RowModel { thread_id, terminal_id, active, scope } = *row;
-        let label = self.terminals.label(thread_id, terminal_id);
+        let RowModel { key, terminal_id, active, scope } = *row;
+        let label = self.terminals.label(key, terminal_id);
         let close_label: SharedString = if active {
             self.with_terminal_shortcut(&format!("Close {label}"), "terminal.close")
         } else {
@@ -1372,8 +1414,8 @@ impl Workspace {
         .into();
         let group = SharedString::from(format!("terminal-row-{terminal_id}"));
         let (close_id, activate_id) = (terminal_id.to_owned(), terminal_id.to_owned());
-        let (thread, panel) = (thread_id.to_owned(), panel.map(str::to_owned));
-        let operable = self.terminal_operable(thread_id);
+        let (thread, panel) = (key.clone(), panel.map(str::to_owned));
+        let operable = self.drawer_operable(key);
         let glyph = |path: &'static str| {
             div().absolute().inset_0().flex().items_center().justify_center().child(icon(path).with_size(px(12.)))
         };
@@ -1450,8 +1492,13 @@ impl Workspace {
 
     /// The sidebar row's indicator: teal while a terminal process runs. It
     /// does not pulse; a looping animation would repaint the sidebar forever.
-    pub(super) fn render_running_terminals(&self, thread_id: &str, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let running = self.terminals.running(thread_id);
+    pub(super) fn render_running_terminals(
+        &self,
+        env: &SharedString,
+        thread_id: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let running = self.terminals.running(Some(env), thread_id);
         let first = running.first()?.to_string();
         let tokens = theme::tokens(cx);
         let color = if tokens.dark { rgb(0x46ecd5).into() } else { gpui_kit::Hsla::from(rgb(0x009689)) };
@@ -1461,10 +1508,10 @@ impl Workspace {
         } else {
             format!("{} terminal processes running. Open terminal", running.len()).into()
         };
-        let thread_id = thread_id.to_owned();
+        let (env, thread_id) = (env.clone(), thread_id.to_owned());
         Some(
             div()
-                .id(SharedString::from(format!("terminal-status-{thread_id}")))
+                .id(SharedString::from(format!("terminal-status-{env}-{thread_id}")))
                 .flex_none()
                 .flex()
                 .items_center()
@@ -1474,30 +1521,55 @@ impl Workspace {
                 .tooltip(tooltip(label))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
-                    this.reveal_thread_terminal(thread_id.clone(), first.clone(), window, cx);
+                    this.reveal_thread_terminal(env.clone(), thread_id.clone(), first.clone(), window, cx);
                 }))
                 .child(icon("icons/terminal.svg").with_size(px(14.)).text_color(color)),
         )
     }
 
-    /// `revealThreadTerminal`: open the thread with that terminal shown.
+    /// `revealThreadTerminal`: open the thread with that terminal shown, in the panel tab holding
+    /// it, else in the drawer.
     pub(super) fn reveal_thread_terminal(
         &mut self,
+        env: SharedString,
         thread_id: String,
         terminal_id: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.select_thread(thread_id.clone(), window, cx);
-        self.terminal_drawer(&thread_id).ensure(&terminal_id);
-        self.terminals.focus_later(&thread_id, &terminal_id);
+        let key = DrawerKey::new(&env, &thread_id);
+        self.select_thread_in(env, thread_id, window, cx);
+        let tab = self.terminals.panel_tab(&key, &terminal_id).map(|surface| Surface::Terminal(surface.clone()));
+        match tab.filter(|tab| self.panel_has_surface(tab)) {
+            Some(tab) => {
+                self.terminals.activate_in_panel(&key, &terminal_id);
+                self.open_surface(tab, window, cx);
+            }
+            None => self.terminals.drawer(&key).ensure(&terminal_id),
+        }
+        self.terminals.focus_later(&key, &terminal_id);
+        cx.notify();
+    }
+
+    /// The setup card's "Open terminal" (`openSetupTerminal`): the setup's terminal in the drawer
+    /// of its thread on its environment.
+    pub(in crate::app) fn open_worktree_setup_terminal(
+        &mut self,
+        env: &str,
+        thread_id: &str,
+        terminal_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let key = DrawerKey::new(env, thread_id);
+        self.terminals.drawer(&key).ensure(terminal_id);
+        self.terminals.focus_later(&key, terminal_id);
         cx.notify();
     }
 }
 
 /// What a session sidebar lists: the drawer's groups, or a panel tab's one group.
 pub(super) struct SidebarModel<'a> {
-    thread_id: &'a str,
+    key: &'a DrawerKey,
     /// Each group's id, terminals and split, in the sidebar's order.
     groups: Vec<(&'a str, &'a [String], Split)>,
     active: &'a str,
@@ -1508,7 +1580,7 @@ pub(super) struct SidebarModel<'a> {
 
 #[derive(Clone, Copy)]
 struct RowModel<'a> {
-    thread_id: &'a str,
+    key: &'a DrawerKey,
     terminal_id: &'a str,
     active: bool,
     /// Keeps the drawer's and each panel tab's focus handles apart.
@@ -1567,24 +1639,31 @@ mod tests {
     }
 
     #[test]
-    fn a_drafts_future_thread_maps_back_to_its_draft_until_sent() {
-        let mut terminals = Terminals::default();
-        let draft = DraftId::for_test("draft");
-        terminals.draft_threads.insert(draft.clone(), "future".into());
-        assert_eq!(terminals.draft_of("future"), Some(&draft));
-        assert_eq!(terminals.draft_of("other"), None);
-        terminals.take_draft_thread(&draft);
-        assert_eq!(terminals.draft_of("future"), None, "a sent draft's thread is listed");
+    fn a_drafts_terminal_tabs_belong_to_the_draft_until_it_launches() {
+        let mut drafts = DraftSessions::default();
+        let draft = drafts.create(ScopedId::new("a", "p"));
+        let (future, _) = drafts.reserve_thread(&draft).unwrap();
+        let terminals = Terminals::default();
+        let key = DrawerKey::new("a", &future);
+        assert_eq!(terminals.owner(&drafts, &key), drafts.target(&draft), "not the thread it will launch");
+        let other = DrawerKey::new("a", "other");
+        assert_eq!(terminals.owner(&drafts, &other), Some(Target::Thread { env: "a".into(), id: "other".into() }));
+        drafts.promote(&draft);
+        assert_eq!(terminals.owner(&drafts, &key), Some(Target::Thread { env: "a".into(), id: future }));
+        assert_eq!(terminals.owner(&drafts, &key.legacy()), None, "an older build's drawer has no environment");
     }
 
     #[test]
     fn a_hidden_threads_focus_request_never_lands_on_the_shown_one() {
         let mut terminals = Terminals::default();
-        terminals.focus_later("hidden", "term-2");
-        assert_eq!(terminals.take_focus("shown"), None);
-        assert_eq!(terminals.take_focus("hidden"), None, "dropped, not kept for later");
-        terminals.focus_later("shown", "term-2");
-        assert_eq!(terminals.take_focus("shown").as_deref(), Some("term-2"));
+        let (hidden, shown) = (DrawerKey::new("a", "hidden"), DrawerKey::new("a", "shown"));
+        terminals.focus_later(&hidden, "term-2");
+        assert_eq!(terminals.take_focus(&shown), None);
+        assert_eq!(terminals.take_focus(&hidden), None, "dropped, not kept for later");
+        terminals.focus_later(&DrawerKey::new("b", "shown"), "term-2");
+        assert_eq!(terminals.take_focus(&shown), None, "a same-id thread on another environment");
+        terminals.focus_later(&shown, "term-2");
+        assert_eq!(terminals.take_focus(&shown).as_deref(), Some("term-2"));
     }
 
     #[test]
@@ -1669,6 +1748,49 @@ mod tests {
     }
 
     #[test]
+    fn same_id_threads_on_two_environments_follow_only_their_own_terminals() {
+        let (a, b) = (DrawerKey::new("a", "t"), DrawerKey::new("b", "t"));
+        let summary = |id: &str| json!({"threadId": "t", "terminalId": id, "cwd": format!("/{id}"), "hasRunningSubprocess": true, "label": ""});
+        let mut terminals = Terminals::default();
+        terminals.apply_metadata(&"a".into(), &json!({"type": "snapshot", "terminals": [summary("term-1")]}));
+        terminals.apply_metadata(&"b".into(), &json!({"type": "snapshot", "terminals": [summary("term-2")]}));
+        terminals.drawer(&a).open = true;
+        terminals.drawer(&b).open = true;
+        terminals.reconcile(Some(&b));
+        assert_eq!(terminals.drawers[&b].terminal_ids, ["term-2"], "A's terminal never attaches on B");
+        assert_eq!(terminals.drawers[&a].terminal_ids, ["term-1"], "A's drawer still follows A");
+
+        // An upsert and a snapshot each change only their own environment's list.
+        terminals.apply_metadata(&"a".into(), &json!({"type": "upsert", "terminal": summary("term-3")}));
+        terminals.apply_metadata(&"b".into(), &json!({"type": "snapshot", "terminals": [summary("term-2")]}));
+        terminals.reconcile(Some(&b));
+        assert_eq!(terminals.drawers[&b].terminal_ids, ["term-2"]);
+        assert_eq!(terminals.drawers[&a].terminal_ids, ["term-1", "term-3"]);
+        assert_eq!(terminals.running(Some("b"), "t"), ["term-2"]);
+        assert_eq!(terminals.summaries(&a).iter().map(|s| s.cwd.as_str()).collect::<Vec<_>>(), ["/term-1", "/term-3"]);
+        assert_eq!(terminals.drawer_reuse(&b).as_deref(), Some("term-2"));
+        assert_eq!(terminals.sole_reporter("t"), None, "two environments list it");
+    }
+
+    #[test]
+    fn new_ids_avoid_unseen_sessions_until_a_readable_current_snapshot() {
+        let key = DrawerKey::new("env", "t");
+        let snapshot = json!({"type": "snapshot", "terminals": [{"threadId": "t", "terminalId": "term-1", "hasRunningSubprocess": false, "label": ""}]});
+        let unique = |id: String, number: &str| id.strip_prefix(number).is_some_and(|rest| rest.len() == 37);
+        let mut terminals = Terminals::default();
+        assert!(unique(terminals.next_id(&key, true), "term-1"), "nothing listed yet");
+        terminals.apply_metadata(&"env".into(), &snapshot);
+        assert_eq!(terminals.next_id(&key, true), "term-2");
+        assert!(unique(terminals.next_id(&key, false), "term-2"), "without terminal:read");
+        terminals.metadata_restarted("env");
+        assert!(unique(terminals.next_id(&key, true), "term-2"), "a reconnect's list is not in yet");
+        terminals.apply_metadata(&"other".into(), &snapshot);
+        assert!(unique(terminals.next_id(&key, true), "term-2"), "another environment's list");
+        terminals.apply_metadata(&"env".into(), &snapshot);
+        assert_eq!(terminals.next_id(&key, true), "term-2");
+    }
+
+    #[test]
     fn hidden_threads_keep_their_sessions_up_to_the_limit() {
         let mut parked = Vec::new();
         for thread in ["a", "b", "c"] {
@@ -1685,16 +1807,70 @@ mod tests {
         let summary = |id: &str, running: bool| json!({"threadId": "t", "terminalId": id, "hasRunningSubprocess": running, "label": ""});
         let snapshot = json!({"type": "snapshot", "terminals": [summary("default", false), summary("term-2", true), summary("term-3", false)]});
         terminals.apply_metadata(&"env".into(), &snapshot);
-        assert_eq!(terminals.drawer_reuse("t").as_deref(), Some("term-2"), "a running terminal first");
-        let group = |ids: &[&str]| panel::PanelGroup {
-            thread_id: "t".into(),
+        let key = DrawerKey::new("env", "t");
+        assert_eq!(terminals.drawer_reuse(&key).as_deref(), Some("term-2"), "a running terminal first");
+        terminals.panel.insert("other".into(), panel_group("other-env", "t", &["term-2", "default"]));
+        assert_eq!(terminals.drawer_reuse(&key).as_deref(), Some("term-2"), "another environment's tab");
+        terminals.panel.insert("surface".into(), panel_group("env", "t", &["term-2"]));
+        assert_eq!(terminals.drawer_reuse(&key).as_deref(), Some("default"));
+        terminals.panel.insert("surface".into(), panel_group("env", "t", &["term-2", "default", "term-3"]));
+        assert_eq!(terminals.drawer_reuse(&key), None);
+    }
+
+    fn panel_group(env: &str, thread_id: &str, ids: &[&str]) -> panel::PanelGroup {
+        panel::PanelGroup {
+            key: DrawerKey::new(env, thread_id),
             terminal_ids: ids.iter().map(|id| (*id).to_owned()).collect(),
             active: ids[0].into(),
             split: Split::Horizontal,
-        };
-        terminals.panel.insert("surface".into(), group(&["term-2"]));
-        assert_eq!(terminals.drawer_reuse("t").as_deref(), Some("default"));
-        terminals.panel.insert("surface".into(), group(&["term-2", "default", "term-3"]));
-        assert_eq!(terminals.drawer_reuse("t"), None);
+        }
+    }
+
+    #[test]
+    fn closing_a_terminal_leaves_a_same_id_threads_tabs_on_another_environment() {
+        let mut terminals = Terminals::default();
+        let (a, b) = (DrawerKey::new("a", "t"), DrawerKey::new("b", "t"));
+        terminals.panel.insert("a-tab".into(), panel_group("a", "t", &["term-1"]));
+        terminals.panel.insert("a-split".into(), panel_group("a", "t", &["term-2", "term-1"]));
+        terminals.panel.insert("b-tab".into(), panel_group("b", "t", &["term-1", "term-2"]));
+
+        assert_eq!(terminals.panel_tab(&b, "term-1").map(String::as_str), Some("b-tab"), "reveal finds B's own tab");
+        assert_eq!(terminals.panel_tab(&b, "term-3"), None);
+        assert_eq!(terminals.remove_from_panel(&b, "term-1", true), Vec::<String>::new());
+        assert_eq!(terminals.panel["b-tab"].terminal_ids, ["term-2"]);
+        assert_eq!(terminals.panel["a-tab"].terminal_ids, ["term-1"], "A's tab keeps its terminal");
+        assert_eq!(terminals.panel["a-split"].terminal_ids, ["term-2", "term-1"]);
+        assert_eq!(terminals.take_focus(&b).as_deref(), Some("term-2"));
+        let mut a_ids = terminals.panel_ids(&a);
+        a_ids.sort();
+        assert_eq!(a_ids, ["term-1", "term-1", "term-2"]);
+
+        assert!(!terminals.activate_in_panel(&b, "term-1"), "B no longer holds term-1");
+        assert!(terminals.activate_in_panel(&a, "term-1"));
+        assert_eq!(terminals.panel["a-split"].active, "term-1");
+
+        let mut emptied = terminals.remove_from_panel(&a, "term-1", false);
+        emptied.sort();
+        assert_eq!(emptied, ["a-tab"]);
+        assert!(terminals.panel.contains_key("b-tab"), "B's tab stays open");
+        assert_eq!(terminals.panel["a-split"].terminal_ids, ["term-2"]);
+        assert_eq!(terminals.take_focus(&a), None, "a hidden drawer's close moves no focus");
+    }
+
+    #[test]
+    fn closing_a_panel_terminal_keeps_focus_in_its_tab_over_an_open_drawer() {
+        let mut terminals = Terminals::default();
+        let key = DrawerKey::new("a", "t");
+        terminals.drawer(&key).place("term-1", Place::New);
+        terminals.panel.insert("tab".into(), panel_group("a", "t", &["term-2", "term-3"]));
+
+        terminals.remove_from_panel(&key, "term-3", true);
+        terminals.close_in_drawer(&key, "term-3", true);
+        assert_eq!(terminals.take_focus(&key).as_deref(), Some("term-2"), "the tab's sibling, not the drawer's shell");
+
+        terminals.drawer(&key).place("term-4", Place::Split(Split::Horizontal));
+        terminals.remove_from_panel(&key, "term-4", true);
+        terminals.close_in_drawer(&key, "term-4", true);
+        assert_eq!(terminals.take_focus(&key).as_deref(), Some("term-1"), "a drawer terminal hands focus on");
     }
 }

@@ -621,6 +621,11 @@ impl Workspace {
         self.page.is_none() && self.panel_state().is_some_and(|panel| panel.open)
     }
 
+    /// The open target's panel has `surface` among its tabs.
+    pub(super) fn panel_has_surface(&self, surface: &Surface) -> bool {
+        self.panel_state().is_some_and(|panel| panel.surfaces.contains(surface))
+    }
+
     /// The surface on screen (`selectActiveRightPanelSurface`).
     pub(super) fn active_surface(&self) -> Option<&Surface> {
         self.panel_state().filter(|panel| panel.open && self.page.is_none())?.active.as_ref()

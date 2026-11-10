@@ -1748,7 +1748,7 @@ impl Workspace {
         let leading = self.render_thread_leading_status(thread, requests, cx);
         let number = self.render_thread_search_number(thread, query, cx);
         let key = format!("{}-{}", thread.environment_id, thread.id);
-        let terminal = (!self.terminals.running(&thread.id).is_empty()).then(|| {
+        let terminal = (!self.terminals.running(Some(&thread.environment_id), &thread.id).is_empty()).then(|| {
             let color = super::pages::terminal_running_color(tokens);
             div()
                 .id(SharedString::from(format!("palette-terminal-{key}")))

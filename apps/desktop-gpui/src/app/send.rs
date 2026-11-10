@@ -335,7 +335,9 @@ impl Workspace {
                         project.workspace_root.clone(),
                     ))
                 });
-                let thread_id = self.terminals.take_draft_thread(&draft).unwrap_or_else(new_id);
+                // The draft's terminals and any opened while the launch is pending share its thread; a
+                // failed launch sends again with it.
+                let thread_id = self.draft_thread(&draft, cx).unwrap_or_else(new_id);
                 let launched_message = new_id();
                 let mut initial =
                     json!({"messageId": launched_message, "text": message_text, "attachments": attachments});

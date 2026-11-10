@@ -2187,7 +2187,7 @@ impl Workspace {
         let sb = tokens.sidebar;
         let thread = facts.thread;
         let pull_request = self.render_row_pull_request_badge(thread, cx);
-        let terminals = self.render_running_terminals(&thread.id, cx);
+        let terminals = self.render_running_terminals(&thread.environment_id, &thread.id, cx);
         (thread.branch.is_some() || terminals.is_some() || pull_request.is_some()).then(|| {
             text_xs(h_flex())
                 .mt(px(2.))
@@ -2454,7 +2454,11 @@ impl Workspace {
             .child(title)
             .map(|el| self.with_rename(el, thread, 36., tokens, cx))
             .children(title_icons);
-        let line = if multiline { line } else { line.children(self.render_running_terminals(&thread.id, cx)) };
+        let line = if multiline {
+            line
+        } else {
+            line.children(self.render_running_terminals(&thread.environment_id, &thread.id, cx))
+        };
         let line = line.child(time_slot);
         let receding_run = recede && matches!(status, Status::Working | Status::Preparing);
         let open_id = ScopedId::of_thread(thread);
@@ -2626,7 +2630,7 @@ impl Workspace {
                     .child(thread.title.clone()),
             )
             .map(|el| self.with_rename(el, thread, 36., tokens, cx))
-            .children(self.render_running_terminals(&thread.id, cx))
+            .children(self.render_running_terminals(&thread.environment_id, &thread.id, cx))
             .child(
                 text_xs(h_flex())
                     .relative()

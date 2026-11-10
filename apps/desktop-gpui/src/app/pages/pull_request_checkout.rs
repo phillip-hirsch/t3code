@@ -103,7 +103,7 @@ impl Workspace {
         let Target::Draft { env, project_id, .. } = draft.clone() else { return };
         let project = self.shell.projects.iter().find(|p| p.id == project_id && p.environment_id == env);
         let Some(cwd) = project.map(|p| p.workspace_root.clone()) else { return };
-        let Some(thread_id) = self.terminal_thread(true) else { return };
+        let Some(thread_id) = self.terminal_thread(cx) else { return };
         let origin = Origin { draft, environment_id: env, project_id, cwd, thread_id };
         let host = self.checkout_host();
         let placeholder = format!("{} URL, checkout command, or #42", host.terms.short);

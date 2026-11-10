@@ -39,6 +39,9 @@ pub(super) struct QueueUi {
 
 /// A queued message open in the composer; the thread's own draft waits in `saved`.
 pub(super) struct QueueEdit {
+    /// Each begin's own, so a save that lands later finds only the edit it saved.
+    id: String,
+    env: SharedString,
     thread_id: String,
     run_id: SharedString,
     original: String,
@@ -71,6 +74,11 @@ impl QueueUi {
     /// Ends an edit, handing back the draft it set aside.
     pub(super) fn take_edit_draft(&mut self) -> Option<(String, Vec<Attachment>, ContextRecords)> {
         self.edit.take().map(|edit| edit.saved)
+    }
+
+    /// The edit begun as `id`, unless it ended or another began since.
+    fn begun_edit(&mut self, id: &str) -> Option<&mut QueueEdit> {
+        self.edit.as_mut().filter(|edit| edit.id == id)
     }
 }
 
@@ -212,7 +220,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((_, thread_id)) = self.pane_thread(pane) else { return };
+        let Some((env, thread_id)) = self.pane_thread(pane) else { return };
         if !message.editable
             || self.queue_ui(pane).is_none_or(|ui| ui.busy.is_some())
             || self.edit_blocked_reason(pane).is_some()
@@ -249,6 +257,8 @@ impl Workspace {
         let text = queue::edit_text(&message.text).to_owned();
         let Some(ui) = self.queue_ui_mut(pane) else { return };
         ui.edit = Some(QueueEdit {
+            id: new_id(),
+            env,
             thread_id,
             run_id: message.run_id.clone(),
             original: text.clone(),
@@ -283,7 +293,8 @@ impl Workspace {
         let Some(edit) = self.queue_ui(pane).and_then(|ui| ui.edit.as_ref()).filter(|edit| !edit.saving) else {
             return;
         };
-        let (thread_id, run_id) = (edit.thread_id.clone(), edit.run_id.clone());
+        let (id, env, thread_id, run_id) =
+            (edit.id.clone(), edit.env.clone(), edit.thread_id.clone(), edit.run_id.clone());
         let (kept, removed_attachment) = (edit.attachments.clone(), edit.removed_attachment);
         let kept_records = retained_records(&edit.records, &edit.attachments);
         // Only the open thread's composer holds attachments; a side chat's edit keeps the queued ones.
@@ -298,9 +309,9 @@ impl Workspace {
         if text.is_empty() && kept.is_empty() && added_count == 0 {
             return;
         }
-        let Some((client, _, shown)) = self.pane_client(pane, cx) else { return };
+        let Some((client, shown_env, shown)) = self.pane_client(pane, cx) else { return };
         // An edit left over from another thread is never sent to this one.
-        if shown != thread_id {
+        if shown_env != env || shown != thread_id {
             return;
         }
         let mut command = json!({
@@ -339,8 +350,7 @@ impl Workspace {
             let result = client.request("orchestration.dispatchCommand", command).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 // The edit was cancelled, begun again, or its pane moved on while this save ran.
-                let current =
-                    this.queue_ui_mut(pane).and_then(|ui| ui.edit.as_mut()).filter(|edit| edit.run_id == run_id);
+                let current = this.queue_ui_mut(pane).and_then(|ui| ui.begun_edit(&id));
                 match (result, current) {
                     (Ok(_), Some(_)) => this.cancel_queue_edit(pane, window, cx),
                     (Err(error), current) => {
@@ -838,5 +848,27 @@ mod tests {
         let ids: Vec<&str> = merged.iter().map(|r| r["contextId"].as_str().unwrap()).collect();
         assert_eq!(ids, ["a", "b", "c"]);
         assert_eq!(merged[0]["v"], 2);
+    }
+
+    #[test]
+    fn a_save_landing_after_the_edit_began_again_finds_no_edit() {
+        let edit = |id: &str, env: &str| QueueEdit {
+            id: id.into(),
+            env: env.to_owned().into(),
+            thread_id: "t".into(),
+            run_id: "r".into(),
+            original: String::new(),
+            attachments: Vec::new(),
+            removed_attachment: false,
+            records: Vec::new(),
+            saved: Default::default(),
+            saving: false,
+        };
+        let mut ui = QueueUi { edit: Some(edit("first", "a")), ..Default::default() };
+        assert!(ui.begun_edit("first").is_some());
+        // The same run, edited again on another environment's same-id thread.
+        ui.edit = Some(edit("second", "b"));
+        assert!(ui.begun_edit("first").is_none());
+        assert!(ui.begun_edit("second").is_some());
     }
 }

@@ -16,11 +16,16 @@ use crate::rpc::StreamEvent;
 use crate::theme::Tokens;
 use crate::worktree_setup::{self, Snapshot, Stage};
 
+/// A thread on its environment: same-id threads on two environments have their own setups.
+type Owner = (SharedString, String);
+
 #[derive(Default)]
 pub(super) struct SetupWatch {
-    thread_id: Option<String>,
-    /// Shared with the timeline row, so a refresh never copies the stage logs.
-    pub(super) snapshot: Option<Rc<Snapshot>>,
+    /// The thread the stream watches.
+    watching: Option<Owner>,
+    /// The card, with the environment that streamed it. Shared with the timeline row, so a
+    /// refresh never copies the stage logs.
+    snapshot: Option<(SharedString, Rc<Snapshot>)>,
     details_open: bool,
     _task: Option<Task<()>>,
 }
@@ -28,8 +33,39 @@ pub(super) struct SetupWatch {
 impl SetupWatch {
     /// Drops the stream with its socket, keeping the card, so the next sync resubscribes.
     pub(super) fn disconnect(&mut self) {
-        self.thread_id = None;
+        self.watching = None;
         self._task = None;
+    }
+
+    /// Watches `wanted` from scratch; a card it holds for that same thread stays up until the
+    /// stream resends it, as after a reconnect.
+    fn restart(&mut self, wanted: Option<Owner>) {
+        let same = |(env, snapshot): &(SharedString, Rc<Snapshot>)| {
+            wanted.as_ref().is_some_and(|(e, thread_id)| e == env && *thread_id == snapshot.thread_id)
+        };
+        let snapshot = self.snapshot.take().filter(same);
+        *self = Self { watching: wanted, snapshot, ..Self::default() };
+    }
+
+    /// Takes `owner`'s streamed snapshot unless the watch moved on or it is older than the card;
+    /// whether the card changed.
+    fn apply(&mut self, owner: &Owner, next: Option<Rc<Snapshot>>) -> bool {
+        let Some(next) = next.filter(|_| self.watching.as_ref() == Some(owner)) else { return false };
+        // Keep the newer of the two: a late event never rolls the card back.
+        let newer = self
+            .snapshot
+            .as_ref()
+            .is_none_or(|(_, held)| next.thread_id != held.thread_id || next.sequence >= held.sequence);
+        if newer {
+            self.snapshot = Some((owner.0.clone(), next));
+        }
+        newer
+    }
+
+    /// The card of `thread_id` on `env`.
+    fn card(&self, env: &str, thread_id: &str) -> Option<&Rc<Snapshot>> {
+        let (_, snapshot) = self.snapshot.as_ref().filter(|(e, s)| e == env && s.thread_id == thread_id)?;
+        Some(snapshot)
     }
 }
 
@@ -37,42 +73,37 @@ impl Workspace {
     /// Keeps one `subscribeWorktreeSetup` stream on an open thread that has or is preparing a worktree.
     pub(super) fn sync_worktree_setup(&mut self, cx: &mut Context<Self>) {
         let wanted = match (&self.target, self.open_projection()) {
-            (Some(Target::Thread { id, .. }), Some(projection)) => {
+            (Some(Target::Thread { env, id }), Some(projection)) => {
                 let preparing = projection.runs.last().is_some_and(|run| run.status == "preparing");
-                (preparing || projection.thread.worktree_path.is_some()).then(|| id.clone())
+                (preparing || projection.thread.worktree_path.is_some()).then(|| (env.clone(), id.clone()))
             }
             _ => None,
         };
-        // Without a socket the watch waits, so it subscribes once one connects.
-        let Some(client) = self.client() else { return };
-        if wanted == self.setup.thread_id {
+        if wanted == self.setup.watching {
             return;
         }
-        // A resubscribe after a reconnect keeps the card up until the stream resends it.
-        let snapshot = self.setup.snapshot.take().filter(|s| wanted.as_ref() == Some(&s.thread_id));
-        self.setup = SetupWatch { thread_id: wanted.clone(), snapshot, ..Default::default() };
-        let Some(thread_id) = wanted else { return };
-        let stream = client.stream("subscribeWorktreeSetup", json!({"threadId": thread_id}));
+        // Without its environment's socket the watch waits, so it subscribes once one connects.
+        let client = match &wanted {
+            Some((env, _)) => match self.env_client(env) {
+                Some(client) => Some(client),
+                None => return,
+            },
+            None => None,
+        };
+        self.setup.restart(wanted.clone());
+        let (Some(owner), Some(client)) = (wanted, client) else { return };
+        let stream = client.stream("subscribeWorktreeSetup", json!({"threadId": owner.1}));
         self.setup._task = Some(cx.spawn(async move |this, cx| {
             while let Some(event) = stream.next().await {
                 let ended = this.update(cx, |this, cx| match event {
-                    StreamEvent::Item(value) if this.setup.thread_id.as_deref() == Some(thread_id.as_str()) => {
+                    StreamEvent::Item(value) => {
                         let next = serde_json::from_value::<Option<Rc<Snapshot>>>(value).ok().flatten();
-                        // Keep the newer of the two: a late event never rolls the card back.
-                        let newer = match (&this.setup.snapshot, &next) {
-                            (Some(held), Some(next)) => {
-                                next.thread_id != held.thread_id || next.sequence >= held.sequence
-                            }
-                            _ => true,
-                        };
-                        if newer && next.is_some() {
-                            this.setup.snapshot = next;
+                        if this.setup.apply(&owner, next) {
                             this.refresh_rows(cx);
                             cx.notify();
                         }
                         false
                     }
-                    StreamEvent::Item(_) => false,
                     StreamEvent::End(_) => true,
                 });
                 if ended.unwrap_or(true) {
@@ -84,19 +115,19 @@ impl Workspace {
 
     /// The card's row, when it shows.
     pub(super) fn insert_worktree_setup(&self, rows: &mut Vec<crate::timeline::Row>) {
-        let Some(projection) = self.open_projection() else { return };
+        let (Some(Target::Thread { env, .. }), Some(projection)) = (&self.target, self.open_projection()) else {
+            return;
+        };
         let run_started = projection.runs.last().is_some_and(|run| run.started_at.is_some());
-        let snapshot = self.setup.snapshot.as_ref().filter(|s| s.thread_id == projection.thread.id);
+        let snapshot = self.setup.card(env, &projection.thread.id);
         if let Some(snapshot) = worktree_setup::visible(snapshot, run_started) {
             worktree_setup::insert_row(rows, snapshot, run_started);
         }
     }
 
     fn cancel_worktree_setup(&mut self, cx: &mut Context<Self>) {
-        let (Some(client), Some(snapshot)) = (self.client(), self.setup.snapshot.as_ref()) else { return };
-        if snapshot.phase != "running" {
-            return;
-        }
+        let Some((env, snapshot)) = &self.setup.snapshot else { return };
+        let Some(client) = self.env_client(env).filter(|_| snapshot.phase == "running") else { return };
         let input = json!({"threadId": snapshot.thread_id});
         cx.spawn(async move |this, cx| {
             if let Err(error) = client.request("worktreeSetup.cancel", input).await {
@@ -295,12 +326,17 @@ pub(super) fn setup_row(
     );
     if let Some(terminal_id) = terminal {
         let (this, thread_id) = (this.clone(), snapshot.thread_id.clone());
-        actions = actions.child(button("setup-terminal", IconName::Terminal, "Open terminal").on_click(
-            move |_, window, cx| {
+        actions =
+            actions.child(button("setup-terminal", IconName::Terminal, "Open terminal").on_click(move |_, _, cx| {
                 let (thread_id, terminal_id) = (thread_id.clone(), terminal_id.clone());
-                let _ = this.update(cx, |w, cx| w.reveal_thread_terminal(thread_id, terminal_id, window, cx));
-            },
-        ));
+                let _ = this.update(cx, |w, cx| {
+                    // The card shows the open thread's setup; its terminal runs on that thread's environment.
+                    let Some(Target::Thread { env, id }) = w.target.clone() else { return };
+                    if id == thread_id && w.setup.card(&env, &id).is_some() {
+                        w.open_worktree_setup_terminal(&env, &id, &terminal_id, cx);
+                    }
+                });
+            }));
     }
     if running {
         let this = this.clone();
@@ -331,4 +367,42 @@ pub(super) fn setup_row(
             .children(field("Setup", &snapshot.setup_script.as_ref().map(|s| s.command.clone())))
     });
     super::chat::lane(8., body.child(actions).children(details)).into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(thread_id: &str, sequence: u64) -> Option<Rc<Snapshot>> {
+        serde_json::from_value(json!({"threadId": thread_id, "phase": "running", "startedAt": "2026-01-01T00:00:00Z",
+            "sequence": sequence}))
+        .ok()
+    }
+
+    fn owner(env: &str, thread_id: &str) -> Owner {
+        (env.into(), thread_id.to_owned())
+    }
+
+    #[test]
+    fn a_same_id_thread_on_another_environment_never_shows_the_setup_card() {
+        let (a, b) = (owner("a", "t"), owner("b", "t"));
+        let mut watch = SetupWatch::default();
+        watch.restart(Some(a.clone()));
+        assert!(watch.apply(&a, snapshot("t", 2)));
+        assert!(watch.card("a", "t").is_some());
+        assert!(watch.card("b", "t").is_none(), "B's thread has no setup of its own");
+
+        // A reconnect resubscribes the same thread and keeps its card until the stream resends it.
+        watch.disconnect();
+        watch.restart(Some(a.clone()));
+        assert!(watch.card("a", "t").is_some());
+        assert!(!watch.apply(&a, snapshot("t", 1)), "a late event never rolls the card back");
+
+        watch.restart(Some(b.clone()));
+        assert!(watch.card("a", "t").is_none() && watch.card("b", "t").is_none(), "A's card is dropped");
+        assert!(!watch.apply(&a, snapshot("t", 3)), "A's stream lands after the switch");
+        assert!(watch.card("b", "t").is_none());
+        assert!(watch.apply(&b, snapshot("t", 1)));
+        assert_eq!(watch.card("b", "t").map(|s| s.sequence), Some(1));
+    }
 }
