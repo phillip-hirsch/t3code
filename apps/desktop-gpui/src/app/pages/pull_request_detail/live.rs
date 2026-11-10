@@ -182,6 +182,7 @@ impl Workspace {
                 self.pull_requests.panel = Some(panel);
                 self.rebuild_pr_timeline();
                 self.read_pr_avatars(&key, cx);
+                self.read_unread_pr(&key, cx);
                 cx.notify();
                 true
             }
@@ -420,30 +421,44 @@ impl Workspace {
             self.sessions().iter().filter_map(|s| Some((s.id.clone()?, s.client.clone()?))).collect();
         let start =
             crate::pull_requests::resync_follows(&mut self.pull_requests.refreshes, &connected, RpcClient::same_socket);
-        let mut started = Vec::new();
+        let started = !start.is_empty();
         for index in start {
             let (environment, client) = connected[index].clone();
             let task = self.follow_pr_refreshes(environment.clone(), client.clone(), cx);
-            self.pull_requests.refreshes.insert(environment.clone(), (client, task));
-            started.push(environment);
+            self.pull_requests.refreshes.insert(environment, (client, task));
         }
-        if !started.is_empty() {
-            self.read_what_was_missed_offline(&started, cx);
+        if started {
+            self.read_what_was_missed_offline(cx);
         }
     }
 
     /// Sockets came up: a list or a shown pull request that opened while they were down, or whose
     /// read failed, has nothing to refresh in place, so it reads now, as the web's queries rerun.
-    fn read_what_was_missed_offline(&mut self, environments: &[SharedString], cx: &mut Context<Self>) {
-        let unread = self.pull_requests.panel.as_ref().is_some_and(|panel| {
-            panel.detail.is_none()
-                && !panel.detail_loading
-                && environments.iter().any(|e| e.as_ref() == panel.reference.environment_id)
-        });
-        if unread && self.pr_panel_on_screen() {
-            self.read_pr_detail(cx);
+    fn read_what_was_missed_offline(&mut self, cx: &mut Context<Self>) {
+        if self.pr_panel_on_screen() {
+            self.read_unread_shown_pr(cx);
         }
         self.read_unread_pull_requests(cx);
+    }
+
+    /// The shown pull request comes on screen (its tab, the page or a thread's surface): what it
+    /// never read on its environment's current socket reads now, as the web's queries do on mount.
+    pub(in crate::app) fn read_unread_shown_pr(&mut self, cx: &mut Context<Self>) {
+        if let Some(key) = self.shown_pr_key() {
+            self.read_unread_pr(&key, cx);
+        }
+    }
+
+    fn read_unread_pr(&mut self, key: &str, cx: &mut Context<Self>) {
+        let (Some(client), Some(panel)) = (self.pull_request_client_of(key), self.pr_panel_ref(key)) else { return };
+        let socket = client.socket_id();
+        let (detail, guide) = (panel.needs_detail_read(&socket), panel.needs_guide_read(&socket));
+        if detail {
+            self.read_pr_detail_of(key, cx);
+        }
+        if guide {
+            self.read_pr_guide_of(key, cx);
+        }
     }
 
     fn follow_pr_refreshes(
@@ -892,6 +907,32 @@ fn page_panel_shortcut(command: &str, open: bool, shown: bool, has_url: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tab_opened_offline_reads_on_the_next_socket_and_a_failure_stands_until_another() {
+        let reference = Reference {
+            environment_id: "env".into(),
+            project_id: "p".into(),
+            host: None,
+            repository: "o/r".into(),
+            number: 1,
+        };
+        let mut panel = Panel::new(reference, None);
+        let (first, second) = (RpcClient::unopened(), RpcClient::unopened());
+        assert!(panel.needs_detail_read(&first.socket_id()), "opened offline: nothing read yet");
+        assert!(!panel.needs_guide_read(&first.socket_id()), "the guide reads only while its tab shows");
+        panel.detail_loading = true;
+        panel.detail_read_on = Some(first.socket_id());
+        assert!(!panel.needs_detail_read(&first.socket_id()), "a read is running");
+        panel.detail_loading = false;
+        assert!(!panel.needs_detail_read(&first.socket_id()), "it failed: showing the tab again keeps the error");
+        assert!(panel.needs_detail_read(&second.socket_id()), "a reconnect reads again");
+        panel.tab = Tab::Guide;
+        assert!(panel.needs_guide_read(&first.socket_id()), "the Guide tab shows with no guide read");
+        panel.guide_read_on = Some(first.socket_id());
+        assert!(!panel.needs_guide_read(&first.socket_id()));
+        assert!(panel.needs_guide_read(&second.socket_id()));
+    }
 
     #[test]
     fn page_panel_shortcuts_act_only_on_a_panel_they_can_reach() {

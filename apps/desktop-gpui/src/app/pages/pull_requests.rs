@@ -316,6 +316,7 @@ impl Workspace {
         } else if std::mem::take(&mut self.pull_requests.stale) {
             self.live_refresh_pull_requests(cx);
         }
+        self.read_unread_shown_pr(cx);
         self.follow_pull_requests(cx);
     }
 

@@ -288,6 +288,7 @@ impl Workspace {
         let Some(client) = self.pull_request_client_of(key) else { return };
         let Some(panel) = self.pr_panel(key) else { return };
         panel.guide_loading = true;
+        panel.guide_read_on = Some(client.socket_id());
         let reference = panel.reference.clone();
         let key = key.to_owned();
         cx.spawn(async move |this, cx| {
