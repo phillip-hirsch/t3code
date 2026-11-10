@@ -428,6 +428,7 @@ impl Workspace {
             }
             self.model_override = None;
             self.model_explicit = false;
+            self.drafts_changed(cx);
         } else if let Some(saved) = self.composer_selections.get_mut(target)
             && saved.model.as_ref() == Some(pick)
         {
@@ -437,6 +438,7 @@ impl Workspace {
                 saved.model = None;
                 saved.explicit = false;
             }
+            self.drafts_changed(cx);
         }
         cx.notify();
     }
