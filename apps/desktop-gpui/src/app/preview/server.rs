@@ -145,6 +145,8 @@ impl ChooserMessage {
 #[derive(Debug, Default)]
 struct Composition {
     marked: String,
+    /// A Windows dead key went to the platform, which composes it with the next key that types.
+    dead_key: bool,
 }
 
 impl Composition {
@@ -167,6 +169,20 @@ impl Composition {
 
     fn marked_range(&self) -> Option<Range<usize>> {
         (!self.marked.is_empty()).then(|| 0..self.marked.encode_utf16().count())
+    }
+
+    /// Whether a key down belongs to the platform's composition, so it types through the input
+    /// handler instead of reaching the page as a key (the terminal's `composing`). A Windows dead
+    /// key, and the key that completes it, need the `TranslateMessage` a handled key skips.
+    fn composing(&mut self, keystroke: &Keystroke, prefer_character_input: bool) -> bool {
+        let m = &keystroke.modifiers;
+        let plain = !(m.control || m.alt || m.platform || m.function);
+        let completes_dead_key = keystroke.key_char.is_some() && std::mem::take(&mut self.dead_key);
+        if plain && prefer_character_input {
+            self.dead_key = !completes_dead_key;
+            return true;
+        }
+        !self.marked.is_empty() || (plain && completes_dead_key)
     }
 }
 
@@ -255,6 +271,15 @@ impl EntityInputHandler for PageInput {
     fn accepts_text_input(&self, _: &mut Window, _: &mut Context<Self>) -> bool {
         self.live
     }
+}
+
+/// A key event for the page: a release, or a press that may ask for character input
+/// (`KeyDownEvent::prefer_character_input`, a Windows dead key).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyAction {
+    Down,
+    DownComposing,
+    Up,
 }
 
 /// Shift+Escape takes the keyboard back from the page (`aria-description` on the web's textarea).
@@ -894,12 +919,13 @@ impl Workspace {
                 }
             }))
             .on_key_down(cx.listener(move |this, e: &KeyDownEvent, window, cx| {
-                if this.server_key(&key_tab, "down", &e.keystroke, window, cx) {
+                let action = if e.prefer_character_input { KeyAction::DownComposing } else { KeyAction::Down };
+                if this.server_key(&key_tab, action, &e.keystroke, window, cx) {
                     cx.stop_propagation();
                 }
             }))
             .on_key_up(cx.listener(move |this, e: &KeyUpEvent, window, cx| {
-                if this.server_key(&key_up_tab, "up", &e.keystroke, window, cx) {
+                if this.server_key(&key_up_tab, KeyAction::Up, &e.keystroke, window, cx) {
                     cx.stop_propagation();
                 }
             }));
@@ -1134,11 +1160,12 @@ impl Workspace {
     fn server_key(
         &mut self,
         tab: &TabRef,
-        action: &str,
+        key_action: KeyAction,
         keystroke: &Keystroke,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        let action = if key_action == KeyAction::Up { "up" } else { "down" };
         let Some(stream) = self.preview.server.streams.get(tab) else { return false };
         // Keys typed into the page's own overlays, such as a prompt's response, stay there.
         if !stream.focus.is_focused(window) {
@@ -1152,6 +1179,12 @@ impl Workspace {
         }
         if !stream.mine() {
             return false;
+        }
+        if key_action != KeyAction::Up {
+            let prefer_character_input = key_action == KeyAction::DownComposing;
+            if stream.input.update(cx, |input, _| input.composition.composing(keystroke, prefer_character_input)) {
+                return false;
+            }
         }
         let m = &keystroke.modifiers;
         // Paste types the clipboard's text, as the page's own paste would.
@@ -1589,6 +1622,29 @@ mod tests {
         assert_eq!(composition.marked_range(), Some(0..2), "ranges count UTF-16 units");
         assert_eq!(composition.unmark(), Some("😀".into()), "an ended composition keeps its text");
         assert_eq!(composition.unmark(), None);
+    }
+
+    #[test]
+    fn dead_keys_and_compositions_type_through_the_input_handler() {
+        let key = |text: &'static str, key_char: Option<&str>| Keystroke {
+            key_char: key_char.map(str::to_owned),
+            ..Keystroke::parse(text).ok().unwrap()
+        };
+        let mut composition = Composition::default();
+        // Windows: the dead key asks for character input; the key that completes it does not.
+        assert!(composition.composing(&key("´", Some("´")), true), "the dead key");
+        assert!(composition.composing(&key("e", Some("é")), false), "the key it composes with");
+        assert!(!composition.composing(&key("e", Some("e")), false), "the dead key is spent");
+        // A dead key pressed twice types it, and a shortcut never composes.
+        assert!(composition.composing(&key("´", Some("´")), true));
+        assert!(composition.composing(&key("´", Some("´")), true));
+        assert!(!composition.composing(&key("e", Some("e")), false));
+        assert!(!composition.composing(&key("ctrl-c", Some("c")), false));
+        // Keys while an IME shows marked text belong to it.
+        composition.mark("に");
+        assert!(composition.composing(&key("enter", None), false));
+        composition.commit("に");
+        assert!(!composition.composing(&key("enter", None), false));
     }
 
     #[test]
