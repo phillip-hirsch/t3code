@@ -7,6 +7,7 @@ use crate::app::pages::settings::widgets::SettingsView;
 
 #[path = "source_control.rs"]
 pub(super) mod source_control;
+pub(in crate::app) use source_control::{AppSignIn, app_sign_in_of};
 #[path = "worktrees.rs"]
 mod worktrees;
 

@@ -83,10 +83,10 @@ struct Credentials {
     app_sign_in: Option<AppSignIn>,
 }
 
-struct AppSignIn {
-    app_name: &'static str,
-    host: &'static str,
-    install_url: &'static str,
+pub(in crate::app) struct AppSignIn {
+    pub(in crate::app) app_name: &'static str,
+    pub(in crate::app) host: &'static str,
+    pub(in crate::app) install_url: &'static str,
     revoke_url: &'static str,
 }
 
@@ -211,6 +211,12 @@ pub(in crate::app::pages::settings) fn secret_reference_fields() -> impl Iterato
 
 fn host(kind: &str) -> Option<&'static HostDefinition> {
     HOSTS.iter().find(|host| host.kind == kind)
+}
+
+/// `kind`'s forge app sign-in, with the host a pull request means when it names none (`publicHost`).
+pub(in crate::app) fn app_sign_in_of(kind: &str) -> Option<(&'static str, &'static AppSignIn)> {
+    let credentials = host(kind)?.credentials.as_ref()?;
+    Some((credentials.public_host, credentials.app_sign_in.as_ref()?))
 }
 
 /// `Option<string>` on the wire: `{"_tag": "Some", "value": …}`.

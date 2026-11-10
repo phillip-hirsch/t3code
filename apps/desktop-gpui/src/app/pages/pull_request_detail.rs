@@ -37,6 +37,7 @@ use crate::rpc::{RpcClient, RpcError};
 use crate::theme::{self, FONT_MONO, Tokens};
 use crate::timestamp::parse_ms;
 
+mod app_access;
 pub(super) mod avatars;
 pub(super) mod breakdown;
 mod code;
@@ -122,6 +123,9 @@ pub(in crate::app) struct Panel {
     guide_loading: bool,
     guide_error: Option<SharedString>,
     guide_starting: bool,
+    /// `sourceControl.appAccess` for the repository: what was asked, and its status once answered.
+    app_access: Option<(app_access::AppAccessQuery, Option<String>)>,
+    _app_access_read: Option<Task<()>>,
     code: Option<code::CodeTab>,
     write: write::WriteState,
     stack: Option<Rc<logic::Stack>>,
@@ -194,6 +198,8 @@ impl Panel {
             guide_loading: false,
             guide_error: None,
             guide_starting: false,
+            app_access: None,
+            _app_access_read: None,
             code: None,
             write: write::WriteState::default(),
             stack: None,
@@ -347,6 +353,7 @@ impl Workspace {
         if guides {
             self.read_pr_guide(cx);
         }
+        self.read_pr_app_access_of(&key, false, cx);
         cx.notify();
     }
 
@@ -523,6 +530,7 @@ impl Workspace {
                     }
                     if landed {
                         this.read_pr_avatars(&detail_key, cx);
+                        this.read_pr_app_access_of(&detail_key, false, cx);
                     }
                     cx.notify();
                 });
@@ -581,6 +589,7 @@ impl Workspace {
                 let Some(panel) = this.pr_panel(&key) else { return };
                 panel.refreshing = false;
                 this.read_pr_detail_of(&key, cx);
+                this.read_pr_app_access_of(&key, true, cx);
                 this.read_pr_stack_of(&key, cx);
                 if this.shown_pr_key().as_deref() == Some(key.as_str()) {
                     this.refresh_pr_code(cx);
@@ -956,7 +965,8 @@ impl Workspace {
             };
             return frame
                 .child(self.render_pr_seed_header(thread, &t, cx))
-                    .child(body)
+                .children(self.render_pr_app_access(&t))
+                .child(body)
                 .into_any_element();
         };
         let panel = self.pull_requests.panel.as_ref().expect("checked above");
@@ -979,6 +989,7 @@ impl Workspace {
         let composer = self.render_pr_composer(&detail, &t, cx);
         frame
             .child(header)
+            .children(self.render_pr_app_access(&t))
             .child(
                 self.pr_scroll_watch(body, cx)
                     .children(composer.map(|c| div().absolute().right(px(16.)).bottom(px(12.)).child(c))),
