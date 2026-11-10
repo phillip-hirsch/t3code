@@ -39,13 +39,13 @@ pub(in crate::app::pages) fn checks_body(
                 .child(div().flex_1().min_w_0().truncate().child(check.name.clone()))
                 .child(div().flex_none().text_color(t.muted_foreground).child(logic::check_status_label(check)))
                 .children(url.map(|url| {
-                    div()
-                        .id(ElementId::Name(format!("pr-check-details-{index}-{}", check.name).into()))
+                    // A focusable link, so Tab and Enter open it too.
+                    Button::new(ElementId::Name(format!("pr-check-details-{index}-{}", check.name).into()))
+                        .link()
+                        .xsmall()
                         .flex_none()
-                        .cursor_pointer()
-                        .text_color(t.primary)
-                        .hover(gpui_kit::Styled::underline)
-                        .child("Details")
+                        .text_xs()
+                        .label("Details")
                         .on_click(move |_, _, cx| cx.open_url(&url))
                 }))
         });
