@@ -6,7 +6,7 @@
 //! web's environment-id tiebreaks and cross-environment grouping drop out.
 
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 
 use crate::model::{ProjectShell, ScopedId, ThreadRef, ThreadShell};
@@ -146,74 +146,125 @@ pub enum ChildRequest {
 /// What each thread's children ask, by the parent's environment and id.
 pub type ChildRequests<'a> = HashMap<ThreadRef<'a>, ChildRequest>;
 
-/// `pendingSubagentRequestsByThread` in `client-runtime/src/state/threadShell.ts`. A child's
-/// parent lives on the child's environment.
+fn request_of(kind: &str) -> ChildRequest {
+    if kind == "user_input" { ChildRequest::Input } else { ChildRequest::Approval }
+}
+
+/// `subagentRequest`: what a subagent, or a task a linked environment delegated, asks. Provider-native
+/// subagents ask on their parent, and a question outlives its run, but the parent stops waiting once
+/// the run ends.
+fn subagent_request(thread: &ThreadShell) -> Option<ChildRequest> {
+    let kind = thread.pending_runtime_request.as_ref()?.kind.as_str();
+    let child = thread.lineage.relationship_to_parent.as_deref() == Some("subagent") || thread.delegated_from.is_some();
+    let asks = kind != "auth_refresh"
+        && child
+        && thread.creation_source.as_deref() != Some("provider")
+        && is_child_run_live(thread);
+    asks.then(|| request_of(kind))
+}
+
+/// `sideChatRequest`: a side chat asks its user directly, so questions roll up as well as approvals.
+fn side_chat_request(thread: &ThreadShell) -> Option<ChildRequest> {
+    let kind = thread.pending_runtime_request.as_ref()?.kind.as_str();
+    (kind != "auth_refresh" && thread.lineage.side_chat == Some(true)).then(|| request_of(kind))
+}
+
+/// Flags an approval on `first`, on `env`, and up its subagent and side chat chain there.
+fn flag_approval<'a>(
+    requests: &mut ChildRequests<'a>,
+    by_ref: &HashMap<ThreadRef<'a>, &'a ThreadShell>,
+    (env, first): ThreadRef<'a>,
+    mut seen: Vec<&'a str>,
+) {
+    let mut next = Some(first);
+    while let Some(id) = next.filter(|id| !seen.contains(id)) {
+        seen.push(id);
+        requests.insert((env, id), ChildRequest::Approval);
+        next = by_ref.get(&(env, id)).and_then(|parent| {
+            let chained = parent.lineage.relationship_to_parent.as_deref() == Some("subagent")
+                || parent.lineage.side_chat == Some(true);
+            chained.then_some(parent.lineage.parent_thread_id.as_deref()).flatten()
+        });
+    }
+}
+
+/// `pendingSubagentRequestsByThread` and `delegatedSubagentRequestsAtom` in
+/// `client-runtime/src/state/threadShell.ts`. A subagent's or side chat's parent lives on the child's
+/// environment; a delegated task's parent is the thread it names on the linked environment.
 pub fn child_requests(threads: &[ThreadShell]) -> ChildRequests<'_> {
     let mut requests: ChildRequests = HashMap::new();
     let by_ref: HashMap<ThreadRef, &ThreadShell> =
         threads.iter().map(|t| ((t.environment_id.as_ref(), t.id.as_str()), t)).collect();
     for child in threads {
-        let Some(kind) = child.pending_runtime_request.as_ref().map(|r| r.kind.as_str()) else { continue };
         let Some(parent_id) = child.lineage.parent_thread_id.as_deref() else { continue };
-        if kind == "auth_refresh" {
-            continue;
-        }
         let env: &str = &child.environment_id;
         if child.lineage.side_chat == Some(true) {
-            let request = if kind == "user_input" { ChildRequest::Input } else { ChildRequest::Approval };
-            if requests.get(&(env, parent_id)) != Some(&ChildRequest::Approval) {
+            if let Some(request) =
+                side_chat_request(child).filter(|_| requests.get(&(env, parent_id)) != Some(&ChildRequest::Approval))
+            {
                 requests.insert((env, parent_id), request);
             }
             continue;
         }
         // The coordinator answers its subagents' questions; only approvals climb.
-        if child.lineage.relationship_to_parent.as_deref() != Some("subagent") || kind == "user_input" {
-            continue;
-        }
-        // `subagentRequest`: provider-native subagents ask on their parent, and a
-        // question outlives its run, but the parent stops waiting once the run ends.
-        if child.creation_source.as_deref() == Some("provider") || !is_child_run_live(child) {
-            continue;
-        }
-        let mut seen = vec![child.id.as_str()];
-        let mut next = Some(parent_id);
-        while let Some(id) = next.filter(|id| !seen.contains(id)) {
-            seen.push(id);
-            requests.insert((env, id), ChildRequest::Approval);
-            next = by_ref.get(&(env, id)).and_then(|parent| {
-                let chained = parent.lineage.relationship_to_parent.as_deref() == Some("subagent")
-                    || parent.lineage.side_chat == Some(true);
-                chained.then_some(parent.lineage.parent_thread_id.as_deref()).flatten()
-            });
+        if child.lineage.relationship_to_parent.as_deref() == Some("subagent")
+            && subagent_request(child) == Some(ChildRequest::Approval)
+        {
+            flag_approval(&mut requests, &by_ref, (env, parent_id), vec![child.id.as_str()]);
         }
     }
-    requests
+    // A delegated task asks for an approval itself or through what it runs (its subagents, its own
+    // delegated tasks). Each pass settles one more hop of a chain; flags only grow, so environments
+    // delegating to each other settle too.
+    let mut tasks: Vec<(&ThreadShell, ThreadRef)> = threads
+        .iter()
+        .filter_map(|t| {
+            let from =
+                t.delegated_from.as_ref().filter(|from| from.environment_id.as_str() != t.environment_id.as_ref())?;
+            Some((t, (from.environment_id.as_str(), from.thread_id.as_str())))
+        })
+        .collect();
+    loop {
+        let before = tasks.len();
+        tasks.retain(|&(task, parent)| {
+            let asks = subagent_request(task) == Some(ChildRequest::Approval)
+                || requests.get(&(task.environment_id.as_ref(), task.id.as_str())) == Some(&ChildRequest::Approval);
+            if asks {
+                flag_approval(&mut requests, &by_ref, parent, Vec::new());
+            }
+            !asks
+        });
+        if tasks.len() == before {
+            return requests;
+        }
+    }
 }
 
-/// `childThreadInputsAtom`: the subagents and side chats under `parent`, at any depth,
-/// on `env`, that ask the user something (`subagentRequest`, `sideChatRequest`).
+/// `childThreadInputsAtom`: the subagents, side chats and delegated tasks under `parent` on `env`, at
+/// any depth and on any environment, that ask the user something.
 pub fn child_thread_inputs<'a>(threads: &'a [ThreadShell], env: &str, parent: &str) -> Vec<&'a ThreadShell> {
-    let is_child = |t: &ThreadShell| {
-        t.lineage.relationship_to_parent.as_deref() == Some("subagent") || t.lineage.side_chat == Some(true)
-    };
-    let asks = |t: &ThreadShell| {
-        let Some(kind) = t.pending_runtime_request.as_ref().map(|r| r.kind.as_str()) else { return false };
-        kind != "auth_refresh"
-            && (t.lineage.side_chat == Some(true)
-                || (t.creation_source.as_deref() != Some("provider") && is_child_run_live(t)))
-    };
-    let mut seen = vec![parent];
-    let mut pending = vec![parent];
+    let mut children: HashMap<ThreadRef, Vec<&ThreadShell>> = HashMap::new();
+    for thread in threads {
+        let lineage = &thread.lineage;
+        let under = lineage.relationship_to_parent.as_deref() == Some("subagent") || lineage.side_chat == Some(true);
+        let parent = match (lineage.parent_thread_id.as_deref().filter(|_| under), &thread.delegated_from) {
+            (Some(id), _) => (thread.environment_id.as_ref(), id),
+            (None, Some(from)) => (from.environment_id.as_str(), from.thread_id.as_str()),
+            (None, None) => continue,
+        };
+        children.entry(parent).or_default().push(thread);
+    }
+    let mut seen = HashSet::from([(env, parent)]);
+    let mut pending = VecDeque::from([(env, parent)]);
     let mut inputs = Vec::new();
-    while let Some(id) = pending.pop() {
-        let children = threads.iter().filter(|t| t.environment_id == env && is_child(t));
-        for child in children.filter(|t| t.lineage.parent_thread_id.as_deref() == Some(id)) {
-            if seen.contains(&child.id.as_str()) {
+    while let Some(key) = pending.pop_front() {
+        for &child in children.get(&key).into_iter().flatten() {
+            let child_key = (child.environment_id.as_ref(), child.id.as_str());
+            if !seen.insert(child_key) {
                 continue;
             }
-            seen.push(&child.id);
-            pending.insert(0, &child.id);
-            if asks(child) {
+            pending.push_back(child_key);
+            if subagent_request(child).is_some() || side_chat_request(child).is_some() {
                 inputs.push(child);
             }
         }
@@ -1500,6 +1551,71 @@ mod tests {
         assert_eq!(Facts::new(&elsewhere, &requests).child_request, None);
         assert_eq!(child_thread_inputs(&threads, "", "parent").len(), 1);
         assert!(child_thread_inputs(&threads, "remote", "parent").is_empty());
+    }
+
+    #[test]
+    fn tasks_delegated_to_linked_environments_ask_on_their_parent() {
+        let on = |env: &str, id: &str, extra: Value| ThreadShell {
+            environment_id: env.to_owned().into(),
+            ..thread(id, extra)
+        };
+        let task = |env: &str, id: &str, from: (&str, &str), request: Option<&str>| {
+            let mut extra = json!({"status": "running",
+                "delegatedFrom": {"environmentId": from.0, "threadId": from.1, "title": "Parent"}});
+            if let Some(kind) = request {
+                extra["pendingRuntimeRequest"] = json!({"kind": kind});
+            }
+            on(env, id, extra)
+        };
+        let parent = on("a", "parent", json!({"latestRunId": "r", "status": "running"}));
+        let asked = |threads: &[ThreadShell]| child_requests(threads).get(&("a", "parent")).copied();
+        let inputs = |threads: &[ThreadShell]| -> Vec<String> {
+            child_thread_inputs(threads, "a", "parent")
+                .iter()
+                .map(|t| format!("{}/{}", t.environment_id, t.id))
+                .collect()
+        };
+
+        // The task on B asks for an approval itself.
+        let threads = [parent.clone(), task("b", "task", ("a", "parent"), Some("command"))];
+        assert_eq!(asked(&threads), Some(ChildRequest::Approval));
+        assert_eq!(inputs(&threads), ["b/task"]);
+        // Its question goes to its coordinator, but the card still shows under the parent.
+        let threads = [parent.clone(), task("b", "task", ("a", "parent"), Some("user_input"))];
+        assert_eq!(asked(&threads), None);
+        assert_eq!(inputs(&threads), ["b/task"]);
+
+        // Through the task's own subagent on B.
+        let sub = on(
+            "b",
+            "sub",
+            json!({"status": "running", "pendingRuntimeRequest": {"kind": "command"},
+            "lineage": {"rootThreadId": "task", "parentThreadId": "task", "relationshipToParent": "subagent"}}),
+        );
+        let threads = [parent.clone(), sub, task("b", "task", ("a", "parent"), None)];
+        assert_eq!(asked(&threads), Some(ChildRequest::Approval));
+        assert_eq!(inputs(&threads), ["b/sub"]);
+
+        // Through a task it delegated on to C, listed before the hop it rides on.
+        let threads = [
+            task("c", "onward", ("b", "task"), Some("command")),
+            parent.clone(),
+            task("b", "task", ("a", "parent"), None),
+        ];
+        assert_eq!(asked(&threads), Some(ChildRequest::Approval));
+        assert_eq!(inputs(&threads), ["c/onward"]);
+
+        // A finished task's request is stale, and the same id on another environment is not the parent.
+        let mut done = task("b", "task", ("a", "parent"), Some("command"));
+        done.status = "idle".into();
+        assert_eq!(asked(&[parent.clone(), done]), None);
+        let elsewhere = [parent, task("b", "task", ("z", "parent"), Some("command"))];
+        assert_eq!(asked(&elsewhere), None);
+        assert!(inputs(&elsewhere).is_empty());
+
+        // Environments delegating to each other settle.
+        let threads = [task("a", "parent", ("b", "task"), None), task("b", "task", ("a", "parent"), Some("command"))];
+        assert_eq!(asked(&threads), Some(ChildRequest::Approval));
     }
 
     fn running(id: &str, working: bool, extra: Value) -> ThreadShell {
