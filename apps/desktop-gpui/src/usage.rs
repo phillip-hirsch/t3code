@@ -1572,21 +1572,166 @@ pub fn parse_price_form(form: &[String; 4]) -> Option<Value> {
     Some(Value::Object(price))
 }
 
-/// `usagePriceCell`: the saved rate and the placeholder its cell shows.
-pub fn price_cell(prices: &Value, model: &str, field: usize) -> (String, &'static str) {
-    let price = prices.get(model).filter(|p| p.is_object());
-    let value = price.map(|p| price_form(Some(p))[field].clone());
-    let placeholder = match (&value, PRICE_FIELDS[field].2) {
-        (None, _) => "Automatic",
-        (Some(_), true) => "Input rate",
-        (Some(_), false) => "0.00",
-    };
-    (value.unwrap_or_default(), placeholder)
+/// `UsagePriceTarget`: one environment the price editor reads and writes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PriceTarget {
+    pub id: String,
+    pub label: String,
+    /// Its `usagePriceOverrides`; `None` until its settings load.
+    pub prices: Option<Value>,
+    /// Its `usageModelAliases`; `None` when its server cannot map models.
+    pub aliases: Option<Value>,
+    /// Why it cannot be written now ("Offline", "Read-only access").
+    pub unavailable: Option<String>,
 }
 
-/// `usageAliasCell`: the saved "Map to" model.
-pub fn alias_cell(aliases: &Value, model: &str) -> String {
-    aliases.get(model).and_then(Value::as_str).unwrap_or_default().to_owned()
+/// What a cell shows across the targets: the shared value, else blank over "Mixed" or "Unavailable".
+pub const MIXED: &str = "Mixed";
+pub const UNAVAILABLE: &str = "Unavailable";
+
+/// `usagePriceCell`: the rate every target saves for `model`, and the placeholder its cell shows.
+pub fn price_cell(targets: &[PriceTarget], model: &str, field: usize) -> (String, &'static str) {
+    if targets.iter().any(|t| t.prices.is_none()) {
+        return (String::new(), UNAVAILABLE);
+    }
+    let values: Vec<Option<String>> = targets
+        .iter()
+        .map(|t| {
+            let price = t.prices.as_ref().and_then(|prices| prices.get(model)).filter(|p| p.is_object());
+            price.map(|p| price_form(Some(p))[field].clone())
+        })
+        .collect();
+    let first = values.first().cloned().flatten();
+    if values.iter().any(|v| *v != values[0]) {
+        return (String::new(), MIXED);
+    }
+    let placeholder = match (values.first(), PRICE_FIELDS[field].2) {
+        (Some(None), _) => "Automatic",
+        (_, true) => "Input rate",
+        (_, false) => "0.00",
+    };
+    (first.unwrap_or_default(), placeholder)
+}
+
+/// `usageAliasCell`: the "Map to" model every target saves for `model`.
+pub fn alias_cell(targets: &[PriceTarget], model: &str) -> (String, &'static str) {
+    let Some(values) = targets
+        .iter()
+        .map(|t| Some(t.aliases.as_ref()?.get(model).and_then(Value::as_str).unwrap_or_default()))
+        .collect::<Option<Vec<&str>>>()
+    else {
+        return (String::new(), UNAVAILABLE);
+    };
+    match values.first() {
+        Some(first) if values.iter().any(|v| v != first) => (String::new(), MIXED),
+        first => (first.copied().unwrap_or_default().to_owned(), "None"),
+    }
+}
+
+/// The models some target prices or maps, sorted.
+pub fn custom_models(targets: &[PriceTarget]) -> Vec<String> {
+    let mut models: Vec<String> = targets
+        .iter()
+        .flat_map(|t| [&t.prices, &t.aliases])
+        .flat_map(|map| map.as_ref().and_then(Value::as_object).into_iter().flat_map(|m| m.keys().cloned()))
+        .collect();
+    models.sort();
+    models.dedup();
+    models
+}
+
+/// `usagePriceTableErrors`: each row's error on the targets that can take a write.
+pub fn price_table_errors(targets: &[PriceTarget], drafts: &[PriceDraft]) -> Vec<(usize, String)> {
+    let mut errors: Vec<(usize, String)> = Vec::new();
+    for target in targets.iter().filter(|t| t.unavailable.is_none()) {
+        let Some(prices) = &target.prices else { continue };
+        let aliases = target.aliases.as_ref().unwrap_or(&Value::Null);
+        for (index, error) in price_table_changes(prices, aliases, &target.label, drafts).err().unwrap_or_default() {
+            errors.retain(|(seen, _)| *seen != index);
+            errors.push((index, error));
+        }
+    }
+    errors.sort_by_key(|(index, _)| *index);
+    errors
+}
+
+/// `writeUsagePrices`' plan for one target: the `server.updateSettings` input, `None` when
+/// nothing changes there, or why it fails without a request. Mixed cells left alone keep the
+/// target's own rate.
+pub fn price_write(target: &PriceTarget, drafts: &[PriceDraft]) -> Result<Option<Value>, String> {
+    if let Some(unavailable) = &target.unavailable {
+        return Err(unavailable.clone());
+    }
+    let prices = target.prices.as_ref().unwrap_or(&Value::Null);
+    let aliases = target.aliases.as_ref().unwrap_or(&Value::Null);
+    let (prices, aliases) = price_table_changes(prices, aliases, &target.label, drafts)
+        .map_err(|errors| errors.into_iter().next().map(|(_, error)| error).unwrap_or_default())?;
+    if !aliases.is_empty() && target.aliases.is_none() {
+        return Err("Update server to map models".into());
+    }
+    let mut patch = serde_json::Map::new();
+    if !prices.is_empty() {
+        patch.insert("usagePriceOverrides".into(), Value::Object(prices));
+    }
+    if !aliases.is_empty() {
+        patch.insert("usageModelAliases".into(), Value::Object(aliases));
+    }
+    Ok((!patch.is_empty()).then(|| json!({"patch": patch})))
+}
+
+/// One destination's save, as the status list shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PriceSave {
+    Saving,
+    Saved,
+    Failed(String),
+}
+
+/// `SaveAttempt`: the drafts a save sent, where to, and how each destination settled.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PriceAttempt {
+    pub drafts: Vec<PriceDraft>,
+    /// `(id, label)`, in the order the list shows them.
+    pub destinations: Vec<(String, String)>,
+    pub results: Vec<(String, PriceSave)>,
+}
+
+impl PriceAttempt {
+    /// A save to `targets`; a retry keeps the first attempt's destinations and settled results.
+    pub fn start(previous: Option<Self>, retry: bool, drafts: Vec<PriceDraft>, targets: &[(String, String)]) -> Self {
+        let (destinations, mut results) = match previous.filter(|_| retry) {
+            Some(previous) => (previous.destinations, previous.results),
+            None => (targets.to_vec(), Vec::new()),
+        };
+        for (id, _) in targets {
+            results.retain(|(seen, _)| seen != id);
+            results.push((id.clone(), PriceSave::Saving));
+        }
+        Self { drafts, destinations, results }
+    }
+
+    pub fn status(&self, id: &str) -> Option<&PriceSave> {
+        self.results.iter().find(|(seen, _)| seen == id).map(|(_, status)| status)
+    }
+
+    pub fn record(&mut self, id: &str, status: PriceSave) {
+        if let Some(entry) = self.results.iter_mut().find(|(seen, _)| seen == id) {
+            entry.1 = status;
+        }
+    }
+
+    /// Destinations whose save failed, which a retry sends again.
+    pub fn failed(&self) -> Vec<(String, String)> {
+        self.destinations
+            .iter()
+            .filter(|(id, _)| matches!(self.status(id), Some(PriceSave::Failed(_))))
+            .cloned()
+            .collect()
+    }
+
+    pub fn settled(&self) -> bool {
+        !self.results.iter().any(|(_, status)| *status == PriceSave::Saving)
+    }
 }
 
 /// A settings patch: keys to their new values.
@@ -2206,8 +2351,72 @@ mod tests {
         assert_eq!(parse_rate(",5"), Some(0.5));
         assert_eq!(parse_rate("1e-3"), Some(0.001));
         assert_eq!(parse_rate("-1"), None);
-        assert_eq!(price_cell(&prices, "old", 2), (String::new(), "Input rate"));
-        assert_eq!(price_cell(&prices, "new", 0), (String::new(), "Automatic"));
+        let here = PriceTarget {
+            id: "a".into(),
+            label: "Here".into(),
+            prices: Some(prices),
+            aliases: Some(aliases),
+            unavailable: None,
+        };
+        assert_eq!(price_cell(std::slice::from_ref(&here), "old", 2), (String::new(), "Input rate"));
+        assert_eq!(price_cell(std::slice::from_ref(&here), "new", 0), (String::new(), "Automatic"));
+    }
+
+    fn price_target(id: &str, prices: Value, aliases: Option<Value>) -> PriceTarget {
+        PriceTarget { id: id.into(), label: id.to_uppercase(), prices: Some(prices), aliases, unavailable: None }
+    }
+
+    #[test]
+    fn prices_edit_several_environments_and_mixed_cells_keep_each_ones_rate() {
+        let rate = |input: u32| json!({"m": {"inputCostPerMillionTokens": input, "outputCostPerMillionTokens": 2}});
+        let targets = [price_target("a", rate(1), Some(json!({}))), price_target("b", rate(3), Some(json!({})))];
+        assert_eq!(price_cell(&targets, "m", 0), (String::new(), MIXED));
+        assert_eq!(price_cell(&targets, "m", 1), ("2".into(), "0.00"), "the same output rate shows");
+        assert_eq!(alias_cell(&targets, "m"), (String::new(), "None"));
+        assert_eq!(custom_models(&targets), ["m"]);
+        let mut offline = targets[1].clone();
+        offline.prices = None;
+        assert_eq!(price_cell(&[targets[0].clone(), offline], "m", 1), (String::new(), UNAVAILABLE));
+        let old_server = price_target("c", rate(1), None);
+        assert_eq!(alias_cell(&[targets[0].clone(), old_server.clone()], "m"), (String::new(), UNAVAILABLE));
+
+        // Only the output was edited: each environment keeps its own input rate.
+        let output =
+            PriceDraft { model: "m".into(), values: [None, Some("5".into()), None, None], ..PriceDraft::default() };
+        let patch = |target: &PriceTarget| price_write(target, std::slice::from_ref(&output)).unwrap().unwrap();
+        assert_eq!(patch(&targets[0])["patch"]["usagePriceOverrides"]["m"]["inputCostPerMillionTokens"], 1.);
+        assert_eq!(patch(&targets[1])["patch"]["usagePriceOverrides"]["m"]["inputCostPerMillionTokens"], 3.);
+        assert_eq!(patch(&targets[1])["patch"]["usagePriceOverrides"]["m"]["outputCostPerMillionTokens"], 5.);
+        let same = PriceDraft { values: [None, Some("2".into()), None, None], ..output.clone() };
+        assert_eq!(price_write(&targets[0], &[same]), Ok(None), "nothing changes there, so no request");
+        let mapped = PriceDraft { model: "n".into(), is_new: true, alias: Some("m".into()), ..PriceDraft::default() };
+        assert_eq!(price_write(&old_server, &[mapped]), Err("Update server to map models".into()));
+        let mut read_only = targets[0].clone();
+        read_only.unavailable = Some("Read-only access".into());
+        assert_eq!(price_write(&read_only, std::slice::from_ref(&output)), Err("Read-only access".into()));
+        let blank = PriceDraft { values: [Some(String::new()), None, None, None], ..output };
+        assert_eq!(
+            price_table_errors(&[targets[0].clone(), read_only], &[blank]),
+            [(0, "Input is required on A.".to_owned())],
+            "a target that cannot be written does not block the others"
+        );
+    }
+
+    #[test]
+    fn a_retry_resends_only_the_failed_destinations() {
+        let destinations = [("a".to_owned(), "A".to_owned()), ("b".to_owned(), "B".to_owned())];
+        let mut attempt = PriceAttempt::start(None, false, Vec::new(), &destinations);
+        assert!(!attempt.settled());
+        attempt.record("a", PriceSave::Saved);
+        attempt.record("b", PriceSave::Failed("Offline".into()));
+        assert!(attempt.settled());
+        let failed = attempt.failed();
+        assert_eq!(failed, [("b".to_owned(), "B".to_owned())]);
+        let retry = PriceAttempt::start(Some(attempt), true, Vec::new(), &failed);
+        assert_eq!(retry.destinations.len(), 2, "the list keeps every destination");
+        assert_eq!((retry.status("a"), retry.status("b")), (Some(&PriceSave::Saved), Some(&PriceSave::Saving)));
+        let fresh = PriceAttempt::start(Some(retry), false, Vec::new(), &destinations[..1]);
+        assert_eq!(fresh.destinations.len(), 1, "a new save starts over");
     }
 
     #[test]
