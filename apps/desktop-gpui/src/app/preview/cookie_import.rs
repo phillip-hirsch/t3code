@@ -229,9 +229,17 @@ impl Workspace {
         if self.preview.cookie_import.in_flight || !self.import_target_listed(&target) {
             return Task::ready(ImportOutcome::blocked(Reason::ReadFailed));
         }
+        let storage = match Storage::of(Some(target.profile_id())) {
+            Ok(storage) => storage,
+            Err(refusal) => {
+                return Task::ready(ImportOutcome::Blocked {
+                    reason: Reason::UnsupportedPlatform,
+                    message: Some(refusal.to_owned()),
+                });
+            }
+        };
         self.preview.cookie_import.in_flight = true;
         cx.notify();
-        let storage = Storage::of(Some(target.profile_id()));
         let read = cx.background_executor().spawn(async move { browser_import::read_cookies(source, &directory) });
         cx.spawn_in(window, async move |this, cx| {
             let outcome = match read.await {

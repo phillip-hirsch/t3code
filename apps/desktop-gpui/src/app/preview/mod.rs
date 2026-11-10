@@ -48,6 +48,7 @@ mod server;
 mod viewport;
 
 pub(super) use cookie_import::{ImportOutcome, ImportTarget, cookie_import_denial};
+pub(super) use profiles::{CUSTOM_PROFILES_UNAVAILABLE, custom_profiles_available};
 
 gpui_kit::actions!(preview, [TogglePreview]);
 
@@ -924,7 +925,14 @@ impl Workspace {
             return;
         }
         let session = self.preview.threads.session(tab);
-        let partition = profiles::Storage::of(session.and_then(|s| s.profile_id.as_deref()));
+        let partition = match profiles::Storage::of(session.and_then(|s| s.profile_id.as_deref())) {
+            Ok(partition) => partition,
+            Err(refusal) => {
+                self.error = Some(refusal.into());
+                cx.notify();
+                return;
+            }
+        };
         self.preview.starting.insert(tab.clone(), url.to_owned());
         let tab = tab.clone();
         cx.spawn_in(window, async move |this, cx| {
@@ -1001,7 +1009,7 @@ impl Workspace {
         let url = rebuild_url(&hosted.status, hosted.view.read(cx).raw().url().ok())?;
         let session = self.preview.threads.session(tab);
         Some(PageSource {
-            storage: profiles::Storage::of(session.and_then(|s| s.profile_id.as_deref())),
+            storage: profiles::Storage::of(session.and_then(|s| s.profile_id.as_deref())).ok()?,
             url,
             chords: self.preview.chords.json.clone(),
         })

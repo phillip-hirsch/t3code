@@ -424,6 +424,11 @@ impl Workspace {
         if self.preview.cookie_import.in_flight {
             return;
         }
+        if !crate::app::preview::custom_profiles_available() {
+            let refusal = Notification::error(crate::app::preview::CUSTOM_PROFILES_UNAVAILABLE);
+            window.push_notification(refusal.title("Could not create a profile"), cx);
+            return;
+        }
         let settings = &self.client_settings.values;
         let name =
             preview::unique_profile_name("New profile", &preview::resolve_profiles(&preview::user_profiles(settings)));
