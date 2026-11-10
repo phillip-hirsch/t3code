@@ -352,7 +352,7 @@ impl Workspace {
             return;
         }
         let Some(client) = self.env_client(environment) else { return };
-        if !self.environment_grants(environment, SETTINGS_WRITE) {
+        if self.list_models_refusal(environment).is_some() {
             return;
         }
         let catalog = &mut self.settings_ui.text_generators;
@@ -383,6 +383,13 @@ impl Workspace {
             });
         })
         .detach();
+    }
+
+    /// `server.listTextGeneratorModels` spends the stored key, so it needs `settings:write` on
+    /// `environment`: `None` when this connection has it, else the web's refusal.
+    fn list_models_refusal(&self, environment: &str) -> Option<String> {
+        (!self.environment_grants(environment, SETTINGS_WRITE))
+            .then(|| format!("This connection requires {SETTINGS_WRITE}."))
     }
 
     fn reread_text_generator_models(&mut self, environment: &SharedString, id: &str, cx: &mut Context<Self>) {
@@ -768,7 +775,7 @@ impl GeneratorWizard {
         let Some(config) = self.config(cx) else { return };
         let Some(workspace) = self.workspace.upgrade() else { return };
         let environment = self.environment.clone();
-        let (client, id) = {
+        let (client, id, refusal) = {
             let workspace = workspace.read(cx);
             if workspace.providers_read_only_on(Some(&environment)) {
                 return;
@@ -778,9 +785,14 @@ impl GeneratorWizard {
                 .saved_id
                 .clone()
                 .unwrap_or_else(|| next_id(PRESETS[self.preset].id, &info.settings, &info.providers));
-            (workspace.env_client(&environment), id)
+            (workspace.env_client(&environment), id, workspace.list_models_refusal(&environment))
         };
         let Some(client) = client else { return };
+        if let Some(refusal) = refusal {
+            self.check_error = Some(refusal);
+            cx.notify();
+            return;
+        }
         self.checking = true;
         self.check_error = None;
         cx.notify();
@@ -820,12 +832,22 @@ impl GeneratorWizard {
         if !self.testing.insert(task) {
             return;
         }
-        let Some(client) = self.workspace.upgrade().and_then(|w| w.read(cx).env_client(&self.environment)) else {
+        let Some(workspace) = self.workspace.upgrade() else {
             self.testing.remove(task);
             return;
         };
-        cx.notify();
+        let Some(client) = workspace.read(cx).env_client(&self.environment) else {
+            self.testing.remove(task);
+            return;
+        };
         let key = format!("{}:{}", selection.instance_id, selection.model);
+        if let Some(refusal) = workspace.read(cx).list_models_refusal(&self.environment) {
+            self.testing.remove(task);
+            self.tests.insert(task, (key, Some(refusal)));
+            cx.notify();
+            return;
+        }
+        cx.notify();
         let payload = json!({ "id": selection.instance_id, "test": true, "model": selection.model });
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request(LIST_MODELS, payload).await;
@@ -1134,9 +1156,14 @@ impl ModelsDialog {
         }
         let Some(workspace) = self.workspace.upgrade() else { return };
         let Some(client) = workspace.read(cx).env_client(&self.environment) else { return };
+        let (environment, id, name) = (self.environment.clone(), self.id.clone(), display_name(&self.config));
+        if let Some(refusal) = workspace.read(cx).list_models_refusal(&environment) {
+            let title = SharedString::from(format!("Couldn't load {name} models"));
+            window.push_notification(Notification::error(refusal).title(title), cx);
+            return;
+        }
         self.refreshing = true;
         cx.notify();
-        let (environment, id, name) = (self.environment.clone(), self.id.clone(), display_name(&self.config));
         let payload = json!({ "id": id, "refresh": true });
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request(LIST_MODELS, payload).await;
@@ -1163,7 +1190,10 @@ impl ModelsDialog {
         let list = self.workspace.upgrade().and_then(|workspace| {
             workspace.update(cx, |w, cx| {
                 w.ensure_text_generator_models(&self.environment, &self.id, &self.config, cx);
-                w.settings_ui.text_generators.list(&self.environment, &self.id).cloned()
+                match w.list_models_refusal(&self.environment) {
+                    Some(refusal) => Some(ModelList::Failed(refusal)),
+                    None => w.settings_ui.text_generators.list(&self.environment, &self.id).cloned(),
+                }
             })
         });
         let description = match &list {
