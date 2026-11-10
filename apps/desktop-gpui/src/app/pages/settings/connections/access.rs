@@ -495,6 +495,7 @@ impl Workspace {
                     .py(px(8.))
                     .gap(px(8.))
                     .cursor_pointer()
+                    .map(|el| ui::fold_trigger(el, t.ring))
                     .on_click(toggle)
                     .child(ui::chevron(open, 16., t.muted_foreground))
                     .child(text_sm(div().flex_none().font_weight(FontWeight::MEDIUM)).child("Authorized clients"))
@@ -694,6 +695,7 @@ fn permissions_details(state: &Entity<AccessState>, s: &AccessState, connected: 
         .min_h(px(44.))
         .gap(px(8.))
         .cursor_pointer()
+        .map(|el| ui::fold_trigger(el, t.ring))
         .on_click(toggle)
         .child(text_sm(div().font_weight(FontWeight::MEDIUM)).child("Permissions"))
         .child(ui::chevron(open, 12., t.muted_foreground));

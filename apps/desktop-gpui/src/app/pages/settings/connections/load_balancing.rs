@@ -12,7 +12,7 @@ use gpui_kit::{
 use serde_json::{Map, Value, json};
 
 use super::super::widgets::{ROW_SELECT_MIN_WIDTH, select_trigger, switch};
-use super::ui::{text_sm, text_xs};
+use super::ui::{fold_trigger, text_sm, text_xs};
 use crate::app::Workspace;
 use crate::load_balancing::{self, PREFERENCES};
 use crate::theme::{self, Tokens};
@@ -81,6 +81,7 @@ impl Workspace {
                     .py(px(8.))
                     .gap(px(8.))
                     .cursor_pointer()
+                    .map(|el| fold_trigger(el, t.ring))
                     .on_click(cx.listener(|this, _, _, cx| {
                         if !this.settings_ui.advanced_open.remove(SECTION) {
                             this.settings_ui.advanced_open.insert(SECTION);
