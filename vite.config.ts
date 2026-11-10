@@ -174,6 +174,7 @@ export default defineConfig({
       "apps/desktop-gpui/vendor/gpui-pre/**",
       "apps/desktop-gpui/vendor/gpui-pre-windows/**",
       "apps/desktop-gpui/vendor/gpui-pre-linux/**",
+      "apps/desktop-gpui/vendor/gpui-pre-macos/**",
       // Macroscope requires one glob per line; Markdown formatting corrupts it.
       ".macroscope/ignore.md",
       ".alchemy",

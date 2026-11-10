@@ -170,6 +170,11 @@ Each key press, repeat and release records whether its keysym is a keypad one
 - `src/linux/wayland/client.rs`, `src/linux/wayland/window.rs`: `WaylandClientState::key_on_numpad`,
   set in the keyboard `Key` event, the repeat timer and `CommitString`, and `key_on_numpad`.
 
+## gpui-pre-macos 0.3.11
+
+GPUI's macOS platform (Zed's `gpui_macos`), which gpui-kit pulls in through `gpui-pre-platform`.
+Unmodified.
+
 ## gpui-base 0.9.0
 
 **Text decorations on the textarea.** The composer needs atomic inline tokens (its chips),
