@@ -89,7 +89,8 @@ impl Workspace {
         let view = cx.entity();
         let view_for_menu = view.clone();
         let menu_tokens = *tokens;
-        let build = move |mut menu: PopupMenu, window: &mut Window, _: &mut Context<PopupMenu>| {
+        let build = move |mut menu: PopupMenu, window: &mut Window, cx: &mut Context<PopupMenu>| {
+            super::track_dropdown_menu(&view, cx);
             for editor in open_in.listed() {
                 let (picked, item_editor) = (editor.clone(), editor.clone());
                 let label = SharedString::from(editor_label(editor).to_owned());

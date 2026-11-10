@@ -2167,6 +2167,7 @@ impl Workspace {
                     // `ghost-muted`: the open menu keeps its trigger's accent fill (`data-pressed`).
                     .selected(add_menu_open)
                     .dropdown_menu(move |menu: PopupMenu, window, cx| {
+                        crate::app::files::clear_on_release(&view, cx, |this| &mut this.right_panel.add_menu_open);
                         // `MenuItem`'s `sm:min-h-7 sm:text-sm`.
                         let rem = window.rem_size();
                         let menu = menu.min_w(px(200.)).metrics(MenuMetrics {
@@ -2504,7 +2505,10 @@ impl Workspace {
                         .rounded(px(6.))
                         .icon(icon("icons/chevron-down.svg"))
                         .tooltip("Open browser in a profile")
-                        .dropdown_menu(move |menu: PopupMenu, window, _| {
+                        .dropdown_menu(move |menu: PopupMenu, window, cx| {
+                            crate::app::files::clear_on_release(&view, cx, |this| {
+                                &mut this.right_panel.profiles_menu_open
+                            });
                             profile_items(menu.max_w(px(224.)), &profiles, &view, window)
                         })
                         .on_open_change(cx.listener(|this, open: &bool, _, cx| {

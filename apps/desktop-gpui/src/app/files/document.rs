@@ -787,6 +787,7 @@ impl Workspace {
     /// Shows the drawn document's view and hides the rest, after the panel recorded what it
     /// drew; like the browser's views, a GPUI overlay hides it. Views not drawn lately close.
     pub(in crate::app) fn sync_document_views(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settle_file_menu(window, cx);
         let covered = self.browser_covered(window, cx);
         let dialog_open = window.has_active_dialog(cx);
         let menu_open = self.files.menu_open;

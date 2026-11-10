@@ -116,7 +116,9 @@ pub(super) struct FilesState {
     assets: asset::Assets,
     /// A menu of the file surfaces is open; native document views hide so it shows.
     pub(super) menu_open: bool,
-    _menu: Option<gpui_kit::Subscription>,
+    _menu: Vec<gpui_kit::Subscription>,
+    /// The tracked menu was released, so `menu_open` clears next frame unless a menu replaced it.
+    menu_released: bool,
     /// A workspace image's or video's actions menu.
     media_menu: Option<media::MediaMenu>,
     /// The crumb menu that is open and the folder it lists.
@@ -143,23 +145,77 @@ pub(super) fn menu_open_change(view: Entity<Workspace>) -> impl Fn(&bool, &mut g
     }
 }
 
-/// Marks a file surface (context) menu open until it is dismissed. Called from the menu's builder, which
-/// runs while the window draws, so the change lands after the frame.
+/// Marks a file surface (context) menu open until it is dismissed or released. Called from the
+/// menu's builder, which runs while the window draws, so the change lands after the frame.
 pub(super) fn track_menu(view: &Entity<Workspace>, cx: &mut gpui_kit::Context<gpui_kit::component::menu::PopupMenu>) {
+    track(view, true, cx);
+}
+
+/// Marks a file surface dropdown's menu open until it is released: its trigger can leave the tree
+/// (navigating away) without `on_open_change(false)`. `menu_open_change` reports its dismissal.
+pub(super) fn track_dropdown_menu(
+    view: &Entity<Workspace>,
+    cx: &mut gpui_kit::Context<gpui_kit::component::menu::PopupMenu>,
+) {
+    track(view, false, cx);
+}
+
+fn track(view: &Entity<Workspace>, dismiss: bool, cx: &mut gpui_kit::Context<gpui_kit::component::menu::PopupMenu>) {
     let menu = cx.entity().downgrade();
     let view = view.clone();
     cx.defer(move |cx| {
         let Some(menu) = menu.upgrade() else { return };
         view.update(cx, |this, cx| {
             this.files.menu_open = true;
-            this.files._menu = Some(cx.subscribe(&menu, |this, _, _: &gpui_kit::DismissEvent, cx| {
-                this.files.menu_open = false;
-                this.files._menu = None;
+            this.files.menu_released = false;
+            this.files._menu = vec![cx.observe_release(&menu, |this, _, cx| {
+                this.files.menu_released = true;
                 cx.notify();
-            }));
+            })];
+            if dismiss {
+                this.files._menu.push(cx.subscribe(&menu, |this, _, _: &gpui_kit::DismissEvent, cx| {
+                    this.files.menu_open = false;
+                    this.files._menu.clear();
+                    cx.notify();
+                }));
+            }
             cx.notify();
         });
     });
+}
+
+/// Clears `flag` once the dropdown menu being built is released: its trigger can leave the tree
+/// (navigating away) while it is open, without `on_open_change(false)`.
+pub(super) fn clear_on_release(
+    view: &Entity<Workspace>,
+    cx: &mut gpui_kit::Context<gpui_kit::component::menu::PopupMenu>,
+    flag: fn(&mut Workspace) -> &mut bool,
+) {
+    let view = view.downgrade();
+    cx.on_release(move |_, cx| {
+        _ = view.update(cx, |this, cx| {
+            *flag(this) = false;
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+impl Workspace {
+    /// A released file menu (its owner left, or a crumb menu moved to another folder) clears
+    /// `menu_open` after the frame drawn now, which builds any menu reopened in its place.
+    pub(super) fn settle_file_menu(&mut self, window: &mut gpui_kit::Window, cx: &mut gpui_kit::Context<Self>) {
+        if !self.files.menu_released {
+            return;
+        }
+        cx.on_next_frame(window, |this, _, cx| {
+            if std::mem::take(&mut this.files.menu_released) {
+                this.files.menu_open = false;
+                this.files._menu.clear();
+                cx.notify();
+            }
+        });
+    }
 }
 
 /// `panelPath` for a link outside the workspace: a host file or folder opens in the panel,

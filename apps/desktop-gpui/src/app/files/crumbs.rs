@@ -205,6 +205,7 @@ impl FolderMenu {
 
     /// The menu for the folder it lists now, rebuilt when that folder's listing lands or fails.
     fn build(&self, menu: PopupMenu, window: &mut Window, cx: &mut Context<PopupMenu>) -> PopupMenu {
+        super::track_dropdown_menu(&self.view, cx);
         let folder = self.directory(cx);
         let (handle, view, root, crumb) =
             (cx.entity().downgrade(), self.view.clone(), self.root.clone(), self.crumb.clone());
