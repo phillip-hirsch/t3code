@@ -21,6 +21,8 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use super::Workspace;
+use super::chat::view_pane;
+use super::side_chat::ChatPane;
 use crate::rpc::RpcClient;
 use crate::theme::Tokens;
 use crate::user_message::{self as logic, Attachment, Layout, Media, UserContent};
@@ -40,7 +42,7 @@ const UNAVAILABLE: &str = "This context is no longer available.";
 const ATTACHMENT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The image's thumbnail once loaded; the first ask starts its load (`useAssetUrls`).
-fn thumbnail(this: &WeakEntity<Workspace>, id: &str, cx: &mut App) -> Option<Arc<Image>> {
+fn thumbnail(this: &WeakEntity<Workspace>, pane: ChatPane, id: &str, cx: &mut App) -> Option<Arc<Image>> {
     let workspace = this.upgrade()?;
     let w = workspace.read(cx);
     if let Some(image) = w.attachment_image(id) {
@@ -49,7 +51,7 @@ fn thumbnail(this: &WeakEntity<Workspace>, id: &str, cx: &mut App) -> Option<Arc
     if !w.attachment_image_requested(id) {
         let (this, id) = (this.clone(), id.to_owned());
         cx.defer(move |cx| {
-            let _ = this.update(cx, |w, cx| w.load_attachment_images([id.as_str()], cx));
+            let _ = this.update(cx, |w, cx| w.load_attachment_images(pane, [id.as_str()], cx));
         });
     }
     None
@@ -89,10 +91,18 @@ fn not_connected(window: &mut Window, cx: &mut App) {
 }
 
 impl Workspace {
+    /// The socket and HTTP origin of the environment `pane`'s thread lives on.
+    fn pane_connection(&self, pane: ChatPane) -> Option<(RpcClient, String)> {
+        let (env, _) = self.pane_thread(pane)?;
+        Some((self.env_client(&env)?, self.env_endpoint(&env)?.http_base.clone()))
+    }
+
     /// `onFileOpen` and `onImageExpand`: a sent file opens in its right panel tab, an image in the
-    /// image viewer; a video or a recording plays in the system's player.
+    /// image viewer over the pane it was sent in; a video or a recording plays in the system's
+    /// player.
     pub(super) fn open_message_attachment(
         &mut self,
+        pane: ChatPane,
         attachment: &Attachment,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -106,7 +116,7 @@ impl Workspace {
             };
             return self.open_attachment(file, window, cx);
         }
-        let (Some(client), Some(base)) = (self.client(), self.http_base().map(str::to_owned)) else {
+        let (Some(owner), Some((client, base))) = (self.pane_owner(pane), self.pane_connection(pane)) else {
             return not_connected(window, cx);
         };
         let resource = attachment_resource(attachment, "inline");
@@ -123,13 +133,12 @@ impl Workspace {
             .detach();
             return;
         }
-        // A preview for a thread the user has left stays closed.
-        let origin = self.target.clone();
+        // A preview for a thread its pane has left stays closed.
         let attachment = attachment.clone();
         cx.spawn_in(window, async move |this, cx| {
             let fetched = fetch_bytes(&client, &base, resource).await;
             let _ = this.update_in(cx, |this, window, cx| {
-                if this.target != origin {
+                if !this.owner_shown(&owner) {
                     return;
                 }
                 match fetched {
@@ -138,7 +147,7 @@ impl Workspace {
                             let image = Arc::new(Image::from_bytes(format, bytes.to_vec()));
                             let name = SharedString::from(attachment.name.clone());
                             let item = super::image_viewer::ViewerImage { image, name, reference: None };
-                            this.open_image_viewer(vec![item], 0, window, cx);
+                            this.open_owned_image_viewer(Some(owner), vec![item], 0, window, cx);
                         }
                         None => {
                             let title = format!("Could not open {}", attachment.label());
@@ -159,11 +168,12 @@ impl Workspace {
     /// `onFileDownload`: saves a sent file where the user picks.
     pub(super) fn download_message_attachment(
         &mut self,
+        pane: ChatPane,
         attachment: &Attachment,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (Some(client), Some(base)) = (self.client(), self.http_base().map(str::to_owned)) else {
+        let Some((client, base)) = self.pane_connection(pane) else {
             return not_connected(window, cx);
         };
         let picked = cx.prompt_for_new_path(&super::attachment_preview::downloads_dir(), Some(&attachment.name));
@@ -191,13 +201,14 @@ impl Workspace {
 }
 
 fn open_handler(
+    pane: ChatPane,
     this: &WeakEntity<Workspace>,
     attachment: &Attachment,
 ) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
     let (this, attachment) = (this.clone(), attachment.clone());
     move |_, window, cx| {
         cx.stop_propagation();
-        let _ = this.update(cx, |w, cx| w.open_message_attachment(&attachment, window, cx));
+        let _ = this.update(cx, |w, cx| w.open_message_attachment(pane, &attachment, window, cx));
     }
 }
 
@@ -219,6 +230,7 @@ fn download_button(
     this: &WeakEntity<Workspace>,
     t: &Tokens,
 ) -> gpui_kit::Stateful<gpui_kit::Div> {
+    let pane = view_pane(message).0;
     let label: SharedString = format!("Download {}", attachment.label()).into();
     let (this, attachment_for_click) = (this.clone(), attachment.clone());
     button(
@@ -238,7 +250,7 @@ fn download_button(
     .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
     .on_click(move |_, window, cx| {
         cx.stop_propagation();
-        let _ = this.update(cx, |w, cx| w.download_message_attachment(&attachment_for_click, window, cx));
+        let _ = this.update(cx, |w, cx| w.download_message_attachment(pane, &attachment_for_click, window, cx));
     })
 }
 
@@ -284,7 +296,7 @@ fn video_tile(message: &str, file: &Attachment, this: &WeakEntity<Workspace>, t:
                 .child(Icon::new(IconName::Play).size(px(16.)).text_color(gpui_kit::white())),
         )
         .child(div().max_w_full().truncate().child(file.name.clone()))
-        .on_click(open_handler(this, file))
+        .on_click(open_handler(view_pane(message).0, this, file))
         .into_any_element()
 }
 
@@ -299,7 +311,7 @@ fn image_tile(
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
-    let picture = thumbnail(this, &image.id, cx);
+    let picture = thumbnail(this, view_pane(message).0, &image.id, cx);
     let own_width = lone && picture.is_some();
     let body = match picture {
         // A lone image takes its width from its own shape.
@@ -330,12 +342,14 @@ fn image_tile(
         .bg(t.background.opacity(0.7))
         .child(body)
         .children(details)
-        .on_click(open_handler(this, image))
+        .on_click(open_handler(view_pane(message).0, this, image))
         .into_any_element()
 }
 
 /// The images and videos (`mediaBlock`): inside the bubble as a small grid, or standing on their
 /// own as a lone picture, a collage, or a column of tiles.
+/// `message` here and in the other blocks is the message's view key (`chat::view_key`), so a
+/// click acts on the pane it was sent in.
 pub(super) fn media_block(
     message: &str,
     layout: &Layout,
@@ -470,7 +484,7 @@ pub(super) fn audio_block(
             .text_sm()
             .child(Icon::new(IconName::AudioLines).size(px(16.)).flex_none().text_color(t.muted_foreground))
             .child(div().min_w_0().flex_1().truncate().hover(gpui_kit::Styled::underline).child(file.name.clone()))
-            .on_click(open_handler(this, file))
+            .on_click(open_handler(view_pane(message).0, this, file))
             .into_any_element()
     });
     Some(
@@ -518,7 +532,7 @@ pub(super) fn file_cards(message: &str, layout: &Layout, this: &WeakEntity<Works
                     )
                     .child(div().text_xs().text_color(t.muted_foreground).child(file.card_detail())),
             )
-            .on_click(open_handler(this, file));
+            .on_click(open_handler(view_pane(message).0, this, file));
         h_flex()
             .w(px(256.))
             .max_w_full()
@@ -568,7 +582,7 @@ pub(super) fn file_list(
                 },
             ))
             .child(Icon::new(IconName::Eye).size(px(16.)).flex_none())
-            .on_click(open_handler(this, file));
+            .on_click(open_handler(view_pane(message).0, this, file));
         h_flex().min_w_0().gap(px(4.)).child(identity).child(download_button(message, file, this, t)).into_any_element()
     });
     let unknown = layout.unknown.iter().map(|attachment| {
@@ -597,6 +611,7 @@ struct ContextRef {
 pub(super) struct ContextChips {
     pub workspace: WeakEntity<Workspace>,
     pub content: Arc<UserContent>,
+    /// The message's view key, which names the pane it shows in.
     pub message: SharedString,
 }
 
@@ -707,7 +722,7 @@ impl ContextChips {
             "environment" => self.environment_chip(id, label, record, &t, cx),
             "image" => {
                 let Some(image) = self.content.record_attachment(record) else { return unavailable(id, label, &t) };
-                let icon = match thumbnail(&self.workspace, &image.id, cx) {
+                let icon = match thumbnail(&self.workspace, view_pane(&self.message).0, &image.id, cx) {
                     Some(picture) => {
                         img(picture).size(px(14.)).rounded(px(2.)).object_fit(ObjectFit::Cover).into_any_element()
                     }
@@ -732,7 +747,7 @@ impl ContextChips {
                     .focus_visible(move |s| s.bg(ring.opacity(0.25)))
                     .child(div().flex_none().child(icon))
                     .child(name)
-                    .on_click(open_handler(&this, image))
+                    .on_click(open_handler(view_pane(&self.message).0, &this, image))
                     .into_any_element()
             }
             "file" => {
@@ -752,7 +767,7 @@ impl ContextChips {
                 chip_shell(id, icon, file.label().to_owned().into(), true, &t)
                     .text_color(ink)
                     .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-                    .on_click(open_handler(&this, file))
+                    .on_click(open_handler(view_pane(&self.message).0, &this, file))
                     .into_any_element()
             }
             "review-comment" if logic::is_pull_request_summary(record) => self
@@ -835,13 +850,15 @@ impl ContextChips {
             return chip_shell(id, lucide(icon), label.into(), false, t).text_color(rgb(ink)).into_any_element();
         }
         let (this, record, content) = (self.workspace.clone(), record.clone(), self.content.clone());
+        let pane = view_pane(&self.message).0;
         let kind = reference.kind.clone();
         chip_shell(id, lucide(icon), label.into(), true, t)
             .text_color(rgb(ink))
             .on_click(move |event, window, cx| {
                 let (record, content, kind) = (record.clone(), content.clone(), kind.clone());
                 let position = event.position();
-                let _ = this.update(cx, |w, cx| w.open_context_details(kind, record, content, position, window, cx));
+                let _ =
+                    this.update(cx, |w, cx| w.open_context_details(pane, kind, record, content, position, window, cx));
             })
             .into_any_element()
     }
@@ -858,6 +875,7 @@ impl Workspace {
     /// Opens a context chip's details over it, as the web's popover does.
     fn open_context_details(
         &mut self,
+        pane: ChatPane,
         kind: String,
         record: Value,
         content: Arc<UserContent>,
@@ -875,7 +893,7 @@ impl Workspace {
                         "terminal" => terminal_details(&record, &t),
                         "element" => element_details(&record, &t),
                         "review-comment" => review_details(&record, cwd.as_deref(), &t),
-                        _ => annotation_details(&record, &content, &view, &t, cx),
+                        _ => annotation_details(pane, &record, &content, &view, &t, cx),
                     };
                     div().w(px(384.)).max_w_full().whitespace_normal().child(body)
                 })
@@ -1038,6 +1056,7 @@ fn review_details(record: &Value, cwd: Option<&str>, t: &Tokens) -> AnyElement {
 /// `UserMessagePreviewAnnotationDetails`: the annotated crop, the page, the comment, what it
 /// targets and the elements it picked.
 fn annotation_details(
+    pane: ChatPane,
     record: &Value,
     content: &UserContent,
     view: &WeakEntity<Workspace>,
@@ -1045,7 +1064,7 @@ fn annotation_details(
     cx: &mut App,
 ) -> AnyElement {
     let screenshot = content.annotation_image(record);
-    let crop = match screenshot.and_then(|image| thumbnail(view, &image.id, cx).map(|picture| (image, picture))) {
+    let crop = match screenshot.and_then(|image| thumbnail(view, pane, &image.id, cx).map(|picture| (image, picture))) {
         Some((image, picture)) => button(div().id(ElementId::Name(format!("annotation-crop:{}", image.id).into())), t)
             .max_h(px(256.))
             .w_full()
@@ -1054,7 +1073,7 @@ fn annotation_details(
             .border_color(t.border.opacity(0.7))
             .bg(t.muted)
             .child(img(picture).w_full().max_h(px(256.)).object_fit(ObjectFit::Contain))
-            .on_click(open_handler(view, image))
+            .on_click(open_handler(pane, view, image))
             .into_any_element(),
         None => div()
             .border_b_1()

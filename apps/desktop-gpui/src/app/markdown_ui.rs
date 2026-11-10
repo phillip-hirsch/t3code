@@ -1698,15 +1698,13 @@ impl Workspace {
     /// chat its reply is in, after a space, unless the draft already ends with it; the composer
     /// takes focus.
     fn use_artifact_template(&mut self, key: &str, template: &Template, window: &mut Window, cx: &mut Context<Self>) {
-        let side = self
-            .side_chat
-            .view
-            .as_ref()
-            .filter(|_| !self.rows.iter().any(|row| super::chat::shows_markdown(row, key)))
-            .filter(|side| side.rows.iter().any(|row| super::chat::shows_markdown(row, key)));
-        let composer = match side {
-            Some(side) => side.ready_composer().cloned(),
-            None => self.composer_takes_citations().then(|| self.composer.clone()),
+        let composer = match super::chat::view_pane(key).0 {
+            super::side_chat::ChatPane::Side => {
+                self.side_chat.view.as_ref().and_then(|side| side.ready_composer().cloned())
+            }
+            super::side_chat::ChatPane::Main => {
+                self.composer_takes_citations(super::side_chat::ChatPane::Main).then(|| self.composer.clone())
+            }
         };
         let Some(composer) = composer else {
             let notification =

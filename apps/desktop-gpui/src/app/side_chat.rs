@@ -4,7 +4,7 @@
 //! approvals and question card, and a plain-text composer; Bring back hands its last reply to
 //! the main thread's next message.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
@@ -37,10 +37,19 @@ const PLACEHOLDER: &str = "Ask a side question";
 const NOT_OPERATE: &str = "This connection cannot change threads.";
 
 /// Which chat a footer row and its controls act on: the open thread's, or the side chat tab's.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum ChatPane {
     Main,
     Side,
+}
+
+/// A pane showing one environment's thread: what that timeline's views, viewers and their async
+/// work belong to. They go once the pane shows something else, as the web unmounts them.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct PaneOwner {
+    pub(super) pane: ChatPane,
+    pub(super) env: SharedString,
+    pub(super) thread: String,
 }
 
 /// The side chat tab on screen, subscribed while it shows.
@@ -51,6 +60,8 @@ pub(super) struct SideChatView {
     state: ThreadState,
     pub(super) rows: Rc<[Row]>,
     cache: timeline::EntryCache,
+    /// The work groups, folds and entries open here; the main timeline opens its own.
+    pub(super) expanded: HashSet<SharedString>,
     pub(super) scroller: Entity<MessageScrollerState>,
     composer: Entity<TextareaState>,
     /// Tracked so typing only re-renders when Send and Stop trade places.
@@ -398,22 +409,26 @@ impl Workspace {
         {
             return;
         }
+        self.stash_side_citation_comment(window, cx);
         self.side_chat.release_view(cx);
+        self.markdown_images.release_side();
+        self.diagrams.forget_sources(ChatPane::Side);
+        self.sync_side_markdown();
         let (Some(thread_id), Some(client), Some(env)) = (shown, client, env) else { return };
         let draft = self.side_chat.drafts.remove(&(env.clone(), thread_id.to_owned())).unwrap_or_default();
         let empty = draft.trim().is_empty();
         let composer = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .auto_grow(1, 8)
-                .submit_on_enter(true)
-                .placeholder(PLACEHOLDER)
-                .default_value(draft)
+            let mut state =
+                TextareaState::new(window, cx).auto_grow(1, 8).submit_on_enter(true).placeholder(PLACEHOLDER);
+            state.set_value(super::citations::citation_content(&draft), window, cx);
+            state
         });
         let events =
             vec![cx.subscribe_in(&composer, window, |this, composer, event: &InputEvent, window, cx| match event {
                 InputEvent::PressEnter { secondary: false, .. } => this.send_side_chat(window, cx),
                 InputEvent::Change => {
                     this.save_custom_answer(ChatPane::Side, cx);
+                    this.drop_orphan_citation_comment(cx);
                     let empty = composer.read(cx).value().trim().is_empty();
                     if let Some(view) = this.side_chat.view.as_mut().filter(|view| view.empty != empty) {
                         view.empty = empty;
@@ -453,6 +468,7 @@ impl Workspace {
             state: ThreadState::default(),
             rows: Rc::default(),
             cache: timeline::EntryCache::default(),
+            expanded: HashSet::default(),
             scroller,
             composer,
             empty,
@@ -472,7 +488,7 @@ impl Workspace {
         let options = timeline::RowOptions { visibility: self.tool_call_visibility(), usage_limit_run: None };
         let Some(view) = self.side_chat.view.as_mut() else { return };
         let mut rows = match view.state.projection.as_ref() {
-            Some(projection) => timeline::rows(projection, &self.expanded, &options, &mut view.cache),
+            Some(projection) => timeline::rows(projection, &view.expanded, &options, &mut view.cache),
             None => Vec::new(),
         };
         for row in &mut rows {
@@ -488,7 +504,7 @@ impl Workspace {
         rows.extend(self.queue_rows(ChatPane::Side));
         self.load_queue_images(ChatPane::Side, cx);
         let answer_images: Vec<String> = rows.iter().flat_map(Row::open_answer_images).map(str::to_owned).collect();
-        self.load_attachment_images(answer_images.iter().map(String::as_str), cx);
+        self.load_attachment_images(ChatPane::Side, answer_images.iter().map(String::as_str), cx);
         let Some(view) = self.side_chat.view.as_mut() else { return };
         super::chat::sync_tick(&mut view._tick, &rows, cx);
         let was_empty = view.rows.is_empty();
@@ -510,12 +526,7 @@ impl Workspace {
         self.side_chat.view.as_ref()?.state.projection.as_ref()
     }
 
-    /// The side chat on screen.
-    pub(super) fn side_chat_thread_id(&self) -> Option<&str> {
-        Some(self.side_chat.view.as_ref()?.thread_id.as_str())
-    }
-
-    fn send_side_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn send_side_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // An open question takes the send as its answer; an open queued message, as its edit.
         if self.side_chat_question().is_some() {
             self.advance_question(ChatPane::Side, window, cx);
@@ -784,6 +795,18 @@ This permanently clears its conversation history."
                     .flex_1()
                     .min_h_0()
                     .relative()
+                    // As in the open thread, the Cite button follows the text views' selections.
+                    .capture_any_mouse_down(cx.listener(|this, _: &gpui_kit::MouseDownEvent, _, cx| {
+                        this.chat_mouse_down(cx);
+                    }))
+                    .capture_any_mouse_up(cx.listener(|this, event: &gpui_kit::MouseUpEvent, window, cx| {
+                        if event.button == gpui_kit::MouseButton::Left {
+                            this.chat_mouse_up(ChatPane::Side, event.position, window, cx);
+                        }
+                    }))
+                    .capture_action(cx.listener(|this, _: &gpui_kit::component::input::SelectAll, window, cx| {
+                        this.chat_select_all(ChatPane::Side, window, cx);
+                    }))
                     .child(
                         MessageScroller::new("side-chat-timeline", view.scroller.clone(), move |index, window, cx| {
                             match rows.get(index) {
@@ -826,6 +849,7 @@ This permanently clears its conversation history."
             Some(draft) => self.render_side_question_actions(draft, running, stop(cx), cx),
             None => self.render_side_primary_action(view, running, stop(cx), cx),
         };
+        let (t_chip, chip_view) = (*t, cx.weak_entity());
         let composer = h_flex()
             .mx_2()
             .mb_2()
@@ -843,7 +867,15 @@ This permanently clears its conversation history."
                     .xsmall()
                     .flex_1()
                     .font_family(t.fonts.composer)
-                    .text_size(px(t.fonts.prompt_size)),
+                    .text_size(px(t.fonts.prompt_size))
+                    // Cite is the one chip a side chat's plain-text composer takes.
+                    .token(move |token, _, _| super::citations::citation_token(token, &t_chip))
+                    .on_token_click(move |event, window, cx| {
+                        let (id, range, bounds) = (event.token().id().to_string(), event.range(), event.bounds());
+                        let _ = chip_view.update(cx, |this, cx| {
+                            this.citation_chip_clicked(ChatPane::Side, id, range, bounds, event.click(), window, cx);
+                        });
+                    }),
             )
             .child(button);
         v_flex()
@@ -936,6 +968,15 @@ impl Workspace {
             },
             ChatPane::Side => self.side_chat.view.as_ref().map(|view| (view.env.clone(), view.thread_id.clone())),
         }
+    }
+
+    pub(super) fn pane_owner(&self, pane: ChatPane) -> Option<PaneOwner> {
+        let (env, thread) = self.pane_thread(pane)?;
+        Some(PaneOwner { pane, env, thread })
+    }
+
+    pub(super) fn owner_shown(&self, owner: &PaneOwner) -> bool {
+        self.pane_shows(owner.pane, &owner.env, &owner.thread)
     }
 
     pub(super) fn side_chat_question(&self) -> Option<&QuestionDraft> {
@@ -1031,10 +1072,31 @@ impl Workspace {
                 let placeholder = view.question.as_ref().map_or(PLACEHOLDER, super::composer::question_placeholder);
                 view.composer.update(cx, |state, cx| {
                     state.set_placeholder(placeholder, window, cx);
-                    state.set_value(text, window, cx);
+                    state.set_value(super::citations::citation_content(&text), window, cx);
                 });
                 cx.notify();
             }
+        }
+    }
+
+    pub(super) fn pane_composer(&self, pane: ChatPane) -> Option<Entity<TextareaState>> {
+        match pane {
+            ChatPane::Main => Some(self.composer.clone()),
+            ChatPane::Side => Some(self.side_chat.view.as_ref()?.composer.clone()),
+        }
+    }
+
+    pub(super) fn pane_rows(&self, pane: ChatPane) -> Rc<[Row]> {
+        match pane {
+            ChatPane::Main => Rc::clone(&self.rows),
+            ChatPane::Side => self.side_chat.view.as_ref().map(|view| Rc::clone(&view.rows)).unwrap_or_default(),
+        }
+    }
+
+    pub(super) fn pane_scroller(&self, pane: ChatPane) -> Option<Entity<MessageScrollerState>> {
+        match pane {
+            ChatPane::Main => Some(self.scroller.clone()),
+            ChatPane::Side => Some(self.side_chat.view.as_ref()?.scroller.clone()),
         }
     }
 

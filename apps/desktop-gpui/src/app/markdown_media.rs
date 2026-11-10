@@ -24,6 +24,7 @@ use super::Workspace;
 use super::embed::{EmbedView, FRAME_CSS, FRAME_SCRIPT, Layer};
 use super::markdown_images::{Source, classify};
 use super::mermaid::css_color;
+use super::side_chat::PaneOwner;
 
 /// `max-w-[min(100%,30rem)]` and `max-h-[30rem]`, in rem.
 const MEDIA_MAX_REM: f32 = 30.;
@@ -301,6 +302,8 @@ struct ChatMedia {
     kind: MediaKind,
     playable: Playable,
     owner: Owner,
+    /// A chat media's pane and thread: it closes once that pane shows another thread.
+    shown_in: Option<PaneOwner>,
     /// The page's name and look until it starts loading (see [`Workspace::sync_chat_media`]).
     pending: Option<(String, ChipLook)>,
     embed: Option<EmbedView>,
@@ -409,13 +412,10 @@ fn media_name(destination: &str, path: Option<&str>, alt: &str, kind: MediaKind)
 }
 
 impl Workspace {
-    fn media_playable(&self, destination: &str) -> Option<Playable> {
+    fn media_playable(&self, destination: &str, thread_id: &str) -> Option<Playable> {
         match classify(destination, self.git_cwd().as_deref()) {
             Source::Direct(url) => Some(Playable::Url(url)),
-            Source::WorkspaceFile(path) => {
-                let thread_id = self.thread.as_ref()?.id.clone();
-                Some(Playable::File { thread_id, path })
-            }
+            Source::WorkspaceFile(path) => Some(Playable::File { thread_id: thread_id.to_owned(), path }),
             _ => None,
         }
     }
@@ -432,13 +432,14 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> InlineElement {
         let t = *crate::theme::tokens(cx);
-        let Some(playable) = self.media_playable(&media.destination) else {
+        // `message` is the view key, which names the pane showing it.
+        let Some(owner) = self.pane_owner(super::chat::view_pane(&message).0) else {
             return unavailable(media.kind, &media.alt, &t);
         };
-        let Some(environment) = self.active_environment().cloned() else {
+        let Some(playable) = self.media_playable(&media.destination, &owner.thread) else {
             return unavailable(media.kind, &media.alt, &t);
         };
-        let key = (environment, message, at);
+        let key = (owner.env.clone(), message, at);
         let frame = self.embeds.frame();
         let path = match &playable {
             Playable::File { path, .. } => Some(path.clone()),
@@ -458,7 +459,7 @@ impl Workspace {
                 font_size,
                 line_height,
             };
-            self.start_chat_media(key.clone(), media.kind, playable, name.clone(), look, window, cx);
+            self.start_chat_media(key.clone(), owner, media.kind, playable, name.clone(), look, window, cx);
         }
         let Some(state) = self.chat_media.media.get_mut(&key) else {
             return unavailable(media.kind, &media.alt, &t);
@@ -570,6 +571,7 @@ impl Workspace {
     fn start_chat_media(
         &mut self,
         key: MediaKey,
+        shown_in: PaneOwner,
         kind: MediaKind,
         playable: Playable,
         name: String,
@@ -578,6 +580,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.insert_chat_media(key.clone(), kind, playable, Owner::Chat, name, look);
+        if let Some(state) = self.chat_media.media.get_mut(&key) {
+            state.shown_in = Some(shown_in);
+        }
         self.load_chat_media(&key, window, cx);
     }
 
@@ -594,6 +599,7 @@ impl Workspace {
             kind,
             playable,
             owner,
+            shown_in: None,
             dark: look.dark,
             pending: Some((name, look)),
             embed: None,
@@ -770,9 +776,20 @@ impl Workspace {
         }
     }
 
-    /// Before the frame draws: media long off screen close, a theme change repaints the pages,
-    /// and media a view asked for without a window start loading.
+    /// Before the frame draws: a chat's media close once its pane shows another thread, as
+    /// unmounting stops them; media long off screen close, a theme change repaints the pages, and
+    /// media a view asked for without a window start loading.
     pub(super) fn sync_chat_media(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let left: Vec<MediaKey> = self
+            .chat_media
+            .media
+            .iter()
+            .filter(|(_, state)| state.shown_in.as_ref().is_some_and(|owner| !self.owner_shown(owner)))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in left {
+            self.chat_media.media.remove(&key);
+        }
         let dark = crate::theme::tokens(cx).dark;
         let media = &mut self.chat_media.media;
         let stale: Vec<(MediaKey, Owner)> = media

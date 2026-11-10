@@ -23,6 +23,7 @@ use gpui_kit::{
 };
 
 use super::Workspace;
+use super::side_chat::PaneOwner;
 
 /// `MAX_ZOOM`: the viewer zooms up to eight times the fitted size.
 const MAX_ZOOM: f32 = 8.;
@@ -282,6 +283,8 @@ struct Drag {
 
 /// The open viewer.
 pub(super) struct ImageViewer {
+    /// The timeline it was opened from, whose leaving closes it (the web keeps it per thread).
+    owner: Option<PaneOwner>,
     items: Vec<ViewerImage>,
     index: usize,
     zoom: Zoom,
@@ -321,7 +324,19 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if index >= items.len() {
+        self.open_owned_image_viewer(None, items, index, window, cx);
+    }
+
+    /// Opens the viewer for a timeline's image: it closes once `owner`'s pane leaves the thread.
+    pub(super) fn open_owned_image_viewer(
+        &mut self,
+        owner: Option<PaneOwner>,
+        items: Vec<ViewerImage>,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if owner.as_ref().is_some_and(|owner| !self.owner_shown(owner)) || index >= items.len() {
             return;
         }
         let restore = window.focused(cx).or_else(|| self.image_viewer.open.as_ref().and_then(|v| v.restore.clone()));
@@ -331,6 +346,7 @@ impl Workspace {
         // `initialFocus={closeButtonRef}`.
         close_focus.focus(window, cx);
         self.image_viewer.open = Some(ImageViewer {
+            owner,
             items,
             index,
             zoom: Zoom::default(),
@@ -345,6 +361,14 @@ impl Workspace {
             bounds: Rc::default(),
         });
         cx.notify();
+    }
+
+    /// Before the frame draws: a timeline's viewer closes once its pane shows another thread.
+    pub(super) fn release_left_image_viewer(&mut self) {
+        let owner = self.image_viewer.open.as_ref().and_then(|viewer| viewer.owner.as_ref());
+        if owner.is_some_and(|owner| !self.owner_shown(owner)) {
+            self.image_viewer.dismiss();
+        }
     }
 
     pub(super) fn image_viewer_open(&self) -> bool {

@@ -1180,7 +1180,7 @@ impl Workspace {
                 Some(Chip::Citation { .. }) => {
                     let (id, range, bounds) = (event.token().id().to_string(), event.range(), event.bounds());
                     let _ = chip_view.update(cx, |this, cx| {
-                        this.citation_chip_clicked(id, range, bounds, event.click(), window, cx);
+                        this.citation_chip_clicked(ChatPane::Main, id, range, bounds, event.click(), window, cx);
                     });
                 }
                 // `ModelMentionChip`: a click or Enter opens its details popover.

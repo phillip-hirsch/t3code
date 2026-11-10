@@ -24,6 +24,7 @@ use super::Workspace;
 use super::embed::{EmbedView, FRAME_CSS, FRAME_SCRIPT, Layer};
 use super::html_page::escape_attribute;
 use super::mermaid::css_color;
+use super::side_chat::{ChatPane, PaneOwner};
 use crate::mcp_apps::{
     self, AppReference, ContextInput, DisplayMode, Download, Event, Host, Outcome, Request, Ticket, ToolCall,
 };
@@ -181,8 +182,13 @@ struct ContextKey {
 /// `htmlRenderTheme`'s variables, by their T3 names.
 type ThemeVariables = Rc<[(&'static str, String)]>;
 
-/// An app by environment and attachment.
-type AppKey = (SharedString, SharedString);
+/// An app by the pane and thread showing it and its attachment: a fork that inherits the
+/// attachment shows its own app, as the web mounts one per timeline.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct AppKey {
+    owner: PaneOwner,
+    attachment: SharedString,
+}
 
 /// The thread item that produced an app: every request it makes runs against this.
 #[derive(Clone)]
@@ -251,21 +257,28 @@ pub(super) struct McpApps {
     theme: Option<(ThemeKey, ThemeVariables)>,
 }
 
-/// Asks the reader in the confirm dialog, with the app back inline so it stays in view.
+/// Asks the reader in the confirm dialog, with the app back inline so it stays in view. A
+/// document its pane let go of asks nothing, and an answer that lands after that runs nothing.
 async fn ask(
     this: &WeakEntity<Workspace>,
-    key: &AppKey,
+    (key, generation): (&AppKey, u64),
     message: String,
     cx: &mut AsyncWindowContext,
 ) -> Result<(), String> {
     const UNASKABLE: &str = "T3 could not ask for approval here.";
+    const CLOSED: &str = "The app was closed.";
     let answer = this
         .update_in(cx, |this, window, cx| {
+            this.app_document(key, generation)?;
             this.set_app_display(key, DisplayMode::Inline, cx);
-            super::confirm::confirm(&message, false, window, cx)
+            Some(super::confirm::confirm(&message, false, window, cx))
         })
-        .map_err(|_| UNASKABLE.to_owned())?;
-    match answer.await {
+        .map_err(|_| UNASKABLE.to_owned())?
+        .ok_or_else(|| CLOSED.to_owned())?;
+    let answer = answer.await;
+    let live = this.update(cx, |this, _| this.app_document(key, generation).is_some()).unwrap_or(false);
+    match answer {
+        _ if !live => Err(CLOSED.to_owned()),
         Ok(true) => Ok(()),
         Ok(false) => Err("Declined by the user.".to_owned()),
         Err(_) => Err(UNASKABLE.to_owned()),
@@ -278,14 +291,17 @@ impl Workspace {
     pub(super) fn render_mcp_app(
         &mut self,
         embed: &Rc<timeline::Embed>,
+        pane: ChatPane,
         width: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let Some(reference) = embed.app.clone() else { return div().into_any_element() };
-        let Some(environment) = self.active_environment().cloned() else { return div().into_any_element() };
-        let key = (environment, embed.attachment_id.clone());
-        if !self.mcp_apps.apps.contains_key(&key) && !self.start_mcp_app(key.clone(), embed, reference, window, cx) {
+        let Some(owner) = self.pane_owner(pane) else { return div().into_any_element() };
+        let key = AppKey { owner, attachment: embed.attachment_id.clone() };
+        if !self.mcp_apps.apps.contains_key(&key)
+            && !self.start_mcp_app(key.clone(), pane, embed, reference, window, cx)
+        {
             return div().into_any_element();
         }
         if self.mcp_apps.apps.get(&key).is_some_and(|app| app.revision != embed.revision) {
@@ -354,35 +370,28 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// The thread whose rows show the app `attachment_id`: the open thread's, else the side chat's.
-    fn app_conversation(&self, attachment_id: &SharedString) -> Option<String> {
-        let shows = |rows: &[timeline::Row]| {
-            rows.iter().any(|row| matches!(row, timeline::Row::Embed(e) if e.attachment_id == *attachment_id))
-        };
-        if shows(&self.rows[..]) {
-            return self.thread.as_ref().map(|thread| thread.id.clone());
-        }
-        if self.side_chat.view.as_ref().is_some_and(|view| shows(&view.rows[..])) {
-            return self.side_chat_thread_id().map(str::to_owned);
-        }
-        None
-    }
-
     fn start_mcp_app(
         &mut self,
         key: AppKey,
+        pane: ChatPane,
         embed: &timeline::Embed,
         reference: Rc<AppReference>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let (Some((thread_id, item_id)), Some(conversation)) =
-            (self.source_of(&embed.id), self.app_conversation(&embed.attachment_id))
+        let source =
+            self.pane_projection(pane).and_then(|p| p.visible_turn_items.iter().find(|row| row.item.id == embed.id));
+        let Some((thread_id, item_id)) = source.map(|row| (row.source_thread_id.clone(), row.source_item_id.clone()))
         else {
             return false;
         };
-        let scope =
-            Scope { environment: key.0.clone(), thread_id, item_id, conversation, server: reference.server.clone() };
+        let scope = Scope {
+            environment: key.owner.env.clone(),
+            thread_id,
+            item_id,
+            conversation: key.owner.thread.clone(),
+            server: reference.server.clone(),
+        };
         let app = AppFrame {
             scope,
             reference,
@@ -470,8 +479,8 @@ impl Workspace {
     fn open_app_document(&mut self, key: &AppKey, window: &mut Window, cx: &mut Context<Self>) {
         self.mcp_apps.next_generation += 1;
         let generation = self.mcp_apps.next_generation;
-        let base = self.env_endpoint(&key.0).map(|endpoint| endpoint.http_base.clone());
-        let client = self.env_client(&key.0);
+        let base = self.env_endpoint(&key.owner.env).map(|endpoint| endpoint.http_base.clone());
+        let client = self.env_client(&key.owner.env);
         let Some(app) = self.mcp_apps.apps.get_mut(key) else { return };
         let mut host = Host::new(&app.reference, APP_VERSION);
         if let Some(call) = app.tool_call.clone() {
@@ -706,7 +715,7 @@ impl Workspace {
                 let height = mcp_apps::clamp_height(height);
                 if (app.height - height).abs() >= 0.5 {
                     app.height = height;
-                    self.remeasure_page_row(&key.1, cx);
+                    self.remeasure_page_row(&key.attachment, cx);
                 }
             }
             Event::RequestTeardown => {
@@ -748,14 +757,14 @@ impl Workspace {
             app.context = None;
         }
         self.set_app_display(key, DisplayMode::Inline, cx);
-        self.remeasure_page_row(&key.1, cx);
+        self.remeasure_page_row(&key.attachment, cx);
     }
 
     /// "Show app": a fresh document with a fresh URL and host.
     fn show_mcp_app(&mut self, key: &AppKey, window: &mut Window, cx: &mut Context<Self>) {
         if self.mcp_apps.apps.get(key).is_some_and(|app| app.document.is_none()) {
             self.open_app_document(key, window, cx);
-            self.remeasure_page_row(&key.1, cx);
+            self.remeasure_page_row(&key.attachment, cx);
         }
     }
 
@@ -812,16 +821,14 @@ impl Workspace {
             }
             _ => {}
         }
-        let send_allowed = self.thread.as_ref().is_some_and(|thread| thread.id == scope.conversation)
-            || self.side_chat_thread_id() == Some(scope.conversation.as_str());
-        let can_send = send_allowed && self.can_operate(&scope.environment);
+        let can_send = self.owner_shown(&key.owner) && self.can_operate(&scope.environment);
         let Some(client) = self.env_client(&scope.environment) else {
             self.finish_app_request(key, generation, ticket, Outcome::Failed("Request failed.".into()), cx);
             return;
         };
         let key = key.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let outcome = run_request(&this, &key, &scope, &client, request, can_send, cx).await;
+            let outcome = run_request(&this, (&key, generation), &scope, &client, request, can_send, cx).await;
             let _ = this.update(cx, |this, cx| this.finish_app_request(&key, generation, ticket, outcome, cx));
         })
         .detach();
@@ -853,14 +860,19 @@ impl Workspace {
         self.mcp_apps.fullscreen.is_some()
     }
 
-    /// Each frame, before anything draws: apps follow the theme and their box, step out of full
-    /// screen when the thread waits on the reader or leaves the screen, and long unseen ones close.
+    /// Each frame, before anything draws: apps whose pane left their thread close, as unmounting
+    /// does; the rest follow the theme and their box, step out of full screen when the thread
+    /// waits on the reader, and long unseen ones close.
     pub(super) fn sync_mcp_apps(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.mcp_apps.apps.is_empty() {
             return;
         }
-        let main_thread = self.thread.as_ref().map(|thread| thread.id.clone());
-        let side_thread = self.side_chat_thread_id().map(str::to_owned);
+        let left: Vec<AppKey> =
+            self.mcp_apps.apps.keys().filter(|key| !self.owner_shown(&key.owner)).cloned().collect();
+        for key in left {
+            self.set_app_display(&key, DisplayMode::Inline, cx);
+            self.mcp_apps.apps.remove(&key);
+        }
         let awaiting_in = |projection: Option<&crate::model::ThreadProjection>| {
             projection.is_some_and(|p| !p.pending_approvals().is_empty() || !p.pending_user_inputs().is_empty())
         };
@@ -872,11 +884,8 @@ impl Workspace {
         let mut step_aside = Vec::new();
         let mut contexts = Vec::new();
         for (key, app) in &mut self.mcp_apps.apps {
-            let on_screen = main_thread.as_ref() == Some(&app.scope.conversation)
-                || side_thread.as_ref() == Some(&app.scope.conversation);
-            let awaiting =
-                if main_thread.as_ref() == Some(&app.scope.conversation) { main_awaiting } else { side_awaiting };
-            if app.display == DisplayMode::Fullscreen && (!on_screen || (awaiting && !app.awaiting)) {
+            let awaiting = if key.owner.pane == ChatPane::Main { main_awaiting } else { side_awaiting };
+            if app.display == DisplayMode::Fullscreen && awaiting && !app.awaiting {
                 step_aside.push(key.clone());
             }
             app.awaiting = awaiting;
@@ -1002,7 +1011,7 @@ fn flush(document: &mut Document, cx: &gpui_kit::App) {
 /// The work behind a request, on the environment that owns the app.
 async fn run_request(
     this: &WeakEntity<Workspace>,
-    key: &AppKey,
+    key: (&AppKey, u64),
     scope: &Scope,
     client: &crate::rpc::RpcClient,
     request: Request,

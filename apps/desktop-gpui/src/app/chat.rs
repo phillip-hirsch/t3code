@@ -2,7 +2,7 @@
 //! colors follow `apps/web/src/components/chat/MessagesTimeline.tsx`, `WorkLog.tsx`
 //! and `index.css` (`.chat-markdown`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
@@ -145,6 +145,7 @@ impl Workspace {
         text: &SharedString,
         cx: &mut Context<Self>,
     ) -> Entity<TextViewState> {
+        self.sync_side_markdown();
         let chips = self.markdown.1;
         let cached = self.markdown.0.get(&key).map(|state| (&*state.text, state.chips));
         let reuse = markdown_reuse(cached, text, chips);
@@ -167,14 +168,7 @@ impl Workspace {
         let view = cx.new(|cx| TextViewState::markdown(&source, cx));
         let row_key = key.clone();
         let _changed = cx.observe(&view, move |this, _, cx| {
-            // The streaming message is near the end.
-            if let Some(index) = this.rows.iter().rposition(|row| shows_markdown(row, &row_key)) {
-                this.scroller.update(cx, |scroller, cx| scroller.remeasure_items(index..index + 1, cx));
-            } else if let Some(side) = &this.side_chat.view
-                && let Some(index) = side.rows.iter().position(|row| shows_markdown(row, &row_key))
-            {
-                side.scroller.update(cx, |scroller, cx| scroller.remeasure_items(index..index + 1, cx));
-            }
+            this.remeasure_markdown_row(&row_key, cx);
             this.paint_find(&row_key, cx);
             this.paint_citation(&row_key, cx);
         });
@@ -197,41 +191,94 @@ impl Workspace {
     fn open_markdown_image(&mut self, key: &str, url: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(text) = self.markdown.0.get(key).map(|state| state.text.clone()) else { return };
         if let Some((items, index)) = self.markdown_gallery(&text, url) {
-            self.open_image_viewer(items, index, window, cx);
+            let owner = self.pane_owner(view_pane(key).0);
+            self.open_owned_image_viewer(owner, items, index, window, cx);
         }
     }
 
-    /// The markdown view kept for `key` (a message's id), if it has rendered.
+    /// The markdown view kept under the view key `key`, if it has rendered.
     pub(super) fn markdown_view(&self, key: &str) -> Option<Entity<TextViewState>> {
         self.markdown.0.get(key).map(|state| state.view.clone())
     }
 
-    /// Re-lays out `key`'s markdown, whose row remeasures (see [`Self::markdown_state`]).
+    /// Re-lays out `key`'s markdown, whose row remeasures (see [`Self::markdown_state`]). What
+    /// loads for an item under its main view key re-lays out its side chat view too.
     pub(super) fn relayout_markdown(&mut self, key: &str, cx: &mut Context<Self>) {
-        if let Some(state) = self.markdown.0.get(key) {
-            state.view.update(cx, |_, cx| cx.notify());
+        let side = (view_pane(key).0 == ChatPane::Main).then(|| view_key(ChatPane::Side, key));
+        for key in std::iter::once(key).chain(side.as_deref()) {
+            if let Some(state) = self.markdown.0.get(key) {
+                state.view.update(cx, |_, cx| cx.notify());
+            }
         }
     }
 
-    pub(super) fn markdown_keys(&self) -> Vec<SharedString> {
-        self.markdown.0.keys().cloned().collect()
+    /// The view keys of `pane`'s markdown.
+    pub(super) fn markdown_keys(&self, pane: ChatPane) -> Vec<SharedString> {
+        self.markdown.0.keys().filter(|key| view_pane(key).0 == pane).cloned().collect()
+    }
+
+    /// The side chat's markdown goes once the tab shows another thread or none, as its timeline
+    /// unmounts; the main pane's goes with its thread (`reset_timeline`).
+    pub(super) fn sync_side_markdown(&mut self) {
+        let shown = self.pane_thread(ChatPane::Side);
+        if self.markdown.2 != shown {
+            self.markdown.0.retain(|key, _| view_pane(key).0 == ChatPane::Main);
+            self.markdown.2 = shown;
+        }
+    }
+
+    /// Remeasures the row showing the view key `key`, in its pane.
+    fn remeasure_markdown_row(&self, key: &str, cx: &mut Context<Self>) {
+        let (pane, item) = view_pane(key);
+        let (rows, scroller) = match (pane, &self.side_chat.view) {
+            (ChatPane::Main, _) => (&self.rows, &self.scroller),
+            (ChatPane::Side, Some(side)) => (&side.rows, &side.scroller),
+            (ChatPane::Side, None) => return,
+        };
+        // The streaming message is near the end.
+        if let Some(index) = rows.iter().rposition(|row| shows_markdown(row, item)) {
+            scroller.update(cx, |scroller, cx| scroller.remeasure_items(index..index + 1, cx));
+        }
+    }
+
+    /// Remeasures the rows showing the view key `key`'s item in either pane: an image one pane
+    /// loaded draws in the other's copy of the item too, which found it already claimed.
+    pub(super) fn remeasure_item_rows(&self, key: &str, cx: &mut Context<Self>) {
+        let item = view_pane(key).1;
+        for pane in [ChatPane::Main, ChatPane::Side] {
+            self.remeasure_markdown_row(&view_key(pane, item), cx);
+        }
     }
 
     fn toggle_code_wrap(&mut self, key: &str, cx: &mut Context<Self>) {
         if let Some(state) = self.markdown.0.get_mut(key) {
             state.nowrap = !state.nowrap;
-            if let Some(index) = self.rows.iter().rposition(|row| shows_markdown(row, key)) {
-                self.scroller.update(cx, |scroller, cx| scroller.remeasure_items(index..index + 1, cx));
-            }
+            self.remeasure_markdown_row(key, cx);
             cx.notify();
         }
     }
 
-    /// Opens or closes a work group, turn fold or entry, holding the toggled heading where it
-    /// is on screen (`preserveDisclosurePosition`).
-    pub(super) fn toggle_expanded(&mut self, key: SharedString, cx: &mut Context<Self>) {
-        if !self.expanded.remove(&key) {
-            self.expanded.insert(key);
+    /// The work groups, turn folds and entries open in `pane`'s timeline.
+    fn pane_expanded(&mut self, pane: ChatPane) -> Option<&mut HashSet<SharedString>> {
+        match pane {
+            ChatPane::Main => Some(&mut self.expanded),
+            ChatPane::Side => self.side_chat.view.as_mut().map(|view| &mut view.expanded),
+        }
+    }
+
+    pub(super) fn is_expanded(&self, pane: ChatPane, key: &str) -> bool {
+        match pane {
+            ChatPane::Main => self.expanded.contains(key),
+            ChatPane::Side => self.side_chat.view.as_ref().is_some_and(|view| view.expanded.contains(key)),
+        }
+    }
+
+    /// Opens or closes a work group, turn fold or entry in `pane`, holding the toggled heading
+    /// where it is on screen (`preserveDisclosurePosition`).
+    pub(super) fn toggle_expanded(&mut self, pane: ChatPane, key: SharedString, cx: &mut Context<Self>) {
+        let Some(expanded) = self.pane_expanded(pane) else { return };
+        if !expanded.remove(&key) {
+            expanded.insert(key);
         }
         let running = |projection: Option<&ThreadProjection>| projection.is_some_and(ThreadProjection::is_running);
         let main_rows = Rc::clone(&self.rows);
@@ -370,9 +417,10 @@ fn hold_top(
 /// parse survives scrolling, and a landed parse remeasures its row.
 ///
 /// The second field counts changes to the skills and models chips resolve against, so a
-/// message that names one rebuilds once they change and other messages stay parsed.
+/// message that names one rebuilds once they change and other messages stay parsed. Views are
+/// kept by view key ([`view_key`]); the third field is the side chat thread the side ones show.
 #[derive(Default)]
-pub(super) struct MarkdownStates(HashMap<SharedString, MarkdownState>, u64);
+pub(super) struct MarkdownStates(HashMap<SharedString, MarkdownState>, u64, Option<(SharedString, String)>);
 
 impl MarkdownStates {
     pub(super) fn chips_changed(&mut self) {
@@ -419,10 +467,29 @@ fn hash_source(source: &str) -> u64 {
     hasher.finish()
 }
 
-/// The key a row's markdown is cached under: its message id, or `thought:{entry}`.
 /// The key an open entry's markdown and images load under, so its row remeasures when they land.
 pub(super) fn thought_key(entry_id: &str) -> SharedString {
     format!("thought:{entry_id}").into()
+}
+
+const SIDE_VIEW: &str = "side:";
+
+/// What a pane's view of an item (a message id, `thought:{entry}`, ...) and the state drawn for
+/// it are kept under: the main timeline's under the item's key, the side chat's apart, so a
+/// message both show (a fork inherits it) has its own view, selection and media in each.
+pub(super) fn view_key(pane: ChatPane, key: &str) -> SharedString {
+    match pane {
+        ChatPane::Main => SharedString::from(key.to_owned()),
+        ChatPane::Side => format!("{SIDE_VIEW}{key}").into(),
+    }
+}
+
+/// The pane and item key of a view key.
+pub(super) fn view_pane(key: &str) -> (ChatPane, &str) {
+    match key.strip_prefix(SIDE_VIEW) {
+        Some(item) => (ChatPane::Side, item),
+        None => (ChatPane::Main, key),
+    }
 }
 
 pub(super) fn shows_markdown(row: &Row, key: &str) -> bool {
@@ -447,18 +514,20 @@ enum MarkdownKind {
     User,
 }
 
-/// `ChatMarkdown` for `text`, parsed once per `key` for as long as the thread is open.
+/// `ChatMarkdown` for `text` in `pane`, parsed once per item `key` while the pane shows the thread.
 pub(super) fn markdown(
     this: &WeakEntity<Workspace>,
-    key: SharedString,
+    pane: ChatPane,
+    key: &str,
     text: &SharedString,
     streaming: bool,
     t: &Tokens,
     cx: &mut App,
 ) -> AnyElement {
-    markdown_with(this, key, text, MarkdownKind::Assistant { streaming }, None, None, t, cx)
+    markdown_with(this, view_key(pane, key), text, MarkdownKind::Assistant { streaming }, None, None, t, cx)
 }
 
+/// `key` is the view key ([`view_key`]).
 fn markdown_with(
     this: &WeakEntity<Workspace>,
     key: SharedString,
@@ -969,10 +1038,14 @@ pub(super) fn focus_ring(t: &Tokens) -> gpui_kit::BoxShadow {
     gpui_kit::BoxShadow::new(px(0.), px(0.), alpha(t.ring, 0.7)).spread_radius(px(2.)).inset()
 }
 
-fn toggle(this: &WeakEntity<Workspace>, key: SharedString) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
+fn toggle(
+    this: &WeakEntity<Workspace>,
+    pane: ChatPane,
+    key: SharedString,
+) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
     let this = this.clone();
     move |_, _, cx| {
-        let _ = this.update(cx, |workspace, cx| workspace.toggle_expanded(key.clone(), cx));
+        let _ = this.update(cx, |workspace, cx| workspace.toggle_expanded(pane, key.clone(), cx));
     }
 }
 
@@ -1000,7 +1073,7 @@ pub(super) fn render_row(
         } => {
             use super::user_message as attachments;
             let expanded =
-                this.upgrade().is_some_and(|workspace| workspace.read(cx).expanded.contains(&timeline::entry_key(id)));
+                this.upgrade().is_some_and(|workspace| workspace.read(cx).is_expanded(pane, &timeline::entry_key(id)));
             let fold = folded_message(attribution.as_ref(), &crate::user_message::plain_text(text), this, cx);
             let actions = message_actions::user_actions(
                 this,
@@ -1019,16 +1092,17 @@ pub(super) fn render_row(
                 top_right: *grouped_with_previous,
                 bottom_right: layout.media_above_text || *grouped_with_next,
             };
-            let media = attachments::media_block(id, &layout, corners, this, &t, window, cx);
+            let view = view_key(pane, id);
+            let media = attachments::media_block(&view, &layout, corners, this, &t, window, cx);
             let (media_above, media_inside) = if layout.media_above_text { (media, None) } else { (None, media) };
             let inside: Vec<AnyElement> = media_inside
                 .into_iter()
-                .chain(attachments::audio_block(id, &layout, this, &t))
-                .chain(layout.file_cards_only.then(|| attachments::file_cards(id, &layout, this, &t)))
-                .chain(attachments::file_list(id, &layout, this, &t).filter(|_| !layout.file_cards_only))
+                .chain(attachments::audio_block(&view, &layout, this, &t))
+                .chain(layout.file_cards_only.then(|| attachments::file_cards(&view, &layout, this, &t)))
+                .chain(attachments::file_list(&view, &layout, this, &t).filter(|_| !layout.file_cards_only))
                 .collect();
             let body = (!layout.file_cards_only && !layout.audio_only && !text.trim().is_empty())
-                .then(|| markdown_with(this, id.clone(), text, MarkdownKind::User, None, Some(content), &t, cx));
+                .then(|| markdown_with(this, view.clone(), text, MarkdownKind::User, None, Some(content), &t, cx));
             let bare = layout.media_only || layout.file_cards_only || layout.audio_only;
             user_row(
                 id,
@@ -1037,6 +1111,7 @@ pub(super) fn render_row(
                 actions,
                 steer.filter(|_| !*continues_steer),
                 UserRowLook {
+                    pane,
                     grouped_with_previous: *grouped_with_previous,
                     grouped_with_next: *grouped_with_next,
                     expanded,
@@ -1068,7 +1143,7 @@ pub(super) fn render_row(
                 div().px(px(4.)).py(px(2.)).text_size(px(TEXT)).line_height(px(LINE)).text_color(t.chat_text()).child(
                     markdown_with(
                         this,
-                        id.clone(),
+                        view_key(pane, id),
                         text,
                         MarkdownKind::Assistant { streaming: *streaming },
                         Some(lane_width - 8.),
@@ -1103,8 +1178,8 @@ pub(super) fn render_row(
             )
             .into_any_element()
         }
-        Row::Plan { id, plan } => plan_card(id, plan, this, lane_width, cx, &t),
-        Row::Work(work) => work_row(work, this, &t, cx),
+        Row::Plan { id, plan } => plan_card(id, plan, pane, this, lane_width, cx, &t),
+        Row::Work(work) => work_row(work, pane, this, &t, cx),
         Row::Working { started_at } => {
             let label = match started_at.as_deref().and_then(crate::timestamp::parse_ms) {
                 Some(start) => format!("Working for {}", working_duration(now_ms() - start)),
@@ -1125,7 +1200,7 @@ pub(super) fn render_row(
                 .hover(|style| style.text_color(t.foreground))
                 .child(label.clone())
                 .child(Icon::new(chevron).size(px(14.)))
-                .on_click(toggle(this, key.clone()));
+                .on_click(toggle(this, pane, key.clone()));
             let time = hover_timestamp(this, format!("time:{key}"), created_at, &t, cx);
             lane(6., rule_row(&t).group("timeline-row").flex().items_center().child(button).children(time))
                 .into_any_element()
@@ -1164,14 +1239,14 @@ pub(super) fn render_row(
         // Subagent rows carry no bottom space of their own.
         Row::Subagent(card) => lane(0., subagent_card(card, this, &t, cx)).into_any_element(),
         Row::SubagentGroup { key, cards, expanded } => {
-            lane(0., subagent_group(key, cards, *expanded, this, &t, cx)).into_any_element()
+            lane(0., subagent_group(key, cards, *expanded, pane, this, &t, cx)).into_any_element()
         }
         // `HtmlRenderTimelineRow` and `McpAppTimelineRow`: the page or the app, inline.
         Row::Embed(embed) => {
             let body = this
                 .update(cx, |workspace, cx| match &embed.page {
-                    Some(size) => workspace.render_html_page(embed, size, lane_width - 8., window, cx),
-                    None => workspace.render_mcp_app(embed, lane_width - 8., window, cx),
+                    Some(size) => workspace.render_html_page(embed, pane, size, lane_width - 8., window, cx),
+                    None => workspace.render_mcp_app(embed, pane, lane_width - 8., window, cx),
                 })
                 .unwrap_or_else(|_| div().into_any_element());
             lane(8., div().px(px(4.)).child(body)).into_any_element()
@@ -1201,14 +1276,14 @@ pub(super) fn render_row(
                         .child("Superseded attempt"),
                 )
                 .child(div().text_size(px(11.)).text_color(t.muted_foreground).child("Cut off by a steer"))
-                .on_click(toggle(this, key.clone()));
+                .on_click(toggle(this, pane, key.clone()));
             lane(8., button).into_any_element()
         }
         Row::Queued { message, last } => super::queue::queued_row(message, *last, pane, this, &t, cx),
         Row::QueueToggle { total, expanded } => super::queue::toggle_row(*total, *expanded, pane, this, &t),
         Row::Now(line) => super::thread_now::now_row(line, pane, this, lane_width, &t, window, cx),
         Row::Workflow { row, expanded } => {
-            lane(16., super::workflow::workflow_row(row, *expanded, this, lane_width, &t, cx)).into_any_element()
+            lane(16., super::workflow::workflow_row(row, *expanded, pane, this, lane_width, &t, cx)).into_any_element()
         }
         Row::WorktreeSetup { snapshot, embedded } => {
             super::worktree_setup::setup_row(snapshot, *embedded, this, &t, cx)
@@ -1516,6 +1591,7 @@ fn subagent_group(
     key: &SharedString,
     cards: &[Rc<timeline::SubagentCard>],
     expanded: bool,
+    pane: ChatPane,
     this: &WeakEntity<Workspace>,
     t: &Tokens,
     cx: &App,
@@ -1604,7 +1680,7 @@ fn subagent_group(
                 .size(px(14.))
                 .text_color(muted),
         )
-        .on_click(toggle(this, key.clone()));
+        .on_click(toggle(this, pane, key.clone()));
     v_flex()
         .w_full()
         .pb(px(8.))
@@ -1764,6 +1840,7 @@ struct UserBody {
 
 /// How a user message bubble sits among its neighbours, and how much of it shows.
 struct UserRowLook<'a> {
+    pane: ChatPane,
     grouped_with_previous: bool,
     grouped_with_next: bool,
     expanded: bool,
@@ -1855,7 +1932,7 @@ fn user_row(
     this: &WeakEntity<Workspace>,
     t: &Tokens,
 ) -> AnyElement {
-    let UserRowLook { grouped_with_previous, grouped_with_next, expanded, attribution, fold, probe } = look;
+    let UserRowLook { pane, grouped_with_previous, grouped_with_next, expanded, attribution, fold, probe } = look;
     let steer_label = steer.map(|_| {
         h_flex()
             .mr(px(4.))
@@ -1869,7 +1946,7 @@ fn user_row(
     let UserBody { media_above, attachments, body, bare } = contents;
     if let Some(fold) = fold {
         let body = v_flex().children(attachments).children(body).into_any_element();
-        return folded_row(id, body, actions, steer_label, fold, expanded, this, t);
+        return folded_row(id, body, actions, steer_label, fold, (pane, expanded), this, t);
     }
     let guest = match attribution {
         Some(timeline::Attribution::Guest { name }) => Some(name.clone()),
@@ -1912,7 +1989,7 @@ fn user_row(
             .text_color(t.muted_foreground)
             .hover(|style| style.bg(t.accent).text_color(t.foreground))
             .child(if expanded { "Show less" } else { "Show full message" })
-            .on_click(toggle(this, timeline::entry_key(id)))
+            .on_click(toggle(this, pane, timeline::entry_key(id)))
     });
     // Hover actions under the bubble keep their 24px row while hidden.
     let actions = h_flex().w_full().max_w(relative(0.8)).justify_end().pr(px(4.)).child(actions);
@@ -1953,7 +2030,7 @@ fn folded_row(
     actions: gpui_kit::Div,
     steer_label: Option<gpui_kit::Div>,
     fold: FoldedMessage,
-    expanded: bool,
+    (pane, expanded): (ChatPane, bool),
     this: &WeakEntity<Workspace>,
     t: &Tokens,
 ) -> AnyElement {
@@ -1976,7 +2053,7 @@ fn folded_row(
                 .flex_none()
                 .text_color(muted),
         )
-        .on_click(toggle(this, timeline::entry_key(id)));
+        .on_click(toggle(this, pane, timeline::entry_key(id)));
     let bubble = v_flex()
         .min_w_0()
         .max_w(relative(0.8))
@@ -2505,17 +2582,18 @@ static PIERRE_LIGHT: LazyLock<Arc<HighlightTheme>> = LazyLock::new(|| pierre_the
 fn plan_card(
     id: &SharedString,
     plan: &timeline::PlanText,
+    pane: ChatPane,
     this: &WeakEntity<Workspace>,
     lane_width: f32,
     cx: &mut App,
     t: &Tokens,
 ) -> AnyElement {
     let key = timeline::entry_key(id);
-    let expanded = this.upgrade().is_some_and(|workspace| workspace.read(cx).expanded.contains(&key));
+    let expanded = this.upgrade().is_some_and(|workspace| workspace.read(cx).is_expanded(pane, &key));
     let collapsible = plan.preview.is_some();
     let (body_key, body_text): (SharedString, &SharedString) = match &plan.preview {
-        Some(preview) if !expanded => (format!("{id}:preview").into(), preview),
-        _ => (id.clone(), &plan.displayed),
+        Some(preview) if !expanded => (view_key(pane, &format!("{id}:preview")), preview),
+        _ => (view_key(pane, id), &plan.displayed),
     };
     let collapsed = collapsible && !expanded;
     let card_background = alpha(t.card, 0.7);
@@ -2565,7 +2643,7 @@ fn plan_card(
                 .text_size(px(TEXT))
                 .hover(|style| style.bg(t.accent))
                 .child(if expanded { "Collapse plan" } else { "Expand plan" })
-                .on_click(toggle(this, key.clone())),
+                .on_click(toggle(this, pane, key.clone())),
         )
     });
     let card = v_flex()
@@ -2679,11 +2757,11 @@ fn work_bottom(work: &WorkRow) -> f32 {
     }
 }
 
-fn work_row(work: &WorkRow, this: &WeakEntity<Workspace>, t: &Tokens, cx: &mut App) -> AnyElement {
+fn work_row(work: &WorkRow, pane: ChatPane, this: &WeakEntity<Workspace>, t: &Tokens, cx: &mut App) -> AnyElement {
     let muted = t.muted_foreground;
     let row = div().w_full().min_w_0().rounded(px(6.)).px(px(2.)).py(px(2.));
     let content: AnyElement = match &work.kind {
-        WorkRowKind::Single { entry, label, expanded } => single_entry(entry, label, *expanded, this, t, cx),
+        WorkRowKind::Single { entry, label, expanded } => single_entry(entry, label, *expanded, pane, this, t, cx),
         WorkRowKind::Toggle { group, summary, icon, created_at, .. } => {
             focusable(row.id(ElementId::Name(work.id.clone())), t)
                 .group("timeline-row")
@@ -2695,7 +2773,7 @@ fn work_row(work: &WorkRow, this: &WeakEntity<Workspace>, t: &Tokens, cx: &mut A
                     muted,
                     hover_timestamp(this, format!("time:{}", work.id), created_at, t, cx),
                 ))
-                .on_click(toggle(this, group.clone()))
+                .on_click(toggle(this, pane, group.clone()))
                 .into_any_element()
         }
         WorkRowKind::Details { entries } => v_flex()
@@ -2705,7 +2783,7 @@ fn work_row(work: &WorkRow, this: &WeakEntity<Workspace>, t: &Tokens, cx: &mut A
             // `scrollbar-gutter-stable`: the 6px scrollbar's lane stays reserved.
             .pr(px(6.))
             .rounded(px(6.))
-            .children(entries.iter().map(|detail| detail_entry(detail, this, t, cx)).collect::<Vec<_>>())
+            .children(entries.iter().map(|detail| detail_entry(detail, pane, this, t, cx)).collect::<Vec<_>>())
             .into_any_element(),
         WorkRowKind::Live { group, entry, label, thought, expanded, .. } => {
             let failed = entry.failed();
@@ -2740,7 +2818,7 @@ fn work_row(work: &WorkRow, this: &WeakEntity<Workspace>, t: &Tokens, cx: &mut A
                             muted,
                             None,
                         ))
-                        .on_click(toggle(this, group.clone())),
+                        .on_click(toggle(this, pane, group.clone())),
                 )
                 .into_any_element()
         }
@@ -2751,7 +2829,7 @@ fn work_row(work: &WorkRow, this: &WeakEntity<Workspace>, t: &Tokens, cx: &mut A
                 Some(group) => focusable(row.id(ElementId::Name(work.id.clone())), t)
                     .cursor_pointer()
                     .child(line)
-                    .on_click(toggle(this, group.clone()))
+                    .on_click(toggle(this, pane, group.clone()))
                     .into_any_element(),
                 None => row.child(line).into_any_element(),
             }
@@ -2826,7 +2904,7 @@ fn chevron(expandable: bool, expanded: bool, t: &Tokens) -> AnyElement {
 }
 
 /// The image a tool viewed, once it loads (`WorkLogDetails kind="media"`).
-fn viewed_image(entry: &Entry, this: &WeakEntity<Workspace>, cx: &App) -> Option<AnyElement> {
+fn viewed_image(entry: &Entry, pane: ChatPane, this: &WeakEntity<Workspace>, cx: &App) -> Option<AnyElement> {
     use gpui_kit::StyledImage as _;
     let workspace = this.upgrade()?;
     let workspace = workspace.read(cx);
@@ -2859,7 +2937,10 @@ fn viewed_image(entry: &Entry, this: &WeakEntity<Workspace>, cx: &App) -> Option
                     .on_click(move |_, window, cx| {
                         cx.stop_propagation();
                         let item = item.clone();
-                        let _ = this.update(cx, |w, cx| w.open_image_viewer(vec![item], 0, window, cx));
+                        let _ = this.update(cx, |w, cx| {
+                            let owner = w.pane_owner(pane);
+                            w.open_owned_image_viewer(owner, vec![item], 0, window, cx);
+                        });
                     }),
             )
             .into_any_element(),
@@ -2869,12 +2950,13 @@ fn viewed_image(entry: &Entry, this: &WeakEntity<Workspace>, cx: &App) -> Option
 fn entry_details(
     entry: &Entry,
     label: &str,
+    pane: ChatPane,
     this: &WeakEntity<Workspace>,
     t: &Tokens,
     cx: &mut App,
 ) -> Option<AnyElement> {
-    let image = viewed_image(entry, this, cx);
-    let details = entry_text_details(entry, label, this, t, cx);
+    let image = viewed_image(entry, pane, this, cx);
+    let details = entry_text_details(entry, label, pane, this, t, cx);
     match (image, details) {
         (Some(image), Some(details)) => Some(v_flex().child(image).child(details).into_any_element()),
         (image, details) => image.or(details),
@@ -2884,6 +2966,7 @@ fn entry_details(
 fn entry_text_details(
     entry: &Entry,
     label: &str,
+    pane: ChatPane,
     this: &WeakEntity<Workspace>,
     t: &Tokens,
     cx: &mut App,
@@ -2901,7 +2984,7 @@ fn entry_text_details(
                 .text_size(px(TEXT))
                 .line_height(px(LINE))
                 .text_color(t.foreground)
-                .child(markdown(this, thought_key(&entry.id), &text, false, t, cx))
+                .child(markdown(this, pane, &thought_key(&entry.id), &text, false, t, cx))
                 .into_any_element(),
         );
     }
@@ -3085,6 +3168,7 @@ fn single_entry(
     entry: &Rc<Entry>,
     label: &SharedString,
     expanded: bool,
+    pane: ChatPane,
     this: &WeakEntity<Workspace>,
     t: &Tokens,
     cx: &mut App,
@@ -3135,21 +3219,30 @@ fn single_entry(
     };
     let label_text = entry_label(entry, label_text, (expanded, true), this, t, cx);
     let label_color = if entry.is_tool_like() { muted } else { alpha(t.foreground, 0.8) };
-    let details = if expanded { entry_details(entry, label, this, t, cx) } else { None };
+    let details = if expanded { entry_details(entry, label, pane, this, t, cx) } else { None };
     let expandable = expandable(entry, label, this, cx);
     let trailing =
         h_flex().gap(px(6.)).children(entry_open_link(entry, this, t)).child(chevron(expandable, expanded, t));
     let line = work_line(entry.icon(), color, label_text, label_color, Some(trailing.into_any_element()));
     let row = row.id(ElementId::Name(entry.id.clone())).child(line).children(details);
     if expandable {
-        focusable(row, t).cursor_pointer().on_click(toggle(this, timeline::entry_key(&entry.id))).into_any_element()
+        focusable(row, t)
+            .cursor_pointer()
+            .on_click(toggle(this, pane, timeline::entry_key(&entry.id)))
+            .into_any_element()
     } else {
         row.into_any_element()
     }
 }
 
 /// An entry inside an open group (`WorkEntryLogRow`): no vertical padding.
-fn detail_entry(detail: &DetailEntry, this: &WeakEntity<Workspace>, t: &Tokens, cx: &mut App) -> AnyElement {
+fn detail_entry(
+    detail: &DetailEntry,
+    pane: ChatPane,
+    this: &WeakEntity<Workspace>,
+    t: &Tokens,
+    cx: &mut App,
+) -> AnyElement {
     let DetailEntry { entry, label, expanded } = detail;
     let expanded = *expanded;
     let failed = entry.failed() && entry.status != Some(Status::Declined);
@@ -3158,7 +3251,7 @@ fn detail_entry(detail: &DetailEntry, this: &WeakEntity<Workspace>, t: &Tokens, 
     let expandable = expandable(entry, label, this, cx);
     let shown: SharedString = if expanded && entry.is_reasoning() { "Thought".into() } else { label.clone() };
     let shown = entry_label(entry, shown, (expanded, true), this, t, cx);
-    let details = if expanded { entry_details(entry, label, this, t, cx) } else { None };
+    let details = if expanded { entry_details(entry, label, pane, this, t, cx) } else { None };
     div()
         .id(ElementId::Name(format!("group-entry:{}", entry.id).into()))
         .w_full()
@@ -3180,7 +3273,7 @@ fn detail_entry(detail: &DetailEntry, this: &WeakEntity<Workspace>, t: &Tokens, 
             ),
         ))
         .children(details)
-        .when(expandable, |row| focusable(row, t).on_click(toggle(this, timeline::entry_key(&entry.id))))
+        .when(expandable, |row| focusable(row, t).on_click(toggle(this, pane, timeline::entry_key(&entry.id))))
         .into_any_element()
 }
 
@@ -3199,6 +3292,16 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn each_pane_keeps_its_own_view_of_an_item() {
+        for item in ["msg-1", "thought:entry-1", "workflow-script:msg-1", "msg-1:preview"] {
+            let (main, side) = (view_key(ChatPane::Main, item), view_key(ChatPane::Side, item));
+            assert_ne!(main, side, "an inherited {item} must not share its selection across panes");
+            assert_eq!(view_pane(&main), (ChatPane::Main, item));
+            assert_eq!(view_pane(&side), (ChatPane::Side, item));
+        }
+    }
 
     #[test]
     fn user_messages_fold_by_the_text_they_show() {

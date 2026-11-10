@@ -189,6 +189,7 @@ impl Workspace {
 pub(super) fn workflow_row(
     row: &Rc<WorkflowRow>,
     expanded: bool,
+    pane: super::side_chat::ChatPane,
     this: &WeakEntity<Workspace>,
     lane_width: f32,
     t: &Tokens,
@@ -243,8 +244,8 @@ pub(super) fn workflow_row(
         })
         .collect();
     let key = timeline::entry_key(&format!("workflow-script:{}", opening.message_id));
-    let markdown_key: SharedString = format!("workflow-script:{}", opening.message_id).into();
-    let script = super::chat::markdown(this, markdown_key, &row.script_markdown, false, t, cx);
+    let markdown_key = format!("workflow-script:{}", opening.message_id);
+    let script = super::chat::markdown(this, pane, &markdown_key, &row.script_markdown, false, t, cx);
     let foldable = row.foldable;
     let folded = foldable && !expanded;
     let toggle_this = this.clone();
@@ -273,7 +274,7 @@ pub(super) fn workflow_row(
                                 .text_color(muted)
                                 .label(if expanded { "Show less" } else { "Show full script" })
                                 .on_click(move |_, _, cx| {
-                                    let _ = toggle_this.update(cx, |w, cx| w.toggle_expanded(key.clone(), cx));
+                                    let _ = toggle_this.update(cx, |w, cx| w.toggle_expanded(pane, key.clone(), cx));
                                 }),
                         ),
                     )

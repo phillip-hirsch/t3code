@@ -25,6 +25,7 @@ use super::Workspace;
 use super::embed::{EmbedView, FRAME_CSS, FRAME_SCRIPT, Layer};
 use super::image_viewer::{Reference, ViewerImage};
 use super::mermaid::css_color;
+use super::side_chat::{ChatPane, PaneOwner};
 use crate::theme::Tokens;
 use crate::timeline::{self, PAGE_MAX_HEIGHT, PAGE_MIN_HEIGHT, PageSize, clamp_page_height};
 
@@ -209,8 +210,13 @@ fn page_shell(url: &str, title: &str, look: &ShellLook, inline: bool) -> String 
     )
 }
 
-/// A page by environment and attachment.
-type PageKey = (SharedString, SharedString);
+/// A page by the pane and thread showing it and its attachment: a fork that inherits the
+/// attachment shows its own page, as the web mounts one per timeline.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct PageKey {
+    owner: PaneOwner,
+    attachment: SharedString,
+}
 
 struct Page {
     embed: Option<EmbedView>,
@@ -227,10 +233,9 @@ struct Page {
 }
 
 struct Dialog {
+    /// Its pane leaving the thread closes it, as unmounting the row does.
     key: PageKey,
     title: SharedString,
-    /// The thread it opened from: leaving the thread closes it, as unmounting the row does.
-    thread: Option<String>,
     embed: Option<EmbedView>,
     zoom: f32,
     dark: bool,
@@ -284,9 +289,20 @@ async fn mint_page_url(
     }
 }
 
+fn page_row(row: &timeline::Row, attachment_id: &SharedString) -> bool {
+    matches!(row, timeline::Row::Embed(embed) if embed.attachment_id == *attachment_id)
+}
+
 impl Workspace {
-    fn page_key(&self, embed: &timeline::Embed) -> Option<PageKey> {
-        Some((self.active_environment()?.clone(), embed.attachment_id.clone()))
+    fn page_key(&self, pane: ChatPane, embed: &timeline::Embed) -> Option<PageKey> {
+        Some(PageKey { owner: self.pane_owner(pane)?, attachment: embed.attachment_id.clone() })
+    }
+
+    fn pane_page_embed(&self, key: &PageKey) -> Option<Rc<timeline::Embed>> {
+        self.pane_rows(key.owner.pane).iter().find_map(|row| match row {
+            timeline::Row::Embed(embed) if embed.attachment_id == key.attachment => Some(embed.clone()),
+            _ => None,
+        })
     }
 
     /// `HtmlRenderTimelineRow`: the page at its frame height, nothing while its URL is minted, and
@@ -294,13 +310,14 @@ impl Workspace {
     pub(super) fn render_html_page(
         &mut self,
         embed: &Rc<timeline::Embed>,
+        pane: ChatPane,
         size: &PageSize,
         width: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = *crate::theme::tokens(cx);
-        let Some(key) = self.page_key(embed) else { return div().into_any_element() };
+        let Some(key) = self.page_key(pane, embed) else { return div().into_any_element() };
         let frame = self.embeds.frame();
         if !self.html_pages.pages.contains_key(&key) {
             self.start_html_page(key.clone(), embed, window, cx);
@@ -337,7 +354,8 @@ impl Workspace {
             _messages: None,
         };
         self.html_pages.pages.insert(key.clone(), page);
-        let (Some(client), Some(base)) = (self.client(), self.http_base().map(str::to_owned)) else {
+        let base = self.env_endpoint(&key.owner.env).map(|endpoint| endpoint.http_base.clone());
+        let (Some(client), Some(base)) = (self.env_client(&key.owner.env), base) else {
             self.html_page_failed(&key, cx);
             return;
         };
@@ -491,7 +509,7 @@ impl Workspace {
                     return;
                 }
                 page.content_height = Some(height);
-                self.remeasure_page_row(&key.1, cx);
+                self.remeasure_page_row(&key.attachment, cx);
             }
             PageMessage::Link { url, external } => {
                 if external {
@@ -509,7 +527,7 @@ impl Workspace {
                     }
                 }
             }
-            PageMessage::Image { src, name } => self.open_page_image(src, name, window, cx),
+            PageMessage::Image { src, name } => self.open_page_image(&origin, src, name, window, cx),
             PageMessage::Expand => {
                 if let Origin::Inline(key) = origin {
                     self.open_html_dialog(key, window, cx);
@@ -520,8 +538,7 @@ impl Workspace {
 
     /// Re-lays out the timeline row of the page `attachment_id`, whose height changed.
     pub(super) fn remeasure_page_row(&mut self, attachment_id: &SharedString, cx: &mut Context<Self>) {
-        let is_page =
-            |row: &timeline::Row| matches!(row, timeline::Row::Embed(embed) if embed.attachment_id == *attachment_id);
+        let is_page = |row: &timeline::Row| page_row(row, attachment_id);
         if let Some(index) = self.rows.iter().position(is_page) {
             self.scroller.update(cx, |scroller, cx| scroller.remeasure_items(index..index + 1, cx));
         }
@@ -534,8 +551,18 @@ impl Workspace {
     }
 
     /// An image the page asked to expand (`ExpandedImageDialog`): a published image's data URL, or
-    /// a web image, loaded and opened in the image viewer.
-    fn open_page_image(&mut self, src: String, name: String, window: &mut Window, cx: &mut Context<Self>) {
+    /// a web image, loaded and opened in the image viewer while the page's pane still shows its
+    /// thread (the viewer is per thread).
+    fn open_page_image(
+        &mut self,
+        origin: &Origin,
+        src: String,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Origin::Inline(key) | Origin::Dialog(key)) = origin;
+        let owner = key.owner.clone();
         cx.spawn_in(window, async move |this, cx| {
             let (image, reference) = if src.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("data:")) {
                 let image = super::markdown_images::data_url(&src)
@@ -546,9 +573,10 @@ impl Workspace {
                 (image, Some(Reference::Url(src)))
             };
             let _ = this.update_in(cx, |this, window, cx| match image {
+                _ if !this.owner_shown(&owner) => {}
                 Some(image) => {
                     let item = ViewerImage { image, name: name.into(), reference };
-                    this.open_image_viewer(vec![item], 0, window, cx);
+                    this.open_owned_image_viewer(Some(owner), vec![item], 0, window, cx);
                 }
                 None => window.push_notification(Notification::error("The image could not be loaded."), cx),
             });
@@ -573,14 +601,7 @@ impl Workspace {
         if self.html_pages.dialog.is_some() {
             return;
         }
-        let embed =
-            self.rows.iter().chain(self.side_chat.view.iter().flat_map(|side| side.rows.iter())).find_map(|row| {
-                match row {
-                    timeline::Row::Embed(embed) if embed.attachment_id == key.1 => Some(embed.clone()),
-                    _ => None,
-                }
-            });
-        let Some(embed) = embed else { return };
+        let Some(embed) = self.pane_page_embed(&key) else { return };
         let look = ShellLook::of(crate::theme::tokens(cx));
         let restore = window.focused(cx);
         let close_focus = cx.focus_handle().tab_index(0).tab_stop(true);
@@ -588,7 +609,6 @@ impl Workspace {
         self.html_pages.dialog = Some(Dialog {
             key: key.clone(),
             title: embed.title.clone(),
-            thread: self.thread.as_ref().map(|thread| thread.id.clone()),
             embed: None,
             zoom: 1.,
             dark: look.dark,
@@ -610,7 +630,8 @@ impl Workspace {
             cx.notify();
             return;
         }
-        let (Some(client), Some(base)) = (self.client(), self.http_base().map(str::to_owned)) else {
+        let base = self.env_endpoint(&key.owner.env).map(|endpoint| endpoint.http_base.clone());
+        let (Some(client), Some(base)) = (self.env_client(&key.owner.env), base) else {
             self.close_html_dialog(window, cx);
             self.page_unavailable(window, cx);
             return;
@@ -658,9 +679,15 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Each frame, before anything draws: pages follow the theme, pages long off screen close, and
-    /// the dialog closes with the thread it opened from.
+    /// Each frame, before anything draws: pages whose pane left their thread close, as unmounting
+    /// does; the rest follow the theme, pages long off screen close, and the dialog closes with the
+    /// thread it opened from.
     pub(super) fn sync_html_pages(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let left: Vec<PageKey> =
+            self.html_pages.pages.keys().filter(|key| !self.owner_shown(&key.owner)).cloned().collect();
+        for key in left {
+            self.html_pages.pages.remove(&key);
+        }
         let dark = crate::theme::tokens(cx).dark;
         let scheme = if dark { "window.t3Scheme&&t3Scheme('dark')" } else { "window.t3Scheme&&t3Scheme('light')" };
         let theme = if dark { wry::Theme::Dark } else { wry::Theme::Light };
@@ -684,8 +711,8 @@ impl Workspace {
             let oldest_kept = used[KEPT_PAGES - 1];
             pages.pages.retain(|_, page| page.used >= oldest_kept || page.used + 1 >= last);
         }
-        let thread = self.thread.as_ref().map(|thread| thread.id.as_str());
-        if self.html_pages.dialog.as_ref().is_some_and(|dialog| dialog.thread.as_deref() != thread) {
+        let owner_left = self.html_pages.dialog.as_ref().is_some_and(|dialog| !self.owner_shown(&dialog.key.owner));
+        if owner_left {
             self.close_html_dialog(window, cx);
         }
     }

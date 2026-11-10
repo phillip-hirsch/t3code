@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{InlineToken, InputEvent, Textarea, TextareaState};
+use gpui_kit::component::input::{InlineToken, InlineTokenContext, InputContent, InputEvent, Textarea, TextareaState};
 use gpui_kit::component::menu::PopupMenuItem;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::text::{RangeHighlight, RenderedText};
@@ -21,10 +21,13 @@ use gpui_kit::{
 };
 use serde_json::Value;
 
+use super::chat::view_pane;
 use super::send::Intent;
+use super::side_chat::ChatPane;
 use super::{Target, Workspace};
 use crate::assistant_citations::{self, AssistantCitation, Dismissal, MAX_COMMENT_LENGTH, MAX_TEXT_LENGTH, js_len};
 use crate::composer_text::{self, Chip};
+use crate::model::ThreadState;
 use crate::theme::{Tokens, tokens};
 use crate::timeline::Row;
 
@@ -46,8 +49,10 @@ pub(super) struct CitationUi {
 
 /// A selection in one reply that the Cite button would quote.
 struct CiteSelection {
+    /// The chat the reply is in, whose composer Cite fills.
+    pane: ChatPane,
     citation: AssistantCitation,
-    /// Where the pointer let go, in window coordinates.
+    /// Where the button sits, in window coordinates.
     position: Point<Pixels>,
     /// The reply's markdown key and the quote's bytes in its rendered text.
     key: SharedString,
@@ -57,6 +62,8 @@ struct CiteSelection {
 }
 
 struct CommentEditor {
+    /// The chat whose composer holds the chip.
+    pane: ChatPane,
     /// The chip's token id and its start in the composer, when the editor opened.
     chip_id: String,
     chip_start: usize,
@@ -111,13 +118,26 @@ impl Workspace {
     }
 
     /// The pointer let go over the timeline: once the selection settles, offer to cite it.
-    pub(super) fn chat_mouse_up(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
-        cx.on_next_frame(window, move |this, _, cx| this.capture_cite_selection(position, cx));
+    pub(super) fn chat_mouse_up(
+        &mut self,
+        pane: ChatPane,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.on_next_frame(window, move |this, _, cx| this.capture_cite_selection(pane, Some(position), cx));
     }
 
-    /// `captureAssistantTextSelection`: a selection inside one reply of the open thread.
-    fn capture_cite_selection(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
-        let captured = self.cite_selection_at(position, cx);
+    /// Select All in a reply, the text views' one keyboard selection: once it applies, offer to
+    /// cite it (`selectionchange`).
+    pub(super) fn chat_select_all(&mut self, pane: ChatPane, window: &mut Window, cx: &mut Context<Self>) {
+        cx.on_next_frame(window, move |this, _, cx| this.capture_cite_selection(pane, None, cx));
+    }
+
+    /// `captureAssistantTextSelection`: a selection inside one reply of the pane's thread, its
+    /// button at the pointer that made it, else below the selection's end.
+    fn capture_cite_selection(&mut self, pane: ChatPane, pointer: Option<Point<Pixels>>, cx: &mut Context<Self>) {
+        let captured = self.cite_selection_at(pane, pointer, cx);
         if captured.is_some() {
             self.citations.toolbar_focus.get_or_insert_with(|| cx.focus_handle());
         }
@@ -127,10 +147,11 @@ impl Workspace {
         }
     }
 
-    fn cite_selection_at(&self, position: Point<Pixels>, cx: &App) -> Option<CiteSelection> {
-        let Some(Target::Thread { env, id: thread_id }) = &self.target else { return None };
+    fn cite_selection_at(&self, pane: ChatPane, pointer: Option<Point<Pixels>>, cx: &App) -> Option<CiteSelection> {
+        let (env, thread_id) = self.pane_thread(pane)?;
+        let rows = self.pane_rows(pane);
         let mut selected = self
-            .markdown_keys()
+            .markdown_keys(pane)
             .into_iter()
             .filter_map(|key| {
                 let view = self.markdown_view(&key)?;
@@ -138,18 +159,19 @@ impl Workspace {
                 let source = state.selected_source_range()?;
                 Some((key, state.is_selecting(), state.rendered_text(), source))
             })
-            .filter(|(key, ..)| self.rows.iter().any(|row| super::chat::shows_markdown(row, key)));
+            .filter(|(key, ..)| rows.iter().any(|row| super::chat::shows_markdown(row, view_pane(key).1)));
         // A selection that spans replies quotes neither.
         let (Some((key, false, rendered, source)), None) = (selected.next(), selected.next()) else { return None };
-        if !self.rows.iter().any(|row| matches!(row, Row::Assistant { id, .. } if *id == key)) {
+        let item = view_pane(&key).1;
+        if !rows.iter().any(|row| matches!(row, Row::Assistant { id, .. } if **id == *item)) {
             return None;
         }
         let range = rendered.range_for_source(source)?;
         let selector = assistant_citations::create_selector(rendered.as_str(), range.clone())?;
         let citation = AssistantCitation {
             environment_id: env.to_string(),
-            thread_id: thread_id.clone(),
-            message_id: self.message_id_of(&key)?,
+            thread_id,
+            message_id: self.message_id_of(pane, item)?,
             text: selector.text,
             comment: None,
             start: selector.start,
@@ -157,13 +179,17 @@ impl Workspace {
             prefix: selector.prefix,
             suffix: selector.suffix,
         };
-        let scroll_top = self.scroller.read(cx).logical_scroll_top();
-        Some(CiteSelection { citation, position, key, range, scroll_top })
+        let scroller = self.pane_scroller(pane)?.read(cx);
+        // Select All, the only selection the keyboard makes, ends where the reply does.
+        let reply = self.markdown_view(&key)?.read(cx).bounds();
+        let position = selection_action_position(scroller.viewport_bounds(), reply.bottom_right(), pointer);
+        let scroll_top = scroller.logical_scroll_top();
+        Some(CiteSelection { pane, citation, position, key, range, scroll_top })
     }
 
-    /// The `messageId` of the timeline item `item_id`.
-    fn message_id_of(&self, item_id: &str) -> Option<String> {
-        let projection = self.open_projection()?;
+    /// The `messageId` of the pane's timeline item `item_id`.
+    fn message_id_of(&self, pane: ChatPane, item_id: &str) -> Option<String> {
+        let projection = self.pane_projection(pane)?;
         let item = projection.visible_turn_items.iter().find(|row| row.item.id == item_id)?;
         Some(item.item.raw.get("messageId").and_then(Value::as_str).unwrap_or(&item.item.id).to_owned())
     }
@@ -237,7 +263,13 @@ impl Workspace {
         }
         let focused = self.citations.toolbar_focus.as_ref().is_some_and(|focus| focus.is_focused(window));
         match keystroke.key.as_str() {
-            "tab" if plain && !focused && !too_long => {
+            // Tab belongs to the foreground chat; the side chat only follows its selection.
+            "tab"
+                if plain
+                    && !focused
+                    && !too_long
+                    && !self.citations.toolbar.as_ref().is_some_and(|t| t.pane == ChatPane::Side) =>
+            {
                 let Some(focus) = self.citations.toolbar_focus.clone() else { return false };
                 focus.focus(window, cx);
                 cx.notify();
@@ -248,9 +280,9 @@ impl Workspace {
                 true
             }
             "escape" if !m.modified() => {
-                self.citations.toolbar = None;
+                let pane = self.citations.toolbar.take().map_or(ChatPane::Main, |toolbar| toolbar.pane);
                 if focused {
-                    self.focus_composer(window, cx);
+                    self.focus_pane_composer(pane, window, cx);
                 }
                 cx.notify();
                 true
@@ -273,15 +305,18 @@ impl Workspace {
         }
         let (chip_id, range) = (span.token().id().to_string(), span.range());
         let Some(bounds) = state.range_to_bounds(&range) else { return false };
-        self.open_citation_comment(chip_id, range.start, CommentAnchor::Chip(bounds), None, window, cx);
+        self.open_citation_comment(ChatPane::Main, chip_id, range.start, CommentAnchor::Chip(bounds), None, window, cx);
         true
     }
 
-    /// The button hides once the timeline scrolls or another thread opens.
+    /// The button hides once its timeline scrolls or its pane shows another thread.
     fn cite_toolbar_hidden(&self, cx: &App) -> bool {
         self.citations.toolbar.as_ref().is_some_and(|toolbar| {
-            let here = matches!(&self.target, Some(Target::Thread { id, .. }) if *id == toolbar.citation.thread_id);
-            !here || self.scroller.read(cx).logical_scroll_top() != toolbar.scroll_top
+            let citation = &toolbar.citation;
+            !self.pane_shows(toolbar.pane, &citation.environment_id, &citation.thread_id)
+                || self
+                    .pane_scroller(toolbar.pane)
+                    .is_none_or(|scroller| scroller.read(cx).logical_scroll_top() != toolbar.scroll_top)
         })
     }
 
@@ -294,7 +329,7 @@ impl Workspace {
         }
         let origin = self.markdown_view(&toolbar.key).map_or(Point::default(), |view| view.read(cx).bounds().origin);
         let anchor = CommentAnchor::Source { key: toolbar.key.clone(), offset: toolbar.position - origin };
-        if !self.cite_into_composer(&toolbar.citation, anchor, window, cx) {
+        if !self.cite_into_composer(toolbar.pane, &toolbar.citation, anchor, window, cx) {
             let message = "Try citing the selection after the connection or pending input is resolved.";
             window.push_notification(Notification::warning(message).title("The composer is not ready"), cx);
             return;
@@ -306,33 +341,41 @@ impl Workspace {
         self.set_citation_highlight(toolbar.key, HighlightKind::Comment(toolbar.range), cx);
     }
 
-    /// The composer takes text: a target is open, no answer is being sent, and an open question
-    /// takes a typed answer (`insertComposerText`).
-    pub(super) fn composer_takes_citations(&self) -> bool {
-        self.target.is_some()
-            && self.responding.is_none()
-            && self
-                .question
-                .as_ref()
-                .is_none_or(|q| q.questions.get(q.index).is_some_and(crate::requests::Question::allows_custom))
+    /// The pane's composer takes text: its chat is open, no answer or message is being sent, and
+    /// an open question takes a typed answer (`insertComposerText`).
+    pub(super) fn composer_takes_citations(&self, pane: ChatPane) -> bool {
+        let takes_answer = |q: &super::attachments::QuestionDraft| {
+            q.questions.get(q.index).is_some_and(crate::requests::Question::allows_custom)
+        };
+        match pane {
+            ChatPane::Main => {
+                self.target.is_some() && self.responding.is_none() && self.question.as_ref().is_none_or(takes_answer)
+            }
+            ChatPane::Side => {
+                self.pane_thread(ChatPane::Side).is_some()
+                    && !self.pane_sending(ChatPane::Side)
+                    && self.side_chat_question().is_none_or(takes_answer)
+            }
+        }
     }
 
     /// `citeAssistantText`: the chip at the caret, after a space unless one is there, then a
     /// space (or the one already after the caret); its comment editor opens.
     fn cite_into_composer(
         &mut self,
+        pane: ChatPane,
         citation: &AssistantCitation,
         anchor: CommentAnchor,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if !self.composer_takes_citations() {
+        let Some(composer) = self.pane_composer(pane).filter(|_| self.composer_takes_citations(pane)) else {
             return false;
-        }
+        };
         let chip = Chip::citation(citation.clone());
         let chip_id = chip.id();
         let markdown = citation.markdown();
-        let (start, spaces) = self.composer.update(cx, |state, cx| {
+        let (start, spaces) = composer.update(cx, |state, cx| {
             let value = state.value();
             let at = state.cursor();
             let leading = at > 0 && !value[..at].ends_with(char::is_whitespace);
@@ -347,8 +390,10 @@ impl Workspace {
             state.set_selected_range(caret..caret, cx);
             (start, (leading, end == at))
         });
-        self.sync_composer_empty(cx);
-        self.open_citation_comment(chip_id, start, anchor, Some(spaces), window, cx);
+        if pane == ChatPane::Main {
+            self.sync_composer_empty(cx);
+        }
+        self.open_citation_comment(pane, chip_id, start, anchor, Some(spaces), window, cx);
         true
     }
 
@@ -356,6 +401,7 @@ impl Workspace {
     /// goes to the quoted reply.
     pub(super) fn citation_chip_clicked(
         &mut self,
+        pane: ChatPane,
         chip_id: String,
         range: Range<usize>,
         bounds: Bounds<Pixels>,
@@ -370,10 +416,15 @@ impl Workspace {
             _ => true,
         };
         if on_pencil {
-            if self.citations.comment.as_ref().is_some_and(|c| c.chip_id == chip_id && c.chip_start == range.start) {
+            if self
+                .citations
+                .comment
+                .as_ref()
+                .is_some_and(|c| c.pane == pane && c.chip_id == chip_id && c.chip_start == range.start)
+            {
                 self.close_citation_comment(false, window, cx);
             } else if self.target.is_some() {
-                self.open_citation_comment(chip_id, range.start, CommentAnchor::Chip(bounds), None, window, cx);
+                self.open_citation_comment(pane, chip_id, range.start, CommentAnchor::Chip(bounds), None, window, cx);
             }
         } else {
             self.go_to_citation(*citation, window, cx);
@@ -382,6 +433,7 @@ impl Workspace {
 
     fn open_citation_comment(
         &mut self,
+        pane: ChatPane,
         chip_id: String,
         chip_start: usize,
         anchor: CommentAnchor,
@@ -415,14 +467,14 @@ impl Workspace {
             _ => {}
         });
         self.citations.comment =
-            Some(CommentEditor { chip_id, chip_start, input, anchor, remove_on_cancel, _events: events });
+            Some(CommentEditor { pane, chip_id, chip_start, input, anchor, remove_on_cancel, _events: events });
         cx.notify();
     }
 
     /// The span of the chip the comment editor edits, if the composer still holds it.
     fn edited_chip(&self, cx: &App) -> Option<(Range<usize>, AssistantCitation)> {
         let editor = self.citations.comment.as_ref()?;
-        let state = self.composer.read(cx);
+        let state = self.pane_composer(editor.pane)?.read(cx);
         let spans = state.tokens().iter().filter(|span| span.token().id().as_ref() == editor.chip_id.as_str());
         let mut spans: Vec<Range<usize>> = spans.map(gpui_kit::base::input::InlineTokenSpan::range).collect();
         spans.sort_by_key(|range| range.start.abs_diff(editor.chip_start));
@@ -438,41 +490,49 @@ impl Workspace {
         let chip = Chip::citation(citation);
         let end = range.start + markdown.len();
         let token = InlineToken::new(chip.id(), markdown).with_label(chip.label().to_owned());
-        self.composer.update(cx, |state, cx| state.replace_range_with_token(range, token, window, cx)).ok()?;
+        let composer = self.pane_composer(self.citations.comment.as_ref()?.pane)?;
+        composer.update(cx, |state, cx| state.replace_range_with_token(range, token, window, cx)).ok()?;
         Some(end)
     }
 
     /// Save (and with `send`, send the prompt too). A comment over the limit stays open.
     fn save_citation_comment(&mut self, send: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(editor) = &self.citations.comment else { return };
-        let draft = editor.input.read(cx).value().to_string();
+        let (pane, draft) = (editor.pane, editor.input.read(cx).value().to_string());
         if js_len(&draft) > MAX_COMMENT_LENGTH {
             return;
         }
         let end = self.write_citation_comment(&draft, window, cx);
         self.finish_citation_comment(end, true, window, cx);
         if send && end.is_some() {
-            self.submit_with(Intent::Foreground, window, cx);
+            match pane {
+                ChatPane::Main => self.submit_with(Intent::Foreground, window, cx),
+                ChatPane::Side => self.send_side_chat(window, cx),
+            }
         }
     }
 
     /// Cancel: a chip Cite just inserted goes again; otherwise the editor closes unchanged.
     fn cancel_citation_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let remove = self.citations.comment.as_ref().and_then(|c| c.remove_on_cancel);
-        let Some(((before, after), (range, _))) = remove.zip(self.edited_chip(cx)) else {
+        let Some(editor) = &self.citations.comment else { return };
+        let (pane, remove) = (editor.pane, editor.remove_on_cancel);
+        let composer = self.pane_composer(pane);
+        let Some((((before, after), (range, _)), composer)) = remove.zip(self.edited_chip(cx)).zip(composer) else {
             self.close_citation_comment(true, window, cx);
             return;
         };
-        self.composer.update(cx, |state, cx| {
+        composer.update(cx, |state, cx| {
             let value = state.value();
             let from = if before && value[..range.start].ends_with(' ') { range.start - 1 } else { range.start };
             let to = if after && value[range.end..].starts_with(' ') { range.end + 1 } else { range.end };
             state.set_selected_range(from..to, cx);
             state.replace("", window, cx);
         });
-        self.sync_composer_empty(cx);
+        if pane == ChatPane::Main {
+            self.sync_composer_empty(cx);
+        }
         self.finish_citation_comment(None, false, window, cx);
-        self.focus_composer(window, cx);
+        self.focus_pane_composer(pane, window, cx);
     }
 
     /// Closes the editor: Escape drops the draft, any other way out saves a changed draft that
@@ -496,8 +556,10 @@ impl Workspace {
 
     /// The composer's text with the open comment's draft saved into its chip, closing the editor:
     /// a target switch keeps an unsaved comment in the draft it stashes (`onCitationDraftSave`).
+    /// A side chat's editor stays for its view, which saves it when it goes.
     pub(super) fn stash_citation_comment(&mut self, cx: &mut Context<Self>) -> Option<String> {
-        let draft = self.citations.comment.as_ref()?.input.read(cx).value().to_string();
+        let editor = self.citations.comment.as_ref().filter(|editor| editor.pane == ChatPane::Main)?;
+        let draft = editor.input.read(cx).value().to_string();
         let chip = self.edited_chip(cx);
         self.drop_citation_comment(cx);
         let (range, citation) = chip?;
@@ -509,6 +571,22 @@ impl Workspace {
         let mut prompt = self.composer.read(cx).value().to_string();
         prompt.replace_range(range, &citation.with_comment(&comment).markdown());
         Some(prompt)
+    }
+
+    /// Saves a side chat's open comment into its chip and closes the editor, before the side
+    /// chat's view goes (`onCitationDraftSave`).
+    pub(super) fn stash_side_citation_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.citations.comment.as_ref().filter(|editor| editor.pane == ChatPane::Side) else {
+            return;
+        };
+        let draft = editor.input.read(cx).value().to_string();
+        if let Some((_, citation)) = self.edited_chip(cx)
+            && let Dismissal::Commit(comment) =
+                assistant_citations::resolve_dismissal(false, &draft, citation.comment.as_deref())
+        {
+            self.write_citation_comment(&comment, window, cx);
+        }
+        self.drop_citation_comment(cx);
     }
 
     /// A comment editor whose chip left the composer (a send, a recalled prompt) closes.
@@ -534,12 +612,12 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(editor) = &self.citations.comment else { return };
-        let focused = editor.input.focus_handle(cx).contains_focused(window, cx);
+        let (pane, focused) = (editor.pane, editor.input.focus_handle(cx).contains_focused(window, cx));
         self.drop_citation_comment(cx);
         if restore && focused {
-            self.focus_composer(window, cx);
-            if let Some(end) = chip_end {
-                self.composer.update(cx, |state, cx| state.set_selected_range(end..end, cx));
+            self.focus_pane_composer(pane, window, cx);
+            if let Some((end, composer)) = chip_end.zip(self.pane_composer(pane)) {
+                composer.update(cx, |state, cx| state.set_selected_range(end..end, cx));
             }
         }
         cx.notify();
@@ -548,6 +626,8 @@ impl Workspace {
     /// The comment editor, below the quoted text or above its chip (`PopoverPopup width="md"`).
     pub(super) fn render_citation_comment(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let editor = self.citations.comment.as_ref()?;
+        // A side chat's editor goes with its tab.
+        self.pane_composer(editor.pane)?;
         let t = *tokens(cx);
         let (position, corner) = match &editor.anchor {
             CommentAnchor::Source { key, offset } => {
@@ -623,11 +703,7 @@ impl Workspace {
         let env = SharedString::from(citation.environment_id.clone());
         let here =
             matches!(&self.target, Some(Target::Thread { env: e, id }) if *e == env && *id == citation.thread_id);
-        if !here && !self.shell.threads.iter().any(|t| t.environment_id == env && t.id == citation.thread_id) {
-            let (title, message) = UNAVAILABLE;
-            window.push_notification(Notification::warning(message).title(title), cx);
-            return;
-        }
+        // The shell lists only some threads; whether the reply exists is known once its thread loads.
         let thread_id = citation.thread_id.clone();
         self.citations.reveal = Some((citation, window.window_handle()));
         if !here {
@@ -639,30 +715,27 @@ impl Workspace {
     /// Shows the reply a pending citation names once its thread's timeline is in: opens what
     /// folds it, scrolls to it and highlights the quote.
     pub(super) fn reveal_pending_citation(&mut self, cx: &mut Context<Self>) {
+        self.settle_pending_citation(false, cx);
+    }
+
+    /// `reveal_pending_citation`, told whether the cited thread could not be read.
+    pub(super) fn settle_pending_citation(&mut self, load_failed: bool, cx: &mut Context<Self>) {
         let Some((citation, _)) = &self.citations.reveal else { return };
         let here = matches!(&self.target, Some(Target::Thread { env, id })
             if **env == *citation.environment_id && *id == citation.thread_id);
-        if !here {
+        let Some(thread) = self.thread.as_ref().filter(|_| here) else {
             self.citations.reveal = None;
             return;
-        }
-        let Some(projection) = self.open_projection() else { return };
-        let item = projection
-            .visible_turn_items
-            .iter()
-            .map(|row| row.item.as_ref())
-            .find(|item| item.raw.get("messageId").and_then(Value::as_str) == Some(&citation.message_id));
-        let found = item.map(|item| (item.id.clone(), item.item_type == "assistant_message"));
+        };
+        let found = cited_reply(&thread.state, load_failed, &citation.message_id);
         let Some((citation, window)) = self.citations.reveal.take() else { return };
         let item_id = match found {
-            Some((item_id, true)) => item_id,
-            Some((_, false)) => {
-                let message = "The selected text is still saved in your citation.";
-                toast_later(window, "The citation does not refer to an assistant response", message, cx);
+            CitedReply::Found(item_id) => item_id,
+            CitedReply::Loading => {
+                self.citations.reveal = Some((citation, window));
                 return;
             }
-            None => {
-                let (title, message) = UNAVAILABLE;
+            CitedReply::Failed((title, message)) => {
                 toast_later(window, title, message, cx);
                 return;
             }
@@ -777,6 +850,41 @@ const UNAVAILABLE: (&str, &str) = (
     "The cited response is unavailable",
     "It may have been removed. The selected text is still saved in your citation.",
 );
+const COULD_NOT_LOAD: (&str, &str) = (
+    "Could not load the cited response",
+    "Load earlier turns, then click the citation to try again. Your saved quote is unchanged.",
+);
+const NOT_ASSISTANT: (&str, &str) =
+    ("The citation does not refer to an assistant response", "The selected text is still saved in your citation.");
+
+/// Where a citation stands against its thread as loaded so far (`loadCitedHistory`).
+#[derive(Debug, PartialEq)]
+enum CitedReply {
+    Loading,
+    /// The reply's timeline item.
+    Found(String),
+    /// The toast's title and message.
+    Failed((&'static str, &'static str)),
+}
+
+fn cited_reply(state: &ThreadState, load_failed: bool, message_id: &str) -> CitedReply {
+    if state.deleted {
+        return CitedReply::Failed(UNAVAILABLE);
+    }
+    let Some(projection) = &state.projection else {
+        return if load_failed { CitedReply::Failed(COULD_NOT_LOAD) } else { CitedReply::Loading };
+    };
+    let item = projection
+        .visible_turn_items
+        .iter()
+        .map(|row| row.item.as_ref())
+        .find(|item| item.raw.get("messageId").and_then(Value::as_str) == Some(message_id));
+    match item {
+        Some(item) if item.item_type == "assistant_message" => CitedReply::Found(item.id.clone()),
+        Some(_) => CitedReply::Failed(NOT_ASSISTANT),
+        None => CitedReply::Failed(UNAVAILABLE),
+    }
+}
 
 /// `AssistantCitationQuote`: the quote as a block quote, then the comment.
 fn quote_preview(text: &str, comment: Option<&str>, t: &Tokens) -> AnyElement {
@@ -793,6 +901,49 @@ fn quote_preview(text: &str, comment: Option<&str>, t: &Tokens) -> AnyElement {
             div().border_l_2().border_color(t.border).pl(px(12.)).text_color(t.muted_foreground).child(text.to_owned()),
         )
         .children(comment.map(|comment| div().text_color(t.foreground).child(comment.to_owned())))
+        .into_any_element()
+}
+
+/// `resolveSelectionActionPosition`: the pointer, else just below the selection's end, kept
+/// inside the timeline once it has laid out.
+fn selection_action_position(
+    timeline: Bounds<Pixels>,
+    selection_end: Point<Pixels>,
+    pointer: Option<Point<Pixels>>,
+) -> Point<Pixels> {
+    let at = pointer.unwrap_or(point(selection_end.x, selection_end.y + px(4.)));
+    if timeline.size.width <= px(0.) || timeline.size.height <= px(0.) {
+        return at;
+    }
+    let clamp = |value: Pixels, low: Pixels, high: Pixels| value.max(low).min(high);
+    point(clamp(at.x, timeline.left(), timeline.right()), clamp(at.y, timeline.top(), timeline.bottom()))
+}
+
+/// `text` for a plain-text composer, its citations as chips.
+pub(super) fn citation_content(text: &str) -> InputContent {
+    let mut content = InputContent::new(text.to_owned());
+    for (range, chip) in composer_text::chips(text, |_| false) {
+        if !matches!(chip, Chip::Citation { .. }) {
+            continue;
+        }
+        let token = InlineToken::new(chip.id(), &text[range.clone()]).with_label(chip.label().to_owned());
+        content = match content.clone().with_token(range, token) {
+            Ok(next) => next,
+            Err(_) => content,
+        };
+    }
+    content
+}
+
+/// A citation token as the composer draws it; another kind of token shows its label.
+pub(super) fn citation_token(token: &InlineTokenContext, t: &Tokens) -> AnyElement {
+    let label = token.token().label().clone();
+    if !matches!(Chip::from_id(token.token().id()), Some(Chip::Citation { .. })) {
+        return div().child(label).into_any_element();
+    }
+    citation_chip(label, t.fonts.prompt_size, token.is_selected(), t)
+        .h(token.line_height())
+        .max_w(token.available_width())
         .into_any_element()
 }
 
@@ -820,4 +971,80 @@ pub(super) fn citation_chip(label: SharedString, size: f32, selected: bool, t: &
                 .hover(move |s| s.bg(gpui_kit::Hsla::from(accent).opacity(0.17)))
                 .child(Icon::new(Lucide::Pencil).with_size(px(size * 0.85))),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn loaded(items: &[(&str, &str, &str)]) -> ThreadState {
+        let items: Vec<_> = items
+            .iter()
+            .enumerate()
+            .map(|(i, (id, item_type, message_id))| json!({"id": id, "type": item_type, "threadId": "t", "runId": "r1", "nodeId": null, "ordinal": i, "status": "completed", "updatedAt": "x", "messageId": message_id}))
+            .collect();
+        let rows: Vec<_> = items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| json!({"position": i, "visibility": "local", "sourceThreadId": "t", "sourceItemId": item["id"], "item": item}))
+            .collect();
+        let projection = json!({"thread": {"id": "t", "projectId": "p", "title": "t"}, "runs": [{"id": "r1", "status": "completed", "ordinal": 1}], "turnItems": items, "visibleTurnItems": rows});
+        let mut state = ThreadState::default();
+        state.apply(&json!({"kind": "snapshot", "snapshotSequence": 1, "projection": projection})).unwrap();
+        state
+    }
+
+    #[test]
+    fn a_citation_waits_for_its_thread_before_calling_the_reply_unavailable() {
+        let unloaded = ThreadState::default();
+        assert_eq!(cited_reply(&unloaded, false, "m1"), CitedReply::Loading);
+        assert_eq!(cited_reply(&unloaded, true, "m1"), CitedReply::Failed(COULD_NOT_LOAD));
+
+        let mut state = loaded(&[("u", "user_message", "m0"), ("a", "assistant_message", "m1")]);
+        assert_eq!(cited_reply(&state, false, "m1"), CitedReply::Found("a".into()));
+        assert_eq!(cited_reply(&state, false, "m0"), CitedReply::Failed(NOT_ASSISTANT));
+        assert_eq!(cited_reply(&state, false, "gone"), CitedReply::Failed(UNAVAILABLE));
+
+        state.deleted = true;
+        assert_eq!(
+            cited_reply(&state, false, "m1"),
+            CitedReply::Failed(UNAVAILABLE),
+            "a deleted thread keeps its rows"
+        );
+    }
+
+    #[test]
+    fn a_plain_text_composer_restores_citations_as_chips() {
+        let citation = AssistantCitation {
+            environment_id: "e".into(),
+            thread_id: "t".into(),
+            message_id: "m".into(),
+            text: "quoted".into(),
+            comment: None,
+            start: 0,
+            end: 6,
+            prefix: String::new(),
+            suffix: String::new(),
+        };
+        let markdown = citation.markdown();
+        let text = format!("see {markdown} and [a](https://example.com)");
+        let content = citation_content(&text);
+        let ranges: Vec<_> = content.tokens().iter().map(gpui_kit::base::input::InlineTokenSpan::range).collect();
+        assert_eq!(ranges, vec![4..4 + markdown.len()], "only the citation is a chip");
+    }
+
+    #[test]
+    fn the_cite_button_sits_below_a_keyboard_selection_inside_the_timeline() {
+        let timeline = Bounds::new(point(px(100.), px(50.)), gpui_kit::size(px(400.), px(300.)));
+        let end = point(px(300.), px(200.));
+        assert_eq!(selection_action_position(timeline, end, None), point(px(300.), px(204.)));
+        let below = point(px(600.), px(500.));
+        assert_eq!(selection_action_position(timeline, below, None), point(px(500.), px(350.)), "a long reply's end");
+        let pointer = point(px(120.), px(60.));
+        assert_eq!(selection_action_position(timeline, end, Some(pointer)), pointer);
+        let unlaid = Bounds::default();
+        assert_eq!(selection_action_position(unlaid, end, None), point(px(300.), px(204.)));
+    }
 }
