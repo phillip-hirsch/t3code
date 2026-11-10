@@ -210,8 +210,15 @@ fn page_shell(url: &str, title: &str, look: &ShellLook, inline: bool) -> String 
     )
 }
 
-/// A page by environment and attachment.
-type PageKey = (SharedString, SharedString);
+/// A page by the pane and thread showing it and its attachment: a fork that inherits the
+/// attachment shows its own page, as the web mounts one per timeline.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct PageKey {
+    pane: ChatPane,
+    env: SharedString,
+    thread: String,
+    attachment: SharedString,
+}
 
 struct Page {
     embed: Option<EmbedView>,
@@ -228,10 +235,9 @@ struct Page {
 }
 
 struct Dialog {
+    /// Its pane leaving the thread closes it, as unmounting the row does.
     key: PageKey,
     title: SharedString,
-    /// The environment and thread it opened from: leaving them closes it, as unmounting the row does.
-    thread: Option<(SharedString, String)>,
     embed: Option<EmbedView>,
     zoom: f32,
     dark: bool,
@@ -290,8 +296,16 @@ fn page_row(row: &timeline::Row, attachment_id: &SharedString) -> bool {
 }
 
 impl Workspace {
-    fn page_key(&self, embed: &timeline::Embed) -> Option<PageKey> {
-        Some((self.active_environment()?.clone(), embed.attachment_id.clone()))
+    fn page_key(&self, pane: ChatPane, embed: &timeline::Embed) -> Option<PageKey> {
+        let (env, thread) = self.pane_thread(pane)?;
+        Some(PageKey { pane, env, thread, attachment: embed.attachment_id.clone() })
+    }
+
+    fn pane_page_embed(&self, key: &PageKey) -> Option<Rc<timeline::Embed>> {
+        self.pane_rows(key.pane).iter().find_map(|row| match row {
+            timeline::Row::Embed(embed) if embed.attachment_id == key.attachment => Some(embed.clone()),
+            _ => None,
+        })
     }
 
     /// `HtmlRenderTimelineRow`: the page at its frame height, nothing while its URL is minted, and
@@ -299,13 +313,14 @@ impl Workspace {
     pub(super) fn render_html_page(
         &mut self,
         embed: &Rc<timeline::Embed>,
+        pane: ChatPane,
         size: &PageSize,
         width: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = *crate::theme::tokens(cx);
-        let Some(key) = self.page_key(embed) else { return div().into_any_element() };
+        let Some(key) = self.page_key(pane, embed) else { return div().into_any_element() };
         let frame = self.embeds.frame();
         if !self.html_pages.pages.contains_key(&key) {
             self.start_html_page(key.clone(), embed, window, cx);
@@ -342,7 +357,8 @@ impl Workspace {
             _messages: None,
         };
         self.html_pages.pages.insert(key.clone(), page);
-        let (Some(client), Some(base)) = (self.client(), self.http_base().map(str::to_owned)) else {
+        let base = self.env_endpoint(&key.env).map(|endpoint| endpoint.http_base.clone());
+        let (Some(client), Some(base)) = (self.env_client(&key.env), base) else {
             self.html_page_failed(&key, cx);
             return;
         };
@@ -496,7 +512,7 @@ impl Workspace {
                     return;
                 }
                 page.content_height = Some(height);
-                self.remeasure_page_row(&key.1, cx);
+                self.remeasure_page_row(&key.attachment, cx);
             }
             PageMessage::Link { url, external } => {
                 if external {
@@ -548,20 +564,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let pane = match origin {
-            Origin::Inline(key)
-                if !self.rows.iter().any(|row| page_row(row, &key.1))
-                    && self
-                        .side_chat
-                        .view
-                        .as_ref()
-                        .is_some_and(|side| side.rows.iter().any(|row| page_row(row, &key.1))) =>
-            {
-                ChatPane::Side
-            }
-            _ => ChatPane::Main,
-        };
-        let Some((env, thread_id)) = self.pane_thread(pane) else { return };
+        let (Origin::Inline(key) | Origin::Dialog(key)) = origin;
+        let (pane, env, thread_id) = (key.pane, key.env.clone(), key.thread.clone());
         cx.spawn_in(window, async move |this, cx| {
             let (image, reference) = if src.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("data:")) {
                 let image = super::markdown_images::data_url(&src)
@@ -600,14 +604,7 @@ impl Workspace {
         if self.html_pages.dialog.is_some() {
             return;
         }
-        let embed =
-            self.rows.iter().chain(self.side_chat.view.iter().flat_map(|side| side.rows.iter())).find_map(|row| {
-                match row {
-                    timeline::Row::Embed(embed) if embed.attachment_id == key.1 => Some(embed.clone()),
-                    _ => None,
-                }
-            });
-        let Some(embed) = embed else { return };
+        let Some(embed) = self.pane_page_embed(&key) else { return };
         let look = ShellLook::of(crate::theme::tokens(cx));
         let restore = window.focused(cx);
         let close_focus = cx.focus_handle().tab_index(0).tab_stop(true);
@@ -615,7 +612,6 @@ impl Workspace {
         self.html_pages.dialog = Some(Dialog {
             key: key.clone(),
             title: embed.title.clone(),
-            thread: self.pane_thread(ChatPane::Main),
             embed: None,
             zoom: 1.,
             dark: look.dark,
@@ -637,7 +633,8 @@ impl Workspace {
             cx.notify();
             return;
         }
-        let (Some(client), Some(base)) = (self.client(), self.http_base().map(str::to_owned)) else {
+        let base = self.env_endpoint(&key.env).map(|endpoint| endpoint.http_base.clone());
+        let (Some(client), Some(base)) = (self.env_client(&key.env), base) else {
             self.close_html_dialog(window, cx);
             self.page_unavailable(window, cx);
             return;
@@ -711,7 +708,11 @@ impl Workspace {
             let oldest_kept = used[KEPT_PAGES - 1];
             pages.pages.retain(|_, page| page.used >= oldest_kept || page.used + 1 >= last);
         }
-        if self.html_pages.dialog.as_ref().is_some_and(|dialog| dialog.thread != self.pane_thread(ChatPane::Main)) {
+        let owner_left = self.html_pages.dialog.as_ref().is_some_and(|dialog| {
+            let PageKey { pane, env, thread, .. } = &dialog.key;
+            !self.pane_shows(*pane, env, thread)
+        });
+        if owner_left {
             self.close_html_dialog(window, cx);
         }
     }

@@ -37,7 +37,7 @@ const PLACEHOLDER: &str = "Ask a side question";
 const NOT_OPERATE: &str = "This connection cannot change threads.";
 
 /// Which chat a footer row and its controls act on: the open thread's, or the side chat tab's.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum ChatPane {
     Main,
     Side,
@@ -509,11 +509,6 @@ impl Workspace {
 
     pub(super) fn side_chat_projection(&self) -> Option<&ThreadProjection> {
         self.side_chat.view.as_ref()?.state.projection.as_ref()
-    }
-
-    /// The side chat on screen.
-    pub(super) fn side_chat_thread_id(&self) -> Option<&str> {
-        Some(self.side_chat.view.as_ref()?.thread_id.as_str())
     }
 
     pub(super) fn send_side_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {

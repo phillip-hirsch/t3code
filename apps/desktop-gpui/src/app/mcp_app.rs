@@ -182,8 +182,9 @@ struct ContextKey {
 /// `htmlRenderTheme`'s variables, by their T3 names.
 type ThemeVariables = Rc<[(&'static str, String)]>;
 
-/// An app by environment and attachment.
-type AppKey = (SharedString, SharedString);
+/// An app by environment, the thread showing it and attachment: a fork that inherits the
+/// attachment shows its own app, as the web mounts one per timeline.
+type AppKey = (SharedString, String, SharedString);
 
 /// The thread item that produced an app: every request it makes runs against this.
 #[derive(Clone)]
@@ -279,14 +280,17 @@ impl Workspace {
     pub(super) fn render_mcp_app(
         &mut self,
         embed: &Rc<timeline::Embed>,
+        pane: ChatPane,
         width: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let Some(reference) = embed.app.clone() else { return div().into_any_element() };
-        let Some(environment) = self.active_environment().cloned() else { return div().into_any_element() };
-        let key = (environment, embed.attachment_id.clone());
-        if !self.mcp_apps.apps.contains_key(&key) && !self.start_mcp_app(key.clone(), embed, reference, window, cx) {
+        let Some((environment, conversation)) = self.pane_thread(pane) else { return div().into_any_element() };
+        let key = (environment, conversation, embed.attachment_id.clone());
+        if !self.mcp_apps.apps.contains_key(&key)
+            && !self.start_mcp_app(key.clone(), pane, embed, reference, window, cx)
+        {
             return div().into_any_element();
         }
         if self.mcp_apps.apps.get(&key).is_some_and(|app| app.revision != embed.revision) {
@@ -355,35 +359,28 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// The thread whose rows show the app `attachment_id`: the open thread's, else the side chat's.
-    fn app_conversation(&self, attachment_id: &SharedString) -> Option<String> {
-        let shows = |rows: &[timeline::Row]| {
-            rows.iter().any(|row| matches!(row, timeline::Row::Embed(e) if e.attachment_id == *attachment_id))
-        };
-        if shows(&self.rows[..]) {
-            return self.thread.as_ref().map(|thread| thread.id.clone());
-        }
-        if self.side_chat.view.as_ref().is_some_and(|view| shows(&view.rows[..])) {
-            return self.side_chat_thread_id().map(str::to_owned);
-        }
-        None
-    }
-
     fn start_mcp_app(
         &mut self,
         key: AppKey,
+        pane: ChatPane,
         embed: &timeline::Embed,
         reference: Rc<AppReference>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let (Some((thread_id, item_id)), Some(conversation)) =
-            (self.source_of(&embed.id), self.app_conversation(&embed.attachment_id))
+        let source =
+            self.pane_projection(pane).and_then(|p| p.visible_turn_items.iter().find(|row| row.item.id == embed.id));
+        let Some((thread_id, item_id)) = source.map(|row| (row.source_thread_id.clone(), row.source_item_id.clone()))
         else {
             return false;
         };
-        let scope =
-            Scope { environment: key.0.clone(), thread_id, item_id, conversation, server: reference.server.clone() };
+        let scope = Scope {
+            environment: key.0.clone(),
+            thread_id,
+            item_id,
+            conversation: key.1.clone(),
+            server: reference.server.clone(),
+        };
         let app = AppFrame {
             scope,
             reference,
@@ -707,7 +704,7 @@ impl Workspace {
                 let height = mcp_apps::clamp_height(height);
                 if (app.height - height).abs() >= 0.5 {
                     app.height = height;
-                    self.remeasure_page_row(&key.1, cx);
+                    self.remeasure_page_row(&key.2, cx);
                 }
             }
             Event::RequestTeardown => {
@@ -749,14 +746,14 @@ impl Workspace {
             app.context = None;
         }
         self.set_app_display(key, DisplayMode::Inline, cx);
-        self.remeasure_page_row(&key.1, cx);
+        self.remeasure_page_row(&key.2, cx);
     }
 
     /// "Show app": a fresh document with a fresh URL and host.
     fn show_mcp_app(&mut self, key: &AppKey, window: &mut Window, cx: &mut Context<Self>) {
         if self.mcp_apps.apps.get(key).is_some_and(|app| app.document.is_none()) {
             self.open_app_document(key, window, cx);
-            self.remeasure_page_row(&key.1, cx);
+            self.remeasure_page_row(&key.2, cx);
         }
     }
 

@@ -1170,8 +1170,8 @@ pub(super) fn render_row(
         Row::Embed(embed) => {
             let body = this
                 .update(cx, |workspace, cx| match &embed.page {
-                    Some(size) => workspace.render_html_page(embed, size, lane_width - 8., window, cx),
-                    None => workspace.render_mcp_app(embed, lane_width - 8., window, cx),
+                    Some(size) => workspace.render_html_page(embed, pane, size, lane_width - 8., window, cx),
+                    None => workspace.render_mcp_app(embed, pane, lane_width - 8., window, cx),
                 })
                 .unwrap_or_else(|_| div().into_any_element());
             lane(8., div().px(px(4.)).child(body)).into_any_element()
