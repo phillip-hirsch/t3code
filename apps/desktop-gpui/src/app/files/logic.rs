@@ -579,6 +579,24 @@ pub(super) fn is_listable_host_folder(path: &str) -> bool {
     is_host_path(path) && !unc_server
 }
 
+/// `FileMarkdownPreview`'s `imageBaseDir`: the folder a rendered document's relative images and
+/// links start from.
+pub(super) fn markdown_base(cwd: &str, path: &str) -> String {
+    match path.rfind(['/', '\\']) {
+        // `/notes.md` sits in the root, not in `cwd`.
+        Some(at) => absolute_path(cwd, &path[..at.max(1)]),
+        None => cwd.to_owned(),
+    }
+}
+
+/// `resolveMarkdownFileLinkMeta` with the document's folder as the base: the file a rendered
+/// document's link names, with its `:line:column`, and the line.
+pub(super) fn markdown_file_link(base: &str, href: &str) -> Option<(String, Option<u32>)> {
+    let mut file = crate::file_links::parse_file_link(href)?;
+    file.path = crate::file_links::resolve_target(&file.path, Some(base))?;
+    Some((crate::file_links::with_position(&file), file.line))
+}
+
 /// `resolvePathLinkTarget` for a workspace path: joined onto `cwd` with its separator.
 pub(in crate::app) fn absolute_path(cwd: &str, path: &str) -> String {
     if is_host_path(path) {
@@ -902,6 +920,21 @@ mod tests {
         assert!(!is_listable_host_folder(r"\\server") && is_listable_host_folder(r"\\server\share"));
         // A project folder named `~` stays inside the project.
         assert_eq!(crumb_paths("~"), ["", "~"]);
+    }
+
+    #[test]
+    fn rendered_markdown_resolves_from_the_documents_folder() {
+        use crate::app::markdown_images::{Source, classify};
+        assert_eq!(markdown_base("/repo", "docs/guide/README.md"), "/repo/docs/guide");
+        assert_eq!(markdown_base(r"C:\repo", "docs/README.md"), r"C:\repo\docs");
+        assert_eq!(markdown_base("/repo", "README.md"), "/repo");
+        assert_eq!(markdown_base("/repo", "/tmp/notes/a.md"), "/tmp/notes");
+
+        let base = markdown_base("/repo", "docs/README.md");
+        assert_eq!(classify("img/logo.png", Some(&base)), Source::WorkspaceFile("/repo/docs/img/logo.png".into()));
+        assert_eq!(markdown_file_link(&base, "guide.md#L4"), Some(("/repo/docs/guide.md:4".into(), Some(4))));
+        assert_eq!(markdown_file_link(&base, "/etc/hosts"), Some(("/etc/hosts".into(), None)));
+        assert_eq!(markdown_file_link(&base, "https://example.com/a.md"), None);
     }
 
     #[test]
