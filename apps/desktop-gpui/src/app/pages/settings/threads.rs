@@ -650,8 +650,11 @@ impl Workspace {
             resolve_text_generation(stored.as_ref(), &writing_providers(&self.settings_info().providers, &generators));
         let connected = self.settings_client().is_some();
         let save = {
-            let generators = generators.clone();
+            let stored = stored.clone();
             move |this: &mut Self, pick: ModelSelection, window: &mut Window, cx: &mut Context<Self>| {
+                // Generator models can arrive while the picker is open: resolve against them now.
+                let environment = this.settings_environment();
+                let generators = this.text_generation_targets(environment.as_ref(), &[stored.as_ref()], cx);
                 let providers = writing_providers(&this.settings_info().providers, &generators);
                 let resolved = resolve_text_generation(Some(&pick), &providers).unwrap_or(pick);
                 this.save_scoped_model("textGenerationModelSelection", resolved, window, cx);

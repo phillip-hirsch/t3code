@@ -198,6 +198,10 @@ impl Listed {
     }
 }
 
+fn enabled_generators(generators: &Value) -> Vec<(&String, &Value)> {
+    generators.as_object().into_iter().flatten().filter(|(_, config)| config["enabled"] != false).collect()
+}
+
 /// The pickers' stand-ins for one environment's generators, rebuilt only when their inputs change.
 struct Snapshot {
     revision: u64,
@@ -228,6 +232,40 @@ impl TextGeneratorCatalog {
         if self.lists.remove(&(environment.clone(), id.to_owned())).is_some() {
             self.revision += 1;
         }
+    }
+
+    /// The pickers' providers for `environment`'s `generators`, from its lists as they stand.
+    fn targets(
+        &mut self,
+        environment: &SharedString,
+        generators: &Value,
+        selections: &[Option<&ModelSelection>],
+    ) -> Rc<[Provider]> {
+        let enabled = enabled_generators(generators);
+        let selections: Vec<(String, String)> =
+            selections.iter().flatten().map(|s| (s.instance_id.clone(), s.model.clone())).collect();
+        if let Some(cached) = self.snapshots.get(environment)
+            && cached.revision == self.revision
+            && cached.generators == *generators
+            && cached.selections == selections
+        {
+            return cached.providers.clone();
+        }
+        let providers: Rc<[Provider]> = enabled
+            .iter()
+            .filter_map(|(id, config)| {
+                let selected: Vec<&str> = selections
+                    .iter()
+                    .filter(|(instance, _)| instance == *id)
+                    .map(|(_, model)| model.as_str())
+                    .collect();
+                snapshot(id, config, self.list(environment, id), &selected)
+            })
+            .collect();
+        let revision = self.revision;
+        let snapshot = Snapshot { revision, generators: generators.clone(), selections, providers: providers.clone() };
+        self.snapshots.insert(environment.clone(), snapshot);
+        providers
     }
 
     /// Records a reply unless the list was asked for again, or forgotten, since.
@@ -309,36 +347,10 @@ impl Workspace {
         let Some(environment) = environment else { return Rc::default() };
         let Some(info) = self.env_info(environment) else { return Rc::default() };
         let generators = info.settings.get("textGenerators").clone();
-        let enabled: Vec<(&String, &Value)> =
-            generators.as_object().into_iter().flatten().filter(|(_, config)| config["enabled"] != false).collect();
-        for (id, config) in &enabled {
+        for (id, config) in enabled_generators(&generators) {
             self.ensure_text_generator_models(environment, id, config, cx);
         }
-        let selections: Vec<(String, String)> =
-            selections.iter().flatten().map(|s| (s.instance_id.clone(), s.model.clone())).collect();
-        let catalog = &mut self.settings_ui.text_generators;
-        if let Some(cached) = catalog.snapshots.get(environment)
-            && cached.revision == catalog.revision
-            && cached.generators == generators
-            && cached.selections == selections
-        {
-            return cached.providers.clone();
-        }
-        let providers: Rc<[Provider]> = enabled
-            .iter()
-            .filter_map(|(id, config)| {
-                let selected: Vec<&str> = selections
-                    .iter()
-                    .filter(|(instance, _)| instance == *id)
-                    .map(|(_, model)| model.as_str())
-                    .collect();
-                snapshot(id, config, catalog.list(environment, id), &selected)
-            })
-            .collect();
-        let revision = catalog.revision;
-        let snapshot = Snapshot { revision, generators: generators.clone(), selections, providers: providers.clone() };
-        catalog.snapshots.insert(environment.clone(), snapshot);
-        providers
+        self.settings_ui.text_generators.targets(environment, &generators, selections)
     }
 
     /// Asks for a generator's models unless they are loaded for its current connection settings.
@@ -1661,5 +1673,30 @@ mod tests {
         assert_eq!(catalog.list(&environment, "g"), None);
         assert!(listed(0).asked_with(&json!({"kind": "openaiCompatible", "baseUrl": "https://x", "apiKey": ""})));
         assert!(!listed(0).asked_with(&json!({"kind": "openaiCompatible", "baseUrl": "https://y", "apiKey": ""})));
+    }
+
+    #[test]
+    fn a_pick_resolves_against_models_listed_after_the_picker_opened() {
+        use crate::app::pages::settings::model_select::resolve_text_generation;
+        let mut catalog = TextGeneratorCatalog::default();
+        let environment = SharedString::from("env");
+        let generators = json!({"g": {"kind": "openaiCompatible", "baseUrl": "https://x", "apiKey": ""}});
+        let listed = Listed {
+            kind: "openaiCompatible".into(),
+            base_url: "https://x".into(),
+            api_key: json!(""),
+            request: 1,
+            list: ModelList::Loading,
+        };
+        catalog.lists.insert((environment.clone(), "g".into()), listed);
+        let stored = ModelSelection { instance_id: "g".into(), model: "a".into(), options: None };
+        let pick = ModelSelection { model: "b".into(), ..stored.clone() };
+        let resolve = |targets: &[Provider]| resolve_text_generation(Some(&pick), &writing_providers(&[], targets));
+        let opened = catalog.targets(&environment, &generators, &[Some(&stored)]);
+        assert_eq!(resolve(&opened).unwrap().model, "a", "the catalog from opening lacks b");
+        let models = ["a", "b"].map(|id| Model { id: id.into(), name: id.into() }).to_vec();
+        assert!(catalog.settle(environment.clone(), "g".into(), 1, ModelList::Ready(models)));
+        let current = catalog.targets(&environment, &generators, &[Some(&stored)]);
+        assert_eq!(resolve(&current), Some(pick.clone()), "the pick keeps a model listed since");
     }
 }
