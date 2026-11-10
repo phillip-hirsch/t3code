@@ -264,9 +264,12 @@ impl Terminals {
         }));
     }
 
-    /// `clearTerminalUiState`: a deleted thread's drawer goes back to its default.
+    /// `clearTerminalUiState`: a deleted thread's drawer goes back to its default, and its panel
+    /// tabs' groups go with the tabs.
     pub(super) fn forget_thread(&mut self, env: &str, thread_id: &str, cx: &App) {
-        if self.remove_drawer(&DrawerKey::new(env, thread_id)) {
+        let key = DrawerKey::new(env, thread_id);
+        self.panel.retain(|_, group| group.key != key);
+        if self.remove_drawer(&key) {
             self.persist(cx);
         }
     }
@@ -472,14 +475,11 @@ impl Workspace {
         }
     }
 
-    /// `thread_id`'s drawer key: on the open target's environment when it shows the thread, else
-    /// on the environment that lists it.
-    fn drawer_key(&self, thread_id: &str) -> DrawerKey {
-        let env = match &self.target {
-            Some(target) if self.shown_terminal_thread() == Some(thread_id) => Some(target.environment().clone()),
-            _ => self.thread_environment(thread_id),
-        };
-        DrawerKey { env: env.map(|env| env.to_string()), thread_id: thread_id.to_owned() }
+    /// The drawer terminal commands act on: the open target's thread (a draft's, made on first use
+    /// when `create`) on the target's environment.
+    fn terminal_key(&mut self, create: bool) -> Option<DrawerKey> {
+        let thread_id = self.terminal_thread(create)?;
+        Some(DrawerKey::new(self.target.as_ref()?.environment(), &thread_id))
     }
 
     /// The target owning a drawer's terminals: a draft until it launches, else its thread.
@@ -488,22 +488,12 @@ impl Workspace {
     }
 
     fn shown_drawer_key(&self) -> Option<DrawerKey> {
-        self.shown_terminal_thread().map(|thread_id| self.drawer_key(thread_id))
+        Some(DrawerKey::new(self.target.as_ref()?.environment(), self.shown_terminal_thread()?))
     }
 
     /// The shown thread's drawer, if it has one.
     fn shown_drawer(&self) -> Option<&DrawerLayout> {
         self.terminals.drawer_ref(&self.shown_drawer_key()?)
-    }
-
-    fn terminal_drawer(&mut self, thread_id: &str) -> &mut DrawerLayout {
-        let key = self.drawer_key(thread_id);
-        self.terminals.drawer(&key)
-    }
-
-    fn terminal_drawer_mut(&mut self, thread_id: &str) -> Option<&mut DrawerLayout> {
-        let key = self.drawer_key(thread_id);
-        self.terminals.drawer_mut(&key)
     }
 
     /// Where new terminals start: the thread's worktree, else its project root.
@@ -524,12 +514,8 @@ impl Workspace {
         })
     }
 
-    /// `canOperateTerminal`: the environment of `thread_id`'s drawer lets this client start, type
-    /// into, resize and close its terminals.
-    pub(super) fn terminal_operable(&self, thread_id: &str) -> bool {
-        self.drawer_operable(&self.drawer_key(thread_id))
-    }
-
+    /// `canOperateTerminal`: the environment of `key`'s drawer lets this client start, type into,
+    /// resize and close its terminals.
     fn drawer_operable(&self, key: &DrawerKey) -> bool {
         self.terminals_operable_on(key.env.as_deref())
     }
@@ -537,12 +523,6 @@ impl Workspace {
     /// The socket of the environment a drawer's terminals run on.
     fn drawer_client(&self, key: &DrawerKey) -> Option<RpcClient> {
         self.env_client(key.env.as_deref()?)
-    }
-
-    /// The socket `thread_id`'s terminals run on: its drawer's environment, not the first one
-    /// listing a thread with that id.
-    fn terminal_client(&self, thread_id: &str) -> Option<RpcClient> {
-        self.drawer_client(&self.drawer_key(thread_id))
     }
 
     /// `canOperateTerminal` on `env`, which a drawer's key names.
@@ -599,8 +579,7 @@ impl Workspace {
 
     /// `toggleTerminalVisibility`.
     pub(super) fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(thread_id) = self.terminal_thread(true) else { return };
-        let key = self.drawer_key(&thread_id);
+        let Some(key) = self.terminal_key(true) else { return };
         let drawer = self.terminals.drawer(&key);
         if drawer.open {
             drawer.open = false;
@@ -613,10 +592,10 @@ impl Workspace {
                     self.terminals.focus_later(&key, &id);
                 }
                 // Without the grant the drawer opens on its empty state.
-                None if !self.terminal_operable(&thread_id) => {
-                    self.terminal_drawer(&thread_id).open = true;
+                None if !self.drawer_operable(&key) => {
+                    self.terminals.drawer(&key).open = true;
                 }
-                None => self.launch_terminal(thread_id, Place::New, cx),
+                None => self.launch_terminal(key, Place::New, cx),
             }
         } else {
             drawer.open = true;
@@ -626,60 +605,57 @@ impl Workspace {
         cx.notify();
     }
 
-    fn open_drawer_for_action(&mut self) -> Option<String> {
-        let thread_id = self.terminal_thread(true)?;
-        self.terminal_drawer(&thread_id).open = true;
-        Some(thread_id)
+    fn open_drawer_for_action(&mut self) -> Option<DrawerKey> {
+        let key = self.terminal_key(true)?;
+        self.terminals.drawer(&key).open = true;
+        Some(key)
     }
 
     fn split_terminal(&mut self, split: Split, cx: &mut Context<Self>) {
-        let Some(thread_id) = self.open_drawer_for_action() else { return };
-        if self.terminals.drawer_ref(&self.drawer_key(&thread_id)).is_some_and(DrawerLayout::split_limit_reached) {
+        let Some(key) = self.open_drawer_for_action() else { return };
+        if self.terminals.drawer_ref(&key).is_some_and(DrawerLayout::split_limit_reached) {
             return;
         }
-        self.launch_terminal(thread_id, Place::Split(split), cx);
+        self.launch_terminal(key, Place::Split(split), cx);
         cx.notify();
     }
 
     fn new_terminal(&mut self, cx: &mut Context<Self>) {
-        let Some(thread_id) = self.open_drawer_for_action() else { return };
-        self.launch_terminal(thread_id, Place::New, cx);
+        let Some(key) = self.open_drawer_for_action() else { return };
+        self.launch_terminal(key, Place::New, cx);
         cx.notify();
     }
 
     /// Places a new terminal, then opens its shell (`launchTerminal`).
-    fn launch_terminal(&mut self, thread_id: String, place: Place, cx: &mut Context<Self>) {
+    fn launch_terminal(&mut self, key: DrawerKey, place: Place, cx: &mut Context<Self>) {
         let Some(launch) = self.terminal_launch() else { return };
-        self.launch_terminal_with(thread_id, place, launch, None, cx).detach();
+        self.launch_terminal_with(key, place, launch, None, cx).detach();
     }
 
     /// `runProjectScript`: types the command into an idle drawer terminal, or a new one opened in
     /// its cwd. A script that stops when the thread settles always gets a terminal of its own.
     /// Once the command is written, a script with `autoOpenPreview` opens its preview URL.
     fn run_in_terminal(&mut self, run: &super::RunInTerminal, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(thread_id) = self.open_drawer_for_action() else { return };
+        let Some(key) = self.open_drawer_for_action() else { return };
         let Some(mut launch) = self.terminal_launch() else { return };
         launch.cwd.clone_from(&run.cwd);
         launch.stop_on_settle = Some(run.stop_on_settle);
         let input = format!(" {}\r", run.command);
-        let env = self.drawer_key(&thread_id).env;
         let running: Vec<String> =
-            self.terminals.running(env.as_deref(), &thread_id).into_iter().map(str::to_owned).collect();
-        let drawer = self.terminal_drawer(&thread_id);
+            self.terminals.running(key.env.as_deref(), &key.thread_id).into_iter().map(str::to_owned).collect();
+        let drawer = self.terminals.drawer(&key);
         let idle: Vec<&String> = drawer.terminal_ids.iter().filter(|id| !running.contains(id)).collect();
         let reuse = idle.iter().find(|id| ***id == drawer.active_id).or(idle.first()).map(|id| (*id).clone());
         let written = match reuse.filter(|_| !run.stop_on_settle) {
             // Reopening a live terminal only updates its launch flags, as the web's launch does.
             Some(terminal_id) => {
                 drawer.set_active(&terminal_id);
-                let key = self.drawer_key(&thread_id);
-                self.open_terminal_session(key, terminal_id, launch, Some(input), cx)
+                self.open_terminal_session(key.clone(), terminal_id, launch, Some(input), cx)
             }
-            None => self.launch_terminal_with(thread_id.clone(), Place::New, launch, Some(input), cx),
+            None => self.launch_terminal_with(key.clone(), Place::New, launch, Some(input), cx),
         };
-        let environment = self.drawer_key(&thread_id).env;
-        let preview = self.preview_thread_of(&thread_id);
-        match run.preview_url.clone().map(|url| self.resolve_server_url(environment.as_deref(), url)).zip(preview) {
+        let preview = key.env.clone().map(|env| crate::preview::ThreadRef::new(env, key.thread_id.clone()));
+        match run.preview_url.clone().map(|url| self.resolve_server_url(key.env.as_deref(), url)).zip(preview) {
             Some((url, thread)) => cx
                 .spawn_in(window, async move |this, cx| {
                     if written.await {
@@ -696,13 +672,12 @@ impl Workspace {
 
     fn launch_terminal_with(
         &mut self,
-        thread_id: String,
+        key: DrawerKey,
         place: Place,
         launch: Launch,
         then_write: Option<String>,
         cx: &mut Context<Self>,
     ) -> Task<bool> {
-        let key = self.drawer_key(&thread_id);
         if self.drawer_client(&key).is_none() || !self.drawer_operable(&key) {
             return Task::ready(false);
         }
@@ -977,7 +952,7 @@ impl Workspace {
                     None => cx.open_url(url),
                 }
             }
-            SessionEvent::OpenPath(path) => match self.preferred_editor_id().zip(self.active_environment().cloned()) {
+            SessionEvent::OpenPath(path) => match self.preferred_editor_id().zip(key.env.clone()) {
                 Some((editor, environment)) => {
                     let failure = "Unable to open path".to_owned();
                     self.open_path_in_editor(&environment, path.clone(), editor, false, failure, window, cx);
@@ -1032,7 +1007,6 @@ impl Workspace {
     pub(super) fn render_terminal_drawer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         self.sync_terminal_panes(window, cx);
         let key = self.shown_drawer_key()?;
-        let thread_id = key.thread_id.clone();
         let drawer = self.shown_drawer().filter(|d| d.open)?;
         let tokens = *theme::tokens(cx);
         let border = tokens.border.opacity(0.8);
@@ -1069,7 +1043,7 @@ impl Workspace {
                         .outline()
                         .xsmall()
                         .label(self.with_terminal_shortcut("New Terminal", "terminal.new"))
-                        .disabled(!self.terminal_operable(&thread_id))
+                        .disabled(!self.drawer_operable(&key))
                         .on_click(cx.listener(|this, _, _, cx| this.new_terminal(cx))),
                 )
                 .into_any_element()
@@ -1115,9 +1089,9 @@ impl Workspace {
                 .border_t_1()
                 .border_color(border)
                 .on_drag_move(cx.listener(move |this, event: &DragMoveEvent<DrawerResize>, _, cx| {
-                    let Some(thread_id) = this.shown_terminal_thread().map(str::to_owned) else { return };
+                    let Some(key) = this.shown_drawer_key() else { return };
                     let height = f32::from(event.bounds.bottom() - event.event.position.y).round();
-                    if let Some(drawer) = this.terminal_drawer_mut(&thread_id) {
+                    if let Some(drawer) = this.terminals.drawer_mut(&key) {
                         drawer.height = height.clamp(MIN_DRAWER_HEIGHT, max);
                         cx.notify();
                     }
@@ -1289,7 +1263,7 @@ impl Workspace {
     }
 
     fn shown_terminal_operable(&self) -> bool {
-        self.shown_terminal_thread().is_none_or(|thread_id| self.terminal_operable(thread_id))
+        self.shown_drawer_key().is_none_or(|key| self.drawer_operable(&key))
     }
 
     /// Shows `terminal_id` in the drawer, or in its panel tab when the sidebar is a tab's.

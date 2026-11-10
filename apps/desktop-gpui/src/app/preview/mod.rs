@@ -368,13 +368,6 @@ impl Workspace {
         }
     }
 
-    /// `thread_id` on its environment: the open thread's, else the one the sidebar lists it on.
-    pub(in crate::app) fn preview_thread_of(&self, thread_id: &str) -> Option<ThreadRef> {
-        self.preview_thread()
-            .filter(|thread| thread.thread_id == thread_id)
-            .or_else(|| Some(ThreadRef::new(self.thread_environment(thread_id)?, thread_id)))
-    }
-
     /// The open thread's tab `tab_id`.
     fn preview_tab(&self, tab_id: &str) -> Option<TabRef> {
         Some(self.preview_thread()?.tab(tab_id))

@@ -122,11 +122,10 @@ impl Workspace {
 
     /// `addTerminalSurface`: a new terminal in a tab of its own.
     pub(in crate::app) fn add_terminal_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(thread_id), Some(launch)) = (self.terminal_thread(true), self.terminal_launch()) else { return };
-        if self.terminal_client(&thread_id).is_none() || !self.terminal_operable(&thread_id) {
+        let (Some(key), Some(launch)) = (self.terminal_key(true), self.terminal_launch()) else { return };
+        if self.drawer_client(&key).is_none() || !self.drawer_operable(&key) {
             return;
         }
-        let key = self.drawer_key(&thread_id);
         let terminal_id = self.next_terminal_id(&key);
         let surface = format!("terminal-{}", super::super::new_id());
         let group = PanelGroup {
