@@ -43,8 +43,37 @@ pub(super) struct AgentsStage {
     /// Its last listed status: a rebuild briefly drops it, and a sign-in must not be lost.
     last_codex: Option<Provider>,
     /// "Use existing CLI" opens this instance's terminal once Codex has checked the CLI.
-    cli_terminal_for: Option<String>,
+    /// Kept with the choice that asked, so only that choice's failed save takes it back.
+    cli_terminal_for: Option<(String, u64)>,
+    /// Each Codex choice bumps it; it outlives a reset, so a save from before one stays older.
+    codex_choice: u64,
     terminal: Option<SetupTerminal>,
+}
+
+impl AgentsStage {
+    /// The band shown afresh for `environment`, keeping the choice count.
+    fn reset(&mut self, environment: Option<SharedString>) {
+        *self = Self { environment, codex_choice: self.codex_choice, ..Self::default() };
+    }
+
+    /// A choice on `instance_id`'s Codex card, returning its generation. "Use existing CLI" asks
+    /// for the CLI's terminal and ChatGPT takes that back (`onUseCliChange`).
+    fn choose_codex_mode(&mut self, instance_id: &str, existing: bool) -> u64 {
+        self.codex_choice += 1;
+        self.cli_terminal_for = existing.then(|| (instance_id.to_owned(), self.codex_choice));
+        self.codex_choice
+    }
+
+    /// A save that failed takes back the terminal its own choice asked for, not a later one's.
+    fn codex_save_failed(&mut self, choice: u64, instance_id: &str) {
+        self.cli_terminal_for.take_if(|(id, asked)| id == instance_id && *asked == choice);
+    }
+
+    /// The setup terminal while `attempt` of `terminal_id` is its latest open: a replacement
+    /// counts its attempts from one again.
+    fn setup_attempt(&mut self, terminal_id: &str, attempt: u64) -> Option<&mut SetupTerminal> {
+        self.terminal.as_mut().filter(|t| t.terminal_id == terminal_id && t.attempt == attempt)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,7 +184,7 @@ impl Workspace {
     pub(in crate::app) fn sync_welcome_agents(&mut self, cx: &mut Context<Self>) {
         if !(self.welcome_open() && self.settings.is_none()) && self.onboarding.agents.environment.is_some() {
             self.close_setup_terminal(cx);
-            self.onboarding.agents = AgentsStage::default();
+            self.onboarding.agents.reset(None);
         }
     }
 
@@ -178,7 +207,7 @@ impl Workspace {
             return;
         }
         self.close_setup_terminal(cx);
-        self.onboarding.agents = AgentsStage { environment: Some(environment.clone()), ..AgentsStage::default() };
+        self.onboarding.agents.reset(Some(environment.clone()));
         self.refresh_agents(environment, None, cx);
     }
 
@@ -239,7 +268,7 @@ impl Workspace {
         if self.onboarding.agents.environment.as_ref() != Some(environment) {
             return;
         }
-        self.onboarding.agents.cli_terminal_for = (mode == "existing").then(|| instance_id.to_owned());
+        let choice = self.onboarding.agents.choose_codex_mode(instance_id, mode == "existing");
         cx.notify();
         let Some(info) = self.env_info(environment) else { return };
         let Some(provider) = info.provider(instance_id) else { return };
@@ -254,16 +283,11 @@ impl Workspace {
             "patch": {},
             "providerInstanceMutation": { "operation": "upsert", "instanceId": instance_id, "instance": next },
         });
-        let (environment, instance_id) = (environment.clone(), instance_id.to_owned());
+        let instance_id = instance_id.to_owned();
         cx.spawn_in(window, async move |this, cx| {
             let Err(error) = client.request("server.updateSettings", payload).await else { return };
             let _ = this.update_in(cx, |this, window, cx| {
-                let stage = &mut this.onboarding.agents;
-                if stage.environment.as_ref() == Some(&environment)
-                    && stage.cli_terminal_for.as_ref() == Some(&instance_id)
-                {
-                    stage.cli_terminal_for = None;
-                }
+                this.onboarding.agents.codex_save_failed(choice, &instance_id);
                 if !matches!(error, RpcError::Disconnected(_)) {
                     let toast = Notification::error(error.to_string()).title("Could not save Codex setup");
                     window.push_notification(toast, cx);
@@ -308,7 +332,7 @@ impl Workspace {
         terminal.attempt += 1;
         terminal.state = SetupState::Preparing;
         terminal.view = None;
-        let attempt = terminal.attempt;
+        let attempt = (terminal.terminal_id.clone(), terminal.attempt);
         let id = json!({ "threadId": SETUP_THREAD_ID, "terminalId": terminal.terminal_id });
         let mut open = id.clone();
         open["cwd"] = terminal.cwd.clone().into();
@@ -322,13 +346,16 @@ impl Workspace {
             if let Some(previous) = previous {
                 previous.await;
             }
-            let step = |failed| move |this: &mut Self, cx: &mut Context<Self>| this.setup_client(attempt, failed, cx);
+            let step = |failed| {
+                let attempt = attempt.clone();
+                move |this: &mut Self, cx: &mut Context<Self>| this.setup_client(&attempt, failed, cx)
+            };
             let Ok(Some(client)) = this.update(cx, step(SetupState::OpenFailed)) else { return };
             if retry {
                 let _ = client.request("terminal.close", close).await;
             }
             if client.request("terminal.open", open).await.is_err() {
-                let _ = this.update(cx, |this, cx| this.settle_setup(attempt, SetupState::OpenFailed, cx));
+                let _ = this.update(cx, |this, cx| this.settle_setup(&attempt, SetupState::OpenFailed, cx));
                 return;
             }
             let Ok(Some(client)) = this.update(cx, step(SetupState::WriteFailed)) else { return };
@@ -336,16 +363,20 @@ impl Workspace {
                 Ok(_) => SetupState::Ready,
                 Err(_) => SetupState::WriteFailed,
             };
-            let _ = this.update(cx, |this, cx| this.settle_setup(attempt, state, cx));
+            let _ = this.update(cx, |this, cx| this.settle_setup(&attempt, state, cx));
         }));
         cx.notify();
     }
 
     /// The socket for the next step while `attempt` is current and terminals may be operated;
     /// otherwise the step fails as `failed` (a revoked grant) or quietly ends (a newer attempt).
-    fn setup_client(&mut self, attempt: u64, failed: SetupState, cx: &mut Context<Self>) -> Option<RpcClient> {
-        let terminal = self.onboarding.agents.terminal.as_ref().filter(|t| t.attempt == attempt)?;
-        let environment = terminal.environment.clone();
+    fn setup_client(
+        &mut self,
+        attempt: &(String, u64),
+        failed: SetupState,
+        cx: &mut Context<Self>,
+    ) -> Option<RpcClient> {
+        let environment = self.onboarding.agents.setup_attempt(&attempt.0, attempt.1)?.environment.clone();
         let client = self.env_client(&environment).filter(|_| self.env_grants(&environment, TERMINAL_OPERATE));
         if client.is_none() {
             self.settle_setup(attempt, failed, cx);
@@ -353,8 +384,8 @@ impl Workspace {
         client
     }
 
-    fn settle_setup(&mut self, attempt: u64, state: SetupState, cx: &mut Context<Self>) {
-        if let Some(terminal) = self.onboarding.agents.terminal.as_mut().filter(|t| t.attempt == attempt) {
+    fn settle_setup(&mut self, attempt: &(String, u64), state: SetupState, cx: &mut Context<Self>) {
+        if let Some(terminal) = self.onboarding.agents.setup_attempt(&attempt.0, attempt.1) {
             terminal.state = state;
             cx.notify();
         }
@@ -466,7 +497,7 @@ impl Workspace {
         let stage = &self.onboarding.agents;
         let listed = |id: &Option<String>| id.as_ref().and_then(|id| info.provider(id)).cloned();
         let listed_codex = listed(&stage.codex_setup);
-        let cli_provider = listed(&stage.cli_terminal_for);
+        let cli_provider = stage.cli_terminal_for.as_ref().and_then(|(id, _)| info.provider(id)).cloned();
 
         // Codex's card keeps its last status while a rebuild drops it; once it closes, a later
         // status change does not reopen it and move the page.
@@ -791,5 +822,56 @@ impl Workspace {
                 .child(div().h(px(256.)).children(view))
                 .into_any_element(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn terminal(terminal_id: &str) -> SetupTerminal {
+        SetupTerminal {
+            environment: "env".into(),
+            instance_id: "codex".into(),
+            cwd: String::new(),
+            command: String::new(),
+            terminal_id: terminal_id.to_owned(),
+            state: SetupState::Preparing,
+            attempt: 1,
+            task: None,
+            view: None,
+        }
+    }
+
+    #[test]
+    fn a_replaced_setup_terminal_ignores_the_late_steps_of_the_one_it_replaced() {
+        let mut stage = AgentsStage { terminal: Some(terminal("a")), ..AgentsStage::default() };
+        assert!(stage.setup_attempt("a", 1).is_some());
+        stage.terminal = Some(terminal("b"));
+        assert!(stage.setup_attempt("a", 1).is_none(), "both are on their first attempt");
+        assert!(stage.setup_attempt("b", 1).is_some());
+        assert!(stage.setup_attempt("b", 2).is_none());
+    }
+
+    #[test]
+    fn chatgpt_takes_back_the_cli_terminal_and_only_its_own_failed_save_does() {
+        let mut stage = AgentsStage::default();
+        let cli = stage.choose_codex_mode("a", true);
+        assert_eq!(stage.cli_terminal_for, Some(("a".to_owned(), cli)));
+        let chatgpt = stage.choose_codex_mode("a", false);
+        assert_eq!(stage.cli_terminal_for, None, "ChatGPT cancels the pending CLI terminal");
+
+        let again = stage.choose_codex_mode("a", true);
+        stage.codex_save_failed(cli, "a");
+        stage.codex_save_failed(chatgpt, "a");
+        assert_eq!(stage.cli_terminal_for, Some(("a".to_owned(), again)), "older saves failing keep the newer ask");
+        stage.codex_save_failed(again, "a");
+        assert_eq!(stage.cli_terminal_for, None);
+
+        // Leaving the page and coming back starts the band over, but not the count.
+        stage.reset(Some("env".into()));
+        let after = stage.choose_codex_mode("a", true);
+        stage.codex_save_failed(again, "a");
+        assert_eq!(stage.cli_terminal_for, Some(("a".to_owned(), after)), "a save from before the reset is older");
     }
 }
