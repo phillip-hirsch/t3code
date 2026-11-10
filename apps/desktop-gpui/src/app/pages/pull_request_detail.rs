@@ -3069,8 +3069,7 @@ fn more_replies_line(more: usize, url: Option<String>, t: &Tokens) -> AnyElement
         .text_color(t.muted_foreground)
         .child(text)
         .children(url.map(|url| {
-            div()
-                .id("pr-more-replies")
+            super::super::chat::focusable(div().id("pr-more-replies"), t)
                 .cursor_pointer()
                 .hover(|s| s.text_color(t.foreground))
                 .child("View on host")
@@ -3202,8 +3201,7 @@ fn actor_name(actor: Option<&Actor>, t: &Tokens) -> impl IntoElement {
 
 fn open_on_host_button(id: String, url: Option<String>, t: &Tokens) -> Option<impl IntoElement> {
     url.map(|url| {
-        div()
-            .id(ElementId::Name(id.into()))
+        super::super::chat::focusable(div().id(ElementId::Name(id.into())), t)
             .size(px(24.))
             .flex_none()
             .flex()

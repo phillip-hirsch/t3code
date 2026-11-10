@@ -1123,8 +1123,7 @@ impl Workspace {
         if code.hidden_tests > 0 {
             let hidden = code.hidden_tests;
             meta.push(Some(
-                div()
-                    .id("pr-code-hidden-tests")
+                crate::app::chat::focusable(div().id("pr-code-hidden-tests"), t)
                     .flex_none()
                     .cursor_pointer()
                     .text_color(t.foreground)
@@ -1208,8 +1207,7 @@ impl Workspace {
         let segment = |id: &'static str, icon: Lucide, pressed: bool, value: bool, cx: &mut Context<Self>| {
             let pressed_bg = Hsla { a: t.input.a * 0.72, ..t.input };
             let hover = Hsla { a: t.input.a * 0.32, ..t.input };
-            div()
-                .id(id)
+            crate::app::chat::focusable(div().id(id), t)
                 .h(px(24.))
                 .px(px(10.))
                 .flex()

@@ -1256,8 +1256,7 @@ impl Workspace {
             .child(label)
             .when(no_projects, |el| {
                 el.child(
-                    h_flex()
-                        .id("sidebar-empty-add-project")
+                    keyboard_button(h_flex().id("sidebar-empty-add-project"), tokens.ring)
                         .gap(px(6.))
                         .px(px(10.))
                         .py(px(4.))
