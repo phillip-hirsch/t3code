@@ -276,9 +276,7 @@ fn group_pages<'a>(
     for project in projects {
         let env = project.environment_id.as_ref();
         let Some(threads) = by_project.remove(&(env, project.id.as_str())) else { continue };
-        let on_env = |group: &&ProjectGroup| group.members.iter().any(|m| m.project.environment_id.as_ref() == env);
-        let logical =
-            if multiple { logical.iter().find(|group| on_env(group) && group.contains(&project.id)) } else { None };
+        let logical = if multiple { logical.iter().find(|group| group.contains_project(project)) } else { None };
         let key = logical.map_or_else(|| format!("{env}:{}", project.id), |group| group.key.clone());
         match groups.iter_mut().find(|group| group.key == key) {
             Some(group) => group.threads.extend(threads),

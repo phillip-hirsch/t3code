@@ -273,10 +273,6 @@ impl ProjectGroup {
         self.members.iter().map(|m| ScopedId::of_project(&m.project)).collect()
     }
 
-    pub fn contains(&self, project_id: &str) -> bool {
-        self.project_ids.iter().any(|id| id == project_id)
-    }
-
     /// Whether `project`, on its environment, is one of the group's records.
     pub fn contains_project(&self, project: &ProjectShell) -> bool {
         self.contains_ref(project.project_ref())

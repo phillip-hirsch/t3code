@@ -171,9 +171,9 @@ impl SettingsView {
         self.value(key) == contract().default_value(key)
     }
 
-    /// The group a checkout belongs to.
-    fn group_of(&self, project_id: &str) -> Option<&ProjectGroup> {
-        self.groups.iter().find(|g| g.members.iter().any(|m| m.project.id == project_id))
+    /// The group the checkout `project_id` on `environment` belongs to.
+    fn group_of(&self, environment: &str, project_id: &str) -> Option<&ProjectGroup> {
+        self.groups.iter().find(|g| g.contains_ref((environment, project_id)))
     }
 }
 
@@ -1358,7 +1358,9 @@ impl Workspace {
                     let environment = view.environment_by_id(&target.environment_id)?;
                     let label = match &target.project_id {
                         Some(project) => {
-                            let name = view.group_of(project).map_or(project.as_str(), |g| g.display_name.as_str());
+                            let name = view
+                                .group_of(&target.environment_id, project)
+                                .map_or(project.as_str(), |g| g.display_name.as_str());
                             format!("{} · {name}", environment.label)
                         }
                         None => environment.label.to_owned(),
@@ -1372,7 +1374,7 @@ impl Workspace {
             overriding
                 .iter()
                 .filter_map(|project| {
-                    let group = view.group_of(project)?;
+                    let group = view.group_of(view.environment()?.id, project)?;
                     let value =
                         environment_settings.get("projectSettingsOverrides").get(project).and_then(|o| o.get(key));
                     Some((

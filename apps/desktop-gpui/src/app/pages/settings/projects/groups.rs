@@ -96,7 +96,7 @@ pub(super) fn plan_removal(
 ) -> (bool, String) {
     let thread_count = threads
         .iter()
-        .filter(|thread| thread.is_listed() && members.iter().any(|m| m.project.id == thread.project_id))
+        .filter(|thread| thread.is_listed() && members.iter().any(|m| m.project.project_ref() == thread.project_ref()))
         .count()
         + unloaded;
     let whole_group = members.len() == group_member_count;
@@ -213,7 +213,10 @@ mod tests {
             "updatedAt": "2026-11-01T00:00:00.000Z", "createdAt": "2026-11-01T00:00:00.000Z",
         }))
         .unwrap();
-        let (whole, message) = plan_removal(&[&member], 1, false, "api", Some("box"), &[thread], 0);
+        // The same project id on another environment holds threads of its own.
+        let mut elsewhere = thread.clone();
+        elsewhere.environment_id = "other".into();
+        let (whole, message) = plan_removal(&[&member], 1, false, "api", Some("box"), &[thread, elsewhere], 0);
         assert!(whole);
         assert_eq!(
             message,
