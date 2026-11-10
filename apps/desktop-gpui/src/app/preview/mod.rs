@@ -1818,7 +1818,8 @@ fn page_builder<'a>(
         .with_initialization_script(preview::HISTORY_SCRIPT)
         .with_initialization_script(capture::RECORDING_SCRIPT)
         .with_initialization_script(annotation::PICKER_SCRIPT)
-        .with_initialization_script(preview::shortcut_script(chords, keymap::MAC))
+        // Every frame, so a focused iframe forwards too (WebView2 injects into all frames anyway).
+        .with_initialization_script_for_main_only(preview::shortcut_script(chords, keymap::MAC), false)
         .with_initialization_script(preview::CORNER_SCRIPT)
         .with_ipc_handler({
             let sender = sender.clone();

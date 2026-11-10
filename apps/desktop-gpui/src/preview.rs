@@ -311,11 +311,31 @@ pub fn history_message(body: &str) -> Option<PageHistory> {
 /// forwarding does: a matching key never reaches the page, and unless it repeats its command
 /// posts over wry's IPC. Keys match as `matchesKeybindingShortcut` reads them.
 /// `window.__t3PageShortcuts(chords)` swaps the set when the keymap changes.
+/// It runs in every frame. Only the top frame has wry's IPC (WebView2 routes a subframe's
+/// messages elsewhere), so a subframe relays its command to the top, and each frame passes the
+/// chords on to its own frames; a new subframe asks its parent for them.
 const SHORTCUT_SCRIPT: &str = r#"(() => {
-  if (window !== window.top || !window.ipc) return;
+  const top = window === window.top;
+  if (top && !window.ipc) return;
   let chords = __CHORDS__;
   const mac = __MAC__;
-  Object.defineProperty(window, "__t3PageShortcuts", { value: (next) => { chords = next; } });
+  const send = (frame, next) => { try { frame.postMessage({ t3PageShortcuts: next }, "*"); } catch {} };
+  const children = () => Array.from({ length: frames.length }, (_, i) => frames[i]);
+  const swap = (next) => { chords = next; children().forEach((frame) => send(frame, next)); };
+  if (top) Object.defineProperty(window, "__t3PageShortcuts", { value: swap });
+  addEventListener("message", (event) => {
+    const data = event.data;
+    if (!data || typeof data !== "object") return;
+    if (top && typeof data.t3Shortcut === "string") window.ipc.postMessage(JSON.stringify({ t3Shortcut: data.t3Shortcut }));
+    else if (!top && event.source === parent && Array.isArray(data.t3PageShortcuts)) swap(data.t3PageShortcuts);
+    else if (data.t3PageShortcutsWanted === true && children().includes(event.source)) send(event.source, chords);
+    else return;
+    event.stopImmediatePropagation();
+  }, true);
+  if (!top) parent.postMessage({ t3PageShortcutsWanted: true }, "*");
+  const forward = (command) => top
+    ? window.ipc.postMessage(JSON.stringify({ t3Shortcut: command }))
+    : window.top.postMessage({ t3Shortcut: command }, "*");
   const codes = { Backquote: "`", Backslash: "\\", BracketLeft: "[", BracketRight: "]", Comma: ",", Equal: "=", Minus: "-", Period: ".", Quote: "'", Semicolon: ";", Slash: "/" };
   const keysOf = (event) => {
     const lower = event.key.toLowerCase();
@@ -335,7 +355,7 @@ const SHORTCUT_SCRIPT: &str = r#"(() => {
     if (!chord) return;
     event.preventDefault();
     event.stopImmediatePropagation();
-    if (!event.repeat) window.ipc.postMessage(JSON.stringify({ t3Shortcut: chord.command }));
+    if (!event.repeat) forward(chord.command);
   }, true);
 })();"#;
 
@@ -1549,7 +1569,7 @@ mod tests {
         let script = shortcut_script(chords, true);
         assert!(script.contains(&format!("let chords = {chords};")) && script.contains("const mac = true;"));
         assert!(!script.contains("__CHORDS__") && !script.contains("__MAC__"));
-        assert!(script.contains("postMessage(JSON.stringify({ t3Shortcut: chord.command }))"));
+        assert!(script.contains("window.ipc.postMessage(JSON.stringify({ t3Shortcut: command }))"));
         assert_eq!(shortcut_message(r#"{"t3Shortcut":"sidebar.toggle"}"#).as_deref(), Some("sidebar.toggle"));
         assert_eq!(shortcut_message(r#"{"t3Shortcut":1}"#), None);
         assert_eq!(shortcut_message(r#"{"t3History":{}}"#), None);
