@@ -4357,7 +4357,9 @@ impl BlockNode {
             .border_1()
             .border_color(style.border())
             .refine_style(style.table());
-        let body = if scroll {
+        // t3code: every table scrolls once its column floors outgrow the
+        // frame, where the wrapping layout used to clip the columns past it.
+        let body = {
             let scroll_handle = window
                 .use_keyed_state(
                     block_element_id("table-scroll", table.span, options.ix),
@@ -4384,6 +4386,7 @@ impl BlockNode {
                 block_element_id("table", table.span, options.ix),
                 &scroll_handle,
                 &frame,
+                style.muted_foreground(),
                 // Row track sized to `max(viewport, column floors)`:
                 // `min_w_full` fills the frame while the columns can still
                 // shrink-to-fit (their text wrapping), the definite
@@ -4392,13 +4395,6 @@ impl BlockNode {
                 div().min_w_full().w(px(min_total_w)).children(rows),
             )
             .into_any_element()
-        } else {
-            div()
-                .w_full()
-                .overflow_hidden()
-                .refine_style(&frame)
-                .children(rows)
-                .into_any_element()
         };
 
         div()

@@ -9,22 +9,23 @@ use std::time::Duration;
 
 use gpui_kit::component::button::Button;
 use gpui_kit::component::highlighter::HighlightTheme;
-use gpui_kit::component::message_scroller::MessageScroller;
+use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::text::{TextView, TextViewState, TextViewStyle};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, App, AppContext as _, ClickEvent, Context, ElementId, Entity, Font, FontWeight, HighlightStyle, Hsla,
-    InteractiveElement as _, IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _,
-    StyleRefinement, Styled as _, Subscription, Task, TextRun, WeakEntity, Window, div, linear_color_stop,
-    linear_gradient, prelude::FluentBuilder as _, px, relative, rems, rgb,
+    InteractiveElement as _, IntoElement, ListOffset, ParentElement as _, SharedString,
+    StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription, Task, TextRun, WeakEntity, Window,
+    div, linear_color_stop, linear_gradient, prelude::FluentBuilder as _, px, relative, rems, rgb,
 };
 
 use gpui_kit::assets::IconName;
 
 use super::side_chat::ChatPane;
 use super::{Target, Workspace, message_actions, timeline_anchor};
+use crate::model::ThreadProjection;
 use crate::theme::{self, Tokens};
 use crate::timeline::{self, DetailEntry, Row, Steer, WorkRow, WorkRowKind};
 use crate::work_log::{self, Activity, Entry, Status, WorkIcon};
@@ -211,13 +212,25 @@ impl Workspace {
         }
     }
 
-    /// Opens or closes a work group, turn fold or entry.
+    /// Opens or closes a work group, turn fold or entry, holding the toggled heading where it
+    /// is on screen (`preserveDisclosurePosition`).
     pub(super) fn toggle_expanded(&mut self, key: SharedString, cx: &mut Context<Self>) {
         if !self.expanded.remove(&key) {
             self.expanded.insert(key);
         }
+        let running = |projection: Option<&ThreadProjection>| projection.is_some_and(ThreadProjection::is_running);
+        let main_rows = Rc::clone(&self.rows);
+        let main_top = disclosure_anchor(&self.scroller, running(self.open_projection()), cx);
+        let side_running = running(self.side_chat_projection());
+        let side = self.side_chat.view.as_ref().map(|view| {
+            (view.scroller.clone(), Rc::clone(&view.rows), disclosure_anchor(&view.scroller, side_running, cx))
+        });
         self.refresh_rows(cx);
         self.refresh_side_chat_rows(cx);
+        hold_top(&self.scroller, &main_rows, &self.rows, main_top, cx);
+        if let (Some((scroller, rows, top)), Some(view)) = (side, self.side_chat.view.as_ref()) {
+            hold_top(&scroller, &rows, &view.rows, top, cx);
+        }
         cx.notify();
     }
 
@@ -306,6 +319,31 @@ impl Workspace {
             }),
         }
         (anchor.end_space(), anchor.is_pinned())
+    }
+}
+
+/// The top a disclosure toggle holds, so rows opening or closing below it don't move it. Holding
+/// ends tail following until the reader scrolls back to the end, so a running turn that follows
+/// its tail keeps following; a jump to the end that has not landed yet holds nothing.
+fn held_top(running: bool, following: bool, top: ListOffset, rows: usize) -> Option<ListOffset> {
+    (!(running && following) && top.item_ix < rows).then_some(top)
+}
+
+fn disclosure_anchor(scroller: &Entity<MessageScrollerState>, running: bool, cx: &App) -> Option<ListOffset> {
+    let scroller = scroller.read(cx);
+    held_top(running, scroller.is_following_tail(), scroller.logical_scroll_top(), scroller.item_count())
+}
+
+/// Puts a timeline whose rows the toggle changed back at `top`; one it left alone keeps following.
+fn hold_top(
+    scroller: &Entity<MessageScrollerState>,
+    before: &Rc<[Row]>,
+    after: &Rc<[Row]>,
+    top: Option<ListOffset>,
+    cx: &mut App,
+) {
+    if let Some(top) = top.filter(|_| !Rc::ptr_eq(before, after)) {
+        scroller.update(cx, |scroller, cx| scroller.scroll_to_offset(top, cx));
     }
 }
 
@@ -2099,11 +2137,8 @@ fn markdown_view(
                 // A thread no longer here opens nothing, as its chip shows.
                 Some(_) => {
                     let message_environment = workspace.active_environment().map(ToString::to_string);
-                    let destination = super::markdown_ui::thread_link_destination(
-                        url,
-                        message_environment.as_deref(),
-                        &workspace.shell.threads,
-                    );
+                    let destination =
+                        super::markdown_ui::thread_link_destination(url, message_environment.as_deref(), workspace);
                     if let Some((env, thread_id)) = destination {
                         workspace.select_thread_in(env, thread_id, window, cx);
                     }
@@ -3121,5 +3156,16 @@ mod tests {
         assert_eq!(runnable_command("sh", "rm -rf \u{202e}/ tmp\n"), None);
         // A newline or tab inside the block is a control character too, as on the web.
         assert_eq!(runnable_command("sh", "a\nb\n"), None);
+    }
+
+    #[test]
+    fn a_disclosure_holds_its_place_unless_a_running_turn_follows_the_tail() {
+        let top = ListOffset { item_ix: 3, offset_in_item: px(12.) };
+        // A finished turn at the bottom stops following, so the opened heading stays put.
+        assert_eq!(held_top(false, true, top, 10), Some(top));
+        assert_eq!(held_top(true, false, top, 10), Some(top), "a reader scrolled up stays put");
+        assert_eq!(held_top(true, true, top, 10), None, "the live end keeps streaming into view");
+        let pending_end = ListOffset { item_ix: 10, offset_in_item: px(0.) };
+        assert_eq!(held_top(false, true, pending_end, 10), None);
     }
 }

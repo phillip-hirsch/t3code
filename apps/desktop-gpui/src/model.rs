@@ -1140,6 +1140,8 @@ struct ShellCursor {
     older: Option<crate::older_settled::Cut>,
     /// The sequence of each thread's latest removal since the snapshot.
     removed_at: HashMap<String, u64>,
+    /// Threads the subscription removed, so lookups of threads it leaves out ask again.
+    removals: u64,
 }
 
 impl ShellState {
@@ -1156,6 +1158,11 @@ impl ShellState {
     /// `environmentShell` status `live`: this environment's subscription caught up with its server.
     pub fn is_live(&self, environment_id: &str) -> bool {
         self.cursors.get(environment_id).is_some_and(|cursor| cursor.live)
+    }
+
+    /// How many threads `environment_id`'s subscription removed.
+    pub fn removals(&self, environment_id: &str) -> u64 {
+        self.cursors.get(environment_id).map_or(0, |cursor| cursor.removals)
     }
 
     /// Some environment's subscription caught up with its server.
@@ -1403,6 +1410,7 @@ impl ShellState {
                 let id = item["threadId"].as_str().unwrap_or_default();
                 self.threads.retain(|t| !(ours(&t.environment_id) && t.id == id));
                 cursor.removed_at.insert(id.to_owned(), sequence.unwrap_or(cursor.sequence));
+                cursor.removals += 1;
             }
             _ => {}
         }

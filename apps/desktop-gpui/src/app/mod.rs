@@ -405,6 +405,7 @@ pub struct Workspace {
     diagrams: mermaid::Diagrams,
     formulas: math::Formulas,
     entry_kinds: Arc<markdown_ui::EntryKinds>,
+    thread_link_lookups: markdown_ui::ThreadLinkLookups,
     workflow: workflow::WorkflowUi,
     setup: worktree_setup::SetupWatch,
     chat_menu: Option<markdown_ui::ChatMenu>,
@@ -628,6 +629,7 @@ impl Workspace {
             diagrams: Default::default(),
             formulas: Default::default(),
             entry_kinds: Default::default(),
+            thread_link_lookups: Default::default(),
             workflow: Default::default(),
             setup: Default::default(),
             chat_menu: None,
@@ -1427,7 +1429,7 @@ impl Render for Workspace {
         let terminal_drawer = self.render_terminal_drawer(window, cx);
         let theme = cx.theme();
         let canvas = theme.background;
-        div()
+        let view = div()
             .size_full()
             .relative()
             .track_focus(&self.focus)
@@ -1631,6 +1633,9 @@ impl Render for Workspace {
             .children(self.render_history_swipe(cx))
             .child(self.render_caption_overlay(window, cx))
             .children(titlebar::render_resize_edges(window, cx))
-            .into_any_element()
+            .into_any_element();
+        // Only the built view knows whether the card rendered Lineage.
+        self.sync_lineage_tick(cx);
+        view
     }
 }

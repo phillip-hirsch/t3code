@@ -30,6 +30,10 @@ pub(in crate::app) struct LineageUi {
     /// Phases the user opened or closed, by [`row_key`] and phase index; the rest stay open
     /// while they run.
     pub(super) phases_open: HashMap<(String, i64), bool>,
+    /// Repaints an open workflow's running elapsed times once a second.
+    _tick: Option<Task<()>>,
+    /// Whether the card this frame rendered such a time; taken by `sync_lineage_tick`.
+    pub(super) card_ticks: std::cell::Cell<bool>,
 }
 
 /// A related thread's row in the open thread's details, unique across environments.
@@ -99,6 +103,15 @@ pub(super) struct Workflow {
     pub unphased: Vec<Member>,
     /// `canStopWorkflow` short of the grant: a running Claude workflow.
     pub stoppable: bool,
+}
+
+impl Workflow {
+    /// Whether its open row shows a time that runs: a running phase or a working member that started.
+    pub fn ticks(&self) -> bool {
+        let live = |member: &Member| matches!(member.status.as_str(), "pending" | "running" | "waiting");
+        self.phases.iter().any(|phase| phase.running() && phase.members.iter().any(|m| m.started_ms.is_some()))
+            || self.unphased.iter().any(|m| live(m) && m.started_ms.is_some())
+    }
 }
 
 /// What a subagent's Stop needs (`interruptThreadTurn` with a `subagentId`).
@@ -469,6 +482,23 @@ fn unlisted(sources: &Sources) -> Vec<String> {
 }
 
 impl Workspace {
+    /// Repaints once a second while the card shows a running workflow time, and stops as soon
+    /// as a frame renders none (the card closed, Lineage dropped out, or the target changed).
+    pub(in crate::app) fn sync_lineage_tick(&mut self, cx: &mut Context<Self>) {
+        if !self.lineage.card_ticks.take() {
+            self.lineage._tick = None;
+        } else if self.lineage._tick.is_none() {
+            self.lineage._tick = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+    }
+
     /// Runs `f` over the open thread's [`Sources`] and environment.
     fn with_lineage_sources<R>(&self, f: impl FnOnce(&Sources, &SharedString) -> R) -> Option<R> {
         let Some(Target::Thread { env, id }) = &self.target else { return None };
@@ -822,7 +852,7 @@ mod tests {
                 json!({"status": status, "origin": "provider_native", "driver": driver,
                     "nativeTaskRef": {"nativeId": "t", "strength": "strong"},
                     "workflow": {"name": "review", "phases": [{"index": 0, "title": "Find"}],
-                        "agents": [{"index": 0, "label": "bugs", "state": "running", "phaseIndex": 0},
+                        "agents": [{"index": 0, "label": "bugs", "state": "running", "phaseIndex": 0, "startedAt": 1000},
                             {"index": 1, "label": "extra", "state": "queued"}]}}),
             )
         };
@@ -834,12 +864,14 @@ mod tests {
         assert!(workflow.stoppable);
         assert_eq!(workflow.phases.iter().map(|p| (p.index, p.members.len())).collect::<Vec<_>>(), [(0, 1)]);
         assert_eq!(workflow.unphased[0].title, "extra");
+        assert!(workflow.ticks(), "a running phase with a started member shows a running time");
 
         // A settled workflow files under Previous agents even while its thread still runs.
         let agents = [coordinator("completed", "claudeAgent")];
         let found = find(&sources(&threads, &agents, &[]), |_| None);
         assert_eq!((ids(&found.previous), found.previous[0].status.as_deref()), (vec!["wf"], Some("completed")));
         assert!(!found.previous[0].workflow.as_ref().unwrap().stoppable);
+        assert!(!found.previous[0].workflow.as_ref().unwrap().ticks(), "a settled workflow's times stand still");
         let agents = [coordinator("running", "codex")];
         assert!(!find(&sources(&threads, &agents, &[]), |_| None).active[0].workflow.as_ref().unwrap().stoppable);
     }
