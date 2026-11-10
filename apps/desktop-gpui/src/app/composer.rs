@@ -1713,24 +1713,22 @@ impl Workspace {
             |decision: &str, label: &str, warning: Option<SharedString>, tone: Hsla, cx: &mut Context<Self>| {
                 let request_id = request.id.clone();
                 let decision = decision.to_owned();
-                h_flex()
-                    .id(ElementId::Name(format!("approval-{}-{decision}", request.id).into()))
-                    .gap(px(4.))
+                // A button, so Tab reaches it and Enter or Space answers (`InlineButton`).
+                Button::new(ElementId::Name(format!("approval-{}-{decision}", request.id).into()))
+                    .text()
+                    .xsmall()
+                    .h(px(16.))
+                    .text_xs()
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(tone)
-                    .when(warning.is_some(), |el| el.child(Icon::new(Lucide::TriangleAlert).with_size(px(12.))))
-                    .child(label.to_owned())
-                    .when_some(warning, |el, warning| {
-                        el.tooltip(move |window, cx| Tooltip::new(warning.clone()).build(window, cx))
-                    })
+                    .when(warning.is_some(), |el| el.icon(Icon::new(Lucide::TriangleAlert).with_size(px(12.))))
+                    .label(label.to_owned())
+                    .when_some(warning, |el, warning| el.tooltip(warning))
+                    .disabled(!enabled)
                     .when(!enabled, |el| el.opacity(0.64))
-                    .when(enabled, |el| {
-                        el.cursor_pointer().hover(|s| s.underline().text_color(t.foreground)).on_click(cx.listener(
-                            move |this, _, _, cx| {
-                                this.respond(pane, request_id.clone(), json!({"decision": decision}), cx);
-                            },
-                        ))
-                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.respond(pane, request_id.clone(), json!({"decision": decision}), cx);
+                    }))
             };
         let primary: Vec<_> = options.iter().filter(|(d, ..)| d == "decline" || d == "accept").collect();
         let more: Rc<Vec<_>> =
