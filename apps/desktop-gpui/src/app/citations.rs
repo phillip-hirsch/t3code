@@ -51,7 +51,7 @@ struct CiteSelection {
     /// The chat the reply is in, whose composer Cite fills.
     pane: ChatPane,
     citation: AssistantCitation,
-    /// Where the pointer let go, in window coordinates.
+    /// Where the button sits, in window coordinates.
     position: Point<Pixels>,
     /// The reply's markdown key and the quote's bytes in its rendered text.
     key: SharedString,
@@ -124,12 +124,19 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        cx.on_next_frame(window, move |this, _, cx| this.capture_cite_selection(pane, position, cx));
+        cx.on_next_frame(window, move |this, _, cx| this.capture_cite_selection(pane, Some(position), cx));
     }
 
-    /// `captureAssistantTextSelection`: a selection inside one reply of the pane's thread.
-    fn capture_cite_selection(&mut self, pane: ChatPane, position: Point<Pixels>, cx: &mut Context<Self>) {
-        let captured = self.cite_selection_at(pane, position, cx);
+    /// Select All in a reply, the text views' one keyboard selection: once it applies, offer to
+    /// cite it (`selectionchange`).
+    pub(super) fn chat_select_all(&mut self, pane: ChatPane, window: &mut Window, cx: &mut Context<Self>) {
+        cx.on_next_frame(window, move |this, _, cx| this.capture_cite_selection(pane, None, cx));
+    }
+
+    /// `captureAssistantTextSelection`: a selection inside one reply of the pane's thread, its
+    /// button at the pointer that made it, else below the selection's end.
+    fn capture_cite_selection(&mut self, pane: ChatPane, pointer: Option<Point<Pixels>>, cx: &mut Context<Self>) {
+        let captured = self.cite_selection_at(pane, pointer, cx);
         if captured.is_some() {
             self.citations.toolbar_focus.get_or_insert_with(|| cx.focus_handle());
         }
@@ -139,7 +146,7 @@ impl Workspace {
         }
     }
 
-    fn cite_selection_at(&self, pane: ChatPane, position: Point<Pixels>, cx: &App) -> Option<CiteSelection> {
+    fn cite_selection_at(&self, pane: ChatPane, pointer: Option<Point<Pixels>>, cx: &App) -> Option<CiteSelection> {
         let (env, thread_id) = self.pane_thread(pane)?;
         let rows = self.pane_rows(pane);
         let mut selected = self
@@ -170,7 +177,11 @@ impl Workspace {
             prefix: selector.prefix,
             suffix: selector.suffix,
         };
-        let scroll_top = self.pane_scroller(pane)?.read(cx).logical_scroll_top();
+        let scroller = self.pane_scroller(pane)?.read(cx);
+        // Select All, the only selection the keyboard makes, ends where the reply does.
+        let reply = self.markdown_view(&key)?.read(cx).bounds();
+        let position = selection_action_position(scroller.viewport_bounds(), reply.bottom_right(), pointer);
+        let scroll_top = scroller.logical_scroll_top();
         Some(CiteSelection { pane, citation, position, key, range, scroll_top })
     }
 
@@ -874,6 +885,21 @@ fn quote_preview(text: &str, comment: Option<&str>, t: &Tokens) -> AnyElement {
         .into_any_element()
 }
 
+/// `resolveSelectionActionPosition`: the pointer, else just below the selection's end, kept
+/// inside the timeline once it has laid out.
+fn selection_action_position(
+    timeline: Bounds<Pixels>,
+    selection_end: Point<Pixels>,
+    pointer: Option<Point<Pixels>>,
+) -> Point<Pixels> {
+    let at = pointer.unwrap_or(point(selection_end.x, selection_end.y + px(4.)));
+    if timeline.size.width <= px(0.) || timeline.size.height <= px(0.) {
+        return at;
+    }
+    let clamp = |value: Pixels, low: Pixels, high: Pixels| value.max(low).min(high);
+    point(clamp(at.x, timeline.left(), timeline.right()), clamp(at.y, timeline.top(), timeline.bottom()))
+}
+
 /// `text` for a plain-text composer, its citations as chips.
 pub(super) fn citation_content(text: &str) -> InputContent {
     let mut content = InputContent::new(text.to_owned());
@@ -988,5 +1014,18 @@ mod tests {
         let content = citation_content(&text);
         let ranges: Vec<_> = content.tokens().iter().map(|span| span.range()).collect();
         assert_eq!(ranges, [4..4 + markdown.len()], "only the citation is a chip");
+    }
+
+    #[test]
+    fn the_cite_button_sits_below_a_keyboard_selection_inside_the_timeline() {
+        let timeline = Bounds::new(point(px(100.), px(50.)), gpui_kit::size(px(400.), px(300.)));
+        let end = point(px(300.), px(200.));
+        assert_eq!(selection_action_position(timeline, end, None), point(px(300.), px(204.)));
+        let below = point(px(600.), px(500.));
+        assert_eq!(selection_action_position(timeline, below, None), point(px(500.), px(350.)), "a long reply's end");
+        let pointer = point(px(120.), px(60.));
+        assert_eq!(selection_action_position(timeline, end, Some(pointer)), pointer);
+        let unlaid = Bounds::default();
+        assert_eq!(selection_action_position(unlaid, end, None), point(px(300.), px(204.)));
     }
 }

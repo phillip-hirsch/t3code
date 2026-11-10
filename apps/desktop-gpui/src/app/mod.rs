@@ -1602,6 +1602,11 @@ impl Render for Workspace {
                                                                                 }
                                                                             },
                                                                         ))
+                                                                        .capture_action(cx.listener(
+                                                                            |this, _: &gpui_kit::component::input::SelectAll, window, cx| {
+                                                                                this.chat_select_all(side_chat::ChatPane::Main, window, cx);
+                                                                            },
+                                                                        ))
                                                                         .child(self.render_body(window, cx)),
                                                                 )
                                                                 .child(self.render_floating_composer(window, cx)),

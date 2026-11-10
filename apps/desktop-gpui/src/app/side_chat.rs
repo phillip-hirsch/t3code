@@ -793,6 +793,9 @@ This permanently clears its conversation history."
                             this.chat_mouse_up(ChatPane::Side, event.position, window, cx);
                         }
                     }))
+                    .capture_action(cx.listener(|this, _: &gpui_kit::component::input::SelectAll, window, cx| {
+                        this.chat_select_all(ChatPane::Side, window, cx);
+                    }))
                     .child(
                         MessageScroller::new("side-chat-timeline", view.scroller.clone(), move |index, window, cx| {
                             match rows.get(index) {
