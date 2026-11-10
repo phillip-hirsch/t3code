@@ -198,6 +198,9 @@ impl Workspace {
     }
 
     pub(super) fn submit_with(&mut self, intent: Intent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.target_can_operate() {
+            return;
+        }
         // `/side` beats an open question, unless side chats are off and it may be a literal answer.
         let prompt = self.composer.read(cx).value().to_string();
         if (self.question.is_none() || self.side_chat_disabled_reason().is_none())
@@ -484,7 +487,7 @@ impl Workspace {
     pub(super) fn resume_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(Target::Thread { id: thread_id, .. }) = self.target.clone() else { return };
         let (Some(client), Some(projection)) = (self.client(), self.open_projection()) else { return };
-        if self.sending || self.target_rewinding() {
+        if self.sending || self.target_rewinding() || !self.target_can_operate() {
             return;
         }
         let run = projection.resumable_run_id().map(str::to_owned);

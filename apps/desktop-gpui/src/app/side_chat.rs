@@ -34,7 +34,7 @@ use crate::timeline::{self, Row};
 const PLACEHOLDER: &str = "Ask a side question";
 
 /// `threadOperationFailure`: the connection lacks `orchestration:operate`.
-const NOT_OPERATE: &str = "This connection cannot change threads.";
+pub(super) const NOT_OPERATE: &str = "This connection cannot change threads.";
 
 /// Which chat a footer row and its controls act on: the open thread's, or the side chat tab's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

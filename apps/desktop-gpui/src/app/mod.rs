@@ -1300,6 +1300,9 @@ impl Workspace {
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
+        if !self.target_can_operate() {
+            return;
+        }
         let Some(projection) = self.thread.as_ref().and_then(|t| t.state.projection.as_ref()) else { return };
         let thread_id = projection.thread.id.clone();
         let command = if self.server_info().capability("threadStop") {

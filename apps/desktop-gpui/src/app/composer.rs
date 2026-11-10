@@ -981,7 +981,7 @@ impl Workspace {
         let attached = |id: &str| self.question_attached(pane, id);
         let Some(answers) = requests::answers(&draft.questions, &draft.drafts, attached) else { return };
         let request_id = draft.request_id.clone();
-        if self.responding.is_some() {
+        if self.responding.is_some() || !self.target_can_operate() {
             return;
         }
         let mut response = json!({"answers": answers});
@@ -1433,7 +1433,13 @@ impl Workspace {
             )
     }
 
+    /// `canOperateThread`: this connection may change the open target's environment.
+    pub(super) fn target_can_operate(&self) -> bool {
+        self.target.as_ref().is_some_and(|target| self.can_operate(target.environment()))
+    }
+
     fn render_primary_action(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+        let operate = self.target_can_operate();
         let running = self
             .thread
             .as_ref()
@@ -1444,7 +1450,7 @@ impl Workspace {
                 .hover(|s| s.bg(t.error))
                 .child(div().size(px(8.)).rounded(px(1.5)).bg(t.primary_foreground))
                 .tooltip(|window, cx| Tooltip::new("Interrupt").build(window, cx))
-                .on_click(cx.listener(|this, _, _, cx| this.stop(cx)))
+                .when(operate, |el| el.on_click(cx.listener(|this, _, _, cx| this.stop(cx))))
         };
         if let Some(draft) = &self.question {
             let responding = self.responding.as_ref() == Some(&draft.request_id);
@@ -1453,6 +1459,7 @@ impl Workspace {
                 .is_some_and(|(r, _)| r.capability() != Some("not_resumable"));
             let attached = |id: &str| self.question_attached(ChatPane::Main, id);
             let (label, enabled) = question_submit(draft, attached, responding, can_respond);
+            let enabled = enabled && operate;
             let submit = div().id("submit-answer");
             let submit = if enabled { action_control(submit, &self.composer_action_focus[PRIMARY], t) } else { submit };
             return h_flex()
@@ -1500,7 +1507,7 @@ impl Workspace {
         }
         let busy = self.sending || self.saving_queue_edit();
         if can_resume && !sendable {
-            let enabled = !self.sending && !self.target_rewinding() && self.client().is_some();
+            let enabled = operate && !self.sending && !self.target_rewinding() && self.client().is_some();
             // The web's send button in its resume state: the same stage art, a filled play.
             let stage = self.stage_art();
             let (fill, icon) = if stage.is_some() {
@@ -1527,7 +1534,9 @@ impl Workspace {
                 .tooltip(|window, cx| Tooltip::new("Resume thread").build(window, cx))
                 .into_any_element();
         }
-        let disabled_reason: Option<SharedString> = if self.model_fanout().is_some_and(<[_]>::is_empty) {
+        let disabled_reason: Option<SharedString> = if !operate {
+            Some(super::side_chat::NOT_OPERATE.into())
+        } else if self.model_fanout().is_some_and(<[_]>::is_empty) {
             Some("Select at least one model.".into())
         } else if self.attachments_busy() {
             Some("Attachment(s) still uploading".into())
