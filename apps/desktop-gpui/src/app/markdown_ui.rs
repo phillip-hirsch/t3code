@@ -1705,7 +1705,7 @@ impl Workspace {
             .filter(|_| !self.rows.iter().any(|row| super::chat::shows_markdown(row, key)))
             .filter(|side| side.rows.iter().any(|row| super::chat::shows_markdown(row, key)));
         let composer = match side {
-            Some(side) => side.ready_composer().cloned(),
+            Some(_) => self.side_chat.ready_composer().cloned(),
             None => self.composer_takes_citations().then(|| self.composer.clone()),
         };
         let Some(composer) = composer else {

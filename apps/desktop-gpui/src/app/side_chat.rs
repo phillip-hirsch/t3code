@@ -56,7 +56,6 @@ pub(super) struct SideChatView {
     composer: Entity<TextareaState>,
     /// Tracked so typing only re-renders when Send and Stop trade places.
     empty: bool,
-    sending: bool,
     pub(super) queue: super::queue::QueueUi,
     pub(super) now: super::thread_now::NowFooter,
     /// The question card's drafts for the side chat's first pending question; the editor holds
@@ -74,11 +73,6 @@ impl SideChatView {
     fn is(&self, env: &str, thread_id: &str) -> bool {
         self.env == env && self.thread_id == thread_id
     }
-
-    /// The composer, unless a message is being sent from it.
-    pub(super) fn ready_composer(&self) -> Option<&Entity<TextareaState>> {
-        (!self.sending).then_some(&self.composer)
-    }
 }
 
 #[derive(Default)]
@@ -86,6 +80,8 @@ pub(super) struct SideChats {
     pub(super) view: Option<SideChatView>,
     /// A side chat is being forked; another start waits for it (`pendingRef`).
     starting: bool,
+    /// Side chats with a message on its way, which outlive their tab's view.
+    sending: HashSet<Key>,
     /// Side chats being brought back or deleted, each pane's own (`bringingBack`, `deleting`).
     bringing_back: HashSet<Key>,
     deleting: HashSet<Key>,
@@ -130,6 +126,15 @@ impl SideDraft {
 }
 
 impl SideChats {
+    fn sending(&self, env: &str, thread_id: &str) -> bool {
+        self.sending.iter().any(|(e, id)| e == env && id == thread_id)
+    }
+
+    /// The composer on screen, unless a message is being sent from it.
+    pub(super) fn ready_composer(&self) -> Option<&Entity<TextareaState>> {
+        self.view.as_ref().filter(|view| !self.sending(&view.env, &view.thread_id)).map(|view| &view.composer)
+    }
+
     /// Drops the side chat's stream with the socket it ran on; it subscribes again on reconnect.
     pub(super) fn disconnect(&mut self) {
         if let Some(view) = &mut self.view {
@@ -512,7 +517,6 @@ impl Workspace {
             scroller,
             composer,
             empty,
-            sending: false,
             queue: Default::default(),
             now: Default::default(),
             question,
@@ -584,7 +588,7 @@ impl Workspace {
         }
         let Some(view) = self.side_chat.view.as_ref() else { return };
         let text = view.composer.read(cx).value().trim().to_owned();
-        if text.is_empty() || view.sending {
+        if text.is_empty() || self.side_chat.sending(&view.env, &view.thread_id) {
             return;
         }
         let projection = view.state.projection.as_ref();
@@ -600,9 +604,7 @@ impl Workspace {
         let command = turn_command(&view.thread_id, &text, running, follow_up, model);
         let Some((client, ..)) = self.pane_client(ChatPane::Side, cx) else { return };
         let origin = self.target.clone();
-        if let Some(view) = self.side_chat.view.as_mut() {
-            view.sending = true;
-        }
+        self.side_chat.sending.insert(key.clone());
         self.set_pane_text(ChatPane::Side, String::new(), window, cx);
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("orchestration.dispatchCommand", command).await;
@@ -610,9 +612,7 @@ impl Workspace {
                 if result.is_ok() {
                     this.side_chat.models.remove(&key);
                 }
-                if let Some(view) = this.side_chat.view.as_mut().filter(|v| v.is(&key.0, &key.1)) {
-                    view.sending = false;
-                }
+                this.side_chat.sending.remove(&key);
                 if result.is_err() {
                     this.give_back_side_chat(key.clone(), text.clone(), window, cx);
                 }
@@ -1005,7 +1005,7 @@ This permanently clears its conversation history."
                 .xsmall()
                 .icon(Icon::new(IconName::ArrowUp))
                 .tooltip(if operate { "Send" } else { NOT_OPERATE })
-                .disabled(view.sending || !operate)
+                .disabled(self.side_chat.sending(&view.env, &view.thread_id) || !operate)
                 .on_click(cx.listener(|this, _, window, cx| this.send_side_chat(window, cx))),
         }
         .into_any_element()
@@ -1103,7 +1103,9 @@ impl Workspace {
     pub(super) fn pane_sending(&self, pane: ChatPane) -> bool {
         match pane {
             ChatPane::Main => self.target_sending(),
-            ChatPane::Side => self.side_chat.view.as_ref().is_some_and(|view| view.sending),
+            ChatPane::Side => {
+                self.side_chat.view.as_ref().is_some_and(|view| self.side_chat.sending(&view.env, &view.thread_id))
+            }
         }
     }
 
