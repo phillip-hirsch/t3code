@@ -84,13 +84,15 @@ struct Parser {
     pages: Vec<Page>,
     lines: Page,
     run: String,
+    /// The run's length once escaped, in UTF-16 units like the web's markup string.
+    run_length: usize,
     /// Raw and `\'hh` bytes awaiting the current font's code page.
     encoded: Vec<u8>,
     /// `\uc` fallback characters still to drop after a `\u`.
     fallback: usize,
     /// A `\u` high surrogate awaiting its low half.
     high: Option<u16>,
-    /// Text and breaks kept so far, bounded like the web's markup.
+    /// Markup kept so far (escaped text, style tags and `<br>`s), bounded like the web's.
     length: usize,
 }
 
@@ -111,6 +113,7 @@ impl Parser {
             pages: Vec::new(),
             lines: vec![Vec::new()],
             run: String::new(),
+            run_length: 0,
             encoded: Vec::new(),
             fallback: 0,
             high: None,
@@ -119,13 +122,30 @@ impl Parser {
     }
 
     fn bound(&self) -> Result<(), String> {
-        if self.length + self.run.len() > MAX_CONTENT { Err(TOO_MUCH.into()) } else { Ok(()) }
+        if self.length + self.run_length > MAX_CONTENT { Err(TOO_MUCH.into()) } else { Ok(()) }
+    }
+
+    fn push(&mut self, text: &str) {
+        self.run.push_str(text);
+        self.run_length += text
+            .chars()
+            .map(|c| match c {
+                '&' => 5,
+                '<' | '>' => 4,
+                '"' => 6,
+                c => c.len_utf16(),
+            })
+            .sum::<usize>();
+    }
+
+    fn push_char(&mut self, c: char) {
+        self.push(c.encode_utf8(&mut [0; 4]));
     }
 
     /// A high surrogate no low half followed shows as U+FFFD.
     fn settle(&mut self) {
         if self.high.take().is_some() {
-            self.run.push(char::REPLACEMENT_CHARACTER);
+            self.push_char(char::REPLACEMENT_CHARACTER);
         }
     }
 
@@ -135,18 +155,22 @@ impl Parser {
         if !self.encoded.is_empty() {
             self.settle();
             let encoding = self.fonts.get(&self.state.font).copied().unwrap_or(self.state.encoding);
-            let (text, _) = encoding.decode_with_bom_removal(&self.encoded);
-            self.run.push_str(&text);
-            self.encoded.clear();
+            let mut encoded = std::mem::take(&mut self.encoded);
+            self.push(&encoding.decode_with_bom_removal(&encoded).0);
+            encoded.clear();
+            self.encoded = encoded;
         }
         self.bound()?;
         if self.run.is_empty() {
             return Ok(());
         }
-        self.length += self.run.len();
+        let style = self.state.style;
+        let tags = [(style.bold, "<strong></strong>"), (style.italic, "<em></em>"), (style.underline, "<u></u>")];
+        self.length += std::mem::take(&mut self.run_length)
+            + tags.iter().filter(|(on, _)| *on).map(|(_, tag)| tag.len()).sum::<usize>();
         let text = std::mem::take(&mut self.run);
         let line = self.lines.last_mut().expect("a page has a line");
-        line.push(Run { text, style: self.state.style });
+        line.push(Run { text, style });
         Ok(())
     }
 
@@ -159,7 +183,7 @@ impl Parser {
             return Ok(());
         }
         self.settle();
-        self.run.push_str(text);
+        self.push(text);
         self.bound()
     }
 
@@ -175,11 +199,15 @@ impl Parser {
             }
             0xDC00..=0xDFFF => {
                 let pair = self.high.take().map_or(vec![unit], |high| vec![high, unit]);
-                self.run.extend(char::decode_utf16(pair).map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER)));
+                for c in char::decode_utf16(pair) {
+                    self.push_char(c.unwrap_or(char::REPLACEMENT_CHARACTER));
+                }
             }
             _ => {
                 self.settle();
-                self.run.extend(char::from_u32(unit.into()));
+                if let Some(c) = char::from_u32(unit.into()) {
+                    self.push_char(c);
+                }
             }
         }
         self.bound()
@@ -767,6 +795,28 @@ mod tests {
         input[first] = 0xc0;
         assert_eq!(pages(&input), ["<p>\u{410} \u{410}<br>\u{3042}</p>"]);
         assert!(parse(br"{\rtf1\ansicpg99999 text}").unwrap_err().contains("code page"));
+    }
+
+    #[test]
+    fn the_content_limit_counts_escaped_utf16_markup() {
+        // Each `&` is `&amp;` (5 units) and each Cyrillic letter one unit, as the web counts its markup.
+        let document = |cyrillic: usize| {
+            let mut rtf = br"{\rtf1\ansi\ansicpg1251 ".to_vec();
+            rtf.resize(rtf.len() + MAX_CONTENT / 5, b'&');
+            rtf.resize(rtf.len() + cyrillic, 0xc0);
+            rtf.push(b'}');
+            rtf
+        };
+        assert!(parse(&document(MAX_CONTENT % 5)).is_ok());
+        assert_eq!(parse(&document(MAX_CONTENT % 5 + 1)).err().as_deref(), Some(TOO_MUCH));
+        let mut cyrillic = br"{\rtf1\ansi\ansicpg1251 ".to_vec();
+        cyrillic.resize(cyrillic.len() + 5 * 1024 * 1024, 0xc0);
+        cyrillic.push(b'}');
+        assert!(parse(&cyrillic).is_ok(), "5 MiB of one-byte Cyrillic is 5 Mi units");
+        let mut tagged = br"{\rtf1\b ".to_vec();
+        tagged.resize(tagged.len() + MAX_CONTENT - 16, b'a');
+        tagged.extend_from_slice(br"\b0 b}");
+        assert_eq!(parse(&tagged).err().as_deref(), Some(TOO_MUCH), "a closed run's tags count");
     }
 
     #[test]
