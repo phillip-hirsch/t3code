@@ -24,6 +24,7 @@ use serde_json::{Value, json};
 use super::Workspace;
 use super::image_viewer::ViewerImage;
 use super::message_actions;
+use super::side_chat::ChatPane;
 use crate::theme::Tokens;
 
 /// `pele` 1.8.0's global build (MIT, `assets/vendor/pele-LICENSE`), the web's Mermaid renderer.
@@ -404,6 +405,11 @@ impl Diagrams {
 
     pub(super) fn shows_source(&self, key: &SharedString, at: usize) -> bool {
         self.sources.contains(&(key.clone(), at))
+    }
+
+    /// Forgets which of `pane`'s blocks show their source, once it leaves its thread.
+    pub(super) fn forget_sources(&mut self, pane: ChatPane) {
+        self.sources.retain(|(key, _)| super::chat::view_pane(key).0 != pane);
     }
 
     /// The file panel's diagram source for `id`, when it is the one recorded.
@@ -800,6 +806,20 @@ pub(super) fn chat_diagram(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pane_leaving_its_thread_forgets_its_source_toggles() {
+        use super::super::chat::view_key;
+        let mut diagrams = Diagrams::default();
+        for pane in [ChatPane::Main, ChatPane::Side] {
+            diagrams.sources.insert((view_key(pane, "m1"), 0));
+        }
+        diagrams.forget_sources(ChatPane::Side);
+        assert!(diagrams.shows_source(&view_key(ChatPane::Main, "m1"), 0));
+        assert!(!diagrams.shows_source(&view_key(ChatPane::Side, "m1"), 0));
+        diagrams.forget_sources(ChatPane::Main);
+        assert!(diagrams.sources.is_empty());
+    }
 
     #[test]
     fn fences_close_only_with_a_real_closer() {

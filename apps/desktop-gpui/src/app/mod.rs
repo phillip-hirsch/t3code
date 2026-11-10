@@ -1220,6 +1220,7 @@ impl Workspace {
         self.entry_cache = timeline::EntryCache::default();
         self.markdown = chat::MarkdownStates::default();
         self.markdown_images = markdown_images::ImageCache::default();
+        self.diagrams.forget_sources(side_chat::ChatPane::Main);
         // Leaving the thread drops its open image, as the web's thread overlay retention does.
         self.image_viewer.dismiss();
         self.entry_kinds = Arc::default();
