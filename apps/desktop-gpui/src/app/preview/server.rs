@@ -154,9 +154,11 @@ impl Composition {
         text.clone_into(&mut self.marked);
     }
 
-    /// Committed text replaces the composition; the page types it unless it is empty.
+    /// Committed text replaces the composition; the page types it unless it is empty. Typed
+    /// text means no dead key waits: Windows sends a dead key no character.
     fn commit(&mut self, text: &str) -> Option<String> {
         self.marked.clear();
+        self.dead_key = false;
         (!text.is_empty()).then(|| text.to_owned())
     }
 
@@ -173,12 +175,13 @@ impl Composition {
 
     /// Whether a key down belongs to the platform's composition, so it types through the input
     /// handler instead of reaching the page as a key (the terminal's `composing`). A Windows dead
-    /// key, and the key that completes it, need the `TranslateMessage` a handled key skips.
+    /// key, the key that completes it, and text a modifier types (`AltGr`) need the
+    /// `TranslateMessage` a handled key skips. Until that text commits, the key may be a dead key.
     fn composing(&mut self, keystroke: &Keystroke, prefer_character_input: bool) -> bool {
         let m = &keystroke.modifiers;
         let plain = !(m.control || m.alt || m.platform || m.function);
         let completes_dead_key = keystroke.key_char.is_some() && std::mem::take(&mut self.dead_key);
-        if plain && prefer_character_input {
+        if prefer_character_input {
             self.dead_key = !completes_dead_key;
             return true;
         }
@@ -1640,6 +1643,13 @@ mod tests {
         assert!(composition.composing(&key("´", Some("´")), true));
         assert!(!composition.composing(&key("e", Some("e")), false));
         assert!(!composition.composing(&key("ctrl-c", Some("c")), false));
+        // AltGr is Ctrl+Alt on Windows: the text it types asks for character input too.
+        assert!(composition.composing(&key("ctrl-alt-q", Some("@")), true), "German AltGr+Q types @");
+        composition.commit("@");
+        assert!(!composition.composing(&key("e", Some("e")), false), "typed text leaves no dead key");
+        // An AltGr dead key composes with the next key that types.
+        assert!(composition.composing(&key("ctrl-alt-]", Some("~")), true));
+        assert!(composition.composing(&key("a", Some("ã")), false));
         // Keys while an IME shows marked text belong to it.
         composition.mark("に");
         assert!(composition.composing(&key("enter", None), false));
