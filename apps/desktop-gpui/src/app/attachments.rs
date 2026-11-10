@@ -276,6 +276,11 @@ impl Attachment {
         }
     }
 
+    /// Whether it was restored and no upload has started for it yet.
+    pub(super) fn awaits_start(&self) -> bool {
+        self.upload == Upload::Uploading && self.upload_env.is_none()
+    }
+
     /// Whether an upload to `environment` that just finished is the one this attachment waits for.
     fn awaits_upload_on(&self, environment: &str) -> bool {
         self.upload == Upload::Uploading && self.upload_env.as_deref() == Some(environment)
@@ -1013,10 +1018,8 @@ impl Workspace {
 
     /// Attachments a restart brought back upload once their draft is on screen: nothing started them.
     pub(super) fn start_restored_uploads(&mut self, cx: &mut Context<Self>) {
-        let waiting: Vec<String> = (self.attachments.iter())
-            .filter(|a| a.upload == Upload::Uploading && a.upload_env.is_none())
-            .map(|a| a.local_id.clone())
-            .collect();
+        let waiting: Vec<String> =
+            (self.attachments.iter()).filter(|a| a.awaits_start()).map(|a| a.local_id.clone()).collect();
         for local_id in waiting {
             self.upload(local_id, cx);
         }
@@ -1601,7 +1604,9 @@ It is referenced in your text; removing it also removes every reference."
     #[test]
     fn an_upload_lands_only_on_the_machine_its_attachment_waits_on() {
         let mut attachment = Attachment::restored("file", "a.txt".into(), "text/plain".into(), vec![1]);
+        assert!(attachment.awaits_start());
         assert_eq!(attachment.begin_upload(Some("a".into())), None);
+        assert!(!attachment.awaits_start(), "a started upload must not start again");
         assert!(attachment.awaits_upload_on("a"));
         attachment.upload = Upload::Ready("on-a".into());
 

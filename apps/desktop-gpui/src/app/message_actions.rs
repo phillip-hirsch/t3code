@@ -248,8 +248,11 @@ impl Workspace {
             self.restore_composer(window, cx);
             self.focus_composer(window, cx);
         }
+        // Restoring a prompt into the editor already started its uploads.
         for local_id in uploads {
-            self.upload(local_id, cx);
+            if self.attachment_lists().find(&local_id).is_some_and(|(_, file)| file.awaits_start()) {
+                self.upload(local_id, cx);
+            }
         }
         self.drafts_changed(cx);
     }
