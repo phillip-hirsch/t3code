@@ -49,11 +49,20 @@ pub(crate) fn ensure_gtk(cx: &mut App) -> wry::Result<()> {
 }
 
 /// WebKitGTK answers `prefers-color-scheme` from GTK's preference, which GTK 3 does not
-/// read from the desktop, so without this every page renders light.
+/// read from the desktop, so without this every page renders light. `Auto` restores the
+/// preference GTK started with (its `settings.ini`).
 pub(crate) fn set_theme(theme: wry::Theme) {
     use gtk::prelude::GtkSettingsExt as _;
+    // t3code: the first override would otherwise lose GTK's own preference.
+    static STARTUP_PREFERS_DARK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if let Some(settings) = gtk::Settings::default() {
-        settings.set_gtk_application_prefer_dark_theme(matches!(theme, wry::Theme::Dark));
+        let startup =
+            *STARTUP_PREFERS_DARK.get_or_init(|| settings.is_gtk_application_prefer_dark_theme());
+        settings.set_gtk_application_prefer_dark_theme(match theme {
+            wry::Theme::Dark => true,
+            wry::Theme::Light => false,
+            wry::Theme::Auto => startup,
+        });
     }
 }
 

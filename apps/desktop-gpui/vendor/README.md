@@ -261,6 +261,14 @@ GPUI's pixels to wry as logical ones, so a zoomed window misplaced its pages. Th
 draws as one GPUI pixel on every platform (its `ui_scale` field, kept current in `prepaint`). The
 preview divides its own zoom by the scale, since Electron's app zoom leaves previews alone.
 
+**`Theme::Auto` keeps GTK's own preference on Linux.** 0.9.0 sets GTK's process-wide
+`gtk-application-prefer-dark-theme` to false for `Auto`, the same as `Light`, so a page asking for
+the system scheme always rendered light and the first override erased a dark `settings.ini`. The
+patch, in `src/linux.rs` (`set_theme`), records the preference GTK started with before the first
+override and restores it for `Auto`. GTK 3 still never reads the desktop's scheme, so the preview
+resolves its System scheme to the app's appearance itself (`page_appearance` in
+`src/app/preview/mod.rs`) and passes `Light` or `Dark`.
+
 ## gpui-base 0.9.0
 
 **Text decorations on the textarea.** The composer needs atomic inline tokens (its chips),
