@@ -246,6 +246,14 @@ token layout remeasures, and widens only the selections a new token partly cover
 keeping its direction. Test in `src/input/base/state.rs`:
 `test_retokenize_keeps_history_and_moves_a_covered_caret`.
 
+**A composition that ends without a commit emits a change.** `retokenize` refuses while an IME
+composition is active, so the composer waits for the change that ends it. Marked text emits no
+`InputEvent::Change`, and 0.9.0's `unmark_text` (a cancelled composition, or one left as typed)
+emitted none either, so the wait outlasted the composition. The patch, in
+`src/input/base/state.rs`: `unmark_text` emits a change when it ends a composition still marked;
+after a commit, which already emitted one, it does not. Test there:
+`test_composition_cancel_via_unmark_does_not_leak`.
+
 **Code block actions span the top row.** The web's code block header puts the language on the
 left and its buttons on the right. 0.9.0 pins the actions to the block's top-right corner at their
 own width, so the row could span the block only when the caller knew its width. The patch anchors
