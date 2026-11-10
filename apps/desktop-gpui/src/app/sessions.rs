@@ -135,6 +135,12 @@ impl Workspace {
         Some(&self.session(environment_id)?.grants)
     }
 
+    /// `permissionAtom`: whether a control that sends `method` with `payload` to the environment
+    /// may be used. Its socket refuses the request otherwise.
+    pub(super) fn env_permits(&self, environment_id: &str, method: &str, payload: &Value) -> bool {
+        self.session(environment_id).is_some_and(|s| s.grants.permits(method, payload))
+    }
+
     /// `env_grants`, or `None` while the session check is pending or failing.
     pub(super) fn env_grant(&self, environment_id: &str, scope: &str) -> Option<bool> {
         Some(self.session(environment_id)?.grants.session()?.grants(scope))
@@ -242,6 +248,8 @@ impl Workspace {
         let primary = self.primary_environment() == Some(&environment_id);
         let Some(session) = self.session_mut(&environment_id) else { return };
         let Some(client) = session.client.clone() else { return };
+        // A new socket starts from the last answer, as the web keeps a refreshing grant.
+        client.set_grants(session.grants.rpc_grants());
         session.shell_retried = false;
         // A reconnect keeps the last config; only a first connection waits for one.
         let config_known = !session.server_info.config.is_null();
@@ -309,6 +317,9 @@ impl Workspace {
             streams.push(check_session(endpoint, cx, move |this, grants, cx| {
                 let before = this.env_grant(&id, super::git::SOURCE_CONTROL_WRITE);
                 if let Some(session) = this.session_mut(&id) {
+                    if let Some(client) = &session.client {
+                        client.set_grants(grants.rpc_grants());
+                    }
                     session.grants = grants;
                 }
                 this.apply_pr_write_grant(&id, before, cx);
