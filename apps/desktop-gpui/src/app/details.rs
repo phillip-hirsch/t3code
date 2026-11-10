@@ -40,6 +40,9 @@ const SECTION_PADDING: f32 = 18.;
 const HEADING_HEIGHT: f32 = 36.;
 /// A workflow without agents yet: one `text-2xs` line in `py-1.5`.
 const NO_AGENTS_HEIGHT: f32 = 26.;
+/// `ThreadLineageRowList`: `max-h-[13.5rem]`, or `max-h-[min(28rem,55dvh)]` with a workflow open.
+const LINEAGE_LIST_MAX: f32 = 216.;
+const LINEAGE_WORKFLOW_LIST_MAX: f32 = 448.;
 
 /// The card's opaque stand-ins for `dropdown-glass` (the popover at `--glass-opacity`
 /// over the canvas); GPUI has no backdrop blur.
@@ -306,7 +309,8 @@ impl Workspace {
             self.version_control_section(&tokens, &colors, cx),
             self.servers_section(&tokens, &colors, cx),
             self.automations_section(&tokens, &colors, cx),
-            self.lineage_section(&relationships, &tokens, &colors, cx).filter(|_| self.details_item_shown("lineage")),
+            self.lineage_section(&relationships, f32::from(viewport.height), &tokens, &colors, cx)
+                .filter(|_| self.details_item_shown("lineage")),
             self.side_chats_section(&relationships, &tokens, &colors, cx)
                 .filter(|_| self.details_item_shown("sideChats")),
             self.usage_section(&tokens, &colors).filter(|_| self.details_item_shown("usage")),
@@ -1314,6 +1318,7 @@ impl Workspace {
     fn lineage_section(
         &self,
         relationships: &Relationships,
+        viewport_height: f32,
         tokens: &Tokens,
         colors: &CardColors,
         cx: &mut Context<Self>,
@@ -1365,8 +1370,9 @@ impl Workspace {
                 section.child(self.relationship_row(parent, "icons/corner-left-up.svg", false, tokens, colors, cx));
             rows += 1;
         }
-        for child in active {
-            let (element, height) = self.agent_row(child, tokens, colors, cx);
+        if !active.is_empty() {
+            let (element, height) =
+                self.lineage_list("details-active-agents", active, viewport_height, tokens, colors, cx);
             section = section.child(element);
             extra += height;
         }
@@ -1404,11 +1410,10 @@ impl Workspace {
                     })),
             );
             if expanded {
-                for child in previous {
-                    let (element, height) = self.agent_row(child, tokens, colors, cx);
-                    section = section.child(element);
-                    extra += height;
-                }
+                let (element, height) =
+                    self.lineage_list("details-previous-agents-list", previous, viewport_height, tokens, colors, cx);
+                section = section.child(element);
+                extra += height;
             }
         }
         Some(Section {
@@ -1446,6 +1451,32 @@ impl Workspace {
             element: section.into_any_element(),
             min_density: Density::Full,
         })
+    }
+
+    /// `ThreadLineageRowList`: a group's rows, scrolling past its cap so an open workflow
+    /// cannot push Lineage out of the card; and the height it takes.
+    fn lineage_list(
+        &self,
+        id: &'static str,
+        rows: &[Relative],
+        viewport_height: f32,
+        tokens: &Tokens,
+        colors: &CardColors,
+        cx: &mut Context<Self>,
+    ) -> (AnyElement, f32) {
+        let workflow_open = rows
+            .iter()
+            .filter_map(|row| row.workflow.as_ref())
+            .any(|group| self.lineage.open_workflows.contains(&group.subagent_id));
+        let max = if workflow_open { LINEAGE_WORKFLOW_LIST_MAX.min(viewport_height * 0.55) } else { LINEAGE_LIST_MAX };
+        let mut height = 0.;
+        let mut list = div().id(id).max_h(px(max)).overflow_y_scroll();
+        for row in rows {
+            let (element, row_height) = self.agent_row(row, tokens, colors, cx);
+            list = list.child(element);
+            height += row_height;
+        }
+        (list.into_any_element(), f32::min(height, max))
     }
 
     /// A subagent's row, or a workflow's with its agents under it; and the height it takes.
