@@ -4,6 +4,8 @@
 
 mod agents;
 mod first_run;
+mod import;
+mod projects;
 mod welcome;
 
 pub(in crate::app) use self::welcome::{AgentState, agent_name, onboarding_state};
@@ -38,6 +40,7 @@ pub(super) struct Onboarding {
     welcome: Option<Welcome>,
     _timeout: Option<Task<()>>,
     agents: agents::AgentsStage,
+    projects: projects::ProjectsStage,
 }
 
 impl Onboarding {
@@ -47,6 +50,7 @@ impl Onboarding {
             welcome: None,
             _timeout: None,
             agents: agents::AgentsStage::default(),
+            projects: projects::ProjectsStage::default(),
         }
     }
 
@@ -201,6 +205,12 @@ impl Workspace {
         self.page == Some(Page::Welcome)
     }
 
+    /// Follows the Welcome page's bands as the page shows or goes.
+    pub(super) fn sync_welcome(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_welcome_projects(window, cx);
+        self.sync_welcome_agents(cx);
+    }
+
     /// "Reload" on the stalled gate: the primary's subscriptions start over and the wait restarts.
     pub(super) fn reload_first_run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.onboarding.gate.stalled = false;
@@ -213,14 +223,15 @@ impl Workspace {
     }
 
     /// `WelcomePage`'s `finish`: records setup as finished, then lands in `landing` (a project
-    /// the import brought in) or at home, and reports the import.
+    /// the import brought in, on its computer) or at home, and reports the import. False when
+    /// setup could not be saved.
     pub(super) fn finish_welcome(
         &mut self,
-        landing: Option<String>,
+        landing: Option<(SharedString, String)>,
         outcome: &ImportOutcome,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         window.remove_notification::<FinishFailed>(cx);
         if let Err(error) = self.client_settings.try_apply(&completion_patch()) {
             log::warn!("could not finish setup: {error}");
@@ -228,11 +239,12 @@ impl Workspace {
                 .title("Could not finish setup")
                 .id::<FinishFailed>();
             window.push_notification(toast, cx);
-            return;
+            return false;
         }
         self.follow_first_run(cx);
         match landing {
-            Some(project_id) => self.start_draft(project_id, window, cx),
+            // The shell may not list a project created moments ago yet.
+            Some((environment, project_id)) => self.start_draft_in(environment, project_id, window, cx),
             None => self.go_home(window, cx),
         }
         match welcome::finish_toast(outcome) {
@@ -245,6 +257,7 @@ impl Workspace {
             }
             None => {}
         }
+        true
     }
 
     /// `WelcomePage` for the primary computer.
@@ -255,12 +268,20 @@ impl Workspace {
         let agent_ready = welcome::ready_agent_count(&info.providers, &info.settings, &info.managed_policy) > 0;
         let notice = welcome::telemetry_notice(&info.managed_policy);
         let start = |this: &mut Self, _: &gpui_kit::ClickEvent, window: &mut Window, cx: &mut Context<Self>| {
-            this.finish_welcome(None, &ImportOutcome::default(), window, cx);
+            this.start_welcome(window, cx);
         };
-        let start_button = WebButton::new("welcome-start", "Start")
+        // `pt-12 sm:pt-20`, and the bands' `sm:` grid.
+        let wide = window.viewport_size().width >= px(640.);
+        let primary = self.primary_environment().cloned();
+        let agents = primary.clone().map(|environment| self.render_agents(environment, &label, wide, window, cx));
+        let (projects, started) = match primary {
+            Some(environment) => self.render_projects(environment, wide, cx),
+            None => (None, projects::StartState { importing: false, label: "Start".into() }),
+        };
+        let start_button = WebButton::new("welcome-start", started.label)
             .variant(Variant::Primary)
             .size(Size::Default)
-            .disabled(!agent_ready);
+            .disabled(!agent_ready || started.importing);
         let footer = h_flex()
             .mt(px(24.))
             .flex_wrap()
@@ -272,6 +293,7 @@ impl Workspace {
                     WebButton::new("welcome-start-without-agent", "Start without an agent")
                         .variant(Variant::GhostMuted)
                         .size(Size::Default)
+                        .disabled(started.importing)
                         .on_click(cx.listener(start)),
                 )
             }))
@@ -290,11 +312,7 @@ impl Workspace {
                     })
                     .child(if agent_ready { start_button.on_click(cx.listener(start)) } else { start_button }),
             );
-        // `pt-12 sm:pt-20`, and the bands' `sm:` grid.
-        let wide = window.viewport_size().width >= px(640.);
         let top = if wide { 80. } else { 48. };
-        let primary = self.primary_environment().cloned();
-        let agents = primary.map(|environment| self.render_agents(environment, &label, wide, window, cx));
         div()
             .id("welcome-scroll")
             .size_full()
@@ -330,7 +348,14 @@ impl Workspace {
                             .child("."),
                     )
                     // The page's sections are bands under this rule.
-                    .child(div().mt(px(40.)).border_t_1().border_color(t.border.opacity(0.6)).children(agents))
+                    .child(
+                        div()
+                            .mt(px(40.))
+                            .border_t_1()
+                            .border_color(t.border.opacity(0.6))
+                            .children(agents)
+                            .children(projects),
+                    )
                     .child(footer)
                     .child(telemetry_notice(&notice, &t)),
             )

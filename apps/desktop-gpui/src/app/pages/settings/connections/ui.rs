@@ -94,6 +94,8 @@ pub(in crate::app) struct WebButton {
     icon: Option<gpui_kit::assets::IconName>,
     /// An icon outside gpui-kit's catalog, by asset path.
     icon_path: Option<&'static str>,
+    /// An icon after the label, such as a fold's chevron.
+    trailing_icon: Option<gpui_kit::assets::IconName>,
     variant: Variant,
     size: Size,
     disabled: bool,
@@ -108,6 +110,7 @@ impl WebButton {
             label: label.into(),
             icon: None,
             icon_path: None,
+            trailing_icon: None,
             variant: Variant::Outline,
             size: Size::Xs,
             disabled: false,
@@ -133,6 +136,11 @@ impl WebButton {
 
     pub fn icon_path(mut self, path: &'static str) -> Self {
         self.icon_path = Some(path);
+        self
+    }
+
+    pub fn trailing_icon(mut self, icon: gpui_kit::assets::IconName) -> Self {
+        self.trailing_icon = Some(icon);
         self
     }
 
@@ -198,6 +206,7 @@ impl RenderOnce for WebButton {
         base.when_some(self.icon, |el, icon| el.child(Icon::new(icon).size(px(icon_size))))
             .when_some(self.icon_path, |el, path| el.child(Icon::empty().path(path).size(px(icon_size))))
             .child(self.label)
+            .when_some(self.trailing_icon, |el, icon| el.child(Icon::new(icon).size(px(icon_size))))
             .map(|el| match (self.disabled, self.on_click) {
                 (true, _) | (_, None) => el.opacity(0.64),
                 // A tab stop that Enter and Space click, with `focus-visible:ring-2`.
