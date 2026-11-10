@@ -348,10 +348,7 @@ impl Workspace {
             ChatPane::Main => self.target.is_some(),
             ChatPane::Side => self.pane_thread(ChatPane::Side).is_some() && !self.pane_sending(ChatPane::Side),
         };
-        open && !self.question_responding(pane)
-            && self
-                .question(pane)
-                .is_none_or(|q| q.questions.get(q.index).is_some_and(crate::requests::Question::allows_custom))
+        open && self.question_takes_text(pane)
     }
 
     /// `citeAssistantText`: the chip at the caret, after a space unless one is there, then a

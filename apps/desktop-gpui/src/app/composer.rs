@@ -704,18 +704,16 @@ impl Workspace {
                 && self.settings.is_none()
                 && !window.has_active_dialog(cx),
             inert: self.saving_queue_edit(),
-            question_options: self.shortcut_question().map_or(0, |(_, draft)| draft.active().options.len()),
+            answer_locked: !self.question_takes_text(ChatPane::Main),
         };
         let Some(redirect) = focus_redirect(keystroke, gate) else { return false };
-        let (text, fold) = match redirect {
-            FocusRedirect::Type(text) => (text, false),
+        let (text, fold, item) = match redirect {
+            FocusRedirect::Type(text) => (text, false, None),
             FocusRedirect::Paste { as_text } => {
-                let item = cx.read_from_clipboard();
-                let only_text = item.as_ref().is_some_and(|item| {
-                    item.entries().iter().all(|e| matches!(e, gpui_kit::ClipboardEntry::String(_)))
-                });
-                match item.and_then(|item| item.text()).filter(|text| only_text && !text.is_empty()) {
-                    Some(text) => (text, !as_text),
+                let Some(item) = cx.read_from_clipboard() else { return false };
+                let only_text = item.entries().iter().all(|e| matches!(e, gpui_kit::ClipboardEntry::String(_)));
+                match item.text().filter(|text| only_text && !text.is_empty()) {
+                    Some(text) => (text, !as_text, Some(item)),
                     None => return false,
                 }
             }
@@ -725,6 +723,10 @@ impl Workspace {
             state.set_selected_range(end..end, cx);
         });
         self.composer.read(cx).focus_handle(cx).focus(window, cx);
+        // Copied context brings its records and attachments, as a paste into the editor does.
+        if item.is_some_and(|item| self.paste_context(&item, window, cx)) {
+            return true;
+        }
         if fold && self.fold_pasted_text(&text, window, cx) {
             return true;
         }
@@ -798,7 +800,10 @@ impl Workspace {
         let Some(digit) = option_digit(keystroke) else { return false };
         // The web skips keys aimed at any text field; here that is any focus but the workspace's own
         // (composer, find bar, side chat, terminal, preview), and an open palette or dialog.
-        let resting = self.focus.is_focused(window) || window.focused(cx).is_none();
+        // A disabled composer is no text field, though it keeps the focus it had.
+        let disabled =
+            !self.question_takes_text(ChatPane::Main) && self.composer.read(cx).focus_handle(cx).is_focused(window);
+        let resting = self.focus.is_focused(window) || window.focused(cx).is_none() || disabled;
         if !resting || self.palette.is_some() || window.has_active_dialog(cx) {
             return false;
         }
@@ -988,6 +993,12 @@ impl Workspace {
         !self.question_responding(pane)
             && self.pane_can_operate(pane)
             && self.pending_question_request(pane).is_some_and(|(r, _)| r.capability() != Some("not_resumable"))
+    }
+
+    /// The pane's composer takes text: no open question there is choice-only or has its answer on
+    /// the way (`insertComposerText`, the editor's `disabled`).
+    pub(super) fn question_takes_text(&self, pane: ChatPane) -> bool {
+        !self.question_responding(pane) && self.question(pane).is_none_or(|q| q.active().allows_custom())
     }
 
     /// The question whose options 1-9 pick: the open thread's card first, else the side chat's,
@@ -1221,7 +1232,8 @@ impl Workspace {
             .text_size(px(t.fonts.prompt_size))
             .line_height(px(t.fonts.prompt_size * PROMPT_LEADING))
             .mx(px(-4.))
-            .disabled(self.target.is_none())
+            // A choice-only question, or one whose answer is on its way, takes no typing.
+            .disabled(self.target.is_none() || !self.question_takes_text(ChatPane::Main))
             .readonly(saving)
             .token(move |token, _, _| {
                 let records =
@@ -1552,7 +1564,7 @@ impl Workspace {
                 )
                 .into_any_element();
         }
-        let sendable = !self.composer_empty || self.has_attachments();
+        let sendable = !self.composer_empty || self.has_attachments() || self.queue_edit_keeps_attachments();
         let can_resume = self.can_resume();
         let editing = self.editing_queued();
         if running && !sendable && !editing {
@@ -2633,15 +2645,12 @@ struct RedirectGate {
     open: bool,
     /// The composer host is `inert` while a queued edit saves.
     inert: bool,
-    /// Options the open question's digits pick (`ComposerPendingUserInputPanel`), 0 without one.
-    question_options: usize,
+    /// The open question takes no typed answer, so its options keep their digits (`insertComposerText`).
+    answer_locked: bool,
 }
 
 fn focus_redirect(keystroke: &Keystroke, gate: RedirectGate) -> Option<FocusRedirect> {
-    if !gate.resting || !gate.open || gate.inert {
-        return None;
-    }
-    if option_digit(keystroke).is_some_and(|digit| digit <= gate.question_options) {
+    if !gate.resting || !gate.open || gate.inert || gate.answer_locked {
         return None;
     }
     let m = keystroke.modifiers;
@@ -2775,7 +2784,9 @@ mod tests {
         let redirect = |keystroke: &Keystroke, gate| focus_redirect(keystroke, gate);
         assert_eq!(redirect(&typed("a", "a"), open), Some(FocusRedirect::Type("a".into())));
         assert_eq!(redirect(&typed("shift-a", "A"), open), Some(FocusRedirect::Type("A".into())));
-        assert_eq!(redirect(&typed("1", "1"), open), Some(FocusRedirect::Type("1".into())), "no question");
+        // No question, or one taking a custom answer: the web's capture listener types the digit before
+        // its options' listener sees it.
+        assert_eq!(redirect(&typed("1", "1"), open), Some(FocusRedirect::Type("1".into())));
         assert_eq!(redirect(&key("ctrl-v"), open), Some(FocusRedirect::Paste { as_text: false }));
         assert_eq!(redirect(&key("cmd-shift-v"), open), Some(FocusRedirect::Paste { as_text: true }));
         assert_eq!(redirect(&key("ctrl-alt-v"), open), None);
@@ -2791,12 +2802,11 @@ mod tests {
         let inert = RedirectGate { inert: true, ..open };
         assert_eq!(redirect(&typed("a", "a"), inert), None);
         assert_eq!(redirect(&key("ctrl-v"), inert), None);
-        // An open question's digits pick its options; the rest still type.
-        let asking = RedirectGate { question_options: 2, ..open };
-        assert_eq!(redirect(&typed("1", "1"), asking), None);
-        assert_eq!(redirect(&typed("2", "2"), asking), None);
-        assert_eq!(redirect(&typed("3", "3"), asking), Some(FocusRedirect::Type("3".into())), "no third option");
-        assert_eq!(redirect(&typed("a", "a"), asking), Some(FocusRedirect::Type("a".into())));
+        // A choice-only question, or one whose answer is on its way, refuses text: its options take digits.
+        let choosing = RedirectGate { answer_locked: true, ..open };
+        assert_eq!(redirect(&typed("1", "1"), choosing), None);
+        assert_eq!(redirect(&typed("a", "a"), choosing), None);
+        assert_eq!(redirect(&key("ctrl-v"), choosing), None);
     }
 
     #[test]
