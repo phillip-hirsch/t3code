@@ -385,8 +385,8 @@ pub(super) fn destination_choices(
 }
 
 /// Whether the destination picker must show `choices` in place of its `shown` rows. While its
-/// menu is open only a new, removed or renamed row counts, since replacing the items drops the
-/// search being typed; a reorder waits for the menu to close, so it reopens newest first.
+/// menu is open only a new, removed or renamed row counts, so rows don't move under the cursor;
+/// a reorder waits for the menu to close, so it reopens newest first.
 pub(super) fn destination_rows_stale(shown: &[DestinationChoice], choices: &[DestinationChoice], open: bool) -> bool {
     fn by_value(rows: &[DestinationChoice]) -> Vec<&DestinationChoice> {
         let mut rows: Vec<&DestinationChoice> = rows.iter().collect();
