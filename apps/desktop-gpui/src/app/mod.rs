@@ -1242,9 +1242,9 @@ impl Workspace {
             Some(Target::Thread { .. }) => {
                 self.thread.as_ref()?.state.projection.as_ref()?.thread.model_selection.clone()
             }
-            Some(Target::Draft { project_id, .. }) => {
-                let default =
-                    self.server_info().new_thread_model(self.shell.projects.iter().find(|p| &p.id == project_id))?;
+            Some(Target::Draft { env, project_id, .. }) => {
+                let project = self.shell.project(&ScopedId::new(env.clone(), project_id.as_str()));
+                let default = self.server_info().new_thread_model(project)?;
                 Some(self.draft_usage_fallback(&default).map_or(default, |fallback| fallback.selection))
             }
             None => None,
@@ -1277,11 +1277,11 @@ impl Workspace {
             return Some(selection.clone());
         }
         match self.target.as_ref()? {
-            Target::Thread { id, .. } => {
-                self.shell.threads.iter().find(|thread| &thread.id == id)?.model_selection.clone()
+            Target::Thread { env, id } => {
+                self.shell.thread(&ScopedId::new(env.clone(), id.as_str()))?.model_selection.clone()
             }
-            Target::Draft { project_id, .. } => {
-                let project = self.shell.projects.iter().find(|p| &p.id == project_id);
+            Target::Draft { env, project_id, .. } => {
+                let project = self.shell.project(&ScopedId::new(env.clone(), project_id.as_str()));
                 crate::new_thread::draft_carried_model(self.server_info(), project, crate::timestamp::now_ms())
             }
         }
