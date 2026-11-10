@@ -138,7 +138,21 @@ pub(super) struct MessageSearch {
     pub(super) pending: bool,
     /// Counts answers, so views can cache what they derive from `matches`.
     generation: u64,
+    /// Where it asked: a new socket asks again, as `useThreadSearch`'s queries rerun when their
+    /// session changes, and so does a new shell snapshot, which drops the rows an answer mounted.
+    asked_on: Vec<Asked>,
     _task: Option<Task<()>>,
+}
+
+/// An environment a search asked, on which socket, under which shell snapshot.
+type Asked = (SharedString, crate::rpc::SocketId, u64);
+
+impl MessageSearch {
+    /// Whether this search already asked `query` in `scope` everywhere `asked_on` names; an
+    /// environment that dropped asks nothing new.
+    fn asked(&self, query: &str, scope: &SearchScope, asked_on: &[Asked]) -> bool {
+        self.query == query && self.scope == *scope && asked_on.iter().all(|place| self.asked_on.contains(place))
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -974,6 +988,28 @@ impl Workspace {
         }));
     }
 
+    /// The message searches on screen ask again where an environment changed under them (see
+    /// [`MessageSearch::asked_on`]); elsewhere nothing is sent.
+    pub(super) fn rerun_message_searches(&mut self, cx: &mut Context<Self>) {
+        self.refresh_sidebar_search(cx);
+        let query = self.palette_query(cx);
+        let Some(palette) = self.palette.as_ref().filter(|p| p.view == View::Root && !browses(p, &query)) else {
+            return;
+        };
+        let (query, scope) = (palette.messages.query.clone(), palette.messages.scope.clone());
+        self.search_messages(query, scope, |this| this.palette.as_mut().map(|p| &mut p.messages), cx);
+    }
+
+    /// A socket came up: the message searches ask it, and a folder listing that never read, or
+    /// failed, is asked for again, as the web's queries rerun when their session changes.
+    pub(super) fn rerun_searches_on_reconnect(&mut self, cx: &mut Context<Self>) {
+        self.rerun_message_searches(cx);
+        let query = self.palette_query(cx);
+        if self.palette.as_ref().is_some_and(|p| browses(p, &query)) && !self.relative_needs_project(&query) {
+            self.browse_folder(split_browse(&query).0.to_owned(), cx);
+        }
+    }
+
     /// Debounced `orchestration.searchThreads` into the search `slot` returns.
     pub(super) fn search_messages(
         &mut self,
@@ -993,12 +1029,15 @@ impl Workspace {
                 Some((id.clone(), session.client.clone()?, self.shell.generation(&id), input))
             })
             .collect();
+        let asked_on: Vec<Asked> =
+            clients.iter().map(|(env, client, generation, _)| (env.clone(), client.socket_id(), *generation)).collect();
         let Some(search) = slot(self) else { return };
-        if search.query == query && search.scope == scope {
+        if search.asked(&query, &scope, &asked_on) {
             return;
         }
         search.query = query.clone();
         search.scope = scope;
+        search.asked_on = asked_on;
         search.matches.clear();
         search._task = None;
         search.pending = !clients.is_empty();
@@ -3416,6 +3455,22 @@ fn marked_row(highlight: Option<usize>, browsing: bool, rows: usize) -> Option<u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_message_search_asks_again_on_a_new_socket() {
+        let (first, second) = (crate::rpc::RpcClient::unopened(), crate::rpc::RpcClient::unopened());
+        let env = SharedString::from("env");
+        let mut search = MessageSearch { query: "needle".into(), ..MessageSearch::default() };
+        let scope = SearchScope::default();
+        assert!(search.asked("needle", &scope, &[]));
+        assert!(!search.asked("needle", &scope, &[(env.clone(), first.socket_id(), 1)]), "asked offline: online asks");
+        search.asked_on = vec![(env.clone(), first.socket_id(), 1)];
+        assert!(search.asked("needle", &scope, &[(env.clone(), first.socket_id(), 1)]));
+        assert!(!search.asked("needle", &scope, &[(env.clone(), second.socket_id(), 1)]), "a reconnect asks again");
+        assert!(!search.asked("needle", &scope, &[(env.clone(), first.socket_id(), 2)]), "so does a new snapshot");
+        assert!(search.asked("needle", &scope, &[]), "a dropped environment asks nothing new");
+        assert!(!search.asked("other", &scope, &[(env, first.socket_id(), 1)]));
+    }
 
     fn thread(fields: Value) -> crate::model::ThreadShell {
         let mut value = json!({"id": "t1", "projectId": "p1", "title": "Fix it", "status": "idle", "updatedAt": "2026-01-01T00:00:00Z"});
