@@ -494,12 +494,18 @@ impl Workspace {
                         return;
                     }
                 };
-                let state = &mut this.draft_workspace;
-                if !thread && !state.is_for(origin.as_ref()) {
+                if !thread && !this.draft_workspace.is_for(origin.as_ref()) {
                     return;
                 }
+                // The open picker is still the one these refs were read for.
+                let here = this.target == origin && this.composer_cwd().as_ref() == Some(&cwd);
+                let state = &mut this.draft_workspace;
                 // An open picker without a search or further pages lists the fresh first page.
-                if state.branch_open && state.branch_pages.query.is_empty() && state.branch_pages.pages.len() <= 1 {
+                if here
+                    && state.branch_open
+                    && state.branch_pages.query.is_empty()
+                    && state.branch_pages.pages.len() <= 1
+                {
                     state.branch_pages.pages = vec![refs.clone()];
                 }
                 if thread {
