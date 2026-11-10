@@ -37,6 +37,8 @@ struct Slots {
     slots: HashMap<String, Slot>,
     /// The side chat has claimed a slot since it last released.
     side_claimed: bool,
+    /// The generation the next new slot takes.
+    next: u64,
 }
 
 struct Slot {
@@ -44,6 +46,14 @@ struct Slot {
     image: Option<Arc<Image>>,
     main: bool,
     side: bool,
+    generation: u64,
+}
+
+/// The load a new slot started, which fills that slot and no later one at its destination.
+#[derive(Clone, Debug)]
+pub(super) struct Claim {
+    destination: String,
+    generation: u64,
 }
 
 impl ImageCache {
@@ -57,30 +67,40 @@ impl ImageCache {
         self.0.lock().is_ok_and(|cache| cache.slots.contains_key(destination))
     }
 
-    /// Marks `destination` loading; false when the cache has already seen it.
+    /// Marks `destination` loading, in a cache no pane releases ([`Self::store`]); false when
+    /// the cache has already seen it.
     pub(super) fn claim(&self, destination: &str) -> bool {
-        self.claim_for(ChatPane::Main, destination)
+        self.claim_for(ChatPane::Main, destination).is_some()
     }
 
-    /// [`Self::claim`] for an image `pane` shows, which it then holds until it releases.
-    pub(super) fn claim_for(&self, pane: ChatPane, destination: &str) -> bool {
-        let Ok(mut cache) = self.0.lock() else { return false };
+    /// [`Self::claim`] for an image `pane` shows, which it then holds until it releases: the
+    /// load to start, or `None` when the cache has already seen it.
+    pub(super) fn claim_for(&self, pane: ChatPane, destination: &str) -> Option<Claim> {
+        let mut cache = self.0.lock().ok()?;
         cache.side_claimed |= pane == ChatPane::Side;
         let (main, side) = (pane == ChatPane::Main, pane == ChatPane::Side);
-        match cache.slots.get_mut(destination) {
-            Some(slot) => {
-                slot.main |= main;
-                slot.side |= side;
-                false
-            }
-            None => {
-                cache.slots.insert(destination.to_owned(), Slot { image: None, main, side });
-                true
-            }
+        if let Some(slot) = cache.slots.get_mut(destination) {
+            slot.main |= main;
+            slot.side |= side;
+            return None;
+        }
+        let generation = cache.next;
+        cache.next += 1;
+        cache.slots.insert(destination.to_owned(), Slot { image: None, main, side, generation });
+        Some(Claim { destination: destination.to_owned(), generation })
+    }
+
+    /// Fills the slot `claim` started; a load whose slot was released, or claimed again since,
+    /// keeps nothing.
+    pub(super) fn fill(&self, claim: Claim, image: Arc<Image>) {
+        if let Ok(mut cache) = self.0.lock()
+            && let Some(slot) = cache.slots.get_mut(&claim.destination).filter(|s| s.generation == claim.generation)
+        {
+            slot.image = Some(image);
         }
     }
 
-    /// Fills a claimed slot; a load whose slot was released keeps nothing.
+    /// Fills a slot [`Self::claim`] started.
     pub(super) fn store(&self, destination: String, image: Arc<Image>) {
         if let Ok(mut cache) = self.0.lock()
             && let Some(slot) = cache.slots.get_mut(&destination)
@@ -348,9 +368,7 @@ impl Workspace {
         let cache = self.markdown_images.clone();
         let pane = view_pane(key).0;
         for (destination, source) in sources {
-            if !cache.claim_for(pane, &destination) {
-                continue;
-            }
+            let Some(claim) = cache.claim_for(pane, &destination) else { continue };
             let resource = match &source {
                 Source::WorkspaceFile(path) => {
                     thread_id.as_ref().map(|id| json!({"_tag": "media-file", "threadId": id, "path": path}))
@@ -365,8 +383,7 @@ impl Workspace {
                     Source::Blocked => None,
                     Source::Data(format, bytes) => {
                         let image = Arc::new(Image::from_bytes(format, bytes));
-                        let _ =
-                            this.update(cx, |this, cx| this.image_loaded(&cache, destination, Some(image), &key, cx));
+                        let _ = this.update(cx, |this, cx| this.image_loaded(&cache, claim, Some(image), &key, cx));
                         return;
                     }
                     Source::Direct(url) => fetch(url).await,
@@ -390,7 +407,7 @@ impl Workspace {
                     let format = mime.as_deref().and_then(format_for).or_else(|| sniff(&bytes))?;
                     Some(Arc::new(Image::from_bytes(format, bytes)))
                 });
-                let _ = this.update(cx, |this, cx| this.image_loaded(&cache, destination, image, &key, cx));
+                let _ = this.update(cx, |this, cx| this.image_loaded(&cache, claim, image, &key, cx));
             })
             .detach();
         }
@@ -401,13 +418,13 @@ impl Workspace {
     fn image_loaded(
         &mut self,
         cache: &ImageCache,
-        destination: String,
+        claim: Claim,
         image: Option<Arc<Image>>,
         key: &SharedString,
         cx: &mut Context<Self>,
     ) {
         let Some(image) = image else { return };
-        cache.store(destination, image);
+        cache.fill(claim, image);
         if !cache.same(&self.markdown_images) {
             return;
         }
@@ -483,9 +500,7 @@ impl Workspace {
         let cache = self.markdown_images.clone();
         for id in ids {
             let key = attachment_key(id);
-            if !cache.claim_for(pane, &key) {
-                continue;
-            }
+            let Some(claim) = cache.claim_for(pane, &key) else { continue };
             let resource = json!({"_tag": "attachment", "attachmentId": id});
             let (client, base, cache) = (client.clone(), base.clone(), cache.clone());
             cx.spawn(async move |this, cx| {
@@ -504,7 +519,7 @@ impl Workspace {
                     Some(Arc::new(Image::from_bytes(format, bytes)))
                 });
                 let Some(image) = image else { return };
-                cache.store(key, image);
+                cache.fill(claim, image);
                 let _ = this.update(cx, |this, cx| {
                     if cache.same(&this.markdown_images) {
                         cx.notify();
@@ -612,21 +627,27 @@ mod tests {
     fn a_side_chat_releases_only_the_images_it_alone_asked_for() {
         let png = || BLANK.clone();
         let cache = ImageCache::default();
-        assert!(cache.claim_for(ChatPane::Main, "main.png"));
-        assert!(cache.claim_for(ChatPane::Side, "side.png"));
-        assert!(cache.claim_for(ChatPane::Side, "both.png"));
-        assert!(!cache.claim_for(ChatPane::Main, "both.png"));
-        assert!(cache.claim_for(ChatPane::Side, "late.png"));
-        for destination in ["main.png", "side.png", "both.png"] {
-            cache.store(destination.to_owned(), png());
+        let main = cache.claim_for(ChatPane::Main, "main.png").unwrap();
+        let side = cache.claim_for(ChatPane::Side, "side.png").unwrap();
+        let both = cache.claim_for(ChatPane::Side, "both.png").unwrap();
+        assert!(cache.claim_for(ChatPane::Main, "both.png").is_none());
+        let late = cache.claim_for(ChatPane::Side, "late.png").unwrap();
+        for claim in [main, side, both] {
+            cache.fill(claim, png());
         }
         cache.release_side();
         assert!(cache.get("main.png").is_some() && cache.get("both.png").is_some());
         assert!(cache.get("side.png").is_none());
         // A load that lands after its side chat left keeps nothing.
-        cache.store("late.png".to_owned(), png());
+        cache.fill(late.clone(), png());
         assert!(cache.get("late.png").is_none());
-        assert!(cache.claim_for(ChatPane::Side, "side.png"));
+        assert!(cache.claim_for(ChatPane::Side, "side.png").is_some());
+        // Nor once another side chat claimed the same destination: that claim loads its own.
+        let again = cache.claim_for(ChatPane::Side, "late.png").unwrap();
+        cache.fill(late, png());
+        assert!(cache.get("late.png").is_none(), "an obsolete load fills a newer claim");
+        cache.fill(again, png());
+        assert!(cache.get("late.png").is_some());
     }
 
     #[test]
