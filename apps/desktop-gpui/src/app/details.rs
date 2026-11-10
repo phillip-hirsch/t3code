@@ -24,7 +24,7 @@ use crate::theme::{self, Tokens};
 use crate::thread_details;
 
 pub(super) mod automations;
-mod commit_dialog;
+pub(super) mod commit_dialog;
 pub(super) mod lineage;
 mod publish_dialog;
 pub(super) mod servers;

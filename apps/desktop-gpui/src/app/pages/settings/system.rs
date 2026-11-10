@@ -582,7 +582,7 @@ fn relative_label(iso: &str, now_ms: i64) -> String {
 }
 
 /// `formatBytes` (`apps/web/src/lib/formatBytes.ts`).
-pub(super) fn format_bytes(value: f64) -> String {
+pub(in crate::app) fn format_bytes(value: f64) -> String {
     if value.round() < 1024. {
         return format!("{} B", value.round());
     }

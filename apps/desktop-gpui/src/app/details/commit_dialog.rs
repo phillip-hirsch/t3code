@@ -29,7 +29,7 @@ pub(super) struct FileSelection {
 
 /// A checkbox's state; the select-all box is mixed while only some files are picked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Check {
+pub(in crate::app) enum Check {
     Checked,
     Unchecked,
     Mixed,
@@ -366,7 +366,7 @@ fn focus_ring(color: Hsla) -> BoxShadow {
 
 /// The web's `Checkbox`: a 16px box, primary when checked or mixed; a keyboard tab stop that
 /// Space and Enter toggle.
-fn check_box(
+pub(in crate::app) fn check_box(
     id: impl Into<ElementId>,
     check: Check,
     label: impl Into<SharedString>,

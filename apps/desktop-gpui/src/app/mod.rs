@@ -26,6 +26,7 @@ use crate::rpc::{self, ConnectOptions, RpcClient, RpcError, RpcStream, StreamEve
 use crate::runtime;
 use crate::timeline::{self, Row};
 
+mod add_to_machine;
 mod alerts;
 mod attachment_preview;
 mod attachments;

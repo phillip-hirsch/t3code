@@ -112,6 +112,8 @@ fn carry(selections: &mut HashMap<Target, Selection>, from: &Target, to: &Target
 enum HostItem {
     Auto(SharedString),
     Environment(EnvironmentOption),
+    /// "Add to another machine", for the draft's project.
+    AddToMachine(crate::model::ScopedId),
 }
 
 impl HostItem {
@@ -119,6 +121,7 @@ impl HostItem {
         match self {
             Self::Auto(label) => label,
             Self::Environment(option) => &option.label,
+            Self::AddToMachine(_) => "Add to another machine",
         }
     }
 }
@@ -155,7 +158,7 @@ impl Typeahead {
 }
 
 impl Workspace {
-    fn option_for(&self, environment_id: &SharedString, project_id: Option<String>) -> EnvironmentOption {
+    pub(super) fn option_for(&self, environment_id: &SharedString, project_id: Option<String>) -> EnvironmentOption {
         let info = self.session(environment_id).map(|s| &s.server_info);
         EnvironmentOption {
             environment_id: environment_id.clone(),
@@ -213,6 +216,22 @@ impl Workspace {
     /// `canChangeEnvironment`: only an unsent draft moves, and only between several machines.
     fn can_change_environment(&self, options: &[EnvironmentOption]) -> bool {
         matches!(self.target, Some(Target::Draft { .. })) && options.len() > 1
+    }
+
+    /// The draft's project, when it can be added to another machine (`addTargets`).
+    fn add_to_machine_project(&self, options: &[EnvironmentOption]) -> Option<crate::model::ScopedId> {
+        if !matches!(self.target, Some(Target::Draft { .. })) {
+            return None;
+        }
+        let project = self.target_project()?;
+        let existing: Vec<SharedString> = options.iter().map(|option| option.environment_id.clone()).collect();
+        (!self.add_project_targets(project, &existing).is_empty()).then(|| crate::model::ScopedId::of_project(project))
+    }
+
+    /// The picker opens for a draft with a machine to move to, or a machine to add its project to
+    /// (`showEnvironmentPicker`).
+    fn can_pick_host(&self, options: &[EnvironmentOption]) -> bool {
+        self.can_change_environment(options) || self.add_to_machine_project(options).is_some()
     }
 
     /// The draft is a "No project" draft (`activeProjectIsScratch`), which never auto-balances.
@@ -284,6 +303,17 @@ impl Workspace {
             return;
         };
         self.retarget_draft(option.environment_id, project_id, cx);
+    }
+
+    /// The draft moves to `project_id` on `env` as if picked there by hand, so load balancing
+    /// leaves it (`environmentSelection: "manual"`).
+    pub(super) fn move_draft_by_hand(&mut self, env: SharedString, project_id: String, cx: &mut Context<Self>) {
+        let Some(target @ Target::Draft { .. }) = self.target.clone() else { return };
+        self.host.open = false;
+        self.host.selections.insert(target, Selection::Manual);
+        self.host._sample = None;
+        self.host.sample = None;
+        self.retarget_draft(env, project_id, cx);
     }
 
     /// The draft keeps its identity and text and moves to another checkout, becoming that
@@ -450,7 +480,7 @@ impl Workspace {
 
     /// `composer.host`: opens the picker while there is a choice to make.
     pub(super) fn open_host_picker(&mut self, cx: &mut Context<Self>) -> bool {
-        if !self.can_change_environment(&self.logical_project_environments()) {
+        if !self.can_pick_host(&self.logical_project_environments()) {
             return false;
         }
         self.set_host_open(true, cx);
@@ -465,25 +495,31 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The menu's rows and which one is checked: Auto balance where it can be chosen, then the
-    /// machines.
+    /// The menu's rows and which one is checked: Auto balance where it can be chosen, the
+    /// machines, then Add to another machine where the project can go to one.
     fn host_items(&self) -> Vec<(HostItem, bool)> {
         let options = self.logical_project_environments();
         let auto = self.auto_environment_label(&options);
         let active = self.active_environment();
         let balancing = self.client_settings.values.bool("loadBalancingEnabled") && !self.draft_is_scratch();
         let auto_row = balancing.then(|| (HostItem::Auto(auto.unwrap_or("Auto balance").into()), auto.is_some()));
+        let add = self.add_to_machine_project(&options).map(|project| (HostItem::AddToMachine(project), false));
         let machines = options.into_iter().map(|option| {
             let checked = auto.is_none() && Some(&option.environment_id) == active;
             (HostItem::Environment(option), checked)
         });
-        auto_row.into_iter().chain(machines).collect()
+        auto_row.into_iter().chain(machines).chain(add).collect()
     }
 
     fn pick_host_item(&mut self, item: HostItem, window: &mut Window, cx: &mut Context<Self>) {
         match item {
             HostItem::Auto(_) => self.choose_auto_environment(window, cx),
             HostItem::Environment(option) => self.change_environment(option, window, cx),
+            HostItem::AddToMachine(project) => {
+                self.host.open = false;
+                cx.notify();
+                self.open_add_to_machine(project, None, window, cx);
+            }
         }
     }
 
@@ -542,7 +578,7 @@ impl Workspace {
         let options = self.logical_project_environments();
         let active = self.active_environment();
         let current = options.iter().find(|o| Some(&o.environment_id) == active);
-        let can_pick = self.can_change_environment(&options);
+        let can_pick = self.can_pick_host(&options);
         let shown = can_pick || current.is_some_and(|o| !o.is_primary) || self.environment_remote;
         if !shown {
             return None;
@@ -614,8 +650,11 @@ impl Workspace {
                 HostItem::Environment(option) => {
                     (ElementId::Name(format!("host-{}", option.environment_id).into()), machine_icon(&option.machine))
                 }
+                HostItem::AddToMachine(_) => ("host-add-machine".into(), Lucide::Plus),
             };
             let label = SharedString::from(item.label().to_owned());
+            // `ADD_TO_MACHINE_LABEL_CLASS`: faded until highlighted.
+            let faded = matches!(item, HostItem::AddToMachine(_)) && self.host.highlight != Some(index);
             // The pointer highlights the row it moves over, so one row paints at a time.
             menu = menu.child(
                 h_flex()
@@ -633,8 +672,8 @@ impl Workspace {
                             cx.notify();
                         }
                     }))
-                    .child(Icon::new(icon).with_size(px(12.)))
-                    .child(div().flex_1().truncate().child(label))
+                    .child(div().flex().when(faded, |el| el.opacity(0.55)).child(Icon::new(icon).with_size(px(12.))))
+                    .child(div().flex_1().truncate().when(faded, |el| el.opacity(0.55)).child(label))
                     .when(checked, |el| el.child(Icon::new(Lucide::Check).with_size(px(12.))))
                     .on_click(cx.listener(move |this, _, window, cx| this.pick_host_item(item.clone(), window, cx))),
             );

@@ -573,6 +573,8 @@ pub struct RepositoryLocator {
 pub struct RepositoryOrigin {
     pub canonical_key: String,
     #[serde(default)]
+    pub remote_url: Option<String>,
+    #[serde(default)]
     pub display_name: Option<String>,
 }
 

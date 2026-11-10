@@ -1,8 +1,9 @@
 //! Projects that are still being cloned (`ProjectCloneSnapshot`): each environment's
 //! `subscribeProjectClones`, the lifecycle toasts (`ProjectCloneToastCoordinator.tsx`), the
 //! composer banner and send hold of the project on screen (`useProjectCloneBanner.tsx`), their
-//! Cancel, Retry and Remove project actions (`useRemoveClonedProject.ts`), and the forge app
-//! suggestion after a clone starts (`sourceControlAppAccessToast.ts`).
+//! Cancel, Retry and Remove project actions (`useRemoveClonedProject.ts`), the forge app
+//! suggestion after a clone starts (`sourceControlAppAccessToast.ts`), and the ignored-file copy
+//! Add to another machine owes a clone (`useProjectFileCopy`).
 
 pub(super) mod paths;
 
@@ -21,6 +22,7 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
+use super::add_to_machine::FileCopy;
 use super::banners::{Variant, composer_banner};
 use super::{Target, Workspace, new_id};
 use crate::model::ScopedId;
@@ -170,11 +172,19 @@ pub(super) struct ProjectClones {
     silenced: HashSet<ScopedId>,
     /// Closes each finished clone's toast after [`DONE_TOAST`].
     expiries: HashMap<ScopedId, Task<()>>,
+    /// Ignored files Add to another machine copies into its clones.
+    pub(super) copies: super::add_to_machine::FileCopies,
 }
 
 impl ProjectClones {
     pub(super) fn clone_of(&self, project: &ScopedId) -> Option<&CloneSnapshot> {
         self.by_env.get(&project.env)?.iter().find(|clone| clone.project_id == project.id)
+    }
+
+    /// `silenceProjectCloneToasts`: the clone's project is where the user lands, whose composer
+    /// shows its progress and success.
+    pub(super) fn silence(&mut self, project: ScopedId) {
+        self.silenced.insert(project);
     }
 
     /// `EnvironmentCloneToasts`' effect for one environment, `viewing` being the project whose
@@ -270,6 +280,7 @@ impl Workspace {
                 let updated = this.update_in(cx, |this, window, cx| {
                     this.clones.by_env.insert(environment.clone(), clones);
                     this.sync_clone_toasts(window, cx);
+                    this.advance_file_copies(cx);
                     cx.notify();
                 });
                 if updated.is_err() {
@@ -471,28 +482,39 @@ impl Workspace {
         .detach();
     }
 
-    /// The clone of the open thread's or draft's project, on its environment.
-    fn active_project_clone(&self) -> Option<&CloneSnapshot> {
-        let project = match self.target.as_ref()? {
+    /// The open thread's or draft's project, on its environment.
+    fn active_project_key(&self) -> Option<ScopedId> {
+        Some(match self.target.as_ref()? {
             Target::Draft { env, project_id, .. } => ScopedId::new(env.clone(), project_id.as_str()),
             Target::Thread { env, id } => {
                 ScopedId::thread_project(self.shell.thread(&ScopedId::new(env.clone(), id.as_str()))?)
             }
-        };
-        self.clones.clone_of(&project)
+        })
     }
 
-    /// `projectCloneSendBlockReason`: nothing sends into a project still arriving.
+    /// The clone of the open thread's or draft's project, on its environment.
+    fn active_project_clone(&self) -> Option<&CloneSnapshot> {
+        self.clones.clone_of(&self.active_project_key()?)
+    }
+
+    /// `projectCloneSendBlockReason`: nothing sends into a project still arriving, or still
+    /// waiting for its copied files.
     pub(super) fn clone_send_block(&self) -> Option<&'static str> {
-        match self.active_project_clone()?.phase {
-            Phase::Running => Some("Cloning repository"),
-            Phase::Done => None,
-            Phase::Failed | Phase::Cancelled => Some("Repository not cloned"),
+        let project = self.active_project_key()?;
+        match self.clones.clone_of(&project).map(|clone| clone.phase) {
+            Some(Phase::Running) => return Some("Cloning repository"),
+            Some(Phase::Failed | Phase::Cancelled) => return Some("Repository not cloned"),
+            Some(Phase::Done) | None => {}
         }
+        matches!(self.clones.copies.of(&project), Some(FileCopy::Copying)).then_some("Copying files")
     }
 
-    /// `projectCloneBannerItem`: the clone's progress, failure or cancellation over the composer.
+    /// `projectCloneBannerItem`: a failed file copy until dismissed, else the clone's progress,
+    /// failure or cancellation over the composer.
     pub(super) fn render_clone_banner(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if let Some(banner) = self.render_file_copy_banner(t, cx) {
+            return Some(banner);
+        }
         let clone = self.active_project_clone()?;
         let key = self.target.as_ref().map(|target| target.environment().clone())?;
         let key = ScopedId::new(key, clone.project_id.as_str());
@@ -530,6 +552,28 @@ impl Workspace {
         };
         let icon = Icon::new(IconName::Download);
         Some(composer_banner(variant, icon, SharedString::from(title), description.map(Into::into), Some(actions), t))
+    }
+
+    /// A copy that left files behind: which ones and why, until dismissed.
+    fn render_file_copy_banner(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let project = self.active_project_key()?;
+        let Some(FileCopy::Failed { title, failures }) = self.clones.copies.of(&project) else { return None };
+        let dismiss = Button::new("file-copy-banner-dismiss")
+            .ghost()
+            .xsmall()
+            .icon(Icon::new(IconName::X))
+            .tooltip("Dismiss")
+            .on_click(cx.listener(move |this, _, _, cx| this.dismiss_file_copy(&project, cx)));
+        let icon = Icon::new(IconName::Download);
+        let description = SharedString::from(failures.join("\n"));
+        Some(composer_banner(
+            Variant::Error,
+            icon,
+            SharedString::from(title.clone()),
+            Some(description),
+            Some(dismiss.into_any_element()),
+            t,
+        ))
     }
 }
 

@@ -28,6 +28,8 @@ mod search;
 mod snap_shot;
 mod star_prompt;
 mod system;
+pub(in crate::app) use fields::resolve_pasted_path;
+pub(in crate::app) use system::format_bytes;
 pub(in crate::app) mod theme_import;
 pub(in crate::app) mod theme_library;
 mod typography;

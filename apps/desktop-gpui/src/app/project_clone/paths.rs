@@ -87,19 +87,84 @@ fn is_scp_user_host(value: &str) -> bool {
     value[end..].starts_with(':') && prefix.char_indices().any(|(at, c)| c == '@' && at > 0 && at + 1 < prefix.len())
 }
 
-/// `parseCloneUrl`'s host and path for an `ssh://`, `http(s)://` or scp-like URL.
-fn parse_clone_url(url: &str) -> Option<(&str, &str)> {
-    let trimmed = url.trim();
-    for scheme in ["ssh://", "https://", "http://"] {
-        if let Some(rest) = trimmed.strip_prefix(scheme) {
-            return parse_authority_url(rest);
-        }
-    }
-    parse_scp_url(trimmed)
+/// `CloneProtocol`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CloneProtocol {
+    Ssh,
+    Https,
 }
 
-/// `(?:[^/\s]*@)?(\[…\]|[^@:/\s]+)(:\d+)?/(.+)` after the scheme.
-fn parse_authority_url(rest: &str) -> Option<(&str, &str)> {
+/// `parseCloneUrl`: an `ssh://`, `http(s)://` or scp-like URL's protocol, host and path, and
+/// whether it names a port.
+struct ParsedCloneUrl<'a> {
+    protocol: CloneProtocol,
+    host: &'a str,
+    path: &'a str,
+    custom_port: bool,
+}
+
+fn parse_clone_url_parts(url: &str) -> Option<ParsedCloneUrl<'_>> {
+    let trimmed = url.trim();
+    for (scheme, protocol) in
+        [("ssh://", CloneProtocol::Ssh), ("https://", CloneProtocol::Https), ("http://", CloneProtocol::Https)]
+    {
+        if let Some(rest) = trimmed.strip_prefix(scheme) {
+            let (host, path, custom_port) = parse_authority_url(rest)?;
+            return Some(ParsedCloneUrl { protocol, host, path, custom_port });
+        }
+    }
+    let (host, path) = parse_scp_url(trimmed)?;
+    Some(ParsedCloneUrl { protocol: CloneProtocol::Ssh, host, path, custom_port: false })
+}
+
+/// `parseCloneUrl`'s host and path.
+fn parse_clone_url(url: &str) -> Option<(&str, &str)> {
+    parse_clone_url_parts(url).map(|parsed| (parsed.host, parsed.path))
+}
+
+/// `cloneUrlProtocol`.
+pub(crate) fn clone_url_protocol(url: &str) -> Option<CloneProtocol> {
+    parse_clone_url_parts(url).map(|parsed| parsed.protocol)
+}
+
+/// `cloneUrlForProtocol`: the clone URL over the other protocol, since the target machine may
+/// only have SSH keys or only an HTTPS credential helper. `None` when it cannot be rewritten
+/// safely, such as with a custom port.
+pub(crate) fn clone_url_for_protocol(url: &str, protocol: CloneProtocol) -> Option<String> {
+    let parsed = parse_clone_url_parts(url)?;
+    if parsed.protocol == protocol {
+        return Some(url.trim().to_owned());
+    }
+    if parsed.custom_port {
+        return None;
+    }
+    // Azure's transports use different hosts and put the repository marker in different places.
+    let segments: Vec<&str> = parsed.path.split('/').collect();
+    let plain = |segments: [&str; 3]| segments.iter().all(|s| !s.is_empty() && !s.contains(['?', '#']));
+    if parsed.protocol == CloneProtocol::Ssh && parsed.host.eq_ignore_ascii_case("ssh.dev.azure.com") {
+        return match segments.as_slice() {
+            ["v3", org, project, repo] if plain([*org, *project, *repo]) => {
+                Some(format!("https://dev.azure.com/{org}/{project}/_git/{repo}"))
+            }
+            _ => None,
+        };
+    }
+    if parsed.protocol == CloneProtocol::Https && parsed.host.eq_ignore_ascii_case("dev.azure.com") {
+        return match segments.as_slice() {
+            [org, project, "_git", repo] if plain([*org, *project, *repo]) => {
+                Some(format!("git@ssh.dev.azure.com:v3/{org}/{project}/{repo}"))
+            }
+            _ => None,
+        };
+    }
+    Some(match protocol {
+        CloneProtocol::Ssh => format!("git@{}:{}", parsed.host, parsed.path),
+        CloneProtocol::Https => format!("https://{}/{}", parsed.host, parsed.path),
+    })
+}
+
+/// `(?:[^/\s]*@)?(\[…\]|[^@:/\s]+)(:\d+)?/(.+)` after the scheme, and whether it names a port.
+fn parse_authority_url(rest: &str) -> Option<(&str, &str, bool)> {
     let slash = rest.find('/')?;
     let (authority, path) = (&rest[..slash], &rest[slash + 1..]);
     if path.is_empty() || authority.contains(char::is_whitespace) {
@@ -119,7 +184,7 @@ fn parse_authority_url(rest: &str) -> Option<(&str, &str)> {
     };
     let port_ok = port.is_empty()
         || port.strip_prefix(':').is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
-    (host_ok && port_ok).then_some((host, path))
+    (host_ok && port_ok).then_some((host, path, !port.is_empty()))
 }
 
 /// `^(?:[^@/\s]+@)?(\[…\]|[^:/\s[\]]+):(?!/)(.+)$`.
@@ -441,6 +506,28 @@ mod tests {
         );
         assert_eq!(new_project_path_preview("/home/me/T3 Projects", "My App"), "/home/me/T3 Projects/my-app");
         assert_eq!(new_project_path_preview("C:\\Users\\me\\T3 Projects\\", ""), "C:\\Users\\me\\T3 Projects\\project");
+    }
+
+    #[test]
+    fn clone_urls_switch_protocol_where_that_is_safe() {
+        use CloneProtocol::{Https, Ssh};
+        assert_eq!(clone_url_protocol("git@github.com:o/r.git"), Some(Ssh));
+        assert_eq!(clone_url_protocol("http://host/o/r"), Some(Https));
+        assert_eq!(clone_url_protocol("/srv/r.git"), None);
+        let cases = [
+            ("git@github.com:o/r.git", Https, Some("https://github.com/o/r.git")),
+            ("https://github.com/o/r.git", Ssh, Some("git@github.com:o/r.git")),
+            (" https://github.com/o/r.git ", Https, Some("https://github.com/o/r.git")),
+            ("ssh://git@host:2222/o/r.git", Https, None),
+            ("https://host:8443/o/r.git", Ssh, None),
+            ("git@ssh.dev.azure.com:v3/org/proj/repo", Https, Some("https://dev.azure.com/org/proj/_git/repo")),
+            ("https://dev.azure.com/org/proj/_git/repo", Ssh, Some("git@ssh.dev.azure.com:v3/org/proj/repo")),
+            ("https://dev.azure.com/org/repo", Ssh, None),
+            ("/srv/r.git", Ssh, None),
+        ];
+        for (url, protocol, expected) in cases {
+            assert_eq!(clone_url_for_protocol(url, protocol).as_deref(), expected, "{url}");
+        }
     }
 
     #[test]
