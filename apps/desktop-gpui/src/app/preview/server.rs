@@ -18,11 +18,11 @@ use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{Disableable as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Bounds, ClickEvent, Context, ElementInputHandler, Entity, EntityInputHandler,
-    FocusHandle, InteractiveElement as _, IntoElement, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement as _, PathPromptOptions, Pixels, Point,
-    RenderImage, ScrollDelta, ScrollEvent, SharedString, Styled as _, StyledImage as _, Task, UTF16Selection, Window,
-    canvas, div, img, px, size,
+    AnyElement, App, AppContext as _, Bounds, ClickEvent, Context, DispatchPhase, ElementInputHandler, Entity,
+    EntityInputHandler, FocusHandle, InteractiveElement as _, IntoElement, KeyDownEvent, KeyUpEvent, Keystroke,
+    Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement as _,
+    PathPromptOptions, Pixels, Point, RenderImage, ScrollDelta, ScrollEvent, SharedString, Styled as _,
+    StyledImage as _, Task, UTF16Selection, Window, canvas, div, img, px, size,
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -816,6 +816,10 @@ impl Workspace {
             stream.sent_size = Some(size);
             stream.send(json!({"type": "resize", "width": size.0, "height": size.1}));
         }
+        // A press the window stopped seeing ends like the web's `pointercancel`.
+        if stream.buttons != 0 && !window.is_window_active() {
+            self.cancel_server_buttons(key, window.mouse_position());
+        }
         let stream = &self.preview.server.streams[key];
         let control = stream.control.clone();
         let mine = control.as_ref().is_some_and(Control::mine);
@@ -867,8 +871,9 @@ impl Workspace {
         // The web disables its textarea over a PDF.
         let text_input = pdf.is_none().then(|| (stream.focus.clone(), stream.input.clone()));
         let tab = key.clone();
-        let (down_tab, up_tab, move_tab, wheel_tab, key_tab, key_up_tab) =
-            (tab.clone(), tab.clone(), tab.clone(), tab.clone(), tab.clone(), tab.clone());
+        let (down_tab, move_tab, wheel_tab, key_tab, key_up_tab) =
+            (tab.clone(), tab.clone(), tab.clone(), tab.clone(), tab.clone());
+        let (drag_view, drag_tab) = (cx.weak_entity(), tab.clone());
         let body = div()
             .id("server-browser-page")
             .relative()
@@ -883,6 +888,18 @@ impl Workspace {
                         if let Some((focus, input)) = text_input {
                             window.handle_input(&focus, ElementInputHandler::new(bounds, input), cx);
                         }
+                        // A press on the page follows the pointer and its release anywhere in the window.
+                        let (up_view, up_tab) = (drag_view.clone(), drag_tab.clone());
+                        window.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
+                            if phase == DispatchPhase::Capture {
+                                let _ = drag_view.update(cx, |this, _| this.server_mouse_move(&drag_tab, e, true));
+                            }
+                        });
+                        window.on_mouse_event(move |e: &MouseUpEvent, phase, _, cx| {
+                            if phase == DispatchPhase::Capture {
+                                let _ = up_view.update(cx, |this, cx| this.server_mouse_up(&up_tab, e, cx));
+                            }
+                        });
                     },
                 )
                 .absolute()
@@ -899,23 +916,13 @@ impl Workspace {
                 let tab = tab.clone();
                 cx.listener(move |this, e: &MouseDownEvent, w, cx| this.server_mouse_down(&tab, e, w, cx))
             })
-            .on_mouse_down(MouseButton::Middle, {
-                let tab = tab.clone();
-                cx.listener(move |this, e: &MouseDownEvent, w, cx| this.server_mouse_down(&tab, e, w, cx))
-            })
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(move |this, e: &MouseUpEvent, _, cx| this.server_mouse_up(&up_tab, e, cx)),
-            )
-            .on_mouse_up(MouseButton::Right, {
-                let tab = tab.clone();
-                cx.listener(move |this, e: &MouseUpEvent, _, cx| this.server_mouse_up(&tab, e, cx))
-            })
-            .on_mouse_up(
+            .on_mouse_down(
                 MouseButton::Middle,
-                cx.listener(move |this, e: &MouseUpEvent, _, cx| this.server_mouse_up(&tab, e, cx)),
+                cx.listener(move |this, e: &MouseDownEvent, w, cx| this.server_mouse_down(&tab, e, w, cx)),
             )
-            .on_mouse_move(cx.listener(move |this, e: &MouseMoveEvent, _, _| this.server_mouse_move(&move_tab, e)))
+            .on_mouse_move(
+                cx.listener(move |this, e: &MouseMoveEvent, _, _| this.server_mouse_move(&move_tab, e, false)),
+            )
             .on_scroll(cx.listener(move |this, e: &ScrollEvent, _, cx| {
                 if this.server_wheel(&wheel_tab, e) {
                     cx.stop_propagation();
@@ -1128,9 +1135,10 @@ impl Workspace {
         cx.stop_propagation();
     }
 
-    fn server_mouse_move(&mut self, tab: &TabRef, event: &MouseMoveEvent) {
+    /// A hover over the page, or (`dragging`) a held press moving anywhere in the window.
+    fn server_mouse_move(&mut self, tab: &TabRef, event: &MouseMoveEvent, dragging: bool) {
         let Some(stream) = self.preview.server.streams.get(tab) else { return };
-        if !stream.control.as_ref().is_some_and(Control::mine) {
+        if !stream.control.as_ref().is_some_and(Control::mine) || (stream.buttons != 0) != dragging {
             return;
         }
         let held = stream.buttons;
@@ -1145,6 +1153,21 @@ impl Workspace {
             "type": "mouse", "action": "move", "x": x, "y": y, "button": button, "buttons": held,
             "clickCount": 0, "modifiers": modifier_bits(event.modifiers),
         }));
+    }
+
+    /// Releases every held button at `position`, clamped to the page.
+    fn cancel_server_buttons(&mut self, tab: &TabRef, position: Point<Pixels>) {
+        let point = self.server_point(tab, position, true);
+        let Some(stream) = self.preview.server.streams.get_mut(tab) else { return };
+        if let Some((x, y)) = point {
+            for (button, buttons) in released_buttons(stream.buttons) {
+                stream.send(json!({
+                    "type": "mouse", "action": "up", "x": x, "y": y, "button": button, "buttons": buttons,
+                    "clickCount": 0, "modifiers": 0,
+                }));
+            }
+        }
+        stream.buttons = 0;
     }
 
     fn server_wheel(&self, tab: &TabRef, event: &ScrollEvent) -> bool {
@@ -1298,6 +1321,19 @@ fn mouse_button(button: MouseButton) -> Option<(&'static str, u8)> {
         MouseButton::Middle => Some(("middle", 4)),
         MouseButton::Navigate(_) => None,
     }
+}
+
+/// Cancellation releases every held button, one `up` each, with the buttons still held after it.
+fn released_buttons(held: u8) -> Vec<(&'static str, u8)> {
+    let mut buttons = held;
+    [("left", 1), ("right", 2), ("middle", 4)]
+        .into_iter()
+        .filter(|(_, bit)| held & bit != 0)
+        .map(|(button, bit)| {
+            buttons &= !bit;
+            (button, buttons)
+        })
+        .collect()
 }
 
 /// How the frame sits in its area: `object-fit: contain`, mapped to page CSS px.
@@ -1547,6 +1583,13 @@ mod tests {
         let next = Dialog { message: "Age?".into(), ..prompt.clone() };
         assert_eq!(prompt_reset(Some(&prompt), Some(&next)).as_deref(), Some("x"), "another prompt resets");
         assert_eq!(prompt_reset(Some(&prompt), None).as_deref(), Some(""), "a closed dialog clears it");
+    }
+
+    #[test]
+    fn a_cancelled_press_releases_each_held_button() {
+        assert_eq!(released_buttons(0b101), vec![("left", 0b100), ("middle", 0)]);
+        assert_eq!(released_buttons(0b010), vec![("right", 0)]);
+        assert!(released_buttons(0).is_empty());
     }
 
     #[test]
