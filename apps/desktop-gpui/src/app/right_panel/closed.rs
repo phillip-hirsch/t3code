@@ -267,8 +267,12 @@ impl Workspace {
         });
     }
 
-    /// `draft` launched `thread`: its closed tabs reopen there.
+    /// `draft` launched `thread`, or moved to another project on its environment: its closed tabs
+    /// reopen there. The web keys them by environment and thread id, so a move off it leaves them.
     pub(in crate::app) fn retarget_closed_views(&mut self, draft: &Target, thread: &Target) {
+        if draft.environment() != thread.environment() {
+            return;
+        }
         let (from, to) = (StoredTarget::from(draft), StoredTarget::from(thread));
         self.right_panel.closed.update(|history| history.retarget(&from, &to));
     }

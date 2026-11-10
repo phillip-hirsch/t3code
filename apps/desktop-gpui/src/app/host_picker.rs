@@ -340,6 +340,7 @@ impl Workspace {
         let to = Target::draft(env, project_id, draft);
         carry(&mut self.host.selections, &from, &to);
         self.carry_draft_panel(&from, &to);
+        self.retarget_closed_views(&from, &to);
         self.target = Some(to);
         self.sync_draft_workspace(cx);
         self.sync_attachment_uploads(cx);
