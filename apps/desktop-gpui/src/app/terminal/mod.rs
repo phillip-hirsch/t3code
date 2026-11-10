@@ -34,7 +34,7 @@ use serde_json::{Value, json};
 
 use self::layout::{DrawerLayout, Place, Split};
 pub(in crate::app) use self::session::{Launch, SessionEvent, TerminalSession};
-use super::draft_sessions::DraftId;
+use super::draft_sessions::{DraftId, DraftSessions};
 use super::titlebar::icon;
 use super::{Target, Workspace};
 use crate::model::ScopedId;
@@ -335,6 +335,15 @@ impl Terminals {
         self.draft_threads.iter().find(|(_, id)| *id == thread_id).map(|(draft, _)| draft)
     }
 
+    /// Where `key`'s terminals and panel tabs belong: the unsent draft that launches with its
+    /// thread, else that thread on its environment.
+    fn owner(&self, drafts: &DraftSessions, key: &DrawerKey) -> Option<Target> {
+        match self.draft_of(&key.thread_id) {
+            Some(draft) => drafts.target(draft),
+            None => Some(Target::Thread { env: key.env.clone()?.into(), id: key.thread_id.clone() }),
+        }
+    }
+
     /// `key`'s terminals as its environment's stream lists them.
     fn summaries(&self, key: &DrawerKey) -> &[Summary] {
         self.listed(key.env.as_deref(), &key.thread_id)
@@ -472,9 +481,9 @@ impl Workspace {
         DrawerKey { env: env.map(|env| env.to_string()), thread_id: thread_id.to_owned() }
     }
 
-    /// The thread a drawer's key names, on its environment.
+    /// The target owning a drawer's terminals: a draft until it launches, else its thread.
     fn drawer_target(&self, key: &DrawerKey) -> Option<Target> {
-        Some(Target::Thread { env: key.env.clone()?.into(), id: key.thread_id.clone() })
+        self.terminals.owner(&self.drafts, key)
     }
 
     fn shown_drawer_key(&self) -> Option<DrawerKey> {
@@ -732,11 +741,7 @@ impl Workspace {
         };
         self.terminals.focus_later(&key, &terminal_id);
         let payload = launch.payload(&key.thread_id, &terminal_id);
-        let origin = match self.terminals.draft_of(&key.thread_id) {
-            Some(draft) => self.drafts.target(draft),
-            None => self.drawer_target(&key),
-        }
-        .or_else(|| self.target.clone());
+        let origin = self.drawer_target(&key).or_else(|| self.target.clone());
         let thread_id = key.thread_id;
         cx.spawn(async move |this, cx| {
             let mut result = client.request("terminal.open", payload).await.map(drop);
@@ -1648,6 +1653,19 @@ mod tests {
         assert_eq!(terminals.draft_of("other"), None);
         terminals.take_draft_thread(&draft);
         assert_eq!(terminals.draft_of("future"), None, "a sent draft's thread is listed");
+    }
+
+    #[test]
+    fn a_drafts_terminal_tabs_belong_to_the_draft_until_it_launches() {
+        let mut drafts = DraftSessions::default();
+        let draft = drafts.create(ScopedId::new("a", "p"));
+        let mut terminals = Terminals::default();
+        terminals.draft_threads.insert(draft.clone(), "future".into());
+        let key = DrawerKey::new("a", "future");
+        assert_eq!(terminals.owner(&drafts, &key), drafts.target(&draft), "not the thread it will launch");
+        terminals.take_draft_thread(&draft);
+        assert_eq!(terminals.owner(&drafts, &key), Some(Target::Thread { env: "a".into(), id: "future".into() }));
+        assert_eq!(terminals.owner(&drafts, &key.legacy()), None, "an older build's drawer has no environment");
     }
 
     #[test]
