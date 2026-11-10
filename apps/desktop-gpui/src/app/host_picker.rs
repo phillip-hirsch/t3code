@@ -73,8 +73,16 @@ fn sample_unused(sample: &mut Option<Sample>, origin: &Target, still_open: bool)
     }
 }
 
+/// `onEnvironmentChange`'s guard: a scratch project that lands moves the draft only for the newest
+/// machine switch, while the draft is still open where that switch started.
+fn change_lands(request: u64, latest: u64, origin: Option<&Target>, now: Option<&Target>) -> bool {
+    request == latest && origin == now
+}
+
 pub(super) struct HostUi {
     open: bool,
+    /// The newest machine switch (`environmentChangeRef`); an older one settling late is dropped.
+    environment_change: u64,
     /// By draft, as the web keeps them on each draft session: they follow it from machine to
     /// machine, and a new draft starts without them.
     selections: HashMap<Target, Selection>,
@@ -90,6 +98,7 @@ impl HostUi {
     pub(super) fn new(cx: &mut App) -> Self {
         Self {
             open: false,
+            environment_change: 0,
             selections: HashMap::new(),
             sample: None,
             _sample: None,
@@ -303,6 +312,7 @@ impl Workspace {
             return;
         }
         self.host.open = false;
+        self.host.environment_change += 1;
         self.host.selections.insert(target, Selection::Manual);
         self.host._sample = None;
         self.host.sample = None;
@@ -373,12 +383,14 @@ impl Workspace {
 
     fn open_scratch_then_retarget(&mut self, env: SharedString, window: &mut Window, cx: &mut Context<Self>) {
         let Some(client) = self.env_client(&env) else { return };
-        let origin = self.target.clone();
+        let (origin, request) = (self.target.clone(), self.host.environment_change);
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("projects.ensureScratch", json!({})).await;
             let _ = this.update_in(cx, |this, window, cx| match result {
-                // A draft that moved on meanwhile keeps its machine.
-                Ok(value) if this.target == origin => {
+                // A draft that moved on, or a newer switch, keeps the machine it has.
+                Ok(value)
+                    if change_lands(request, this.host.environment_change, origin.as_ref(), this.target.as_ref()) =>
+                {
                     if let Some(project_id) = value["projectId"].as_str() {
                         this.retarget_draft(env, project_id.to_owned(), cx);
                     }
@@ -736,6 +748,14 @@ mod tests {
 
     fn draft(env: &str, project: &str) -> Target {
         Target::draft(env.to_owned().into(), project.to_owned(), crate::app::draft_sessions::DraftId::for_test(project))
+    }
+
+    #[test]
+    fn a_scratch_switch_lands_only_while_it_is_the_newest_for_its_draft() {
+        let (a, b) = (draft("local", "web"), draft("remote", "web"));
+        assert!(change_lands(2, 2, Some(&a), Some(&a)));
+        assert!(!change_lands(1, 2, Some(&a), Some(&a)), "a newer switch superseded it");
+        assert!(!change_lands(2, 2, Some(&a), Some(&b)), "the draft moved meanwhile");
     }
 
     #[test]
