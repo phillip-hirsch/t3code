@@ -147,7 +147,33 @@ pub(super) struct PickerState {
     show_legacy: bool,
     /// Options last picked per `(instance, model)`, restored when switching back.
     remembered: HashMap<(String, String), Vec<Value>>,
+    saves: PickSaves,
     _search_changes: Option<Subscription>,
+}
+
+/// The newest model save sent per target, so an older reply cannot release a newer pick of the
+/// same model (the web compares the pick by identity).
+#[derive(Default)]
+struct PickSaves {
+    serial: u64,
+    latest: HashMap<super::Target, u64>,
+}
+
+impl PickSaves {
+    fn begin(&mut self, target: &super::Target) -> u64 {
+        self.serial += 1;
+        self.latest.insert(target.clone(), self.serial);
+        self.serial
+    }
+
+    /// Whether `serial` is still the target's newest save; it is settled either way.
+    fn settle(&mut self, target: &super::Target, serial: u64) -> bool {
+        let latest = self.latest.get(target) == Some(&serial);
+        if latest {
+            self.latest.remove(target);
+        }
+        latest
+    }
 }
 
 /// One row of the list, resolved once per render while the picker is open.
@@ -325,18 +351,23 @@ impl Workspace {
         let command = json!({"type": "thread.model-selection.set", "commandId": super::new_id(), "threadId": id,
             "modelSelection": pick.to_json()});
         let Some(client) = self.env_client(env) else { return };
+        let serial = self.picker.saves.begin(&target);
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("orchestration.dispatchCommand", command).await;
-            let _ = this.update_in(cx, |this, window, cx| match result {
-                Ok(_) => this.release_model_pick(&target, &pick, cx),
-                Err(error) => pick_failed(window, cx, &error.message()),
+            let _ = this.update_in(cx, |this, window, cx| {
+                let latest = this.picker.saves.settle(&target, serial);
+                match result {
+                    Ok(_) if latest => this.release_model_pick(&target, &pick, cx),
+                    Ok(_) => {}
+                    Err(error) => pick_failed(window, cx, &error.message()),
+                }
             });
         })
         .detach();
     }
 
-    /// `releaseModelSelection`: the thread took `pick`, so its composer stops holding it. A newer
-    /// pick, even of the same model, still waits for its own reply.
+    /// `releaseModelSelection`: the thread took `pick`, the target's newest save, so its composer
+    /// stops holding it.
     fn release_model_pick(&mut self, target: &super::Target, pick: &ModelSelection, cx: &mut Context<Self>) {
         if self.target.as_ref() == Some(target) {
             if self.model_override.as_ref() != Some(pick) {
@@ -1737,6 +1768,20 @@ mod tests {
         assert_eq!(thread_pick(Some(&same), false, Some(&thread)), None, "an inherited model is not a pick");
         assert_eq!(thread_pick(Some(&same), true, None), None, "the thread has not loaded");
         assert_eq!(thread_pick(None, true, Some(&thread)), None);
+    }
+
+    #[test]
+    fn only_a_targets_newest_model_save_releases_its_pick() {
+        let thread = |env: &str| super::super::Target::Thread { env: env.into(), id: "t".into() };
+        let mut saves = PickSaves::default();
+        // Pick A, B, then A again before any reply: the first A's success must not clear the last.
+        let (first, second, third) = (saves.begin(&thread("a")), saves.begin(&thread("a")), saves.begin(&thread("a")));
+        let other = saves.begin(&thread("b"));
+        assert!(!saves.settle(&thread("a"), first));
+        assert!(!saves.settle(&thread("a"), second));
+        assert!(saves.settle(&thread("a"), third));
+        assert!(!saves.settle(&thread("a"), third), "settles once");
+        assert!(saves.settle(&thread("b"), other), "another environment's thread t is its own target");
     }
 
     #[test]
