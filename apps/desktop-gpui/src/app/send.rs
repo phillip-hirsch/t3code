@@ -323,7 +323,9 @@ impl Workspace {
                     ))
                 });
                 let thread_id = self.terminals.take_draft_thread(&project_id).unwrap_or_else(new_id);
-                let mut initial = json!({"messageId": new_id(), "text": message_text, "attachments": attachments});
+                let launched_message = new_id();
+                let mut initial =
+                    json!({"messageId": launched_message, "text": message_text, "attachments": attachments});
                 if let Some(context) = context {
                     initial["context"] = context;
                 }
@@ -341,14 +343,18 @@ impl Workspace {
                     "initialMessage": initial,
                 });
                 background = intent != Intent::Foreground;
-                ("orchestration.launchThread", input, Some(thread_id), workspace.flatten())
+                ("orchestration.launchThread", input, Some((thread_id, launched_message)), workspace.flatten())
             }
         };
         let new_draft_after = intent == Intent::AndNewThread && matches!(origin, Target::Thread { .. });
         let project_id = self.target_project().map(|p| p.id.clone());
         let sent_attachments = std::mem::take(&mut self.attachments);
         let pending_id = pending_send.as_ref().map(|send| send.message_id.clone());
+        let started = pending_send.as_ref().filter(|send| !send.queued).map(|send| send.message_id.clone());
         self.pending_sends.extend(pending_send);
+        if let Some(message_id) = started {
+            self.anchor_new_turn(message_id.into(), cx);
+        }
         self.sending = true;
         self.set_composer_text("", window, cx);
         self.release_typing_hold(false, window, cx);
@@ -410,12 +416,13 @@ impl Workspace {
                                 }
                             }
                             // Follow the new thread only from the draft that launched it.
-                            (Some(thread_id), false) if here => {
+                            (Some((thread_id, message_id)), false) if here => {
                                 // The draft is used up; the project's next draft starts fresh.
                                 this.draft_workspace = Default::default();
                                 // It launched on the draft's environment; the shell may not list it yet.
                                 let environment = origin.environment().clone();
                                 this.select_thread_in(environment, thread_id, window, cx);
+                                this.anchor_new_turn(message_id.into(), cx);
                             }
                             _ if new_draft_after && here => {
                                 if let Some(project_id) = project_id {

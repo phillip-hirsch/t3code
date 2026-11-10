@@ -422,6 +422,10 @@ passing through to gpui-base's (see its "Soft breaks can render as line breaks")
 a row's top. `src/message_scroller.rs`: `scroll_to_offset` scrolls to a row and an offset into
 it, the `logical_scroll_top` it reported.
 
+**A newly started turn anchors near the top.** The web reserves end space under a sent message
+so it can sit near the top while the reply streams in, which needs the rows' measured positions.
+`src/message_scroller.rs`: `bounds_for_item` and `viewport_bounds` pass the list's through.
+
 **A diff says which files are near the viewport, and pins the current file's header.** The web
 reads a large diff's patches as their headers come within 600px of the viewport, and its file
 headers are sticky. The patch, in `src/diff/state.rs` and `src/diff/mod.rs`:

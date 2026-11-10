@@ -88,6 +88,7 @@ mod theme_editor;
 mod thread_menu;
 mod thread_menu_actions;
 mod thread_now;
+mod timeline_anchor;
 mod titlebar;
 mod user_message;
 mod visits;
@@ -212,6 +213,8 @@ pub struct Workspace {
     composer_height: f32,
     /// The transcript lane's width last frame; a change reflows its rows (see `render_body`).
     timeline_lane_width: std::cell::Cell<f32>,
+    /// A newly sent turn held near the top (see `timeline_anchor`); placed while rendering.
+    timeline_anchor: std::cell::RefCell<timeline_anchor::Anchor>,
     /// The question card's drafts, for the first pending question.
     question: Option<QuestionDraft>,
     /// Requests that arrived mid-typing, kept out of sight for now.
@@ -450,6 +453,7 @@ impl Workspace {
             composer_ultrathink: Default::default(),
             composer_height: 0.,
             timeline_lane_width: std::cell::Cell::new(0.),
+            timeline_anchor: Default::default(),
             question: None,
             typing_guard: Default::default(),
             _typing_idle: None,
@@ -899,6 +903,7 @@ impl Workspace {
         self.sync_subagent_tick(cx);
         self.sync_child_approvals(cx);
         self.sync_lineage_titles(cx);
+        self.sync_timeline_anchor(cx);
         let Some((range, count)) = timeline::changed_range(&self.rows, &new_rows) else { return };
         let total = new_rows.len();
         self.rows = Rc::from(new_rows);
@@ -1029,6 +1034,7 @@ impl Workspace {
         self.entry_kinds = Arc::default();
         self.details = inspector::Details::default();
         self._working_tick = None;
+        *self.timeline_anchor.get_mut() = Default::default();
         self.scroller.update(cx, |scroller, cx| scroller.reset(0, cx));
         self.recall_position();
     }

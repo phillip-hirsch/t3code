@@ -23,7 +23,7 @@ use gpui_kit::{
 
 use gpui_kit::assets::IconName;
 
-use super::{Target, Workspace, message_actions};
+use super::{Target, Workspace, message_actions, timeline_anchor};
 use crate::theme::{self, Tokens};
 use crate::timeline::{self, DetailEntry, Row, Steer, WorkRow, WorkRowKind};
 use crate::work_log::{self, Activity, Entry, Status, WorkIcon};
@@ -86,6 +86,7 @@ impl Workspace {
                     self.scroller.update(cx, gpui_kit::component::message_scroller::MessageScrollerState::remeasure);
                 }
                 let composer = self.composer_height;
+                let (end_space, anchored) = self.settle_timeline_anchor(window, cx);
                 // `.chat-scroll-to-bottom` spans the lane, not the canvas, and clears the composer.
                 let pill_offset = lane.left - lane.right;
                 let mut jump_style = StyleRefinement::default().mb(px(composer - 6.));
@@ -110,11 +111,13 @@ impl Workspace {
                         .with_list_style(
                             StyleRefinement::default()
                                 .pt(px(16.))
-                                .pb(px(16. + composer))
+                                .pb(px(16. + composer + end_space))
                                 .pl(px(lane.left))
                                 .pr(px(lane.right)),
                         )
                         .with_row_style(StyleRefinement::default().pb(px(0.)))
+                        // Pinned to an anchored message, the list is at its live end.
+                        .jump_button(!anchored)
                         .with_jump_button_label("Scroll to end")
                         .with_jump_button_style(jump_style)
                         .with_jump_button_renderer(move |button| scroll_to_end_button(button, &t)),
@@ -215,6 +218,88 @@ impl Workspace {
                 }
             }));
         }
+    }
+
+    /// `anchorNewTurn`: sending returns the timeline to its end, and holds the thread's first
+    /// message near the top while its reply streams in.
+    pub(super) fn anchor_new_turn(&mut self, message_id: SharedString, cx: &mut Context<Self>) {
+        self.timeline_anchor.get_mut().arm(message_id);
+        self.scroller.update(cx, gpui_kit::component::message_scroller::MessageScrollerState::scroll_to_end);
+    }
+
+    /// Anchors a run another client started while the end was followed, and lets the anchor go
+    /// once its run works or finishes.
+    pub(super) fn sync_timeline_anchor(&mut self, cx: &mut Context<Self>) {
+        let Some(thread) = self.thread.as_ref() else { return };
+        let projection = thread.state.projection.as_ref();
+        let following = self.scroller.read(cx).is_following_tail();
+        let anchor = self.timeline_anchor.get_mut();
+        let run =
+            projection.and_then(|p| p.runs.iter().rev().find(|run| crate::model::is_active_run_status(&run.status)));
+        let observation = timeline_anchor::RunObservation {
+            thread: thread.id.clone(),
+            hydrated: projection.is_some(),
+            run: run.map(|run| run.id.clone()),
+        };
+        let queued = run.is_some_and(|run| run.status == "queued");
+        let message = run.and_then(|run| run.user_message_id.as_deref());
+        anchor.observe(observation, queued, message, following || anchor.is_pinned());
+        if projection.is_some_and(|projection| anchor.run_moved_on(projection)) {
+            let pinned = anchor.is_pinned();
+            anchor.release();
+            let last = self.rows.len().saturating_sub(1);
+            self.scroller.update(cx, |scroller, cx| {
+                scroller.remeasure_items(last..last + 1, cx);
+                if pinned {
+                    scroller.scroll_to_end(cx);
+                }
+            });
+        }
+    }
+
+    /// Places the anchored message from the list's last layout: the end space under the last
+    /// row, and whether the list is pinned to the message.
+    fn settle_timeline_anchor(&self, window: &mut Window, cx: &mut Context<Self>) -> (f32, bool) {
+        use timeline_anchor::{AnchorRow, Layout, Settle};
+        let mut anchor = self.timeline_anchor.borrow_mut();
+        let Some(message) = anchor.message() else { return (0., false) };
+        let row = timeline_anchor::anchor_row(&self.rows, &timeline_anchor::row_id(self.open_projection(), message));
+        let layout = match row {
+            AnchorRow::First(index) => {
+                let scroller = self.scroller.read(cx);
+                let bounds = |ix: usize| scroller.bounds_for_item(ix);
+                Some(Layout {
+                    index,
+                    rows: self.rows.len(),
+                    top: scroller.logical_scroll_top(),
+                    viewport_height: scroller.viewport_bounds().size.height,
+                    anchor_top: bounds(index).map(|b| b.top()),
+                    previous_height: index.checked_sub(1).and_then(bounds).map(|b| b.size.height),
+                    last_bottom: self.rows.len().checked_sub(1).and_then(bounds).map(|b| b.bottom()),
+                })
+            }
+            AnchorRow::Missing | AnchorRow::NotFirst => None,
+        };
+        let last = self.rows.len().saturating_sub(1);
+        match anchor.settle(row, layout) {
+            Settle::Idle => {}
+            Settle::Wait => window.request_animation_frame(),
+            Settle::Released { to_end } => self.scroller.update(cx, |scroller, cx| {
+                scroller.remeasure_items(last..last + 1, cx);
+                if to_end {
+                    scroller.scroll_to_end(cx);
+                }
+            }),
+            Settle::Placed { remeasure, pin } => self.scroller.update(cx, |scroller, cx| {
+                if remeasure {
+                    scroller.remeasure_items(last..last + 1, cx);
+                }
+                if let Some(pin) = pin {
+                    scroller.scroll_to_offset(pin, cx);
+                }
+            }),
+        }
+        (anchor.end_space(), anchor.is_pinned())
     }
 }
 

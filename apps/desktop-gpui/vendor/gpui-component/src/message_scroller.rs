@@ -74,6 +74,17 @@ impl MessageScrollerState {
         self.list_state.logical_scroll_top()
     }
 
+    /// The bounds the row at `index` had at the last layout, in window coordinates, if it was
+    /// measured and is not above the row at the top.
+    pub fn bounds_for_item(&self, index: usize) -> Option<gpui::Bounds<gpui::Pixels>> {
+        self.list_state.bounds_for_item(index)
+    }
+
+    /// The viewport's bounds at the last layout, in window coordinates.
+    pub fn viewport_bounds(&self) -> gpui::Bounds<gpui::Pixels> {
+        self.list_state.viewport_bounds()
+    }
+
     /// Reset the list to `item_count` rows.
     pub fn reset(&mut self, item_count: usize, cx: &mut Context<Self>) {
         self.list_state.reset(item_count);
