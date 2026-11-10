@@ -420,11 +420,30 @@ impl Workspace {
             self.sessions().iter().filter_map(|s| Some((s.id.clone()?, s.client.clone()?))).collect();
         let start =
             crate::pull_requests::resync_follows(&mut self.pull_requests.refreshes, &connected, RpcClient::same_socket);
+        let mut started = Vec::new();
         for index in start {
             let (environment, client) = connected[index].clone();
             let task = self.follow_pr_refreshes(environment.clone(), client.clone(), cx);
-            self.pull_requests.refreshes.insert(environment, (client, task));
+            self.pull_requests.refreshes.insert(environment.clone(), (client, task));
+            started.push(environment);
         }
+        if !started.is_empty() {
+            self.read_what_was_missed_offline(&started, cx);
+        }
+    }
+
+    /// Sockets came up: a list or a shown pull request that opened while they were down, or whose
+    /// read failed, has nothing to refresh in place, so it reads now, as the web's queries rerun.
+    fn read_what_was_missed_offline(&mut self, environments: &[SharedString], cx: &mut Context<Self>) {
+        let unread = self.pull_requests.panel.as_ref().is_some_and(|panel| {
+            panel.detail.is_none()
+                && !panel.detail_loading
+                && environments.iter().any(|e| e.as_ref() == panel.reference.environment_id)
+        });
+        if unread && self.pr_panel_on_screen() {
+            self.read_pr_detail(cx);
+        }
+        self.read_unread_pull_requests(cx);
     }
 
     fn follow_pr_refreshes(
