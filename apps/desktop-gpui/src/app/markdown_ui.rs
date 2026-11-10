@@ -389,7 +389,7 @@ impl Workspace {
 
     /// `onOpenInBrowser`: an HTML or PDF file of a thread, which has the integrated browser.
     fn can_open_file_in_browser(&self, target: &str) -> bool {
-        self.preview_thread_id().is_some() && is_browser_preview_file(without_position(target))
+        self.browser_available() && is_browser_preview_file(without_position(target))
     }
 
     /// A file link's click: a PDF opens in the integrated browser unless the platform modifier
