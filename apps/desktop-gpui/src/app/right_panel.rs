@@ -334,6 +334,24 @@ struct Commit {
     committed_at: Option<String>,
 }
 
+/// `review.getBranchCommits`' answer.
+#[derive(Clone)]
+struct CommitList {
+    commits: Vec<Commit>,
+    truncated: bool,
+}
+
+/// The checkout and comparison base a commit list answers: (environment, cwd, base ref).
+type CommitsSource = (SharedString, String, Option<String>);
+
+/// The commit list read for `source`; none while only another checkout's (or base's) is loaded.
+fn commits_for<'a>(
+    loaded: &'a Option<(CommitsSource, Result<CommitList, SharedString>)>,
+    source: Option<&CommitsSource>,
+) -> Option<&'a Result<CommitList, SharedString>> {
+    loaded.as_ref().filter(|(from, _)| Some(from) == source).map(|(_, reply)| reply)
+}
+
 /// How [`Workspace::show_diff_files`] puts files in the patch.
 #[derive(Clone, Copy)]
 enum Install {
@@ -433,7 +451,8 @@ pub(super) struct RightPanel {
     diff_reading: bool,
     /// The git diff showed at the last render, to revalidate it when it shows again.
     git_diff_shown: bool,
-    commits: Vec<Commit>,
+    /// The last commit list read and the checkout it answers (`branchCommitsQuery`).
+    commits: Option<(CommitsSource, Result<CommitList, SharedString>)>,
     /// The tab strip, and the tab it last scrolled into view.
     tabs_scroll: ScrollHandle,
     /// The diff header's refs area, measured for its narrow form (`@max-[20rem]/diff-refs`).
@@ -508,7 +527,7 @@ impl RightPanel {
             diff_read_at: None,
             diff_reading: false,
             git_diff_shown: false,
-            commits: Vec::new(),
+            commits: None,
             tabs_scroll: ScrollHandle::new(),
             diff_refs: ScrollHandle::new(),
             diff_refs_waited: std::cell::Cell::new(false),
@@ -1306,7 +1325,7 @@ impl Workspace {
                 input["revision"] = revision.into();
             }
             if let Some(cwd) = cwd {
-                self.read_branch_commits(client.clone(), cwd, remembered_base, cx);
+                self.read_branch_commits(client.clone(), (env, cwd, remembered_base), cx);
             }
             return self.read_tool_call_diff(selection, client, input, ignore_whitespace, install, window, cx);
         }
@@ -1355,7 +1374,7 @@ impl Workspace {
             DiffScope::Turn(_) | DiffScope::ToolCall { .. } => None,
         };
         if let Some(cwd) = cwd.clone() {
-            self.read_branch_commits(client.clone(), cwd, remembered_base.clone(), cx);
+            self.read_branch_commits(client.clone(), (env.clone(), cwd, remembered_base.clone()), cx);
         }
         let commit_sha = match &scope {
             DiffScope::Commit(sha) => Some(sha.clone()),
@@ -1469,18 +1488,26 @@ impl Workspace {
     }
 
     /// `branchCommitsQuery`: the branch's commits for the scope menu.
-    fn read_branch_commits(&mut self, client: RpcClient, cwd: String, base: Option<String>, cx: &mut Context<Self>) {
-        let mut input = json!({"cwd": cwd});
-        if let Some(base) = base {
-            input["baseRef"] = base.into();
+    fn read_branch_commits(&mut self, client: RpcClient, source: CommitsSource, cx: &mut Context<Self>) {
+        let mut input = json!({"cwd": source.1});
+        if let Some(base) = &source.2 {
+            input["baseRef"] = base.clone().into();
         }
         self.right_panel._commits_task = Some(cx.spawn(async move |this, cx| {
-            let Ok(reply) = client.request("review.getBranchCommits", input).await else { return };
+            let reply = client.request("review.getBranchCommits", input).await;
+            let reply = reply.map(|reply| parse_commits(&reply)).map_err(|error| error.to_string().into());
             let _ = this.update(cx, |this, cx| {
-                this.right_panel.commits = parse_commits(&reply);
+                this.right_panel.commits = Some((source, reply));
                 cx.notify();
             });
         }));
+    }
+
+    /// The checkout and base the open thread's Commits menu lists: its environment, git cwd and
+    /// picked base ref.
+    fn branch_commits_source(&self) -> Option<CommitsSource> {
+        let Some(Target::Thread { env, .. }) = &self.target else { return None };
+        Some((env.clone(), self.git_cwd()?, self.diff_base_ref().map(str::to_owned)))
     }
 
     /// The revision of a tool call's item in the thread or side chat on screen
@@ -2566,7 +2593,9 @@ impl Workspace {
             }
             scope => scope.clone(),
         };
-        let commits = self.right_panel.commits.clone();
+        let commits_source = self.branch_commits_source();
+        let commits = commits_for(&self.right_panel.commits, commits_source.as_ref()).cloned();
+        let listed = commits.as_ref().and_then(|reply| reply.as_ref().ok()).map_or(&[][..], |list| &list.commits[..]);
         let scope_label: SharedString = match &scope {
             DiffScope::Branch => "Changes".into(),
             DiffScope::Unstaged => "Uncommitted".into(),
@@ -2574,7 +2603,7 @@ impl Workspace {
             DiffScope::Turn(run) => {
                 format!("Turn {}", turns.iter().find(|t| &t.run_id == run).map_or(0, |t| t.turn_count)).into()
             }
-            DiffScope::Commit(sha) => commits
+            DiffScope::Commit(sha) => listed
                 .iter()
                 .find(|c| &c.sha == sha)
                 .map_or_else(|| format!("Commit {}", &sha[..sha.len().min(7)]), |c| c.subject.clone())
@@ -2660,14 +2689,21 @@ impl Workspace {
                 });
                 let (commits, scope, commit_view) = (commits.clone(), menu_scope.clone(), view.clone());
                 let identity = menu_identity.clone();
+                let source = commits_source.clone();
                 menu.submenu("Commits", window, cx, move |mut menu, window, cx| {
-                    if commits.is_empty() {
-                        return menu.item(PopupMenuItem::new("No commits on this branch.").disabled(true));
-                    }
+                    let list = match &commits {
+                        None => return menu.item(PopupMenuItem::new("Loading commits...").disabled(true)),
+                        Some(Err(error)) => return menu.item(PopupMenuItem::new(error.clone()).disabled(true)),
+                        Some(Ok(list)) if list.commits.is_empty() => {
+                            return menu.item(PopupMenuItem::new("No commits on this branch.").disabled(true));
+                        }
+                        Some(Ok(list)) => list,
+                    };
                     let now = crate::timestamp::now_ms();
                     let popup = cx.entity().downgrade();
-                    for commit in &commits {
+                    for commit in &list.commits {
                         let value = DiffScope::Commit(commit.sha.clone());
+                        let source = source.clone();
                         let checked = scope == value;
                         let url = identity.as_ref().and_then(|identity| commit_link::commit_url(identity, &commit.sha));
                         let time: SharedString = commit
@@ -2688,9 +2724,16 @@ impl Workspace {
                         menu =
                             menu.item(PopupMenuItem::element(move |_, cx| row.render(cx)).checked(checked).on_click(
                                 window.listener_for(&commit_view, move |this, _, _, cx| {
-                                    this.set_diff_scope(value.clone(), cx);
+                                    // The list belongs to one checkout; a commit never lands on another.
+                                    if this.branch_commits_source() == source {
+                                        this.set_diff_scope(value.clone(), cx);
+                                    }
                                 }),
                             ));
+                    }
+                    if list.truncated {
+                        let label = format!("Showing latest {} commits", list.commits.len());
+                        menu = menu.item(PopupMenuItem::new(label).disabled(true));
                     }
                     menu.max_h(px(320.)).max_w(px(384.)).scrollable(true)
                 })
@@ -3328,8 +3371,8 @@ struct ParsedDiff {
 }
 
 /// `review.getBranchCommits`' commits, newest first as the server lists them.
-fn parse_commits(reply: &Value) -> Vec<Commit> {
-    reply["commits"]
+fn parse_commits(reply: &Value) -> CommitList {
+    let commits = reply["commits"]
         .as_array()
         .into_iter()
         .flatten()
@@ -3340,7 +3383,8 @@ fn parse_commits(reply: &Value) -> Vec<Commit> {
                 committed_at: c["committedAt"].as_str().map(str::to_owned),
             })
         })
-        .collect()
+        .collect();
+    CommitList { commits, truncated: reply["truncated"].as_bool().unwrap_or(false) }
 }
 
 fn parse_diff(value: &Value, source_kind: Option<&str>) -> Option<ParsedDiff> {
@@ -3611,6 +3655,24 @@ fn launcher_step(keystroke: &gpui_kit::Keystroke, highlight: Option<usize>, len:
 mod tests {
     use super::*;
     use crate::model::ThreadState;
+
+    #[test]
+    fn commits_show_only_for_the_checkout_and_base_they_came_from() {
+        let source = |env: &str, cwd: &str, base: Option<&str>| -> CommitsSource {
+            (env.to_owned().into(), cwd.to_owned(), base.map(str::to_owned))
+        };
+        let list = CommitList { commits: vec![], truncated: false };
+        let loaded = Some((source("a", "/repo", None), Ok(list)));
+        assert!(commits_for(&loaded, Some(&source("a", "/repo", None))).is_some());
+        for other in [
+            Some(source("b", "/repo", None)),
+            Some(source("a", "/other", None)),
+            Some(source("a", "/repo", Some("main"))),
+            None,
+        ] {
+            assert!(commits_for(&loaded, other.as_ref()).is_none());
+        }
+    }
 
     #[test]
     fn showing_the_diff_reads_it_again_only_after_the_floor() {
