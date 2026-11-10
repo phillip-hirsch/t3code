@@ -72,6 +72,11 @@ impl QueueUi {
     pub(super) fn take_edit_draft(&mut self) -> Option<(String, Vec<Attachment>, ContextRecords)> {
         self.edit.take().map(|edit| edit.saved)
     }
+
+    /// The draft an open edit set aside, which a failed send rejoins.
+    pub(super) fn edit_draft_mut(&mut self) -> Option<&mut (String, Vec<Attachment>, ContextRecords)> {
+        self.edit.as_mut().map(|edit| &mut edit.saved)
+    }
 }
 
 impl Workspace {

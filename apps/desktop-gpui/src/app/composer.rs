@@ -468,26 +468,17 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.drafts_changed(cx);
-        if self.target.as_ref() == Some(origin) {
-            match &mut self.question {
-                Some(question) => question.prompt = merge_prompt(text, &question.prompt),
-                None => {
-                    let merged = merge_prompt(text, &self.composer.read(cx).value());
-                    self.set_composer_text(merged, window, cx);
-                }
-            }
+        if self.composer_holds_prompt(origin) {
+            let merged = merge_prompt(text, &self.composer.read(cx).value());
+            self.set_composer_text(merged, window, cx);
             return;
         }
-        let slot = match self.composer_drafts.get_mut(origin) {
-            Some(ComposerDraft::Prompt(prompt, ..)) => prompt,
-            Some(ComposerDraft::Question(question)) => &mut question.prompt,
-            None => {
-                let draft = ComposerDraft::Prompt(text, Vec::new(), ContextRecords::default());
-                self.composer_drafts.insert(origin.clone(), draft);
-                return;
-            }
-        };
-        *slot = merge_prompt(text, slot);
+        if self.target.as_ref() != Some(origin) {
+            self.composer_drafts.entry(origin.clone()).or_insert_with(ComposerDraft::empty);
+        }
+        if let Some((prompt, ..)) = self.set_aside_prompt(origin) {
+            *prompt = merge_prompt(text, prompt);
+        }
     }
 
     /// A failed send's attachments, back with `origin`'s prompt wherever it waits: the composer,
@@ -501,18 +492,16 @@ impl Workspace {
         if attachments.is_empty() {
             return;
         }
-        let list = if self.target.as_ref() == Some(origin) {
-            match &mut self.question {
-                Some(question) => &mut question.prompt_attachments,
-                None => &mut self.attachments,
-            }
+        if self.composer_holds_prompt(origin) {
+            self.attachments.extend(attachments);
         } else {
-            match self.composer_drafts.entry(origin.clone()).or_insert_with(ComposerDraft::empty) {
-                ComposerDraft::Prompt(_, kept, _) => kept,
-                ComposerDraft::Question(question) => &mut question.prompt_attachments,
+            if self.target.as_ref() != Some(origin) {
+                self.composer_drafts.entry(origin.clone()).or_insert_with(ComposerDraft::empty);
             }
-        };
-        list.extend(attachments);
+            if let Some((_, kept, _)) = self.set_aside_prompt(origin) {
+                kept.extend(attachments);
+            }
+        }
         self.drafts_changed(cx);
     }
 

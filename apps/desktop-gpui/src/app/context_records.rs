@@ -131,10 +131,13 @@ impl Workspace {
     }
 
     /// The records of `target`'s prompt: the composer's on screen, else the set-aside prompt's
-    /// (a draft not on screen, or the prompt a question card holds).
+    /// (a draft not on screen, or the prompt a question card or queued message's edit holds).
     pub(super) fn draft_records(&self, target: &Target) -> Option<&ContextRecords> {
         if self.target.as_ref() == Some(target) {
-            return Some(self.question.as_ref().map_or(&self.context.records, |question| &question.prompt_records));
+            if let Some(question) = &self.question {
+                return Some(&question.prompt_records);
+            }
+            return Some(self.queue_edit_draft().map_or(&self.context.records, |(_, _, records)| records));
         }
         match self.composer_drafts.get(target)? {
             ComposerDraft::Prompt(_, _, records) => Some(records),
@@ -142,24 +145,39 @@ impl Workspace {
         }
     }
 
-    /// `target`'s prompt and records when the editor doesn't hold them: a draft not on screen,
-    /// or the prompt a question card set aside.
-    fn set_aside_prompt(&mut self, target: &Target) -> Option<(&mut String, &mut ContextRecords)> {
+    /// Whether the editor holds `target`'s own prompt: it is on screen, and neither a question
+    /// card nor a queued message's edit has the editor.
+    pub(super) fn composer_holds_prompt(&self, target: &Target) -> bool {
+        self.target.as_ref() == Some(target) && self.question.is_none() && !self.editing_queued()
+    }
+
+    /// `target`'s prompt, attachments and records when the editor doesn't hold them: a draft not
+    /// on screen, or the prompt a question card or queued message's edit set aside.
+    pub(super) fn set_aside_prompt(
+        &mut self,
+        target: &Target,
+    ) -> Option<(&mut String, &mut Vec<Attachment>, &mut ContextRecords)> {
         if self.target.as_ref() == Some(target) {
-            return self.question.as_mut().map(|question| (&mut question.prompt, &mut question.prompt_records));
+            if let Some(question) = &mut self.question {
+                return Some((&mut question.prompt, &mut question.prompt_attachments, &mut question.prompt_records));
+            }
+            let (prompt, attachments, records) = self.queue.edit_draft_mut()?;
+            return Some((prompt, attachments, records));
         }
         match self.composer_drafts.get_mut(target)? {
-            ComposerDraft::Prompt(prompt, _, records) => Some((prompt, records)),
-            ComposerDraft::Question(question) => Some((&mut question.prompt, &mut question.prompt_records)),
+            ComposerDraft::Prompt(prompt, attachments, records) => Some((prompt, attachments, records)),
+            ComposerDraft::Question(question) => {
+                Some((&mut question.prompt, &mut question.prompt_attachments, &mut question.prompt_records))
+            }
         }
     }
 
     /// Replaces a record `target`'s draft holds (a comment whose lines moved), keeping its chip.
     pub(super) fn replace_context_record(&mut self, target: &Target, record: Value, cx: &mut Context<Self>) {
-        let replaced = if self.target.as_ref() == Some(target) && self.question.is_none() {
+        let replaced = if self.composer_holds_prompt(target) {
             self.context.records.replace(record)
         } else {
-            self.set_aside_prompt(target).is_some_and(|(_, records)| records.replace(record))
+            self.set_aside_prompt(target).is_some_and(|(_, _, records)| records.replace(record))
         };
         if replaced {
             cx.notify();
@@ -177,7 +195,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let chip = Chip::Context { kind: kind.to_owned(), id: id.to_owned(), label: String::new() }.id();
-        if self.target.as_ref() == Some(target) && self.question.is_none() {
+        if self.composer_holds_prompt(target) {
             // Every reference, chip or not (rich text shows a fenced one as code), in one edit.
             let removals = composer_text::context_reference_removals(&self.composer.read(cx).value(), &chip);
             if let Some(first) = removals.last().map(|range| range.start) {
@@ -187,7 +205,7 @@ impl Workspace {
             }
             self.context.records.remove(id);
             self.sync_composer_empty(cx);
-        } else if let Some((prompt, records)) = self.set_aside_prompt(target) {
+        } else if let Some((prompt, _, records)) = self.set_aside_prompt(target) {
             for range in composer_text::context_reference_removals(prompt, &chip) {
                 prompt.replace_range(range, "");
             }
@@ -235,14 +253,14 @@ impl Workspace {
         if records.is_empty() {
             return;
         }
-        if self.target.as_ref() == Some(origin) && self.question.is_none() {
+        if self.composer_holds_prompt(origin) {
             self.context.records.extend(records.iter().cloned());
             return;
         }
         if self.target.as_ref() != Some(origin) {
             self.composer_drafts.entry(origin.clone()).or_insert_with(ComposerDraft::empty);
         }
-        if let Some((_, held)) = self.set_aside_prompt(origin) {
+        if let Some((_, _, held)) = self.set_aside_prompt(origin) {
             held.extend(records.iter().cloned());
         }
     }

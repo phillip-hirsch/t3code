@@ -627,7 +627,8 @@ impl Workspace {
     }
 
     /// A failed send's text back in its side chat, ahead of anything typed there since: in the
-    /// composer, set aside under an open question, or kept until its tab shows again.
+    /// composer, set aside under an open question or queued message's edit, or kept until its tab
+    /// shows again.
     fn give_back_side_chat(&mut self, key: Key, text: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(view) = self.side_chat.view.as_mut().filter(|view| view.is(&key.0, &key.1)) else {
             self.side_chat.give_back(key, text);
@@ -635,6 +636,10 @@ impl Workspace {
         };
         if let Some(question) = &mut view.question {
             question.prompt = merge_prompt(text, &question.prompt);
+            return;
+        }
+        if let Some((prompt, ..)) = view.queue.edit_draft_mut() {
+            *prompt = merge_prompt(text, prompt);
             return;
         }
         let merged = merge_prompt(text, &view.composer.read(cx).value());
