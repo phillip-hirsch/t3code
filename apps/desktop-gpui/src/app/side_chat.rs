@@ -403,17 +403,17 @@ impl Workspace {
         let draft = self.side_chat.drafts.remove(&(env.clone(), thread_id.to_owned())).unwrap_or_default();
         let empty = draft.trim().is_empty();
         let composer = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .auto_grow(1, 8)
-                .submit_on_enter(true)
-                .placeholder(PLACEHOLDER)
-                .default_value(draft)
+            let mut state =
+                TextareaState::new(window, cx).auto_grow(1, 8).submit_on_enter(true).placeholder(PLACEHOLDER);
+            state.set_value(super::citations::citation_content(&draft), window, cx);
+            state
         });
         let events =
             vec![cx.subscribe_in(&composer, window, |this, composer, event: &InputEvent, window, cx| match event {
                 InputEvent::PressEnter { secondary: false, .. } => this.send_side_chat(window, cx),
                 InputEvent::Change => {
                     this.save_custom_answer(ChatPane::Side, cx);
+                    this.drop_orphan_citation_comment(cx);
                     let empty = composer.read(cx).value().trim().is_empty();
                     if let Some(view) = this.side_chat.view.as_mut().filter(|view| view.empty != empty) {
                         view.empty = empty;
@@ -515,7 +515,7 @@ impl Workspace {
         Some(self.side_chat.view.as_ref()?.thread_id.as_str())
     }
 
-    fn send_side_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn send_side_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // An open question takes the send as its answer; an open queued message, as its edit.
         if self.side_chat_question().is_some() {
             self.advance_question(ChatPane::Side, window, cx);
@@ -784,6 +784,15 @@ This permanently clears its conversation history."
                     .flex_1()
                     .min_h_0()
                     .relative()
+                    // As in the open thread, the Cite button follows the text views' selections.
+                    .capture_any_mouse_down(cx.listener(|this, _: &gpui_kit::MouseDownEvent, _, cx| {
+                        this.chat_mouse_down(cx);
+                    }))
+                    .capture_any_mouse_up(cx.listener(|this, event: &gpui_kit::MouseUpEvent, window, cx| {
+                        if event.button == gpui_kit::MouseButton::Left {
+                            this.chat_mouse_up(ChatPane::Side, event.position, window, cx);
+                        }
+                    }))
                     .child(
                         MessageScroller::new("side-chat-timeline", view.scroller.clone(), move |index, window, cx| {
                             match rows.get(index) {
@@ -826,6 +835,7 @@ This permanently clears its conversation history."
             Some(draft) => self.render_side_question_actions(draft, running, stop(cx), cx),
             None => self.render_side_primary_action(view, running, stop(cx), cx),
         };
+        let (t_chip, chip_view) = (*t, cx.weak_entity());
         let composer = h_flex()
             .mx_2()
             .mb_2()
@@ -843,7 +853,15 @@ This permanently clears its conversation history."
                     .xsmall()
                     .flex_1()
                     .font_family(t.fonts.composer)
-                    .text_size(px(t.fonts.prompt_size)),
+                    .text_size(px(t.fonts.prompt_size))
+                    // Cite is the one chip a side chat's plain-text composer takes.
+                    .token(move |token, _, _| super::citations::citation_token(token, &t_chip))
+                    .on_token_click(move |event, window, cx| {
+                        let (id, range, bounds) = (event.token().id().to_string(), event.range(), event.bounds());
+                        let _ = chip_view.update(cx, |this, cx| {
+                            this.citation_chip_clicked(ChatPane::Side, id, range, bounds, event.click(), window, cx);
+                        });
+                    }),
             )
             .child(button);
         v_flex()
@@ -1031,10 +1049,31 @@ impl Workspace {
                 let placeholder = view.question.as_ref().map_or(PLACEHOLDER, super::composer::question_placeholder);
                 view.composer.update(cx, |state, cx| {
                     state.set_placeholder(placeholder, window, cx);
-                    state.set_value(text, window, cx);
+                    state.set_value(super::citations::citation_content(&text), window, cx);
                 });
                 cx.notify();
             }
+        }
+    }
+
+    pub(super) fn pane_composer(&self, pane: ChatPane) -> Option<Entity<TextareaState>> {
+        match pane {
+            ChatPane::Main => Some(self.composer.clone()),
+            ChatPane::Side => Some(self.side_chat.view.as_ref()?.composer.clone()),
+        }
+    }
+
+    pub(super) fn pane_rows(&self, pane: ChatPane) -> Rc<[Row]> {
+        match pane {
+            ChatPane::Main => Rc::clone(&self.rows),
+            ChatPane::Side => self.side_chat.view.as_ref().map(|view| Rc::clone(&view.rows)).unwrap_or_default(),
+        }
+    }
+
+    pub(super) fn pane_scroller(&self, pane: ChatPane) -> Option<Entity<MessageScrollerState>> {
+        match pane {
+            ChatPane::Main => Some(self.scroller.clone()),
+            ChatPane::Side => Some(self.side_chat.view.as_ref()?.scroller.clone()),
         }
     }
 

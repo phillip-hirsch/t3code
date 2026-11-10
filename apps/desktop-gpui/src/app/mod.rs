@@ -1598,7 +1598,7 @@ impl Render for Workspace {
                                                                         .capture_any_mouse_up(cx.listener(
                                                                             |this, event: &gpui_kit::MouseUpEvent, window, cx| {
                                                                                 if event.button == gpui_kit::MouseButton::Left {
-                                                                                    this.chat_mouse_up(event.position, window, cx);
+                                                                                    this.chat_mouse_up(side_chat::ChatPane::Main, event.position, window, cx);
                                                                                 }
                                                                             },
                                                                         ))
