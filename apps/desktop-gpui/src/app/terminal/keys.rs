@@ -155,13 +155,13 @@ impl Keyboard {
     }
 }
 
-/// The keystroke with the Shift the window saw held: GPUI on Windows and Linux reports Shift+/
-/// as `?` with Shift consumed, where the web still sees Shift (Kitty reports it).
+/// The keystroke with the Shift the window saw held: GPUI reports Shift+/ as `?` (Windows,
+/// Linux) and German Shift+ö as `Ö` (Windows, macOS) with Shift consumed, where the web still
+/// sees Shift (Kitty reports it).
 pub(super) fn with_held_shift(keystroke: &Keystroke, shift: bool) -> Keystroke {
     let mut keystroke = keystroke.clone();
-    let caseless =
-        single_char(&keystroke.key).is_some_and(|c| !c.is_control() && !c.is_lowercase() && !c.is_uppercase());
-    if shift && caseless {
+    let printable = single_char(&keystroke.key).is_some_and(|c| !c.is_control());
+    if shift && printable {
         keystroke.modifiers.shift = true;
     }
     keystroke
@@ -610,6 +610,13 @@ mod tests {
         let us_nine = Platform { layout: Some('9'), ..Platform::key(Windows(0x0a)) };
         assert_eq!(sent_as(&mut core, &paren, us_nine).as_deref(), Some("\x1b[57:40;2u"), "US 9");
         assert_eq!(sent_as(&mut core, &paren, Platform::key(Windows(0x0a))).as_deref(), Some("\x1b[57:40;2u"));
+        // German Shift+ö: Windows and macOS report `Ö` with Shift consumed; Kitty still hears Shift,
+        // the key's own `ö` and its uppercase alternate, on the US `;` key.
+        let shifted_o = with_held_shift(&typed("Ö", Some("Ö")), true);
+        for native in [Windows(0x27), Xkb(47), Mac(0x29)] {
+            let platform = Platform { layout: Some('ö'), ..Platform::key(native) };
+            assert_eq!(sent_as(&mut core, &shifted_o, platform).as_deref(), Some("\x1b[246:214:59;2u"), "{native:?}");
+        }
     }
 
     #[test]
