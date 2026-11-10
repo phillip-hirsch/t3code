@@ -846,12 +846,24 @@ impl Workspace {
         apply: impl Fn(&mut Self, &Value) + 'static,
         after_batch: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) -> Task<()> {
+        Self::pump_until(stream, window, cx, apply, after_batch, |_, _, _| {})
+    }
+
+    /// `pump`, also telling `on_end` how the stream ended, after its last batch.
+    fn pump_until(
+        stream: RpcStream,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        apply: impl Fn(&mut Self, &Value) + 'static,
+        after_batch: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        on_end: impl Fn(&mut Self, &Result<(), RpcError>, &mut Context<Self>) + 'static,
+    ) -> Task<()> {
         cx.spawn_in(window, async move |this, cx| {
             while let Some(first) = stream.next().await {
                 let mut events = vec![first];
                 events.extend(std::iter::from_fn(|| stream.try_next()));
                 let ended = this.update_in(cx, |this, window, cx| {
-                    let mut ended = false;
+                    let mut ended = None;
                     let mut applied = false;
                     for event in events {
                         match event {
@@ -860,20 +872,23 @@ impl Workspace {
                                 applied = true;
                             }
                             StreamEvent::End(result) => {
-                                ended = true;
-                                if let Err(error) = result
+                                if let Err(error) = &result
                                     && !matches!(error, RpcError::Disconnected(_))
                                 {
                                     this.error = Some(error.to_string().into());
                                 }
+                                ended = Some(result);
                             }
                         }
                     }
                     if applied {
                         after_batch(this, window, cx);
                     }
+                    if let Some(result) = &ended {
+                        on_end(this, result, cx);
+                    }
                     cx.notify();
-                    ended
+                    ended.is_some()
                 });
                 if ended.unwrap_or(true) {
                     break;
@@ -892,7 +907,8 @@ impl Workspace {
         let stream = client.stream("orchestration.subscribeThread", input);
         let thread_id = thread.id.clone();
         let batch_thread_id = thread_id.clone();
-        thread._subscription = Some(Self::pump(
+        let end_thread_id = thread_id.clone();
+        thread._subscription = Some(Self::pump_until(
             stream,
             window,
             cx,
@@ -933,6 +949,14 @@ impl Workspace {
                 this.sync_queue_edit(side_chat::ChatPane::Main, window, cx);
                 this.sync_resume_compaction(cx);
                 this.observe_proactive_panels(cx);
+            },
+            // A stream that ended short of a snapshot sends none; a drop resubscribes on reconnect.
+            move |this, result, cx| {
+                if this.thread.as_ref().is_some_and(|t| t.id == end_thread_id)
+                    && !matches!(result, Err(RpcError::Disconnected(_)))
+                {
+                    this.settle_pending_citation(true, cx);
+                }
             },
         ));
     }
@@ -1027,7 +1051,10 @@ impl Workspace {
         self.sync_child_approvals(cx);
         self.sync_lineage_titles(cx);
         self.sync_timeline_anchor(cx);
-        let Some((range, count)) = timeline::changed_range(&self.rows, &new_rows) else { return };
+        let Some((range, count)) = timeline::changed_range(&self.rows, &new_rows) else {
+            self.reveal_pending_citation(cx);
+            return;
+        };
         let total = new_rows.len();
         self.rows = Rc::from(new_rows);
         self.sync_details(cx);
