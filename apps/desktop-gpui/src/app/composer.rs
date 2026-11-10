@@ -1164,13 +1164,8 @@ impl Workspace {
                                             .line_height(px(t.fonts.prompt_size * PROMPT_LEADING))
                                             .text_color(t.muted_foreground)
                                             .map(|el| match suggestion {
-                                                Some(text) => {
-                                                    el.child(super::composer_suggestion::suggested_placeholder(
-                                                        text,
-                                                        t.fonts.prompt_size * PROMPT_LEADING,
-                                                        &t,
-                                                    ))
-                                                }
+                                                Some(text) => el
+                                                    .child(super::composer_suggestion::suggested_placeholder(text, &t)),
                                                 None => el.child(placeholder),
                                             }),
                                     )

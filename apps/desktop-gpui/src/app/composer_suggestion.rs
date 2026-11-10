@@ -3,10 +3,7 @@
 
 use std::collections::HashSet;
 
-use gpui_kit::component::h_flex;
-use gpui_kit::{
-    Context, FontWeight, IntoElement, Keystroke, ParentElement as _, SharedString, Styled as _, Task, Window, div, px,
-};
+use gpui_kit::{Context, FontWeight, HighlightStyle, IntoElement, Keystroke, SharedString, StyledText, Task, Window};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -83,33 +80,19 @@ fn suggestion_key(keystroke: &Keystroke) -> Option<SuggestionKey> {
     }
 }
 
-/// `Kbd variant="outline"`: a physical key, so the hint stays distinct beside the placeholder.
-fn tab_hint(t: &Tokens) -> impl IntoElement {
-    div()
-        .h(px(20.))
-        .min_w(px(20.))
-        .px(px(6.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(4.))
-        .border_1()
-        .border_b_2()
-        .border_color(t.foreground.opacity(0.15))
-        .text_xs()
-        .line_height(px(16.))
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(t.muted_foreground)
-        .child("⇥ Tab")
-}
-
-/// The placeholder with the suggestion's Tab hint after it (`placeholderSuffix`).
-pub(super) fn suggested_placeholder(text: SharedString, line_height: f32, t: &Tokens) -> impl IntoElement {
-    h_flex()
-        .flex_wrap()
-        .items_start()
-        .child(div().mr(px(8.)).child(text))
-        .child(div().h(px(line_height)).flex().items_center().child(tab_hint(t)))
+/// The placeholder with the suggestion's Tab hint as its inline suffix (`placeholderSuffix`), so
+/// the hint follows the last wrapped line. A text run cannot draw `Kbd`'s outline; its weight
+/// and a key-cap tint keep the hint distinct.
+pub(super) fn suggested_placeholder(text: SharedString, t: &Tokens) -> impl IntoElement {
+    const HINT: &str = "\u{a0}⇥\u{a0}Tab\u{a0}";
+    let start = text.len() + 1;
+    let hint = HighlightStyle {
+        color: Some(t.muted_foreground),
+        font_weight: Some(FontWeight::MEDIUM),
+        background_color: Some(t.foreground.opacity(0.07)),
+        ..Default::default()
+    };
+    StyledText::new(format!("{text} {HINT}")).with_highlights([(start..start + HINT.len(), hint)])
 }
 
 impl Workspace {
