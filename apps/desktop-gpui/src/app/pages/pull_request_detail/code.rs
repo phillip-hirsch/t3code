@@ -686,6 +686,7 @@ impl Workspace {
                 }
             }
             let draft = self.pull_requests.panel.as_ref().and_then(|p| p.write.draft.as_ref());
+            let draft = draft.filter(|d| d.excerpt.is_none());
             if let Some(draft) = draft {
                 let (side, line) = draft.anchor();
                 group_at(&mut groups, &draft.path.clone(), side, line).draft = true;

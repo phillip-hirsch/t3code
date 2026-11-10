@@ -75,20 +75,27 @@ pub(in crate::app) struct ReviewDraft {
     next_id: u64,
 }
 
-/// A line comment being written under its line in the Code tab.
+/// A line comment being written under its line in the Code tab or a guide excerpt.
 pub(super) struct LineDraft {
     pub(super) path: String,
     old_path: Option<String>,
     position: Position,
     start: Option<Position>,
+    /// The picked lines as picked, which a handoff to an agent quotes whole.
+    pub(super) picked: (Point, Point),
+    /// The guide excerpt it was opened under; `None` in the Code tab.
+    pub(super) excerpt: Option<String>,
     input: Entity<TextareaState>,
 }
 
 impl LineDraft {
-    pub(super) fn anchor(&self) -> (crate::pull_request_diff::Side, u64) {
+    pub(super) fn anchor(&self) -> Point {
         self.position.anchor()
     }
 }
+
+/// A diff line: its side and number.
+pub(super) type Point = (crate::pull_request_diff::Side, u64);
 
 /// An edit in progress: a comment (`kind` is its endpoint) or the description.
 struct Editing {
@@ -218,6 +225,14 @@ fn summary_shortcut_verdict(
 /// Forgejo needs a summary to request changes (`reviewSummaryRequired`).
 fn summary_required(provider: &str) -> bool {
     provider == "forgejo"
+}
+
+/// Where a line draft opens: path, old path, anchor, range start, picked lines and excerpt.
+type DraftPlace = (String, Option<String>, Position, Option<Position>, (Point, Point), Option<String>);
+
+/// `canCommentOnLines`: the host takes line comments and this viewer may write them.
+pub(super) fn pr_can_comment(detail: &Detail) -> bool {
+    detail.capabilities.review.inline_comment && detail.viewer_permissions.comment
 }
 
 fn text_of(input: &Entity<TextareaState>, cx: &App) -> String {
@@ -807,38 +822,91 @@ impl Workspace {
         cx.notify();
     }
 
-    // Line comments in the Code tab.
+    // Line comments in the Code tab and the guide's excerpts.
 
-    /// `beginComment`: a line or selection gets a draft under its last line.
+    /// `beginComment` in the Code tab: a line or selection gets a draft under its last line.
     pub(super) fn begin_pr_line_comment(
         &mut self,
         path: String,
-        start: (crate::pull_request_diff::Side, u64),
-        end: (crate::pull_request_diff::Side, u64),
+        start: Point,
+        end: Point,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(panel) = self.pull_requests.panel.as_ref() else { return };
-        let Some(detail) = panel.detail.clone() else { return };
+        let Some(detail) = panel.detail.as_ref() else { return };
         let Some(code) = panel.code.as_ref() else { return };
-        if code.commit_selected() || panel.write.draft.is_some() {
-            return;
-        }
-        if !(detail.capabilities.review.inline_comment && detail.viewer_permissions.comment) {
+        if code.commit_selected() || panel.write.draft.is_some() || !pr_can_comment(detail) {
             return;
         }
         let ranged = detail.capabilities.review.range_comment == Some(true);
         let Some(file) = code.patch(&path) else { return };
         let old_path = file.old_path.clone().filter(|old| *old != path);
-        let Some((position, start)) = crate::pull_request_diff::review_anchor(file, start, end, ranged) else { return };
-        let input = cx.new(|cx| TextareaState::new(window, cx).rows(3).placeholder("Leave a comment"));
+        let Some((position, first)) = crate::pull_request_diff::review_anchor(file, start, end, ranged) else { return };
+        let draft = (path, old_path, position, first, (start, end), None);
+        self.open_pr_line_draft(draft, "Leave a comment", window, cx);
+    }
+
+    /// `ExcerptDiff`'s `beginComment`: lines picked in a guide excerpt get a draft that goes to
+    /// the review, or only to an agent when this viewer may not comment.
+    pub(super) fn begin_pr_excerpt_comment(
+        &mut self,
+        excerpt: String,
+        path: String,
+        picked: (Point, Point),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let can_ask = self.pr_can_ask();
+        let Some(panel) = self.pull_requests.panel.as_ref() else { return };
+        let Some(detail) = panel.detail.as_ref() else { return };
+        let can_comment = pr_can_comment(detail);
+        if panel.write.draft.is_some() || !(can_comment || can_ask) {
+            return;
+        }
+        let ranged = detail.capabilities.review.range_comment == Some(true);
+        let Some(file) = panel.guide_diff.file(&path) else { return };
+        let old_path = file.old_path.clone().filter(|old| *old != path);
+        let Some((position, first)) = crate::pull_request_diff::review_anchor(file, picked.0, picked.1, ranged) else {
+            return;
+        };
+        let placeholder = if can_comment { "Add a comment…" } else { "Ask the agent about these lines…" };
+        self.open_pr_line_draft((path, old_path, position, first, picked, Some(excerpt)), placeholder, window, cx);
+    }
+
+    fn open_pr_line_draft(
+        &mut self,
+        (path, old_path, position, start, picked, excerpt): DraftPlace,
+        placeholder: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = cx.new(|cx| TextareaState::new(window, cx).rows(3).placeholder(placeholder));
         input.update(cx, |input, cx| input.focus(window, cx));
-        let sub = watch(&input, Some(|this, _, cx| this.add_pr_line_comment(cx)), window, cx);
+        let sub = watch(&input, Some(Self::submit_pr_line_draft), window, cx);
         if let Some(write) = self.pr_write() {
-            write.draft = Some(LineDraft { path, old_path, position, start, input });
+            write.draft = Some(LineDraft { path, old_path, position, start, picked, excerpt, input });
             write._watch.extend(sub);
         }
         cx.notify();
+    }
+
+    pub(super) fn cancel_pr_line_draft(&mut self, cx: &mut Context<Self>) {
+        if let Some(write) = self.pr_write() {
+            write.draft = None;
+        }
+        cx.notify();
+    }
+
+    /// The draft's own submit: the review, or an agent where the viewer may only ask.
+    fn submit_pr_line_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.pull_requests.panel.as_ref() else { return };
+        let comments = panel.detail.as_ref().is_some_and(|d| pr_can_comment(d));
+        if comments {
+            self.add_pr_line_comment(cx);
+        } else if panel.write.draft.as_ref().is_some_and(|d| d.excerpt.is_some()) {
+            self.send_pr_draft_to_agent(window, cx);
+        }
     }
 
     fn add_pr_line_comment(&mut self, cx: &mut Context<Self>) {
@@ -864,26 +932,66 @@ impl Workspace {
         cx.notify();
     }
 
-    /// "Add to agent": the drafted lines and request go to a new thread instead of the review.
+    /// "Add to agent" and "Ask agent": the picked lines, quoted from the file's diff, and the
+    /// request go to an agent instead of the review (`finishSelection`, `askAgent`).
     fn send_pr_draft_to_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(draft) = self.pr_write().and_then(|w| w.draft.take()) else { return };
+        let Some(panel) = self.pull_requests.panel.as_ref() else { return };
+        let (Some(detail), Some(draft)) = (panel.detail.as_ref(), panel.write.draft.as_ref()) else { return };
         let request = text_of(&draft.input, cx);
-        let lines = match (draft.start.map(Position::anchor), draft.position.anchor()) {
-            (Some((_, from)), (_, to)) if from != to => format!("L{from}-L{to}"),
-            (_, (side, line)) => {
-                format!("L{line}{}", if side == crate::pull_request_diff::Side::Left { " (before)" } else { "" })
-            }
+        if request.trim().is_empty() {
+            return;
+        }
+        let ((start, end), number, path) = (draft.picked, detail.number, draft.path.as_str());
+        let (producer, section_id, section_title, file) = match &draft.excerpt {
+            None => (
+                format!("pull-request-selection:{path}:{}:{}", start.1, end.1),
+                format!("pull-request:{number}"),
+                format!("PR #{number} review"),
+                panel.code.as_ref().and_then(|code| code.patch(path)),
+            ),
+            Some(_) => (
+                format!("pull-request-guide:{path}:{}:{}", start.1, end.1),
+                format!("pull-request-guide:{path}"),
+                "Review guide".to_owned(),
+                panel.guide_diff.file(path),
+            ),
         };
-        self.add_pr_selection_to_agent(draft.path, lines, request, window, cx);
+        let section = crate::review_comment::Section { id: &section_id, title: &section_title };
+        let context_id = crate::composer_context::kind_scoped_id(crate::review_comment::KIND, &producer);
+        let rows = file.map(crate::pull_request_diff::file_rows).unwrap_or_default();
+        let record = crate::review_comment::diff_comment(&context_id, &section, path, &rows, start, end, &request);
+        let keep_guide = draft.excerpt.is_some();
+        self.cancel_pr_line_draft(cx);
+        if let Some(record) = record {
+            self.add_pr_selection_to_agent(record, &request, keep_guide, window, cx);
+        }
     }
 
-    /// `DiffCommentAnnotation kind="draft"`.
+    /// `DiffCommentAnnotation kind="draft"`: in the Code tab "Add to review" with "Add to agent"
+    /// beside it; in an excerpt "Ask agent" beside it, or alone when the viewer may not comment.
     pub(super) fn render_pr_line_draft(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let draft = self.pull_requests.panel.as_ref()?.write.draft.as_ref()?;
+        let panel = self.pull_requests.panel.as_ref()?;
+        let draft = panel.write.draft.as_ref()?;
+        let can_comment = panel.detail.as_ref().is_some_and(|d| pr_can_comment(d));
         let (_, line) = draft.position.anchor();
         let empty = text_of(&draft.input, cx).trim().is_empty();
+        let in_guide = draft.excerpt.is_some();
+        let agent_label = if in_guide { "Ask agent" } else { "Add to agent" };
+        let agent = (can_comment && (!in_guide || self.pr_can_ask())).then(|| {
+            xs_outline("pr-draft-agent", t)
+                .disabled(empty)
+                .child(agent_label)
+                .on_click(cx.listener(|this, _, window, cx| this.send_pr_draft_to_agent(window, cx)))
+        });
+        let submit = Button::new("pr-draft-add")
+            .primary()
+            .xsmall()
+            .disabled(empty)
+            .child(if can_comment { "Add to review" } else { agent_label })
+            .on_click(cx.listener(|this, _, window, cx| this.submit_pr_line_draft(window, cx)));
         Some(
             v_flex()
+                .id("pr-draft")
                 .mx(px(12.))
                 .my(px(8.))
                 .p(px(12.))
@@ -893,6 +1001,13 @@ impl Workspace {
                 .border_color(Hsla { a: t.border.a * 0.7, ..t.border })
                 .bg(t.background)
                 .shadow_sm()
+                .font_family(theme::FONT_SANS)
+                .capture_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| {
+                    if event.keystroke.key == "escape" {
+                        cx.stop_propagation();
+                        this.cancel_pr_line_draft(cx);
+                    }
+                }))
                 .child(
                     div()
                         .text_xs()
@@ -901,33 +1016,18 @@ impl Workspace {
                         .child(format!("{}:{line}", draft.path)),
                 )
                 .child(Textarea::new(&draft.input))
-                .children(self.render_pr_completions(&draft.input, t, cx))
+                .children(can_comment.then(|| self.render_pr_completions(&draft.input, t, cx)).flatten())
                 .child(
                     h_flex()
                         .justify_end()
                         .gap(px(8.))
-                        .child(ghost_button("pr-draft-cancel", t).child("Cancel").on_click(cx.listener(
-                            |this, _, _, cx| {
-                                if let Some(write) = this.pr_write() {
-                                    write.draft = None;
-                                }
-                                cx.notify();
-                            },
-                        )))
                         .child(
-                            xs_outline("pr-draft-agent", t)
-                                .disabled(empty)
-                                .child("Add to agent")
-                                .on_click(cx.listener(|this, _, window, cx| this.send_pr_draft_to_agent(window, cx))),
+                            ghost_button("pr-draft-cancel", t)
+                                .child("Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| this.cancel_pr_line_draft(cx))),
                         )
-                        .child(
-                            Button::new("pr-draft-add")
-                                .primary()
-                                .xsmall()
-                                .disabled(empty)
-                                .child("Add to review")
-                                .on_click(cx.listener(|this, _, _, cx| this.add_pr_line_comment(cx))),
-                        ),
+                        .children(agent)
+                        .child(submit),
                 )
                 .into_any_element(),
         )

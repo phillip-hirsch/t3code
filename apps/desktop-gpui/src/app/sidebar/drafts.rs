@@ -21,12 +21,13 @@ pub(super) struct Discarded {
     target: Target,
     prompt: String,
     attachments: Vec<crate::app::attachments::Attachment>,
+    records: crate::composer_context::ContextRecords,
 }
 
 /// A draft's prompt and attachment count (`composerDraftHasUserContent`).
 fn content(draft: &ComposerDraft) -> (&str, usize) {
     match draft {
-        ComposerDraft::Prompt(prompt, attachments) => (prompt, attachments.len()),
+        ComposerDraft::Prompt(prompt, attachments, _) => (prompt, attachments.len()),
         ComposerDraft::Question(question) => (&question.prompt, 0),
     }
 }
@@ -134,19 +135,20 @@ impl Workspace {
 
     /// `discardComposerDraft`: clears the draft and offers to undo it.
     pub(super) fn discard_draft(&mut self, target: Target, window: &mut Window, cx: &mut Context<Self>) {
-        let (prompt, attachments) = if self.target.as_ref() == Some(&target) {
+        let (prompt, attachments, records) = if self.target.as_ref() == Some(&target) {
             let prompt = self.composer.read(cx).value().to_string();
             let attachments = std::mem::take(&mut self.attachments);
+            let records = self.take_context_records();
             self.set_composer_text("", window, cx);
             self.sidebar.open_draft_preview = None;
-            (prompt, attachments)
+            (prompt, attachments, records)
         } else {
             match self.composer_drafts.remove(&target) {
-                Some(ComposerDraft::Prompt(prompt, attachments)) => (prompt, attachments),
+                Some(ComposerDraft::Prompt(prompt, attachments, records)) => (prompt, attachments, records),
                 Some(ComposerDraft::Question(mut question)) => {
                     let prompt = std::mem::take(&mut question.prompt);
                     self.composer_drafts.insert(target.clone(), ComposerDraft::Question(question));
-                    (prompt, Vec::new())
+                    (prompt, Vec::new(), Default::default())
                 }
                 None => return,
             }
@@ -154,13 +156,14 @@ impl Workspace {
         if prompt.trim().is_empty() && attachments.is_empty() {
             return;
         }
-        self.set_undo(UndoAction::Discarded, Vec::new(), Some(Discarded { target, prompt, attachments }), cx);
+        let discarded = Discarded { target, prompt, attachments, records };
+        self.set_undo(UndoAction::Discarded, Vec::new(), Some(discarded), cx);
         cx.notify();
     }
 
     /// Puts a discarded draft back, unless its target has new content since.
     pub(super) fn restore_discarded(&mut self, discarded: Discarded, window: &mut Window, cx: &mut Context<Self>) {
-        let Discarded { target, prompt, attachments } = discarded;
+        let Discarded { target, prompt, attachments, records } = discarded;
         let fresh = if self.target.as_ref() == Some(&target) {
             !self.composer.read(cx).value().trim().is_empty() || !self.attachments.is_empty()
         } else {
@@ -173,6 +176,7 @@ impl Workspace {
         }
         if self.target.as_ref() == Some(&target) {
             self.attachments = attachments;
+            self.context.records = records;
             self.set_composer_text(prompt, window, cx);
             if matches!(target, Target::Draft { .. }) {
                 self.freeze_open_draft(cx);
@@ -181,7 +185,7 @@ impl Workspace {
             match self.composer_drafts.get_mut(&target) {
                 Some(ComposerDraft::Question(question)) => question.prompt = prompt,
                 _ => {
-                    self.composer_drafts.insert(target, ComposerDraft::Prompt(prompt, attachments));
+                    self.composer_drafts.insert(target, ComposerDraft::Prompt(prompt, attachments, records));
                 }
             }
         }

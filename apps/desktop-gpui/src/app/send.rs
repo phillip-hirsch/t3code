@@ -343,6 +343,7 @@ impl Workspace {
         let new_draft_after = intent == Intent::AndNewThread && matches!(origin, Target::Thread { .. });
         let project_id = self.target_project().map(|p| p.id.clone());
         let sent_attachments = std::mem::take(&mut self.attachments);
+        let sent_records = self.take_context_records();
         let pending_id = pending_send.as_ref().map(|send| send.message_id.clone());
         self.pending_sends.extend(pending_send);
         self.sending = true;
@@ -425,11 +426,12 @@ impl Workspace {
                         this.pending_sends.retain(|send| Some(&send.message_id) != pending_id.as_ref());
                         this.set_error_for(&origin, error.into());
                         if !text.is_empty() {
+                            this.give_back_context_records(&origin, sent_records);
                             this.give_back_prompt(&origin, text, window, cx);
                         }
                         if this.target.as_ref() == Some(&origin) {
                             this.attachments.extend(sent_attachments);
-                        } else if let Some(ComposerDraft::Prompt(_, kept)) = this.composer_drafts.get_mut(&origin) {
+                        } else if let Some(ComposerDraft::Prompt(_, kept, _)) = this.composer_drafts.get_mut(&origin) {
                             kept.extend(sent_attachments);
                         }
                     }

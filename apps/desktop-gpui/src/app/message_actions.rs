@@ -230,8 +230,8 @@ impl Workspace {
             }
         };
         let uploads: Vec<String> = files.iter().map(|file| file.local_id().to_owned()).collect();
-        match self.composer_drafts.entry(origin).or_insert_with(|| ComposerDraft::Prompt(String::new(), Vec::new())) {
-            ComposerDraft::Prompt(prompt, attachments) => {
+        match self.composer_drafts.entry(origin).or_insert_with(ComposerDraft::empty) {
+            ComposerDraft::Prompt(prompt, attachments, _) => {
                 merge(prompt);
                 attachments.extend(files);
             }
@@ -292,7 +292,7 @@ async fn wait_for_rollback(stream: &RpcStream, command_id: &str, witness: &str) 
 }
 
 /// `prepareRevertedMessageAttachments`: each attachment's bytes, through a signed URL.
-async fn download_attachments(
+pub(super) async fn download_attachments(
     client: &RpcClient,
     http_base: &str,
     files: Vec<Value>,

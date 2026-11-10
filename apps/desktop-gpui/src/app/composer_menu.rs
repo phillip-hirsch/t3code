@@ -1,4 +1,4 @@
-//! The `@` files, `$` skills and `/` commands menu above the composer
+//! The `@` files, `$` skills, `/` commands and `#` pull requests menu above the composer
 //! (`ComposerCommandMenu.tsx`, `ComposerCommandMenuLayer.tsx`,
 //! `useComposerMenuItems.ts`).
 
@@ -19,11 +19,16 @@ use serde_json::json;
 use super::{Target, Workspace};
 use crate::composer_search::{self, MenuAction, MenuItem};
 use crate::composer_text::{self, Chip, Trigger, TriggerKind};
+use crate::pull_request_completions::{self, Reference};
+use crate::pull_requests::ListResult;
+use crate::rpc::RpcClient;
 use crate::theme::Tokens;
 
 /// `useComposerPathSearch` waits this long after the last keystroke.
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
 const SEARCH_LIMIT: u32 = 80;
+/// The `#` menu's `useDebouncedValue` delay for a host search or a number.
+const PULL_REQUEST_DEBOUNCE: Duration = Duration::from_millis(180);
 /// `--chat-composer-drawer-inset` and the 17px the composer covers.
 const DRAWER_INSET: f32 = 22.;
 const OVERLAP: f32 = 17.;
@@ -37,9 +42,71 @@ pub(super) struct MenuState {
     highlighted: usize,
     scroll: ScrollHandle,
     loading: bool,
+    /// What the empty `#` menu says once nothing is loading.
+    empty: SharedString,
+    /// The last `#` listings and number lookups, by environment and project.
+    pull_requests: PullRequestReads,
+    /// The listing and query the running `#` read serves.
+    pull_request_search: Option<(ListKey, String)>,
+    /// The `#` query whose debounce ran out (`useDebouncedValue`).
+    settled_query: Option<String>,
     _search: Option<Task<()>>,
     /// Provider/checkout pairs already asked for a workspace skills snapshot.
     snapshots_requested: HashSet<(Option<SharedString>, String, String)>,
+}
+
+/// `usePullRequestList` and `pullRequestEnvironment.detail` for the `#` menu, held while the
+/// draft is open so typing narrows without asking again. Keys carry the environment and
+/// project, since ids repeat across environments.
+#[derive(Default)]
+struct PullRequestReads {
+    /// A listing per host search (`None` for the plain one); `Err` when it could not be read.
+    lists: Vec<(ListKey, Result<Rc<ListResult>, ()>)>,
+    /// A number's own lookup, `None` when the host has no such pull request.
+    exact: Vec<((ListKey, u64), Option<Reference>)>,
+}
+
+/// The environment, project and host search a listing answers.
+type ListKey = (SharedString, String, Option<String>);
+
+/// What one `#` read brought back.
+enum Read {
+    List(Result<Rc<ListResult>, ()>),
+    Exact(u64, Option<Box<Reference>>),
+}
+
+/// Keeps `value` under `key`, dropping the oldest past a few dozen.
+fn remember<K: PartialEq, V>(held: &mut Vec<(K, V)>, key: K, value: V) {
+    held.retain(|(k, _)| *k != key);
+    if held.len() >= 32 {
+        held.remove(0);
+    }
+    held.push((key, value));
+}
+
+/// One `#` row: `#123` and the title, after the repository when it is another one.
+fn pull_request_item(reference: Reference, repository: &str) -> MenuItem {
+    let own = reference.repository.trim().eq_ignore_ascii_case(repository.trim());
+    MenuItem {
+        id: format!("pull-request:{}:{}:{}", reference.project_id, reference.repository, reference.number),
+        label: format!("#{}", reference.number),
+        description: if own {
+            reference.title.clone()
+        } else {
+            format!("{} · {}", reference.repository, reference.title)
+        },
+        action: MenuAction::PullRequest(Box::new(reference)),
+    }
+}
+
+/// `pullRequestTextQuery` and the number `#123` names (`pullRequestTriggerNumber`).
+fn pull_request_query(query: &str) -> (Option<&str>, Option<u64>) {
+    if query.chars().all(|c| c.is_ascii_digit()) {
+        // `Number.isSafeInteger(n) && n > 0`.
+        (None, query.parse().ok().filter(|n| (1..=(1 << 53) - 1).contains(n)))
+    } else {
+        (Some(query), None)
+    }
 }
 
 impl Workspace {
@@ -102,6 +169,10 @@ impl Workspace {
         if trigger.kind == TriggerKind::Path {
             let machines = self.machine_items(&trigger.query);
             self.search_files(trigger.query.trim().to_owned(), cwd, machines, cx);
+            return;
+        }
+        if trigger.kind == TriggerKind::PullRequest {
+            self.search_pull_requests(&trigger.query, cx);
             return;
         }
         self.menu._search = None;
@@ -209,6 +280,128 @@ impl Workspace {
         }));
     }
 
+    /// The environment, project, repository and connection the `#` menu reads pull requests
+    /// from (`pullRequestProjectId`, `pullRequestRepository`); `None` when it can't.
+    fn pull_request_scope(&self) -> Option<(SharedString, String, String, RpcClient)> {
+        let project = self.target_project()?;
+        let repository =
+            project.repository_identity.as_ref().and_then(pull_request_completions::repository_selector)?;
+        Some((self.active_environment()?.clone(), project.id.clone(), repository, self.client()?))
+    }
+
+    /// The `#` menu (`useComposerMenuItems`): what is known shows at once; the listing, then a
+    /// number's own lookup when the listing lacks it, follow 180ms after the last keystroke.
+    fn search_pull_requests(&mut self, query: &str, cx: &mut Context<Self>) {
+        let Some((environment, project_id, repository, client)) = self.pull_request_scope() else {
+            self.menu._search = None;
+            self.menu.pull_request_search = None;
+            self.menu.loading = false;
+            self.menu.items = Rc::default();
+            self.menu.empty = "Pull requests are not available for this project.".into();
+            return;
+        };
+        let (text, number) = pull_request_query(query);
+        let key: ListKey = (environment, project_id.clone(), text.map(str::to_owned));
+        let reads = &self.menu.pull_requests;
+        let list = reads.lists.iter().find(|(held, _)| *held == key).map(|(_, list)| list.clone());
+        let exact = number.and_then(|n| reads.exact.iter().find(|(held, _)| held.0 == key && held.1 == n));
+        let exact = exact.map(|(_, found)| found.clone());
+        let listed = list.as_ref().and_then(|list| list.as_ref().ok()).map(Rc::as_ref);
+        let in_listing = |n: u64| {
+            listed.is_some_and(|list| {
+                list.entries.iter().any(|e| {
+                    e.number == n
+                        && e.project_id == project_id
+                        && e.repository.trim().eq_ignore_ascii_case(repository.trim())
+                })
+            })
+        };
+        let linked = match &self.target {
+            Some(Target::Thread { id, .. }) => {
+                self.shell.threads.iter().find(|thread| &thread.id == id).map_or_else(Vec::new, |thread| {
+                    pull_request_completions::linked_references(&thread.pull_requests, &project_id)
+                })
+            }
+            _ => Vec::new(),
+        };
+        let found = pull_request_completions::chat_matches(
+            query,
+            listed,
+            exact.as_ref().and_then(Option::as_ref),
+            &linked,
+            &project_id,
+            &repository,
+        );
+        self.menu.items = found.into_iter().map(|reference| pull_request_item(reference, &repository)).collect();
+        self.menu.highlighted = self.menu.highlighted.min(self.menu.items.len().saturating_sub(1));
+        let unreadable = list.as_ref().is_some_and(|list| {
+            list.as_ref().map_or(true, |list| list.errors.iter().any(|error| error.project_id == project_id))
+        });
+        self.menu.empty = if unreadable {
+            "Pull requests could not be read for this project.".into()
+        } else if query.is_empty() {
+            "No pull requests found in this repository.".into()
+        } else {
+            format!("No pull request matches {query}.").into()
+        };
+        let lookup = number.filter(|n| list.is_some() && exact.is_none() && !in_listing(*n));
+        self.menu.loading = list.is_none() || lookup.is_some();
+        if !self.menu.loading {
+            self.menu._search = None;
+            self.menu.pull_request_search = None;
+            return;
+        }
+        // The read for this query is already on its way.
+        let search = (key.clone(), query.to_owned());
+        if self.menu._search.is_some() && self.menu.pull_request_search.as_ref() == Some(&search) {
+            return;
+        }
+        self.menu.pull_request_search = Some(search);
+        let debounce = (text.is_some() || number.is_some()) && self.menu.settled_query.as_deref() != Some(query);
+        let (settled, list_key) = (query.to_owned(), key.clone());
+        self.menu._search = Some(cx.spawn(async move |this, cx| {
+            if debounce {
+                cx.background_executor().timer(PULL_REQUEST_DEBOUNCE).await;
+                let settled = settled.clone();
+                let _ = this.update(cx, |this, _| this.menu.settled_query = Some(settled));
+            }
+            let read = match lookup {
+                Some(number) => {
+                    let input = json!({"projectId": list_key.1, "repository": repository, "number": number});
+                    let found = client.request("pullRequests.detail", input).await;
+                    let found = found.inspect_err(|error| log::warn!("pull request lookup failed: {error}")).ok();
+                    Read::Exact(number, found.as_ref().and_then(Reference::of_detail).map(Box::new))
+                }
+                None => {
+                    let limit = crate::pull_requests::PAGE_SIZE;
+                    let mut input = json!({"state": "all", "projectId": list_key.1, "limit": limit});
+                    if let Some(text) = &list_key.2 {
+                        input["query"] = text.as_str().into();
+                    }
+                    let listed = client.request("pullRequests.list", input).await;
+                    let listed = listed.map_err(|error| log::warn!("pull request listing failed: {error}"));
+                    Read::List(listed.and_then(|value| serde_json::from_value(value).map_err(|_| ())).map(Rc::new))
+                }
+            };
+            let _ = this.update(cx, |this, cx| {
+                let reads = &mut this.menu.pull_requests;
+                match read {
+                    Read::List(list) => remember(&mut reads.lists, list_key, list),
+                    Read::Exact(number, found) => {
+                        remember(&mut reads.exact, (list_key, number), found.map(|found| *found));
+                    }
+                }
+                this.menu.pull_request_search = None;
+                // Lands only in the menu still asking: same draft, same `#` query.
+                if this.menu.trigger.as_ref().is_some_and(|t| t.kind == TriggerKind::PullRequest && t.query == settled)
+                {
+                    this.refresh_menu_items(cx);
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
     /// Hides the menu for the trigger now under the caret, as Escape does.
     pub(super) fn hide_menu(&mut self, cx: &mut Context<Self>) {
         if let Some(trigger) = self.menu.trigger.take() {
@@ -262,6 +455,14 @@ impl Workspace {
                 let link = composer_text::context_link("environment", &id, &item.label);
                 (link, Some(Chip::Context { kind: "environment".into(), id, label: item.label.clone() }))
             }
+            // `buildPullRequestReferenceContext`: the chip's record joins the draft with it.
+            MenuAction::PullRequest(reference) => {
+                let record = reference.context_record();
+                let (kind, id) = ("review-comment", record["contextId"].as_str().unwrap_or_default().to_owned());
+                let link = composer_text::context_link(kind, &id, &item.label);
+                self.context.records.insert(record);
+                (link, Some(Chip::Context { kind: kind.into(), id, label: item.label.clone() }))
+            }
         };
         self.menu.trigger = None;
         self.composer.update(cx, |state, cx| {
@@ -299,12 +500,14 @@ impl Workspace {
         let outline = if t.dark { gpui_kit::hsla(0., 0., 1., 0.05) } else { gpui_kit::hsla(0., 0., 0., 0.08) };
         let surface = t.background.blend(t.card.opacity(t.glass));
         let body: AnyElement = if items.is_empty() {
-            let text = match (self.menu.loading, trigger.kind) {
-                (true, TriggerKind::Path) => "Searching workspace files...",
-                (true, _) => "Searching workspace skills...",
-                (false, TriggerKind::Path) => "No matching files or folders.",
-                (false, TriggerKind::Skill) => "No skills found. Try / to browse provider commands.",
-                (false, TriggerKind::SlashCommand) => "No matching command.",
+            let text: SharedString = match (self.menu.loading, trigger.kind) {
+                (true, TriggerKind::Path) => "Searching workspace files...".into(),
+                (true, TriggerKind::PullRequest) => "Finding pull request...".into(),
+                (true, _) => "Searching workspace skills...".into(),
+                (false, TriggerKind::Path) => "No matching files or folders.".into(),
+                (false, TriggerKind::Skill) => "No skills found. Try / to browse provider commands.".into(),
+                (false, TriggerKind::SlashCommand) => "No matching command.".into(),
+                (false, TriggerKind::PullRequest) => self.menu.empty.clone(),
             };
             div()
                 .px(px(20.))
@@ -384,6 +587,11 @@ fn menu_row(item: &MenuItem, kind: TriggerKind, active: bool, t: &Tokens) -> gpu
         MenuAction::File { directory: true, .. } => Some(Icon::new(Lucide::Folder).text_color(t.muted_foreground)),
         MenuAction::Environment { machine, .. } => {
             Some(Icon::new(super::host_picker::machine_icon(machine)).text_color(t.muted_foreground))
+        }
+        MenuAction::PullRequest(reference) => {
+            let (glyph, _, light, dark, alpha) =
+                super::composer::pull_request_state(&reference.state, reference.is_draft);
+            Some(Icon::new(glyph).text_color(super::composer::pull_request_tone(light, dark, alpha, t)))
         }
         // `PierreEntryIcon`: the file tree's per-type glyph.
         MenuAction::File { path, .. } => {

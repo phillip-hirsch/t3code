@@ -42,6 +42,8 @@ pub enum MenuAction {
         environment_id: String,
         machine: String,
     },
+    /// `#` a pull request: a review-comment reference to it.
+    PullRequest(Box<crate::pull_request_completions::Reference>),
 }
 
 /// The skills and commands a provider offers from `cwd`, falling back to its global lists.
@@ -309,6 +311,7 @@ pub fn slash_items(
             MenuAction::Skill { name, .. } => format!("2\0{name}"),
             MenuAction::File { path, .. } => path.clone(),
             MenuAction::Environment { environment_id, .. } => environment_id.clone(),
+            MenuAction::PullRequest(reference) => reference.url.clone(),
         },
     )
 }

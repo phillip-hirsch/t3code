@@ -2,7 +2,7 @@
 //! approval rows above it (`TimelinePendingApprovalRow.tsx`) and the question
 //! banner attached to it (`ComposerPendingUserInputPanel.tsx`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -27,6 +27,7 @@ use super::composer_fit::{ControlsWidths, ModeFit, resolve_mode_fit};
 use super::context_strip::PermissionsForm;
 use super::send::Intent;
 use super::{Target, Workspace, new_id};
+use crate::composer_context::ContextRecords;
 use crate::composer_text::{self, Chip};
 use crate::model::{ModelSelection, RuntimeRequest, TurnItem};
 use crate::new_thread::UsageFallback;
@@ -109,9 +110,16 @@ fn merge_prompt(failed: String, newer: &str) -> String {
 /// What a target keeps of the composer while another one is on screen, like
 /// the web's `composerDraftStore` (in memory only).
 pub(super) enum ComposerDraft {
-    Prompt(String, Vec<Attachment>),
+    /// The prompt, its attachments and the context records its chips name.
+    Prompt(String, Vec<Attachment>, ContextRecords),
     /// An open question card; its prompt is the one it set aside.
     Question(QuestionDraft),
+}
+
+impl ComposerDraft {
+    pub(super) fn empty() -> Self {
+        ComposerDraft::Prompt(String::new(), Vec::new(), ContextRecords::default())
+    }
 }
 
 /// A target's model and permissions picks while another one is on screen.
@@ -145,6 +153,7 @@ impl Workspace {
         let chips: Vec<String> = state.tokens().iter().map(|s| s.token().id().to_string()).collect();
         let previous = std::mem::replace(&mut self.chip_ids, chips);
         self.sync_attachment_chips(&previous, cx);
+        self.sync_context_chips(cx);
         self.sync_trigger(cx);
         self.sync_composer_marks(cx);
     }
@@ -218,6 +227,7 @@ impl Workspace {
         self.chip_ids = content.tokens().iter().map(|s| s.token().id().to_string()).collect();
         // `set_value` clears the undo history that could bring a deleted chip back.
         self.release_retained_attachments(cx);
+        self.reset_context_chips(&text);
         self.composer.update(cx, |composer, cx| composer.set_value(content, window, cx));
         self.sync_composer_empty(cx);
         self.sync_trigger(cx);
@@ -278,17 +288,19 @@ impl Workspace {
             self.composer_selections.remove(&target);
         }
         let attachments = std::mem::take(&mut self.attachments);
+        let records = self.take_context_records();
         let draft = match (self.question.take(), self.take_queue_edit_draft()) {
             (Some(question), _) => ComposerDraft::Question(question),
             // A queued message's edit ends here; the thread keeps its own draft.
-            (None, Some((prompt, attachments))) => ComposerDraft::Prompt(prompt, attachments),
-            (None, None) => ComposerDraft::Prompt(self.composer.read(cx).value().to_string(), attachments),
+            (None, Some((prompt, attachments, records))) => ComposerDraft::Prompt(prompt, attachments, records),
+            (None, None) => ComposerDraft::Prompt(self.composer.read(cx).value().to_string(), attachments, records),
         };
         self.prompt_history = None;
         self.menu = Default::default();
         self.prompt_stash.open = false;
         self.picker.dismiss();
-        if matches!(&draft, ComposerDraft::Prompt(prompt, attachments) if prompt.is_empty() && attachments.is_empty()) {
+        if matches!(&draft, ComposerDraft::Prompt(prompt, attachments, _) if prompt.is_empty() && attachments.is_empty())
+        {
             self.composer_drafts.remove(&target);
         } else {
             self.composer_drafts.insert(target, draft);
@@ -315,10 +327,11 @@ impl Workspace {
             return;
         }
         let slot = match self.composer_drafts.get_mut(origin) {
-            Some(ComposerDraft::Prompt(prompt, _)) => prompt,
+            Some(ComposerDraft::Prompt(prompt, ..)) => prompt,
             Some(ComposerDraft::Question(question)) => &mut question.prompt,
             None => {
-                self.composer_drafts.insert(origin.clone(), ComposerDraft::Prompt(text, Vec::new()));
+                let draft = ComposerDraft::Prompt(text, Vec::new(), ContextRecords::default());
+                self.composer_drafts.insert(origin.clone(), draft);
                 return;
             }
         };
@@ -337,13 +350,15 @@ impl Workspace {
                 self.question = Some(question);
                 self.load_custom_answer(window, cx);
             }
-            Some(ComposerDraft::Prompt(prompt, attachments)) => {
+            Some(ComposerDraft::Prompt(prompt, attachments, records)) => {
                 self.question = None;
                 self.attachments = attachments;
+                self.context.records = records;
                 self.set_composer_text(prompt, window, cx);
             }
             None => {
                 self.question = None;
+                self.context.records = ContextRecords::default();
                 self.set_composer_text("", window, cx);
             }
         }
@@ -870,13 +885,15 @@ impl Workspace {
         let view = cx.weak_entity();
         let chip_view = view.clone();
         let hover_view = view.clone();
-        let pull_requests = Rc::new(pull_request_contexts(self.queue_edit_records()));
+        let pull_requests = Rc::new(pull_request_contexts(self.context.records.iter()));
         let chip_tooltip = self.render_chip_tooltip(&pull_requests, &t);
         let machines: Rc<[(String, Lucide)]> = (self.sessions().iter())
             .filter_map(|s| {
                 Some((s.id.as_ref()?.to_string(), super::host_picker::machine_icon(s.server_info.machine_kind())))
             })
             .collect();
+        let held: Rc<HashSet<String>> =
+            Rc::new(self.context.records.iter().filter_map(|r| r["contextId"].as_str().map(str::to_owned)).collect());
         let editor = Textarea::new(&self.composer)
             .appearance(false)
             .xsmall()
@@ -885,7 +902,10 @@ impl Workspace {
             .line_height(px(t.fonts.prompt_size * PROMPT_LEADING))
             .mx(px(-4.))
             .disabled(self.target.is_none())
-            .token(move |token, _, _| render_chip(token, &pull_requests, &machines, &t))
+            .token(move |token, _, _| {
+                let records = ChipRecords { pull_requests: &pull_requests, held: &held, machines: &machines };
+                render_chip(token, &records, &t)
+            })
             // A pull request chip shows its details while hovered (`PullRequestContextDetails`).
             .on_token_hover(move |event, _, cx| {
                 let hovered = event.is_hovered().then(|| (event.token().id().to_string(), event.bounds()));
@@ -1901,32 +1921,44 @@ fn mark_style(style: u8, t: &Tokens) -> HighlightStyle {
     }
 }
 
-fn render_chip(
-    token: &InlineTokenContext,
-    pull_requests: &HashMap<String, PullRequestContext>,
-    machines: &[(String, Lucide)],
-    t: &Tokens,
-) -> AnyElement {
+/// What a chip shows of the record behind it.
+struct ChipRecords<'a> {
+    pull_requests: &'a HashMap<String, PullRequestContext>,
+    /// The context ids the draft holds records for.
+    held: &'a HashSet<String>,
+    machines: &'a [(String, Lucide)],
+}
+
+fn render_chip(token: &InlineTokenContext, records: &ChipRecords, t: &Tokens) -> AnyElement {
     let id = token.token().id();
     let chip = Chip::from_id(id);
+    // A record-backed chip whose record is gone sends nothing (`UnresolvedContextChip`);
+    // attachments and machines carry their own.
+    let unresolved = matches!(&chip, Some(Chip::Context { kind, id, .. })
+        if !matches!(kind.as_str(), "image" | "file" | "environment") && !records.held.contains(id));
     // `WorkspaceEntryTooltip`: a mention names its workspace path.
-    let path = match &chip {
+    let tooltip = match &chip {
+        _ if unresolved => Some(SharedString::from(UNRESOLVED_CONTEXT)),
         Some(Chip::File { path }) => Some(SharedString::from(path.clone())),
         _ => None,
     };
     let (accent, icon) = match chip {
+        _ if unresolved => (t.foreground.into(), Lucide::CircleDashed),
         Some(Chip::Skill { .. }) => (rgb(0xb261be), Lucide::Box),
         Some(Chip::Context { kind, id, .. })
-            if let Some(pr) = pull_requests.get(&id).filter(|_| kind == REVIEW_COMMENT) =>
+            if let Some(pr) = records.pull_requests.get(&id).filter(|_| kind == REVIEW_COMMENT) =>
         {
             (rgb(0x0090cd), pr.state().0)
         }
+        Some(Chip::Context { kind, .. }) if kind == REVIEW_COMMENT => (rgb(0x0090cd), Lucide::MessageCircle),
+        Some(Chip::Context { kind, .. }) if kind == "preview-annotation" => (rgb(0x0090cd), Lucide::MousePointerClick),
         Some(Chip::Context { kind, .. }) if kind == "image" => (rgb(0x0090cd), Lucide::Image),
         Some(Chip::Context { kind, .. }) if kind == "terminal" => (rgb(0x0090cd), Lucide::Terminal),
         // `EnvironmentContextChip`: the machine's own icon.
         Some(Chip::Context { kind, id, .. }) if kind == "environment" => {
             let environment = id.strip_prefix("environment_").unwrap_or_default();
-            let icon = machines.iter().find(|(id, _)| id == environment).map_or(Lucide::Server, |(_, icon)| *icon);
+            let icon =
+                records.machines.iter().find(|(id, _)| id == environment).map_or(Lucide::Server, |(_, icon)| *icon);
             (rgb(0x0090cd), icon)
         }
         Some(Chip::Context { .. }) => (rgb(0x0090cd), Lucide::File),
@@ -1943,9 +1975,11 @@ fn render_chip(
         .child(Icon::new(icon).with_size(px(14.)).flex_none())
         .child(div().min_w_0().truncate().child(token.token().label().clone()))
         .id(ElementId::Name(format!("chip-{}-{id}", token.range().start).into()))
-        .when_some(path, |el, path| el.tooltip(move |window, cx| Tooltip::new(path.clone()).build(window, cx)))
+        .when_some(tooltip, |el, tip| el.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx)))
         .into_any_element()
 }
+
+const UNRESOLVED_CONTEXT: &str = "This context is no longer available. Remove it or attach it again.";
 
 /// The kind of a context record that can carry a change request (`ReviewCommentContextRecord`).
 const REVIEW_COMMENT: &str = "review-comment";
@@ -1964,14 +1998,8 @@ struct PullRequestContext {
 }
 
 impl PullRequestContext {
-    /// `resolvePullRequestState`: the glyph, the label, and the tone as light, dark and dark alpha.
     fn state(&self) -> (Lucide, &'static str, u32, u32, f32) {
-        match self.state.as_str() {
-            "merged" => (Lucide::GitMerge, "Merged", 0x7f22fe, 0xc4b4ff, 0.9),
-            "closed" => (Lucide::GitPullRequestClosed, "Closed", 0xe7000b, 0xffa2a2, 0.9),
-            _ if self.is_draft => (Lucide::GitPullRequestDraft, "Draft", 0x71717b, 0x9f9fa9, 0.8),
-            _ => (Lucide::GitPullRequestArrow, "Open", 0x009966, 0x5ee9b5, 0.9),
-        }
+        pull_request_state(&self.state, self.is_draft)
     }
 
     /// `capitalizeTerm(singular)` for the host the URL names (`findByChangeRequestUrl`).
@@ -1987,10 +2015,25 @@ impl PullRequestContext {
     }
 }
 
+/// `resolvePullRequestState`: the glyph, the label, and the tone as light, dark and dark alpha.
+pub(super) fn pull_request_state(state: &str, is_draft: bool) -> (Lucide, &'static str, u32, u32, f32) {
+    match state {
+        "merged" => (Lucide::GitMerge, "Merged", 0x7f22fe, 0xc4b4ff, 0.9),
+        "closed" => (Lucide::GitPullRequestClosed, "Closed", 0xe7000b, 0xffa2a2, 0.9),
+        _ if is_draft => (Lucide::GitPullRequestDraft, "Draft", 0x71717b, 0x9f9fa9, 0.8),
+        _ => (Lucide::GitPullRequestArrow, "Open", 0x009966, 0x5ee9b5, 0.9),
+    }
+}
+
+/// [`pull_request_state`]'s tone for the theme.
+pub(super) fn pull_request_tone(light: u32, dark: u32, alpha: f32, t: &Tokens) -> Hsla {
+    if t.dark { Hsla::from(rgb(dark)).opacity(alpha) } else { rgb(light).into() }
+}
+
 /// The review-comment records' change requests, by the context id their chips carry.
-fn pull_request_contexts(records: &[Value]) -> HashMap<String, PullRequestContext> {
+fn pull_request_contexts<'a>(records: impl IntoIterator<Item = &'a Value>) -> HashMap<String, PullRequestContext> {
     records
-        .iter()
+        .into_iter()
         .filter(|record| record["kind"].as_str() == Some(REVIEW_COMMENT))
         .filter_map(|record| {
             let id = record["contextId"].as_str()?.to_owned();
@@ -2010,7 +2053,7 @@ impl Workspace {
         let Some(Chip::Context { kind, id, .. }) = Chip::from_id(chip) else { return None };
         let pr = pull_requests.get(&id).filter(|_| kind == REVIEW_COMMENT)?;
         let (glyph, label, light, dark, alpha) = pr.state();
-        let tone: Hsla = if t.dark { Hsla::from(rgb(dark)).opacity(alpha) } else { rgb(light).into() };
+        let tone = pull_request_tone(light, dark, alpha, t);
         let branch = |name: &str| div().min_w_0().truncate().font_family(t.fonts.mono).child(name.to_owned());
         let details = v_flex()
             .max_w(px(320.))

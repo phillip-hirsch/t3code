@@ -59,11 +59,6 @@ pub(super) fn available(item: &SearchItem) -> bool {
         && !item.wsl_available_only
         && !item.managed_tunnel_only
         && !item.peer_links_only
-        // Browser rows for surfaces this client doesn't have (see `browser.rs`).
-        && !matches!(
-            item.id.as_str(),
-            "browser-recording-key-presses" | "browser-recording-mouse-presses"
-        )
 }
 
 /// Matches every query token somewhere in the title, section label or search terms, and
@@ -154,5 +149,9 @@ mod tests {
     fn the_shipped_index_finds_its_settings() {
         let results = search("delete confirmation", shipped());
         assert_eq!(results.first().map(|i| i.id.as_str()), Some("delete-confirmation"));
+        let results = search("key presses", shipped());
+        assert_eq!(results.first().map(|i| i.id.as_str()), Some("browser-recording-key-presses"));
+        let results = search("mouse presses", shipped());
+        assert_eq!(results.first().map(|i| i.id.as_str()), Some("browser-recording-mouse-presses"));
     }
 }

@@ -360,6 +360,27 @@ pub(crate) struct PatchLine {
     modified: Option<usize>,
 }
 
+/// One line of [`DiffFile::patch_body`]: its one-based line on each side it
+/// is on (an unchanged line is on both) and its text without the line ending.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiffPatchLine<'a> {
+    original: Option<usize>,
+    modified: Option<usize>,
+    text: &'a str,
+}
+
+impl<'a> DiffPatchLine<'a> {
+    pub fn original(&self) -> Option<usize> {
+        self.original
+    }
+    pub fn modified(&self) -> Option<usize> {
+        self.modified
+    }
+    pub fn text(&self) -> &'a str {
+        self.text
+    }
+}
+
 impl PatchLine {
     pub(crate) fn line(&self, side: DiffSide) -> Option<usize> {
         match side {
@@ -597,6 +618,18 @@ impl DiffFile {
 
     pub(crate) fn patch_lines(&self) -> &[PatchLine] {
         &self.inner.patch_lines
+    }
+    /// The patch body in patch order, for tools that anchor to its lines.
+    pub fn patch_body(&self) -> impl Iterator<Item = DiffPatchLine<'_>> + '_ {
+        self.inner.patch_lines.iter().map(|line| {
+            let original = line.original.map(|ix| &self.inner.original.lines[ix]);
+            let modified = line.modified.map(|ix| &self.inner.modified.lines[ix]);
+            DiffPatchLine {
+                original: original.map(SourceLine::line_number),
+                modified: modified.map(SourceLine::line_number),
+                text: modified.or(original).map_or("", |line| line.text.as_str()),
+            }
+        })
     }
     /// The position of a side's line in [`Self::patch_lines`].
     pub(crate) fn patch_ix(&self, side: DiffSide, ix: usize) -> usize {
@@ -975,6 +1008,20 @@ mod tests {
             }
         );
         assert_eq!(doc.text_for_lines(DiffSide::Modified, 2, 3), "new\nextra\n");
+        let body: Vec<_> = doc
+            .patch_body()
+            .map(|line| (line.original(), line.modified(), line.text()))
+            .collect();
+        assert_eq!(
+            body,
+            [
+                (Some(1), Some(1), "same"),
+                (Some(2), None, "old"),
+                (None, Some(2), "new"),
+                (None, Some(3), "extra"),
+                (Some(3), Some(4), "tail"),
+            ]
+        );
         assert_eq!(doc.text_for_lines(DiffSide::Original, 99, 100), "");
         let bare_cr = fixture::modified("a.txt", "a\rb", "a\rb");
         assert!(!bare_cr.has_changes());

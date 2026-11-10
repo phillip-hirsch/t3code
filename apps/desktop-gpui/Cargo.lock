@@ -8432,6 +8432,7 @@ dependencies = [
  "objc2-app-kit 0.3.2",
  "objc2-core-graphics",
  "objc2-foundation 0.3.2",
+ "rav1e",
  "raw-window-handle",
  "reqwest",
  "resvg 0.46.0",

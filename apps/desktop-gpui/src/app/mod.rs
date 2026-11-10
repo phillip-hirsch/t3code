@@ -39,6 +39,7 @@ mod composer_menu;
 mod composer_meter;
 mod composer_plan;
 mod confirm;
+mod context_records;
 mod context_strip;
 mod desktop;
 mod details;
@@ -73,6 +74,7 @@ mod queue;
 mod quit;
 mod recovery;
 mod request_cards;
+mod review_comments;
 mod right_panel;
 mod send;
 mod sessions;
@@ -249,6 +251,8 @@ pub struct Workspace {
     reading_attachments: Vec<Target>,
     /// Attachments whose chip was deleted, kept until the editor's undo history ends.
     retained_attachments: Vec<attachments::Attachment>,
+    /// The open draft's context records, behind its `t3-context://` chips.
+    context: context_records::ContextState,
     /// Sent messages their thread doesn't show yet.
     pending_sends: Vec<send::PendingSend>,
     error: Option<SharedString>,
@@ -357,11 +361,13 @@ pub struct Workspace {
 
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let view = cx.weak_entity();
         let composer = cx.new(|cx| {
             // The composer paints its own contextual placeholder.
             let mut state =
                 TextareaState::new(window, cx).auto_grow(2, composer::EDITOR_MAX_ROWS).submit_on_enter(true);
             state.set_scrollbar_renderer(Some(composer::editor_scrollbar()));
+            state.set_copy_metadata(context_records::copy_metadata(view));
             state
         });
         let scroller = cx.new(|cx| MessageScrollerState::new(0, cx));
@@ -467,6 +473,7 @@ impl Workspace {
             dragging_files: false,
             reading_attachments: Vec::new(),
             retained_attachments: Vec::new(),
+            context: Default::default(),
             pending_sends: Vec::new(),
             error: None,
             sidebar: sidebar::SidebarState::new(window, cx),

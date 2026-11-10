@@ -80,7 +80,7 @@ enum Load {
 pub(super) struct PreviewState {
     kind: logic::FileKind,
     load: Load,
-    editor: Option<Entity<EditorState>>,
+    pub(super) editor: Option<Entity<EditorState>>,
     /// The contents as last read or written.
     saved: String,
     save: logic::SaveQueue,
@@ -98,6 +98,8 @@ pub(super) struct PreviewState {
     revealed: Option<u64>,
     /// The open request the rendered view was picked over (`handledReveal`).
     rendered_reveal: Option<u64>,
+    /// The gutter marks of the comments on its lines.
+    pub(super) marks: super::comments::Marks,
     _read: Option<Task<()>>,
     _full: Option<Task<()>>,
     _save: Option<Task<()>>,
@@ -122,6 +124,7 @@ impl PreviewState {
             mutation: None,
             revealed: None,
             rendered_reveal: None,
+            marks: Default::default(),
             _read: None,
             _full: None,
             _save: None,
@@ -365,6 +368,7 @@ impl Workspace {
                     Some(editor) if *editor.read(cx).value() != *contents => {
                         let text = contents.clone();
                         editor.update(cx, |editor, cx| editor.set_value(text, window, cx));
+                        state.marks.reset();
                     }
                     Some(_) => {}
                     None => {
@@ -375,6 +379,7 @@ impl Workspace {
                         state._subscription =
                             Some(cx.subscribe_in(&editor, window, move |this, _, event: &InputEvent, _, cx| {
                                 if matches!(event, InputEvent::Change) {
+                                    this.remap_file_comments(&save_key, cx);
                                     this.change_file(&save_key, cx);
                                 }
                             }));
@@ -509,13 +514,14 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(state) = self.files.previews.get(key) else { return };
+        let Some(state) = self.files.previews.get_mut(key) else { return };
         let (Some(editor), markdown) = (state.editor.clone(), state.markdown.clone()) else { return };
         let Some(next) = logic::set_markdown_task(&editor.read(cx).value(), item_start, checked) else { return };
         if let Some(markdown) = markdown {
             markdown.update(cx, |view, cx| view.set_text(&next, cx));
         }
         editor.update(cx, |editor, cx| editor.set_value(next, window, cx));
+        state.marks.reset();
         self.change_file(key, cx);
     }
 
@@ -647,7 +653,8 @@ impl Workspace {
         self.sync_preview(&key, window, cx);
         let reveal = self.files.reveals.get(&key).map_or(0, |(_, request)| *request);
         let folder = self.files.previews.get(&key).is_some_and(|s| matches!(s.load, Load::Folder));
-        let subheader = self.render_file_subheader(&key, &target.project_name, folder, &tokens, cx);
+        let editable = self.can_write_files(&checkout.env, cx) == Some(true) && !logic::is_host_path(&path);
+        let subheader = self.render_file_subheader(&key, &target.project_name, folder, editable, &tokens, cx);
         let draft = !matches!(self.target, Some(Target::Thread { .. }));
         let read_only =
             (self.can_write_files(&checkout.env, cx) == Some(false) && !logic::is_host_path(&path)).then(|| {
@@ -759,6 +766,7 @@ impl Workspace {
         key: &FileKey,
         project_name: &SharedString,
         folder: bool,
+        editable: bool,
         tokens: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -835,6 +843,9 @@ impl Workspace {
         let mode = (!folder).then(|| Rendered::of(&path)).flatten();
         let rendered = mode.is_some_and(|mode| self.files.shows_rendered(key, mode));
         let shows_raw_text = text && !rendered && kind != logic::FileKind::Pdf;
+        // The editor takes comments while it edits the whole file (`EditableFileSurface`).
+        let whole = state.is_some_and(|s| matches!(s.load, Load::Text { truncated: false, .. }));
+        let commentable = editable && whole && shows_raw_text && self.can_comment_on_file(key);
         let open_in_browser =
             !folder && matches!(kind, logic::FileKind::Html | logic::FileKind::Pdf) && self.browser_available();
         let wrap = state.and_then(|s| s.wrap).unwrap_or_else(|| self.client_settings.values.bool("wordWrap"));
@@ -866,6 +877,7 @@ impl Workspace {
                     }),
                 ))
             })
+            .when(commentable, |el| el.child(self.render_file_comment_button(key, tokens, cx)))
             .when(shows_raw_text, |el| {
                 let key = key.clone();
                 let label = if wrap { "Disable word wrap" } else { "Enable word wrap" };
@@ -1066,13 +1078,16 @@ impl Workspace {
                         .into_any_element();
                 }
                 let Some(editor) = state.editor.clone() else { return div().into_any_element() };
-                Editor::new(&editor)
+                let read_only = *truncated || !editable;
+                let editor = Editor::new(&editor)
                     .appearance(false)
                     .bordered(false)
-                    .readonly(*truncated || !editable)
+                    .readonly(read_only)
                     .h_full()
                     .font_family(tokens.fonts.mono)
-                    .into_any_element()
+                    .into_any_element();
+                // `EditableFileSurface` takes line comments; the read-only source does not.
+                if read_only { editor } else { self.with_file_comments(key, editor, tokens, cx) }
             }
         }
     }

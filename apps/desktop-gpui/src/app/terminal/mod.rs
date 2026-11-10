@@ -19,7 +19,6 @@ use std::time::Duration;
 
 use gpui_kit::component::button::Button;
 use gpui_kit::component::button::ButtonVariant;
-use gpui_kit::component::input::InlineToken;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Disableable as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -34,7 +33,6 @@ use self::layout::{DrawerLayout, Place, Split};
 use self::session::{Launch, SessionEvent, TerminalSession};
 use super::titlebar::icon;
 use super::{Target, Workspace};
-use crate::composer_text::Chip;
 use crate::rpc::RpcClient;
 use crate::theme::{self, Tokens};
 
@@ -114,15 +112,12 @@ pub(super) struct Terminals {
     draft_threads: HashMap<String, String>,
     /// The terminal to focus once it mounts, by thread: another thread's request never lands.
     focus_pending: Option<(String, String)>,
-    /// Selections added to chat, by context id: the `TerminalContextRecord` each chip sends.
-    pub(super) contexts: HashMap<String, Value>,
     /// Right-panel terminal tabs, by surface id.
     panel: HashMap<String, panel::PanelGroup>,
 }
 
-/// `COMPOSER_CONTEXT_TERMINAL_TEXT_MAX_CHARS` and `clampContextText`'s marker.
+/// `COMPOSER_CONTEXT_TERMINAL_TEXT_MAX_CHARS`.
 const CONTEXT_TEXT_MAX: usize = 64_000;
-const TRUNCATION_MARKER: &str = "\n… truncated …";
 
 /// `formatTerminalContextLabel`.
 fn context_label(terminal_label: &str, line_start: usize, line_end: usize) -> String {
@@ -135,17 +130,7 @@ fn context_label(terminal_label: &str, line_start: usize, line_end: usize) -> St
 
 /// `terminalContextRecord`: the text clamped to the server's limit in UTF-16 units.
 fn context_record(id: &str, terminal_id: &str, terminal_label: &str, selected: &session::Selected) -> Value {
-    let mut text = selected.text.clone();
-    if text.encode_utf16().count() > CONTEXT_TEXT_MAX {
-        let budget = CONTEXT_TEXT_MAX - TRUNCATION_MARKER.encode_utf16().count();
-        let mut units = 0;
-        let end = text.char_indices().find(|(_, c)| {
-            units += c.len_utf16();
-            units > budget
-        });
-        text.truncate(end.map_or(text.len(), |(i, _)| i));
-        text.push_str(TRUNCATION_MARKER);
-    }
+    let text = crate::composer_context::clamp_text(&selected.text, CONTEXT_TEXT_MAX);
     let label = context_label(terminal_label, selected.line_start, selected.line_end);
     json!({
         "version": 1,
@@ -829,42 +814,13 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.question.is_some() {
-            return;
-        }
+        let Some(target) = self.target.clone() else { return };
         let terminal_label = self.terminals.label(thread_id, terminal_id);
         let id = format!("terminal_{}", super::new_id());
         let record = context_record(&id, terminal_id, &terminal_label, selected);
-        let label = record["label"].as_str().unwrap_or_default().to_owned();
-        let chip = Chip::Context { kind: "terminal".into(), id: id.clone(), label: label.clone() };
-        let link = crate::composer_text::context_link("terminal", &id, &label);
-        self.terminals.contexts.insert(id, record);
-        self.composer.update(cx, |state, cx| {
-            let at = state.cursor();
-            if at > 0 && !state.value()[..at].ends_with(char::is_whitespace) {
-                state.insert(" ", window, cx);
-            }
-            let at = state.cursor();
-            let token = InlineToken::new(chip.id(), link).with_label(label);
-            if state.replace_range_with_token(at..at, token, window, cx).is_ok() {
-                state.insert(" ", window, cx);
-            }
-        });
-        self.sync_composer_empty(cx);
-        self.focus_composer(window, cx);
-        cx.notify();
-    }
-
-    /// The terminal records the prompt's chips name (`buildMessageContext` puts them first).
-    pub(super) fn terminal_context_records(&self, text: &str) -> Vec<Value> {
-        let mut found: Vec<(usize, &Value)> = self
-            .terminals
-            .contexts
-            .iter()
-            .filter_map(|(id, record)| Some((text.find(&format!("/terminal/{id})"))?, record)))
-            .collect();
-        found.sort_by_key(|(at, _)| *at);
-        found.into_iter().map(|(_, record)| record.clone()).collect()
+        if self.add_context_record(&target, record, window, cx).is_some() {
+            self.focus_composer(window, cx);
+        }
     }
 
     /// Wires the terminal actions onto the workspace root.
@@ -1471,7 +1427,7 @@ mod tests {
         assert_eq!(record["label"], "Terminal 1 lines 2-9");
         let text = record["text"].as_str().unwrap();
         assert_eq!(text.encode_utf16().count(), CONTEXT_TEXT_MAX);
-        assert!(text.ends_with(TRUNCATION_MARKER));
+        assert!(text.ends_with("\n… truncated …"));
     }
 
     #[test]

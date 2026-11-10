@@ -19,7 +19,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     Anchor, AnyElement, App, AppContext as _, ClickEvent, Context, Entity, FocusHandle, Focusable as _,
-    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, SharedString,
+    InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, ParentElement as _, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, div, px,
 };
 use gpui_webview::WebView;
@@ -32,6 +32,8 @@ use crate::preview::{self, Appearance, Applied, NavStatus, Session, ThreadPrevie
 use crate::rpc::RpcClient;
 use crate::theme::{self, Tokens};
 
+mod annotation;
+mod capture;
 mod empty;
 mod profiles;
 mod server;
@@ -64,6 +66,8 @@ pub(super) enum PageEvent {
     },
     /// The page asked for a new window (`window.open`, `target=_blank`).
     OpenLink(String),
+    /// The annotation overlay's message, with its session.
+    Annotation(String, annotation::PickMessage),
 }
 
 struct HostedTab {
@@ -121,6 +125,10 @@ pub(super) struct PreviewState {
     /// Pages opened per project, for a blank tab's "Recently used".
     history: crate::browser_history::BrowserHistory,
     discovery: empty::Discovery,
+    /// Screenshots and the recording in progress.
+    capture: capture::Captures,
+    /// The annotation in progress.
+    annotation: annotation::Annotations,
     /// Failed tabs showing the unreachable page's details.
     unreachable_details: HashSet<String>,
     /// A hidden view that keeps WebView2's browser process running, so tabs and file previews
@@ -160,6 +168,8 @@ impl PreviewState {
             server: Default::default(),
             history: crate::browser_history::BrowserHistory::load(),
             discovery: Default::default(),
+            capture: Default::default(),
+            annotation: Default::default(),
             unreachable_details: HashSet::new(),
             #[cfg(windows)]
             _warm: None,
@@ -819,8 +829,15 @@ impl Workspace {
     }
 
     fn on_page_event(&mut self, tab_id: &str, event: PageEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if let PageEvent::Annotation(session, message) = event {
+            return self.on_pick_message(tab_id, &session, message, window, cx);
+        }
+        if matches!(event, PageEvent::Started(_)) {
+            self.annotation_page_left(tab_id, window, cx);
+        }
         let Some(tab) = self.preview.tabs.get_mut(tab_id) else { return };
         let title = tab.status.title().unwrap_or_default().to_owned();
+        let loaded = matches!(event, PageEvent::Finished(_));
         match event {
             PageEvent::Started(url) => tab.status = NavStatus::Loading { url, title },
             // A failure reported for this load stays; the error page's load is not a success.
@@ -856,10 +873,14 @@ impl Workspace {
                 self.open_preview_tab(thread_id, Some(url), window, cx);
                 return;
             }
+            PageEvent::Annotation(..) => return,
         }
         let (thread_id, status) = (tab.thread_id.clone(), tab.status.clone());
         self.record_title(&thread_id, &status);
         self.report_status(tab_id, cx);
+        if loaded {
+            self.recording_page_loaded(tab_id, cx);
+        }
         self.sync_address(window, cx);
         cx.notify();
     }
@@ -948,6 +969,7 @@ impl Workspace {
     pub(super) fn sync_preview_views(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let covered = self.browser_covered(window, cx);
         self.retain_server_streams(covered, window, cx);
+        self.sync_annotation(window, cx);
         let panel = self.preview.panel_view.take().filter(|_| !covered);
         let mini = self.preview.mini_view.take().filter(|_| !covered);
         let shown =
@@ -1009,6 +1031,15 @@ impl Workspace {
             .key_context(super::keymap::PREVIEW_CONTEXT)
             .flex_1()
             .min_h_0()
+            // Escape ends a pick from the app's side too; in the page the overlay takes it.
+            .when(self.annotating(), |el| {
+                el.capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                    if event.keystroke.key == "escape" {
+                        this.cancel_annotation(window, cx);
+                        cx.stop_propagation();
+                    }
+                }))
+            })
             .child(self.render_preview_chrome(thread_id, &tokens, window, cx))
             .child(self.render_page_area(thread_id, tab_id, available, window, cx))
             .into_any_element()
@@ -1072,7 +1103,7 @@ impl Workspace {
         }
     }
 
-    /// `PreviewChromeRow`: back, forward, reload, the address bar and the menu.
+    /// `PreviewChromeRow`: back, forward, reload, the address bar, capture, float and the menu.
     fn render_preview_chrome(
         &self,
         thread_id: &str,
@@ -1104,6 +1135,12 @@ impl Workspace {
             let floating = self.preview.floating.get(thread_id) == Some(&s.tab_id);
             (s.tab_id.clone(), floating, !unreachable && (server_tab.is_some() || hosted.is_some()))
         });
+        // `onPickElement` and `onCapture`: this computer's own tabs, once they show a reachable page.
+        let own_tab = session.filter(|s| !s.server_hosted());
+        let page_ready = hosted.is_some() && !unreachable;
+        let annotate =
+            own_tab.map(|s| self.render_annotate_button(thread_id, &s.tab_id, page_ready, unreachable, tokens, cx));
+        let capture = own_tab.map(|s| self.render_capture_button(thread_id, &s.tab_id, page_ready, tokens, cx));
         let server_tab = server_tab.map(|s| s.tab_id.clone());
         let (back_tab, forward_tab) = (server_tab.clone(), server_tab);
         let address_focused = self.preview.address.read(cx).focus_handle(cx).is_focused(window);
@@ -1196,6 +1233,8 @@ impl Workspace {
                         )
                     }),
             )
+            .children(annotate)
+            .children(capture)
             .children(float.map(|(tab, floating, enabled)| {
                 let label = if floating { "Close floating preview" } else { "Float preview over chat" };
                 let thread = thread_id.to_owned();
@@ -1517,11 +1556,16 @@ fn page_builder<'a>(
         .with_url(url)
         .with_devtools(true)
         .with_initialization_script(preview::HISTORY_SCRIPT)
+        .with_initialization_script(capture::RECORDING_SCRIPT)
+        .with_initialization_script(annotation::PICKER_SCRIPT)
         .with_ipc_handler({
             let sender = sender.clone();
             move |request| {
-                if let Some(history) = preview::history_message(request.body()) {
+                let body = request.body();
+                if let Some(history) = preview::history_message(body) {
                     let _ = sender.try_send(PageEvent::History(history));
+                } else if let Some((session, message)) = annotation::pick_message(body) {
+                    let _ = sender.try_send(PageEvent::Annotation(session, message));
                 }
             }
         })

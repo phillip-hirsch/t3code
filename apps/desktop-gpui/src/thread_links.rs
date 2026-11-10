@@ -19,7 +19,7 @@ fn id(value: &str) -> Option<String> {
 }
 
 /// `decodeURIComponent`: `None` for a stray `%` or bytes that are not UTF-8.
-fn decode_uri_component(value: &str) -> Option<String> {
+pub fn decode_uri_component(value: &str) -> Option<String> {
     let bytes = value.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;

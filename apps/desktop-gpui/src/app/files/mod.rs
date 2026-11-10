@@ -5,6 +5,7 @@
 mod archive;
 mod asset;
 mod chrome;
+mod comments;
 mod crumbs;
 mod document;
 mod logic;
@@ -86,6 +87,8 @@ pub(super) struct FilesState {
     writable: HashMap<SharedString, (Option<bool>, gpui_kit::Task<()>)>,
     /// The open thread's workspace mutation, read once per frame for the tree and preview.
     mutation: (Option<String>, Option<String>),
+    /// The line comment being written in a file.
+    comment: Option<comments::FileDraft>,
 }
 
 /// A dropdown's `on_open_change`: its popover closes on outside clicks without the menu's
