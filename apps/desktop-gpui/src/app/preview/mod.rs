@@ -32,6 +32,7 @@ use crate::preview::{self, Appearance, Applied, NavStatus, Session, ThreadPrevie
 use crate::rpc::RpcClient;
 use crate::theme::{self, Tokens};
 
+mod capture;
 mod empty;
 mod profiles;
 mod server;
@@ -121,6 +122,8 @@ pub(super) struct PreviewState {
     /// Pages opened per project, for a blank tab's "Recently used".
     history: crate::browser_history::BrowserHistory,
     discovery: empty::Discovery,
+    /// Screenshots and the recording in progress.
+    capture: capture::Captures,
     /// Failed tabs showing the unreachable page's details.
     unreachable_details: HashSet<String>,
     /// A hidden view that keeps WebView2's browser process running, so tabs and file previews
@@ -160,6 +163,7 @@ impl PreviewState {
             server: Default::default(),
             history: crate::browser_history::BrowserHistory::load(),
             discovery: Default::default(),
+            capture: Default::default(),
             unreachable_details: HashSet::new(),
             #[cfg(windows)]
             _warm: None,
@@ -821,6 +825,7 @@ impl Workspace {
     fn on_page_event(&mut self, tab_id: &str, event: PageEvent, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.preview.tabs.get_mut(tab_id) else { return };
         let title = tab.status.title().unwrap_or_default().to_owned();
+        let loaded = matches!(event, PageEvent::Finished(_));
         match event {
             PageEvent::Started(url) => tab.status = NavStatus::Loading { url, title },
             // A failure reported for this load stays; the error page's load is not a success.
@@ -860,6 +865,9 @@ impl Workspace {
         let (thread_id, status) = (tab.thread_id.clone(), tab.status.clone());
         self.record_title(&thread_id, &status);
         self.report_status(tab_id, cx);
+        if loaded {
+            self.recording_page_loaded(tab_id, cx);
+        }
         self.sync_address(window, cx);
         cx.notify();
     }
@@ -1072,7 +1080,7 @@ impl Workspace {
         }
     }
 
-    /// `PreviewChromeRow`: back, forward, reload, the address bar and the menu.
+    /// `PreviewChromeRow`: back, forward, reload, the address bar, capture, float and the menu.
     fn render_preview_chrome(
         &self,
         thread_id: &str,
@@ -1103,6 +1111,11 @@ impl Workspace {
         let float = session.map(|s| {
             let floating = self.preview.floating.get(thread_id) == Some(&s.tab_id);
             (s.tab_id.clone(), floating, !unreachable && (server_tab.is_some() || hosted.is_some()))
+        });
+        // `onCapture`: this computer's own tabs, once they show a reachable page.
+        let capture = session.filter(|s| !s.server_hosted()).map(|s| {
+            let page_ready = hosted.is_some() && !unreachable;
+            self.render_capture_button(thread_id, &s.tab_id, page_ready, tokens, cx)
         });
         let server_tab = server_tab.map(|s| s.tab_id.clone());
         let (back_tab, forward_tab) = (server_tab.clone(), server_tab);
@@ -1196,6 +1209,7 @@ impl Workspace {
                         )
                     }),
             )
+            .children(capture)
             .children(float.map(|(tab, floating, enabled)| {
                 let label = if floating { "Close floating preview" } else { "Float preview over chat" };
                 let thread = thread_id.to_owned();
@@ -1517,6 +1531,7 @@ fn page_builder<'a>(
         .with_url(url)
         .with_devtools(true)
         .with_initialization_script(preview::HISTORY_SCRIPT)
+        .with_initialization_script(capture::RECORDING_SCRIPT)
         .with_ipc_handler({
             let sender = sender.clone();
             move |request| {
