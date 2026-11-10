@@ -5,13 +5,16 @@
 
 use std::borrow::Cow;
 use std::io::Read as _;
+use std::rc::Rc;
 
-use gpui_kit::{AppContext as _, Context, Hsla, Window};
+use gpui_kit::{App, AppContext as _, Context, Hsla, Window};
 use serde::Serialize;
 
 use super::FileKey;
 use crate::app::Workspace;
+use crate::app::keymap::{self, PageChord, ShortcutContext};
 use crate::app::mermaid::css_color;
+use crate::keybindings::Rule;
 use crate::theme::Tokens;
 
 /// One viewer kind: where its page lives, how it reads the file and what it does with reports.
@@ -175,6 +178,18 @@ fn respond(responder: wry::RequestAsyncResponder, status: u16, content_type: &st
     responder.respond(response);
 }
 
+type ChordSource = (Rc<[Rule]>, Rc<[Rule]>, ShortcutContext);
+
+/// The shell chords a focused viewer page hands back ([`keymap::viewer_chords`]), and what they
+/// were resolved from: the keymap, the environment's project scripts and the panels' state.
+#[derive(Default)]
+pub(super) struct ViewerChords {
+    source: Option<ChordSource>,
+    list: Vec<PageChord<String>>,
+    /// `list` as JSON, for the pages' script.
+    json: Rc<str>,
+}
+
 /// A request the page made over the custom protocol.
 struct PageRequest {
     path: String,
@@ -193,6 +208,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let resource = self.asset_resource(&key, "media-file");
+        self.sync_viewer_chords(cx);
+        let shortcuts = crate::preview::shortcut_script(&self.files.documents.chords.json, keymap::MAC);
         let (requests, incoming) = async_channel::unbounded::<PageRequest>();
         let (reports, inbox) = async_channel::unbounded::<String>();
         let builder = wry::WebViewBuilder::new()
@@ -204,6 +221,7 @@ impl Workspace {
                 let _ = reports.try_send(request.into_body());
             })
             .with_new_window_req_handler(|_, _| wry::NewWindowResponse::Deny)
+            .with_initialization_script(shortcuts)
             .with_url(spec.url);
         let serve_key = key.clone();
         let serve = cx.spawn(async move |this, cx| {
@@ -238,13 +256,74 @@ impl Workspace {
             }
         });
         let report_key = key.clone();
-        let listen = cx.spawn(async move |this, cx| {
+        let listen = cx.spawn_in(window, async move |this, cx| {
             while let Ok(body) = inbox.recv().await {
-                let _ = this.update(cx, |this, cx| (spec.report)(this, &report_key, &body, cx));
+                let _ = this.update_in(cx, |this, window, cx| match crate::preview::shortcut_message(&body) {
+                    Some(command) => this.viewer_shortcut(&report_key, &command, window, cx),
+                    None => (spec.report)(this, &report_key, &body, cx),
+                });
             }
         });
         self.files.documents.begin_viewer(&key, resource, vec![serve, listen]);
         self.build_view(key, builder, None, window, cx);
+    }
+
+    /// The context viewer chords resolve and run in: nothing of the shell focused.
+    fn viewer_context(&self) -> ShortcutContext {
+        ShortcutContext {
+            terminal_open: self.terminal_open(),
+            right_panel_open: self.right_panel_open(),
+            ..ShortcutContext::default()
+        }
+    }
+
+    /// Resolves the chords viewer pages forward again when the keymap, the project scripts or
+    /// the panels changed, and swaps a changed set into every open viewer page.
+    pub(super) fn sync_viewer_chords(&mut self, cx: &App) {
+        let source = (self.keymap.clone(), self.server_info().keybindings.clone(), self.viewer_context());
+        let chords = &mut self.files.documents.chords;
+        if chords.source.as_ref().is_some_and(|(rules, scripts, context)| {
+            Rc::ptr_eq(rules, &source.0) && Rc::ptr_eq(scripts, &source.1) && *context == source.2
+        }) {
+            return;
+        }
+        let list = keymap::viewer_chords(&source.0, &source.1, &source.2);
+        chords.source = Some(source);
+        if !chords.json.is_empty() && list == chords.list {
+            return;
+        }
+        chords.json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".into()).into();
+        chords.list = list;
+        let script = crate::preview::shortcut_update_script(&chords.json);
+        for view in self.files.documents.viewer_views() {
+            let _ = view.read(cx).raw().evaluate_script(&script);
+        }
+    }
+
+    /// A shell shortcut a focused viewer page handed back, as the web's in-page viewers let it
+    /// reach the app. The page can post any message, so only a forwarded command from a page on
+    /// screen runs.
+    fn viewer_shortcut(&mut self, key: &FileKey, command: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.files.documents.shown_view(key).cloned() else { return };
+        let chords = &self.files.documents.chords.list;
+        let Some(command) = chords.iter().find(|chord| chord.command == command).map(|c| c.command.clone()) else {
+            return;
+        };
+        // GPUI focus alone can't take the keyboard back from the native view.
+        let focus_parent = |cx: &App| {
+            let _ = view.read(cx).raw().focus_parent();
+        };
+        // F6 moves on from the panel that shows the page.
+        let cycles = matches!(command.as_str(), "workspace.focusNext" | "workspace.focusPrevious");
+        if cycles {
+            focus_parent(cx);
+            self.areas.panel.focus(window, cx);
+        }
+        let focused = window.focused(cx);
+        let context = self.viewer_context();
+        if self.run_command(&command, false, &context, window, cx) && !cycles && window.focused(cx) != focused {
+            focus_parent(cx);
+        }
     }
 
     /// How the file is read: signed with the environment's current connection and the resource

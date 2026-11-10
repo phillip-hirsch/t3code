@@ -248,8 +248,8 @@ pub(super) const PAGE_FORWARDED_COMMANDS: [&str; 6] = [
 
 /// `PreviewForwardedShortcut`, with `mod` resolved to the platform's modifier for the page.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
-pub(super) struct PageChord {
-    pub command: &'static str,
+pub(super) struct PageChord<C = &'static str> {
+    pub command: C,
     pub key: String,
     pub meta: bool,
     pub ctrl: bool,
@@ -269,15 +269,57 @@ fn page_chords_on(rules: &[Rule], terminal_open: bool, closed_views: bool, mac: 
         .then_some("view.reopenClosed")
         .into_iter()
         .chain(PAGE_FORWARDED_COMMANDS)
-        .flat_map(|command| {
-            effective_shortcuts(rules, command, context, mac).map(move |s| PageChord {
-                command,
-                meta: s.meta_key || (s.mod_key && mac),
-                ctrl: s.ctrl_key || (s.mod_key && !mac),
-                shift: s.shift_key,
-                alt: s.alt_key,
-                key: s.key,
-            })
+        .flat_map(|command| effective_shortcuts(rules, command, context, mac).map(move |s| page_chord(command, s, mac)))
+        .collect()
+}
+
+fn page_chord<C>(command: C, s: Shortcut, mac: bool) -> PageChord<C> {
+    PageChord {
+        command,
+        meta: s.meta_key || (s.mod_key && mac),
+        ctrl: s.ctrl_key || (s.mod_key && !mac),
+        shift: s.shift_key,
+        alt: s.alt_key,
+        key: s.key,
+    }
+}
+
+/// What a file viewer page keeps with `mod` alone: the PDF's Find, and copying, selecting and
+/// editing in its fields.
+const VIEWER_KEYS: [&str; 6] = ["a", "c", "f", "v", "x", "z"];
+
+/// The chords a focused file viewer page (PDF, Office) hands back. The web's viewers sit in its
+/// DOM, where the shell's shortcuts reach the app as `context` resolves them (project scripts from
+/// `scripts`, as [`resolve_chat`] does); a page forwards those with Cmd, Ctrl or a function key,
+/// which type no text, but the viewer's own.
+pub(super) fn viewer_chords(primary: &[Rule], scripts: &[Rule], context: &ShortcutContext) -> Vec<PageChord<String>> {
+    viewer_chords_on(primary, scripts, context, MAC)
+}
+
+fn viewer_chords_on(
+    primary: &[Rule],
+    scripts: &[Rule],
+    context: &ShortcutContext,
+    mac: bool,
+) -> Vec<PageChord<String>> {
+    let mut commands: Vec<(&[Rule], &str)> = Vec::new();
+    for (rules, scripted) in [(primary, false), (scripts, true)] {
+        for rule in rules {
+            let command = rule.command.as_str();
+            if script_id(command).is_some() == scripted && !commands.iter().any(|(_, known)| *known == command) {
+                commands.push((rules, command));
+            }
+        }
+    }
+    let function = |key: &str| key.strip_prefix('f').is_some_and(|n| n.parse::<u8>().is_ok());
+    commands
+        .into_iter()
+        .flat_map(|(rules, command)| {
+            effective_shortcuts(rules, command, context, mac).map(move |s| page_chord(command.to_owned(), s, mac))
+        })
+        .filter(|c| {
+            let own = (c.meta, c.ctrl, c.shift, c.alt) == (mac, !mac, false, false) && VIEWER_KEYS.contains(&&*c.key);
+            (c.meta || c.ctrl || function(&c.key)) && !own
         })
         .collect()
 }
@@ -668,6 +710,43 @@ mod tests {
             page_chords_on(defaults(), false, true, false).first(),
             Some(&chord("view.reopenClosed", "t", true, true, false, false))
         );
+    }
+
+    #[test]
+    fn viewer_pages_forward_shell_chords_but_their_own() {
+        let rest = ShortcutContext::default();
+        let chord = |command: &str, key: &str, ctrl, shift, alt, meta| PageChord {
+            command: command.to_owned(),
+            key: key.into(),
+            meta,
+            ctrl,
+            shift,
+            alt,
+        };
+        let chords = viewer_chords_on(defaults(), &[], &rest, false);
+        assert!(chords.contains(&chord("commandPalette.toggle", "k", true, false, false, false)));
+        assert!(chords.contains(&chord("thread.next", "]", true, true, false, false)));
+        assert!(chords.contains(&chord("projectSearch.toggle", "f", true, true, false, false)));
+        assert!(
+            chords.contains(&chord("workspace.focusNext", "f6", false, false, false, false)),
+            "F-keys type nothing"
+        );
+        assert!(!chords.iter().any(|c| c.command == "chat.find"), "Mod+F opens the PDF's own find");
+        assert!(!chords.iter().any(|c| c.command == "thread.undo"), "Mod+Z undoes in the find field");
+        assert!(!chords.iter().any(|c| c.command == "terminal.split"), "its condition does not hold");
+        let mac = viewer_chords_on(defaults(), &[], &rest, true);
+        assert!(mac.contains(&chord("commandPalette.toggle", "k", false, false, false, true)), "`mod` is Cmd");
+
+        let primary = merge_with_defaults(&[
+            compile("g", "chat.new", None).unwrap(),
+            compile("mod+shift+r", "script.lint.run", None).unwrap(),
+        ]);
+        let scripts = [compile("mod+shift+y", "script.build.run", None).unwrap()];
+        let commands: Vec<_> =
+            viewer_chords_on(&primary, &scripts, &rest, false).into_iter().map(|c| (c.command, c.key)).collect();
+        assert!(!commands.contains(&("chat.new".into(), "g".into())), "a plain key stays the page's text");
+        assert!(commands.contains(&("script.build.run".into(), "y".into())), "the environment's project scripts");
+        assert!(!commands.iter().any(|(command, _)| command == "script.lint.run"), "the primary binds no script");
     }
 
     #[test]
