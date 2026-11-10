@@ -188,6 +188,8 @@ struct Listed {
     api_key: Value,
     request: u64,
     list: ModelList,
+    /// Never asked: the session lacks `settings:write`, and the list holds that refusal.
+    refused: bool,
 }
 
 impl Listed {
@@ -195,6 +197,12 @@ impl Listed {
         config["kind"] == self.kind.as_str()
             && config["baseUrl"] == self.base_url.as_str()
             && config["apiKey"] == self.api_key
+    }
+
+    /// Still answers for `config` while the grant is as it was: a refusal is asked again once
+    /// granted, and a list is refused once the grant is gone.
+    fn current(&self, config: &Value, refused: bool) -> bool {
+        self.asked_with(config) && self.refused == refused
     }
 }
 
@@ -266,6 +274,22 @@ impl TextGeneratorCatalog {
         let snapshot = Snapshot { revision, generators: generators.clone(), selections, providers: providers.clone() };
         self.snapshots.insert(environment.clone(), snapshot);
         providers
+    }
+
+    /// Starts `id`'s list for `config` as `list`, returning the request a reply must match.
+    fn record(&mut self, environment: &SharedString, id: &str, config: &Value, list: ModelList, refused: bool) -> u64 {
+        self.requests += 1;
+        let listed = Listed {
+            kind: config["kind"].as_str().unwrap_or_default().to_owned(),
+            base_url: config["baseUrl"].as_str().unwrap_or_default().to_owned(),
+            api_key: config["apiKey"].clone(),
+            request: self.requests,
+            list,
+            refused,
+        };
+        self.lists.insert((environment.clone(), id.to_owned()), listed);
+        self.revision += 1;
+        self.requests
     }
 
     /// Records a reply unless the list was asked for again, or forgotten, since.
@@ -362,28 +386,21 @@ impl Workspace {
         config: &Value,
         cx: &mut Context<Self>,
     ) {
+        // Only a checked session refuses; a pending or failed check waits for its retry.
+        let session = self.settings_ui.grants.get(environment.as_ref()).and_then(|(_, load)| load.session());
+        let denied = session.is_some_and(|session| !session.grants(SETTINGS_WRITE));
         let key = (environment.clone(), id.to_owned());
-        if self.settings_ui.text_generators.lists.get(&key).is_some_and(|listed| listed.asked_with(config)) {
+        if self.settings_ui.text_generators.lists.get(&key).is_some_and(|listed| listed.current(config, denied)) {
             return;
         }
         let Some(client) = self.env_client(environment) else { return };
-        if self.list_models_refusal(environment).is_some() {
+        if let Some(refusal) = self.list_models_refusal(environment) {
+            if denied {
+                self.settings_ui.text_generators.record(environment, id, config, ModelList::Failed(refusal), true);
+            }
             return;
         }
-        let catalog = &mut self.settings_ui.text_generators;
-        catalog.requests += 1;
-        let request = catalog.requests;
-        catalog.lists.insert(
-            key,
-            Listed {
-                kind: config["kind"].as_str().unwrap_or_default().to_owned(),
-                base_url: config["baseUrl"].as_str().unwrap_or_default().to_owned(),
-                api_key: config["apiKey"].clone(),
-                request,
-                list: ModelList::Loading,
-            },
-        );
-        catalog.revision += 1;
+        let request = self.settings_ui.text_generators.record(environment, id, config, ModelList::Loading, false);
         let (environment, id) = (environment.clone(), id.to_owned());
         cx.spawn(async move |this, cx| {
             let result = client.request(LIST_MODELS, json!({ "id": id })).await;
@@ -1663,6 +1680,7 @@ mod tests {
             api_key: json!(""),
             request,
             list: ModelList::Loading,
+            refused: false,
         };
         catalog.lists.insert((environment.clone(), "g".into()), listed(2));
         assert!(!catalog.settle(environment.clone(), "g".into(), 1, ModelList::Failed("old".into())));
@@ -1681,22 +1699,39 @@ mod tests {
         let mut catalog = TextGeneratorCatalog::default();
         let environment = SharedString::from("env");
         let generators = json!({"g": {"kind": "openaiCompatible", "baseUrl": "https://x", "apiKey": ""}});
-        let listed = Listed {
-            kind: "openaiCompatible".into(),
-            base_url: "https://x".into(),
-            api_key: json!(""),
-            request: 1,
-            list: ModelList::Loading,
-        };
-        catalog.lists.insert((environment.clone(), "g".into()), listed);
+        let request = catalog.record(&environment, "g", &generators["g"], ModelList::Loading, false);
         let stored = ModelSelection { instance_id: "g".into(), model: "a".into(), options: None };
         let pick = ModelSelection { model: "b".into(), ..stored.clone() };
         let resolve = |targets: &[Provider]| resolve_text_generation(Some(&pick), &writing_providers(&[], targets));
         let opened = catalog.targets(&environment, &generators, &[Some(&stored)]);
         assert_eq!(resolve(&opened).unwrap().model, "a", "the catalog from opening lacks b");
         let models = ["a", "b"].map(|id| Model { id: id.into(), name: id.into() }).to_vec();
-        assert!(catalog.settle(environment.clone(), "g".into(), 1, ModelList::Ready(models)));
+        assert!(catalog.settle(environment.clone(), "g".into(), request, ModelList::Ready(models)));
         let current = catalog.targets(&environment, &generators, &[Some(&stored)]);
         assert_eq!(resolve(&current), Some(pick.clone()), "the pick keeps a model listed since");
+    }
+
+    #[test]
+    fn a_refused_list_shows_why_until_the_grant_changes() {
+        let mut catalog = TextGeneratorCatalog::default();
+        let environment = SharedString::from("env");
+        let config = json!({"kind": "openaiCompatible", "baseUrl": "https://x", "apiKey": ""});
+        let generators = json!({ "g": config.clone() });
+        let refusal = ModelList::Failed("This connection requires settings:write.".into());
+        catalog.record(&environment, "g", &config, refusal, true);
+        let stored = ModelSelection { instance_id: "g".into(), model: "a".into(), options: None };
+        let shown = catalog.targets(&environment, &generators, &[Some(&stored)]);
+        assert_eq!(
+            (shown[0].status.as_str(), shown[0].message.as_deref()),
+            ("error", Some("This connection requires settings:write.")),
+            "the picker explains the refusal instead of showing the model as ready"
+        );
+        let key = (environment.clone(), "g".to_owned());
+        let current = |catalog: &TextGeneratorCatalog, refused| catalog.lists[&key].current(&config, refused);
+        assert!(current(&catalog, true), "still refused, so not asked");
+        assert!(!current(&catalog, false), "the grant arriving asks again");
+        let request = catalog.record(&environment, "g", &config, ModelList::Loading, false);
+        assert!(catalog.settle(environment.clone(), "g".into(), request, ModelList::Ready(Vec::new())));
+        assert!(!current(&catalog, true), "losing the grant refuses again");
     }
 }
