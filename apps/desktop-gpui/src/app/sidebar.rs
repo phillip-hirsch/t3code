@@ -1359,7 +1359,13 @@ impl Workspace {
                 };
                 self.open_menu(position, Anchor::TopLeft, window, cx, build);
             }
-            NavRow::Folder(_) | NavRow::Shelf(_) | NavRow::SettledMore => {}
+            NavRow::Folder(key) => {
+                let groups = self.project_groups();
+                let Some(group) = groups.iter().find(|group| group.key == key) else { return };
+                let build = self.folder_menu(group, cx);
+                self.open_menu(position, Anchor::TopLeft, window, cx, build);
+            }
+            NavRow::Shelf(_) | NavRow::SettledMore => {}
         }
     }
 
@@ -2304,6 +2310,9 @@ impl Workspace {
         let key = group.key.clone();
         let project = ScopedId::of_project(representative);
         let new_thread_label: SharedString = format!("New thread in {}", group.display_name).into();
+        // The keyboard row's button takes Tab from the list and shows while focused (`focus-within`).
+        let keyboard = self.sidebar.ring_row.as_ref() == Some(&NavRow::Folder(group.key.clone()));
+        let ring = super::chat::focus_ring(tokens);
         let new_thread = div()
             .id(SharedString::from(format!("folder-new-{}", group.key)))
             .absolute()
@@ -2312,11 +2321,16 @@ impl Workspace {
             .right(px(24.))
             .flex()
             .items_center()
-            .invisible()
-            .group_hover(FOLDER_GROUP, gpui_kit::Styled::visible)
+            .when(!keyboard, |el| el.invisible().group_hover(FOLDER_GROUP, gpui_kit::Styled::visible))
             .child(
                 div()
                     .id(SharedString::from(format!("folder-new-button-{}", group.key)))
+                    .when(keyboard, |el| {
+                        el.track_focus(&self.sidebar.row_control)
+                            .opacity(0.)
+                            .focus_visible(move |s| s.opacity(1.).shadow(vec![ring]))
+                            .group_hover(FOLDER_GROUP, |s| s.opacity(1.))
+                    })
                     .size(px(24.))
                     .flex()
                     .items_center()
