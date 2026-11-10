@@ -52,6 +52,21 @@ struct FileComment {
     text: String,
 }
 
+/// Moves each tracked mark to its remapped lines. What to rebuild: every held comment, whose
+/// quote follows the file's contents (`handleEditChange`), and the draft when it moved.
+fn remap_tracked(
+    tracked: &mut [(Option<String>, u64, u64)],
+    lines: &[(u64, u64)],
+) -> Vec<(Option<String>, (u64, u64))> {
+    (tracked.iter_mut().zip(lines))
+        .filter_map(|((id, start, end), &lines)| {
+            let moved = lines != (*start, *end);
+            (*start, *end) = lines;
+            (moved || id.is_some()).then(|| (id.clone(), lines))
+        })
+        .collect()
+}
+
 impl Workspace {
     /// The open draft's comments on `key`'s file, top to bottom.
     fn file_comments(&self, key: &FileKey) -> Vec<FileComment> {
@@ -118,17 +133,13 @@ impl Workspace {
             return;
         }
         let text = editor.read(cx).text();
-        let mut moved = Vec::new();
-        for ((id, start, end), range) in state.marks.tracked.iter_mut().zip(ranges) {
-            let lines = review_comment::remapped_lines(text, range, *end - *start);
-            if lines != (*start, *end) {
-                (*start, *end) = lines;
-                moved.push((id.clone(), lines));
-            }
-        }
-        let Some(target) = self.target.clone().filter(|_| !moved.is_empty()) else { return };
+        let lines: Vec<(u64, u64)> = (state.marks.tracked.iter().zip(ranges))
+            .map(|((_, start, end), range)| review_comment::remapped_lines(text, range, *end - *start))
+            .collect();
+        let changed = remap_tracked(&mut state.marks.tracked, &lines);
+        let Some(target) = self.target.clone().filter(|_| !changed.is_empty()) else { return };
         let contents = editor.read(cx).value();
-        for (id, (start, end)) in moved {
+        for (id, (start, end)) in changed {
             let Some(id) = id else {
                 if let Some(draft) = self.files.comment.as_mut().filter(|draft| draft.key == *key) {
                     (draft.start, draft.end) = (start, end);
@@ -136,9 +147,13 @@ impl Workspace {
                 continue;
             };
             let held = self.draft_records(&target).and_then(|records| records.get(&id));
-            let Some(comment) = held.and_then(|record| record["text"].as_str()).map(str::to_owned) else { continue };
-            let record = review_comment::file_comment(&id, &key.path, start, end, &comment, &contents);
-            self.replace_context_record(&target, record, cx);
+            let Some((held, comment)) = held.and_then(|record| Some((record, record["text"].as_str()?))) else {
+                continue;
+            };
+            let record = review_comment::file_comment(&id, &key.path, start, end, comment, &contents);
+            if record != *held {
+                self.replace_context_record(&target, record, cx);
+            }
         }
     }
 
@@ -283,5 +298,21 @@ impl Workspace {
             list = list.child(div().when(ruled, |el| el.border_t_1().border_color(rule)).child(entry));
         }
         v_flex().size_full().min_h_0().child(div().flex_1().min_h_0().child(editor)).child(list).into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_edit_requotes_every_held_comment_and_only_a_moved_draft() {
+        let mut tracked = vec![(Some("a".to_owned()), 1, 1), (None, 3, 4)];
+        assert_eq!(remap_tracked(&mut tracked, &[(1, 1), (3, 4)]), vec![(Some("a".to_owned()), (1, 1))]);
+        assert_eq!(
+            remap_tracked(&mut tracked, &[(2, 2), (5, 6)]),
+            vec![(Some("a".to_owned()), (2, 2)), (None, (5, 6))],
+        );
+        assert_eq!(tracked, vec![(Some("a".to_owned()), 2, 2), (None, 5, 6)]);
     }
 }
