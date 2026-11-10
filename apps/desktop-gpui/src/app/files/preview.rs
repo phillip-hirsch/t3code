@@ -847,6 +847,7 @@ impl Workspace {
             let tooltip: SharedString = if crumb.is_empty() { project_name.clone() } else { crumb.clone().into() };
             let source = source.clone();
             let keep = !folder;
+            let navigable = !current && (!host || logic::is_listable_host_folder(&crumb));
             trail = trail.child(
                 div()
                     .id(ElementId::Name(format!("crumb:{crumb}").into()))
@@ -862,7 +863,7 @@ impl Workspace {
                             el.text_color(tokens.muted_foreground)
                         }
                     })
-                    .when(!current, |el| {
+                    .when(navigable, |el| {
                         crate::app::chat::focusable(el, tokens)
                             .cursor_pointer()
                             .hover(|s| s.text_color(tokens.foreground))

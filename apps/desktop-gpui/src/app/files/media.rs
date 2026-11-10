@@ -41,21 +41,12 @@ pub(super) struct MediaMenu {
     _release: Subscription,
 }
 
-/// `isWindowsAbsolutePath`: a drive path or a UNC share.
-fn is_windows_absolute(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    path.starts_with("\\\\")
-        || (bytes.len() >= 2
-            && bytes[0].is_ascii_alphabetic()
-            && bytes[1] == b':'
-            && bytes.get(2).is_none_or(|c| matches!(c, b'/' | b'\\')))
-}
-
 /// `mediaFileReference` as the menu copies it (`formatFilePathForClipboard`): the full path and,
 /// inside the workspace, the relative one, with backslashes for a Windows host.
 fn clipboard_paths(cwd: &str, path: &str) -> (String, Option<String>) {
     let absolute = logic::absolute_path(cwd, path);
-    let format = |text: &str| if is_windows_absolute(&absolute) { text.replace('/', "\\") } else { text.to_owned() };
+    let format =
+        |text: &str| if logic::is_windows_absolute(&absolute) { text.replace('/', "\\") } else { text.to_owned() };
     let relative = (!logic::is_host_path(path)).then(|| format(path));
     (format(&absolute), relative)
 }
