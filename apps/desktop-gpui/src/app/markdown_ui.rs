@@ -220,7 +220,7 @@ impl Workspace {
     }
 
     /// A model chip's popover (`ModelMentionChip`): the model, its provider and the reference.
-    fn open_model_menu(
+    pub(super) fn open_model_menu(
         &mut self,
         instance_id: &str,
         model: &str,

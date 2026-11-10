@@ -442,11 +442,27 @@ impl Workspace {
         self.stash_menu_key(keystroke, window, cx)
             || self.draft_workspace_key(keystroke, window, cx)
             || (self.composer.focus_handle(cx).is_focused(window)
-                && (self.code_key(keystroke, window, cx)
+                && (self.model_chip_key(keystroke, window, cx)
+                    || self.code_key(keystroke, window, cx)
                     || self.list_outdent_key(keystroke, window, cx)
                     || self.plan_toggle_key(keystroke, window, cx)
                     || self.menu_key(keystroke, window, cx)
                     || self.prompt_suggestion_key(keystroke, window, cx)))
+    }
+
+    /// Enter on a selected model chip opens its details, as the web chip's button does.
+    fn model_chip_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if keystroke.key != "enter" || keystroke.modifiers.modified() {
+            return false;
+        }
+        let state = self.composer.read(cx);
+        let selection = state.selected_range();
+        let Some(Chip::Model { instance_id, model, .. }) = selected_chip(state.tokens(), &selection) else {
+            return false;
+        };
+        let Some(bounds) = state.range_to_bounds(&selection) else { return false };
+        self.open_model_menu(&instance_id, &model, model_chip_menu_at(bounds), window, cx);
+        true
     }
 
     /// Keys left after the keymap: 1-9 on a question card, prompt history, then a plain send.
@@ -999,6 +1015,11 @@ impl Workspace {
                     let path = if trimmed.is_empty() || drive_root { path.clone() } else { trimmed.to_owned() };
                     let _ = chip_view.update(cx, |this, cx| this.open_file_surface(path, window, cx));
                 }
+                // `ModelMentionChip`: a click or Enter opens its details popover.
+                Some(Chip::Model { instance_id, model, .. }) => {
+                    let at = model_chip_menu_at(event.bounds());
+                    let _ = chip_view.update(cx, |this, cx| this.open_model_menu(&instance_id, &model, at, window, cx));
+                }
                 _ => {}
             })
             .on_paste(move |item, window, cx| {
@@ -1104,7 +1125,9 @@ impl Workspace {
                         .children(self.render_stash_menu(f32::from(window.viewport_size().height) * 0.4, &t, cx))
                         .child(surface),
                 )
-                .children(self.render_context_strip(&t, cx)),
+                .children(self.render_context_strip(&t, cx))
+                // Message and composer chips share one menu; both surfaces draw the composer.
+                .children(self.render_chat_menu()),
         )
     }
 
@@ -2103,11 +2126,21 @@ fn render_chip(
 
 /// A `model:` chip: the provider's logo and the model's name, its details while hovered. A model
 /// the environment no longer offers keeps the name it was picked with.
+/// The chip a selection covers exactly, as a click or Shift+Arrow selects one.
+fn selected_chip(spans: &[gpui_kit::base::input::InlineTokenSpan], selection: &std::ops::Range<usize>) -> Option<Chip> {
+    let span = spans.iter().find(|span| span.range() == *selection)?;
+    Chip::from_id(span.token().id())
+}
+
+/// Where a composer model chip's popover opens: under the chip.
+fn model_chip_menu_at(bounds: gpui_kit::Bounds<gpui_kit::Pixels>) -> gpui_kit::Point<gpui_kit::Pixels> {
+    gpui_kit::point(bounds.left(), bounds.bottom() + px(4.))
+}
+
 fn render_model_chip(token: &InlineTokenContext, mention: Option<&ModelMention>, t: &Tokens) -> AnyElement {
     let id = token.token().id();
     let accent = mention.map_or_else(|| model_chip_accent(""), |m| model_chip_accent(&m.driver));
     let icon = model_chip_icon(mention.map_or("", |m| m.driver.as_str()), accent);
-    let details = mention.cloned().map(|mention| (mention, token.token().text().clone(), *t));
     h_flex()
         .h(token.line_height())
         .max_w(token.available_width())
@@ -2119,12 +2152,7 @@ fn render_model_chip(token: &InlineTokenContext, mention: Option<&ModelMention>,
         .child(icon.with_size(px(14.)).flex_none())
         .child(div().min_w_0().truncate().child(token.token().label().clone()))
         .id(ElementId::Name(format!("chip-{}-{id}", token.range().start).into()))
-        .when_some(details, |el, (mention, source, t)| {
-            el.tooltip(move |window, cx| {
-                let (mention, source) = (mention.clone(), source.clone());
-                Tooltip::element(move |_, _| model_mention_details(&mention, &source, &t)).build(window, cx)
-            })
-        })
+        .cursor_pointer()
         .into_any_element()
 }
 
@@ -2305,6 +2333,20 @@ fn black(alpha: f32) -> Hsla {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enter_opens_a_model_chip_only_while_the_selection_is_that_chip() {
+        let text = "ask model:codex/gpt-6.1 or $review now";
+        let content = InputContent::new(text)
+            .with_token(4..23, InlineToken::new("model:codex/gpt-6.1", "model:codex/gpt-6.1"))
+            .and_then(|content| content.with_token(27..34, InlineToken::new("skill:review", "$review")))
+            .unwrap();
+        let spans = content.tokens();
+        assert!(matches!(selected_chip(spans, &(4..23)), Some(Chip::Model { model, .. }) if model == "gpt-6.1"));
+        assert_eq!(selected_chip(spans, &(23..23)), None, "a caret beside it sends");
+        assert_eq!(selected_chip(spans, &(0..23)), None, "a wider selection");
+        assert_eq!(selected_chip(spans, &(27..34)), Some(Chip::Skill { name: "review".into() }));
+    }
 
     #[test]
     fn review_comment_chips_keep_their_change_request() {

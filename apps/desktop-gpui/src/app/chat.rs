@@ -117,7 +117,6 @@ impl Workspace {
                         .with_jump_button_renderer(move |button| scroll_to_end_button(button, &t)),
                     )
                     .children(minimap)
-                    .children(self.render_chat_menu())
                     .into_any_element()
             }
         }
