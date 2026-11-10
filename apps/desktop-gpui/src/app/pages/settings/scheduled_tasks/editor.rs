@@ -29,7 +29,6 @@ use super::worktree_mode::{self, NewWorktreeMode};
 use super::{ScheduledTasksView, notify_error};
 use crate::app::Workspace;
 use crate::app::model_picker::{OnPick, PickHost};
-use crate::app::pages::settings::connections::logic::ORCHESTRATION_OPERATE;
 use crate::app::pages::settings::widgets::select_trigger;
 use crate::model::{ModelSelection, ProjectShell};
 use crate::rpc::RpcClient;
@@ -60,7 +59,6 @@ pub(super) struct TaskEditor {
     list: WeakEntity<ScheduledTasksView>,
     /// The environment the task is saved on: its config, projects and models.
     environment: SharedString,
-    pub(super) client: RpcClient,
     task: Option<ScheduledTask>,
     /// Settings' scope when the editor opened: which environments and projects it offers.
     scope: Scope,
@@ -220,7 +218,6 @@ impl TaskEditor {
             workspace,
             list,
             environment,
-            client,
             task,
             scope,
             draft,
@@ -251,11 +248,12 @@ impl TaskEditor {
         }
     }
 
-    /// `upsertScheduledTask.permissionAtom`: this connection may operate on the environment.
+    /// `upsertScheduledTask.permissionAtom` on the environment the task is saved on.
     fn can_operate(&self, cx: &App) -> bool {
+        let input = json!({"id": self.draft.editing_id});
         self.workspace
             .upgrade()
-            .is_some_and(|w| w.read(cx).environment_grants(&self.environment, ORCHESTRATION_OPERATE))
+            .is_some_and(|w| w.read(cx).env_permits(&self.environment, "scheduledTasks.upsert", &input))
     }
 
     /// "Runs on" picked another connected environment: its projects, models and checkouts
@@ -279,7 +277,6 @@ impl TaskEditor {
         let worktree_client = client.clone();
         self.worktree = cx.new(|cx| NewWorktreeMode::new(worktree_client, cwd, None, window, cx));
         self.environment = environment;
-        self.client = client;
         cx.notify();
     }
 
@@ -594,10 +591,11 @@ impl TaskEditor {
             input["id"] = json!(id);
             input["requireExisting"] = json!(true);
         }
+        // The socket the environment has now: a reconnect while the editor was open replaced it.
+        let Some(client) = workspace.read(cx).env_client(&self.environment) else { return };
         self.submission_pending = true;
         self.set_saving(true, cx);
         cx.notify();
-        let client = self.client.clone();
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("scheduledTasks.upsert", input).await;
             let _ = this.update_in(cx, |this, window, cx| {
