@@ -24,6 +24,7 @@ use super::Workspace;
 use super::embed::{EmbedView, FRAME_CSS, FRAME_SCRIPT, Layer};
 use super::html_page::escape_attribute;
 use super::mermaid::css_color;
+use super::side_chat::ChatPane;
 use crate::mcp_apps::{
     self, AppReference, ContextInput, DisplayMode, Download, Event, Host, Outcome, Request, Ticket, ToolCall,
 };
@@ -812,8 +813,9 @@ impl Workspace {
             }
             _ => {}
         }
-        let send_allowed = self.thread.as_ref().is_some_and(|thread| thread.id == scope.conversation)
-            || self.side_chat_thread_id() == Some(scope.conversation.as_str());
+        let send_allowed = [ChatPane::Main, ChatPane::Side]
+            .into_iter()
+            .any(|pane| self.pane_shows(pane, &scope.environment, &scope.conversation));
         let can_send = send_allowed && self.can_operate(&scope.environment);
         let Some(client) = self.env_client(&scope.environment) else {
             self.finish_app_request(key, generation, ticket, Outcome::Failed("Request failed.".into()), cx);
@@ -859,8 +861,11 @@ impl Workspace {
         if self.mcp_apps.apps.is_empty() {
             return;
         }
-        let main_thread = self.thread.as_ref().map(|thread| thread.id.clone());
-        let side_thread = self.side_chat_thread_id().map(str::to_owned);
+        let main_thread = self.pane_thread(ChatPane::Main);
+        let side_thread = self.pane_thread(ChatPane::Side);
+        let shows = |pane: &Option<(SharedString, String)>, scope: &Scope| {
+            pane.as_ref().is_some_and(|(env, id)| *env == scope.environment && *id == scope.conversation)
+        };
         let awaiting_in = |projection: Option<&crate::model::ThreadProjection>| {
             projection.is_some_and(|p| !p.pending_approvals().is_empty() || !p.pending_user_inputs().is_empty())
         };
@@ -872,10 +877,9 @@ impl Workspace {
         let mut step_aside = Vec::new();
         let mut contexts = Vec::new();
         for (key, app) in &mut self.mcp_apps.apps {
-            let on_screen = main_thread.as_ref() == Some(&app.scope.conversation)
-                || side_thread.as_ref() == Some(&app.scope.conversation);
-            let awaiting =
-                if main_thread.as_ref() == Some(&app.scope.conversation) { main_awaiting } else { side_awaiting };
+            let in_main = shows(&main_thread, &app.scope);
+            let on_screen = in_main || shows(&side_thread, &app.scope);
+            let awaiting = if in_main { main_awaiting } else { side_awaiting };
             if app.display == DisplayMode::Fullscreen && (!on_screen || (awaiting && !app.awaiting)) {
                 step_aside.push(key.clone());
             }

@@ -25,6 +25,7 @@ use super::Workspace;
 use super::embed::{EmbedView, FRAME_CSS, FRAME_SCRIPT, Layer};
 use super::image_viewer::{Reference, ViewerImage};
 use super::mermaid::css_color;
+use super::side_chat::ChatPane;
 use crate::theme::Tokens;
 use crate::timeline::{self, PAGE_MAX_HEIGHT, PAGE_MIN_HEIGHT, PageSize, clamp_page_height};
 
@@ -229,8 +230,8 @@ struct Page {
 struct Dialog {
     key: PageKey,
     title: SharedString,
-    /// The thread it opened from: leaving the thread closes it, as unmounting the row does.
-    thread: Option<String>,
+    /// The environment and thread it opened from: leaving them closes it, as unmounting the row does.
+    thread: Option<(SharedString, String)>,
     embed: Option<EmbedView>,
     zoom: f32,
     dark: bool,
@@ -588,7 +589,7 @@ impl Workspace {
         self.html_pages.dialog = Some(Dialog {
             key: key.clone(),
             title: embed.title.clone(),
-            thread: self.thread.as_ref().map(|thread| thread.id.clone()),
+            thread: self.pane_thread(ChatPane::Main),
             embed: None,
             zoom: 1.,
             dark: look.dark,
@@ -684,8 +685,7 @@ impl Workspace {
             let oldest_kept = used[KEPT_PAGES - 1];
             pages.pages.retain(|_, page| page.used >= oldest_kept || page.used + 1 >= last);
         }
-        let thread = self.thread.as_ref().map(|thread| thread.id.as_str());
-        if self.html_pages.dialog.as_ref().is_some_and(|dialog| dialog.thread.as_deref() != thread) {
+        if self.html_pages.dialog.as_ref().is_some_and(|dialog| dialog.thread != self.pane_thread(ChatPane::Main)) {
             self.close_html_dialog(window, cx);
         }
     }
