@@ -582,17 +582,22 @@ impl RenameForm {
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let label = self.label.read(cx).value().to_string();
         let saving = self.saved.update(cx, |saved, cx| saved.rename(&self.id, &label, cx));
-        cx.spawn_in(window, async move |this, cx| {
-            let result = finished(saving).await;
-            drop(this.update_in(cx, |this, window, cx| match result {
-                Ok(()) => window.close_dialog(cx),
-                Err(error) => {
-                    this.error = Some(error.into());
-                    cx.notify();
-                }
-            }));
-        })
-        .detach();
+        let form = cx.weak_entity();
+        window
+            .spawn(cx, async move |cx| {
+                let result = finished(saving).await;
+                drop(cx.update(|window, cx| match (result, form.upgrade()) {
+                    (Ok(()), Some(_)) => window.close_dialog(cx),
+                    (Ok(()), None) => {}
+                    (Err(error), Some(form)) => form.update(cx, |form, cx| {
+                        form.error = Some(error.into());
+                        cx.notify();
+                    }),
+                    // Closed while saving: the failure still has to surface.
+                    (Err(error), None) => error_toast(window, cx, "Could not rename the environment", error),
+                }));
+            })
+            .detach();
     }
 }
 

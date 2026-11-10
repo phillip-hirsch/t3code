@@ -630,9 +630,14 @@ fn open_link_dialog(
     let description: SharedString = "Agents here can then launch, message and wait on threads there. It appears in that environment's Connections, where it can be revoked.".into();
     window.open_dialog(cx, move |dialog, _, cx| {
         let t = theme::tokens(cx);
+        // The web keeps it open while linking, so a result is never lost with the form.
+        let busy = form.read(cx).busy;
         dialog
             .title("Link an environment")
             .w(px(448.))
+            .close_button(!busy)
+            .keyboard(!busy)
+            .overlay_closable(!busy)
             .child(text_sm(div().mb(px(16.)).text_color(t.muted_foreground)).child(description.clone()))
             .child(form.clone())
     });
