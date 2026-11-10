@@ -583,8 +583,13 @@ mod tests {
             _ => Vec::new(),
         };
         let pycharm = remote_editor("pycharm").unwrap();
+        // The app only builds candidates for its own platform; on a Windows host the joins use `\`.
+        let candidates: Vec<String> = install_candidates(pycharm, Platform::MacOs, &env, &read_dir)
+            .iter()
+            .map(|path| path.replace('\\', "/"))
+            .collect();
         assert_eq!(
-            install_candidates(pycharm, Platform::MacOs, &env, &read_dir),
+            candidates,
             [
                 "/Users/me/Applications/PyCharm.app/Contents/MacOS/pycharm",
                 "/Users/me/Applications/PyCharm CE.app/Contents/MacOS/pycharm",
@@ -595,10 +600,11 @@ mod tests {
             ]
         );
         let zed = remote_editor("zed").unwrap();
-        let mac_zed = install_candidates(zed, Platform::MacOs, &env, &|_| Vec::new());
+        let unix = |paths: Vec<String>| -> Vec<String> { paths.iter().map(|path| path.replace('\\', "/")).collect() };
+        let mac_zed = unix(install_candidates(zed, Platform::MacOs, &env, &|_| Vec::new()));
         assert_eq!(mac_zed.last().map(String::as_str), Some("zeditor"));
         assert_eq!(mac_zed.first().map(String::as_str), Some("/Users/me/Applications/Zed.app/Contents/MacOS/cli"));
-        let linux_zed = install_candidates(zed, Platform::Linux, &env, &|_| Vec::new());
+        let linux_zed = unix(install_candidates(zed, Platform::Linux, &env, &|_| Vec::new()));
         assert_eq!(&linux_zed[..2], ["zeditor", "/Users/me/.local/bin/zeditor"]);
     }
 

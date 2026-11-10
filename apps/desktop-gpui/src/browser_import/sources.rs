@@ -797,7 +797,9 @@ mod tests {
         let firefox = definition(SourceId::Firefox);
         let root = user_data_directory(firefox, &paths).unwrap();
         touch(&root.join("abc.default").join("cookies.sqlite"));
-        let snap = home.join("snap/firefox/common/.mozilla/firefox");
+        let snap = ["snap", "firefox", "common", ".mozilla", "firefox"]
+            .iter()
+            .fold(home.clone(), |path, part| path.join(part));
         touch(&snap.join("snap.default").join("cookies.sqlite"));
         let found = list_profiles(firefox, &paths);
         let directories: Vec<&str> = found.iter().map(|p| p.directory.as_str()).collect();
@@ -805,7 +807,7 @@ mod tests {
         assert_eq!(directories, ["abc.default", snap_profile.as_str()]);
         assert_eq!(
             resolve_cookie_database(firefox, &paths, &snap_profile),
-            Some(snap.join("snap.default/cookies.sqlite"))
+            Some(snap.join("snap.default").join("cookies.sqlite"))
         );
         std::fs::remove_dir_all(home).unwrap();
     }
