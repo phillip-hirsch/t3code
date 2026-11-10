@@ -5,8 +5,8 @@
 //!
 //! The Repositories and Writing & review rows write through the settings scope. Discovery,
 //! sign-in, tokens, accounts and host fields are per environment (`server.updateSettings` on the
-//! environment discovery ran against). The web's secret-provider picker beside token fields
-//! belongs to Settings › Secrets; here a token is always a typed value.
+//! environment discovery ran against). Token and host credential fields offer the secret
+//! providers the environment can read from (`SecretSourceInput`).
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -223,6 +223,23 @@ fn has_secret(value: &Value) -> bool {
     value.as_str().map_or(!value.is_null(), |text| !text.is_empty())
 }
 
+/// The token draft's secret reference: one picked over this host's saved token (`key`), else the
+/// saved token when it is a reference.
+fn token_reference(picked: Option<&(String, Option<Value>)>, key: &str, saved: &Value) -> Option<Value> {
+    match picked {
+        Some((picked_over, reference)) if picked_over == key => reference.clone(),
+        _ => crate::app::pages::settings::secret_source::as_reference(saved).cloned(),
+    }
+}
+
+/// What Save sends: the reference, else the typed token; `None` when there is nothing to save.
+fn submission(typed: &str, reference: Option<&Value>) -> Option<Value> {
+    match reference {
+        Some(reference) => Some(reference.clone()),
+        None => Some(typed.trim()).filter(|typed| !typed.is_empty()).map(Value::from),
+    }
+}
+
 /// `redactedPlaceholder`: the same length and punctuation, other characters scrambled stably.
 fn redacted(value: &str) -> String {
     const ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
@@ -334,6 +351,9 @@ struct SourceControlState {
     token_saved: bool,
     token_host: Entity<InputState>,
     token: Entity<InputState>,
+    /// A secret reference picked for the token (or `None`, back to a typed one), with the host
+    /// and saved token it was picked over: it applies only while they are unchanged.
+    token_reference: Option<(String, Option<Value>)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -365,6 +385,7 @@ impl SourceControlState {
             token_saved: false,
             token_host,
             token,
+            token_reference: None,
             _subscriptions: subscriptions,
         }
     }
@@ -1257,11 +1278,15 @@ impl Workspace {
             (state.token_host.clone(), state.token.clone(), state.saving)
         };
         let typed_host = host_input.read(cx).value().trim().to_lowercase();
-        let draft = token_input.read(cx).value().trim().to_owned();
-        let is_saved = has_secret(&tokens_map[&typed_host]);
-        if state.read(cx).token_saved != is_saved {
-            state.update(cx, |state, _| state.token_saved = is_saved);
-            let placeholder = if is_saved { "Stored secret, enter a new value to replace" } else { "Not set" };
+        let saved_token = tokens_map[&typed_host].clone();
+        let is_saved = has_secret(&saved_token);
+        let source_key = json!([typed_host, saved_token]).to_string();
+        let reference = token_reference(state.read(cx).token_reference.as_ref(), &source_key, &saved_token);
+        let draft = submission(&token_input.read(cx).value(), reference.as_ref());
+        let configured = is_saved && !saved_token.is_object();
+        if state.read(cx).token_saved != configured {
+            state.update(cx, |state, _| state.token_saved = configured);
+            let placeholder = if configured { "Stored secret, enter a new value to replace" } else { "Not set" };
             token_input.update(cx, |input, cx| input.set_placeholder(placeholder, window, cx));
         }
         let saved_hosts: Vec<String> = tokens_map
@@ -1271,14 +1296,14 @@ impl Workspace {
         let link_host = if typed_host.is_empty() { credentials.public_host.to_owned() } else { typed_host.clone() };
         let save = {
             let (state, tokens_map) = (state.clone(), tokens_map);
-            move |this: &mut Self, host: String, token: String, cx: &mut Context<Self>| {
+            move |this: &mut Self, host: String, token: Value, cx: &mut Context<Self>| {
                 state.update(cx, |state, cx| {
                     state.saving = true;
                     cx.notify();
                 });
                 // The whole map: other tokens' redaction markers keep their values.
                 let mut tokens = tokens_map.as_object().cloned().unwrap_or_default();
-                tokens.insert(host, json!(token));
+                tokens.insert(host, token);
                 let state = state.clone();
                 this.update_environment_settings(
                     json!({ "sourceControlHosts": { kind: { "tokens": tokens } } }),
@@ -1286,6 +1311,7 @@ impl Workspace {
                     move |this, ok, cx| {
                         state.update(cx, |state, _| state.saving = false);
                         if ok {
+                            state.update(cx, |state, _| state.token_reference = None);
                             this.clear_token_draft(&state, cx);
                             this.rescan(&state, cx);
                         }
@@ -1295,7 +1321,26 @@ impl Workspace {
         };
         let remove = save.clone();
         let remove_host = typed_host.clone();
-        let can_save = !typed_host.is_empty() && !draft.is_empty() && !saving;
+        let can_save = !typed_host.is_empty() && draft.is_some() && !saving;
+        let token_field = {
+            let state = state.downgrade();
+            crate::app::pages::settings::secret_source::secret_source_input(
+                format!("{kind}-token"),
+                "GitHub token",
+                reference.as_ref(),
+                &self.settings_secret_sources(),
+                saving,
+                || Input::new(&token_input).small().disabled(saving).into_any_element(),
+                move |secret, _, cx| {
+                    let _ = state.update(cx, |state, cx| {
+                        state.token_reference = Some((source_key.clone(), secret));
+                        cx.notify();
+                    });
+                },
+                window,
+                cx,
+            )
+        };
         v_flex()
             .gap(px(12.))
             .child({
@@ -1329,14 +1374,7 @@ impl Workspace {
                         div().w(px(192.)).child(Input::new(&host_input).small().disabled(saving)),
                         &t,
                     ))
-                    .child(
-                        field_label(
-                            "Token",
-                            div().flex_1().child(Input::new(&token_input).small().disabled(saving)),
-                            &t,
-                        )
-                        .flex_1(),
-                    ),
+                    .child(field_label("Token", h_flex().flex_1().child(token_field.row()), &t).flex_1()),
             )
             .child(
                 h_flex()
@@ -1362,7 +1400,7 @@ impl Workspace {
                                         .label("Remove")
                                         .disabled(saving)
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            remove(this, remove_host.clone(), String::new(), cx);
+                                            remove(this, remove_host.clone(), json!(""), cx);
                                         })),
                                 )
                             })
@@ -1373,8 +1411,8 @@ impl Workspace {
                                     .label("Save")
                                     .disabled(!can_save)
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        if can_save {
-                                            save(this, typed_host.clone(), draft.clone(), cx);
+                                        if let Some(draft) = draft.clone().filter(|_| can_save) {
+                                            save(this, typed_host.clone(), draft, cx);
                                         }
                                     })),
                             ),
@@ -1648,18 +1686,74 @@ impl Workspace {
                 }
             };
             let input = if field.secret {
-                let placeholder =
-                    if has_secret(stored) { "Stored secret, enter a new value to replace" } else { "Not set" };
-                self.secret_field(&format!("{kind}-{key}"), placeholder, window, cx, commit)
+                let reference = crate::app::pages::settings::secret_source::as_reference(stored);
+                let placeholder = if has_secret(stored) && reference.is_none() {
+                    "Stored secret, enter a new value to replace"
+                } else {
+                    "Not set"
+                };
+                let input = self.secret_field(&format!("{kind}-{key}"), placeholder, window, cx, commit);
+                let write = {
+                    let (state, workspace) = (state.clone(), cx.weak_entity());
+                    move |value: Value, cx: &mut gpui_kit::App| {
+                        let state = state.clone();
+                        let _ = workspace.update(cx, |this, cx| {
+                            this.update_environment_settings(
+                                json!({ "sourceControlHosts": { kind: { key: value } } }),
+                                cx,
+                                move |this, ok, cx| {
+                                    if ok {
+                                        this.rescan(&state, cx);
+                                    }
+                                },
+                            );
+                        });
+                    }
+                };
+                let write = Rc::new(write);
+                let parts = {
+                    let write = write.clone();
+                    crate::app::pages::settings::secret_source::secret_source_input(
+                        format!("{kind}-{key}"),
+                        field.title,
+                        reference,
+                        &self.settings_secret_sources(),
+                        false,
+                        || input.element(),
+                        move |secret, _, cx| write(secret.unwrap_or_else(|| json!("")), cx),
+                        window,
+                        cx,
+                    )
+                };
+                h_flex()
+                    .w(px(384.))
+                    .items_start()
+                    .gap(px(8.))
+                    .child(parts.row())
+                    .when(has_secret(stored), |el| {
+                        el.child(
+                            Button::new(SharedString::from(format!("clear-{kind}-{key}")))
+                                .ghost()
+                                .small()
+                                .size(px(28.))
+                                .text_color(t.muted_foreground)
+                                .icon(Icon::new(Lucide::X).with_size(px(14.)))
+                                .tooltip(format!("Clear {}", field.title))
+                                .on_click(move |_, _, cx| write(json!(""), cx)),
+                        )
+                    })
+                    .into_any_element()
             } else {
                 let text = stored.as_str().unwrap_or_default();
                 self.text_field(&format!("{kind}-{key}"), text, field.placeholder, false, None, window, cx, commit)
+                    .sized(px(384.))
+                    .into_any_element()
             };
             column = column.child(
                 v_flex()
                     .gap(px(6.))
                     .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(t.foreground).child(field.title))
-                    .child(input.sized(px(384.)))
+                    .child(input)
                     .child(div().max_w(px(672.)).text_xs().text_color(t.muted_foreground).child(field.description)),
             );
         }
