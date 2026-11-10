@@ -151,6 +151,12 @@ pub enum Chip {
         citation: Box<AssistantCitation>,
         label: String,
     },
+    /// `model:<instance>/<model>`: a model named for the agent; `label` is its display name.
+    Model {
+        instance_id: String,
+        model: String,
+        label: String,
+    },
 }
 
 impl Chip {
@@ -160,6 +166,7 @@ impl Chip {
             Chip::Skill { name } => format!("skill:{name}"),
             Chip::Context { kind, id, .. } => format!("context:{kind}/{id}"),
             Chip::Citation { citation, .. } => format!("{CITATION_ID}{}", citation.href()),
+            Chip::Model { instance_id, model, .. } => model_mention(instance_id, model),
         }
     }
 
@@ -173,11 +180,11 @@ impl Chip {
         match self {
             Chip::File { path } => basename(path),
             Chip::Skill { name } => name,
-            Chip::Context { label, .. } | Chip::Citation { label, .. } => label,
+            Chip::Context { label, .. } | Chip::Citation { label, .. } | Chip::Model { label, .. } => label,
         }
     }
 
-    /// The chip an editor token id names; context chips come back without their label.
+    /// The chip an editor token id names; context and model chips come back without their label.
     pub fn from_id(id: &str) -> Option<Self> {
         if let Some(path) = id.strip_prefix("file:") {
             return Some(Chip::File { path: path.to_owned() });
@@ -187,6 +194,13 @@ impl Chip {
         }
         if let Some(href) = id.strip_prefix(CITATION_ID) {
             return crate::assistant_citations::parse_href(href).map(Chip::citation);
+        }
+        if let Some((instance_id, model)) = id.strip_prefix(MODEL_PREFIX).and_then(|rest| rest.split_once('/')) {
+            return Some(Chip::Model {
+                instance_id: instance_id.to_owned(),
+                model: model.to_owned(),
+                label: String::new(),
+            });
         }
         let (kind, id) = id.strip_prefix("context:")?.split_once('/')?;
         Some(Chip::Context { kind: kind.to_owned(), id: id.to_owned(), label: String::new() })
@@ -205,23 +219,158 @@ pub fn context_link(kind: &str, id: &str, label: &str) -> String {
 const CONTEXT_PREFIX: &str = "t3-context://v1/";
 const CITATION_ID: &str = "citation:";
 
+/// JavaScript's `\s` and `trimEnd` whitespace (Rust's adds U+0085 and lacks U+FEFF).
+fn is_js_space(c: char) -> bool {
+    matches!(
+        c,
+        '\t' | '\n' | '\u{b}' | '\u{c}' | '\r' | ' ' | '\u{a0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}'
+    )
+}
+
+/// The context links in `text` as the web's `collectComposerContextReferences` finds them: the
+/// `CONTEXT_LINK` pattern `(!?)\[([^\]\n]{0,512})\]\((t3-context://v1/[^\s)]{1,200})\)`, left to
+/// right without overlap, each with its chip id when the href parses (`parseComposerContextHref`).
+/// A match whose href does not parse is still consumed, as `matchAll` does.
+fn context_links(text: &str) -> Vec<(Range<usize>, Option<Chip>)> {
+    let mut links = Vec::new();
+    if !text.contains("](t3-context:") {
+        return links;
+    }
+    let mut at = 0;
+    while let Some(open) = text[at..].find('[') {
+        let bracket = at + open;
+        // `!?` takes a `!` right before the `[`; with or without it the rest must match.
+        let start = if bracket > at && text[..bracket].ends_with('!') { bracket - 1 } else { bracket };
+        match context_link_at(text, bracket) {
+            Some((end, chip)) => {
+                links.push((start..end, chip));
+                at = end;
+            }
+            None => at = bracket + 1,
+        }
+    }
+    links
+}
+
+/// The end of a context link whose `[` is at `bracket`, and its chip if the href parses.
+fn context_link_at(text: &str, bracket: usize) -> Option<(usize, Option<Chip>)> {
+    let rest = text[bracket..].strip_prefix('[')?;
+    let close = rest.find([']', '\n'])?;
+    if !rest[close..].starts_with(']') || rest[..close].encode_utf16().count() > 512 {
+        return None;
+    }
+    let target = rest[close + 1..].strip_prefix('(')?;
+    let href_len = target.find(|c: char| c == ')' || is_js_space(c)).unwrap_or(target.len());
+    if !target[href_len..].starts_with(')') {
+        return None;
+    }
+    let body = target[..href_len].strip_prefix(CONTEXT_PREFIX)?;
+    if !(1..=200).contains(&body.encode_utf16().count()) {
+        return None;
+    }
+    let end = bracket + 1 + close + 1 + 1 + href_len + 1;
+    let kind_ok = |k: &str| {
+        k.len() <= 40
+            && k.starts_with(|c: char| c.is_ascii_lowercase())
+            && k.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    };
+    let id_ok =
+        |i: &str| (1..=128).contains(&i.len()) && i.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    let chip = body.split_once('/').filter(|(kind, id)| kind_ok(kind) && id_ok(id)).map(|(kind, id)| Chip::Context {
+        kind: kind.to_owned(),
+        id: id.to_owned(),
+        label: context_label(&rest[..close], kind),
+    });
+    Some((end, chip))
+}
+
+/// `sanitizeComposerContextLabel`: brackets, backslashes and line breaks become spaces, runs of
+/// whitespace one space, at most 200 UTF-16 units without splitting a pair, else the kind.
+fn context_label(raw: &str, kind: &str) -> String {
+    let spaced: String =
+        raw.chars().map(|c| if matches!(c, '[' | ']' | '\\' | '\r' | '\n') { ' ' } else { c }).collect();
+    let mut label = String::new();
+    for word in spaced.split(is_js_space).filter(|w| !w.is_empty()) {
+        if !label.is_empty() {
+            label.push(' ');
+        }
+        label.push_str(word);
+    }
+    let mut units = 0;
+    let cut = label
+        .char_indices()
+        .find(|(_, c)| {
+            units += c.len_utf16();
+            units > 200
+        })
+        .map_or(label.len(), |(at, _)| at);
+    label.truncate(cut);
+    if label.is_empty() { kind.to_owned() } else { label }
+}
+
+/// `collectComposerContextReferences`: each context link in `text` whose href parses, as its whole
+/// byte range (a leading `!` included) with its kind and id.
+pub fn context_references(text: &str) -> impl Iterator<Item = (Range<usize>, String, String)> {
+    context_links(text).into_iter().filter_map(|(range, chip)| match chip? {
+        Chip::Context { kind, id, .. } => Some((range, kind, id)),
+        _ => None,
+    })
+}
+
+/// `collectInlineContextIds`: the chip id of each context link anywhere in `text`, once, chip or
+/// not (fenced code included).
+pub fn context_reference_ids(text: &str) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for id in context_links(text).into_iter().filter_map(|(_, chip)| chip.map(|chip| chip.id())) {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+/// `removeInlineContextReference`: the byte ranges that remove every reference to chip `id` from
+/// `text`, chip or not, in the order to apply them. Like the web it works last reference first on
+/// the text as it shrinks: each takes the space after it, else the one before it, and when the
+/// removals end at the end of the text, trailing whitespace goes too.
+pub fn context_reference_removals(text: &str, id: &str) -> Vec<Range<usize>> {
+    let found: Vec<Range<usize>> = context_links(text)
+        .into_iter()
+        .filter(|(_, chip)| chip.as_ref().is_some_and(|chip| chip.id() == id))
+        .map(|(range, _)| range)
+        .collect();
+    let mut result = text.to_owned();
+    let mut cursor = result.len();
+    let mut removals = Vec::with_capacity(found.len() + 1);
+    for Range { mut start, mut end } in found.into_iter().rev() {
+        if result[end..].starts_with(' ') {
+            end += 1;
+        } else if result[..start].ends_with(' ') {
+            start -= 1;
+        }
+        result.replace_range(start..end, "");
+        removals.push(start..end);
+        cursor = start;
+    }
+    if !removals.is_empty() && cursor >= result.len() {
+        let trimmed = result.trim_end_matches(is_js_space).len();
+        if trimmed < result.len() {
+            removals.push(trimmed..result.len());
+        }
+    }
+    removals
+}
+
 /// The file links and known skills in `text` that render as chips: each must
 /// start the text or follow whitespace, and be followed by whitespace
-/// (`FILE_LINK_TOKEN_REGEX`, `SKILL_TOKEN_REGEX`). Citations are chips wherever they
-/// stand, ahead of any other token they overlap (`collectComposerPromptInlineTokens`).
+/// (`FILE_LINK_TOKEN_REGEX`, `SKILL_TOKEN_REGEX`). Citations and context links are chips
+/// wherever they stand, ahead of any other token they overlap
+/// (`collectComposerPromptInlineTokens`).
 pub fn chips(text: &str, is_skill: impl Fn(&str) -> bool) -> Vec<(Range<usize>, Chip)> {
-    let mut citations = crate::assistant_citations::collect(text).into_iter().peekable();
     let mut found = Vec::new();
     let mut i = 0;
     while i < text.len() {
-        if citations.peek().is_some_and(|(range, _)| range.start == i)
-            && let Some((range, citation)) = citations.next()
-        {
-            i = range.end;
-            found.push((range, Chip::citation(citation)));
-            continue;
-        }
-        let next_citation = citations.peek().map_or(text.len(), |(range, _)| range.start);
         let at_word_start = i == 0 || text[..i].ends_with(is_space);
         let rest = &text[i..];
         let next = rest.chars().next().map_or(1, char::len_utf8);
@@ -229,9 +378,7 @@ pub fn chips(text: &str, is_skill: impl Fn(&str) -> bool) -> Vec<(Range<usize>, 
             i += next;
             continue;
         }
-        let parsed = if let Some(found) = parse_context_link(rest) {
-            Some(found)
-        } else if rest.starts_with('[') {
+        let parsed = if rest.starts_with('[') {
             parse_file_link(rest).map(|(len, path)| (len, Chip::File { path }))
         } else if rest.starts_with(is_currency) {
             parse_skill(&rest[next..])
@@ -241,38 +388,254 @@ pub fn chips(text: &str, is_skill: impl Fn(&str) -> bool) -> Vec<(Range<usize>, 
             None
         };
         match parsed {
-            Some((len, chip))
-                if i + len <= next_citation
-                    && (text[i + len..].starts_with(is_space)
-                        || (matches!(chip, Chip::Context { .. }) && i + len == text.len())) =>
-            {
+            Some((len, chip)) if text[i + len..].starts_with(is_space) => {
                 found.push((i..i + len, chip));
                 i += len;
             }
             _ => i += next,
         }
     }
+    // Citations, then context links, chip wherever the web's collectors find them, and win over
+    // what they overlap (`collectComposerPromptInlineTokens`).
+    let citations = crate::assistant_citations::collect(text).into_iter().map(|(range, c)| (range, Chip::citation(c)));
+    let links: Vec<(Range<usize>, Chip)> =
+        citations.chain(context_links(text).into_iter().filter_map(|(range, chip)| Some((range, chip?)))).collect();
+    if links.is_empty() {
+        return found;
+    }
+    found.retain(|(range, _)| !links.iter().any(|(link, _)| range.start < link.end && link.start < range.end));
+    found.extend(links);
+    found.sort_by_key(|(range, _)| range.start);
+    // A link starting inside an earlier one stays text (`splitPromptTextIntoComposerSegments`).
+    let mut end = 0;
+    found.retain(|(range, _)| {
+        let kept = range.start >= end;
+        if kept {
+            end = range.end;
+        }
+        kept
+    });
     found
+}
+
+/// [`chips`], plus the `model:` references `model_label` knows, labelled by it. Like a
+/// `$skill`, a reference chips only once whitespace follows it, so `gpt-6` cannot chip on the
+/// way to `gpt-6.1` (`collectModelTokens`). In `rich` text, fenced code stays as written.
+pub fn chips_with_models(
+    text: &str,
+    rich: bool,
+    is_skill: impl Fn(&str) -> bool,
+    model_label: impl Fn(&str, &str) -> Option<String>,
+) -> ChipSpans {
+    let mut found = chips(text, is_skill);
+    let taken = found.len();
+    for mention in model_mentions(text) {
+        let range = mention.range;
+        if !text[range.end..].starts_with(char::is_whitespace)
+            || found[..taken].iter().any(|(other, _)| other.start < range.end && range.start < other.end)
+        {
+            continue;
+        }
+        let Some(label) = model_label(&mention.instance_id, &mention.model) else { continue };
+        found.push((range, Chip::Model { instance_id: mention.instance_id, model: mention.model, label }));
+    }
+    if rich && text.contains(['`', '~']) {
+        let code = crate::composer_edit::fenced_ranges(text);
+        found.retain(|(range, _)| !code.iter().any(|block| block.start < range.end && range.start < block.end));
+    }
+    found.sort_by_key(|(range, _)| range.start);
+    found
+}
+
+/// `skillChipReplacements`, once the known skills or models change: which `tokens` (each its
+/// range, token id and label) go back to text, and which runs of `text` become skill or model
+/// chips. Other chips stay; a model chip whose name changed comes back relabelled. In `rich`
+/// text, one inside fenced code goes back to text.
+pub fn reconcile_chips(
+    text: &str,
+    rich: bool,
+    tokens: &[(Range<usize>, &str, &str)],
+    is_skill: impl Fn(&str) -> bool,
+    model_label: impl Fn(&str, &str) -> Option<String>,
+) -> (Vec<Range<usize>>, ChipSpans) {
+    let code = if rich && text.contains(['`', '~']) { crate::composer_edit::fenced_ranges(text) } else { Vec::new() };
+    let in_code = |range: &Range<usize>| code.iter().any(|block| block.start < range.end && range.start < block.end);
+    let stale: Vec<Range<usize>> = tokens
+        .iter()
+        .filter(|(range, id, label)| match Chip::from_id(id) {
+            Some(Chip::Skill { name }) => in_code(range) || !is_skill(&name),
+            Some(Chip::Model { instance_id, model, .. }) => {
+                in_code(range) || model_label(&instance_id, &model).as_deref() != Some(*label)
+            }
+            _ => false,
+        })
+        .map(|(range, ..)| range.clone())
+        .collect();
+    let kept: Vec<&Range<usize>> = tokens.iter().map(|(range, ..)| range).filter(|r| !stale.contains(r)).collect();
+    let fresh = chips_with_models(text, rich, &is_skill, &model_label)
+        .into_iter()
+        .filter(|(range, chip)| {
+            matches!(chip, Chip::Skill { .. } | Chip::Model { .. })
+                && !kept.iter().any(|other| other.start < range.end && range.start < other.end)
+        })
+        .collect();
+    (stale, fresh)
+}
+
+/// [`reconcile_chips`] after an undo or redo: only chips it brought back for a skill or model
+/// that is gone return to text (a renamed model's relabelled); plain text stays as it was.
+pub fn reconcile_restored_chips(
+    text: &str,
+    rich: bool,
+    tokens: &[(Range<usize>, &str, &str)],
+    is_skill: impl Fn(&str) -> bool,
+    model_label: impl Fn(&str, &str) -> Option<String>,
+) -> (Vec<Range<usize>>, ChipSpans) {
+    let (stale, mut fresh) = reconcile_chips(text, rich, tokens, is_skill, model_label);
+    fresh.retain(|(range, _)| stale.contains(range));
+    (stale, fresh)
+}
+
+/// Rich text turned on or off: the web remounts its editor, rebuilding every chip from the text
+/// (`buildDocJson`). Which `tokens` go back to text and which runs become chips, so the editor
+/// ends with exactly [`chips_with_models`]'s; a chip already in place stays as it is.
+pub fn remount_chips(
+    text: &str,
+    rich: bool,
+    tokens: &[(Range<usize>, &str, &str)],
+    is_skill: impl Fn(&str) -> bool,
+    model_label: impl Fn(&str, &str) -> Option<String>,
+) -> (Vec<Range<usize>>, ChipSpans) {
+    let rebuilt = chips_with_models(text, rich, is_skill, model_label);
+    let same = |(range, id, label): &(Range<usize>, &str, &str), (other, chip): &(Range<usize>, Chip)| {
+        range == other && *id == chip.id() && (!matches!(chip, Chip::Model { .. }) || *label == chip.label())
+    };
+    let stale = tokens.iter().filter(|token| !rebuilt.iter().any(|chip| same(token, chip)));
+    let stale = stale.map(|(range, ..)| range.clone()).collect();
+    let fresh = rebuilt.into_iter().filter(|chip| !tokens.iter().any(|token| same(token, chip))).collect();
+    (stale, fresh)
+}
+
+const MODEL_PREFIX: &str = "model:";
+
+/// `formatComposerModelMention`: the prompt text naming a provider instance's model for the
+/// agent. No `@`, which would read as a file mention.
+pub fn model_mention(instance_id: &str, model: &str) -> String {
+    format!("{MODEL_PREFIX}{instance_id}/{model}")
+}
+
+/// A `model:<instance>/<model>` reference and where it sits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelMention {
+    pub instance_id: String,
+    pub model: String,
+    pub range: Range<usize>,
+}
+
+/// `collectComposerModelMentions`: the references [`model_mention`] writes, at the start of the
+/// text or after whitespace, `,`, `(`, `[`, `"` or `'`. Model slugs may hold `/` and balanced
+/// brackets; sentence punctuation and an unbalanced closing bracket after one are prose.
+pub fn model_mentions(text: &str) -> Vec<ModelMention> {
+    let mut found = Vec::new();
+    let mut scanned = 0;
+    for (start, _) in text.match_indices(MODEL_PREFIX) {
+        let after_boundary =
+            text[..start].chars().next_back().is_none_or(|c| c.is_whitespace() || ",([\"'".contains(c));
+        if start < scanned || !after_boundary {
+            continue;
+        }
+        let rest = &text[start + MODEL_PREFIX.len()..];
+        // `ProviderInstanceId`: a letter, then letters, digits, `_` or `-`.
+        let instance_len =
+            rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-')).unwrap_or(rest.len());
+        let instance_id = &rest[..instance_len];
+        let Some(slug_text) = rest[instance_len..].strip_prefix('/') else { continue };
+        if !instance_id.starts_with(|c: char| c.is_ascii_alphabetic()) {
+            continue;
+        }
+        let slug_len = slug_text.find(|c: char| c.is_whitespace() || ",\"'".contains(c)).unwrap_or(slug_text.len());
+        if slug_len == 0 {
+            continue;
+        }
+        let head = MODEL_PREFIX.len() + instance_len + 1;
+        scanned = start + head + slug_len;
+        let model = trim_model_slug(&slug_text[..slug_len]);
+        if model.is_empty() {
+            continue;
+        }
+        found.push(ModelMention {
+            instance_id: instance_id.to_owned(),
+            model: model.to_owned(),
+            range: start..start + head + model.len(),
+        });
+    }
+    found
+}
+
+/// `trimModelSlug`: `foo(bar)` keeps its brackets; `(model:a/b).` drops the `).`.
+fn trim_model_slug(slug: &str) -> &str {
+    let mut trimmed = slug;
+    while let Some(last) = trimmed.chars().next_back() {
+        let opening = match last {
+            ')' => Some('('),
+            ']' => Some('['),
+            _ => None,
+        };
+        let count = |c: char| trimmed.matches(c).count();
+        let unbalanced = opening.is_some_and(|open| count(open) < count(last));
+        if !".;:!?".contains(last) && !unbalanced {
+            break;
+        }
+        trimmed = &trimmed[..trimmed.len() - last.len_utf8()];
+    }
+    trimmed
+}
+
+/// `threadTitleTextFromPrompt`'s `modelMentionsAsSlugs`: a title names a mentioned model by its
+/// slug, without the reference syntax.
+pub fn model_mentions_as_slugs(text: &str) -> std::borrow::Cow<'_, str> {
+    let mentions = model_mentions(text);
+    if mentions.is_empty() {
+        return text.into();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for mention in mentions {
+        out.push_str(&text[cursor..mention.range.start]);
+        out.push_str(&mention.model);
+        cursor = mention.range.end;
+    }
+    out.push_str(&text[cursor..]);
+    out.into()
 }
 
 /// Chips with their byte ranges in the text they came from.
 pub type ChipSpans = Vec<(Range<usize>, Chip)>;
 
-/// `handlePaste`: the chips in pasted `text`, with a space after a mention or skill that ends it
-/// and before one that starts it unless the caret follows whitespace; `None` when it has none.
-pub fn pasted_chips(text: &str, after_space: bool, is_skill: impl Fn(&str) -> bool) -> Option<(String, ChipSpans)> {
+/// `handlePaste`: the chips in pasted `text`, with a space after a mention, skill or model that
+/// ends it and before one that starts it unless the caret follows whitespace; `None` when it has
+/// none.
+pub fn pasted_chips(
+    text: &str,
+    after_space: bool,
+    rich: bool,
+    is_skill: impl Fn(&str) -> bool,
+    model_label: impl Fn(&str, &str) -> Option<String>,
+) -> Option<(String, ChipSpans)> {
     // A trailing line break lets a mention that ends the paste parse, as the web's does.
-    let mut found: Vec<_> = chips(
+    let mut found: Vec<_> = chips_with_models(
         &format!(
             "{text}
 "
         ),
+        rich,
         is_skill,
+        model_label,
     )
     .into_iter()
     .filter(|(range, _)| range.end <= text.len())
     .collect();
-    let spaced = |chip: &Chip| matches!(chip, Chip::File { .. } | Chip::Skill { .. });
+    let spaced = |chip: &Chip| matches!(chip, Chip::File { .. } | Chip::Skill { .. } | Chip::Model { .. });
     let mut padded = text.to_owned();
     if found.last().is_some_and(|(range, chip)| range.end == text.len() && spaced(chip)) {
         padded.push(' ');
@@ -315,21 +678,6 @@ fn parse_link_label(text: &str) -> Option<(usize, String)> {
             _ => label.push(c),
         }
     }
-}
-
-fn parse_context_link(text: &str) -> Option<(usize, Chip)> {
-    let bang = usize::from(text.starts_with('!'));
-    let (close, label) = parse_link_label(&text[bang..])?;
-    let after = &text[bang + close + 1..];
-    let target = after.strip_prefix('(')?.strip_prefix(CONTEXT_PREFIX)?;
-    let end = target.find(')')?;
-    let (kind, id) = target[..end].split_once('/')?;
-    let valid = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-    if !valid(kind) || !valid(id) {
-        return None;
-    }
-    let len = bang + close + 1 + 1 + CONTEXT_PREFIX.len() + end + 1;
-    Some((len, Chip::Context { kind: kind.to_owned(), id: id.to_owned(), label }))
 }
 
 /// A skill name after the sigil: alphanumerics, `:`, `_`, `-`, with a letter.
@@ -526,13 +874,174 @@ mod tests {
     #[test]
     fn pasted_mentions_and_skills_become_chips_kept_apart_from_their_neighbours() {
         let skill = |name: &str| name == "review";
-        assert_eq!(pasted_chips("plain words", false, skill), None);
-        let (text, found) = pasted_chips("[a.rs](src/a.rs)", false, skill).unwrap();
+        let none = |_: &str, _: &str| None;
+        assert_eq!(pasted_chips("plain words", false, true, skill, none), None);
+        let (text, found) = pasted_chips("[a.rs](src/a.rs)", false, true, skill, none).unwrap();
         assert_eq!(text, " [a.rs](src/a.rs) ");
         assert_eq!(found, [(1..17, Chip::File { path: "src/a.rs".into() })]);
-        let (text, found) = pasted_chips("see $review", true, skill).unwrap();
+        let (text, found) = pasted_chips("see $review", true, true, skill, none).unwrap();
         assert_eq!((text.as_str(), found), ("see $review ", vec![(4..11, Chip::Skill { name: "review".into() })]));
-        assert_eq!(pasted_chips("$unknown", true, skill), None, "only a skill the provider offers");
+        assert_eq!(pasted_chips("$unknown", true, true, skill, none), None, "only a skill the provider offers");
+        let (text, found) = pasted_chips("model:codex/gpt-6.1", false, true, skill, codex_model).unwrap();
+        assert_eq!(text, " model:codex/gpt-6.1 ", "a model chip is spaced like a mention");
+        assert_eq!(found, [(1..20, gpt_chip())]);
+        let fenced = "```\nmodel:codex/gpt-6.1 $review\n```";
+        assert_eq!(pasted_chips(fenced, false, true, skill, codex_model), None, "code stays as written");
+        let (_, found) = pasted_chips(fenced, false, false, skill, codex_model).unwrap();
+        assert_eq!(found.len(), 2, "plain text has no code blocks");
+    }
+
+    fn codex_model(instance_id: &str, model: &str) -> Option<String> {
+        (instance_id == "codex" && model == "gpt-6.1").then(|| "GPT-6.1".to_owned())
+    }
+
+    fn gpt_chip() -> Chip {
+        Chip::Model { instance_id: "codex".into(), model: "gpt-6.1".into(), label: "GPT-6.1".into() }
+    }
+
+    fn mentions(text: &str) -> Vec<String> {
+        model_mentions(text).into_iter().map(|m| format!("{}/{}", m.instance_id, m.model)).collect()
+    }
+
+    #[test]
+    fn model_references_read_back_what_a_pick_writes_inside_prose() {
+        let text = format!("use {}, then model:codex/gpt-5.4.", model_mention("opencode", "anthropic/opus"));
+        let found = model_mentions(&text);
+        assert_eq!(
+            found.iter().map(|m| (m.instance_id.as_str(), m.model.as_str(), m.range.clone())).collect::<Vec<_>>(),
+            [("opencode", "anthropic/opus", 4..33), ("codex", "gpt-5.4", 40..59)]
+        );
+        assert_eq!(&text[found[0].range.clone()], "model:opencode/anthropic/opus");
+        for (text, expected) in [
+            ("(model:codex/gpt-6.1).", vec!["codex/gpt-6.1"]),
+            ("\"model:codex/gpt-6.1\"", vec!["codex/gpt-6.1"]),
+            ("model:codex/gpt-6.1,model:claudeAgent/sonnet", vec!["codex/gpt-6.1", "claudeAgent/sonnet"]),
+            ("model:codex/gpt-6.1's output", vec!["codex/gpt-6.1"]),
+            ("model:opencode/foo(bar)", vec!["opencode/foo(bar)"]),
+            ("model:codex/GPT-6.1-Sol[1m]", vec!["codex/GPT-6.1-Sol[1m]"]),
+        ] {
+            assert_eq!(mentions(text), expected, "{text}");
+        }
+        for text in ["remodel:codex/gpt", "model:codex", "model:/gpt", "model:codex/.", "model:1x/gpt", "é model:a"] {
+            assert_eq!(mentions(text), Vec::<String>::new(), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_known_model_reference_chips_once_whitespace_follows_it() {
+        let found = |text: &str| chips_with_models(text, true, |_| false, codex_model);
+        assert_eq!(found("Ask model:codex/gpt-6.1 now"), [(4..23, gpt_chip())]);
+        assert_eq!(found("Ask model:openai/gpt-4o now"), [], "only a model the environment offers");
+        assert_eq!(found("Ask model:codex/gpt-6.1"), [], "still being typed");
+        assert_eq!(found("```\nAsk model:codex/gpt-6.1 now\n```\n"), [], "inside a fenced block");
+        assert_eq!(found("~~~sh\nAsk model:codex/gpt-6.1 now"), [], "inside an unclosed block");
+        assert_eq!(found("```\nx\n```\nAsk model:codex/gpt-6.1 now"), [(14..33, gpt_chip())], "after one");
+        let both = chips_with_models("$review model:codex/gpt-6.1 x", true, |name| name == "review", codex_model);
+        assert_eq!(both, [(0..7, Chip::Skill { name: "review".into() }), (8..27, gpt_chip())]);
+        assert_eq!(gpt_chip().id(), "model:codex/gpt-6.1");
+        assert_eq!(
+            Chip::from_id(&gpt_chip().id()),
+            Some(Chip::Model { instance_id: "codex".into(), model: "gpt-6.1".into(), label: String::new() })
+        );
+    }
+
+    #[test]
+    fn chips_follow_the_skills_and_models_that_load_or_go() {
+        let text = "$review model:codex/gpt-6.1 x";
+        let skill = |name: &str| name == "review";
+        let none = |_: &str, _: &str| None;
+        let review = (0..7, "skill:review", "review");
+        let gpt = (8..27, "model:codex/gpt-6.1", "GPT-6.1");
+        assert_eq!(
+            reconcile_chips(text, true, &[], skill, codex_model),
+            (vec![], vec![(0..7, Chip::Skill { name: "review".into() }), (8..27, gpt_chip())]),
+            "text restored before the lists loaded"
+        );
+        assert_eq!(reconcile_chips(text, true, &[review.clone(), gpt.clone()], skill, codex_model), (vec![], vec![]));
+        assert_eq!(reconcile_chips(text, true, &[review.clone(), gpt], |_| false, none), (vec![0..7, 8..27], vec![]));
+        let renamed = (8..27, "model:codex/gpt-6.1", "GPT-6");
+        let (stale, fresh) = reconcile_chips(text, true, &[review, renamed.clone()], skill, codex_model);
+        assert_eq!((stale, fresh), (vec![renamed.0.clone()], vec![(renamed.0, gpt_chip())]));
+        let pasted = (0..27, "paste:1", "Pasted text");
+        assert_eq!(reconcile_chips(text, true, &[pasted], skill, codex_model), (vec![], vec![]), "inside another chip");
+        let fenced = format!("```\n{text}\n```");
+        assert_eq!(reconcile_chips(&fenced, true, &[], skill, codex_model), (vec![], vec![]), "code stays as written");
+        let in_code = [(4..11, "skill:review", "review"), (12..31, "model:codex/gpt-6.1", "GPT-6.1")];
+        assert_eq!(
+            reconcile_chips(&fenced, true, &in_code, skill, codex_model),
+            (vec![4..11, 12..31], vec![]),
+            "chips made with rich text off go back to text in code once it is on"
+        );
+        assert_eq!(reconcile_chips(&fenced, false, &in_code, skill, codex_model), (vec![], vec![]));
+
+        // Turning rich text on or off rebuilds file and context chips from the text too.
+        let refs = "```\n[a.ts](src/a.ts) ![shot.png](t3-context://v1/image/img_1) \n```";
+        let file = Chip::File { path: "src/a.ts".into() };
+        let image = Chip::Context { kind: "image".into(), id: "img_1".into(), label: "shot.png".into() };
+        let chipped = [(4..20, "file:src/a.ts", "a.ts"), (21..61, "context:image/img_1", "shot.png")];
+        assert_eq!(remount_chips(refs, true, &chipped, skill, none), (vec![4..20, 21..61], vec![]), "on");
+        assert_eq!(remount_chips(refs, false, &[], skill, none), (vec![], vec![(4..20, file), (21..61, image)]), "off");
+        assert_eq!(remount_chips(refs, false, &chipped, skill, none), (vec![], vec![]));
+        // An attachment stays while any reference to it does, chip or not (`collectInlineContextIds`).
+        assert_eq!(context_reference_ids(refs), ["context:image/img_1"]);
+        let glued = "x[T](t3-context://v1/thread/a)[T](t3-context://v1/thread/a) [a\nb](t3-context://v1/file/f)";
+        assert_eq!(context_reference_ids(glued), ["context:thread/a"], "once each; a label holds no newline");
+        // Removing an attachment takes every reference with it (`removeInlineContextReference`).
+        let remove = |text: &str, id: &str| {
+            let mut left = text.to_owned();
+            for range in context_reference_removals(text, id) {
+                left.replace_range(range, "");
+            }
+            left
+        };
+        let image = "context:image/img_1";
+        let link = "[I](t3-context://v1/image/img_1)";
+        assert_eq!(remove(&format!("a {link} b\n```\n{link}\n```"), image), "a b\n```\n\n```", "fenced too");
+        assert_eq!(remove(&format!("```\n{link} {link}KEEP\n```"), image), "```\nKEEP\n```", "one shared space");
+        assert_eq!(remove(&format!("see !{link} now"), image), "see now", "an image's `!` is its own");
+        assert_eq!(remove(&format!("x {link}"), image), "x", "the space before it when none follows");
+        assert_eq!(remove(&format!("x  {link}"), image), "x", "ending the text trims what trails");
+        assert_eq!(remove(&format!("{link} x  "), image), "x  ", "but only then");
+        // The web's pattern: a label ends at the first `]` (no Markdown escapes) and holds no
+        // newline, and an href needs a lowercase kind and a valid id.
+        assert_eq!(remove(&format!("KEEP ![literal\\]{link}"), image), "KEEP ![literal\\]", "only the link");
+        // Chips use the same pattern, wherever it matches, so a pasted chip spans just the link.
+        let pasted = format!("KEEP ![literal\\]!{link} tail");
+        let found = chips(&pasted, |_| false);
+        assert_eq!(found.len(), 1);
+        assert_eq!(&pasted[found[0].0.clone()], format!("!{link}"), "the chip leaves the literal text");
+        assert_eq!(found[0].1.label(), "I");
+        assert!(context_reference_ids("[x](t3-context://v1/Image/img_1)").is_empty(), "kind is lowercase");
+        assert_eq!(remove(&format!("x\u{feff} {link}"), image), "x", "JavaScript's trimEnd set");
+        assert!(context_reference_removals(&format!("a {link}"), "context:image/other").is_empty());
+        let (stale, fresh) = remount_chips(&fenced, false, &[], skill, codex_model);
+        assert_eq!((stale, fresh.len()), (vec![], 2), "skills and models too");
+
+        let gpt = (8..27, "model:codex/gpt-6.1", "GPT-6.1");
+        let restored = |model_label: fn(&str, &str) -> Option<String>| {
+            reconcile_restored_chips(text, true, std::slice::from_ref(&gpt), skill, model_label)
+        };
+        assert_eq!(
+            restored(|_, _| None),
+            (vec![gpt.0.clone()], vec![]),
+            "an undo brings back a chip for a model that went"
+        );
+        assert_eq!(restored(codex_model), (vec![], vec![]), "plain `$review` the user left as text stays text");
+        let renamed = |_: &str, _: &str| Some("GPT-6".to_owned());
+        let relabelled = Chip::Model { instance_id: "codex".into(), model: "gpt-6.1".into(), label: "GPT-6".into() };
+        assert_eq!(restored(renamed), (vec![gpt.0.clone()], vec![(8..27, relabelled)]));
+    }
+
+    #[test]
+    fn titles_name_a_mentioned_model_by_its_slug() {
+        assert_eq!(
+            model_mentions_as_slugs("Delegate to model:codex/gpt-6.1-sol and report back"),
+            "Delegate to gpt-6.1-sol and report back"
+        );
+        assert_eq!(
+            model_mentions_as_slugs("model:opencode/anthropic/opus, then model:codex/gpt-5.4."),
+            "anthropic/opus, then gpt-5.4."
+        );
     }
 
     #[test]

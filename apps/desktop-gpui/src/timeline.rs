@@ -330,6 +330,8 @@ pub enum RequestKind {
     Secret {
         label: SharedString,
         placeholder: Option<SharedString>,
+        /// The page the agent asks the user to sign in on, if it named one.
+        url: Option<SharedString>,
         /// `delivery: "file"`: the agent's commands can read the value.
         file: bool,
     },
@@ -370,6 +372,7 @@ fn request_card(item: &TurnItem) -> RequestCard {
         "secret_request" => RequestKind::Secret {
             label: text("label").unwrap_or_else(|| "Secret".into()),
             placeholder: text("placeholder"),
+            url: text("url"),
             file: item.str("delivery") == Some("file"),
         },
         _ => RequestKind::Link {

@@ -715,10 +715,15 @@ impl Workspace {
                 .disabled(self.banners.disconnecting)
                 .on_click(cx.listener(move |this, _, window, cx| this.disconnect_saved(&id, window, cx)))
         });
+        let (reconnect, disconnect) = match disconnect {
+            Some(disconnect) => (reconnect, Some(corner_action(disconnect, false))),
+            None => (reconnect.map(|button| corner_action(button, false)), None),
+        };
         let actions = (reconnect.is_some() || disconnect.is_some())
             .then(|| h_flex().gap(px(2.)).children(reconnect).children(disconnect).into_any_element());
         let variant = if presented == Presented::Error { Variant::Error } else { Variant::Warning };
-        Some(composer_banner(variant, Icon::new(IconName::WifiOff), SharedString::from(title), headline, actions, t))
+        let title = SharedString::from(title);
+        Some(composer_banner(variant, Icon::new(IconName::WifiOff), title, headline, actions, false, t))
     }
 
     /// `handleReconnectActiveEnvironment`: a switched-off environment is switched on, else retried now.
@@ -774,15 +779,16 @@ impl Workspace {
         let label = self.primary_info().environment_label.clone().unwrap_or_else(|| "Server".into());
         let title = format!("{label} is {}", if reconnecting { "reconnecting" } else { "offline" });
         let actions = (!reconnecting).then(|| {
-            Button::new("reconnect-server")
+            let reconnect = Button::new("reconnect-server")
                 .ghost()
                 .xsmall()
                 .label("Reconnect")
-                .on_click(cx.listener(|this, _, window, cx| this.reconnect(window, cx)))
-                .into_any_element()
+                .on_click(cx.listener(|this, _, window, cx| this.reconnect(window, cx)));
+            corner_action(reconnect, false).into_any_element()
         });
         let variant = if reconnecting { Variant::Warning } else { Variant::Error };
-        Some(composer_banner(variant, Icon::new(IconName::WifiOff), SharedString::from(title), reason, actions, t))
+        let title = SharedString::from(title);
+        Some(composer_banner(variant, Icon::new(IconName::WifiOff), title, reason, actions, false, t))
     }
 
     /// Starts the connection over, and the backend too when it is down, without waiting out
@@ -815,7 +821,7 @@ impl Workspace {
         }
     }
 
-    pub(super) fn render_branch_banner(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(super) fn render_branch_banner(&self, joined: bool, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (key, branch, current) = self.branch_mismatch()?;
         let shown = !self.banners.dismissed_branches.contains(&key)
             && (!self.composer_empty || self.banners.revealed_branch.as_ref() == Some(&key));
@@ -858,7 +864,7 @@ impl Workspace {
                         this.request_restore_thread_branch(restore_key.clone(), branch.clone(), window, cx);
                     })),
             )
-            .child(
+            .child(corner_action(
                 Button::new("branch-dismiss")
                     .ghost()
                     .xsmall()
@@ -868,13 +874,15 @@ impl Workspace {
                         this.banners.dismissed_branches.insert(dismiss_key.clone());
                         cx.notify();
                     })),
-            );
+                joined,
+            ));
         Some(composer_banner(
             Variant::Info,
             Icon::new(IconName::GitBranch),
             title,
             None,
             Some(actions.into_any_element()),
+            joined,
             t,
         ))
     }
@@ -969,7 +977,7 @@ impl Workspace {
     }
 
     /// `extensionStatusBannerItem`: what a Pi extension reports about the session.
-    pub(super) fn render_extension_status_banner(&self, t: &Tokens) -> Option<AnyElement> {
+    pub(super) fn render_extension_status_banner(&self, joined: bool, t: &Tokens) -> Option<AnyElement> {
         let statuses = self.open_projection()?.provider_extension_statuses();
         if statuses.is_empty() {
             return None;
@@ -977,10 +985,15 @@ impl Workspace {
         let texts: Vec<&str> = statuses.iter().map(|status| status.text.as_str()).collect();
         let title = SharedString::from(format!("Pi \u{b7} {}", texts.join(" \u{b7} ")));
         let lead = div().child("\u{25b8}").into_any_element();
-        Some(composer_banner_with_lead(Variant::Info, lead, title, None, None, t))
+        Some(composer_banner_with_lead(Variant::Info, lead, title, None, None, joined, t))
     }
 
-    pub(super) fn render_recovery_banner(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(super) fn render_recovery_banner(
+        &self,
+        joined: bool,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let thread = self.open_shell_thread()?;
         let state = recovery(thread, self.request_pending(), crate::timestamp::now_ms())?;
         let code = thread.last_error_code.as_deref();
@@ -1057,15 +1070,17 @@ impl Workspace {
             );
         }
         if workspace_limit {
-            actions = actions.child(
+            actions = actions.child(corner_action(
                 Button::new("recovery-admin-request")
                     .ghost()
                     .xsmall()
                     .label("Copy request for admin")
                     .on_click(cx.listener(|_, _, window, cx| copy_admin_request(window, cx))),
-            );
+                joined,
+            ));
         } else if chatgpt_limit {
-            actions = actions.child(super::pages::settings::chatgpt_usage_button("recovery-usage", t).xsmall());
+            let usage = super::pages::settings::chatgpt_usage_button("recovery-usage", t).xsmall();
+            actions = actions.child(corner_action(usage, joined));
         }
         let icon = if chatgpt_limit { Icon::empty().path("icons/app/openai.svg") } else { Icon::new(IconName::Gauge) };
         Some(composer_banner(
@@ -1074,6 +1089,7 @@ impl Workspace {
             SharedString::from(title),
             Some(description.into()),
             Some(actions.into_any_element()),
+            joined,
             t,
         ))
     }
@@ -1178,16 +1194,24 @@ fn alert(
 }
 
 /// One `ComposerBannerStack` card, tucked under the composer like the fallback notice.
+/// A `joined` card follows another in the dock, which runs into its square top.
 pub(super) fn composer_banner(
     variant: Variant,
     icon: Icon,
     title: impl IntoElement,
     description: Option<SharedString>,
     actions: Option<AnyElement>,
+    joined: bool,
     t: &Tokens,
 ) -> AnyElement {
     let lead = icon.size(px(12.)).into_any_element();
-    composer_banner_with_lead(variant, lead, title, description, actions, t)
+    composer_banner_with_lead(variant, lead, title, description, actions, joined, t)
+}
+
+/// A banner's last action, whose top-right corner nests in the card's (`--composer-banner-corner-top`);
+/// under a joined card's square top it keeps the control radius.
+pub(super) fn corner_action(button: Button, joined: bool) -> Button {
+    if joined { button } else { button.rounded_tr(px(12.)) }
 }
 
 /// [`composer_banner`] led by any element, such as a glyph.
@@ -1197,6 +1221,7 @@ fn composer_banner_with_lead(
     title: impl IntoElement,
     description: Option<SharedString>,
     actions: Option<AnyElement>,
+    joined: bool,
     t: &Tokens,
 ) -> AnyElement {
     let (outline, tint) = match variant {
@@ -1215,8 +1240,8 @@ fn composer_banner_with_lead(
                 // 5px padding plus the 17px the composer covers.
                 .pb(px(22.))
                 .gap(px(4.))
-                .rounded_t(px(16.))
                 .border_1()
+                .map(|el| if joined { el.border_t_0() } else { el.rounded_t(px(16.)) })
                 .border_color(outline)
                 .bg(t.background.blend(t.composer_glass().opacity(t.glass)).blend(tint))
                 .text_xs()

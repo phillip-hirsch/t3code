@@ -4638,9 +4638,14 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
             .map(|range| self.range_to_utf16(&range.into()))
     }
 
-    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
-        self.ime_marked_range = None;
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let ended_uncommitted = self.ime_marked_range.take().is_some();
         self.undo_manager.commit_transaction();
+        // Marked text emits no change, so a composition that ends without a
+        // commit (cancelled, or left as typed) reports one here.
+        if ended_uncommitted && self.emit_events {
+            self.emit_change(cx);
+        }
     }
 
     /// Replace text in range.
@@ -5036,6 +5041,13 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         }
         if new_text.is_empty() {
             self.undo_manager.commit_transaction();
+            // An empty preedit cancels the composition and clears the mark, so a
+            // later `unmark_text` cannot report it: report the cancel here. The
+            // text is back to what it was, so no edit batch goes out; the next
+            // one still spans from the pre-composition text.
+            if !starts_composition && self.emit_events {
+                cx.emit(InputEvent::Change);
+            }
         }
         cx.notify();
     }
@@ -9333,25 +9345,55 @@ mod tests {
     }
 
     /// Canceling a composition via `unmark_text` closes its transaction so it
-    /// does not leak and swallow a later edit.
+    /// does not leak and swallow a later edit, and reports the change the
+    /// marked text never did; a commit's own change is not reported twice.
     #[gpui::test]
     fn test_composition_cancel_via_unmark_does_not_leak(cx: &mut TestAppContext) {
         let input_view = InputView::build_textarea(cx, |state| state.default_value(""));
         let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
         let input = input_view.input;
+        let changes = Rc::new(Cell::new(0));
+        let observed = changes.clone();
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&input, move |_, event: &InputEvent, _| {
+                if matches!(event, InputEvent::Change) {
+                    observed.set(observed.get() + 1);
+                }
+            })
+        });
 
-        cx.update(|window, cx| {
+        let after_cancel = cx.update(|window, cx| {
             input.update(cx, |s, cx| {
                 // Start a composition, then cancel it via unmark.
                 s.replace_and_mark_text_in_range(None, "n", Some(1..1), window, cx);
                 s.unmark_text(window, cx);
-                let after_cancel = s.undo_manager.undo_count();
+                s.unmark_text(window, cx);
+                s.undo_manager.undo_count()
+            })
+        });
+        assert_eq!(changes.get(), 1, "the cancel is reported once");
 
+        cx.update(|window, cx| {
+            input.update(cx, |s, cx| {
                 // A later edit is recorded independently.
                 s.replace_text_in_range(None, "x", window, cx);
                 assert_eq!(s.undo_manager.undo_count(), after_cancel + 1);
+                s.replace_and_mark_text_in_range(None, "y", Some(1..1), window, cx);
+                s.replace_text_in_range(None, "y", window, cx);
+                s.unmark_text(window, cx);
             });
         });
+        assert_eq!(changes.get(), 3, "a commit followed by unmark is one change");
+
+        cx.update(|window, cx| {
+            input.update(cx, |s, cx| {
+                // Cancelled through an empty preedit; the unmark that follows adds nothing.
+                s.replace_and_mark_text_in_range(None, "z", Some(1..1), window, cx);
+                s.replace_and_mark_text_in_range(None, "", None, window, cx);
+                s.unmark_text(window, cx);
+            });
+        });
+        assert_eq!(changes.get(), 4, "an empty-preedit cancel is reported once");
     }
 
     #[gpui::test]
@@ -12105,6 +12147,45 @@ mod tests {
 4. c");
                 assert_eq!(state.selections.iter().count(), 1);
                 assert_eq!(state.selected_range(), 8..8);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn test_retokenize_keeps_history_and_moves_a_covered_caret(cx: &mut TestAppContext) {
+        use crate::input::{InlineToken, InputContent};
+        let view = multi_line(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("say hi", window, cx);
+                state.replace_ranges(&[(0..0, "ok ".to_string())], 4..4, window, cx);
+                let content = InputContent::new("ok say hi")
+                    .with_token(3..6, InlineToken::new("t", "say"))
+                    .unwrap();
+                state.retokenize(content, cx).unwrap();
+                assert_eq!(state.tokens().len(), 1);
+                assert_eq!(state.selected_range(), 6..6);
+                assert!(state.retokenize(InputContent::new("other"), cx).is_err());
+
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "say hi");
+                assert_eq!(state.tokens()[0].range(), 0..3);
+
+                // Every cursor is normalized, each keeping its direction.
+                state.set_value("say hi you", window, cx);
+                state.set_selected_range_with_direction(1..5, true, cx);
+                state.add_selection(8..8, cx);
+                let content = InputContent::new("say hi you")
+                    .with_token(0..3, InlineToken::new("t", "say"))
+                    .and_then(|content| content.with_token(7..10, InlineToken::new("u", "you")))
+                    .unwrap();
+                state.retokenize(content, cx).unwrap();
+                assert!(state.is_selection_reversed());
+                let ranges: Vec<_> = state.selections.iter().map(|s| s.start..s.end).collect();
+                assert_eq!(ranges, [0..5, 10..10]);
             });
         });
     }

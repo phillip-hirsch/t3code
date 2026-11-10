@@ -355,6 +355,25 @@ leaves, which `replace_text_in_ranges_selecting` in `src/input/base/state.rs` se
 records its cursors, so redo restores that caret rather than one per range. Test there:
 `test_replace_ranges_redo_restores_chosen_selection`.
 
+**Tokens change under unchanged text.** When an environment's skills or models load or change,
+the composer turns plain `$name` and `model:` text into chips and stale chips back into text, as
+the web does outside its undo history. `set_value` would clear the history and the selection;
+each token replacement would add an undo step. The patch, in `src/input/base/inline_tokens.rs`:
+`retokenize`, which installs new tokens over the same text, bumps the document revision so the
+token layout remeasures, and widens only the selections a new token partly covers, each cursor
+keeping its direction. Test in `src/input/base/state.rs`:
+`test_retokenize_keeps_history_and_moves_a_covered_caret`.
+
+**A composition that ends without a commit emits a change.** `retokenize` refuses while an IME
+composition is active, so the composer waits for the change that ends it. Marked text emits no
+`InputEvent::Change`, and 0.9.0's `unmark_text` (a cancelled composition, or one left as typed)
+emitted none either, so the wait outlasted the composition. The patch, in
+`src/input/base/state.rs`: `unmark_text` emits a change when it ends a composition still marked;
+after a commit, which already emitted one, it does not. An empty preedit (the other way a
+composition is cancelled) clears the mark itself, so `replace_and_mark_text_in_range` emits the
+change there, without an edit batch since the text is back to what it was. Test there:
+`test_composition_cancel_via_unmark_does_not_leak`.
+
 **Code block actions span the top row.** The web's code block header puts the language on the
 left and its buttons on the right. 0.9.0 pins the actions to the block's top-right corner at their
 own width, so the row could span the block only when the caller knew its width. The patch anchors

@@ -821,7 +821,7 @@ This permanently clears its conversation history."
                 .tooltip("Stop")
                 .on_click(cx.listener(|this, _, _, cx| this.stop_side_chat(cx)))
         };
-        let question = self.render_question(ChatPane::Side, t, cx);
+        let question = self.render_question(ChatPane::Side, false, t, cx);
         let button = match self.side_chat_question() {
             Some(draft) => self.render_side_question_actions(draft, running, stop(cx), cx),
             None => self.render_side_primary_action(view, running, stop(cx), cx),

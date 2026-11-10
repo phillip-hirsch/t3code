@@ -8,7 +8,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{Icon, Sizable as _};
 use gpui_kit::{AnyElement, Context, IntoElement as _, SharedString, Styled as _, px};
 
-use super::banners::{Variant, composer_banner};
+use super::banners::{Variant, composer_banner, corner_action};
 use super::{Target, Workspace};
 use crate::theme::Tokens;
 
@@ -71,7 +71,12 @@ impl Workspace {
     }
 
     /// `freshSessionBannerItem`; an approval's feedback goes to that approval, so it waits.
-    pub(super) fn render_fresh_session_banner(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(super) fn render_fresh_session_banner(
+        &self,
+        joined: bool,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         self.fresh_session_arm()?;
         if self.open_projection().is_some_and(|p| !p.pending_approvals().is_empty()) {
             return None;
@@ -92,7 +97,8 @@ impl Workspace {
             Icon::new(IconName::Eraser),
             SharedString::from("Your next message starts a fresh session"),
             Some("The agent won't see earlier messages in this thread.".into()),
-            Some(dismiss.into_any_element()),
+            Some(corner_action(dismiss, joined).into_any_element()),
+            joined,
             t,
         ))
     }

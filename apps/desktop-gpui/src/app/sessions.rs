@@ -315,6 +315,7 @@ impl Workspace {
                 // Skills arrive with provider updates.
                 this.refresh_menu_items(cx);
                 this.sync_theme_feed(window, cx);
+                this.chip_lists_changed(cx);
             },
         );
         let mut streams = vec![
@@ -388,6 +389,7 @@ impl Workspace {
         self.setup.disconnect();
         self.details = super::inspector::Details::default();
         self.side_chat.disconnect();
+        self.prompt_suggestions.disconnect();
     }
 
     fn subscribe_shell(&mut self, environment_id: SharedString, window: &mut Window, cx: &mut Context<Self>) {

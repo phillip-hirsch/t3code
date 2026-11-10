@@ -95,6 +95,57 @@ impl FooterText {
     }
 }
 
+/// Which composer chips a catch-up may change; a later kind covers every earlier one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum ChipSync {
+    /// After an undo or redo: only the chips it brought back for a skill or model that is gone.
+    Restored,
+    /// The skills or models chips resolve against changed (`skillChipReplacements`).
+    Lists,
+    /// Rich text turned on or off: every chip is rebuilt from the text, as the web's remount does.
+    Remount,
+}
+
+/// The catch-up to run now: `sync`, or the wider one still waiting in `pending`.
+fn take_chip_sync(pending: &mut Option<ChipSync>, sync: ChipSync) -> ChipSync {
+    pending.take().map_or(sync, |waiting| waiting.max(sync))
+}
+
+/// Whether the editor took a catch-up. One it refused during an IME composition waits in
+/// `pending` for the change that ends the composition.
+fn settle_chip_sync(
+    pending: &mut Option<ChipSync>,
+    sync: ChipSync,
+    result: Result<(), gpui_kit::base::input::InlineTokenError>,
+) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(gpui_kit::base::input::InlineTokenError::CompositionActive) => {
+            *pending = Some(sync);
+            false
+        }
+        Err(error) => {
+            log::warn!("composer chips not reconciled: {error:?}");
+            false
+        }
+    }
+}
+
+/// Records `now` as the provider chips resolve against; whether it differs from the one before.
+fn note_provider(seen: &mut Option<String>, now: Option<&str>) -> bool {
+    if seen.as_deref() == now {
+        return false;
+    }
+    *seen = now.map(str::to_owned);
+    true
+}
+
+/// Whether `now` holds a chip `before` did not, counting each occurrence of an id.
+fn adds_chip(before: &[String], now: &[String]) -> bool {
+    let count = |ids: &[String], id: &String| ids.iter().filter(|other| *other == id).count();
+    now.iter().any(|id| count(now, id) > count(before, id))
+}
+
 /// A failed message first, then whatever was typed after it.
 fn merge_prompt(failed: String, newer: &str) -> String {
     if newer.trim().is_empty() { failed } else { format!("{failed}\n\n{newer}") }
@@ -159,9 +210,17 @@ impl Workspace {
             self.prompt_history = None;
         }
         let chips: Vec<String> = state.tokens().iter().map(|s| s.token().id().to_string()).collect();
-        let previous = std::mem::replace(&mut self.chip_ids, chips);
+        // A chip an undo or redo brings back may name a skill or model that has gone since.
+        let restored = adds_chip(&self.chip_ids, &chips);
+        self.chip_ids = chips;
+        let references = composer_text::context_reference_ids(&state.value());
+        let previous = std::mem::replace(&mut self.context_refs, references);
         self.sync_attachment_chips(&previous, cx);
         self.sync_context_chips(cx);
+        // A catch-up refused while an IME composition was active runs once a change ends it.
+        if restored || self.chip_sync_pending.is_some() {
+            self.reconcile_composer_chips(ChipSync::Restored, cx);
+        }
         self.sync_trigger(cx);
         self.sync_composer_marks(cx);
         self.drafts_changed(cx);
@@ -189,7 +248,7 @@ impl Workspace {
     }
 
     /// `set_value` emits no `Change`, so this keeps `composer_empty` in step.
-    /// File links, known skills and context links in `text` come back as chips.
+    /// File links, known skills and models, and context links in `text` come back as chips.
     pub(super) fn set_composer_text(
         &mut self,
         text: impl Into<SharedString>,
@@ -199,7 +258,13 @@ impl Workspace {
         let text: SharedString = text.into();
         let skills = self.skill_names();
         let mut content = InputContent::new(text.clone());
-        for (range, chip) in composer_text::chips(&text, |name| skills.iter().any(|s| s == name)) {
+        let chips = composer_text::chips_with_models(
+            &text,
+            self.client_settings.values.bool("composerRichTextEnabled"),
+            |name| skills.iter().any(|s| s == name),
+            |instance_id, model| self.model_mention(instance_id, model).map(|m| m.label),
+        );
+        for (range, chip) in chips {
             let token = InlineToken::new(chip.id(), &text[range.clone()]).with_label(chip.label().to_owned());
             content = match content.clone().with_token(range, token) {
                 Ok(next) => next,
@@ -207,6 +272,8 @@ impl Workspace {
             };
         }
         self.chip_ids = content.tokens().iter().map(|s| s.token().id().to_string()).collect();
+        self.context_refs = composer_text::context_reference_ids(&text);
+        self.chip_sync_pending = None;
         // `set_value` clears the undo history that could bring a deleted chip back.
         self.release_retained_attachments(cx);
         self.reset_context_chips(&text);
@@ -218,7 +285,81 @@ impl Workspace {
         self.drafts_changed(cx);
     }
 
-    /// Pasted file links, known skills and context links arrive as chips (`handlePaste`);
+    /// The skills or models chips resolve against may have changed: the composer's chips and
+    /// the messages that name one catch up.
+    pub(super) fn chip_lists_changed(&mut self, cx: &mut Context<Self>) {
+        let provider = self.composer_provider().map(|p| p.instance_id.clone());
+        note_provider(&mut self.chip_provider, provider.as_deref());
+        self.reconcile_composer_chips(ChipSync::Lists, cx);
+        self.markdown.chips_changed();
+        cx.notify();
+    }
+
+    /// The composer's provider, whose skills chips name, changed from outside a pick (another
+    /// client's model change on the open thread): chips catch up. A model change within the
+    /// provider leaves them, since a model chip names any provider's model.
+    pub(super) fn sync_chip_provider(&mut self, cx: &mut Context<Self>) {
+        let provider = self.composer_provider().map(|p| p.instance_id.clone());
+        if note_provider(&mut self.chip_provider, provider.as_deref()) {
+            self.refresh_menu_items(cx);
+            self.chip_lists_changed(cx);
+        }
+    }
+
+    /// Brings the composer's chips in line with the text and the lists it knows, outside the undo
+    /// history and keeping the selection; `sync` says which chips may change. Attachments keep
+    /// their records: like the web's, a send reads their references from the text.
+    pub(super) fn reconcile_composer_chips(&mut self, sync: ChipSync, cx: &mut Context<Self>) {
+        let sync = take_chip_sync(&mut self.chip_sync_pending, sync);
+        let state = self.composer.read(cx);
+        let (text, spans) = (state.value(), state.tokens().to_vec());
+        if sync != ChipSync::Remount
+            && spans.is_empty()
+            && !text.contains(composer_text::is_currency)
+            && !text.contains("model:")
+        {
+            return;
+        }
+        let skills = self.skill_names();
+        let tokens: Vec<_> =
+            spans.iter().map(|s| (s.range(), s.token().id().as_ref(), s.token().label().as_ref())).collect();
+        let rich = self.client_settings.values.bool("composerRichTextEnabled");
+        let is_skill = |name: &str| skills.iter().any(|s| s == name);
+        let model_label = |instance_id: &str, model: &str| self.model_mention(instance_id, model).map(|m| m.label);
+        let (stale, fresh) = match sync {
+            ChipSync::Restored => composer_text::reconcile_restored_chips(&text, rich, &tokens, is_skill, model_label),
+            ChipSync::Lists => composer_text::reconcile_chips(&text, rich, &tokens, is_skill, model_label),
+            ChipSync::Remount => composer_text::remount_chips(&text, rich, &tokens, is_skill, model_label),
+        };
+        if stale.is_empty() && fresh.is_empty() {
+            return;
+        }
+        let mut next: Vec<_> = spans
+            .iter()
+            .filter(|span| !stale.contains(&span.range()))
+            .map(|span| (span.range(), span.token().clone()))
+            .chain(fresh.into_iter().map(|(range, chip)| {
+                let token = InlineToken::new(chip.id(), &text[range.clone()]).with_label(chip.label().to_owned());
+                (range, token)
+            }))
+            .collect();
+        next.sort_by_key(|(range, _)| range.start);
+        let mut content = InputContent::new(text);
+        for (range, token) in next {
+            content = match content.clone().with_token(range, token) {
+                Ok(next) => next,
+                Err(_) => content,
+            };
+        }
+        let result = self.composer.update(cx, |composer, cx| composer.retokenize(content, cx));
+        if settle_chip_sync(&mut self.chip_sync_pending, sync, result) {
+            let state = self.composer.read(cx);
+            self.chip_ids = state.tokens().iter().map(|s| s.token().id().to_string()).collect();
+            self.sync_composer_marks(cx);
+        }
+    }
+
+    /// Pasted file links, known skills and models, and context links arrive as chips (`handlePaste`);
     /// `false` leaves a paste without any, or one into code, to the editor.
     pub(super) fn paste_chips(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let state = self.composer.read(cx);
@@ -229,9 +370,13 @@ impl Workspace {
         }
         let after_space = value[..selection.start].chars().next_back().is_none_or(char::is_whitespace);
         let skills = self.skill_names();
-        let Some((text, found)) =
-            composer_text::pasted_chips(text, after_space, |name| skills.iter().any(|s| s == name))
-        else {
+        let Some((text, found)) = composer_text::pasted_chips(
+            text,
+            after_space,
+            rich,
+            |name| skills.iter().any(|s| s == name),
+            |instance_id, model| self.model_mention(instance_id, model).map(|m| m.label),
+        ) else {
             return false;
         };
         let at = selection.start;
@@ -246,6 +391,19 @@ impl Workspace {
             state.set_selected_range(end..end, cx);
         });
         true
+    }
+
+    /// The model a `model:` reference names, as its chip shows it (`modelMentionPresentationAtom`):
+    /// any provider of this environment that offers it, ready or not.
+    pub(super) fn model_mention(&self, instance_id: &str, model: &str) -> Option<ModelMention> {
+        let provider = self.server_info().provider(instance_id)?;
+        let option = provider.models.iter().find(|m| m.slug == model)?;
+        Some(ModelMention {
+            label: crate::model_label::display_model_name(option),
+            provider_label: (option.sub_provider.clone())
+                .unwrap_or_else(|| crate::model_label::provider_name(provider).to_owned()),
+            driver: provider.driver.clone(),
+        })
     }
 
     /// The user-invocable skills of the composer's provider, by name.
@@ -378,10 +536,27 @@ impl Workspace {
         self.stash_menu_key(keystroke, window, cx)
             || self.draft_workspace_key(keystroke, window, cx)
             || (self.composer.focus_handle(cx).is_focused(window)
-                && (self.code_key(keystroke, window, cx)
+                && (self.model_chip_key(keystroke, window, cx)
+                    || self.code_key(keystroke, window, cx)
                     || self.block_backspace_key(keystroke, window, cx)
                     || self.list_outdent_key(keystroke, window, cx)
-                    || self.menu_key(keystroke, window, cx)))
+                    || self.menu_key(keystroke, window, cx)
+                    || self.prompt_suggestion_key(keystroke, window, cx)))
+    }
+
+    /// Enter on a selected model chip opens its details, as the web chip's button does.
+    fn model_chip_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if keystroke.key != "enter" || keystroke.modifiers.modified() {
+            return false;
+        }
+        let state = self.composer.read(cx);
+        let selection = state.selected_range();
+        let Some(Chip::Model { instance_id, model, .. }) = selected_chip(state.tokens(), &selection) else {
+            return false;
+        };
+        let Some(bounds) = state.range_to_bounds(&selection) else { return false };
+        self.open_model_menu(&instance_id, &model, model_chip_menu_at(bounds), window, cx);
+        true
     }
 
     /// Keys left after the keymap: 1-9 on a question card, prompt history, then a plain send.
@@ -881,7 +1056,7 @@ impl Workspace {
         cx.notify();
     }
 
-    /// `ChatComposer.tsx` placeholder precedence.
+    /// `ChatComposer.tsx` placeholder precedence; an offered prompt suggestion replaces only the default.
     fn placeholder(&self, approval: Option<&RuntimeRequest>) -> &'static str {
         if let Some(approval) = approval {
             return if approval.supports_feedback() {
@@ -932,6 +1107,9 @@ impl Workspace {
         let approvals = self.shown_approvals();
         let first_approval = approvals.first().map(|(request, _)| *request);
         let placeholder = self.placeholder(first_approval);
+        let suggestion = self
+            .offered_prompt_suggestion(first_approval.is_some())
+            .map(|text| super::composer_suggestion::suggested_placeholder(text, &t, window));
         let outline = t.composer_outline();
         let view = cx.weak_entity();
         let chip_view = view.clone();
@@ -945,6 +1123,16 @@ impl Workspace {
             .collect();
         let held: Rc<HashSet<String>> =
             Rc::new(self.context.records.iter().filter_map(|r| r["contextId"].as_str().map(str::to_owned)).collect());
+        let models: Rc<HashMap<String, ModelMention>> = Rc::new(
+            (self.composer.read(cx).tokens().iter())
+                .filter_map(|span| {
+                    let Some(Chip::Model { instance_id, model, .. }) = Chip::from_id(span.token().id()) else {
+                        return None;
+                    };
+                    Some((span.token().id().to_string(), self.model_mention(&instance_id, &model)?))
+                })
+                .collect(),
+        );
         let editor = Textarea::new(&self.composer)
             .appearance(false)
             .xsmall()
@@ -954,7 +1142,8 @@ impl Workspace {
             .mx(px(-4.))
             .disabled(self.target.is_none())
             .token(move |token, _, _| {
-                let records = ChipRecords { pull_requests: &pull_requests, held: &held, machines: &machines };
+                let records =
+                    ChipRecords { pull_requests: &pull_requests, held: &held, machines: &machines, models: &models };
                 render_chip(token, &records, &t)
             })
             // A pull request chip shows its details while hovered (`PullRequestContextDetails`).
@@ -988,6 +1177,11 @@ impl Workspace {
                     let _ = chip_view.update(cx, |this, cx| {
                         this.citation_chip_clicked(id, range, bounds, event.click(), window, cx);
                     });
+                }
+                // `ModelMentionChip`: a click or Enter opens its details popover.
+                Some(Chip::Model { instance_id, model, .. }) => {
+                    let at = model_chip_menu_at(event.bounds());
+                    let _ = chip_view.update(cx, |this, cx| this.open_model_menu(&instance_id, &model, at, window, cx));
                 }
                 _ => {}
             })
@@ -1055,7 +1249,10 @@ impl Workspace {
                                             .line_height(px(t.fonts.prompt_size * PROMPT_LEADING))
                                             .text_color(t.placeholder)
                                             .children(super::theme_inspect::probe(&["placeholder"], cx))
-                                            .child(placeholder),
+                                            .map(|el| match suggestion {
+                                                Some(suggested) => el.child(suggested),
+                                                None => el.child(placeholder),
+                                            }),
                                     )
                                 }),
                             ),
@@ -1089,7 +1286,9 @@ impl Workspace {
                         .children(self.render_language_picker(&t, window, cx))
                         .child(surface),
                 )
-                .children(self.render_context_strip(&t, cx)),
+                .children(self.render_context_strip(&t, cx))
+                // Message and composer chips share one menu; both surfaces draw the composer.
+                .children(self.render_chat_menu()),
         )
     }
 
@@ -1573,18 +1772,19 @@ impl Workspace {
     /// `ComposerBanner.Dock`: the banners tucked under the composer, with the stash tab
     /// on their right.
     fn render_banner_dock(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let banners: Vec<AnyElement> = (self.render_environment_banner(t, cx).into_iter())
-            .chain(self.render_fallback_banner(t, cx))
-            .chain(self.render_recovery_banner(t, cx))
-            .chain(self.render_extension_status_banner(t))
-            .chain(self.render_usage_limits_banner(t, cx))
-            .chain(self.render_clone_banner(t, cx))
-            .chain(self.render_fresh_session_banner(t, cx))
-            .chain(self.render_branch_banner(t, cx))
-            .chain(self.render_runtime_mode_ceiling_banner(t, cx))
-            .chain(self.render_question(ChatPane::Main, t, cx))
-            .chain(self.render_child_approvals(t, cx))
-            .collect();
+        // Each card after the first joins the one above it.
+        let mut banners: Vec<AnyElement> = self.render_environment_banner(t, cx).into_iter().collect();
+        banners.extend(self.render_fallback_banner(!banners.is_empty(), t, cx));
+        banners.extend(self.render_recovery_banner(!banners.is_empty(), t, cx));
+        banners.extend(self.render_extension_status_banner(!banners.is_empty(), t));
+        banners.extend(self.render_usage_limits_banner(!banners.is_empty(), t, cx));
+        banners.extend(self.render_clone_banner(!banners.is_empty(), t, cx));
+        banners.extend(self.render_fresh_session_banner(!banners.is_empty(), t, cx));
+        banners.extend(self.render_branch_banner(!banners.is_empty(), t, cx));
+        banners.extend(self.render_runtime_mode_ceiling_banner(!banners.is_empty(), t, cx));
+        let joined = !banners.is_empty();
+        banners.extend(self.render_question(ChatPane::Main, joined, t, cx));
+        banners.extend(self.render_child_approvals(t, cx));
         let badge = self.render_stash_badge(t, cx);
         if banners.is_empty() && badge.is_none() {
             return None;
@@ -1601,7 +1801,7 @@ impl Workspace {
     }
 
     /// `modelFallbackBannerItem`: "Using X", why, and a way back to the default.
-    fn render_fallback_banner(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_fallback_banner(&self, joined: bool, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
         let Some(Target::Draft { project_id, .. }) = &self.target else { return None };
         let project = self.shell.projects.iter().find(|p| &p.id == project_id);
         let default = self.server_info().new_thread_model(project)?;
@@ -1639,8 +1839,8 @@ impl Workspace {
                         // 5px padding plus the 17px the composer covers.
                         .pb(px(22.))
                         .gap(px(4.))
-                        .rounded_t(px(16.))
                         .border_1()
+                        .map(|el| if joined { el.border_t_0() } else { el.rounded_t(px(16.)) })
                         .border_color(outline)
                         .bg(t.composer_glass().opacity(t.glass))
                         .text_xs()
@@ -1682,10 +1882,12 @@ impl Workspace {
                                 .gap(px(2.))
                                 .child(
                                     Button::new("fallback-use-default").ghost().xsmall().label(use_default).on_click(
-                                        cx.listener(move |this, _, _, cx| this.pick_model(default.clone(), cx)),
+                                        cx.listener(move |this, _, window, cx| {
+                                            this.pick_model(default.clone(), window, cx);
+                                        }),
                                     ),
                                 )
-                                .child(
+                                .child(super::banners::corner_action(
                                     Button::new("fallback-dismiss")
                                         .ghost()
                                         .xsmall()
@@ -1695,14 +1897,21 @@ impl Workspace {
                                             this.composer_ui.dismissed_fallback = Some(window.clone());
                                             cx.notify();
                                         })),
-                                ),
+                                    joined,
+                                )),
                         ),
                 )
                 .into_any_element(),
         )
     }
 
-    pub(super) fn render_question(&self, pane: ChatPane, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(super) fn render_question(
+        &self,
+        pane: ChatPane,
+        joined: bool,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let draft = self.question(pane)?;
         let (request, item) = self.pending_question_request(pane)?;
         let question = &draft.questions[draft.index];
@@ -1816,7 +2025,7 @@ impl Workspace {
                     },
                 )))
         });
-        Some(top_drawer(v_flex().child(header).children(body), t))
+        Some(top_drawer(v_flex().child(header).children(body), joined, t))
     }
 }
 
@@ -1853,7 +2062,7 @@ pub(super) fn question_submit(
 }
 
 /// `ComposerBanner.Root variant="info"` in the top drawer, its bottom tucked under the composer.
-pub(super) fn top_drawer(content: impl IntoElement, t: &Tokens) -> AnyElement {
+pub(super) fn top_drawer(content: impl IntoElement, joined: bool, t: &Tokens) -> AnyElement {
     let outline = t.composer_outline();
     div()
         .mb(px(-17.))
@@ -1863,8 +2072,8 @@ pub(super) fn top_drawer(content: impl IntoElement, t: &Tokens) -> AnyElement {
                 .pt(px(4.))
                 // 4px padding plus the 17px the composer covers.
                 .pb(px(21.))
-                .rounded_t(px(16.))
                 .border_1()
+                .map(|el| if joined { el.border_t_0() } else { el.rounded_t(px(16.)) })
                 .border_color(outline)
                 .bg(t.composer_glass().opacity(t.glass))
                 .text_xs()
@@ -1969,6 +2178,58 @@ struct ChipRecords<'a> {
     /// The context ids the draft holds records for.
     held: &'a HashSet<String>,
     machines: &'a [(String, Lucide)],
+    /// What each `model:` chip names.
+    models: &'a HashMap<String, ModelMention>,
+}
+
+/// What a `model:` chip shows of the model it names (`ModelMentionPresentation`).
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ModelMention {
+    pub label: String,
+    /// Its sub-provider, else its provider.
+    pub provider_label: String,
+    pub driver: String,
+}
+
+/// `--context-chip-model`: `oklch(0.62 0.13 105)`.
+const MODEL_CHIP_ACCENT: crate::theme_color::Oklch = crate::theme_color::Oklch { l: 0.62, c: 0.13, h: 105. };
+
+/// `logoAccent`: the model chip's lightness with the hue and chroma of the provider logo's own
+/// color, for logos that keep one color in both themes; else the model chip's own accent.
+#[expect(clippy::cast_possible_truncation, reason = "colour channels; f32 is plenty")]
+pub(super) fn model_chip_accent(driver: &str) -> Hsla {
+    use crate::theme_color::{Oklch, Rgb, oklch_to_rgb, rgb_to_oklch};
+    // `BUNDLED_LOGO_COLOR_BY_PROVIDER` also colors Antigravity, whose logo isn't bundled here.
+    let logo = match driver {
+        "antigravity" => Some(Hsla::from(rgb(0x5b87bf))),
+        _ => crate::assets::provider_icon(driver).and_then(|(_, tint)| tint),
+    };
+    let color = logo.map_or(MODEL_CHIP_ACCENT, |logo| {
+        let logo = logo.to_rgb();
+        let [r, g, b] = [logo.r, logo.g, logo.b].map(|channel| f64::from(channel) * 255.);
+        Oklch { l: MODEL_CHIP_ACCENT.l, ..rgb_to_oklch(Rgb { r, g, b }) }
+    });
+    let rgb = oklch_to_rgb(color, false);
+    gpui_kit::Rgba { r: (rgb.r / 255.) as f32, g: (rgb.g / 255.) as f32, b: (rgb.b / 255.) as f32, a: 1. }.into()
+}
+
+/// The provider logo a model chip leads with, in the logo's own color or else `accent`.
+pub(super) fn model_chip_icon(driver: &str, accent: Hsla) -> Icon {
+    match crate::assets::provider_icon(driver) {
+        Some((asset, tint)) => Icon::empty().path(asset).text_color(tint.unwrap_or(accent)),
+        None => Icon::new(Lucide::Bot).text_color(accent),
+    }
+}
+
+/// `ModelMentionChip`'s details: the model, its provider, and the reference the prompt holds.
+pub(super) fn model_mention_details(mention: &ModelMention, source: &str, t: &Tokens) -> gpui_kit::Div {
+    v_flex()
+        .gap(px(4.))
+        .max_w(px(320.))
+        .text_sm()
+        .child(div().font_weight(FontWeight::MEDIUM).text_color(t.foreground).child(mention.label.clone()))
+        .child(div().text_color(t.muted_foreground).child(mention.provider_label.clone()))
+        .child(div().font_family(t.fonts.mono).text_xs().text_color(t.muted_foreground).child(source.to_owned()))
 }
 
 /// A chip in the editor (`ContextChip`): icon and label in the kind's accent ink.
@@ -1992,6 +2253,9 @@ fn render_chip(token: &InlineTokenContext, records: &ChipRecords, t: &Tokens) ->
         Some(Chip::File { path }) => Some(SharedString::from(path.clone())),
         _ => None,
     };
+    if matches!(chip, Some(Chip::Model { .. })) {
+        return render_model_chip(token, records.models.get(id.as_ref()), t);
+    }
     let (accent, icon) = match chip {
         _ if unresolved => (t.foreground.into(), Lucide::CircleDashed),
         Some(Chip::Skill { .. }) => (rgb(0xb261be), Lucide::Box),
@@ -2030,6 +2294,38 @@ fn render_chip(token: &InlineTokenContext, records: &ChipRecords, t: &Tokens) ->
 }
 
 const UNRESOLVED_CONTEXT: &str = "This context is no longer available. Remove it or attach it again.";
+
+/// The chip a selection covers exactly, as a click or Shift+Arrow selects one.
+fn selected_chip(spans: &[gpui_kit::base::input::InlineTokenSpan], selection: &std::ops::Range<usize>) -> Option<Chip> {
+    let span = spans.iter().find(|span| span.range() == *selection)?;
+    Chip::from_id(span.token().id())
+}
+
+/// Where a composer model chip's popover opens: under the chip.
+fn model_chip_menu_at(bounds: gpui_kit::Bounds<gpui_kit::Pixels>) -> gpui_kit::Point<gpui_kit::Pixels> {
+    gpui_kit::point(bounds.left(), bounds.bottom() + px(4.))
+}
+
+/// A `model:` chip: the provider's logo and the model's name, its details while hovered. A model
+/// the environment no longer offers keeps the name it was picked with.
+fn render_model_chip(token: &InlineTokenContext, mention: Option<&ModelMention>, t: &Tokens) -> AnyElement {
+    let id = token.token().id();
+    let accent = mention.map_or_else(|| model_chip_accent(""), |m| model_chip_accent(&m.driver));
+    let icon = model_chip_icon(mention.map_or("", |m| m.driver.as_str()), accent);
+    h_flex()
+        .h(token.line_height())
+        .max_w(token.available_width())
+        .gap(px(3.))
+        .rounded(px(4.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(accent)
+        .when(token.is_selected(), |el| el.bg(t.primary.opacity(0.25)))
+        .child(icon.with_size(px(14.)).flex_none())
+        .child(div().min_w_0().truncate().child(token.token().label().clone()))
+        .id(ElementId::Name(format!("chip-{}-{id}", token.range().start).into()))
+        .cursor_pointer()
+        .into_any_element()
+}
 
 /// The kind of a context record that can carry a change request (`ReviewCommentContextRecord`).
 const REVIEW_COMMENT: &str = "review-comment";
@@ -2244,6 +2540,59 @@ mod tests {
         assert_eq!(question_submit(&draft, none, false, true), ("Submit answers", true));
         assert_eq!(question_submit(&draft, none, true, true), ("Submitting...", false));
         assert_eq!(question_submit(&draft, none, false, false), ("Submit answers", false), "not resumable");
+    }
+
+    #[test]
+    fn chips_catch_up_once_the_composer_provider_changes() {
+        let mut seen = None;
+        assert!(note_provider(&mut seen, Some("codex")), "the thread's provider arrives");
+        assert!(!note_provider(&mut seen, Some("codex")), "a model change within it");
+        assert!(note_provider(&mut seen, Some("claudeAgent")), "another client moved the thread");
+        assert_eq!(seen.as_deref(), Some("claudeAgent"));
+        assert!(note_provider(&mut seen, None), "its provider went");
+        assert!(!note_provider(&mut seen, None));
+    }
+
+    #[test]
+    fn a_chip_catch_up_refused_mid_composition_runs_once_it_ends() {
+        use gpui_kit::base::input::InlineTokenError::{CompositionActive, TextMismatch};
+        let mut pending = None;
+        let sync = take_chip_sync(&mut pending, ChipSync::Remount);
+        assert!(!settle_chip_sync(&mut pending, sync, Err(CompositionActive)), "rich text turned on mid-composition");
+        assert_eq!(pending, Some(ChipSync::Remount));
+        let sync = take_chip_sync(&mut pending, ChipSync::Lists);
+        assert_eq!(sync, ChipSync::Remount, "a narrower catch-up still runs the waiting one");
+        assert!(!settle_chip_sync(&mut pending, sync, Err(CompositionActive)), "still composing");
+        let sync = take_chip_sync(&mut pending, ChipSync::Restored);
+        assert!(settle_chip_sync(&mut pending, sync, Ok(())), "the commit's change runs it");
+        assert_eq!((sync, pending), (ChipSync::Remount, None));
+        let sync = take_chip_sync(&mut pending, ChipSync::Lists);
+        assert!(!settle_chip_sync(&mut pending, sync, Err(TextMismatch)));
+        assert_eq!(pending, None, "only a composition defers one");
+    }
+
+    #[test]
+    fn an_undo_that_brings_back_a_chip_is_noticed() {
+        let ids = |ids: &[&str]| ids.iter().map(|id| (*id).to_owned()).collect::<Vec<_>>();
+        let gpt = "model:codex/gpt-6.1";
+        assert!(adds_chip(&ids(&["skill:review"]), &ids(&["skill:review", gpt])));
+        assert!(adds_chip(&ids(&[gpt]), &ids(&[gpt, gpt])), "a second chip for one model");
+        assert!(!adds_chip(&ids(&[gpt, gpt]), &ids(&[gpt])));
+        assert!(!adds_chip(&ids(&[gpt, "skill:review"]), &ids(&["skill:review", gpt])));
+    }
+
+    #[test]
+    fn enter_opens_a_model_chip_only_while_the_selection_is_that_chip() {
+        let text = "ask model:codex/gpt-6.1 or $review now";
+        let content = InputContent::new(text)
+            .with_token(4..23, InlineToken::new("model:codex/gpt-6.1", "model:codex/gpt-6.1"))
+            .and_then(|content| content.with_token(27..34, InlineToken::new("skill:review", "$review")))
+            .unwrap();
+        let spans = content.tokens();
+        assert!(matches!(selected_chip(spans, &(4..23)), Some(Chip::Model { model, .. }) if model == "gpt-6.1"));
+        assert_eq!(selected_chip(spans, &(23..23)), None, "a caret beside it sends");
+        assert_eq!(selected_chip(spans, &(0..23)), None, "a wider selection");
+        assert_eq!(selected_chip(spans, &(27..34)), Some(Chip::Skill { name: "review".into() }));
     }
 
     #[test]

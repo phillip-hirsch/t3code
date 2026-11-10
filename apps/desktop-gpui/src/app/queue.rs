@@ -437,8 +437,9 @@ impl Workspace {
         }
         let text = self.pane_text(pane, cx);
         let attached = pane == ChatPane::Main && self.has_attachments();
-        let changed = text.trim() != edit.original.trim() || attached;
-        let keep = changed && edit.saved.0.trim().is_empty() && edit.saved.1.is_empty();
+        let thread_draft_empty = edit.saved.0.trim().is_empty() && edit.saved.1.is_empty();
+        let exit = edit_exit(&text, &edit.original, edit.removed_attachment, attached, thread_draft_empty);
+        let (changed, keep) = (exit != EditExit::Clean, exit == EditExit::Kept);
         let title = self.pane_projection(pane).map(|p| p.thread.title.clone());
         let Some((saved_text, saved_attachments, saved_records)) =
             self.queue_ui_mut(pane).and_then(QueueUi::take_edit_draft)
@@ -506,6 +507,24 @@ impl Workspace {
             cx.propagate();
         }
     }
+}
+
+/// What an open edit becomes when its run leaves the queue (`recoverQueuedMessageEdit`).
+#[derive(Debug, PartialEq, Eq)]
+enum EditExit {
+    /// Unchanged: it just closes.
+    Clean,
+    /// Changed, with something to put back, into an empty thread draft.
+    Kept,
+    Discarded,
+}
+
+fn edit_exit(text: &str, original: &str, removed: bool, added: bool, thread_draft_empty: bool) -> EditExit {
+    if !(removed || text != original || added) {
+        return EditExit::Clean;
+    }
+    // A cleared edit has nothing to put back, so it can only be discarded.
+    if thread_draft_empty && (!text.trim().is_empty() || added) { EditExit::Kept } else { EditExit::Discarded }
 }
 
 /// The edit's context records, less those of attachments it no longer carries.
@@ -786,6 +805,18 @@ mod tests {
         assert_eq!(shape(&rows(&state(4), false)), ["r0", "r1.", "toggle 4 false"]);
         assert_eq!(shape(&rows(&state(4), true)), ["r0", "r1", "r2", "r3.", "toggle 4 true"]);
         assert!(rows(&state(0), false).is_empty());
+    }
+
+    #[test]
+    fn a_run_leaving_the_queue_keeps_only_a_changed_edit_with_content() {
+        let exit = |text: &str, removed: bool, added: bool, empty: bool| edit_exit(text, "hi", removed, added, empty);
+        assert_eq!(exit("hi", false, false, true), EditExit::Clean);
+        assert_eq!(exit("hi ", false, false, true), EditExit::Kept, "whitespace is an edit");
+        assert_eq!(exit("hi", true, false, true), EditExit::Kept, "removing an attachment is an edit");
+        assert_eq!(exit("hi", true, false, false), EditExit::Discarded, "never over another draft");
+        assert_eq!(exit("", false, false, true), EditExit::Discarded, "a cleared edit has nothing to keep");
+        assert_eq!(exit("", true, false, true), EditExit::Discarded);
+        assert_eq!(exit("", false, true, true), EditExit::Kept);
     }
 
     #[test]

@@ -84,23 +84,15 @@ pub fn kind_scoped_id(kind: &str, producer: &str) -> String {
     context_id(&format!("{kind}_{producer}"))
 }
 
-/// The `kind` and id of each `(t3-context://v1/kind/id)` reference in `text`, with its byte range.
+/// Each context link in `text` as `collectComposerContextReferences` finds it
+/// ([`crate::composer_text::context_references`]): the whole link's byte range, and its kind and
+/// id as slices of `text`, which end the link as `kind/id)`.
 fn references(text: &str) -> impl Iterator<Item = (std::ops::Range<usize>, &str, &str)> {
-    let mut from = 0;
-    std::iter::from_fn(move || {
-        while let Some(at) = text[from..].find(HREF_PREFIX).map(|at| from + at) {
-            let start = at + HREF_PREFIX.len();
-            from = start;
-            let Some(len) = text[start..].find([')', ' ', '\n', '\t', '\r']) else { continue };
-            if !text[start + len..].starts_with(')') || !text[..at].ends_with("](") {
-                continue;
-            }
-            let Some((kind, id)) = text[start..start + len].split_once('/') else { continue };
-            if valid_kind(kind) && valid_id(id) {
-                return Some((start..start + len, kind, id));
-            }
-        }
-        None
+    crate::composer_text::context_references(text).map(move |(range, kind, id)| {
+        let id_end = range.end - 1;
+        let id_start = id_end - id.len();
+        let kind_start = id_start - 1 - kind.len();
+        (range, &text[kind_start..id_start - 1], &text[id_start..id_end])
     })
 }
 
@@ -123,12 +115,8 @@ pub fn strip_references(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut copied = 0;
     for (range, _, _) in references(text) {
-        let opener = range.start - HREF_PREFIX.len() - 2;
-        // A label holds no brackets, so its link starts at the last `[` before `](`.
-        let Some(open) = text[copied..opener].rfind('[').map(|at| copied + at) else { continue };
-        let open = if text[..open].ends_with('!') { open - 1 } else { open };
-        out.push_str(&text[copied..open]);
-        copied = range.end + 1;
+        out.push_str(&text[copied..range.start]);
+        copied = range.end;
     }
     out.push_str(&text[copied..]);
     out
@@ -157,13 +145,12 @@ pub fn ensure_references(prompt: &str, records: &[Value]) -> String {
 pub fn rewrite_ids(text: &str, ids: &HashMap<String, String>) -> String {
     let mut out = String::with_capacity(text.len());
     let mut copied = 0;
-    for (range, kind, id) in references(text) {
+    for (range, _, id) in references(text) {
         if let Some(new) = ids.get(id).filter(|new| *new != id) {
-            out.push_str(&text[copied..range.start]);
-            out.push_str(kind);
-            out.push('/');
+            let id_start = range.end - 1 - id.len();
+            out.push_str(&text[copied..id_start]);
             out.push_str(new);
-            copied = range.end;
+            copied = range.end - 1;
         }
     }
     out.push_str(&text[copied..]);

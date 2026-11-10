@@ -175,7 +175,7 @@ impl Workspace {
     }
 
     /// A Shift-pick in the composer's picker.
-    pub(super) fn toggle_fanout_model(&mut self, picked: ModelSelection, cx: &mut Context<Self>) {
+    pub(super) fn toggle_fanout_model(&mut self, picked: ModelSelection, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(target), Some(active)) = (self.target.clone(), self.composer_model()) else { return };
         match toggle(self.model_fanout(), &active, picked) {
             Toggled::Several(next) => {
@@ -184,7 +184,7 @@ impl Workspace {
             Toggled::One(remaining) => {
                 self.composer_ui.fanout.selections.remove(&target);
                 if !same_model(&remaining, &active) {
-                    self.pick_model(remaining, cx);
+                    self.pick_model(remaining, window, cx);
                 }
             }
         }

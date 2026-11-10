@@ -209,12 +209,38 @@ impl Workspace {
             .collect()
     }
 
-    /// The markdown source a message parses: its `$skill` tokens become chip links.
+    /// The markdown source a message parses: its `$skill` tokens and the `model:` references
+    /// this environment knows become chip links.
     pub(super) fn with_skill_links(&self, text: &str) -> String {
-        if !text.contains(|c: char| crate::composer_text::is_currency(c)) {
+        if !may_hold_chips(text) {
             return text.to_owned();
         }
-        skill_links(text, &self.markdown_skills())
+        let skills = if text.contains(crate::composer_text::is_currency) { self.markdown_skills() } else { Vec::new() };
+        skill_links(text, &skills, |instance_id, model| {
+            self.model_mention(instance_id, model).map(|m| (m.label, m.driver))
+        })
+    }
+
+    /// A model chip's popover (`ModelMentionChip`): the model, its provider and the reference.
+    pub(super) fn open_model_menu(
+        &mut self,
+        instance_id: &str,
+        model: &str,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mention) = self.model_mention(instance_id, model) else { return };
+        let source = crate::composer_text::model_mention(instance_id, model);
+        let t = *crate::theme::tokens(cx);
+        self.open_chat_menu(position, window, cx, move |menu, _, _| {
+            menu.item(
+                PopupMenuItem::element(move |_, _| {
+                    super::composer::model_mention_details(&mention, &source, &t).p(px(4.))
+                })
+                .disabled(true),
+            )
+        });
     }
 }
 
@@ -464,45 +490,74 @@ fn is_web_link(url: &str) -> bool {
     url.starts_with("https://") || url.starts_with("http://") || url.starts_with("//")
 }
 
+/// Whether `text` can name a skill or model chip at all.
+pub(super) fn may_hold_chips(text: &str) -> bool {
+    text.contains(crate::composer_text::is_currency) || text.contains("model:")
+}
+
 /// `matchInlineSkills` over prose: each `$name` of a known skill, outside code, becomes
-/// `[Label](t3-skill:name)` for [`SkillChips`] to draw.
-pub(super) fn skill_links(text: &str, skills: &[InlineSkill]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(text.len());
-    let mut fenced = false;
-    for line in text.split_inclusive('\n') {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            fenced = !fenced;
-            out.push_str(line);
-            continue;
+/// `[Label](t3-skill:name)` for [`SkillChips`] to draw, and each `model:` reference `model`
+/// names (as label and driver) becomes `[Label](t3-model:driver/instance/model)` for
+/// [`ModelChips`] (`SkillInlineText`).
+pub(super) fn skill_links(
+    text: &str,
+    skills: &[InlineSkill],
+    model: impl Fn(&str, &str) -> Option<(String, String)>,
+) -> String {
+    let mut links: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    for prose in prose_ranges(text) {
+        let part = &text[prose.clone()];
+        // A token may end the text, as the web's `(?=\s|$)` allows.
+        let probe = format!("{part} ");
+        let at = |range: std::ops::Range<usize>| prose.start + range.start..prose.start + range.end;
+        for (range, chip) in crate::composer_text::chips(&probe, |name| skills.iter().any(|s| s.name == name)) {
+            let crate::composer_text::Chip::Skill { name } = chip else { continue };
+            let Some(skill) = skills.iter().find(|s| s.name == name) else { continue };
+            links.push((at(range), format!("[{}]({SKILL_SCHEME}{})", skill.label.replace(']', "\\]"), skill.name)));
         }
-        if fenced || line.starts_with("    ") || line.starts_with('\t') {
-            out.push_str(line);
-            continue;
-        }
-        // Backtick spans stay as written.
-        for (index, part) in line.split('`').enumerate() {
-            if index > 0 {
-                out.push('`');
-            }
-            if index % 2 == 1 {
-                out.push_str(part);
-                continue;
-            }
-            let mut last = 0;
-            // A token may end the part, as the web's `(?=\s|$)` allows.
-            let probe = format!("{part} ");
-            for (range, chip) in crate::composer_text::chips(&probe, |name| skills.iter().any(|s| s.name == name)) {
-                let crate::composer_text::Chip::Skill { name } = chip else { continue };
-                let Some(skill) = skills.iter().find(|s| s.name == name) else { continue };
-                out.push_str(&part[last..range.start]);
-                let _ = write!(out, "[{}]({SKILL_SCHEME}{})", skill.label.replace(']', "\\]"), skill.name);
-                last = range.end;
-            }
-            out.push_str(&part[last..]);
+        for mention in crate::composer_text::model_mentions(part) {
+            let Some((label, driver)) = model(&mention.instance_id, &mention.model) else { continue };
+            let url = model_link(&driver, &mention.instance_id, &mention.model);
+            links.push((at(mention.range), format!("[{}]({url})", escape_link_text(&label))));
         }
     }
+    links.sort_by_key(|(range, _)| range.start);
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for (range, link) in links {
+        if range.start < last {
+            continue;
+        }
+        out.push_str(&text[last..range.start]);
+        out.push_str(&link);
+        last = range.end;
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+/// Source ranges of the prose text nodes the renderer draws, outside links, link references,
+/// images, definitions, HTML and code, as the web leaves `a` and `code` children alone.
+fn prose_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    use markdown::mdast::Node;
+    fn walk(node: &Node, out: &mut Vec<std::ops::Range<usize>>) {
+        match node {
+            Node::Text(_) => out.extend(node.position().map(|p| p.start.offset..p.end.offset)),
+            Node::Link(_)
+            | Node::LinkReference(_)
+            | Node::Image(_)
+            | Node::ImageReference(_)
+            | Node::Definition(_)
+            | Node::Html(_)
+            | Node::InlineCode(_)
+            | Node::Code(_) => {}
+            _ => node.children().into_iter().flatten().for_each(|child| walk(child, out)),
+        }
+    }
+    // Unclaimed math renders as prose, so it parses without math, as the renderer re-parses it.
+    let Ok(root) = markdown::to_mdast(text, &markdown::ParseOptions::gfm()) else { return Vec::new() };
+    let mut out = Vec::new();
+    walk(&root, &mut out);
     out
 }
 
@@ -594,6 +649,129 @@ impl MarkdownPlugin for CitationChips {
             .on_click(move |event, window, cx| {
                 let (citation, position) = (citation.clone(), event.position());
                 let _ = workspace.update(cx, |w, cx| w.open_citation_menu(citation, position, window, cx));
+            })
+            .into_any_element()
+    }
+}
+
+/// The model a `t3-model:` link names; [`skill_links`] writes them.
+const MODEL_SCHEME: &str = "t3-model:";
+
+/// `t3-model:{driver}/{instance}/{model}`, the model percent-encoded so any slug survives
+/// Markdown's link destination rules; the driver gives the chip its look without a lookup.
+fn model_link(driver: &str, instance_id: &str, model: &str) -> String {
+    use std::fmt::Write as _;
+    let mut url = format!("{MODEL_SCHEME}{driver}/{instance_id}/");
+    for byte in model.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-_.~:/".contains(&byte) {
+            url.push(char::from(byte));
+        } else {
+            let _ = write!(url, "%{byte:02X}");
+        }
+    }
+    url
+}
+
+/// The driver, instance and model of a [`model_link`].
+fn parse_model_link(url: &str) -> Option<ModelChip> {
+    let (driver, rest) = url.strip_prefix(MODEL_SCHEME)?.split_once('/')?;
+    let (instance_id, encoded) = rest.split_once('/')?;
+    let mut bytes = Vec::with_capacity(encoded.len());
+    let mut rest = encoded.as_bytes();
+    while let Some((&byte, tail)) = rest.split_first() {
+        if byte == b'%' {
+            let hex = std::str::from_utf8(tail.get(..2)?).ok()?;
+            bytes.push(u8::from_str_radix(hex, 16).ok()?);
+            rest = &tail[2..];
+        } else {
+            bytes.push(byte);
+            rest = tail;
+        }
+    }
+    Some(ModelChip {
+        driver: driver.to_owned(),
+        instance_id: instance_id.to_owned(),
+        model: String::from_utf8(bytes).ok()?,
+    })
+}
+
+/// Link text that reads back as `text`: every ASCII punctuation mark escaped.
+fn escape_link_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_ascii_punctuation() {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ModelChip {
+    driver: String,
+    instance_id: String,
+    model: String,
+}
+
+/// Draws `t3-model:` links as the composer's model chip (`ModelMentionChip`): the provider's
+/// logo and the model's name; a click, Enter or Space opens its details.
+pub(super) struct ModelChips {
+    pub workspace: WeakEntity<Workspace>,
+}
+
+impl MarkdownPlugin for ModelChips {
+    fn name(&self) -> &'static str {
+        "t3-model"
+    }
+
+    fn parse(
+        &self,
+        node: &gpui_kit::component::text::markdown_ast::Node,
+        context: &MarkdownParseContext<'_>,
+    ) -> Option<MarkdownNode> {
+        let gpui_kit::component::text::markdown_ast::Node::Link(link) = node else { return None };
+        let chip = parse_model_link(&link.url)?;
+        // Where the chip sits keeps two chips of one model apart, each with its own focus.
+        let at = context.offset() + node.position().map_or(0, |position| position.start.offset);
+        let label = link_text(&link.children);
+        let source = crate::composer_text::model_mention(&chip.instance_id, &chip.model);
+        Some(
+            MarkdownNode::new("t3-model", (chip, at))
+                .accessibility_label(format!("Model {label}"))
+                .text(label)
+                .markdown(source),
+        )
+    }
+
+    fn render(&self, node: &MarkdownNode, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let Some((chip, at)) = node.data::<(ModelChip, usize)>().cloned() else { return div().into_any_element() };
+        let accent = super::composer::model_chip_accent(&chip.driver);
+        let workspace = self.workspace.clone();
+        let id = format!("model-chip:{at}:{}/{}", chip.instance_id, chip.model);
+        let focus = window
+            .use_keyed_state(SharedString::from(format!("{id}:focus")), cx, |_, cx| cx.focus_handle().tab_stop(true))
+            .read(cx)
+            .clone();
+        // `focus-visible:outline-2 -outline-offset-2 outline-current`, drawn over the chip so the prose doesn't move.
+        let ring = (focus.is_focused(window) && window.last_input_was_keyboard())
+            .then(|| div().absolute().inset_0().rounded(px(4.)).border_2().border_color(accent));
+        h_flex()
+            .id(SharedString::from(id))
+            .track_focus(&focus)
+            .relative()
+            .gap(px(3.))
+            .rounded(px(4.))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(accent)
+            .cursor_pointer()
+            .child(super::composer::model_chip_icon(&chip.driver, accent).size(px(14.)).flex_none())
+            .child(node.as_text().to_owned())
+            .children(ring)
+            .on_click(move |event, window, cx| {
+                let position = event.position();
+                let _ = workspace
+                    .update(cx, |w, cx| w.open_model_menu(&chip.instance_id, &chip.model, position, window, cx));
             })
             .into_any_element()
     }
@@ -765,7 +943,11 @@ impl MarkdownPlugin for FileChips {
                 let file = file_links::split_position(&candidate, "");
                 (candidate, file, false)
             }
-            Node::Link(link) if !link.url.starts_with(SKILL_SCHEME) && !link.url.starts_with("t3-thread:") => {
+            Node::Link(link)
+                if !link.url.starts_with(SKILL_SCHEME)
+                    && !link.url.starts_with(MODEL_SCHEME)
+                    && !link.url.starts_with("t3-thread:") =>
+            {
                 let (file, description) = file_link(&link_text(&link.children), &link.url)?;
                 (file_links::with_position(&file), file, description.is_some())
             }
@@ -1557,16 +1739,55 @@ mod tests {
     #[test]
     fn known_skills_outside_code_become_chip_links() {
         let skills = [skill("design", "Design"), skill("pdf:pdf", "PDF")];
+        let links = |text: &str| skill_links(text, &skills, |_, _| None);
         assert_eq!(
-            skill_links("Use $design then $missing and $pdf:pdf.", &skills),
+            links("Use $design then $missing and $pdf:pdf."),
             "Use [Design](t3-skill:design) then $missing and $pdf:pdf."
         );
-        assert_eq!(skill_links("Try `$design` here", &skills), "Try `$design` here");
+        assert_eq!(links("Try `$design` here"), "Try `$design` here");
+        assert_eq!(links("```\n$design \n```\n$design now"), "```\n$design \n```\n[Design](t3-skill:design) now");
+        assert_eq!(links("costs $5 and $10"), "costs $5 and $10");
         assert_eq!(
-            skill_links("```\n$design \n```\n$design now", &skills),
-            "```\n$design \n```\n[Design](t3-skill:design) now"
+            links("see [$design](https://x.dev) or $design"),
+            "see [$design](https://x.dev) or [Design](t3-skill:design)"
         );
-        assert_eq!(skill_links("costs $5 and $10", &skills), "costs $5 and $10");
+    }
+
+    #[test]
+    fn known_model_references_outside_code_become_chip_links_that_parse_back() {
+        let known = |instance_id: &str, model: &str| {
+            (instance_id == "codex" && model.starts_with("gpt-6.1")).then(|| ("GPT-6.1".to_owned(), "codex".to_owned()))
+        };
+        let links = |text: &str| skill_links(text, &[skill("design", "Design")], known);
+        assert_eq!(
+            links("Ask (model:codex/gpt-6.1), not model:openai/gpt-4o, then $design"),
+            "Ask ([GPT\\-6\\.1](t3-model:codex/codex/gpt-6.1)), not model:openai/gpt-4o, then [Design](t3-skill:design)"
+        );
+        assert_eq!(links("Try `model:codex/gpt-6.1` here"), "Try `model:codex/gpt-6.1` here");
+        assert_eq!(links("```\nmodel:codex/gpt-6.1\n```\n"), "```\nmodel:codex/gpt-6.1\n```\n");
+        // Links keep their text as written, as the web leaves `a` children alone.
+        let linked = "[use model:codex/gpt-6.1 now](https://example.com) ![model:codex/gpt-6.1](a.png)";
+        assert_eq!(links(linked), linked);
+        let coded = "[use `x` model:codex/gpt-6.1 now](https://example.com)";
+        assert_eq!(links(coded), coded, "a code span inside a link's text");
+        let reference =
+            "[use model:codex/gpt-6.1 and $design][ref]\n\n[ref]: https://x.dev \"model:codex/gpt-6.1 $design\"\n";
+        assert_eq!(links(reference), reference, "reference links and their definitions");
+        assert_eq!(
+            links("**$design** and [model:codex/gpt-6.1]"),
+            "**[Design](t3-skill:design)** and [[GPT\\-6\\.1](t3-model:codex/codex/gpt-6.1)]",
+            "an undefined reference is prose"
+        );
+        assert_eq!(
+            links("[a [b] model:codex/gpt-6.1](u (v)) model:codex/gpt-6.1"),
+            "[a [b] model:codex/gpt-6.1](u (v)) [GPT\\-6\\.1](t3-model:codex/codex/gpt-6.1)"
+        );
+        let odd = "gpt-6.1(x) [1m]%";
+        let url = model_link("codex", "codex", odd);
+        assert!(!url.contains(['(', ')', ' ', '[', ']']), "{url}");
+        let chip = parse_model_link(&url).unwrap();
+        assert_eq!((chip.driver.as_str(), chip.instance_id.as_str(), chip.model.as_str()), ("codex", "codex", odd));
+        assert_eq!(parse_model_link("t3-model:codex/codex/a%2"), None, "a cut escape");
     }
 
     #[test]

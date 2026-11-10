@@ -18,7 +18,7 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
-use super::banners::{Variant, composer_banner};
+use super::banners::{Variant, composer_banner, corner_action};
 use super::composer::{control_button, runtime_modes};
 use super::{Target, Workspace};
 use crate::new_thread::{self, DraftWorkspace, EnvMode, WorkspaceChoice};
@@ -1233,21 +1233,26 @@ impl Workspace {
     }
 
     /// The `managed-runtime-mode` banner: why sending is refused, and the switch down.
-    pub(super) fn render_runtime_mode_ceiling_banner(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(super) fn render_runtime_mode_ceiling_banner(
+        &self,
+        joined: bool,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         if self.question.is_some() {
             return None;
         }
         let (denial, fallback) = self.runtime_mode_ceiling()?;
         let actions = fallback.map(|mode| {
             let label = runtime_modes().iter().find(|(id, ..)| *id == mode).map_or(mode, |(_, label, _)| label);
-            Button::new("runtime-mode-ceiling-switch")
+            let switch = Button::new("runtime-mode-ceiling-switch")
                 .ghost()
                 .xsmall()
                 .label(format!("Switch to {label}"))
-                .on_click(cx.listener(move |this, _, _, cx| this.set_runtime_mode(mode, cx)))
-                .into_any_element()
+                .on_click(cx.listener(move |this, _, _, cx| this.set_runtime_mode(mode, cx)));
+            corner_action(switch, joined).into_any_element()
         });
-        Some(composer_banner(Variant::Warning, Icon::new(Lucide::Building), denial, None, actions, t))
+        Some(composer_banner(Variant::Warning, Icon::new(Lucide::Building), denial, None, actions, joined, t))
     }
 
     /// The open permissions popover's keys (`ComposerPermissionsSection`'s radio items): the

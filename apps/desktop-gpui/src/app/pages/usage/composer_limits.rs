@@ -208,8 +208,13 @@ impl Workspace {
         .detach();
     }
 
-    /// `usageLimitsBannerItem`: the open panel in the banner dock.
-    pub(in crate::app) fn render_usage_limits_banner(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// `usageLimitsBannerItem`: the open panel in the banner dock; a `joined` card follows another.
+    pub(in crate::app) fn render_usage_limits_banner(
+        &self,
+        joined: bool,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let panel = &self.composer_ui.usage_limits;
         let opened_at = panel.current(self.usage_limits_key().as_deref())?;
         let report = self.usage_limits_report(opened_at)?;
@@ -335,8 +340,8 @@ impl Workspace {
                         .pt(px(5.))
                         // 5px padding plus the 17px the composer covers.
                         .pb(px(22.))
-                        .rounded_t(px(16.))
                         .border_1()
+                        .map(|el| if joined { el.border_t_0() } else { el.rounded_t(px(16.)) })
                         .border_color(outline)
                         .bg(t.card.opacity(t.glass))
                         .text_xs()

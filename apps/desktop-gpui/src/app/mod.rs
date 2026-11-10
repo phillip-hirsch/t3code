@@ -41,6 +41,7 @@ mod composer_fit;
 mod composer_menu;
 mod composer_plan;
 mod composer_rich;
+mod composer_suggestion;
 mod confirm;
 mod context_records;
 mod context_strip;
@@ -283,8 +284,14 @@ pub struct Workspace {
     prompt_stash: prompt_stash::PromptStash,
     /// Where Up/Down prompt history stands.
     prompt_history: Option<crate::composer_text::HistoryPosition>,
-    /// The editor's chip ids after the last edit, to notice deleted attachment chips.
+    /// The editor's chip ids after the last edit, to notice a chip an undo brings back.
     chip_ids: Vec<String>,
+    /// The context links the text held after the last edit, to notice deleted attachment references.
+    context_refs: Vec<String>,
+    /// A chip catch-up the composer refused during an IME composition.
+    chip_sync_pending: Option<composer::ChipSync>,
+    /// The provider instance the composer's and messages' skill chips last resolved against.
+    chip_provider: Option<String>,
     /// The composer's Markdown styling, made the first time `composerRichTextEnabled` paints.
     composer_marks: Option<gpui_kit::component::input::TextDecorationCollection<TextareaMode>>,
     /// Ctrl (Cmd) is down, which turns steer into queue.
@@ -295,7 +302,7 @@ pub struct Workspace {
     dragging_files: bool,
     /// Targets whose dropped or picked files are still being read, one entry per read.
     reading_attachments: Vec<attachments::Origin>,
-    /// Attachments whose chip was deleted, kept until the editor's undo history ends.
+    /// Attachments whose reference was deleted, kept until the editor's undo history ends.
     retained_attachments: Vec<attachments::Attachment>,
     /// The open draft's context records, behind its `t3-context://` chips.
     context: context_records::ContextState,
@@ -414,6 +421,7 @@ pub struct Workspace {
     subagents: subagents::SubagentUi,
     banners: banners::BannerUi,
     fresh_sessions: fresh_session::FreshSessions,
+    prompt_suggestions: composer_suggestion::PromptSuggestions,
     /// Window bounds persistence and other desktop shell state.
     desktop: desktop::DesktopShell,
     /// Each environment's project clones and their toasts.
@@ -476,6 +484,7 @@ impl Workspace {
                     window.refresh();
                 }
             }),
+            cx.on_focus_lost(window, Self::recover_request_focus),
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
                     this.clear_system_alerts(window, cx);
@@ -547,6 +556,9 @@ impl Workspace {
             prompt_stash: Default::default(),
             prompt_history: None,
             chip_ids: Vec::new(),
+            context_refs: Vec::new(),
+            chip_sync_pending: None,
+            chip_provider: None,
             composer_marks: None,
             ctrl_held: false,
             environment_remote: false,
@@ -638,6 +650,7 @@ impl Workspace {
             subagents: Default::default(),
             banners: Default::default(),
             fresh_sessions: Default::default(),
+            prompt_suggestions: Default::default(),
             desktop,
             clones: project_clone::ProjectClones::default(),
             keep_alive: Default::default(),
@@ -910,6 +923,8 @@ impl Workspace {
                     return;
                 }
                 this.refresh_rows(cx);
+                // Another client may have moved the thread to a provider with other skills.
+                this.sync_chip_provider(cx);
                 this.refresh_thread_find(cx);
                 this.sync_typing_guard(window, cx);
                 this.sync_question(side_chat::ChatPane::Main, window, cx);
@@ -1365,7 +1380,8 @@ fn respond_value(thread_id: &str, request_id: &str, response: Value) -> Value {
 }
 
 fn draft_title(text: &str) -> String {
-    let text = crate::assistant_citations::to_plain_text(text);
+    // `threadTitleTextFromPrompt`: model references as their slugs, then citations as plain text.
+    let text = crate::assistant_citations::to_plain_text(&crate::composer_text::model_mentions_as_slugs(text));
     let line = text.lines().next().unwrap_or_default().trim();
     match line.char_indices().nth(60) {
         Some((end, _)) => format!("{}…", &line[..end]),
@@ -1395,6 +1411,7 @@ impl Render for Workspace {
         }
         self.follow_rows_surface(cx);
         self.sync_error_scope();
+        self.sync_prompt_suggestion(cx);
         self.sync_saved_connection_banner(cx);
         self.sync_sheet_focus(window, cx);
         self.sync_welcome(window, cx);

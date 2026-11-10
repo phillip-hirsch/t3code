@@ -1,4 +1,5 @@
-//! The `@` files, `$` skills, `/` commands and `#` pull requests menu above the composer
+//! The `@` files, machines and models, `$` skills, `/` commands and `#` pull requests menu above
+//! the composer
 //! (`ComposerCommandMenu.tsx`, `ComposerCommandMenuLayer.tsx`,
 //! `useComposerMenuItems.ts`).
 
@@ -19,6 +20,7 @@ use serde_json::json;
 use super::{Target, Workspace};
 use crate::composer_search::{self, MenuAction, MenuItem};
 use crate::composer_text::{self, Chip, Trigger, TriggerKind};
+use crate::model::Provider;
 use crate::pull_request_completions::{self, Reference};
 use crate::pull_requests::ListResult;
 use crate::rpc::RpcClient;
@@ -29,6 +31,8 @@ const SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
 const SEARCH_LIMIT: u32 = 80;
 /// The `#` menu's `useDebouncedValue` delay for a host search or a number.
 const PULL_REQUEST_DEBOUNCE: Duration = Duration::from_millis(180);
+/// `projects.searchEntries` takes at most this many UTF-16 units of query.
+const SEARCH_QUERY_MAX: usize = 256;
 /// `--chat-composer-drawer-inset` and the 17px the composer covers.
 const DRAWER_INSET: f32 = 22.;
 const OVERLAP: f32 = 17.;
@@ -167,8 +171,9 @@ impl Workspace {
         };
         let cwd = self.composer_cwd();
         if trigger.kind == TriggerKind::Path {
-            let machines = self.machine_items(&trigger.query);
-            self.search_files(trigger.query.trim().to_owned(), cwd, machines, cx);
+            let mut leading = self.machine_items(&trigger.query);
+            leading.extend(self.model_items(&trigger.query));
+            self.search_files(trigger.query.trim().to_owned(), cwd, leading, cx);
             return;
         }
         if trigger.kind == TriggerKind::PullRequest {
@@ -241,17 +246,31 @@ impl Workspace {
         composer_search::environment_items(machines, here, query)
     }
 
-    fn search_files(&mut self, query: String, cwd: Option<String>, machines: Vec<MenuItem>, cx: &mut Context<Self>) {
+    /// `@` names the models of this environment's ready providers that the picker would list,
+    /// leaving out legacy and unavailable ones so they don't fill the cap.
+    fn model_items(&self, query: &str) -> Vec<MenuItem> {
+        let info = self.server_info();
+        let ready =
+            |p: &&Provider| p.enabled && p.availability.as_deref() != Some("unavailable") && p.status == "ready";
+        let candidates: Vec<_> = (info.providers.iter().filter(ready))
+            .flat_map(|p| p.models.iter().map(move |m| (p, m)))
+            .filter(|(p, m)| !m.is_legacy && !m.is_unavailable && !Self::model_hidden(info, p, m))
+            .collect();
+        composer_search::model_items(&candidates, query)
+    }
+
+    /// Fetches files after the `leading` rows (machines, then models) the query already matched.
+    fn search_files(&mut self, query: String, cwd: Option<String>, leading: Vec<MenuItem>, cx: &mut Context<Self>) {
         let (Some(cwd), Some(client), false) = (cwd, self.client(), query.is_empty()) else {
             self.menu._search = None;
             self.menu.loading = false;
-            self.menu.items = Rc::from(machines);
+            self.menu.items = Rc::from(leading);
             return;
         };
         self.menu.loading = true;
         self.menu._search = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SEARCH_DEBOUNCE).await;
-            let input = json!({"cwd": cwd, "query": query, "limit": SEARCH_LIMIT});
+            let input = json!({"cwd": cwd, "query": bounded_query(&query), "limit": SEARCH_LIMIT});
             let result = client.request("projects.searchEntries", input).await;
             let _ = this.update(cx, |this, cx| {
                 // A newer query replaced this one.
@@ -266,7 +285,7 @@ impl Workspace {
                         Vec::new()
                     }
                 };
-                this.menu.items = machines.into_iter().chain(files).collect();
+                this.menu.items = leading.into_iter().chain(files).collect();
                 this.menu.highlighted = 0;
                 cx.notify();
             });
@@ -460,6 +479,11 @@ impl Workspace {
                 self.context.records.insert(record);
                 (link, Some(Chip::Context { kind: kind.into(), id, label: item.label.clone() }))
             }
+            // It names the model for the agent; the thread's own model stays.
+            MenuAction::ModelMention { instance_id, model, .. } => (
+                composer_text::model_mention(instance_id, model),
+                Some(Chip::Model { instance_id: instance_id.clone(), model: model.clone(), label: item.label.clone() }),
+            ),
         };
         self.menu.trigger = None;
         self.composer.update(cx, |state, cx| {
@@ -601,6 +625,11 @@ fn menu_row(item: &MenuItem, kind: TriggerKind, active: bool, t: &Tokens) -> gpu
             let (asset, color) = crate::file_icons::file_icon(path, t.dark);
             Some(Icon::empty().path(asset).text_color(color))
         }
+        // `ProviderInstanceIcon`: the provider's logo, in its own color where it has one.
+        MenuAction::ModelMention { driver, .. } => Some(match crate::assets::provider_icon(driver) {
+            Some((asset, tint)) => Icon::empty().path(asset).text_color(tint.unwrap_or(t.foreground)),
+            None => Icon::new(Lucide::Bot).text_color(t.muted_foreground),
+        }),
         _ => None,
     };
     let badge = match (&item.action, kind) {
@@ -661,6 +690,19 @@ fn menu_row(item: &MenuItem, kind: TriggerKind, active: bool, t: &Tokens) -> gpu
         }))
 }
 
+/// A long pasted path cut to the request's bound, never inside a surrogate pair.
+fn bounded_query(query: &str) -> &str {
+    let mut units = 0;
+    let end = query
+        .char_indices()
+        .find(|(_, c)| {
+            units += c.len_utf16();
+            units > SEARCH_QUERY_MAX
+        })
+        .map_or(query.len(), |(at, _)| at);
+    &query[..end]
+}
+
 /// `resolveProviderSkillSourceKind`: where a skill comes from, as its badge shows it.
 fn skill_badge(scope: Option<&str>, path: &str) -> ((Lucide, &'static str), Option<&'static str>) {
     let path = path.replace('\\', "/");
@@ -676,4 +718,20 @@ fn skill_badge(scope: Option<&str>, path: &str) -> ((Lucide, &'static str), Opti
         }
     };
     (kind, Some(" Skill"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bounded_query;
+
+    #[test]
+    fn path_queries_stop_at_256_utf16_units_without_splitting_a_pair() {
+        let a = |n: usize| "a".repeat(n);
+        assert_eq!(bounded_query("src"), "src");
+        assert_eq!(bounded_query(&a(256)), a(256));
+        let long = [a(86), "b".repeat(86), "c".repeat(86), "unique.ts".into()].join("/");
+        assert_eq!(bounded_query(&long), [a(86), "b".repeat(86), "c".repeat(82)].join("/"));
+        assert_eq!(bounded_query(&format!("{}😀/boundary.ts", a(255))), a(255));
+        assert_eq!(bounded_query(&format!("{}😀/boundary.ts", a(254))), format!("{}😀", a(254)));
+    }
 }

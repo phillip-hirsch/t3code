@@ -12,9 +12,9 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, FocusHandle, FontWeight, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, WeakEntity,
-    Window, div, prelude::FluentBuilder as _, px, svg,
+    AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable as _, FontWeight,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Subscription, WeakEntity, Window, div, prelude::FluentBuilder as _, px, svg,
 };
 use serde_json::{Value, json};
 
@@ -44,6 +44,10 @@ pub(super) struct RequestUi {
     references: HashMap<SharedString, (Entity<InputState>, Subscription)>,
     busy: HashSet<SharedString>,
     errors: HashMap<SharedString, SharedString>,
+    /// The timeline card whose input has focus, and that input's focus.
+    focused: Option<(SharedString, FocusHandle)>,
+    /// A focused input whose card went away; focus it held returns to the composer.
+    lost: Option<FocusHandle>,
 }
 
 /// A configured secret provider a pending card can read its answer from (`SecretRequestSource`).
@@ -107,6 +111,166 @@ pub(super) fn secret_reference(source: &str, text: &str) -> Option<Value> {
     is_one_password_reference(reference).then(|| json!({"provider": source, "reference": reference}))
 }
 
+/// `secretRequestLink`: the page a secret card opens, as its href and host. The agent's `url`
+/// wins over the one link its reason names, and only http(s) opens, so no other scheme can.
+pub(super) fn secret_request_link(url: Option<&str>, reason: &str) -> Option<(String, String)> {
+    let page = page_url(&match url {
+        Some(url) => url.to_owned(),
+        None => reason_link(reason)?,
+    })?;
+    let host = page.host_str()?;
+    let host = page.port().map_or_else(|| host.to_owned(), |port| format!("{host}:{port}"));
+    Some((page.into(), host))
+}
+
+/// `secretRequestPageUrl`.
+fn page_url(value: &str) -> Option<url::Url> {
+    let url = url::Url::parse(value).ok()?;
+    (matches!(url.scheme(), "http" | "https") && url.host_str().is_some_and(|host| !host.is_empty())).then_some(url)
+}
+
+/// `reasonLink`: the one distinct http(s) link in `reason`, for agents that put it there
+/// instead of in `url`. Backticks, <angle brackets> and markdown link targets keep their exact
+/// text; a bare link drops trailing punctuation and the emphasis wrapped around it.
+fn reason_link(reason: &str) -> Option<String> {
+    let mut links: Vec<String> = Vec::new();
+    let mut at = 0;
+    while let Some(next) = reason[at..].chars().next() {
+        let rest = &reason[at..];
+        let (link, len) = match enclosed_link(rest) {
+            Some(found) => found,
+            None => match link_len(rest, |c| matches!(c, '<' | '>' | '"' | '\'' | '`' | '[' | ']')) {
+                Some(len) => {
+                    let before = &reason[..at];
+                    let mut link = trim_punctuation(&rest[..len]);
+                    loop {
+                        let trimmed = trim_emphasis(link, before);
+                        if trimmed.len() == link.len() {
+                            break;
+                        }
+                        link = trimmed;
+                    }
+                    (link, len)
+                }
+                None => {
+                    at += next.len_utf8();
+                    continue;
+                }
+            },
+        };
+        // Two spellings of one page (`https://a.dev` and `https://a.dev/`) count once.
+        let link = page_url(link).map_or_else(|| link.to_owned(), String::from);
+        if !links.contains(&link) {
+            links.push(link);
+        }
+        at += len;
+    }
+    (links.len() == 1).then(|| links.remove(0))
+}
+
+fn scheme_len(text: &str) -> Option<usize> {
+    let scheme = ["https://", "http://"]
+        .into_iter()
+        .find(|scheme| text.get(..scheme.len()).is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme)))?;
+    Some(scheme.len())
+}
+
+/// The length of the http(s) link that starts `text`, its body ending at whitespace or `stop`.
+fn link_len(text: &str, stop: impl Fn(char) -> bool) -> Option<usize> {
+    let scheme = scheme_len(text)?;
+    let body: usize = text[scheme..].chars().take_while(|&c| !c.is_whitespace() && !stop(c)).map(char::len_utf8).sum();
+    (body > 0).then_some(scheme + body)
+}
+
+/// A markdown link target's length up to its closing `)`, allowing balanced parentheses inside.
+fn target_len(text: &str) -> Option<usize> {
+    let plain = |c: char| !c.is_whitespace() && c != '(' && c != ')';
+    let scheme = scheme_len(text)?;
+    let mut end = scheme;
+    loop {
+        let rest = &text[end..];
+        match rest.chars().next() {
+            Some(c) if plain(c) => end += c.len_utf8(),
+            Some('(') => {
+                let inner: usize = rest[1..].chars().take_while(|&c| plain(c)).map(char::len_utf8).sum();
+                if !rest[1 + inner..].starts_with(')') {
+                    break;
+                }
+                end += inner + 2;
+            }
+            _ => break,
+        }
+    }
+    (end > scheme).then_some(end)
+}
+
+/// A link in backticks, angle brackets or a markdown target at the start of `text`, and how
+/// much of `text` that takes.
+fn enclosed_link(text: &str) -> Option<(&str, usize)> {
+    let (open, close) = match text.chars().next()? {
+        '`' => ("`", '`'),
+        '<' => ("<", '>'),
+        ']' => ("](", ')'),
+        _ => return None,
+    };
+    let body = text.strip_prefix(open)?;
+    let len = if close == ')' { target_len(body)? } else { link_len(body, |c| c == close)? };
+    body[len..].starts_with(close).then(|| (&body[..len], open.len() + len + 1))
+}
+
+/// `trimPunctuation`: a `)` stays when the link opened a matching `(`.
+fn trim_punctuation(link: &str) -> &str {
+    let mut end = link.len();
+    while let Some(last) = link[..end].chars().next_back().filter(|&c| ".,;:!?)".contains(c)) {
+        let kept = &link[..end];
+        if last == ')' && kept.matches('(').count() >= kept.matches(')').count() {
+            break;
+        }
+        end -= 1;
+    }
+    &link[..end]
+}
+
+/// `trimEmphasis`: drops a closing `*` or `_` run only when the same run opened emphasis
+/// before the link and is still open there.
+fn trim_emphasis<'a>(link: &'a str, before: &str) -> &'a str {
+    let Some(mark) = link.chars().next_back().filter(|&c| matches!(c, '*' | '_')) else { return link };
+    let run = &link[link.len() - link.chars().rev().take_while(|&c| c == mark).count().min(3)..];
+    let Some(opened) = emphasis_opener(before, run) else { return link };
+    let after_open = &before[opened..];
+    let ends_run = |after: &str| after.chars().next().is_none_or(|c| c.is_whitespace() || ".,;:!?)".contains(c));
+    let closed = after_open
+        .char_indices()
+        .any(|(at, c)| !c.is_whitespace() && after_open[at + c.len_utf8()..].strip_prefix(run).is_some_and(ends_run));
+    if closed { link } else { trim_punctuation(&link[..link.len() - run.len()]) }
+}
+
+/// Where the last `run` that opens emphasis in `before` ends: at the start or after whitespace,
+/// `(`, `*` or `_` (so `**_url_**` nests), and followed by text.
+fn emphasis_opener(before: &str, run: &str) -> Option<usize> {
+    let opens = |end: usize| before[end..].chars().next().is_none_or(|c| !c.is_whitespace());
+    let mut found = None;
+    let mut at = 0;
+    while at <= before.len() {
+        let start = if at == 0 && before.starts_with(run) && opens(run.len()) {
+            Some(0)
+        } else {
+            (before[at..].chars().next())
+                .filter(|&c| c.is_whitespace() || matches!(c, '(' | '*' | '_'))
+                .map(|c| at + c.len_utf8())
+                .filter(|&start| before[start..].starts_with(run) && opens(start + run.len()))
+        };
+        match start {
+            Some(start) => {
+                found = Some(start + run.len());
+                at = start + run.len();
+            }
+            None => at += before[at..].chars().next().map_or(1, char::len_utf8),
+        }
+    }
+    found
+}
+
 /// `secretRequestFailureMessage` / `linkRequestFailureMessage`: only errors written for the
 /// user pass their message through, so a typed value can never surface.
 fn failure_message(error: &RpcError, tags: &[&str]) -> SharedString {
@@ -140,6 +304,34 @@ impl Workspace {
         ui.references.retain(|id, _| shown(id));
         ui.sources.retain(|id, _| shown(id));
         ui.errors.retain(|id, _| shown(id));
+        if ui.focused.as_ref().is_some_and(|(id, _)| !shown(id)) {
+            ui.lost = ui.focused.take().map(|(_, focus)| focus);
+        }
+    }
+
+    /// `workspaceFocus` recovery: focus that dropped with an answered or ended timeline card,
+    /// whoever answered it, goes on to the composer.
+    pub(super) fn recover_request_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.requests.lost.take().is_some_and(|focus| focus.is_focused(window)) {
+            self.focus_composer(window, cx);
+        }
+    }
+
+    /// Tracks which timeline card's input has focus; a side-chat card keeps its own.
+    fn request_input_focus(&mut self, card: &RequestCard, input: &Entity<InputState>, event: &InputEvent, cx: &App) {
+        match event {
+            InputEvent::Focus if self.in_timeline(card) => {
+                self.requests.focused = Some((card.item_id.clone(), input.read(cx).focus_handle(cx)));
+            }
+            InputEvent::Blur if self.requests.focused.as_ref().is_some_and(|(id, _)| *id == card.item_id) => {
+                self.requests.focused = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn in_timeline(&self, card: &RequestCard) -> bool {
+        self.rows.iter().any(|row| matches!(row, timeline::Row::Request(shown) if shown.item_id == card.item_id))
     }
 
     fn secret_input(&mut self, card: &RequestCard, window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
@@ -153,11 +345,12 @@ impl Workspace {
         let input = cx.new(|cx| InputState::new(window, cx).masked(true).placeholder(placeholder));
         let id = card.item_id.clone();
         let card = card.clone();
-        let subscription = cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, _, cx| match event {
-            InputEvent::PressEnter { .. } => this.answer_secret(&card, true, cx),
-            InputEvent::Change => cx.notify(),
-            _ => {}
-        });
+        let subscription =
+            cx.subscribe_in(&input, window, move |this, input, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { .. } => this.answer_secret(&card, true, window, cx),
+                InputEvent::Change => cx.notify(),
+                _ => this.request_input_focus(&card, input, event, cx),
+            });
         self.requests.secrets.insert(id, (input.clone(), subscription));
         input
     }
@@ -183,14 +376,15 @@ impl Workspace {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder(REFERENCE_PLACEHOLDER));
         let id = card.item_id.clone();
         let card = card.clone();
-        let subscription = cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, _, cx| match event {
-            InputEvent::PressEnter { .. } => this.answer_secret(&card, true, cx),
-            InputEvent::Change => {
-                this.requests.errors.remove(&card.item_id);
-                cx.notify();
-            }
-            _ => {}
-        });
+        let subscription =
+            cx.subscribe_in(&input, window, move |this, input, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { .. } => this.answer_secret(&card, true, window, cx),
+                InputEvent::Change => {
+                    this.requests.errors.remove(&card.item_id);
+                    cx.notify();
+                }
+                _ => this.request_input_focus(&card, input, event, cx),
+            });
         self.requests.references.insert(id, (input.clone(), subscription));
         input
     }
@@ -204,8 +398,16 @@ impl Workspace {
         cx.notify();
     }
 
+    /// A timeline card's controls disable once it is answered, so focus goes on to the composer
+    /// (`workspaceFocus` recovering a finished conversation prompt). A side-chat card keeps its own.
+    fn leave_answered_card(&mut self, card: &RequestCard, window: &mut Window, cx: &mut Context<Self>) {
+        if self.in_timeline(card) {
+            self.focus_composer(window, cx);
+        }
+    }
+
     /// `secrets.answerRequest`: save the typed value, read it from a secret provider, or decline.
-    fn answer_secret(&mut self, card: &RequestCard, save: bool, cx: &mut Context<Self>) {
+    fn answer_secret(&mut self, card: &RequestCard, save: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(client) = self.client() else { return };
         let id = card.item_id.clone();
         if self.requests.busy.contains(&id) {
@@ -244,6 +446,7 @@ impl Workspace {
         let input = json!({"threadId": card.thread_id, "turnItemId": id, "answer": answer});
         self.requests.busy.insert(id.clone());
         self.requests.errors.remove(&id);
+        self.leave_answered_card(card, window, cx);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = client.request("secrets.answerRequest", input).await;
@@ -265,7 +468,7 @@ impl Workspace {
         .detach();
     }
 
-    fn decline_link(&mut self, card: &RequestCard, cx: &mut Context<Self>) {
+    fn decline_link(&mut self, card: &RequestCard, window: &mut Window, cx: &mut Context<Self>) {
         let Some(host) = self.thread_environment(&card.thread_id) else { return };
         let Some(client) = self.env_client(&host).filter(|_| self.manages_access(&host)) else { return };
         let id = card.item_id.clone();
@@ -273,6 +476,7 @@ impl Workspace {
             return;
         }
         self.requests.errors.remove(&id);
+        self.leave_answered_card(card, window, cx);
         cx.notify();
         let input = json!({"threadId": card.thread_id, "turnItemId": id, "answer": {"type": "decline"}});
         cx.spawn(async move |this, cx| {
@@ -299,7 +503,7 @@ pub(super) fn request_row(
 ) -> AnyElement {
     let Some(workspace) = this.upgrade() else { return div().into_any_element() };
     let body = match &card.kind {
-        RequestKind::Secret { label, file, .. } => {
+        RequestKind::Secret { label, url, file, .. } => {
             let (input, sources) = workspace.update(cx, |w, cx| {
                 let sources = w.secret_sources();
                 let source = w.requests.sources.get(&card.item_id).filter(|id| sources.iter().any(|s| &s.id == *id));
@@ -309,7 +513,7 @@ pub(super) fn request_row(
                 };
                 (input, sources)
             });
-            secret_card(card, label, *file, &input, &sources, &workspace, t, cx)
+            secret_card(card, label, url.as_ref(), *file, &input, &sources, &workspace, t, cx)
         }
         RequestKind::Link { .. } => link_card(card, &workspace, t, cx),
     };
@@ -331,6 +535,7 @@ fn card_frame(t: &Tokens) -> gpui_kit::Div {
 fn secret_card(
     card: &Rc<RequestCard>,
     label: &SharedString,
+    url: Option<&SharedString>,
     file: bool,
     input: &Entity<InputState>,
     sources: &[SecretSource],
@@ -361,6 +566,25 @@ fn secret_card(
                     el.child(div().text_sm().text_color(t.muted_foreground).child(card.reason.clone()))
                 }),
         )
+        .children(secret_request_link(url.map(AsRef::as_ref), &card.reason).map(|(href, host)| {
+            v_flex()
+                .min_w_0()
+                .items_start()
+                .gap(px(6.))
+                .child(
+                    Button::new("secret-open-link")
+                        .outline()
+                        .small()
+                        .label(format!("Open {host}"))
+                        .child(Icon::new(IconName::ExternalLink).size(px(16.)))
+                        .on_click(move |_, _, cx| cx.open_url(&href)),
+                )
+                // A link found in the reason is already shown there.
+                .children(
+                    url.cloned()
+                        .map(|url| div().text_xs().font_family(t.fonts.mono).text_color(t.muted_foreground).child(url)),
+                )
+        }))
         .child(
             h_flex()
                 .min_w_0()
@@ -368,8 +592,8 @@ fn secret_card(
                 .children(picker)
                 .child(div().flex_1().min_w_0().child(Input::new(input).disabled(busy)))
                 .child(Button::new("secret-save").primary().label("Save securely").disabled(busy || empty).on_click(
-                    move |_, _, cx| {
-                        let _ = save_view.update(cx, |w, cx| w.answer_secret(&save_card, true, cx));
+                    move |_, window, cx| {
+                        let _ = save_view.update(cx, |w, cx| w.answer_secret(&save_card, true, window, cx));
                     },
                 )),
         )
@@ -395,8 +619,8 @@ fn secret_card(
                         .text_color(t.muted_foreground)
                         .label("Decline")
                         .disabled(busy)
-                        .on_click(move |_, _, cx| {
-                            let _ = decline_view.update(cx, |w, cx| w.answer_secret(&decline_card, false, cx));
+                        .on_click(move |_, window, cx| {
+                            let _ = decline_view.update(cx, |w, cx| w.answer_secret(&decline_card, false, window, cx));
                         }),
                 ),
         )
@@ -451,8 +675,8 @@ fn link_card(card: &Rc<RequestCard>, workspace: &Entity<Workspace>, t: &Tokens, 
                     .text_color(t.muted_foreground)
                     .label("Decline")
                     .disabled(busy)
-                    .on_click(move |_, _, cx| {
-                        let _ = view.update(cx, |w, cx| w.decline_link(&decline_card, cx));
+                    .on_click(move |_, window, cx| {
+                        let _ = view.update(cx, |w, cx| w.decline_link(&decline_card, window, cx));
                     }),
             )
             .child(
@@ -1302,6 +1526,46 @@ mod tests {
         assert!(!plan.asks_address && !plan.two_steps, "the agent's address is already filled in");
         let picked = link_plan(&link_request(None, None, None), &machines, Some(ANOTHER_ADDRESS), "");
         assert!(picked.target == LinkTarget::Address && picked.asks_address && !picked.machine_ready);
+    }
+
+    #[test]
+    fn a_secret_card_finds_the_one_link_in_its_reason() {
+        let cases = [
+            ("Open this link and sign in: https://a.dev/x?s=1. Then paste the code.", Some("https://a.dev/x?s=1")),
+            ("Open [https://a.dev/x?s=1](https://a.dev/x?s=1) and sign in.", Some("https://a.dev/x?s=1")),
+            ("Sign in [here](https://a.dev/login?state=abc(def)).", Some("https://a.dev/login?state=abc(def)")),
+            ("Sign in at https://a.dev/login?state=abc(def).", Some("https://a.dev/login?state=abc(def)")),
+            ("(Sign in at https://a.dev/login.)", Some("https://a.dev/login")),
+            ("Open **https://a.dev/x?s=1** and sign in.", Some("https://a.dev/x?s=1")),
+            ("Open https://a.dev/x?state=u7o_ and sign in.", Some("https://a.dev/x?state=u7o_")),
+            ("**Sign in at https://a.dev/device**", Some("https://a.dev/device")),
+            ("_Open https://a.dev/device_.", Some("https://a.dev/device")),
+            ("_https://a.dev/x?state=u7o_&client_id=cli_", Some("https://a.dev/x?state=u7o_&client_id=cli")),
+            ("Use client_id acme at https://a.dev/x?state=u7o_", Some("https://a.dev/x?state=u7o_")),
+            ("_Sign in_ at https://a.dev/x?state=u7o_", Some("https://a.dev/x?state=u7o_")),
+            ("_Required_: Open https://a.dev/x?state=u7o_", Some("https://a.dev/x?state=u7o_")),
+            ("(**https://a.dev/login**)", Some("https://a.dev/login")),
+            ("Open ***https://a.dev/device***", Some("https://a.dev/device")),
+            ("Open **_https://a.dev/device_**", Some("https://a.dev/device")),
+            ("Open [https://a.dev/x?s=u7o_](https://a.dev/x?s=u7o_) and sign in.", Some("https://a.dev/x?s=u7o_")),
+            ("Open `https://a.dev/x?s=1.` and sign in.", Some("https://a.dev/x?s=1.")),
+            ("Open https://a.dev/x?s=1, then if needed https://a.dev/x?s=1 again.", Some("https://a.dev/x?s=1")),
+            ("Open https://a.dev or https://b.dev.", None),
+            ("Open https://a.dev (also written https://a.dev/).", Some("https://a.dev/")),
+            ("Paste the code the CLI printed.", None),
+            ("Sign in at HTTPS://é.dev/日本 — then paste it.", Some("https://xn--9ca.dev/%E6%97%A5%E6%9C%AC")),
+        ];
+        for (reason, href) in cases {
+            assert_eq!(secret_request_link(None, reason).map(|(href, _)| href).as_deref(), href, "{reason:?}");
+        }
+    }
+
+    #[test]
+    fn a_secret_card_opens_only_the_agents_http_url() {
+        let link = secret_request_link(Some("https://auth.acme.dev:8443/a"), "See https://docs.acme.dev");
+        assert_eq!(link, Some(("https://auth.acme.dev:8443/a".to_owned(), "auth.acme.dev:8443".to_owned())));
+        assert_eq!(secret_request_link(Some("javascript:alert(1)"), "See https://docs.acme.dev"), None);
+        assert_eq!(secret_request_link(Some("file:///etc/passwd"), ""), None);
     }
 
     #[test]

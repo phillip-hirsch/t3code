@@ -511,8 +511,8 @@ impl Workspace {
 
     /// `projectCloneBannerItem`: a failed file copy until dismissed, else the clone's progress,
     /// failure or cancellation over the composer.
-    pub(super) fn render_clone_banner(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if let Some(banner) = self.render_file_copy_banner(t, cx) {
+    pub(super) fn render_clone_banner(&self, joined: bool, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if let Some(banner) = self.render_file_copy_banner(joined, t, cx) {
             return Some(banner);
         }
         let clone = self.active_project_clone()?;
@@ -551,11 +551,12 @@ impl Workspace {
             }
         };
         let icon = Icon::new(IconName::Download);
-        Some(composer_banner(variant, icon, SharedString::from(title), description.map(Into::into), Some(actions), t))
+        let description = description.map(Into::into);
+        Some(composer_banner(variant, icon, SharedString::from(title), description, Some(actions), joined, t))
     }
 
     /// A copy that left files behind: which ones and why, until dismissed.
-    fn render_file_copy_banner(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_file_copy_banner(&self, joined: bool, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
         let project = self.active_project_key()?;
         let Some(FileCopy::Failed { title, failures }) = self.clones.copies.of(&project) else { return None };
         let dismiss = Button::new("file-copy-banner-dismiss")
@@ -572,6 +573,7 @@ impl Workspace {
             SharedString::from(title.clone()),
             Some(description),
             Some(dismiss.into_any_element()),
+            joined,
             t,
         ))
     }
