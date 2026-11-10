@@ -95,6 +95,9 @@ pub(super) struct DraftWorkspaceState {
     start_from_origin_default: bool,
     /// `vcs.listRefs` for the project's checkout.
     refs: Option<Value>,
+    /// The socket the defaults and refs were last asked on, and whether that read still runs.
+    read_on: Option<crate::rpc::SocketId>,
+    reading: bool,
     _load: Option<Task<()>>,
     branch_open: bool,
     /// The open branch picker hangs off the details card's branch row, not the strip's.
@@ -135,6 +138,13 @@ impl DraftWorkspaceState {
     pub(super) fn existing_worktree(&self, target: Option<&Target>) -> Option<&str> {
         let path = self.choice.existing_worktree.as_ref()?;
         self.is_for(target).then_some(path.as_str())
+    }
+
+    /// Whether to read the defaults and refs on `socket`: neither has landed and no read runs, and
+    /// a failure stands until a new socket, as the web's queries rerun when their session changes.
+    fn needs_read(&self, socket: &crate::rpc::SocketId) -> bool {
+        let loaded = self.default_mode.is_some() && self.refs.is_some();
+        !loaded && !self.reading && self.read_on.as_ref() != Some(socket)
     }
 }
 
@@ -243,30 +253,35 @@ impl BranchGrants {
 const NEXT_PAGE_DISTANCE: f32 = 96.;
 
 impl Workspace {
-    /// Loads the draft's default workspace mode and refs when the draft or its project changes.
+    /// Loads the draft's default workspace mode and refs when the draft or its project changes,
+    /// and again after a reconnect while they are missing.
     pub(super) fn sync_draft_workspace(&mut self, cx: &mut Context<Self>) {
         let Some(target) = self.target.clone() else { return };
         let Target::Draft { env, project_id, draft } = &target else { return };
-        if self.draft_workspace.is_for(Some(&target)) {
-            return;
+        if !self.draft_workspace.is_for(Some(&target)) {
+            // Reset first, so nothing from the previous draft survives but the picks this draft made;
+            // send.rs resolves the workspace itself when this never loads.
+            self.stash_draft_workspace();
+            self.draft_workspace = DraftWorkspaceState {
+                env: Some(env.clone()),
+                project_id: Some(project_id.clone()),
+                choice: self.drafts.workspace(draft),
+                draft: Some(draft.clone()),
+                ..Default::default()
+            };
         }
-        // Reset first, so nothing from the previous draft survives but the picks this draft made;
-        // send.rs resolves the workspace itself when this never loads.
-        self.stash_draft_workspace();
-        self.draft_workspace = DraftWorkspaceState {
-            env: Some(env.clone()),
-            project_id: Some(project_id.clone()),
-            choice: self.drafts.workspace(draft),
-            draft: Some(draft.clone()),
-            ..Default::default()
-        };
         let key = crate::model::ScopedId::new(env.clone(), project_id.as_str());
         let (Some(client), Some(project)) = (self.env_client(env), self.shell.project(&key)) else {
             return;
         };
+        if !self.draft_workspace.needs_read(&client.socket_id()) {
+            return;
+        }
         let has_threads = self.shell.project_has_threads(project);
         let workspace = DraftWorkspace::new(self.server_info(), project, has_threads);
         self.draft_workspace.start_from_origin_default = workspace.start_from_origin();
+        self.draft_workspace.read_on = Some(client.socket_id());
+        self.draft_workspace.reading = true;
         let cwd = project.workspace_root.clone();
         self.draft_workspace._load = Some(cx.spawn(async move |this, cx| {
             let mode = workspace.default_mode(&client).await;
@@ -275,6 +290,7 @@ impl Workspace {
                 if !this.draft_workspace.is_for(Some(&target)) {
                     return;
                 }
+                this.draft_workspace.reading = false;
                 this.draft_workspace.default_mode = Some(mode);
                 match refs {
                     Ok(refs) => this.draft_workspace.refs = Some(refs),
@@ -1868,6 +1884,22 @@ mod tests {
         assert_eq!(state.existing_worktree(draft("a", "p", "d2").as_ref()), None, "another draft keeps its root");
         assert_eq!(state.existing_worktree(draft("b", "p", "d1").as_ref()), None, "another environment keeps its root");
         assert!(!state.is_for(None));
+    }
+
+    #[test]
+    fn a_draft_reads_its_workspace_again_on_a_new_socket_until_it_has_it() {
+        let (first, second) = (crate::rpc::RpcClient::unopened(), crate::rpc::RpcClient::unopened());
+        let mut state = DraftWorkspaceState::default();
+        assert!(state.needs_read(&first.socket_id()), "opened offline: nothing read yet");
+        state.read_on = Some(first.socket_id());
+        state.reading = true;
+        assert!(!state.needs_read(&first.socket_id()), "a read is running");
+        state.reading = false;
+        state.default_mode = Some(EnvMode::Local);
+        assert!(!state.needs_read(&first.socket_id()), "refs failed: the failure stands on that socket");
+        assert!(state.needs_read(&second.socket_id()), "a reconnect reads again");
+        state.refs = Some(json!({"refs": []}));
+        assert!(!state.needs_read(&second.socket_id()), "both loaded");
     }
 
     #[test]
