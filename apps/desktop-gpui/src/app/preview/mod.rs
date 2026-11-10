@@ -641,6 +641,7 @@ impl Workspace {
         let zoom_to = |direction| json!({"zoomFactor": preview::step_zoom(zoom, direction)});
         match command {
             "preview.refresh" => self.refresh_preview_tab(&tab, cx),
+            "preview.focusUrl" if self.server_input_disabled(&tab) => {}
             "preview.focusUrl" => self.preview.address.update(cx, |input, cx| {
                 input.focus(window, cx);
                 input.select_all(window, cx);
@@ -1266,11 +1267,10 @@ impl Workspace {
                     tab.zoom = zoom;
                     let _ = view.set_zoom(zoom);
                 }
-                let appearance = session.and_then(|s| s.color_scheme).unwrap_or(tab.defaults.1);
-                if tab.appearance != Some(appearance) {
-                    tab.appearance = Some(appearance);
-                    let _ = view.set_theme(wry_theme(appearance));
-                }
+            }
+            let appearance = session.and_then(|s| s.color_scheme).unwrap_or(tab.defaults.1);
+            if theme_change(&mut tab.appearance, scale.is_some(), appearance) {
+                let _ = view.set_theme(wry_theme(appearance));
             }
             if tab.shown != scale.is_some() {
                 tab.shown = scale.is_some();
@@ -1455,8 +1455,9 @@ impl Workspace {
         let hosted = tab.as_ref().and_then(|tab| self.preview.tabs.get(tab));
         // An agent tab navigates over its stream, from the server's own history.
         let server_tab = session.filter(|s| s.server_hosted());
+        let input_disabled = tab.as_ref().is_some_and(|tab| self.server_input_disabled(tab));
         let (can_back, can_forward) = match server_tab {
-            Some(s) => (s.can_go_back, s.can_go_forward),
+            Some(s) => (s.can_go_back && !input_disabled, s.can_go_forward && !input_disabled),
             None => hosted.map_or((false, false), |tab| (tab.can_go_back, tab.can_go_forward)),
         };
         let loading = match server_tab {
@@ -1465,6 +1466,7 @@ impl Workspace {
         };
         let url = self.active_url();
         let has_page = hosted.is_some() || server_tab.is_some_and(|s| !matches!(s.nav_status, NavStatus::Idle));
+        let can_reload = has_page && !input_disabled;
         let reload_tab = tab.clone();
         let unreachable = match server_tab {
             Some(s) => matches!(s.nav_status, NavStatus::LoadFailed { .. }),
@@ -1525,9 +1527,9 @@ impl Workspace {
                             }),
                     )
                     .child(
-                        icon_button("preview-reload", IconName::RotateCw, has_page, tokens, cx)
+                        icon_button("preview-reload", IconName::RotateCw, can_reload, tokens, cx)
                             .tooltip(if loading { "Loading…" } else { "Refresh" })
-                            .when(has_page, |el| {
+                            .when(can_reload, |el| {
                                 el.on_click(cx.listener(move |this, _, _, cx| {
                                     if let Some(tab) = &reload_tab {
                                         this.refresh_preview_tab(tab, cx);
@@ -1547,6 +1549,7 @@ impl Workspace {
                     .child(
                         Input::new(&self.preview.address)
                             .appearance(false)
+                            .disabled(input_disabled)
                             .flex_1()
                             .h(px(28.))
                             .px_2()
@@ -1734,6 +1737,20 @@ impl Workspace {
     }
 }
 
+/// Whether a tab's view takes `appearance` now, given what it last `applied`. On Linux
+/// gpui-webview sets GTK's process-wide dark preference, which the tabs shown meanwhile change,
+/// so a hidden tab forgets what it applied.
+fn theme_change(applied: &mut Option<Appearance>, shown: bool, appearance: Appearance) -> bool {
+    if !shown {
+        #[cfg(target_os = "linux")]
+        {
+            *applied = None;
+        }
+        return false;
+    }
+    applied.replace(appearance) != Some(appearance)
+}
+
 /// The native view's colour scheme for a tab's.
 fn wry_theme(appearance: Appearance) -> wry::Theme {
     match appearance {
@@ -1818,7 +1835,8 @@ fn page_builder<'a>(
         .with_initialization_script(preview::HISTORY_SCRIPT)
         .with_initialization_script(capture::RECORDING_SCRIPT)
         .with_initialization_script(annotation::PICKER_SCRIPT)
-        .with_initialization_script(preview::shortcut_script(chords, keymap::MAC))
+        // Every frame, so a focused iframe forwards too (WebView2 injects into all frames anyway).
+        .with_initialization_script_for_main_only(preview::shortcut_script(chords, keymap::MAC), false)
         .with_initialization_script(preview::CORNER_SCRIPT)
         .with_ipc_handler({
             let sender = sender.clone();
@@ -1869,6 +1887,19 @@ fn page_builder<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shown_tab_takes_its_colour_scheme_once() {
+        let mut applied = None;
+        assert!(!theme_change(&mut applied, false, Appearance::Dark), "a hidden tab waits");
+        assert!(theme_change(&mut applied, true, Appearance::Dark));
+        assert!(!theme_change(&mut applied, true, Appearance::Dark));
+        assert!(theme_change(&mut applied, true, Appearance::Light));
+        // Another tab shows meanwhile. On Linux it changed GTK's process-wide preference, so this
+        // tab applies its own again when it returns.
+        assert!(!theme_change(&mut applied, false, Appearance::Light));
+        assert_eq!(theme_change(&mut applied, true, Appearance::Light), cfg!(target_os = "linux"));
+    }
 
     #[test]
     fn a_page_is_rebuilt_where_it_is() {

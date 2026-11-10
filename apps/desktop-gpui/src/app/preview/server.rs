@@ -700,6 +700,12 @@ impl Workspace {
         Some(None)
     }
 
+    /// `serverInputDisabled`: an agent tab takes this viewer's navigation only while it has control.
+    pub(super) fn server_input_disabled(&self, tab: &TabRef) -> bool {
+        self.preview.threads.session(tab).is_some_and(crate::preview::Session::server_hosted)
+            && !self.preview.server.streams.get(tab).is_some_and(ServerStream::mine)
+    }
+
     /// Sends `input` to the agent tab on screen, if this viewer may.
     pub(super) fn send_server_input(&self, tab: &TabRef, input: Value) -> bool {
         self.preview.server.streams.get(tab).is_some_and(|stream| stream.send(input))
