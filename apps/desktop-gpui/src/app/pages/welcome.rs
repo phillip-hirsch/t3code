@@ -305,6 +305,13 @@ impl Workspace {
             }
             return;
         }
+        if let Some(terminal) = &self.welcome.terminal {
+            let client = self.env_client(&terminal.environment);
+            let read_only = !self.env_grants(&terminal.environment, TERMINAL_OPERATE);
+            if let Some(pane) = self.welcome.terminal.as_mut().and_then(|t| t.pane.as_mut()) {
+                pane.sync(client.as_ref(), read_only, cx);
+            }
+        }
         let Some(environment) = self.welcome_environment() else { return };
         let Some(info) = self.env_info(&environment) else { return };
         let settings = (!info.config.is_null()).then_some(&info.settings);

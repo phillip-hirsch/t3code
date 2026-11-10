@@ -10,6 +10,9 @@ use crate::rpc::RpcClient;
 
 pub(in crate::app) struct StandaloneTerminal {
     session: Entity<TerminalSession>,
+    /// The socket and grant it attached with, to notice a reconnect or a grant change.
+    client: RpcClient,
+    read_only: bool,
     _events: Subscription,
 }
 
@@ -29,7 +32,7 @@ impl StandaloneTerminal {
         let session = cx.new(|cx| {
             let mut session = TerminalSession::new(thread_id, terminal_id, launch, None, false, window, cx);
             session.can_add_to_chat = false;
-            session.attach(client, cx);
+            session.attach(client.clone(), cx);
             session
         });
         let _events = cx.subscribe_in(&session, window, move |this, _, event: &SessionEvent, window, cx| match event {
@@ -37,7 +40,19 @@ impl StandaloneTerminal {
             SessionEvent::OpenUrl { url, .. } => cx.open_url(url),
             SessionEvent::Activated | SessionEvent::AddToChat(_) | SessionEvent::OpenPath(_) => {}
         });
-        Self { session, _events }
+        Self { session, client, read_only: false, _events }
+    }
+
+    /// Follows its environment like a drawer pane: a new socket reattaches, and without
+    /// `terminal:operate` it only observes.
+    pub(in crate::app) fn sync(&mut self, client: Option<&RpcClient>, read_only: bool, cx: &mut Context<Workspace>) {
+        if let Some(client) = client.filter(|client| !client.same_socket(&self.client)) {
+            self.client = client.clone();
+            self.session.update(cx, |session, cx| session.attach(client.clone(), cx));
+        }
+        if std::mem::replace(&mut self.read_only, read_only) != read_only {
+            self.session.update(cx, |session, cx| session.set_read_only(read_only, cx));
+        }
     }
 
     pub(in crate::app) fn view(&self) -> AnyView {
