@@ -346,10 +346,10 @@ type CommitsSource = (SharedString, String, Option<String>);
 
 /// The commit list read for `source`; none while only another checkout's (or base's) is loaded.
 fn commits_for<'a>(
-    loaded: &'a Option<(CommitsSource, Result<CommitList, SharedString>)>,
+    loaded: Option<&'a (CommitsSource, Result<CommitList, SharedString>)>,
     source: Option<&CommitsSource>,
 ) -> Option<&'a Result<CommitList, SharedString>> {
-    loaded.as_ref().filter(|(from, _)| Some(from) == source).map(|(_, reply)| reply)
+    loaded.filter(|(from, _)| Some(from) == source).map(|(_, reply)| reply)
 }
 
 /// How [`Workspace::show_diff_files`] puts files in the patch.
@@ -2606,7 +2606,7 @@ impl Workspace {
             scope => scope.clone(),
         };
         let commits_source = self.branch_commits_source();
-        let commits = commits_for(&self.right_panel.commits, commits_source.as_ref()).cloned();
+        let commits = commits_for(self.right_panel.commits.as_ref(), commits_source.as_ref()).cloned();
         let listed = commits.as_ref().and_then(|reply| reply.as_ref().ok()).map_or(&[][..], |list| &list.commits[..]);
         let scope_label: SharedString = match &scope {
             DiffScope::Branch => "Changes".into(),
@@ -3688,14 +3688,14 @@ mod tests {
         };
         let list = CommitList { commits: vec![], truncated: false };
         let loaded = Some((source("a", "/repo", None), Ok(list)));
-        assert!(commits_for(&loaded, Some(&source("a", "/repo", None))).is_some());
+        assert!(commits_for(loaded.as_ref(), Some(&source("a", "/repo", None))).is_some());
         for other in [
             Some(source("b", "/repo", None)),
             Some(source("a", "/other", None)),
             Some(source("a", "/repo", Some("main"))),
             None,
         ] {
-            assert!(commits_for(&loaded, other.as_ref()).is_none());
+            assert!(commits_for(loaded.as_ref(), other.as_ref()).is_none());
         }
     }
 
