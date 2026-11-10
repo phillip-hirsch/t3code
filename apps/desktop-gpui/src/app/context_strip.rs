@@ -624,11 +624,10 @@ impl Workspace {
             cx.notify();
             return;
         }
-        let elsewhere = self.find_ref(&name).and_then(|r| r["worktreePath"].as_str().map(str::to_owned));
-        let root = self.composer_cwd();
-        if let Some(path) = elsewhere {
-            // Already checked out in a worktree: reuse it instead of switching.
-            self.draft_workspace.choice.existing_worktree = (Some(&path) != root.as_ref()).then_some(path);
+        let active = self.draft_workspace.existing_worktree(self.target.as_ref()).map(str::to_owned);
+        let Some(selection) = self.branch_selection_target(&name, active.as_deref()) else { return };
+        if selection.reuse_existing_worktree {
+            self.set_draft_worktree(selection.next_worktree_path);
             self.draft_workspace.choice.branch = Some(name);
             cx.notify();
             return;
@@ -636,7 +635,30 @@ impl Workspace {
         if !grants.write {
             return;
         }
-        self.run_ref_command("vcs.switchRef", json!({"cwd": root, "refName": name}), name, "Failed to switch ref.", cx);
+        let input = json!({"cwd": selection.checkout_cwd, "refName": name});
+        let worktree = selection.next_worktree_path;
+        self.run_ref_command("vcs.switchRef", input, name, worktree, "Failed to switch ref.", cx);
+    }
+
+    /// `resolveBranchSelectionTarget` for the open thread or draft, checked out at `active`, and the ref `name`.
+    fn branch_selection_target(&self, name: &str, active: Option<&str>) -> Option<BranchSelectionTarget> {
+        let project = self.target_project()?;
+        let picked = self.find_ref(name);
+        Some(resolve_branch_selection_target(
+            &project.workspace_root,
+            project.repository_identity.as_ref().and_then(|identity| identity.root_path.as_deref()),
+            active,
+            picked.as_ref().is_some_and(|r| r["isDefault"].as_bool() == Some(true)),
+            picked.as_ref().and_then(|r| r["worktreePath"].as_str()),
+        ))
+    }
+
+    /// `setDraftThreadContext` with a branch change's worktree and the mode it implies.
+    fn set_draft_worktree(&mut self, next: Option<String>) {
+        let mode = self.draft_env_mode();
+        let choice = &mut self.draft_workspace.choice;
+        choice.mode = Some(draft_mode_after_branch_change(next.as_deref(), choice.existing_worktree.as_deref(), mode));
+        choice.existing_worktree = next;
     }
 
     /// `setDraftThreadContext` after a git action created `branch` for `draft`.
@@ -659,20 +681,24 @@ impl Workspace {
             self.run_thread_ref_command(thread, "vcs.createRef", input, name, worktree, cx);
             return;
         }
+        let worktree = self.draft_workspace.existing_worktree(self.target.as_ref()).map(str::to_owned);
         self.run_ref_command(
             "vcs.createRef",
             json!({"cwd": cwd, "refName": name, "switchRef": true}),
             name,
+            worktree,
             "Failed to create and switch ref.",
             cx,
         );
     }
 
+    /// Runs a ref command for the draft, which then records the ref and `worktree`.
     fn run_ref_command(
         &mut self,
         method: &'static str,
         input: Value,
         name: String,
+        worktree: Option<String>,
         failure: &'static str,
         cx: &mut Context<Self>,
     ) {
@@ -691,6 +717,7 @@ impl Workspace {
                     Ok(value) => {
                         let switched = value.get("refName").and_then(Value::as_str).map(str::to_owned);
                         this.draft_workspace.choice.branch = Some(switched.unwrap_or(name));
+                        this.set_draft_worktree(worktree);
                         this.refresh_refs(cx);
                     }
                     Err(error) => {
@@ -743,25 +770,19 @@ impl Workspace {
     /// `selectBranch` on a started thread: reuse the worktree that has the ref checked
     /// out, else switch the thread's checkout (`resolveBranchSelectionTarget`).
     fn select_thread_branch(&mut self, thread: ScopedId, name: String, cx: &mut Context<Self>) {
-        let Some(root) = self.target_project().map(|p| p.workspace_root.clone()) else { return };
         let active = self.open_projection().and_then(|p| p.thread.worktree_path.clone());
-        let picked = self.find_ref(&name);
-        let elsewhere = picked.as_ref().and_then(|r| r["worktreePath"].as_str()).map(str::to_owned);
-        let is_default = picked.as_ref().is_some_and(|r| r["isDefault"].as_bool() == Some(true));
-        if let Some(path) = elsewhere {
-            let next = (!is_within(&root, &path)).then_some(path);
+        let Some(selection) = self.branch_selection_target(&name, active.as_deref()) else { return };
+        if selection.reuse_existing_worktree {
             if let Some(checkout) = self.thread_checkout(&thread) {
-                self.set_thread_branch(&checkout, &name, next, cx);
+                self.set_thread_branch(&checkout, &name, selection.next_worktree_path, cx);
             }
             return;
         }
         if !self.branch_grants().write {
             return;
         }
-        let next = active.filter(|_| !is_default);
-        let checkout = next.clone().unwrap_or(root);
-        let input = json!({"cwd": checkout, "refName": name});
-        self.run_thread_ref_command(thread, "vcs.switchRef", input, name, next, cx);
+        let input = json!({"cwd": selection.checkout_cwd, "refName": name});
+        self.run_thread_ref_command(thread, "vcs.switchRef", input, name, selection.next_worktree_path, cx);
     }
 
     fn run_thread_ref_command(
@@ -1523,11 +1544,91 @@ impl Workspace {
     }
 }
 
-/// `workspaceRelativeFilePath(root, path) !== null`: `path` is `root` or inside it.
-fn is_within(root: &str, path: &str) -> bool {
-    let normalize = |p: &str| p.replace('\\', "/").trim_end_matches('/').to_lowercase();
-    let (root, path) = (normalize(root), normalize(path));
-    path == root || path.starts_with(&format!("{root}/"))
+/// `workspaceRelativeFilePath(path, root)`: `path` relative to `root`, `"."` for the root itself,
+/// `None` outside it. Windows and UNC roots compare case-insensitively, POSIX roots do not.
+fn workspace_relative_file_path(path: &str, root: &str) -> Option<String> {
+    if root.is_empty() {
+        return None;
+    }
+    let is_drive = |p: &str| {
+        let p = p.as_bytes();
+        p.len() >= 2 && p[0].is_ascii_alphabetic() && p[1] == b':' && p.get(2).is_none_or(|c| matches!(c, b'/' | b'\\'))
+    };
+    let strip_slash_drive = |p: &str| -> String {
+        let b = p.as_bytes();
+        let prefixed = b.len() >= 4 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':';
+        if prefixed && matches!(b[3], b'/' | b'\\') { p[1..].to_owned() } else { p.to_owned() }
+    };
+    let is_unc = |p: &str| p.starts_with("\\\\");
+    let is_network = |p: &str| p.len() >= 2 && p.as_bytes()[..2].iter().all(|c| matches!(c, b'/' | b'\\'));
+    let stripped_root = strip_slash_drive(root);
+    let case_insensitive = is_unc(&stripped_root) || is_drive(&stripped_root) || (is_network(root) && is_unc(path));
+    let (path, root) = if case_insensitive {
+        (strip_slash_drive(&path.replace('\\', "/")), strip_slash_drive(&root.replace('\\', "/")))
+    } else {
+        (path.to_owned(), root.to_owned())
+    };
+    let root = root.trim_end_matches('/');
+    let fold = |p: &str| if case_insensitive { p.to_lowercase() } else { p.to_owned() };
+    let (path_key, root_key) = (fold(&path), fold(root));
+    if path_key.trim_end_matches('/') == root_key {
+        return Some(".".into());
+    }
+    if !path_key.starts_with(&format!("{root_key}/")) {
+        return None;
+    }
+    let relative = path.get(root.len() + 1..)?;
+    // `/repo/../x` starts with the root but escapes it.
+    let mut depth = 0_usize;
+    for segment in relative.split('/') {
+        match segment {
+            ".." => depth = depth.checked_sub(1)?,
+            "" | "." => {}
+            _ => depth += 1,
+        }
+    }
+    Some(relative.to_owned())
+}
+
+/// `resolveDraftEnvModeAfterBranchChange`: a draft moved to a worktree runs there; one moved back
+/// to the main checkout runs locally.
+fn draft_mode_after_branch_change(next: Option<&str>, current: Option<&str>, mode: EnvMode) -> EnvMode {
+    if next.is_some() || (mode == EnvMode::Worktree && current.is_none()) { EnvMode::Worktree } else { EnvMode::Local }
+}
+
+/// Where a picked ref is checked out, and the worktree the thread records (`resolveBranchSelectionTarget`).
+#[derive(Debug, PartialEq, Eq)]
+struct BranchSelectionTarget {
+    checkout_cwd: String,
+    next_worktree_path: Option<String>,
+    reuse_existing_worktree: bool,
+}
+
+fn resolve_branch_selection_target(
+    project_cwd: &str,
+    project_checkout_root: Option<&str>,
+    active_worktree_path: Option<&str>,
+    is_default: bool,
+    ref_worktree_path: Option<&str>,
+) -> BranchSelectionTarget {
+    if let Some(path) = ref_worktree_path {
+        // Until the project's checkout root loads, a checkout containing the project counts as its own.
+        let is_project_checkout = match project_checkout_root {
+            None => workspace_relative_file_path(project_cwd, path).is_some(),
+            Some(root) => workspace_relative_file_path(root, path).as_deref() == Some("."),
+        };
+        return BranchSelectionTarget {
+            checkout_cwd: path.to_owned(),
+            next_worktree_path: (!is_project_checkout).then(|| path.to_owned()),
+            reuse_existing_worktree: true,
+        };
+    }
+    let next = active_worktree_path.filter(|_| !is_default).map(str::to_owned);
+    BranchSelectionTarget {
+        checkout_cwd: next.clone().unwrap_or_else(|| project_cwd.to_owned()),
+        next_worktree_path: next,
+        reuse_existing_worktree: false,
+    }
 }
 
 /// `ComposerControl size="xs"`: `h-7 text-sm sm:h-6 sm:text-xs`, 7px padding, 6px gap, muted
@@ -1617,11 +1718,103 @@ mod tests {
     use super::super::Target;
     use super::super::draft_sessions::DraftId;
     use super::{
-        BranchGrants, DraftWorkspaceState, RefSearch, clipboard_path, previous_worktree_seed, runtime_mode_denial,
+        BranchGrants, BranchSelectionTarget, DraftWorkspaceState, RefSearch, clipboard_path,
+        draft_mode_after_branch_change, previous_worktree_seed, resolve_branch_selection_target, runtime_mode_denial,
         runtime_mode_fallback, step_highlight, step_permission,
     };
     use crate::model::ScopedId;
+    use crate::new_thread::EnvMode;
     use serde_json::json;
+
+    #[test]
+    fn a_draft_leaving_its_worktree_runs_locally() {
+        let worktree = Some("/repo/.t3/worktrees/feature-a");
+        assert_eq!(draft_mode_after_branch_change(None, worktree, EnvMode::Worktree), EnvMode::Local);
+        assert_eq!(draft_mode_after_branch_change(worktree, None, EnvMode::Local), EnvMode::Worktree);
+        assert_eq!(
+            draft_mode_after_branch_change(None, None, EnvMode::Worktree),
+            EnvMode::Worktree,
+            "a new worktree's base"
+        );
+        assert_eq!(draft_mode_after_branch_change(None, None, EnvMode::Local), EnvMode::Local);
+    }
+
+    fn target(checkout_cwd: &str, next_worktree_path: Option<&str>, reuse: bool) -> BranchSelectionTarget {
+        BranchSelectionTarget {
+            checkout_cwd: checkout_cwd.into(),
+            next_worktree_path: next_worktree_path.map(Into::into),
+            reuse_existing_worktree: reuse,
+        }
+    }
+
+    #[test]
+    fn a_ref_in_another_worktree_reuses_it() {
+        assert_eq!(
+            resolve_branch_selection_target(
+                "/repo/nested-checkout/packages/app",
+                Some("/repo/nested-checkout"),
+                None,
+                true,
+                Some("/repo"),
+            ),
+            target("/repo", Some("/repo"), true),
+        );
+        let feature_b = "/repo/.t3/worktrees/feature-b";
+        assert_eq!(
+            resolve_branch_selection_target(
+                "/repo",
+                None,
+                Some("/repo/.t3/worktrees/feature-a"),
+                false,
+                Some(feature_b)
+            ),
+            target(feature_b, Some(feature_b), true),
+        );
+        // regression: a worktree nested under the project is not the project's own checkout
+        for root in [None, Some("/repo")] {
+            assert_eq!(
+                resolve_branch_selection_target("/repo", root, None, false, Some("/repo/.worktrees/feature")),
+                target("/repo/.worktrees/feature", Some("/repo/.worktrees/feature"), true),
+            );
+        }
+    }
+
+    #[test]
+    fn a_ref_in_the_projects_own_checkout_switches_back_to_it() {
+        // A subdirectory project's own checkout is reported at the repository root; the
+        // checkout root is unknown until the project's status loads.
+        for (project_cwd, active, root) in [
+            ("/repo", Some("/repo/.t3/worktrees/feature-a"), Some("/repo")),
+            ("/repo/packages/app", Some("/repo/.t3/worktrees/feature-a"), Some("/repo")),
+            ("/repo/packages/app", None, Some("/repo")),
+            ("/repo/packages/app", Some("/repo/.t3/worktrees/feature-a"), None),
+            ("/repo/packages/app", None, None),
+        ] {
+            assert_eq!(
+                resolve_branch_selection_target(project_cwd, root, active, true, Some("/repo")),
+                target("/repo", None, true),
+            );
+        }
+        // Windows paths compare without case or separator differences.
+        assert_eq!(
+            resolve_branch_selection_target("C:\\Repo\\app", Some("C:\\Repo"), None, true, Some("c:/repo")),
+            target("c:/repo", None, true),
+        );
+    }
+
+    #[test]
+    fn a_ref_without_a_worktree_switches_in_the_current_checkout() {
+        let feature_a = "/repo/.t3/worktrees/feature-a";
+        assert_eq!(
+            resolve_branch_selection_target("/repo", None, Some(feature_a), false, None),
+            target(feature_a, Some(feature_a), false),
+        );
+        assert_eq!(
+            resolve_branch_selection_target("/repo", None, Some(feature_a), true, None),
+            target("/repo", None, false),
+            "the default ref returns to the project's checkout",
+        );
+    }
 
     #[test]
     fn a_draft_uses_the_worktree_it_picked_for_itself_only() {

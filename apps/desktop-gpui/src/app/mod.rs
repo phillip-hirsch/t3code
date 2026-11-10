@@ -1190,25 +1190,25 @@ impl Workspace {
             self.retire_thread(leaving.environment(), old.id, old.state, cx);
         }
         let saved = self.target.as_ref().and_then(|target| self.composer_selections.remove(target));
+        // The draft already open keeps its picks (`useHandleNewThread`'s `isDraftAlreadyOpen`).
         match saved.filter(|_| opened) {
             Some(saved) => {
                 self.model_override = saved.model;
                 self.model_explicit = saved.explicit;
                 self.runtime_mode_override = saved.runtime_mode;
             }
-            None => {
-                if opened {
-                    let project = self.target_project();
-                    self.model_override = crate::new_thread::new_draft_model(
-                        self.server_info(),
-                        project,
-                        carried,
-                        self.sticky_model.as_ref(),
-                    );
-                    self.model_explicit = false;
-                }
+            None if opened => {
+                let project = self.target_project();
+                self.model_override = crate::new_thread::new_draft_model(
+                    self.server_info(),
+                    project,
+                    carried,
+                    self.sticky_model.as_ref(),
+                );
+                self.model_explicit = false;
                 self.runtime_mode_override = None;
             }
+            None => {}
         }
         self.restore_composer(window, cx);
         if opened {
