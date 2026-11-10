@@ -31,22 +31,21 @@ use crate::app::Workspace;
 use crate::app::model_picker::{OnPick, PickHost};
 use crate::app::pages::settings::widgets::select_trigger;
 use crate::model::{ModelSelection, ProjectShell};
-use crate::rpc::RpcClient;
 use crate::settings::scope::Scope;
 use crate::theme::{self, Tokens};
 
-/// Opens the editor for `task`, or for a new task when it is `None`, on `target`'s environment
-/// and socket, under Settings' `scope`.
+/// Opens the editor for `task`, or for a new task when it is `None`, on `environment`, under
+/// Settings' `scope`.
 pub(super) fn open(
     workspace: WeakEntity<Workspace>,
     list: WeakEntity<ScheduledTasksView>,
-    target: (SharedString, RpcClient),
+    environment: SharedString,
     task: Option<ScheduledTask>,
     scope: Scope,
     window: &mut Window,
     cx: &mut App,
 ) {
-    let editor = cx.new(|cx| TaskEditor::new(workspace, list, target, task, scope, window, cx));
+    let editor = cx.new(|cx| TaskEditor::new(workspace, list, environment, task, scope, window, cx));
     window.open_dialog(cx, move |dialog, _, cx| {
         // The form keeps the dialog open while a save is in flight, as `onOpenChange` does.
         let saving = editor.read(cx).saving;
@@ -125,7 +124,7 @@ impl TaskEditor {
     fn new(
         workspace: WeakEntity<Workspace>,
         list: WeakEntity<ScheduledTasksView>,
-        (environment, client): (SharedString, RpcClient),
+        environment: SharedString,
         task: Option<ScheduledTask>,
         scope: Scope,
         window: &mut Window,
@@ -169,14 +168,16 @@ impl TaskEditor {
         });
         let task_json = task.as_ref().map(ScheduledTask::to_json);
         let context = match workspace.upgrade() {
-            Some(workspace) => WebhookContext::new(client.clone(), &environment, &workspace, cx),
+            Some(workspace) => WebhookContext::new(&environment, &workspace),
             None => unreachable!("the editor opens from a live workspace"),
         };
         let webhook = cx.new(|cx| WebhookFields::new(context, task_json.clone(), window, cx));
         let project = crate::model::ScopedId::new(environment.clone(), draft.project_id.as_str());
         let cwd =
             workspace.upgrade().and_then(|w| w.read(cx).shell.project(&project).map(|p| p.workspace_root.clone()));
-        let worktree = cx.new(|cx| NewWorktreeMode::new(client.clone(), cwd, task_json.as_ref(), window, cx));
+        let worktree = cx.new(|cx| {
+            NewWorktreeMode::new(workspace.clone(), environment.clone(), cwd, task_json.as_ref(), window, cx)
+        });
         let on_text = |field: fn(&mut DraftState) -> &mut String| {
             move |this: &mut Self,
                   state: &Entity<InputState>,
@@ -260,8 +261,8 @@ impl TaskEditor {
     /// replace the ones picked on the last (`setEnvironmentId` and the draft reset beside it).
     fn set_environment(&mut self, environment: SharedString, window: &mut Window, cx: &mut Context<Self>) {
         let Some(workspace) = self.workspace.upgrade() else { return };
-        let Some(client) = workspace.read(cx).env_client(&environment) else { return };
-        if self.task.is_some() || environment == self.environment {
+        let connected = workspace.read(cx).env_client(&environment).is_some();
+        if !connected || self.task.is_some() || environment == self.environment {
             return;
         }
         let projects = scoped_projects(workspace.read(cx), &self.scope, &environment);
@@ -271,10 +272,11 @@ impl TaskEditor {
         self.draft.base_model_selection = None;
         self.draft.existing_worktree_path.clear();
         self.checkout.update(cx, |input, cx| input.set_value("", window, cx));
-        let context = WebhookContext::new(client.clone(), &environment, &workspace, cx);
+        let context = WebhookContext::new(&environment, &workspace);
         self.webhook.update(cx, |fields, cx| fields.set_context(context, cx));
         let cwd = projects.iter().find(|p| p.id == self.draft.project_id).map(|p| p.workspace_root.clone());
-        self.worktree = cx.new(|cx| NewWorktreeMode::new(client, cwd, None, window, cx));
+        let weak = workspace.downgrade();
+        self.worktree = cx.new(|cx| NewWorktreeMode::new(weak, environment.clone(), cwd, None, window, cx));
         self.environment = environment;
         cx.notify();
     }
