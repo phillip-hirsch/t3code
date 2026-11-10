@@ -245,9 +245,8 @@ impl Workspace {
     ) {
         let (workspace, environments) = (cx.weak_entity(), self.editor_environments());
         let check_on = check_on.or_else(|| self.settings_environment().map(|id| id.to_string()));
-        let client = check_on.as_deref().and_then(|id| self.env_client(id));
         let sources = check_on.as_deref().map(|id| self.secret_sources_on(id)).unwrap_or_default();
-        let editor = cx.new(|cx| EasEditor::new(workspace, environments, client, sources, host, window, cx));
+        let editor = cx.new(|cx| EasEditor::new(workspace, environments, check_on, sources, host, window, cx));
         open_editor(editor, window, cx);
     }
 
@@ -265,7 +264,6 @@ impl Workspace {
             .map(|member| TokenSeed {
                 environment: member.id.to_owned(),
                 label: member.label.to_owned(),
-                client: self.env_client(member.id),
                 sources: self.secret_sources_on(member.id),
                 saved: hosts::readable_hosts::<SimlockHost>(member.settings, "simlockDeviceHosts")
                     .into_iter()
@@ -693,12 +691,17 @@ enum AccountCheck {
     Failed(String),
 }
 
+/// `environment`'s socket now: a reconnect while an editor is open replaces it.
+fn live_client(workspace: &WeakEntity<Workspace>, environment: &str, cx: &App) -> Option<RpcClient> {
+    workspace.upgrade()?.read(cx).env_client(environment)
+}
+
 struct EasEditor {
     workspace: WeakEntity<Workspace>,
     /// The environments selected at open, saved to while connected.
     environments: Vec<(String, String)>,
-    /// The socket of the environment the account check runs on, taken at open.
-    client: Option<RpcClient>,
+    /// The environment the account check runs on, picked at open; its socket is looked up at each check.
+    check_on: Option<String>,
     /// The secret providers the token can read from there.
     sources: Vec<SecretSource>,
     host: EasHost,
@@ -744,7 +747,7 @@ impl EasEditor {
     fn new(
         workspace: WeakEntity<Workspace>,
         environments: Vec<(String, String)>,
-        client: Option<RpcClient>,
+        check_on: Option<String>,
         sources: Vec<SecretSource>,
         host: Option<EasHost>,
         window: &mut Window,
@@ -785,7 +788,7 @@ impl EasEditor {
         let mut editor = Self {
             workspace,
             environments,
-            client,
+            check_on,
             sources,
             app_id: host.app_id.clone(),
             token: if saved { TokenEntry::Saved } else { TokenEntry::Cleared },
@@ -835,7 +838,8 @@ impl EasEditor {
     }
 
     fn run_check(&mut self, input: Value, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.client.clone() else { return };
+        let check_on = self.check_on.as_deref();
+        let Some(client) = check_on.and_then(|id| live_client(&self.workspace, id, cx)) else { return };
         self.check_run += 1;
         let run = self.check_run;
         self.account = AccountCheck::Checking;
@@ -1089,7 +1093,6 @@ enum Identity {
 struct TokenSeed {
     environment: String,
     label: String,
-    client: Option<RpcClient>,
     sources: Vec<SecretSource>,
     /// This environment's saved token: redacted when a literal, shown when a reference.
     saved: Value,
@@ -1215,7 +1218,8 @@ impl SimlockEditor {
 
     /// A new host starts at the gateway an environment's own agent-device already uses.
     fn detect_gateway(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let clients: Vec<RpcClient> = self.tokens.iter().filter_map(|field| field.seed.client.clone()).collect();
+        let clients: Vec<RpcClient> =
+            self.tokens.iter().filter_map(|field| live_client(&self.workspace, &field.seed.environment, cx)).collect();
         cx.spawn_in(window, async move |this, cx| {
             let answers = futures::future::join_all(
                 clients.iter().map(|client| client.request("device.simlockIdentity", json!({}))),
@@ -1252,7 +1256,9 @@ impl SimlockEditor {
         cx.notify();
         let next = self.next(cx);
         let valid = hosts::simlock_problem(&next).is_none();
-        for index in 0..self.tokens.len() {
+        let clients: Vec<Option<RpcClient>> =
+            self.tokens.iter().map(|field| live_client(&self.workspace, &field.seed.environment, cx)).collect();
+        for (index, client) in clients.into_iter().enumerate() {
             let field = &mut self.tokens[index];
             if !valid {
                 field.identity = None;
@@ -1270,7 +1276,7 @@ impl SimlockEditor {
             if field.identity.as_ref().is_some_and(|(asked, _)| *asked == input) {
                 continue;
             }
-            let Some(client) = field.seed.client.clone() else { continue };
+            let Some(client) = client else { continue };
             field.identity = Some((input.clone(), Identity::Checking));
             cx.spawn_in(window, async move |this, cx| {
                 let result = client.request("device.simlockIdentity", input.clone()).await;

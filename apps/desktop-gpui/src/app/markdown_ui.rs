@@ -437,17 +437,20 @@ impl Workspace {
             _ => "Open in editor".into(),
         };
         // The file belongs to the environment and thread on screen now, whatever shows at the click.
-        let (editor, client) = (self.preferred_editor().map(str::to_owned), self.client());
+        let (editor, environment) = (self.preferred_editor().map(str::to_owned), self.active_environment().cloned());
         let in_browser = self.can_open_file_in_browser(&target).then(|| self.preview_thread()).flatten();
         let reveal = self.reveal_label();
         let view = cx.weak_entity();
         self.open_chat_menu(pane, position, window, cx, move |mut menu, _, _| {
             if let Some(editor) = editor {
-                let (view, client) = (view.clone(), client.clone());
+                let (view, environment) = (view.clone(), environment.clone());
                 let input = json!({"cwd": target, "editor": editor});
                 menu = menu.item(PopupMenuItem::new(open_label.clone()).on_click(move |_, window, cx| {
-                    let (client, input) = (client.clone(), input.clone());
-                    let _ = view.update(cx, |w, cx| w.shell_open(client, input, "Unable to open file", window, cx));
+                    let input = input.clone();
+                    let _ = view.update(cx, |w, cx| {
+                        let client = environment.as_ref().and_then(|env| w.env_client(env));
+                        w.shell_open(client, input, "Unable to open file", window, cx);
+                    });
                 }));
             }
             if let Some(thread) = in_browser {
@@ -461,11 +464,14 @@ impl Workspace {
                 }));
             }
             if let Some(label) = reveal {
-                let (view, client) = (view.clone(), client.clone());
+                let (view, environment) = (view.clone(), environment.clone());
                 let input = json!({"cwd": without_position(&target), "editor": "file-manager", "reveal": true});
                 menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
-                    let (client, input) = (client.clone(), input.clone());
-                    let _ = view.update(cx, |w, cx| w.shell_open(client, input, "Unable to reveal file", window, cx));
+                    let input = input.clone();
+                    let _ = view.update(cx, |w, cx| {
+                        let client = environment.as_ref().and_then(|env| w.env_client(env));
+                        w.shell_open(client, input, "Unable to reveal file", window, cx);
+                    });
                 }));
             }
             let copy = |value: String, title: &'static str| {

@@ -9,12 +9,14 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    Anchor, AnyElement, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement,
+    Anchor, AnyElement, App, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement,
     KeyDownEvent, ParentElement as _, Render, ScrollStrategy, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Task, UniformListScrollHandle, Window, anchored, deferred, div, px, uniform_list,
+    Styled as _, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, anchored, deferred, div, px,
+    uniform_list,
 };
 use serde_json::{Value, json};
 
+use crate::app::Workspace;
 use crate::new_thread::sanitize_new_ref_name;
 use crate::rpc::RpcClient;
 use crate::theme::{Tokens, tokens};
@@ -26,7 +28,9 @@ const ROW_HEIGHT: f32 = 28.;
 const LIST_MAX_HEIGHT: f32 = 224.;
 
 pub(super) struct NewWorktreeMode {
-    client: RpcClient,
+    workspace: WeakEntity<Workspace>,
+    /// The task's environment, whose socket is looked up at each read.
+    environment: SharedString,
     cwd: Option<String>,
     base_ref: String,
     start_from_origin: bool,
@@ -62,7 +66,8 @@ pub(super) fn render_new_worktree_mode(mode: &Entity<NewWorktreeMode>) -> impl I
 
 impl NewWorktreeMode {
     pub(super) fn new(
-        client: RpcClient,
+        workspace: WeakEntity<Workspace>,
+        environment: SharedString,
         cwd: Option<String>,
         task: Option<&Value>,
         window: &mut Window,
@@ -80,7 +85,8 @@ impl NewWorktreeMode {
             _ => {}
         });
         let mut mode = Self {
-            client,
+            workspace,
+            environment,
             cwd,
             base_ref,
             start_from_origin,
@@ -150,6 +156,11 @@ impl NewWorktreeMode {
         }
     }
 
+    /// The environment's socket now: a reconnect while the editor is open replaces it.
+    fn client(&self, cx: &App) -> Option<RpcClient> {
+        self.workspace.upgrade()?.read(cx).env_client(&self.environment)
+    }
+
     fn load_page(&mut self, cursor: Option<u64>, cx: &mut Context<Self>) {
         let Some(cwd) = self.cwd.clone() else { return };
         let mut input = json!({"cwd": cwd, "limit": PAGE_LIMIT});
@@ -160,7 +171,12 @@ impl NewWorktreeMode {
         if let Some(cursor) = cursor {
             input["cursor"] = cursor.into();
         }
-        let client = self.client.clone();
+        let Some(client) = self.client(cx) else {
+            self.refs.loading = None;
+            self.refs.error = Some("This environment is not connected.".into());
+            cx.notify();
+            return;
+        };
         let task = cx.spawn(async move |this, cx| {
             let result = client.request("vcs.listRefs", input).await;
             let _ = this.update(cx, |this, cx| {
@@ -191,7 +207,11 @@ impl NewWorktreeMode {
             self._selected_ref_task = None;
             return;
         };
-        let (client, name) = (self.client.clone(), self.base_ref.clone());
+        let Some(client) = self.client(cx) else {
+            self._selected_ref_task = None;
+            return;
+        };
+        let name = self.base_ref.clone();
         self._selected_ref_task = Some(cx.spawn(async move |this, cx| {
             let input = json!({"cwd": cwd, "query": name, "limit": 10});
             let Ok(page) = client.request("vcs.listRefs", input).await else { return };

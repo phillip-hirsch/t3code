@@ -632,7 +632,7 @@ impl Workspace {
     /// What deleting `key` takes, read now. A worktree is only its own once no thread outside
     /// `deleted` (this batch's deletions so far) uses it.
     pub(super) fn delete_plan(&self, key: &ScopedId, deleted: &HashSet<ScopedId>) -> Option<DeletePlan> {
-        let (Some(client), Some(thread)) = (self.env_client(&key.env), self.thread(key)) else { return None };
+        let thread = self.thread(key).filter(|_| self.env_client(&key.env).is_some())?;
         let sort_order =
             self.client_settings.values.get("sidebarThreadSortOrder").as_str().unwrap_or_default().to_owned();
         let fallback = fallback_after_delete(&self.shell.threads, key, &sort_order, now_ms()).map(ScopedId::of_thread);
@@ -663,7 +663,6 @@ impl Workspace {
         let ask_server = info.config.get("shellThreadFamilies").and_then(Value::as_bool) == Some(true)
             || self.shell.older_settled(&environment).is_some();
         Some(DeletePlan {
-            client,
             key: key.clone(),
             was_open: self.is_open_thread(key),
             fallback,
@@ -1062,7 +1061,6 @@ fn worktree_display(path: &str) -> &str {
 /// the delete, which detaches them on the server too.
 /// What deleting one thread takes, from [`Workspace::delete_plan`].
 pub(super) struct DeletePlan {
-    client: RpcClient,
     key: ScopedId,
     was_open: bool,
     fallback: Option<ScopedId>,
@@ -1081,10 +1079,17 @@ pub(super) async fn run_delete(
     plan: DeletePlan,
     cx: &mut gpui_kit::AsyncWindowContext,
 ) -> Result<bool, String> {
-    let DeletePlan { client, key, was_open, fallback, mut orphan, ask_server, has_runtime, project_root, side_chats } =
-        plan;
+    let DeletePlan { key, was_open, fallback, mut orphan, ask_server, has_runtime, project_root, side_chats } = plan;
     let (environment, thread_id) = (key.env.clone(), key.id.clone());
+    // The environment's socket at each step: a reconnect while the question is open replaces it.
+    let live_client = |cx: &mut gpui_kit::AsyncWindowContext| {
+        this.read_with(cx, |this, _| this.env_client(&environment))
+            .ok()
+            .flatten()
+            .ok_or_else(|| NOT_CONNECTED.to_owned())
+    };
     if let (Some(path), true) = (&orphan, ask_server) {
+        let client = live_client(cx)?;
         let occupants = client.request("orchestration.getWorktreeThreadIds", json!({"worktreePath": path})).await;
         let alone = occupants.ok().and_then(|value| {
             let ids = value["threadIds"].as_array()?.clone();
@@ -1111,6 +1116,7 @@ pub(super) async fn run_delete(
             return Err(NOT_OPERATE.to_owned());
         }
     }
+    let client = live_client(cx)?;
     if has_runtime {
         stop_provider_sessions(&client, &thread_id).await;
     }

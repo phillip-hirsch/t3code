@@ -367,7 +367,8 @@ enum Install {
 /// retries.
 struct FilePatches {
     selection: (Target, DiffScope),
-    client: RpcClient,
+    /// The selection's environment, whose socket each patch read looks up: a reconnect replaces it.
+    environment: SharedString,
     request: diff_load::PatchRequest,
     files: Vec<diff_load::FileStat>,
     /// `files` by path, for the headers' counts.
@@ -384,7 +385,7 @@ struct FilePatches {
 impl FilePatches {
     fn new(
         selection: (Target, DiffScope),
-        client: RpcClient,
+        environment: SharedString,
         request: diff_load::PatchRequest,
         files: Vec<diff_load::FileStat>,
         previous: Option<&Self>,
@@ -400,7 +401,7 @@ impl FilePatches {
         demand.request(rows.iter().enumerate().filter_map(|(index, row)| row.as_ref().map(|_| index)));
         Self {
             selection,
-            client,
+            environment,
             request,
             stats: std::rc::Rc::new(stats),
             index,
@@ -1469,6 +1470,7 @@ impl Workspace {
                     this.right_panel.diff_read_at = Some(std::time::Instant::now());
                 }
                 let previous = this.right_panel.patches.take().filter(|_| retain);
+                let patch_environment = env.clone();
                 let loader = contents_source.map(|source| {
                     contents_loader(
                         cx.weak_entity(),
@@ -1500,7 +1502,7 @@ impl Workspace {
                             Some(request) => {
                                 let patches = FilePatches::new(
                                     selection.clone(),
-                                    client.clone(),
+                                    patch_environment,
                                     request,
                                     parsed.deferred,
                                     previous.as_ref(),
@@ -1634,6 +1636,8 @@ impl Workspace {
     /// Starts the patch reads the demand lets run now; the patch shows it is loading while any
     /// asked-for read is outstanding.
     fn start_patch_reads(&mut self, cx: &mut Context<Self>) {
+        let Some(environment) = self.right_panel.patches.as_ref().map(|p| p.environment.clone()) else { return };
+        let client = self.env_client(&environment);
         let Some(patches) = &mut self.right_panel.patches else { return };
         let outstanding = patches.demand.outstanding();
         if let DiffLoad::Ready { pending, .. } = &mut self.right_panel.load
@@ -1643,10 +1647,13 @@ impl Workspace {
             cx.notify();
         }
         for index in patches.demand.start() {
-            let (client, file) = (patches.client.clone(), patches.files[index].clone());
+            let (client, file) = (client.clone(), patches.files[index].clone());
             let (input, source_kind) = (patches.request.input(&file), patches.request.source_kind);
             patches._reads.push(cx.spawn(async move |this, cx| {
-                let reply = client.request("review.getDiffPreview", input).await;
+                let reply = match client {
+                    Some(client) => client.request("review.getDiffPreview", input).await,
+                    None => Err(crate::rpc::RpcError::Disconnected("This environment is not connected.".into())),
+                };
                 if let Err(error) = &reply {
                     log::warn!("diff file patch failed: {error}");
                 }

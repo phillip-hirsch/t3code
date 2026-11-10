@@ -402,19 +402,22 @@ impl Workspace {
                 )
                 .child(div().flex_none().text_color(t.muted_foreground).child("Runs on its own"))
                 // Antigravity's subagents keep their children's work in the provider (`NativeChildWorkDialog`).
-                .when(driver == "antigravity", |bar| {
-                    let (client, thread_id) = (self.client(), projection.thread.id.clone());
-                    bar.child(
-                        Button::new("subagent-work")
-                            .ghost()
-                            .small()
-                            .icon(Icon::new(IconName::ListTree).size(px(16.)))
-                            .label("Subagent work")
-                            .on_click(move |_, window, cx| {
-                                open_native_work(client.clone(), thread_id.clone(), window, cx);
-                            }),
-                    )
-                })
+                .when_some(
+                    self.target.as_ref().and_then(Target::thread_key).filter(|_| driver == "antigravity"),
+                    |bar, thread| {
+                        let workspace = cx.weak_entity();
+                        bar.child(
+                            Button::new("subagent-work")
+                                .ghost()
+                                .small()
+                                .icon(Icon::new(IconName::ListTree).size(px(16.)))
+                                .label("Subagent work")
+                                .on_click(move |_, window, cx| {
+                                    open_native_work(workspace.clone(), thread.clone(), window, cx);
+                                }),
+                        )
+                    },
+                )
                 .children(parent.map(|parent| {
                     Button::new("open-parent")
                         .ghost()
@@ -432,8 +435,9 @@ impl Workspace {
 
 /// `NativeChildWorkDialog`: what a provider-native subagent's own children did, read only.
 struct NativeWork {
-    client: Option<crate::rpc::RpcClient>,
-    thread_id: String,
+    workspace: gpui_kit::WeakEntity<Workspace>,
+    /// The subagent thread; its environment's socket is looked up at each read.
+    thread: ScopedId,
     /// `None` while loading.
     result: Option<Result<Value, SharedString>>,
     _load: Option<Task<()>>,
@@ -441,9 +445,14 @@ struct NativeWork {
 
 impl NativeWork {
     fn load(&mut self, cx: &mut gpui_kit::Context<Self>) {
-        let Some(client) = self.client.clone() else { return };
+        let client = self.workspace.upgrade().and_then(|w| w.read(cx).env_client(&self.thread.env));
+        let Some(client) = client else {
+            self.result = Some(Err("This environment is not connected.".into()));
+            cx.notify();
+            return;
+        };
         self.result = None;
-        let input = json!({"threadId": self.thread_id});
+        let input = json!({"threadId": self.thread.id});
         self._load = Some(cx.spawn(async move |this, cx| {
             let result = client.request("orchestration.getNativeChildWork", input).await;
             let _ = this.update(cx, |this, cx| {
@@ -589,15 +598,15 @@ impl gpui_kit::Render for NativeWork {
 }
 
 fn open_native_work(
-    client: Option<crate::rpc::RpcClient>,
-    thread_id: String,
+    workspace: gpui_kit::WeakEntity<Workspace>,
+    thread: ScopedId,
     window: &mut gpui_kit::Window,
     cx: &mut gpui_kit::App,
 ) {
     use gpui_kit::AppContext as _;
     use gpui_kit::component::WindowExt as _;
     let view = cx.new(|cx| {
-        let mut work = NativeWork { client, thread_id, result: None, _load: None };
+        let mut work = NativeWork { workspace, thread, result: None, _load: None };
         work.load(cx);
         work
     });

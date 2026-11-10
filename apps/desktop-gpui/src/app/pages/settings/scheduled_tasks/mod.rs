@@ -278,14 +278,14 @@ impl ScheduledTasksView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.client_on(&environment) else { return };
-        self.open_editor_on(environment, client, Some(task), window, cx);
+        if self.client_on(&environment).is_some() {
+            self.open_editor_on(environment, Some(task), window, cx);
+        }
     }
 
     fn open_editor_on(
         &mut self,
         environment: SharedString,
-        client: RpcClient,
         task: Option<ScheduledTask>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -293,7 +293,7 @@ impl ScheduledTasksView {
         let Some(workspace) = self.workspace.upgrade() else { return };
         let scope = workspace.read(cx).settings_view().scope;
         let list = cx.entity().downgrade();
-        editor::open(self.workspace.clone(), list, (environment, client), task, scope, window, cx);
+        editor::open(self.workspace.clone(), list, environment, task, scope, window, cx);
         self.editor_open = true;
     }
 
@@ -323,10 +323,10 @@ impl ScheduledTasksView {
         let Some(task) = linked.cloned() else { return true };
         if self.opened_link.as_ref() != Some(task_id) {
             self.opened_link = Some(task_id.clone());
-            if let (false, Some(client)) = (self.editor_open, self.client_on(environment)) {
+            if !self.editor_open && self.client_on(environment).is_some() {
                 let environment = environment.clone();
                 cx.defer_in(window, move |this, window, cx| {
-                    this.open_editor_on(environment, client, Some((*task).clone()), window, cx);
+                    this.open_editor_on(environment, Some((*task).clone()), window, cx);
                 });
             }
         }
@@ -377,7 +377,6 @@ impl ScheduledTasksView {
         &self,
         environment: &SharedString,
         task: &Rc<ScheduledTask>,
-        client: &RpcClient,
         t: &Tokens,
         cx: &mut Context<Self>,
     ) -> RowFrame {
@@ -412,11 +411,8 @@ impl ScheduledTasksView {
         let id = format!("{environment}-{}", task.id);
         let view = cx.entity();
         let menu_task = Rc::clone(task);
-        let client = client.clone();
-        let context = webhook
-            .then(|| self.workspace.upgrade())
-            .flatten()
-            .map(|w| webhooks::WebhookContext::new(client.clone(), environment, &w, cx));
+        let context =
+            webhook.then(|| self.workspace.upgrade()).flatten().map(|w| webhooks::WebhookContext::new(environment, &w));
         let menu_environment = environment.clone();
         let menu = Button::new(SharedString::from(format!("scheduled-task-actions-{id}")))
             .ghost()
@@ -502,12 +498,12 @@ impl ScheduledTasksView {
         t: &Tokens,
         cx: &mut Context<Self>,
     ) -> Vec<RowFrame> {
-        let Some(client) = &environment.client else {
+        if environment.client.is_none() {
             return vec![
                 RowFrame::new("Environment disconnected")
                     .description(format!("Reconnect {} to view its scheduled tasks.", environment.label)),
             ];
-        };
+        }
         let tasks = match self.scoped_tasks(&environment.id, scope) {
             None => return vec![RowFrame::new("Loading scheduled tasks…")],
             Some(Err(error)) => return vec![RowFrame::new("Could not load scheduled tasks").description(error)],
@@ -520,7 +516,7 @@ impl ScheduledTasksView {
         if tasks.is_empty() {
             rows.push(no_scheduled_tasks());
         }
-        rows.extend(tasks.iter().map(|task| self.render_row(&environment.id, task, client, t, cx)));
+        rows.extend(tasks.iter().map(|task| self.render_row(&environment.id, task, t, cx)));
         rows
     }
 
@@ -540,16 +536,14 @@ impl ScheduledTasksView {
             shown.iter().map(|e| (e, e.client.as_ref().and_then(|_| self.scoped_tasks(&e.id, scope)))).collect();
         let mut rows: Vec<AnyElement> = Vec::new();
         for (environment, state) in &states {
-            let (Some(client), Some(Ok(tasks))) = (&environment.client, state) else { continue };
+            let (Some(_), Some(Ok(tasks))) = (&environment.client, state) else { continue };
             if tasks.is_empty() {
                 continue;
             }
             let secondary = scope::environment_secondary(&environment.id, &labeled);
             rows.push(environment_header(environment, secondary, t));
             rows.extend(
-                tasks
-                    .iter()
-                    .map(|task| self.render_row(&environment.id, task, client, t, cx).render(t).into_any_element()),
+                tasks.iter().map(|task| self.render_row(&environment.id, task, t, cx).render(t).into_any_element()),
             );
         }
         let populated = !rows.is_empty();
@@ -649,7 +643,8 @@ impl Render for ScheduledTasksView {
                 .iter()
                 .find(|id| Some(*id) == default.as_ref())
                 .or(permitted.first())
-                .and_then(|id| Some((id.clone(), workspace.env_client(id)?)));
+                .filter(|id| workspace.env_client(id).is_some())
+                .cloned();
             (shown, view.scope, workspace.settings_ui.scheduled_task_link.clone(), creation)
         };
         let wanted: Vec<(SharedString, RpcClient)> =
@@ -665,8 +660,8 @@ impl Render for ScheduledTasksView {
             .label("New task")
             .disabled(creation.is_none())
             .on_click(cx.listener(move |this, _, window, cx| {
-                if let Some((environment, client)) = creation.clone() {
-                    this.open_editor_on(environment, client, None, window, cx);
+                if let Some(environment) = creation.clone() {
+                    this.open_editor_on(environment, None, window, cx);
                 }
             }))
             .into_any_element();

@@ -808,7 +808,7 @@ impl Workspace {
         if self.side_chat.deleting.contains(&key) || !self.side_chat_operable() {
             return;
         }
-        let (Some(client), Some(origin)) = (self.client(), self.target.clone()) else { return };
+        let (true, Some(origin)) = (self.env_client(&key.0).is_some(), self.target.clone()) else { return };
         let confirm = self.client_settings.values.get("confirmThreadDelete").as_bool() == Some(true);
         let answer = confirm.then(|| {
             let message = format!(
@@ -823,13 +823,13 @@ This permanently clears its conversation history."
             {
                 return;
             }
+            // The environment's socket after the question: a reconnect while it is open replaces it.
             let started = this.update(cx, |this, cx| {
                 cx.notify();
-                this.side_chat.deleting.insert(key.clone())
+                let client = this.env_client(&key.0)?;
+                this.side_chat.deleting.insert(key.clone()).then_some(client)
             });
-            if !matches!(started, Ok(true)) {
-                return;
-            }
+            let Ok(Some(client)) = started else { return };
             let result = client.request("orchestration.dispatchCommand", delete_command(&thread_id, false)).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.side_chat.deleting.remove(&key);

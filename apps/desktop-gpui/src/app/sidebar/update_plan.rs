@@ -23,12 +23,12 @@ use crate::usage::provider_display_name;
 /// The grant a provider update needs on its machine.
 const PROVIDERS_MANAGE: &str = "providers:manage";
 
-/// One machine's share of the run: its name, its socket, and `(driver, instanceId)` per provider.
+/// One machine's share of the run: its environment, its name, and `(driver, instanceId)` per
+/// provider. Its socket is looked up when the run starts, as a reconnect replaces it.
 #[derive(Clone)]
 pub(super) struct MachineUpdate {
     pub(super) environment_id: SharedString,
     pub(super) label: String,
-    pub(super) client: RpcClient,
     pub(super) candidates: Vec<(String, String)>,
 }
 
@@ -45,14 +45,29 @@ fn candidates(providers: &[Provider]) -> Vec<(String, String)> {
 fn machine_update(
     environment_id: Option<&SharedString>,
     manages: bool,
-    client: Option<&RpcClient>,
+    connected: bool,
     info: &ServerInfo,
 ) -> Option<MachineUpdate> {
-    let environment_id = environment_id.filter(|_| manages)?.clone();
-    let client = client?.clone();
+    let environment_id = environment_id.filter(|_| manages && connected)?.clone();
     let candidates = candidates(&info.providers);
     let label = info.environment_label.clone().unwrap_or_else(|| "Server".into());
-    (!candidates.is_empty()).then_some(MachineUpdate { environment_id, label, client, candidates })
+    (!candidates.is_empty()).then_some(MachineUpdate { environment_id, label, candidates })
+}
+
+/// Each `server.updateProvider` of `plan`, on the socket `live` gives its machine now; a machine
+/// `live` has none for (disconnected, or its grant revoked) is skipped.
+fn update_requests(
+    plan: Vec<MachineUpdate>,
+    live: impl Fn(&str) -> Option<RpcClient>,
+) -> Vec<(RpcClient, serde_json::Value)> {
+    plan.into_iter()
+        .filter_map(|machine| Some((live(&machine.environment_id)?, machine.candidates)))
+        .flat_map(|(client, candidates)| {
+            candidates.into_iter().map(move |(driver, instance_id)| {
+                (client.clone(), json!({"provider": driver, "instanceId": instance_id}))
+            })
+        })
+        .collect()
 }
 
 /// `countLabel`: "1 provider", "2 providers".
@@ -77,7 +92,7 @@ impl Workspace {
             .iter()
             .filter_map(|session| {
                 let manages = session.id.as_ref().is_some_and(|id| self.env_grants(id, PROVIDERS_MANAGE));
-                machine_update(session.id.as_ref(), manages, session.client.as_ref(), &session.server_info)
+                machine_update(session.id.as_ref(), manages, session.client.is_some(), &session.server_info)
             })
             .collect()
     }
@@ -87,7 +102,7 @@ impl Workspace {
         describe(&named(plan)).0.into()
     }
 
-    /// Asks with the machines and providers, then updates each machine's providers on its own socket.
+    /// Asks with the machines and providers, then updates each machine's providers on its socket then.
     pub(super) fn confirm_provider_updates(
         &mut self,
         plan: Vec<MachineUpdate>,
@@ -184,21 +199,13 @@ impl Workspace {
     }
 
     /// `updateAll`: every machine's providers at once; a failure leaves the others updating. A
-    /// machine whose grant was revoked while the dialog was open is skipped.
+    /// machine whose grant was revoked or that disconnected while the dialog was open is skipped.
     fn run_provider_updates(&mut self, plan: Vec<MachineUpdate>, cx: &mut Context<Self>) {
-        let requests: Vec<_> = plan
+        let live = |id: &str| self.env_client(id).filter(|_| self.env_grants(id, PROVIDERS_MANAGE));
+        let requests = update_requests(plan, live)
             .into_iter()
-            .filter(|machine| self.env_grants(&machine.environment_id, PROVIDERS_MANAGE))
-            .flat_map(|machine| {
-                machine.candidates.into_iter().map(move |(driver, instance_id)| {
-                    let client = machine.client.clone();
-                    async move {
-                        let input = json!({"provider": driver, "instanceId": instance_id});
-                        client.request("server.updateProvider", input).await
-                    }
-                })
-            })
-            .collect();
+            .map(|(client, input)| async move { client.request("server.updateProvider", input).await });
+        let requests: Vec<_> = requests.collect();
         cx.spawn(async move |this, cx| {
             let failure = futures::future::join_all(requests).await.into_iter().find_map(Result::err);
             if let Some(error) = failure {
@@ -239,11 +246,27 @@ mod tests {
         });
         let mut info = ServerInfo::default();
         info.providers = vec![serde_json::from_value(behind).unwrap()];
-        let (id, client) = (SharedString::from("mac"), RpcClient::unopened());
-        let plan = machine_update(Some(&id), true, Some(&client), &info).expect("a managed machine updates");
+        let id = SharedString::from("mac");
+        let plan = machine_update(Some(&id), true, true, &info).expect("a managed machine updates");
         assert_eq!(plan.candidates, [("codex".to_owned(), "codex".to_owned())]);
-        assert!(machine_update(Some(&id), false, Some(&client), &info).is_none(), "read-only machines are left out");
-        assert!(machine_update(None, true, Some(&client), &info).is_none());
-        assert!(machine_update(Some(&id), true, None, &info).is_none(), "a disconnected machine waits");
+        assert!(machine_update(Some(&id), false, true, &info).is_none(), "read-only machines are left out");
+        assert!(machine_update(None, true, true, &info).is_none());
+        assert!(machine_update(Some(&id), true, false, &info).is_none(), "a disconnected machine waits");
+    }
+
+    #[test]
+    fn updates_go_out_on_each_machines_socket_at_confirmation() {
+        let machine = |id: &str| MachineUpdate {
+            environment_id: id.into(),
+            label: id.into(),
+            candidates: vec![("codex".into(), "codex".into())],
+        };
+        // The dialog opened on one socket; the machine reconnected before Update was pressed.
+        let reconnected = RpcClient::unopened();
+        let live = |id: &str| (id == "mac").then(|| reconnected.clone());
+        let requests = update_requests(vec![machine("mac"), machine("gone")], live);
+        assert_eq!(requests.len(), 1, "a machine with no socket now is skipped");
+        assert!(requests[0].0.same_socket(&reconnected));
+        assert_eq!(requests[0].1, json!({"provider": "codex", "instanceId": "codex"}));
     }
 }
