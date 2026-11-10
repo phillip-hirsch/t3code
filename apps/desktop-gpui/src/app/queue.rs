@@ -97,12 +97,11 @@ impl Workspace {
     /// The pane's queue rows.
     pub(super) fn queue_rows(&mut self, pane: ChatPane) -> Vec<Row> {
         let state = match (self.pane_thread(pane), self.pane_projection(pane)) {
-            (Some((_, id)), Some(projection)) => {
+            (Some((env, id)), Some(projection)) => {
                 let archived = self
                     .shell
-                    .threads
-                    .iter()
-                    .any(|t| t.id == id && (t.archived_at.is_some() || t.deleted_at.is_some()));
+                    .thread(&crate::model::ScopedId::new(env, &id))
+                    .is_some_and(|t| t.archived_at.is_some() || t.deleted_at.is_some());
                 queue::derive(projection, archived)
             }
             _ => QueueState::default(),

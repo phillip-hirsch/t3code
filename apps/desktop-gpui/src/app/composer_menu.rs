@@ -329,8 +329,8 @@ impl Workspace {
             })
         };
         let linked = match &self.target {
-            Some(Target::Thread { id, .. }) => {
-                self.shell.threads.iter().find(|thread| &thread.id == id).map_or_else(Vec::new, |thread| {
+            Some(Target::Thread { env, id }) => {
+                self.shell.thread(&crate::model::ScopedId::new(env.clone(), id)).map_or_else(Vec::new, |thread| {
                     pull_request_completions::linked_references(&thread.pull_requests, &project_id)
                 })
             }
