@@ -1315,7 +1315,11 @@ impl Workspace {
             && matches!(self.right_panel.load, DiffLoad::Ready { .. } | DiffLoad::Empty(_));
         let install = if retain { Install::Update } else { Install::Replace };
         self.right_panel.loaded = Some(key);
-        let (Some(client), Target::Thread { env, id: thread_id }) = (self.client(), target) else { return };
+        // A read still on its way answers the previous key, maybe another checkout's.
+        (self.right_panel._task, self.right_panel.diff_reading) = (None, false);
+        let (Some(client), Target::Thread { env, id: thread_id }) = (self.client(), target) else {
+            return self.reset_unread_diff(retain, cx);
+        };
         if let DiffScope::ToolCall { thread_id, item_id } = &scope {
             let mut input = json!({"threadId": thread_id, "itemId": item_id});
             if let Some(revision) = mutation.0 {
@@ -1350,7 +1354,7 @@ impl Workspace {
                 }
             }
             scope => {
-                let Some(cwd) = cwd.clone() else { return };
+                let Some(cwd) = cwd.clone() else { return self.reset_unread_diff(retain, cx) };
                 // Stats only; the patches follow one file at a time, as the web reads them.
                 let mut input = json!({"cwd": cwd, "ignoreWhitespace": ignore_whitespace, "metadataOnly": true});
                 if let Some(base) = &base_ref {
@@ -1748,6 +1752,14 @@ impl Workspace {
         };
         self.right_panel.pending_reveal = None;
         self.reveal_diff_file(&path, cx);
+    }
+
+    /// A selection that cannot be read yet shows nothing of the last one, unless it is that one.
+    fn reset_unread_diff(&mut self, retain: bool, cx: &mut Context<Self>) {
+        if !retain {
+            self.right_panel.load = DiffLoad::Idle;
+            self.clear_diff(cx);
+        }
     }
 
     fn clear_diff(&mut self, cx: &mut Context<Self>) {
