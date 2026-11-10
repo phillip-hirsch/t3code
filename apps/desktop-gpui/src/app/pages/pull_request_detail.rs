@@ -42,6 +42,7 @@ pub(super) mod breakdown;
 mod code;
 mod completions;
 mod guide;
+pub(super) mod guide_runs;
 mod handoff;
 mod header;
 pub(super) use header::checks_body;
@@ -55,8 +56,6 @@ const CONVERSATION_PAGE: usize = 10;
 /// How long an inline "Confirm …?" stays armed (`useInlineActionConfirm`).
 const CONFIRM_WINDOW: Duration = Duration::from_secs(3);
 const COPIED_WINDOW: Duration = Duration::from_millis(1600);
-/// A guide run takes minutes; its answer is read again at this pace while it runs.
-const GUIDE_POLL: Duration = Duration::from_secs(15);
 
 /// The thread whose right panel shows the pull request (`threadRef` beside `PullRequestDetailPanel`).
 #[derive(Clone, Debug)]
@@ -123,7 +122,6 @@ pub(in crate::app) struct Panel {
     guide_loading: bool,
     guide_error: Option<SharedString>,
     guide_starting: bool,
-    _guide_poll: Option<Task<()>>,
     code: Option<code::CodeTab>,
     write: write::WriteState,
     stack: Option<Rc<logic::Stack>>,
@@ -196,7 +194,6 @@ impl Panel {
             guide_loading: false,
             guide_error: None,
             guide_starting: false,
-            _guide_poll: None,
             code: None,
             write: write::WriteState::default(),
             stack: None,
@@ -794,86 +791,11 @@ impl Workspace {
         cx.notify();
     }
 
-    /// `pullRequests.reviewGuide`, read again while a run is writing one.
+    /// `pullRequests.reviewGuide` for the shown pull request.
     fn read_pr_guide(&mut self, cx: &mut Context<Self>) {
-        let Some(client) = self.pull_request_client() else { return };
-        let Some(panel) = self.pull_requests.panel.as_mut() else { return };
-        panel.guide_loading = true;
-        let key = panel.reference.key();
-        let input = panel.reference.to_json();
-        cx.spawn(async move |this, cx| {
-            let result = client.request("pullRequests.reviewGuide", input).await;
-            let _ = this.update(cx, |this, cx| {
-                let Some(panel) = this.pr_panel(&key) else { return };
-                panel.guide_loading = false;
-                match result {
-                    Ok(value) => {
-                        panel.guide_error = None;
-                        panel.set_guide(value);
-                    }
-                    Err(error) => panel.guide_error = Some(list_logic::error_message(&error).into()),
-                }
-                this.poll_pr_guide(cx);
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn poll_pr_guide(&mut self, cx: &mut Context<Self>) {
-        let Some(panel) = self.pull_requests.panel.as_mut() else { return };
-        let running = panel.guide.as_ref().is_some_and(|g| g["run"]["_tag"] == "Running");
-        if !running {
-            panel._guide_poll = None;
-            return;
+        if let Some(key) = self.shown_pr_key() {
+            self.read_pr_guide_of(&key, cx);
         }
-        let key = panel.reference.key();
-        panel._guide_poll = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(GUIDE_POLL).await;
-            let _ = this.update(cx, |this, cx| {
-                if this.pr_panel(&key).is_some() {
-                    this.read_pr_guide(cx);
-                }
-            });
-        }));
-    }
-
-    /// `useReviewGuideWriter.write`: starts an agent run on the server (`pullRequests.generateReviewGuide`).
-    fn write_pr_guide(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.pull_request_client() else { return };
-        let Some(panel) = self.pull_requests.panel.as_mut() else { return };
-        if panel.guide_starting || panel.guide.as_ref().is_some_and(|g| g["run"]["_tag"] == "Running") {
-            return;
-        }
-        panel.guide_starting = true;
-        if panel.guide.as_ref().is_none_or(|g| g["guide"].is_null()) {
-            panel.tab = Tab::Guide;
-        }
-        let key = panel.reference.key();
-        let input = panel.reference.to_json();
-        cx.spawn_in(window, async move |this, cx| {
-            let result = client.request("pullRequests.generateReviewGuide", input).await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                let Some(panel) = this.pr_panel(&key) else { return };
-                panel.guide_starting = false;
-                match result {
-                    Ok(value) => panel.set_guide(value),
-                    Err(error) => toast_error(
-                        window,
-                        cx,
-                        "Could not start a review guide",
-                        logic::readable_failure(
-                            &list_logic::error_message(&error),
-                            "Check the review guide model in Settings → Source control.",
-                        ),
-                    ),
-                }
-                this.poll_pr_guide(cx);
-                cx.notify();
-            });
-        })
-        .detach();
-        cx.notify();
     }
 
     fn rebuild_pr_timeline(&mut self) {
@@ -1032,7 +954,10 @@ impl Workspace {
                 }
                 _ => detail_ghost(&t),
             };
-            return frame.child(self.render_pr_seed_header(thread, &t, cx)).child(body).into_any_element();
+            return frame
+                .child(self.render_pr_seed_header(thread, &t, cx))
+                    .child(body)
+                .into_any_element();
         };
         let panel = self.pull_requests.panel.as_ref().expect("checked above");
         let guides = self.review_guides_enabled(&panel.reference);

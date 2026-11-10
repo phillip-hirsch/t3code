@@ -142,6 +142,8 @@ pub(in crate::app) struct PullRequestsState {
     /// Open pull requests in tab order; `panel` is the shown one and `parked` holds the rest.
     pub(super) tabs: Vec<Reference>,
     pub(super) parked: std::collections::HashMap<String, super::pull_request_detail::Panel>,
+    /// Review guide runs being watched, by pull request key, whether or not a panel shows them.
+    pub(super) guide_runs: std::collections::HashMap<String, super::pull_request_detail::guide_runs::GuideRun>,
     /// The panel's dragged width; `None` is half the window.
     pub(super) panel_width: Option<f32>,
     /// Whether the panel shows beside the list, or over it; hiding keeps every tab.
@@ -224,6 +226,7 @@ impl PullRequestsState {
             reviews: std::collections::HashMap::new(),
             tabs: Vec::new(),
             parked: std::collections::HashMap::new(),
+            guide_runs: std::collections::HashMap::new(),
             panel_width: None,
             layout: super::pull_request_detail::PanelLayout::default(),
             refreshes: std::collections::HashMap::new(),
