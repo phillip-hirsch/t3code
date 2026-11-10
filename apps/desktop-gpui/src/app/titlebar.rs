@@ -270,7 +270,7 @@ impl Workspace {
         let focus = &self.titlebar_focus;
         // These act on press; Enter and Space reach them as keyboard clicks.
         let toggle = |id: &'static str, path: &'static str, pressed: bool, enabled: bool, stop: &FocusHandle| {
-            let color = if enabled { tokens.foreground.opacity(0.8) } else { tokens.muted_foreground };
+            let color = tokens.titlebar_toggle_ink(enabled);
             control(id)
                 .when(pressed, |el| el.bg(tokens.accent))
                 .when(enabled, |el| {
@@ -337,7 +337,7 @@ impl Workspace {
         let focus = &self.titlebar_focus;
         // These act on press; Enter and Space reach them as keyboard clicks.
         let toggle = |id: &'static str, path: &'static str, pressed: bool, enabled: bool, stop: &FocusHandle| {
-            let color = if enabled { tokens.foreground.opacity(0.8) } else { tokens.muted_foreground };
+            let color = tokens.titlebar_toggle_ink(enabled);
             control(id)
                 .when(pressed, |el| el.bg(tokens.accent))
                 .when(enabled, |el| {

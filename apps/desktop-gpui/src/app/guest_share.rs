@@ -222,7 +222,18 @@ impl Workspace {
             .focus_visible(move |s| s.shadow(vec![ring]))
             .child("Stop sharing")
             .when(closing, |el| el.opacity(0.64))
-            .when(!closing, |el| el.cursor_pointer().hover(move |s| s.bg(accent).text_color(foreground)))
+            // A theme gives the chat header's buttons its toolbar controls (`[data-chat-header] [data-slot="button"]`).
+            .when(t.themed, |el| {
+                el.bg(t.toolbar.control)
+                    .border_1()
+                    .border_color(t.toolbar.border)
+                    .text_color(t.toolbar.control_foreground)
+            })
+            .when(!closing, |el| {
+                el.cursor_pointer().hover(move |s| {
+                    if t.themed { s.bg(t.toolbar.control_hover) } else { s.bg(accent).text_color(foreground) }
+                })
+            })
             .on_click(cx.listener(move |this, _, _, cx| this.stop_guest_share(&thread_id, cx)));
         Some(
             h_flex()

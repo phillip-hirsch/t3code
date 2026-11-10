@@ -1936,7 +1936,7 @@ fn stale_banner(error: SharedString, view: &Entity<Workspace>, t: &Tokens, windo
         .rounded(px(8.))
         .border_1()
         .border_color(Hsla { a: 0.3, ..t.warning })
-        .bg(Hsla { a: 0.08, ..t.warning })
+        .bg(t.warning_surface)
         .px(px(12.))
         .py(px(8.))
         .text_xs()

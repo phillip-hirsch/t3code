@@ -989,7 +989,7 @@ impl Workspace {
                     .items_center()
                     .justify_center()
                     .rounded_full()
-                    .bg(Hsla { a: 0.12, ..t.warning })
+                    .bg(t.warning_surface)
                     .child(Icon::new(Lucide::TriangleAlert).with_size(px(20.)).text_color(t.warning)),
             )
             .child(div().text_base().font_weight(FontWeight::SEMIBOLD).text_color(t.foreground).child(title))

@@ -1811,7 +1811,7 @@ impl Workspace {
                 .child(icon(IconName::RefreshCw, 16., sb.icon))
                 .into_any_element();
         }
-        let surface: Hsla = rgb(if tokens.dark { 0x0a0a0a } else { 0xf4f4f5 }).into();
+        let surface = sb.control_surface;
         let tip = Self::provider_update_summary(&plan);
         keyboard_button(div().id("sidebar-update"), tokens.ring)
             .ml_auto()
@@ -2044,7 +2044,7 @@ impl Workspace {
                     .overflow_hidden()
                     .cursor_pointer()
                     .when(active, |el| el.bg(sb.row_active))
-                    .when(selected, |el| el.bg(row_selected(tokens)))
+                    .when(selected, |el| el.bg(tokens.sidebar.row_selected))
                     .when(receding_run, |el| el.opacity(0.7))
                     // GPUI allows one hover style per element.
                     .when(!active && !selected || receding_run, |el| {
@@ -2396,7 +2396,7 @@ impl Workspace {
                 if active {
                     el.bg(sb.row_active)
                 } else if selected {
-                    el.bg(row_selected(tokens))
+                    el.bg(tokens.sidebar.row_selected)
                 } else {
                     let hover = if draft { tokens.warning.opacity(0.08) } else { sb.row_hover };
                     el.when(draft, |el| el.bg(tokens.warning.opacity(0.04))).hover(move |s| {
@@ -2515,7 +2515,7 @@ impl Workspace {
                 if active {
                     el.bg(sb.row_active)
                 } else if selected {
-                    el.bg(row_selected(tokens))
+                    el.bg(tokens.sidebar.row_selected)
                 } else if draft {
                     drafts::draft_surface(el, tokens)
                 } else {
@@ -2589,11 +2589,6 @@ fn top_status(
         Status::Ready if unread => (IconName::CircleCheck, "Done", tokens.success_foreground),
         Status::Ready => return None,
     })
-}
-
-/// `--sidebar-row-selected`: white in light themes, a 7% tint in dark ones.
-fn row_selected(tokens: &Tokens) -> Hsla {
-    if tokens.dark { tokens.sidebar.foreground.opacity(0.07) } else { tokens.sidebar.row_active }
 }
 
 impl Workspace {

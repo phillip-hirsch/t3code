@@ -1660,7 +1660,7 @@ fn user_row(
         .p(px(12.))
         .rounded(px(16.))
         .bg(surface)
-        .text_color(t.foreground)
+        .text_color(t.message_foreground)
         .text_size(px(TEXT))
         .line_height(px(LINE))
         .when(grouped_with_previous, |this| this.rounded_tr(px(6.)))
@@ -1762,7 +1762,7 @@ fn folded_row(
         .max_w(relative(0.8))
         .rounded(px(16.))
         .bg(t.message_surface)
-        .text_color(t.foreground)
+        .text_color(t.message_foreground)
         .text_size(px(TEXT))
         .line_height(px(LINE))
         .when(expanded, gpui_kit::Styled::w_full)
@@ -1936,7 +1936,7 @@ pub(super) fn code_block_header(
     cx: &App,
     toggle_wrap: impl Fn(&mut Workspace, &mut Context<Workspace>) + 'static,
 ) -> AnyElement {
-    let label_color = alpha(t.foreground, 0.72);
+    let label_color = alpha(if t.themed { t.code_foreground } else { t.foreground }, 0.72);
     let code: SharedString = block.code();
     // Its place in the source keeps two identical blocks apart and skips hashing every frame.
     let at = block.span.as_ref().map_or_else(|| fnv1a(&code), |span| span.start as u64);
@@ -2039,14 +2039,22 @@ pub(super) fn inline_code_style(t: &Tokens) -> StyleRefinement {
 }
 
 /// `.chat-markdown` (`index.css:1866-2280`) and `MarkdownCodeBlock.tsx`.
-/// The code block fill: `input/32` in dark mode, `secondary` in light.
+/// The code block fill: `input/32` in dark mode, `secondary` in light; a theme's code surface.
 fn code_background(t: &Tokens) -> Hsla {
-    if t.dark { alpha(t.input, 0.32) } else { t.secondary }
+    match (t.themed, t.dark) {
+        (true, _) => t.code_background,
+        (false, true) => alpha(t.input, 0.32),
+        (false, false) => t.secondary,
+    }
 }
 
 pub(super) fn markdown_style(t: &Tokens, user: bool, wrap: bool) -> TextViewStyle {
     let code_background = code_background(t);
-    let code_border = if t.dark { gpui_kit::transparent_black() } else { alpha(t.border, 0.7) };
+    let code_border = match (t.themed, t.dark) {
+        (true, _) => t.border,
+        (false, true) => gpui_kit::transparent_black(),
+        (false, false) => alpha(t.border, 0.7),
+    };
     // The web's header row (6px + 24px toolbar) sits above the code's own 12.8px.
     let mut code_block = StyleRefinement::default()
         .pt(px(42.8))
@@ -2057,6 +2065,9 @@ pub(super) fn markdown_style(t: &Tokens, user: bool, wrap: bool) -> TextViewStyl
         .border_color(code_border)
         .text_size(px(t.fonts.code_size))
         .line_height(relative(1.375));
+    if t.themed {
+        code_block = code_block.text_color(t.code_foreground);
+    }
     if !wrap {
         code_block = code_block.whitespace_nowrap();
         code_block.overflow.x = Some(gpui_kit::Overflow::Scroll);

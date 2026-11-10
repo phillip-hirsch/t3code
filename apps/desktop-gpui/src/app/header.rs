@@ -28,7 +28,8 @@ impl Workspace {
             .flex_none()
             .pl(if self.sidebar_open.docked() { px(20.) } else { titlebar::collapsed_content_left(window) })
             .pr(if panel_open { px(20.) } else { controls_inset })
-            .bg(tokens.background);
+            // `bg-background`, which a theme replaces with its toolbar (`[data-chat-header]`).
+            .bg(tokens.toolbar.background);
         let header = titlebar::drag_region(header);
         if let Some(page) = self.page.filter(|page| !page.is_modal()) {
             return header.child(div().text_sm().font_medium().text_color(tokens.foreground).child(page.title()));

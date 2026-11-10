@@ -866,7 +866,7 @@ impl Workspace {
         let approvals = self.shown_approvals();
         let first_approval = approvals.first().map(|(request, _)| *request);
         let placeholder = self.placeholder(first_approval);
-        let outline = if t.dark { white(0.05) } else { black(0.08) };
+        let outline = t.composer_outline();
         let view = cx.weak_entity();
         let chip_view = view.clone();
         let hover_view = view.clone();
@@ -926,16 +926,16 @@ impl Workspace {
             .border_1()
             .border_color(outline)
             // The glass fill over the canvas, opaque so the banner tucked under it stays hidden.
-            .bg(t.background.blend(t.card.opacity(t.glass)))
+            .bg(t.background.blend(t.composer_glass().opacity(t.glass)))
             .shadow(if t.dark {
-                vec![BoxShadow::new(px(0.), px(1.), white(0.03)).inset()]
+                vec![BoxShadow::new(px(0.), px(1.), t.composer_highlight()).inset()]
             } else {
                 vec![BoxShadow::new(px(0.), px(1.), black(0.05)).blur_radius(px(2.))]
             })
             // A Files row dropped here joins the prompt as a mention (`isDragOverComposer`).
             .drag_over::<super::files::MentionDrag>(move |style, _, _, _| {
                 style
-                    .bg(t.background.blend(t.card.opacity(t.glass)).blend(t.accent.opacity(0.45)))
+                    .bg(t.background.blend(t.composer_glass().opacity(t.glass)).blend(t.accent.opacity(0.45)))
                     .border_color(t.primary.opacity(0.7))
             })
             .on_drop(cx.listener(|this, drag: &super::files::MentionDrag, window, cx| {
@@ -974,7 +974,7 @@ impl Workspace {
                                             .font_family(t.fonts.composer)
                                             .text_size(px(t.fonts.prompt_size))
                                             .line_height(px(t.fonts.prompt_size * PROMPT_LEADING))
-                                            .text_color(t.muted_foreground)
+                                            .text_color(t.placeholder)
                                             .child(placeholder),
                                     )
                                 }),
@@ -1555,7 +1555,7 @@ impl Workspace {
             .and_then(|at| crate::timestamp::upcoming_local(at, hour12))
             .map(|at| format!(" · resets {at}"))
             .unwrap_or_default();
-        let outline = if t.dark { white(0.05) } else { black(0.08) };
+        let outline = t.composer_outline();
         let use_default = format!("Use {}", model_name(&default));
         Some(
             div()
@@ -1570,7 +1570,7 @@ impl Workspace {
                         .rounded_t(px(16.))
                         .border_1()
                         .border_color(outline)
-                        .bg(t.card.opacity(t.glass))
+                        .bg(t.composer_glass().opacity(t.glass))
                         .text_xs()
                         .child(
                             div()
@@ -1767,7 +1767,7 @@ impl Workspace {
 
 /// `ComposerBanner.Root variant="info"` in the top drawer, its bottom tucked under the composer.
 fn top_drawer(content: impl IntoElement, t: &Tokens) -> AnyElement {
-    let outline = if t.dark { white(0.05) } else { black(0.08) };
+    let outline = t.composer_outline();
     div()
         .mb(px(-17.))
         .child(
@@ -1779,7 +1779,7 @@ fn top_drawer(content: impl IntoElement, t: &Tokens) -> AnyElement {
                 .rounded_t(px(16.))
                 .border_1()
                 .border_color(outline)
-                .bg(t.card.opacity(t.glass))
+                .bg(t.composer_glass().opacity(t.glass))
                 .text_xs()
                 .line_height(px(16.))
                 .shadow(if t.dark {

@@ -71,6 +71,25 @@ mod actions {
     );
 }
 
+/// The code surface diffs paint on (the web's `--code-background` and `--code-foreground`).
+/// An app sets it as a global; without one a diff uses the theme's background and foreground.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DiffCodeColors {
+    pub background: Hsla,
+    pub foreground: Hsla,
+}
+
+impl gpui::Global for DiffCodeColors {}
+
+fn code_colors(cx: &App) -> DiffCodeColors {
+    cx.try_global::<DiffCodeColors>()
+        .copied()
+        .unwrap_or_else(|| DiffCodeColors {
+            background: cx.theme().background,
+            foreground: cx.theme().foreground,
+        })
+}
+
 pub(crate) fn init(cx: &mut App) {
     // Pierre's find keys use the primary modifier: Cmd on macOS, Ctrl elsewhere.
     let mac = cx.platform_info().is_mac();
@@ -647,7 +666,7 @@ fn render_diff(
             .left_0()
             .right_0()
             .occlude()
-            .bg(cx.theme().background)
+            .bg(code_colors(cx).background)
             .child(render_file_header(file, &code, window, cx))
             .child(
                 gpui::canvas(
@@ -880,8 +899,8 @@ fn render_diff(
         .size_full()
         .min_w_0()
         .min_h_0()
-        .bg(cx.theme().background)
-        .text_color(cx.theme().foreground)
+        .bg(code_colors(cx).background)
+        .text_color(code_colors(cx).foreground)
         .text_sm()
         .border_1()
         .border_color(cx.theme().border)
@@ -1228,8 +1247,9 @@ fn render_hunk_separator(
                 Some(count) => t!("Diff.HiddenLines", count = count).to_string(),
                 None => t!("Diff.MoreContext").to_string(),
             };
-            let surface = cx.theme().foreground.opacity(0.03);
-            let text = cx.theme().foreground.opacity(0.5);
+            let ink = code_colors(cx).foreground;
+            let surface = ink.opacity(0.03);
+            let text = ink.opacity(0.5);
             let bar = h_flex()
                 .flex_1()
                 .h_full()
@@ -1254,8 +1274,8 @@ fn render_hunk_separator(
             let style = ButtonCustomVariant::new(cx)
                 .color(surface)
                 .foreground(text)
-                .hover(cx.theme().foreground.opacity(0.08))
-                .active(cx.theme().foreground.opacity(0.08))
+                .hover(ink.opacity(0.08))
+                .active(ink.opacity(0.08))
                 .shadow(false);
             let expand = |id: &'static str, expansion: FoldExpansion| {
                 let state = code.state.clone();

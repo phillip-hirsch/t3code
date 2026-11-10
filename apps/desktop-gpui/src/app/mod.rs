@@ -1244,11 +1244,13 @@ impl Render for Workspace {
         self.sync_document_views(window, cx);
         let terminal_drawer = self.render_terminal_drawer(window, cx);
         let theme = cx.theme();
+        let canvas = theme.background;
         div()
             .size_full()
             .relative()
             .track_focus(&self.focus)
-            .bg(theme.background)
+            // `html, body`: the app chrome, behind the panes that paint the canvas.
+            .bg(crate::theme::tokens(cx).chrome)
             .text_color(theme.foreground)
             .text_sm()
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
@@ -1315,6 +1317,8 @@ impl Render for Workspace {
                             .flex_1()
                             .h_full()
                             .min_w_0()
+                            // `SidebarInset`'s `bg-background`.
+                            .bg(canvas)
                             .when(right_panel.is_none(), |el| el.pr(titlebar::RIGHT_RESIZE_INSET))
                             // A maximized panel takes the row; the chat column keeps its state at zero width.
                             .when(self.right_panel_maximized(), |el| el.w_0().flex_none().overflow_hidden())

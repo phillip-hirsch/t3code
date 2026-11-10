@@ -2112,7 +2112,7 @@ impl Workspace {
                     .rounded(px(6.))
                     .border_1()
                     .border_color(Hsla { a: 0.3, ..t.warning })
-                    .bg(Hsla { a: 0.08, ..t.warning })
+                    .bg(t.warning_surface)
                     .px(px(8.))
                     .py(px(6.))
                     .text_xs()

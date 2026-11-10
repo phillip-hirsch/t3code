@@ -934,7 +934,7 @@ impl Workspace {
                 .flex_1()
                 .min_h_0()
                 .w_full()
-                .bg(tokens.background)
+                .bg(tokens.terminal.background)
                 .when(has_sidebar, |el| el.gap(px(6.)))
                 .child(self.render_terminal_panes(drawer, &tokens))
                 .when(has_sidebar, |el| {

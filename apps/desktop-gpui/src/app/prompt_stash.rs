@@ -680,7 +680,7 @@ impl Workspace {
                 .rounded_t(px(16.))
                 .border_1()
                 .border_color(banner_outline(t))
-                .bg(t.card.opacity(t.glass))
+                .bg(t.composer_glass().opacity(t.glass))
                 .text_xs()
                 .line_height(px(16.))
                 .child(row)
@@ -752,7 +752,7 @@ impl Workspace {
                         .rounded_t(px(16.))
                         .border_1()
                         .border_color(banner_outline(t))
-                        .bg(t.background.blend(t.card.opacity(t.glass)))
+                        .bg(t.background.blend(t.composer_glass().opacity(t.glass)))
                         .text_xs()
                         .line_height(px(16.))
                         .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_stash_menu(cx)))
@@ -856,7 +856,7 @@ impl Workspace {
 }
 
 fn banner_outline(t: &Tokens) -> gpui_kit::Hsla {
-    if t.dark { gpui_kit::hsla(0., 0., 1., 0.05) } else { gpui_kit::hsla(0., 0., 0., 0.08) }
+    t.composer_outline()
 }
 
 /// The banner row's 24px icon column.

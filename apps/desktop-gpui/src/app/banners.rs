@@ -1202,9 +1202,8 @@ fn composer_banner_with_lead(
     let (outline, tint) = match variant {
         Variant::Error => (t.error.opacity(0.32), t.error.opacity(0.08)),
         Variant::Warning => (t.warning.opacity(0.28), t.warning.opacity(0.08)),
-        // `neutralOutline`: white 5% in dark, the contrast foreground at 8% in light.
-        Variant::Info if t.dark => (gpui_kit::white().opacity(0.05), gpui_kit::transparent_black()),
-        Variant::Info => (t.foreground.opacity(0.08), gpui_kit::transparent_black()),
+        // `neutralOutline`: the composer's outline.
+        Variant::Info => (t.composer_outline(), gpui_kit::transparent_black()),
     };
     div()
         .mx(px(22.))
@@ -1219,7 +1218,7 @@ fn composer_banner_with_lead(
                 .rounded_t(px(16.))
                 .border_1()
                 .border_color(outline)
-                .bg(t.background.blend(t.card.opacity(t.glass)).blend(tint))
+                .bg(t.background.blend(t.composer_glass().opacity(t.glass)).blend(tint))
                 .text_xs()
                 .child(
                     div()

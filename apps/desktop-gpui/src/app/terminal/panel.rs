@@ -272,7 +272,7 @@ impl Workspace {
             .flex_1()
             .min_h_0()
             .flex()
-            .bg(tokens.background)
+            .bg(tokens.terminal.background)
             .when(has_sidebar, |el| el.gap(px(6.)))
             .child(panes)
             .child(side)

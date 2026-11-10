@@ -412,3 +412,8 @@ patch the way the web reads Pierre's `hunks`, `additionLines` and `deletionLines
 must have no original lines, a deleted one no modified lines. 0.9.0 keeps both counts
 crate-private. `src/diff/document.rs`: `DiffFile::lines_count` is public and `DiffFile::hunk_count`
 is new.
+
+**A diff paints on the code surface.** The web's diffs sit on `--code-background` and
+`--code-foreground`, which a theme sets apart from the canvas. 0.9.0 paints the theme's background
+and foreground. `src/diff/mod.rs`: `DiffCodeColors`, a global the app sets; the diff body, its
+pinned header and its hunk separators read it, falling back to the theme's colors without it.
