@@ -104,7 +104,7 @@ pub enum Row {
     },
     /// A subagent's card, opening its thread (`SubagentTimelineLink`).
     Subagent(Rc<SubagentCard>),
-    /// A page an agent rendered (`html_render`) or an MCP app, opened in the browser.
+    /// A page an agent rendered (`html_render`) or an MCP app (`McpAppTimelineRow`).
     Embed(Rc<Embed>),
     /// A thread the turn created, summarized under its last reply (`resourceSummary`).
     CreatedThread {
@@ -166,8 +166,57 @@ pub struct Embed {
     pub id: SharedString,
     pub title: SharedString,
     pub attachment_id: SharedString,
-    /// The MCP server, for an app; `None` for a rendered page.
-    pub app_server: Option<SharedString>,
+    /// The app, for an MCP app; `None` for a rendered page.
+    pub app: Option<Rc<crate::mcp_apps::AppReference>>,
+    /// `turnItemDetailRevision`: `"live"` until the item settles, then its `updatedAt`.
+    pub revision: SharedString,
+    /// A rendered page's measured size (`HtmlRenderReference`); `None` for an app.
+    pub page: Option<PageSize>,
+}
+
+/// `HTML_RENDER_MIN_HEIGHT` and `HTML_RENDER_MAX_HEIGHT`.
+pub const PAGE_MIN_HEIGHT: f32 = 80.;
+pub const PAGE_MAX_HEIGHT: f32 = 2000.;
+
+/// `clampHtmlRenderHeight`.
+pub fn clamp_page_height(height: f32) -> f32 {
+    height.round().clamp(PAGE_MIN_HEIGHT, PAGE_MAX_HEIGHT)
+}
+
+/// The height the agent gave a page and the heights the server measured it at, by width
+/// (ascending), as `readHtmlRenderReference` validates them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PageSize {
+    pub height: f32,
+    pub heights: Vec<(u32, f32)>,
+}
+
+impl PageSize {
+    #[expect(clippy::cast_possible_truncation, reason = "finite values the server measured")]
+    fn read(page: &Value) -> Option<Self> {
+        let height = page.get("height").and_then(Value::as_f64).filter(|h| h.is_finite())?;
+        // `readMeasuredHeights`: up to 24 `[width, height]` pairs, all valid or none kept.
+        let heights = page
+            .get("heights")
+            .and_then(Value::as_array)
+            .filter(|list| !list.is_empty() && list.len() <= 24)
+            .and_then(|list| {
+                list.iter()
+                    .map(|entry| {
+                        let pair = entry.as_array().filter(|pair| pair.len() == 2)?;
+                        let width = pair[0].as_u64().filter(|w| (1..=10_000).contains(w))?;
+                        let height = pair[1].as_f64().filter(|h| h.is_finite())?;
+                        Some((width as u32, clamp_page_height(height as f32)))
+                    })
+                    .collect::<Option<Vec<_>>>()
+            })
+            .map(|mut heights| {
+                heights.sort_by_key(|(width, _)| *width);
+                heights
+            })
+            .unwrap_or_default();
+        Some(Self { height: clamp_page_height(height as f32), heights })
+    }
 }
 
 impl Embed {
@@ -193,25 +242,31 @@ fn embed(item: &TurnItem) -> Option<Embed> {
         return None;
     }
     let tool = item.str("toolName").unwrap_or_default();
-    if let Some(app) = output.get("t3McpApp") {
-        let (server, name) = (text(app, "server")?, text(app, "tool")?);
-        if tool != format!("{server}.{name}") && tool != format!("mcp__{server}__{name}") {
-            return None;
-        }
+    let revision: SharedString = match item.status.as_str() {
+        "idle" | "pending" | "running" | "waiting" => "live".into(),
+        _ => item.str("updatedAt").unwrap_or_default().to_owned().into(),
+    };
+    if output.get(crate::mcp_apps::OUTPUT_KEY).is_some() {
+        let app = crate::mcp_apps::AppReference::from_tool(tool, output)?;
         return Some(Embed {
             id: item.id.clone().into(),
-            title: format!("{server} app").into(),
-            attachment_id: text(app, "attachmentId")?.to_owned().into(),
-            app_server: Some(server.to_owned().into()),
+            title: format!("{} app", app.server).into(),
+            attachment_id: app.attachment_id.clone().into(),
+            app: Some(Rc::new(app)),
+            revision,
+            page: None,
         });
     }
     let page = output.get("htmlRender").filter(|_| item.status == "completed" && tool.ends_with("html_render"))?;
+    page.get("title").filter(|title| title.is_string())?;
     let title: String = text(page, "title").unwrap_or("HTML").chars().take(200).collect();
     Some(Embed {
         id: item.id.clone().into(),
         title: title.into(),
-        attachment_id: text(page, "attachmentId")?.to_owned().into(),
-        app_server: None,
+        attachment_id: text(page, "attachmentId").filter(|id| id.len() <= 256)?.to_owned().into(),
+        app: None,
+        revision,
+        page: Some(PageSize::read(page)?),
     })
 }
 
@@ -3069,20 +3124,32 @@ mod tests {
                 json!({"id": "t", "type": "dynamic_tool", "status": "completed", "toolName": tool, "output": output});
             embed(&serde_json::from_value(value).unwrap())
         };
-        let page =
-            tool("mcp__t3-code__html_render", json!({"htmlRender": {"attachmentId": "a1", "title": "Q3: plan?"}}));
+        let page = tool(
+            "mcp__t3-code__html_render",
+            json!({"htmlRender": {"attachmentId": "a1", "title": "Q3: plan?", "height": 12.4,
+                "heights": [[640, 900.6], [320, 3000]]}}),
+        );
         assert_eq!(
             page.as_ref().map(|p| (p.attachment_id.as_ref(), p.file_name())),
             Some(("a1", "Q3 plan.html".into()))
         );
-        let app =
-            tool("mcp__maps__show", json!({"t3McpApp": {"attachmentId": "a2", "server": "maps", "tool": "show"}}));
-        assert_eq!(app.map(|a| a.title), Some("maps app".into()));
-        // An app reference from another tool is ignored, so tools cannot pose as an app.
+        // `readHtmlRenderReference`: heights clamp and sort by width.
+        assert_eq!(page.and_then(|p| p.page), Some(PageSize { height: 80., heights: vec![(320, 2000.), (640, 901.)] }));
+        let page = |value: Value| tool("mcp__t3-code__html_render", json!({"htmlRender": value})).and_then(|p| p.page);
+        // One bad measurement drops them all; a page needs its height and a title.
         assert_eq!(
-            tool("mcp__other__x", json!({"t3McpApp": {"attachmentId": "a2", "server": "maps", "tool": "show"}})),
-            None
+            page(json!({"attachmentId": "a", "title": "", "height": 300, "heights": [[640, 900], [0, 1]]})),
+            Some(PageSize { height: 300., heights: vec![] })
         );
+        assert_eq!(page(json!({"attachmentId": "a", "title": "x"})), None);
+        assert_eq!(page(json!({"attachmentId": "a", "height": 300})), None);
+        let reference =
+            json!({"attachmentId": "a2", "server": "maps", "tool": "show", "resourceUri": "ui://maps/show"});
+        let app = tool("mcp__maps__show", json!({"t3McpApp": reference}));
+        assert_eq!(app.as_ref().map(|a| (a.title.as_ref(), a.revision.as_ref())), Some(("maps app", "")));
+        assert_eq!(app.and_then(|a| a.app).map(|a| a.resource_uri.clone()), Some("ui://maps/show".into()));
+        // An app reference from another tool is ignored, so tools cannot pose as an app.
+        assert_eq!(tool("mcp__other__x", json!({"t3McpApp": reference})), None);
         assert_eq!(
             tool("mcp__t3-code__html_render", json!({"isError": true, "htmlRender": {"attachmentId": "a1"}})),
             None

@@ -1,7 +1,7 @@
 //! An attachment's preview (`ComposerFilePreviewDialog`, `AttachmentFilePreview.tsx`): a draft's
-//! or a sent message's file, its text or image, with copy, save and (for a draft) remove. Rich
-//! renderers (markdown, tables, PDFs, office files) stay in the web; other files get its
-//! "No preview" notice.
+//! or a sent message's file, its text, with copy, save and (for a draft) remove; an image opens
+//! the image viewer instead. Rich renderers (markdown, tables, PDFs, office files) stay in the
+//! web; other files get its "No preview" notice.
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -13,9 +13,8 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    ClipboardItem, Context, FontWeight, Image, InteractiveElement as _, IntoElement, ObjectFit, ParentElement as _,
-    SharedString, StatefulInteractiveElement as _, Styled as _, StyledImage as _, Window, div, img, px, relative,
-    uniform_list,
+    ClipboardItem, Context, FontWeight, Image, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Window, div, px, uniform_list,
 };
 
 use super::Workspace;
@@ -28,7 +27,6 @@ const LINE_HEIGHT: f32 = 20.;
 enum Body {
     /// The lines, split once, and whether the file went past the preview limit.
     Text(Rc<[SharedString]>, bool),
-    Image(Arc<Image>),
     None,
 }
 
@@ -73,25 +71,42 @@ impl Workspace {
     /// Opens a composer attachment's preview.
     pub(super) fn open_attachment_preview(&mut self, local_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(attachment) = self.attachments.iter().find(|a| a.local_id() == local_id) else { return };
+        // An image opens the image viewer with the draft's other images (`buildExpandedImagePreview`).
+        if attachment.image().is_some() {
+            let (mut items, mut index) = (Vec::new(), 0);
+            for attachment in &self.attachments {
+                let Some(image) = attachment.image() else { continue };
+                if attachment.local_id() == local_id {
+                    index = items.len();
+                }
+                let name = SharedString::from(attachment.name().to_owned());
+                items.push(super::image_viewer::ViewerImage { image, name, reference: None });
+            }
+            self.open_image_viewer(items, index, window, cx);
+            return;
+        }
         let preview = Preview {
             origin: "Draft",
             name: attachment.name().to_owned(),
             bytes: attachment.bytes().clone(),
-            image: attachment.image(),
+            image: None,
             removable: Some(local_id.to_owned()),
         };
         self.open_preview_dialog(preview, window, cx);
     }
 
-    /// `AttachmentFilePreview` in a dialog: the file's text or image, with copy, save and,
-    /// for a draft's attachment, remove.
+    /// `AttachmentFilePreview` in a dialog: the file's text, with copy, save and, for a draft's
+    /// attachment, remove. An image opens the image viewer instead.
     pub(super) fn open_preview_dialog(&mut self, preview: Preview, window: &mut Window, cx: &mut Context<Self>) {
         let Preview { origin, name, bytes, image, removable } = preview;
+        if let Some(image) = image {
+            let item = super::image_viewer::ViewerImage { image, name: name.into(), reference: None };
+            return self.open_image_viewer(vec![item], 0, window, cx);
+        }
         let size = super::attachments::format_size(bytes.len() as u64);
-        let body = match (image, text_lines(&bytes)) {
-            (Some(image), _) => Body::Image(image),
-            (None, Some((lines, truncated))) => Body::Text(Rc::from(lines), truncated),
-            (None, None) => Body::None,
+        let body = match text_lines(&bytes) {
+            Some((lines, truncated)) => Body::Text(Rc::from(lines), truncated),
+            None => Body::None,
         };
         let extension = name.rsplit_once('.').map(|(_, e)| e.to_owned()).filter(|e| !e.is_empty());
         let name = SharedString::from(name);
@@ -223,15 +238,6 @@ impl Workspace {
                         })
                         .into_any_element()
                 }
-                Body::Image(image) => div()
-                    .flex_1()
-                    .min_h_0()
-                    .p(px(16.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(img(image.clone()).max_w(relative(1.)).max_h(relative(1.)).object_fit(ObjectFit::Contain))
-                    .into_any_element(),
                 Body::None => v_flex()
                     .flex_1()
                     .min_h_0()

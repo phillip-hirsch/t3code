@@ -95,6 +95,23 @@ registered for the current focus, because Windows `WM_CHAR` and IME callbacks re
 handler without checking focus. Pointer events are untouched. Tests:
 `focus_next_skips_an_inert_subtree`, `cached_view_replay_recomputes_inertness`.
 
+**The interface can scale like a page zoom.** Electron's View menu zoom (and Ctrl+wheel) scales
+the whole page; 0.3.11 has only the display's scale factor, and `rem_size` scales nothing drawn
+in `px`. The patch adds `Window::set_ui_scale`: the window's logical pixels become the
+platform's divided by the scale, so everything draws larger or smaller and stays crisp. Window
+bounds and sizes stay in the platform's units. Files:
+
+- `src/window.rs`: the `ui_scale` field, `ui_scale`/`set_ui_scale`; `bounds_changed` multiplies
+  the scale factor by it and divides the viewport and pointer by it; the platform input callback
+  scales each event (`PlatformInput::scaled_down`) before `dispatch_event`, so events GPUI
+  synthesizes in window units aren't scaled twice; `insets` and `visual_viewport_bounds` divide,
+  and `show_window_menu`, `set_client_inset`, `set_client_corner_radii`, `set_input_region` and
+  the IME position multiply. Accessibility bounds already go out in device pixels.
+- `src/interactive.rs`: `PlatformInput::scaled_down`, positions and pixel scroll deltas.
+- `src/platform.rs`: `PlatformInputHandler`'s bounds and points the platform asks about.
+- `src/geometry.rs`: `Pixels::scale_down`.
+- Test in `window.rs`: `ui_scale_scales_the_interface_against_the_platform_window`.
+
 The crate's tests need `--features test-support`; run them from a scratch copy outside this
 repository (`cargo test --features test-support --lib`). The copy needs the published crate's
 missing pieces: put it two levels below a folder whose `assets/fonts/ibm-plex-sans` and
@@ -133,6 +150,19 @@ so saved bounds include no shadow. The app keeps its resize edges for that case
 (`render_resize_edges` in `src/app/titlebar.rs`). Files:
 
 - `src/linux/x11/window.rs`: `request_decorations`, `window_decorations` and `set_client_inset`.
+
+## gpui-webview 0.9.0
+
+The native WebView the app embeds in GPUI's layout (the preview browser, HTML pages, MCP apps,
+media and Mermaid).
+
+**Native views follow the interface scale.** With gpui-pre's `Window::set_ui_scale` (above), a
+GPUI pixel is no longer a platform logical pixel. 0.9.0 already places Linux views in device
+pixels and matches their page zoom to GPUI's scale factor, but on Windows and macOS it passed
+GPUI's pixels to wry as logical ones, so a zoomed window misplaced its pages. The patch, in
+`src/lib.rs`, multiplies those bounds by the scale and the page zoom by it too, so a CSS pixel
+draws as one GPUI pixel on every platform (its `ui_scale` field, kept current in `prepaint`). The
+preview divides its own zoom by the scale, since Electron's app zoom leaves previews alone.
 
 ## gpui-base 0.9.0
 
@@ -354,6 +384,30 @@ empty, so it adds nothing to the text, find or copies. Files:
 - `src/text/format/markdown.rs`: the leading branch of `parse_paragraph`, `link_text_mark` (shared
   with the `Node::Link` arm); test `a_leading_object_opens_the_link_whose_text_follows_it`.
 
+**Markdown images open on a click.** The web's chat markdown makes an image that is not inside a
+link a button (`role="button"`, `tabIndex={0}`) whose click, Enter or Space opens the expanded
+image viewer. 0.9.0's images are clickable only inside a link. The patch adds
+`TextView::on_image_click`: with a handler set, an image outside a link is a tab stop with a
+pointer cursor and a 2px ring on keyboard focus, and a left click, Enter or Space calls the handler
+with the image's URL. Linked images keep following their link. Files:
+
+- `src/text/text_view.rs`: `ImageClickHandlerFn`, `on_image_click` and `clickable_image`.
+- `src/text/state.rs`: the handler carried to each frame's `NodeContext`.
+- `src/text/node.rs`: `NodeContext::image_click_handler`, the plain image path in
+  `Paragraph::render`, and the image's URL on `InlineFlowItem::Image`.
+- `src/text/inline_flow.rs`: `InlineFlow::image_click_handler` and `image_element`.
+
+**Code blocks can draw as something else.** The web's chat draws a closed Mermaid fence as its
+diagram, with the source a toggle away. 0.9.0 always draws a fenced block as code. The patch adds
+`TextView::code_block_renderer`: the closure gets each `CodeBlock` and returns the element that
+replaces it, keeping the block's spacing, or `None` to draw the block as usual. Files:
+
+- `src/text/text_view.rs`: `CodeBlockRenderFn`, the `code_block_renderer` field and builder.
+- `src/text/state.rs`: the renderer, carried to each frame's `NodeContext`.
+- `src/text/node.rs`: `NodeContext::code_block_renderer`, asked first in `CodeBlock::render`.
+
+gpui-component's `src/text/compat.rs` forwards `code_block_renderer` from its `TextView`.
+
 The crate's own tests need `--features test-support` and `include_str!` a `README.md` four levels
 above `src/text`, which this folder lacks: run them from a scratch copy laid out as
 `<dir>/crates/gpui-base` with a `<dir>/README.md`, with `[patch.crates-io]` pointing `gpui-pre` and
@@ -483,3 +537,9 @@ the patch (`reviewCommentContext.ts`) and quote those rows; 0.9.0 keeps a file's
 The patch, in `src/diff/document.rs`: `DiffFile::patch_body`, each line of the patch in order as a
 `DiffPatchLine` (its line on each side and its text), exported from `src/diff/mod.rs`. Test: an
 assertion in `alignment_covers_each_source_line_once`.
+
+**Markdown images open on a click.** `src/text/compat.rs`: `TextView::on_image_click`, passing
+through to gpui-base's (see its "Markdown images open on a click").
+
+**Code blocks can draw as something else.** `src/text/compat.rs`: `TextView::code_block_renderer`,
+passing through to gpui-base's (see its "Code blocks can draw as something else").

@@ -46,6 +46,7 @@ mod context_strip;
 mod desktop;
 mod details;
 mod draft_picker;
+mod embed;
 pub(crate) mod environments;
 mod external_links;
 mod fanout;
@@ -56,14 +57,20 @@ mod git;
 mod guest_share;
 mod header;
 mod host_picker;
+mod html_page;
+mod image_viewer;
 mod inspector;
 mod keep_alive;
 mod keymap;
 mod layout;
 pub mod main_window;
 mod markdown_images;
+mod markdown_media;
 mod markdown_ui;
+mod math;
+mod mcp_app;
 pub mod menu;
+mod mermaid;
 mod message_actions;
 mod minimap;
 mod model_picker;
@@ -127,7 +134,6 @@ impl RunInTerminal {
     }
 }
 pub use terminal::key_bindings as terminal_key_bindings;
-pub use titlebar::TRAFFIC_LIGHTS;
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
@@ -351,6 +357,14 @@ pub struct Workspace {
     now: thread_now::NowUi,
     markdown_images: markdown_images::ImageCache,
     link_hover: external_links::LinkHoverState,
+    image_viewer: image_viewer::ViewerUi,
+    /// Native pages laid into the layout: rendered HTML pages and chat media.
+    embeds: embed::Embeds,
+    html_pages: html_page::HtmlPages,
+    mcp_apps: mcp_app::McpApps,
+    chat_media: markdown_media::ChatMediaUi,
+    diagrams: mermaid::Diagrams,
+    formulas: math::Formulas,
     entry_kinds: Arc<markdown_ui::EntryKinds>,
     workflow: workflow::WorkflowUi,
     setup: worktree_setup::SetupWatch,
@@ -551,6 +565,13 @@ impl Workspace {
             now: Default::default(),
             markdown_images: Default::default(),
             link_hover: Default::default(),
+            image_viewer: Default::default(),
+            embeds: Default::default(),
+            html_pages: Default::default(),
+            mcp_apps: Default::default(),
+            chat_media: Default::default(),
+            diagrams: Default::default(),
+            formulas: Default::default(),
             entry_kinds: Default::default(),
             workflow: Default::default(),
             setup: Default::default(),
@@ -1045,6 +1066,8 @@ impl Workspace {
         self.entry_cache = timeline::EntryCache::default();
         self.markdown = chat::MarkdownStates::default();
         self.markdown_images = markdown_images::ImageCache::default();
+        // Leaving the thread drops its open image, as the web's thread overlay retention does.
+        self.image_viewer.dismiss();
         self.entry_kinds = Arc::default();
         self.details = inspector::Details::default();
         self._working_tick = None;
@@ -1271,6 +1294,7 @@ impl Render for Workspace {
         let mini_player = self.render_preview_mini_player(window, cx);
         self.sync_preview_views(window, cx);
         self.sync_document_views(window, cx);
+        self.begin_embed_frame(window, cx);
         let terminal_drawer = self.render_terminal_drawer(window, cx);
         let theme = cx.theme();
         div()
@@ -1296,6 +1320,10 @@ impl Render for Workspace {
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if this.quit_key_down(event, cx) {
                     cx.stop_propagation();
+                    return;
+                }
+                // The image viewer sits over every other layer and takes its own Escape.
+                if this.image_viewer_open() {
                     return;
                 }
                 // Escape closes the topmost layer: Settings, then the details popover.
@@ -1335,6 +1363,7 @@ impl Render for Workspace {
                 this.snap_shot_record_modifiers(event, cx);
                 this.quit_modifiers_changed(event, cx);
             }))
+            .when(!cfg!(target_os = "macos"), |el| el.child(menu::wheel_zoom_listener(self.image_viewer_open())))
             .child(
                 h_flex()
                     .size_full()
@@ -1426,11 +1455,15 @@ impl Render for Workspace {
             // The panel toggles stay above the sheet, as the web's `z-50` titlebar controls do.
             .children(self.render_sidebar_sheet(window, cx))
             .child(self.render_titlebar_overlay(window, cx))
+            .children(self.render_mcp_app_fullscreen(cx))
             .children(self.render_page_modal(window, cx))
             .children(self.render_settings(window, cx))
             .children(self.theme_editor.clone())
             .children(self.render_palette(window, cx))
             .children(self.render_file_overlay(window, cx))
+            .children(self.render_html_dialog(window, cx))
+            .children(self.render_image_viewer(window, cx))
+            .child(self.embeds.sweep())
             .children(self.render_quit_hint(cx))
             .child(self.render_caption_overlay(window, cx))
             .children(titlebar::render_resize_edges(window, cx))

@@ -101,27 +101,33 @@ impl Workspace {
                     .min_h_0()
                     .relative()
                     .child(
-                        MessageScroller::new("timeline", self.scroller.clone(), move |index, window, cx| {
-                            match rows.get(index) {
-                                Some(row) => render_row(row, ChatPane::Main, &this, lane_width, window, cx),
-                                None => div().into_any_element(),
-                            }
-                        })
-                        // Top spacer `h-4`; rows carry their own bottom space.
-                        // The list's side padding becomes every row's inset: that is the lane.
-                        .with_list_style(
-                            StyleRefinement::default()
-                                .pt(px(16.))
-                                .pb(px(16. + composer + end_space))
-                                .pl(px(lane.left))
-                                .pr(px(lane.right)),
-                        )
-                        .with_row_style(StyleRefinement::default().pb(px(0.)))
-                        // Pinned to an anchored message, the list is at its live end.
-                        .jump_button(!anchored)
-                        .with_jump_button_label("Scroll to end")
-                        .with_jump_button_style(jump_style)
-                        .with_jump_button_renderer(move |button| scroll_to_end_button(button, &t)),
+                        self.embeds.clip_scope(
+                            MessageScroller::new(
+                                "timeline",
+                                self.scroller.clone(),
+                                move |index, window, cx| match rows.get(index) {
+                                    Some(row) => render_row(row, ChatPane::Main, &this, lane_width, window, cx),
+                                    None => div().into_any_element(),
+                                },
+                            )
+                            // Top spacer `h-4`; rows carry their own bottom space.
+                            // The list's side padding becomes every row's inset: that is the lane.
+                            .with_list_style(
+                                StyleRefinement::default()
+                                    .pt(px(16.))
+                                    .pb(px(16. + composer + end_space))
+                                    .pl(px(lane.left))
+                                    .pr(px(lane.right)),
+                            )
+                            .with_row_style(StyleRefinement::default().pb(px(0.)))
+                            // Pinned to an anchored message, the list is at its live end.
+                            .jump_button(!anchored)
+                            .with_jump_button_label("Scroll to end")
+                            .with_jump_button_style(jump_style)
+                            .with_jump_button_renderer(move |button| scroll_to_end_button(button, &t)),
+                            // Embeds stop at the composer floating over the timeline's bottom.
+                            px(composer),
+                        ),
                     )
                     .children(minimap)
                     .children(self.render_chat_menu())
@@ -140,10 +146,11 @@ impl Workspace {
         if let Some(state) = self.markdown.0.get(&key).filter(|state| state.text == *text) {
             return state.view.clone();
         }
-        let source = self.with_skill_links(text);
+        let source: SharedString = self.with_skill_links(text).into();
         self.load_markdown_images(&key, &source, cx);
         if let Some(state) = self.markdown.0.get_mut(&key) {
             state.text = text.clone();
+            state.source = source.clone();
             state.view.update(cx, |view, cx| view.set_text(&source, cx));
             return state.view.clone();
         }
@@ -161,16 +168,31 @@ impl Workspace {
             this.paint_find(&row_key, cx);
             this.paint_citation(&row_key, cx);
         });
-        self.markdown
-            .0
-            .insert(key.clone(), MarkdownState { view: view.clone(), text: text.clone(), nowrap: false, _changed });
+        let state = MarkdownState { view: view.clone(), text: text.clone(), source, nowrap: false, _changed };
+        self.markdown.0.insert(key.clone(), state);
         self.paint_find(&key, cx);
         view
+    }
+
+    /// Expands the image at `url` in the message `key` into the viewer, with the message's other
+    /// images as its gallery.
+    fn open_markdown_image(&mut self, key: &str, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = self.markdown.0.get(key).map(|state| state.text.clone()) else { return };
+        if let Some((items, index)) = self.markdown_gallery(&text, url) {
+            self.open_image_viewer(items, index, window, cx);
+        }
     }
 
     /// The markdown view kept for `key` (a message's id), if it has rendered.
     pub(super) fn markdown_view(&self, key: &str) -> Option<Entity<TextViewState>> {
         self.markdown.0.get(key).map(|state| state.view.clone())
+    }
+
+    /// Re-lays out `key`'s markdown, whose row remeasures (see [`Self::markdown_state`]).
+    pub(super) fn relayout_markdown(&mut self, key: &str, cx: &mut Context<Self>) {
+        if let Some(state) = self.markdown.0.get(key) {
+            state.view.update(cx, |_, cx| cx.notify());
+        }
     }
 
     pub(super) fn markdown_keys(&self) -> Vec<SharedString> {
@@ -297,6 +319,8 @@ pub(super) struct MarkdownStates(HashMap<SharedString, MarkdownState>);
 struct MarkdownState {
     view: Entity<TextViewState>,
     text: SharedString,
+    /// The markdown the view parsed, which its source spans index.
+    source: SharedString,
     /// The code-block wrap toggle is off (`wordWrap` defaults on).
     nowrap: bool,
     _changed: Subscription,
@@ -357,12 +381,25 @@ fn markdown_with(
         let wrap = !workspace.markdown.0.get(&key).is_some_and(|state| state.nowrap);
         let math = workspace.client_settings.values.get("mathRenderingEnabled") == &serde_json::Value::Bool(true);
         let chips = (workspace.git_cwd(), workspace.entry_kinds.clone());
-        (workspace.markdown_state(key, text, cx), wrap, workspace.markdown_images.clone(), math, chips)
+        let state = workspace.markdown_state(key.clone(), text, cx);
+        let source = workspace.markdown.0.get(&key).map(|state| state.source.clone()).unwrap_or_default();
+        (state, source, wrap, workspace.markdown_images.clone(), math, chips)
     }) {
-        Ok((state, wrap, images, math, chips)) => {
-            markdown_view(&state, kind, key_for_view, wrap, width, this, chips, content, t)
+        Ok((state, source, wrap, images, math, chips)) => {
+            // A user message sits on its bubble; the media chip's page paints that around it.
+            let background = if kind == MarkdownKind::User { t.message_surface } else { t.background };
+            markdown_view(&state, &source, kind, key_for_view.clone(), wrap, width, math, this, chips, content, t)
                 .image_source(images.resolver())
-                .when(math, |view| view.plugin(super::markdown_ui::InlineMath).plugin(super::markdown_ui::DisplayMath))
+                .plugin(super::markdown_media::MarkdownMedia {
+                    workspace: this.clone(),
+                    key: key_for_view.clone(),
+                    background,
+                })
+                .when(math, |view| {
+                    let key = key_for_view;
+                    view.plugin(super::markdown_ui::InlineMath { workspace: this.clone(), key: key.clone() })
+                        .plugin(super::markdown_ui::DisplayMath { workspace: this.clone(), key })
+                })
                 .into_any_element()
         }
         Err(_) => div().into_any_element(),
@@ -1038,7 +1075,16 @@ pub(super) fn render_row(
         Row::SubagentGroup { key, cards, expanded } => {
             lane(0., subagent_group(key, cards, *expanded, this, &t, cx)).into_any_element()
         }
-        Row::Embed(embed) => lane(8., embed_card(embed, this, &t)).into_any_element(),
+        // `HtmlRenderTimelineRow` and `McpAppTimelineRow`: the page or the app, inline.
+        Row::Embed(embed) => {
+            let body = this
+                .update(cx, |workspace, cx| match &embed.page {
+                    Some(size) => workspace.render_html_page(embed, size, lane_width - 8., window, cx),
+                    None => workspace.render_mcp_app(embed, lane_width - 8., window, cx),
+                })
+                .unwrap_or_else(|_| div().into_any_element());
+            lane(8., div().px(px(4.)).child(body)).into_any_element()
+        }
         Row::CreatedThread { id, title, thread_id, .. } => {
             lane(8., created_thread_card(id, title.as_ref(), thread_id.as_ref(), this, &t)).into_any_element()
         }
@@ -1488,7 +1534,6 @@ fn subagent_group(
         .into_any_element()
 }
 
-/// A rendered page or MCP app. The web embeds it in a frame; here it opens in the browser.
 /// `V2LifecycleRow`'s `resourceSummary` card: a thread the turn created, with Open chat.
 fn created_thread_card(
     id: &SharedString,
@@ -1542,57 +1587,6 @@ fn created_thread_card(
         .into_any_element()
 }
 
-fn embed_card(embed: &Rc<timeline::Embed>, this: &WeakEntity<Workspace>, t: &Tokens) -> AnyElement {
-    let open = {
-        let (this, embed) = (this.clone(), embed.clone());
-        move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-            let _ = this.update(cx, |workspace, cx| workspace.open_embed(&embed, cx));
-        }
-    };
-    h_flex()
-        .w_full()
-        .min_w_0()
-        .gap(px(10.))
-        .px(px(12.))
-        .py(px(10.))
-        .rounded(px(8.))
-        .border_1()
-        .border_color(alpha(t.border, 0.6))
-        .bg(alpha(t.card, 0.3))
-        .child(
-            Icon::new(if embed.app_server.is_some() { IconName::AppWindow } else { IconName::Globe })
-                .size(px(16.))
-                .text_color(icon_color(t)),
-        )
-        .child(
-            v_flex()
-                .flex_1()
-                .min_w_0()
-                .child(div().truncate().text_size(px(TEXT)).font_weight(FontWeight::MEDIUM).child(embed.title.clone()))
-                .child(div().text_xs().text_color(t.muted_foreground).child(match &embed.app_server {
-                    Some(_) => "MCP app",
-                    None => "HTML page",
-                })),
-        )
-        .child(
-            focusable(h_flex().id(ElementId::Name(format!("embed-open:{}", embed.id).into())), t)
-                .flex_none()
-                .h(px(24.))
-                .px(px(7.))
-                .gap(px(4.))
-                .rounded(px(8.))
-                .border_1()
-                .border_color(t.input)
-                .cursor_pointer()
-                .text_xs()
-                .hover(|style| style.bg(t.accent))
-                .child(Icon::new(IconName::ExternalLink).size(px(12.)))
-                .child("Open in browser")
-                .on_click(open),
-        )
-        .into_any_element()
-}
-
 impl Workspace {
     /// Opens a file sent with an answer through a signed URL, as its link does on the web.
     fn open_answer_attachment(&mut self, attachment_id: &str, cx: &mut Context<Self>) {
@@ -1606,32 +1600,6 @@ impl Workspace {
                 },
                 Err(error) => log::debug!("assets.createUrl for an answer attachment: {error}"),
             }
-        })
-        .detach();
-    }
-
-    /// Mints a signed URL for the page (`assets.createUrl`) and opens it.
-    fn open_embed(&mut self, embed: &timeline::Embed, cx: &mut Context<Self>) {
-        let (Some(client), Some(base)) = (self.client(), self.http_base().map(str::to_owned)) else { return };
-        let mut resource = serde_json::json!({
-            "_tag": "attachment",
-            "attachmentId": embed.attachment_id,
-            "mimeType": "text/html",
-            "disposition": "inline",
-        });
-        match &embed.app_server {
-            Some(_) => resource["renderIntent"] = "mcp-app".into(),
-            None => resource["fileName"] = embed.file_name().into(),
-        }
-        cx.spawn(async move |this, cx| {
-            let result = client.request("assets.createUrl", serde_json::json!({"resource": resource})).await;
-            let _ = this.update(cx, |this, cx| {
-                match result.as_ref().ok().and_then(|r| r.get("relativeUrl")).and_then(|u| u.as_str()) {
-                    Some(url) => cx.open_url(&format!("{base}{url}")),
-                    None => this.error = Some("Page unavailable. Reconnect to the environment and try again.".into()),
-                }
-                cx.notify();
-            });
         })
         .detach();
     }
@@ -1974,10 +1942,12 @@ fn folded_row(
 
 fn markdown_view(
     state: &Entity<TextViewState>,
+    source: &SharedString,
     kind: MarkdownKind,
     key: SharedString,
     wrap: bool,
     width: Option<f32>,
+    math: bool,
     this: &WeakEntity<Workspace>,
     (cwd, kinds): (Option<String>, Arc<super::markdown_ui::EntryKinds>),
     content: Option<&Arc<timeline::UserContent>>,
@@ -1993,6 +1963,10 @@ fn markdown_view(
         key: key.clone(),
         usable: kind != MarkdownKind::User,
     };
+    let image_this = this.clone();
+    let (image_key, diagram_key) = (key.clone(), key.clone());
+    let (diagram_this, diagram_source) = (this.clone(), source.clone());
+    let header_source = source.clone();
     TextView::new(state)
         .style(markdown_style(&t, kind == MarkdownKind::User, wrap))
         .inline_code_style(inline_code)
@@ -2004,11 +1978,56 @@ fn markdown_view(
         .when(kind == MarkdownKind::User, TextView::markdown_line_breaks)
         .code_block_actions(move |block, _, cx| {
             let wrap_key = key.clone();
-            code_block_header(&header_this, &key, block, wrap, streaming, true, width, &t, cx, move |workspace, cx| {
-                workspace.toggle_code_wrap(&wrap_key, cx);
-            })
+            // A Mermaid fence counts as streaming only while it is still open.
+            let (streaming, toggle) = match mermaid_fence(block, &header_source, streaming) {
+                Some(MermaidFence { at, open: false }) => {
+                    let showing = header_this.upgrade().is_some_and(|w| w.read(cx).diagrams.shows_source(&key, at));
+                    (false, Some(super::mermaid::view_toggle(&header_this, &key, at, showing, &t)))
+                }
+                Some(MermaidFence { open: true, .. }) => (true, None),
+                None => (streaming, None),
+            };
+            code_block_header(
+                &header_this,
+                &key,
+                block,
+                wrap,
+                streaming,
+                true,
+                width,
+                toggle,
+                &t,
+                cx,
+                move |workspace, cx| {
+                    workspace.toggle_code_wrap(&wrap_key, cx);
+                },
+            )
+        })
+        // `MarkdownMermaidCodeBlock`: a closed Mermaid fence draws its diagram.
+        // A `math` fence is display math once it closes (`MarkdownMath`), when Render math is on.
+        .code_block_renderer(move |block, window, cx| {
+            if math && block.lang().as_deref() == Some("math") {
+                let span = block.span.as_ref()?;
+                let closed = !streaming
+                    || diagram_source
+                        .get(span.start..span.end)
+                        .is_some_and(|fence| super::mermaid::fence_closed(fence, &block.code()));
+                return closed.then(|| {
+                    super::math::display_formula(&diagram_this, &diagram_key, &block.code(), span.start, window, cx)
+                });
+            }
+            let fence = mermaid_fence(block, &diagram_source, streaming).filter(|fence| !fence.open)?;
+            let code = block.code();
+            if code.trim().is_empty() {
+                return None;
+            }
+            super::mermaid::chat_diagram(&diagram_this, &diagram_key, fence.at, code, &t, window, cx)
         })
         .table_actions(move |table, _, cx| super::markdown_ui::table_actions(table, &table_this, &table_key, &t, cx))
+        .on_image_click(move |url, window, cx| {
+            let _ = image_this
+                .update(cx, |workspace, cx| workspace.open_markdown_image(&image_key, url.as_ref(), window, cx));
+        })
         // A sent message's context chips, ahead of the plugins that read other links.
         .when_some(content, |view, content| {
             view.plugin(super::user_message::ContextChips {
@@ -2106,6 +2125,7 @@ pub(super) fn code_block_header(
     streaming: bool,
     run: bool,
     width: Option<f32>,
+    view_toggle: Option<AnyElement>,
     t: &Tokens,
     cx: &App,
     toggle_wrap: impl Fn(&mut Workspace, &mut Context<Workspace>) + 'static,
@@ -2181,8 +2201,31 @@ pub(super) fn code_block_header(
                 .text_color(label_color)
                 .children(block.lang().filter(|lang| !lang.is_empty())),
         )
-        .child(h_flex().gap(px(2.)).child(wrap_button).children(run).children((!streaming).then_some(copy)))
+        .child(
+            h_flex()
+                .gap(px(2.))
+                .child(wrap_button)
+                .children(run)
+                .children(view_toggle)
+                .children((!streaming).then_some(copy)),
+        )
         .into_any_element()
+}
+
+/// A Mermaid fence: its place in the message, and whether it is still streaming open.
+struct MermaidFence {
+    at: usize,
+    open: bool,
+}
+
+fn mermaid_fence(block: &gpui_kit::base::text::CodeBlock, source: &str, streaming: bool) -> Option<MermaidFence> {
+    if block.lang().as_deref() != Some("mermaid") {
+        return None;
+    }
+    let span = block.span.as_ref()?;
+    let open = streaming
+        && !source.get(span.start..span.end).is_some_and(|fence| super::mermaid::fence_closed(fence, &block.code()));
+    Some(MermaidFence { at: span.start, open })
 }
 
 /// `MarkdownCodeBlock`'s `canRun`: a shell block whose command reads the same in the terminal.
@@ -2683,11 +2726,38 @@ fn viewed_image(entry: &Entry, this: &WeakEntity<Workspace>, cx: &App) -> Option
     use gpui_kit::StyledImage as _;
     let workspace = this.upgrade()?;
     let workspace = workspace.read(cx);
-    let image = workspace.markdown_images.get(&workspace.viewed_image(entry)?)?;
+    let path = workspace.viewed_image(entry)?;
+    let image = workspace.markdown_images.get(&path)?;
+    let root = workspace.git_cwd();
+    let full = match super::markdown_images::classify(&path, root.as_deref()) {
+        super::markdown_images::Source::WorkspaceFile(full) => full,
+        _ => path.clone(),
+    };
+    // A click expands it (`ChatMarkdownAssetImage`'s `onImageExpand`).
+    let item = super::image_viewer::ViewerImage {
+        image: image.clone(),
+        name: path.rsplit(['/', '\\']).next().unwrap_or("image").to_owned().into(),
+        reference: Some(super::image_viewer::file_reference(&full, root.as_deref())),
+    };
+    let (this, ring) = (this.clone(), crate::theme::tokens(cx).ring);
     Some(
         div()
             .mt(px(4.))
-            .child(gpui_kit::img(image).max_w_full().max_h(px(256.)).object_fit(gpui_kit::ObjectFit::Contain))
+            .child(
+                gpui_kit::img(image)
+                    .id(ElementId::Name(format!("viewed-image:{}", entry.id).into()))
+                    .max_w_full()
+                    .max_h(px(256.))
+                    .object_fit(gpui_kit::ObjectFit::Contain)
+                    .tab_index(0)
+                    .cursor_pointer()
+                    .focus_visible(move |style| style.border_2().border_color(ring))
+                    .on_click(move |_, window, cx| {
+                        cx.stop_propagation();
+                        let item = item.clone();
+                        let _ = this.update(cx, |w, cx| w.open_image_viewer(vec![item], 0, window, cx));
+                    }),
+            )
             .into_any_element(),
     )
 }

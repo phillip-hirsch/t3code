@@ -1009,8 +1009,13 @@ fn resolve_thread_link<'a>(
     })
 }
 
-/// `$…$` math when Render math is on (`MarkdownMath`), as its Unicode form; copying keeps the TeX.
-pub(super) struct InlineMath;
+/// `$…$` math when Render math is on (`MarkdownMath`), typeset; its TeX source until then and
+/// when it does not parse. Copying keeps the TeX.
+pub(super) struct InlineMath {
+    pub workspace: WeakEntity<Workspace>,
+    /// The markdown view, which re-lays out once a formula lands.
+    pub key: SharedString,
+}
 
 impl MarkdownPlugin for InlineMath {
     fn name(&self) -> &'static str {
@@ -1023,20 +1028,28 @@ impl MarkdownPlugin for InlineMath {
         _: &MarkdownParseContext<'_>,
     ) -> Option<MarkdownNode> {
         let gpui_kit::component::text::markdown_ast::Node::InlineMath(math) = node else { return None };
-        Some(
-            MarkdownNode::new("t3-inline-math", ())
-                .text(crate::tex::to_unicode(&math.value))
-                .markdown(format!("\\({}\\)", math.value.trim())),
-        )
+        let tex = math.value.trim().to_owned();
+        let source = format!("\\({tex}\\)");
+        Some(MarkdownNode::new("t3-inline-math", tex).text(source.clone()).markdown(source))
     }
 
-    fn render(&self, node: &MarkdownNode, _: &mut Window, _: &mut App) -> impl IntoElement {
-        div().px(px(2.)).italic().whitespace_nowrap().child(node.as_text().to_owned())
+    fn render_inline(
+        &self,
+        node: &MarkdownNode,
+        context: &gpui_kit::component::text::InlineRenderContext,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<gpui_kit::component::text::InlineElement> {
+        let tex = node.data::<String>()?;
+        super::math::inline_formula(&self.workspace, &self.key, tex, context, window, cx)
     }
 }
 
 /// `$$…$$` display math when Render math is on: its own centered line.
-pub(super) struct DisplayMath;
+pub(super) struct DisplayMath {
+    pub workspace: WeakEntity<Workspace>,
+    pub key: SharedString,
+}
 
 impl MarkdownPlugin for DisplayMath {
     fn is_block(&self) -> bool {
@@ -1053,15 +1066,22 @@ impl MarkdownPlugin for DisplayMath {
         _: &MarkdownParseContext<'_>,
     ) -> Option<MarkdownNode> {
         let gpui_kit::component::text::markdown_ast::Node::Math(math) = node else { return None };
-        Some(
-            MarkdownNode::new("t3-display-math", ())
-                .text(crate::tex::to_unicode(&math.value))
-                .markdown(format!("\\[\n{}\n\\]", math.value.trim())),
-        )
+        let tex = math.value.trim().to_owned();
+        let source = format!("\\[\n{tex}\n\\]");
+        Some(MarkdownNode::new("t3-display-math", tex).text(source.clone()).markdown(source))
     }
 
-    fn render(&self, node: &MarkdownNode, _: &mut Window, _: &mut App) -> impl IntoElement {
-        div().w_full().my(gpui_kit::rems(0.65)).flex().justify_center().italic().child(node.as_text().to_owned())
+    fn render(&self, node: &MarkdownNode, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let tex = node.data::<String>().map_or("", String::as_str);
+        let at = node.source_range().map_or(0, |range| range.start);
+        div().w_full().my(gpui_kit::rems(0.65)).child(super::math::display_formula(
+            &self.workspace,
+            &self.key,
+            tex,
+            at,
+            window,
+            cx,
+        ))
     }
 }
 

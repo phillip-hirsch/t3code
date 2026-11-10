@@ -11,7 +11,7 @@ use gpui_kit::component::notification::Notification;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, Entity, Hsla, InteractiveElement as _, IntoElement, ParentElement as _,
+    AnyElement, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
     StatefulInteractiveElement as _, Styled as _, Task, Window, div, px,
 };
 use gpui_webview::WebView;
@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 use super::FileKey;
 use super::logic::{self, FileKind};
 use super::media::MediaKind;
+use crate::app::mermaid::{REFUSAL, Shown, css_color};
 use crate::app::{Target, Workspace};
 
 /// Document views kept alive while not drawn, so switching tabs back keeps the page.
@@ -36,8 +37,6 @@ struct DocView {
     /// The workspace mutation and `fileRevision` the page loaded.
     mutation: (Option<String>, Option<String>),
     revision: Option<String>,
-    /// A rendered diagram's source revision.
-    content: u64,
     shown: bool,
     used: u64,
     _task: Option<Task<()>>,
@@ -46,7 +45,7 @@ struct DocView {
 }
 
 impl DocView {
-    fn new(kind: FileKind, mutation: (Option<String>, Option<String>), content: u64) -> Self {
+    fn new(kind: FileKind, mutation: (Option<String>, Option<String>)) -> Self {
         Self {
             kind,
             view: None,
@@ -55,7 +54,6 @@ impl DocView {
             drawn: false,
             mutation,
             revision: None,
-            content,
             shown: false,
             used: 0,
             _task: None,
@@ -115,11 +113,6 @@ impl Documents {
     pub(super) fn forget(&mut self, key: &FileKey) {
         self.views.remove(key);
     }
-
-    /// Whether `key`'s diagram must be built for source `revision`.
-    pub(super) fn stale(&self, key: &FileKey, revision: u64) -> bool {
-        self.views.get(key).is_none_or(|doc| doc.content != revision)
-    }
 }
 
 #[derive(Default)]
@@ -128,15 +121,6 @@ pub(super) struct Documents {
     /// The document drawn this frame.
     drawn: Option<FileKey>,
     frame: u64,
-}
-
-/// A colour as CSS: `#rrggbb`, or `rgba(...)` when translucent like many dark tokens.
-fn css_hex(color: Hsla) -> String {
-    let rgba = gpui_kit::Rgba::from(color);
-    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped to 0..=255 before the cast")]
-    let byte = |v: f32| (v.clamp(0., 1.) * 255.).round() as u8;
-    let (r, g, b) = (byte(rgba.r), byte(rgba.g), byte(rgba.b));
-    if rgba.a < 1. { format!("rgba({r},{g},{b},{:.3})", rgba.a) } else { format!("#{r:02x}{g:02x}{b:02x}") }
 }
 
 fn escape_attribute(value: &str) -> String {
@@ -187,60 +171,21 @@ fn document_page(kind: FileKind, url: &str, background: &str, dark: bool) -> Pag
     }
 }
 
-/// `pele` 1.8.0's global build (MIT, `assets/vendor/pele-LICENSE`), the web's Mermaid renderer.
-const PELE_GZ: &[u8] = include_bytes!("../../../assets/vendor/pele-1.8.0.global.js.gz");
-const MERMAID_SCHEME: &str = "t3mermaid";
-#[cfg(windows)]
-const MERMAID_PAGE_URL: &str = "http://t3mermaid.localhost/";
-#[cfg(not(windows))]
-const MERMAID_PAGE_URL: &str = "t3mermaid://localhost/";
-
-fn pele_script() -> &'static [u8] {
-    static SCRIPT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-    SCRIPT.get_or_init(|| {
-        let mut out = Vec::new();
-        let _ = std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(PELE_GZ), &mut out);
-        out
-    })
-}
-
-/// The colours pele reads (`.pele` in the web's CSS).
-pub(super) struct DiagramColors {
-    pub background: String,
-    pub foreground: String,
-    pub muted: String,
-    pub surface: String,
-    pub surface_alt: String,
-    pub accent: String,
-    pub critical: String,
-    pub dark: bool,
-}
-
-/// `MermaidViewer`: the diagram, or the web's refusal for sources that could load resources.
-/// The page may run only its own script and load nothing else.
-fn mermaid_page(source: &str, colors: &DiagramColors) -> String {
-    // JSON is valid JavaScript; `<` is escaped so the source cannot close the script.
-    let source = serde_json::to_string(source).unwrap_or_default().replace('<', "\\u003c");
-    let DiagramColors { background, foreground, muted, surface, surface_alt, accent, critical, dark } = colors;
-    let scheme = if *dark { "dark" } else { "light" };
+/// A chat video's page (`ChatMarkdownVideo`): the same element and bridge as the file panel's,
+/// filling an embed sized to the video (see [`crate::app::embed`]), rounded with a faint border on
+/// `background`, letterboxed in `fill`. It reports the video's natural size and pauses when its
+/// row unmounts.
+pub(in crate::app) fn inline_video_page(url: &str, background: &str, border: &str, fill: &str, dark: bool) -> String {
+    use crate::app::embed::{FRAME_CSS, FRAME_SCRIPT};
+    let src = escape_attribute(url);
+    let scheme = if dark { "dark" } else { "light" };
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" \
-         content=\"default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:\">\
-         <style>html{{color-scheme:{scheme};background:{background};color:{foreground}}}\
-         body{{margin:0;padding:24px;font:12px system-ui,sans-serif}}#d{{display:flex;justify-content:center}}\
-         #d svg{{max-width:100%;height:auto}}.note{{color:{muted};line-height:1.6}}.error{{color:{critical}}}\
-         .pele{{--pele-bg:{background};--pele-fg:{foreground};--pele-muted:{muted};--pele-line:{muted};\
-         --pele-surface:{surface};--pele-surface-alt:{surface_alt};\
-         --pele-border:color-mix(in srgb,{foreground} 28%,transparent);--pele-accent:{accent};--pele-critical:{critical}}}\
-         </style><script src=\"/pele.js\"></script></head><body><div id=\"d\" class=\"pele\"></div><script>\
-         const source = {source}; const root = document.getElementById('d');\
-         const note = (text, cls) => {{ const p = document.createElement('p'); p.className = cls; p.textContent = text; root.replaceChildren(p); }};\
-         if (/%%\\s*\\{{|^\\s*---|<\\/?[A-Za-z]|<[!?]|@\\s*\\{{|\\b(?:img|image)\\s*:|url\\s*\\(|@import|(?:https?|data|blob|file):/im.test(source)) {{\
-           note('This diagram contains resource URLs, markup, node metadata, or custom configuration. Show Mermaid source to inspect it safely.', 'note');\
-         }} else {{ try {{ pele.mount(root, source.trim(), {{ links: false, images: false, zoom: false, autoDirection: false,\
-           onError: (e) => note('Unable to render diagram: ' + (e && e.message || 'The diagram could not be rendered.'), 'error') }}); }}\
-           catch (e) {{ note('Unable to render diagram: ' + (e && e.message || 'The diagram could not be rendered.'), 'error'); }} }}\
-         </script></body></html>"
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"color-scheme\" content=\"{scheme}\">\
+         <style>{FRAME_CSS}html{{background:{background}}}video{{display:block;width:100%;height:100%;\
+         box-sizing:border-box;border:1px solid {border};border-radius:8px;background:{fill};object-fit:contain}}</style></head>\
+         <body><div id=\"t3-embed\"><video id=\"m\" controls playsinline preload=\"metadata\" src=\"{src}\"></video></div>\
+         <script>{FRAME_SCRIPT}{MEDIA_SCRIPT}m.addEventListener('loadedmetadata',()=>\
+         post({{type:'size',w:m.videoWidth,h:m.videoHeight}}));window.t3Hidden=()=>m.pause();</script></body></html>"
     )
 }
 
@@ -341,7 +286,7 @@ impl Workspace {
         let mutation = self.files.mutation.clone();
         let documents = &mut self.files.documents;
         documents.drawn = Some(key.clone());
-        let state = documents.views.entry(key.clone()).or_insert_with(|| DocView::new(kind, mutation.clone(), 0));
+        let state = documents.views.entry(key.clone()).or_insert_with(|| DocView::new(kind, mutation.clone()));
         if state.view.is_none() && state._task.is_none() && state.failed.is_none() {
             self.start_document(key.clone(), kind, window, cx);
         } else if state.view.is_some() && state.mutation != mutation {
@@ -521,8 +466,8 @@ impl Workspace {
         let Some((client, endpoint)) = self.file_connection(&key) else { return };
         let resource = self.document_resource(&key, kind);
         let tokens = *crate::theme::tokens(cx);
-        let (background, dark) = (css_hex(tokens.background), self.dark_theme(cx));
-        let foreground = css_hex(tokens.foreground);
+        let (background, dark) = (css_color(tokens.background), self.dark_theme(cx));
+        let foreground = css_color(tokens.foreground);
         let request_key = key.clone();
         // A page's popup or `target=_blank` link opens in the system browser.
         let (links, opened) = async_channel::unbounded::<String>();
@@ -656,55 +601,31 @@ impl Workspace {
         cx.notify();
     }
 
-    /// A Mermaid file's diagram (`MermaidViewer`), rebuilt when its source changes.
+    /// A Mermaid file's diagram (`MermaidViewer`), or the refusal for a source that could load
+    /// resources; `source` is given when `id` is new. A click expands it.
     pub(super) fn render_mermaid(
         &mut self,
-        key: &FileKey,
-        revision: u64,
+        id: u64,
         source: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let tokens = *crate::theme::tokens(cx);
-        let dark = self.dark_theme(cx);
-        let mutation = self.files.mutation.clone();
-        let documents = &mut self.files.documents;
-        documents.drawn = Some(key.clone());
-        if let Some(source) = source {
-            documents.views.remove(key);
-            let colors = DiagramColors {
-                background: css_hex(tokens.background),
-                foreground: css_hex(tokens.foreground),
-                muted: css_hex(tokens.muted_foreground),
-                surface: css_hex(tokens.secondary),
-                surface_alt: css_hex(tokens.accent),
-                accent: css_hex(tokens.primary),
-                critical: css_hex(tokens.error),
-                dark,
-            };
-            let page = mermaid_page(&source, &colors);
-            let builder = wry::WebViewBuilder::new()
-                .with_custom_protocol(MERMAID_SCHEME.into(), move |_, request| {
-                    let (body, content_type): (Vec<u8>, &str) = if request.uri().path() == "/pele.js" {
-                        (pele_script().to_vec(), "text/javascript")
-                    } else {
-                        (page.clone().into_bytes(), "text/html")
-                    };
-                    wry::http::Response::builder()
-                        .header("content-type", content_type)
-                        .body(std::borrow::Cow::Owned(body))
-                        .unwrap_or_default()
-                })
-                .with_url(MERMAID_PAGE_URL);
-            documents.views.insert(key.clone(), DocView::new(FileKind::Text, mutation, revision));
-            self.build_view(key.clone(), builder, None, window, cx);
+        let (shown, source) = self.file_diagram(id, source, window, cx);
+        if matches!(shown, Shown::Refused) {
+            return div().p(px(24.)).text_xs().text_color(tokens.muted_foreground).child(REFUSAL).into_any_element();
         }
-        match self.files.documents.views.get(key).map(|doc| (&doc.view, &doc.failed)) {
-            Some((Some(view), _)) => div().flex_1().min_h_0().size_full().child(view.clone()).into_any_element(),
-            Some((None, Some(error))) => {
-                super::chrome::failure(format!("Unable to render diagram: {error}"), None, &tokens)
-            }
-            _ => super::chrome::loading(&tokens),
+        let this = cx.entity().downgrade();
+        match crate::app::mermaid::diagram_body(&this, id, &shown, &source, &tokens) {
+            Some(body) => div()
+                .id("mermaid-file")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .p(px(24.))
+                .child(body)
+                .into_any_element(),
+            None => super::chrome::loading(&tokens),
         }
     }
 
@@ -719,7 +640,7 @@ impl Workspace {
         let Some((client, endpoint)) = self.file_connection(&key) else { return };
         let resource = self.document_resource(&key, kind);
         let tokens = *crate::theme::tokens(cx);
-        let (background, dark) = (css_hex(tokens.background), self.dark_theme(cx));
+        let (background, dark) = (css_color(tokens.background), self.dark_theme(cx));
         let request_key = key.clone();
         let task = cx.spawn_in(window, async move |this, cx| {
             let Ok((url, revision)) = mint_asset_url(client, endpoint.http_base, resource).await else { return };
@@ -855,29 +776,17 @@ mod tests {
         assert!(video.contains("window.t3Media") && video.contains("'contextmenu'"));
         assert_eq!(media_adopt_script("http://h/a\"b"), r#"window.t3Media&&window.t3Media.adopt("http://h/a\"b")"#);
         assert!(audio.contains("content=\"dark\""));
+        let chat = inline_video_page("http://h/a\"b.mp4", "#fff", "#eee", "#000", false);
+        assert!(chat.contains("src=\"http://h/a&quot;b.mp4\"") && chat.contains("id=\"t3-embed\""));
+        assert!(chat.contains("window.t3Media") && chat.contains("type:'size'") && chat.contains("window.t3Hidden"));
+        assert!(chat.contains("background:#000;object-fit:contain"), "the letterbox fill");
         assert_eq!(resolve_asset_url("http://h:1/", "/api/assets/t/a.pdf"), "http://h:1/api/assets/t/a.pdf");
         assert_eq!(resolve_asset_url("http://h:1", "https://x/y"), "https://x/y");
         assert_eq!(resolve_asset_url("http://h:1", "httpx/y"), "http://h:1/httpx/y", "a path, not a URL");
-        assert_eq!(css_hex(gpui_kit::rgb(0x0a0b0c).into()), "#0a0b0c");
-        assert_eq!(css_hex(gpui_kit::rgba(0xffffff80).into()), "rgba(255,255,255,0.502)");
         assert_eq!(font_mime(b"wOF2...."), Some("font/woff2"));
         assert_eq!(font_mime(&[0, 1, 0, 0, 9]), Some("font/ttf"));
         assert_eq!(font_mime(b"PK\x03\x04"), None);
         assert!(font_specimen("#000", "#fff", true).contains("src:url('/font')"));
-        let colors = DiagramColors {
-            background: "#000".into(),
-            foreground: "#fff".into(),
-            muted: "#888".into(),
-            surface: "#111".into(),
-            surface_alt: "#222".into(),
-            accent: "#00f".into(),
-            critical: "#f00".into(),
-            dark: true,
-        };
-        let page = mermaid_page("graph TD\n A</script><b>x</b>", &colors);
-        assert!(page.contains("const source = \"graph TD\\n A\\u003c/script>\\u003cb>x\\u003c/b>\";"));
-        assert!(page.contains("default-src 'none'") && page.contains("--pele-bg:#000"));
-        assert!(pele_script().starts_with(b"/*! Pele 1.8.0"), "the vendored renderer decompresses");
     }
 
     #[test]

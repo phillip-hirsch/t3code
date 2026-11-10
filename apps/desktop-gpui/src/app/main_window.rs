@@ -3,7 +3,7 @@
 
 use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, Entity, Global, TitlebarOptions, WeakEntity, WindowDecorations,
-    WindowOptions, point, px, size,
+    WindowOptions, px, size,
 };
 
 use super::Workspace;
@@ -29,13 +29,13 @@ pub fn open(cx: &mut App) -> Option<(AnyWindowHandle, Entity<Workspace>)> {
         Some(backend) => backend.restart(),
         None => cx.set_global(PrimaryBackend::start(crate::runtime().handle())),
     }
-    let (x, y) = super::TRAFFIC_LIGHTS;
+    let zoom_level = cx.global::<Desktop>().settings.zoom_level;
     let (min_width, min_height) = desktop::settings::MIN_WINDOW_SIZE;
     let options = WindowOptions {
         titlebar: Some(TitlebarOptions {
             title: Some("T3 Code".into()),
             appears_transparent: true,
-            traffic_light_position: Some(point(px(x), px(y))),
+            traffic_light_position: Some(super::titlebar::traffic_lights(desktop::zoom::factor(zoom_level))),
         }),
         window_bounds: Some(cx.global::<Desktop>().window_bounds(cx)),
         window_min_size: Some(size(px(min_width as f32), px(min_height as f32))),
@@ -47,6 +47,7 @@ pub fn open(cx: &mut App) -> Option<(AnyWindowHandle, Entity<Workspace>)> {
         ..Default::default()
     };
     let opened = gpui_kit::open_window(options, cx, |window, cx| {
+        super::menu::apply_zoom(zoom_level, window, cx);
         crate::theme::sync(window, cx);
         cx.new(|cx| Workspace::new(window, cx))
     });

@@ -13,6 +13,7 @@ pub mod settings;
 pub mod shell_env;
 pub mod snap_shot;
 pub mod window_state;
+pub mod zoom;
 
 use gpui_kit::{App, Bounds, Global, Pixels, WindowBounds, point, px, size};
 

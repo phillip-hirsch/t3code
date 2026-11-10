@@ -50,8 +50,18 @@ hmac = "0.12"
 # The system zone's IANA name, which usage reads send so the server buckets days locally.
 iana-time-zone = "0.1"
 # Agent browser tabs stream JPEG frames, SnapShots encode PNG, and attached images are
-# downscaled and re-encoded; GPUI already builds all four codecs.
-image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+# downscaled and re-encoded. The image viewer reads every format GPUI draws for its natural
+# size; GPUI already builds all these codecs.
+image = { version = "0.25", default-features = false, features = [
+  "bmp",
+  "gif",
+  "ico",
+  "jpeg",
+  "png",
+  "pnm",
+  "tiff",
+  "webp",
+] }
 log = "0.4"
 # Notebook Markdown is made inert on the tree the chat renderer parses; gpui-base already builds it.
 markdown = "1"
@@ -86,6 +96,8 @@ uuid = { version = "1", features = ["v4"] }
 zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 # Office documents' XML parts; GPUI's SVG renderer already builds it.
 roxmltree = "0.21"
+# An SVG's natural size in the image viewer; GPUI's SVG renderer already builds it.
+usvg = { version = "0.46", default-features = false }
 wry = { version = "0.53.3", package = "lb-wry", features = ["devtools"] }
 # SnapShots: the screen capture.
 xcap = "0.9"
@@ -174,6 +186,8 @@ gpui-pre = { path = "vendor/gpui-pre" }
 gpui-pre-windows = { path = "vendor/gpui-pre-windows" }
 # gpui-pre-linux 0.3.11: X11 client-side decorations without a compositor.
 gpui-pre-linux = { path = "vendor/gpui-pre-linux" }
+# gpui-webview 0.9.0: native views follow the interface scale.
+gpui-webview = { path = "vendor/gpui-webview" }
 
 # BeautifulRust's lint set (github.com/morganlinton/BeautifulRust), trimmed for an application:
 # no library-API lints (missing_docs, missing_*_doc, exhaustive_enums, unreachable_pub, print_*).

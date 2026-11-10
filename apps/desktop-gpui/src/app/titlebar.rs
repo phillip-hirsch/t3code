@@ -16,8 +16,8 @@ use std::cell::Cell;
 use gpui_kit::{
     AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, Decorations, Div, Element, ElementId, FocusHandle,
     FontFallbacks, GlobalElementId, Hsla, InspectorElementId, InteractiveElement, IntoElement, LayoutId, MouseButton,
-    ParentElement as _, Pixels, ResizeEdge, SharedString, Stateful, StatefulInteractiveElement as _, Styled as _,
-    TextRenderingMode, Tiling, Window, WindowControlArea, div, font, hsla, px, rgb, svg,
+    ParentElement as _, Pixels, Point, ResizeEdge, SharedString, Stateful, StatefulInteractiveElement as _,
+    Styled as _, TextRenderingMode, Tiling, Window, WindowControlArea, div, font, hsla, point, px, rgb, svg,
 };
 
 use super::{ToggleRightPanel, ToggleSidebar, Workspace};
@@ -37,9 +37,11 @@ const CONTROL_SIZE: Pixels = px(28.);
 const CONTROLS_LEFT: Pixels = px(13.);
 /// `MACOS_TRAFFIC_LIGHTS_LEFT_INSET` (90px) plus `ml-px`: the traffic lights' room.
 const MACOS_CONTROLS_LEFT: Pixels = px(91.);
-/// Where macOS's traffic lights sit, as Electron's `syncMacosWindowButtons` places them: 16px in
-/// and centered on the 52px top row (14px buttons).
-pub const TRAFFIC_LIGHTS: (f32, f32) = (16., 19.);
+/// Where macOS's traffic lights sit, as Electron's `syncMacosWindowButtons` places them: 16pt in
+/// and centered on the 52px top row at the interface scale, while the 14pt buttons never zoom.
+pub(super) fn traffic_lights(ui_scale: f32) -> Point<Pixels> {
+    point(px(16.), px((52. * ui_scale / 2. - 7.).round()))
+}
 /// Linux client-side decorations: how far in from each edge a press resizes the window.
 const RESIZE_EDGE: Pixels = px(5.);
 /// The panel toggles end 12px + 1px left of the caption buttons.

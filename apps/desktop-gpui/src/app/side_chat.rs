@@ -489,6 +489,11 @@ impl Workspace {
         self.side_chat.view.as_ref()?.state.projection.as_ref()
     }
 
+    /// The side chat on screen.
+    pub(super) fn side_chat_thread_id(&self) -> Option<&str> {
+        Some(self.side_chat.view.as_ref()?.thread_id.as_str())
+    }
+
     fn send_side_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // An open question takes the send as its answer; an open queued message, as its edit.
         if self.side_chat_question().is_some() {

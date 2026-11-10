@@ -371,16 +371,9 @@ impl Workspace {
                     ),
             );
         let summary = (!stop.summary.trim().is_empty())
-            .then(|| self.pr_markdown(&format!("guide:{index}"), &stop.summary, cx))
+            .then(|| self.pr_body(&format!("guide:{index}"), &stop.summary, false, t, cx))
             .flatten()
-            .map(|state| {
-                div().text_sm().text_color(t.muted_foreground).child(pr_markdown_view(
-                    &state,
-                    t,
-                    cx.entity(),
-                    self.pr_code_wraps(&state),
-                ))
-            });
+            .map(|markdown| div().text_sm().text_color(t.muted_foreground).child(markdown));
         let attention = stop.attention.as_ref().map(|a| {
             h_flex()
                 .items_start()

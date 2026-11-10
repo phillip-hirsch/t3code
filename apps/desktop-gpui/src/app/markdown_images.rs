@@ -11,6 +11,7 @@ use markdown::mdast::Node;
 use serde_json::{Value, json};
 
 use super::Workspace;
+use super::image_viewer::{Reference, ViewerImage, file_reference};
 
 /// A 1×1 transparent PNG, drawn while an image loads or when it cannot.
 static BLANK: LazyLock<Arc<Image>> = LazyLock::new(|| {
@@ -32,6 +33,26 @@ impl ImageCache {
     /// The loaded image for `destination`, if it has loaded.
     pub(super) fn get(&self, destination: &str) -> Option<Arc<Image>> {
         self.0.lock().ok()?.get(destination).cloned().flatten()
+    }
+
+    /// Marks `destination` loading; false when the cache has already seen it.
+    pub(super) fn claim(&self, destination: &str) -> bool {
+        let Ok(mut cache) = self.0.lock() else { return false };
+        if cache.contains_key(destination) {
+            return false;
+        }
+        cache.insert(destination.to_owned(), None);
+        true
+    }
+
+    pub(super) fn store(&self, destination: String, image: Arc<Image>) {
+        if let Ok(mut cache) = self.0.lock() {
+            cache.insert(destination, Some(image));
+        }
+    }
+
+    pub(super) fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 
     /// `TextView`'s `image_source`: the loaded image, else a blank one.
@@ -62,6 +83,26 @@ fn may_hold_images(markdown: &str) -> bool {
 /// The destinations of the images the parsed `markdown` shows, in order and once each: inline
 /// `![alt](dest)`, reference `![alt][id]` (by its definition) and raw HTML `<img src>`.
 pub(super) fn image_destinations(markdown: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for image in markdown_images(markdown) {
+        if !found.contains(&image.destination) {
+            found.push(image.destination);
+        }
+    }
+    found
+}
+
+/// One image a message shows.
+#[derive(Debug, PartialEq)]
+pub(super) struct MarkdownImage {
+    pub destination: String,
+    pub alt: String,
+    /// The link it sits in, which a click follows instead of expanding the image.
+    pub link: Option<String>,
+}
+
+/// Every image `markdown` shows, in order.
+pub(super) fn markdown_images(markdown: &str) -> Vec<MarkdownImage> {
     let mut options = markdown::ParseOptions::gfm();
     options.constructs.math_text = true;
     options.constructs.math_flow = true;
@@ -69,7 +110,7 @@ pub(super) fn image_destinations(markdown: &str) -> Vec<String> {
     let mut definitions = HashMap::new();
     collect_definitions(&root, &mut definitions);
     let mut found = Vec::new();
-    collect_images(&root, &definitions, &mut found);
+    collect_images(&root, &definitions, None, &mut found);
     found
 }
 
@@ -83,24 +124,30 @@ fn collect_definitions<'a>(node: &'a Node, definitions: &mut HashMap<&'a str, &'
     }
 }
 
-fn collect_images(node: &Node, definitions: &HashMap<&str, &str>, found: &mut Vec<String>) {
-    let mut push = |dest: &str| {
-        if !dest.is_empty() && !found.iter().any(|d| d == dest) {
-            found.push(dest.to_owned());
+fn collect_images(node: &Node, definitions: &HashMap<&str, &str>, link: Option<&str>, found: &mut Vec<MarkdownImage>) {
+    let mut push = |dest: &str, alt: &str| {
+        if !dest.is_empty() {
+            let link = link.map(str::to_owned);
+            found.push(MarkdownImage { destination: dest.to_owned(), alt: alt.to_owned(), link });
         }
     };
     match node {
-        Node::Image(image) => push(&image.url),
+        Node::Image(image) => push(&image.url, &image.alt),
         Node::ImageReference(image) => {
             if let Some(url) = definitions.get(image.identifier.as_str()) {
-                push(url);
+                push(url, &image.alt);
             }
         }
-        Node::Html(html) => html_image_sources(&html.value).iter().for_each(|src| push(src)),
+        Node::Html(html) => html_image_sources(&html.value).iter().for_each(|src| push(src, "")),
         _ => {}
     }
+    let link = match node {
+        Node::Link(link) => Some(link.url.as_str()),
+        Node::LinkReference(link) => Some(definitions.get(link.identifier.as_str()).copied().unwrap_or_default()),
+        _ => link,
+    };
     for child in node.children().into_iter().flatten() {
-        collect_images(child, definitions, found);
+        collect_images(child, definitions, link, found);
     }
 }
 
@@ -192,7 +239,7 @@ fn format_for(mime: &str) -> Option<ImageFormat> {
 }
 
 /// `data:image/png;base64,...`.
-fn data_url(url: &str) -> Option<(ImageFormat, Vec<u8>)> {
+pub(super) fn data_url(url: &str) -> Option<(ImageFormat, Vec<u8>)> {
     let (meta, payload) = url.strip_prefix("data:")?.split_once(',')?;
     let mime = meta.split(';').next()?;
     let format = format_for(mime)?;
@@ -222,8 +269,10 @@ impl Workspace {
     /// that shows `key` to remeasure once it lands.
     pub(super) fn load_images(&mut self, key: &SharedString, destinations: Vec<String>, cx: &mut Context<Self>) {
         let root = self.git_cwd();
+        // Audio and video play in their own players (`super::markdown_media`), never as images.
         let sources = destinations
             .into_iter()
+            .filter(|destination| super::markdown_media::media_kind(destination).is_none())
             .map(|destination| {
                 let source = classify(&destination, root.as_deref());
                 (destination, source)
@@ -324,6 +373,55 @@ impl Workspace {
     }
 }
 
+impl Workspace {
+    /// The gallery a click on the image at `url` opens (`markdownImageGallery`): the loaded
+    /// images of `markdown`, less those linking somewhere other than an image, and where `url`
+    /// is among them.
+    pub(super) fn markdown_gallery(&self, markdown: &str, url: &str) -> Option<(Vec<ViewerImage>, usize)> {
+        gallery(&self.markdown_images, self.git_cwd().as_deref(), markdown, url)
+    }
+}
+
+/// [`Workspace::markdown_gallery`] over the images `cache` holds, with relative files under `root`.
+pub(super) fn gallery(
+    cache: &ImageCache,
+    root: Option<&str>,
+    markdown: &str,
+    url: &str,
+) -> Option<(Vec<ViewerImage>, usize)> {
+    let mut items = Vec::new();
+    let mut index = None;
+    for image in markdown_images(markdown) {
+        if image.link.as_deref().is_some_and(|link| !links_to_image(link)) {
+            continue;
+        }
+        let Some(loaded) = cache.get(&image.destination) else { continue };
+        if index.is_none() && image.link.is_none() && image.destination == url {
+            index = Some(items.len());
+        }
+        // An image linking to a web image names that image, as its menu copies it.
+        let web_link = image.link.filter(|link| link.starts_with("https://") || link.starts_with("http://"));
+        let reference = match web_link {
+            Some(link) => Some(Reference::Url(link)),
+            None => match classify(&image.destination, root) {
+                Source::Direct(url) => Some(Reference::Url(url)),
+                Source::WorkspaceFile(path) => Some(file_reference(&path, root)),
+                Source::Data(..) | Source::Asset(_) | Source::Blocked => None,
+            },
+        };
+        let name = image.alt.trim();
+        let name = if name.is_empty() { "image" } else { name };
+        items.push(ViewerImage { image: loaded, name: name.to_owned().into(), reference });
+    }
+    Some((items, index?))
+}
+
+/// `mediaKindFromPath(href) === "image"`: the link's path ends in an image extension.
+fn links_to_image(link: &str) -> bool {
+    let path = link.split(['?', '#']).next().unwrap_or_default();
+    !path.is_empty() && super::files::is_image(path)
+}
+
 /// An attachment's place in the image cache, apart from any markdown destination.
 fn attachment_key(id: &str) -> String {
     format!("t3-attachment:{id}")
@@ -402,6 +500,13 @@ pub(super) fn sniff(bytes: &[u8]) -> Option<ImageFormat> {
     }
 }
 
+/// The web image at `url`, decoded by its type or its bytes; `None` when it fails to load.
+pub(super) async fn fetch_image(url: String) -> Option<Arc<Image>> {
+    let (mime, bytes) = fetch(url).await?;
+    let format = mime.as_deref().and_then(format_for).or_else(|| sniff(&bytes))?;
+    Some(Arc::new(Image::from_bytes(format, bytes)))
+}
+
 /// The largest image a message loads: an agent can link any URL.
 const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 
@@ -444,6 +549,25 @@ mod tests {
         let markdown =
             "![ref][Logo] then <img alt=\"x\" src='html.png?a=1&amp;b=2'>\n\n`![no](code.png)`\n\n[logo]: ref.png";
         assert_eq!(image_destinations(markdown), vec!["ref.png", "html.png?a=1&b=2"]);
+    }
+
+    #[test]
+    fn a_gallery_knows_alt_text_and_linked_images() {
+        let markdown = "![one](a.png) [![two](b.png)](https://x.dev) ![](a.png) [![big][t]][full]\n\n[t]: t.png\n[full]: https://x.dev/full.png?s=1";
+        let images = markdown_images(markdown);
+        let summary: Vec<_> =
+            images.iter().map(|i| (i.destination.as_str(), i.alt.as_str(), i.link.as_deref())).collect();
+        assert_eq!(
+            summary,
+            [
+                ("a.png", "one", None),
+                ("b.png", "two", Some("https://x.dev")),
+                ("a.png", "", None),
+                ("t.png", "big", Some("https://x.dev/full.png?s=1"))
+            ]
+        );
+        assert!(!links_to_image("https://x.dev"));
+        assert!(links_to_image("https://x.dev/full.png?s=1"));
     }
 
     #[test]
