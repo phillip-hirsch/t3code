@@ -114,10 +114,10 @@ impl SideChats {
         }
     }
 
-    /// Releases the view on screen, keeping its unsent text for when it shows again. A queued
-    /// message's edit ends here; the side chat keeps its own draft.
-    fn release_view(&mut self, cx: &App) {
-        let Some(mut view) = self.view.take() else { return };
+    /// Releases the view on screen, keeping its unsent text for when it shows again, and says
+    /// which chat it showed. A queued message's edit ends here; the side chat keeps its own draft.
+    fn release_view(&mut self, cx: &App) -> Option<Key> {
+        let mut view = self.view.take()?;
         let text = match (view.question.take(), view.queue.take_edit_draft()) {
             (Some(question), _) => question.prompt,
             (None, Some((text, ..))) => text,
@@ -127,8 +127,9 @@ impl SideChats {
         if text.is_empty() {
             self.drafts.remove(&key);
         } else {
-            self.drafts.insert(key, text);
+            self.drafts.insert(key.clone(), text);
         }
+        Some(key)
     }
 }
 
@@ -398,7 +399,11 @@ impl Workspace {
         {
             return;
         }
-        self.side_chat.release_view(cx);
+        // A chat that left takes its cards' typed answers; one resubscribing keeps them.
+        let released = self.side_chat.release_view(cx);
+        if released.is_some_and(|(e, t)| env.as_ref() != Some(&e) || shown != Some(t.as_str())) {
+            self.prune_requests();
+        }
         let (Some(thread_id), Some(client), Some(env)) = (shown, client, env) else { return };
         let draft = self.side_chat.drafts.remove(&(env.clone(), thread_id.to_owned())).unwrap_or_default();
         let empty = draft.trim().is_empty();

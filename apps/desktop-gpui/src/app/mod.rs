@@ -1198,6 +1198,8 @@ impl Workspace {
         self._working_tick = None;
         *self.timeline_anchor.get_mut() = Default::default();
         self.scroller.update(cx, |scroller, cx| scroller.reset(0, cx));
+        // The cards went with the rows; their typed answers go too, as the web's unmounted forms.
+        self.prune_requests();
         self.recall_position();
     }
 
