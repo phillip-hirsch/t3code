@@ -297,15 +297,23 @@ impl Workspace {
 
     /// Moves `tab`'s page back into the main window, `window`, and closes its separate window.
     pub(super) fn close_separate_window(&mut self, tab: &TabRef, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(separate) = self.preview.separate.remove(tab) else { return };
+        let Some(view) = self.preview.separate.get(tab).map(|separate| separate.view.clone()) else { return };
         // Hidden until the panel or the mini player lays it out again.
-        let _ = separate.view.read(cx).set_visible(false);
+        let _ = view.read(cx).set_visible(false);
         let source = self.page_source(tab, cx);
-        match place_page(&separate.view, source.as_ref(), window, cx) {
+        match place_page(&view, source.as_ref(), window, cx) {
             Ok(Some((rebuilt, events))) => self.replace_view(tab, rebuilt, events, window, cx),
             Ok(None) => {}
+            // The page stays in its window rather than going down with it; a closed tab's goes anyway.
+            Err(error) if self.preview.tabs.contains_key(tab) => {
+                let _ = view.read(cx).set_visible(true);
+                self.error = Some(format!("Unable to return the preview to the panel: {error}").into());
+                cx.notify();
+                return;
+            }
             Err(error) => log::warn!("could not move the page back from its separate window: {error}"),
         }
+        let Some(separate) = self.preview.separate.remove(tab) else { return };
         if let Some(hosted) = self.preview.tabs.get_mut(tab) {
             hosted.shown = false;
             hosted.zoom = 0.;
