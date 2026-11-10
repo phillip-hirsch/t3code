@@ -1031,13 +1031,18 @@ impl Workspace {
     /// The model the next message runs on.
     fn composer_model(&self) -> Option<ModelSelection> {
         let selection = self.stored_composer_model()?;
-        let descriptors = self.server_info().model(&selection).and_then(|m| m.capabilities.as_ref());
-        Some(match descriptors {
-            Some(capabilities) => {
-                crate::model_label::with_legacy_ultracode(&capabilities.option_descriptors, selection)
-            }
-            None => selection,
-        })
+        let descriptors = self.composer_descriptors(&selection);
+        let selection = crate::model_label::with_legacy_ultracode(&descriptors, selection);
+        Some(crate::model_label::without_plan_agent_selection(&descriptors, selection))
+    }
+
+    /// The options the composer offers for `selection`'s model: never the `opencode` Plan agent.
+    fn composer_descriptors(
+        &self,
+        selection: &ModelSelection,
+    ) -> std::borrow::Cow<'_, [crate::model::OptionDescriptor]> {
+        let model = self.server_info().model(selection).and_then(|m| m.capabilities.as_ref());
+        crate::model_label::without_plan_agent(model.map(|c| c.option_descriptors.as_slice()).unwrap_or_default())
     }
 
     fn stored_composer_model(&self) -> Option<ModelSelection> {

@@ -133,16 +133,23 @@ impl Workspace {
     }
 
     /// `TraitsPicker` with prompt-injected effort left out: every select's choices, then each
-    /// on/off option. `None` when the model has nothing to pick (`hasAnyControls`).
+    /// on/off option. `None` when the model has nothing to pick (`hasAnyControls`). The `opencode`
+    /// Plan agent shows only with `include_plan_agent`.
     pub(in crate::app) fn traits_picker(
         &self,
         id: impl Into<ElementId>,
         selection: &ModelSelection,
+        include_plan_agent: bool,
         cx: &mut Context<Self>,
         on_pick: impl Fn(&mut Self, ModelSelection, &mut Window, &mut Context<Self>) + 'static,
     ) -> Option<AnyElement> {
         let t = *tokens(cx);
-        let descriptors = self.settings_info().model(selection)?.capabilities.as_ref()?.option_descriptors.clone();
+        let descriptors = &self.settings_info().model(selection)?.capabilities.as_ref()?.option_descriptors;
+        let descriptors = if include_plan_agent {
+            descriptors.clone()
+        } else {
+            model_label::without_plan_agent(descriptors).into_owned()
+        };
         let (selects, toggles) = trait_controls(&descriptors)?;
         let label = model_label::effort_label(&descriptors, selection).unwrap_or_else(|| "Options".into());
         let current = selection.clone();

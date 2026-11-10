@@ -350,7 +350,7 @@ impl Workspace {
                 .children(if mixed || denial.is_some() {
                     None
                 } else {
-                    self.traits_picker("default-model-traits", selection, cx, pick("defaultModelSelection"))
+                    self.traits_picker("default-model-traits", selection, false, cx, pick("defaultModelSelection"))
                 })
                 .into_any_element(),
             None => muted(if mixed { "Mixed" } else { "No providers available" }, &t).into_any_element(),
@@ -510,7 +510,7 @@ impl Workspace {
                 stored
                     .as_ref()
                     .filter(|_| !mixed)
-                    .and_then(|stored| self.traits_picker("fallback-model-traits", stored, cx, pick)),
+                    .and_then(|stored| self.traits_picker("fallback-model-traits", stored, false, cx, pick)),
             )
             .into_any_element()
     }
@@ -677,7 +677,13 @@ impl Workspace {
                     cx,
                     save.clone(),
                 ))
-                .children(self.traits_picker("text-generation-traits", selection, cx, save))
+                .children(self.traits_picker(
+                    "text-generation-traits",
+                    selection,
+                    crate::model_label::selects_plan_agent(selection),
+                    cx,
+                    save,
+                ))
                 .into_any_element(),
         };
         let streaming = view.str("responseStreamingMode").to_owned();

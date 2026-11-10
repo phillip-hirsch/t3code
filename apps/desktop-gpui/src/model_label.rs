@@ -2,6 +2,8 @@
 //! (`getTriggerDisplayModelName`, `packages/provider-core/src/modelShortName.ts`)
 //! and the effort word (`describeComposerEffort` with `effortDisplay: "label"`).
 
+use std::borrow::Cow;
+
 use serde_json::{Value, json};
 
 use crate::model::{ModelSelection, OptionDescriptor, ProviderModel};
@@ -289,6 +291,59 @@ pub fn with_option(selection: &ModelSelection, id: &str, value: Value) -> ModelS
     ModelSelection { options: Some(options), ..selection.clone() }
 }
 
+/// `withoutPlanAgentOption`: the agent select without the `opencode` Plan agent, which retired with plan
+/// mode; the select goes when nothing is left.
+pub fn without_plan_agent(descriptors: &[OptionDescriptor]) -> Cow<'_, [OptionDescriptor]> {
+    let is_agent = |d: &OptionDescriptor| d.kind == "select" && d.id == "agent";
+    if !descriptors.iter().any(|d| is_agent(d) && d.options.iter().any(|o| o.id == "plan")) {
+        return Cow::Borrowed(descriptors);
+    }
+    let filtered = descriptors.iter().filter_map(|descriptor| {
+        if !is_agent(descriptor) {
+            return Some(descriptor.clone());
+        }
+        let options: Vec<_> = descriptor.options.iter().filter(|o| o.id != "plan").cloned().collect();
+        let survives = |id: &str| options.iter().any(|o| o.id == id);
+        let current = descriptor.current_value.as_ref().and_then(Value::as_str).filter(|id| survives(id));
+        let current =
+            current.or_else(|| options.iter().find(|o| o.is_default).or(options.first()).map(|o| o.id.as_str()));
+        let current_value = current.map(|id| Value::String(id.to_owned()));
+        (!options.is_empty()).then(|| OptionDescriptor { options, current_value, ..descriptor.clone() })
+    });
+    Cow::Owned(filtered.collect())
+}
+
+/// `selectsPlanAgent`: whether `selection` runs the `opencode` Plan agent.
+pub fn selects_plan_agent(selection: &ModelSelection) -> bool {
+    selection.options.iter().flatten().any(is_plan_agent)
+}
+
+fn is_plan_agent(option: &Value) -> bool {
+    option.get("id").and_then(Value::as_str) == Some("agent")
+        && option.get("value").and_then(Value::as_str) == Some("plan")
+}
+
+/// The outgoing selection for `descriptors` from [`without_plan_agent`]: a Plan agent becomes the
+/// select's current agent, or goes when the model offers none (`getComposerProviderState`).
+pub fn without_plan_agent_selection(descriptors: &[OptionDescriptor], selection: ModelSelection) -> ModelSelection {
+    if !selects_plan_agent(&selection) {
+        return selection;
+    }
+    let agent =
+        descriptors.iter().find(|d| d.kind == "select" && d.id == "agent").and_then(|d| d.current_value.clone());
+    let options: Vec<Value> = selection
+        .options
+        .iter()
+        .flatten()
+        .filter_map(|option| match (is_plan_agent(option), &agent) {
+            (false, _) => Some(option.clone()),
+            (true, Some(agent)) => Some(json!({"id": "agent", "value": agent})),
+            (true, None) => None,
+        })
+        .collect();
+    ModelSelection { options: (!options.is_empty()).then_some(options), ..selection }
+}
+
 /// `getDisplayModelName`: the model's full name without its sub-provider prefix.
 pub fn display_model_name(model: &ProviderModel) -> String {
     strip_qualifier(model.name.as_deref().unwrap_or(&model.slug), model.sub_provider.as_deref())
@@ -490,5 +545,59 @@ mod tests {
         unset[1].id = "thinking".into();
         unset[1].label = "Thinking".into();
         assert_eq!(effort_label(&unset, &selection).as_deref(), Some("Thinking"), "Pi's thinking names itself");
+    }
+
+    #[test]
+    fn the_plan_agent_leaves_the_agent_select_and_outgoing_selections() {
+        let agent = |current: Option<&str>, options: Value| {
+            let mut descriptor = json!({"id": "agent", "label": "Agent", "type": "select", "options": options});
+            if let Some(current) = current {
+                descriptor["currentValue"] = json!(current);
+            }
+            let effort = json!({"id": "effort", "label": "Effort", "type": "select", "options": [{"id": "low", "label": "Low"}]});
+            serde_json::from_value::<Vec<OptionDescriptor>>(json!([effort, descriptor])).unwrap()
+        };
+        let choice = |id: &str, default: bool| json!({"id": id, "label": id, "isDefault": default});
+        let ids = |descriptor: &OptionDescriptor| descriptor.options.iter().map(|o| o.id.clone()).collect::<Vec<_>>();
+        let filtered = |descriptors: &[OptionDescriptor]| without_plan_agent(descriptors).into_owned();
+
+        let kept = filtered(&agent(Some("build"), json!([choice("plan", false), choice("build", false)])));
+        assert_eq!((ids(&kept[1]), kept[1].current_value.clone()), (vec!["build".into()], Some(json!("build"))));
+        let defaulted =
+            filtered(&agent(Some("plan"), json!([choice("plan", false), choice("x", false), choice("build", true)])));
+        assert_eq!(defaulted[1].current_value, Some(json!("build")), "a Plan current value falls back to the default");
+        let first = filtered(&agent(None, json!([choice("plan", true), choice("x", false), choice("y", false)])));
+        assert_eq!(first[1].current_value, Some(json!("x")), "with no default left, the first agent");
+        let only_plan = filtered(&agent(Some("plan"), json!([choice("plan", true)])));
+        assert_eq!(only_plan.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(), ["effort"], "an empty select goes");
+        let untouched = agent(None, json!([choice("build", true)]));
+        assert!(matches!(without_plan_agent(&untouched), Cow::Borrowed(_)));
+
+        let selection = |options: Value| ModelSelection {
+            instance_id: "opencode".into(),
+            model: "m".into(),
+            options: serde_json::from_value(options).unwrap(),
+        };
+        let plan = selection(json!([{"id": "effort", "value": "low"}, {"id": "agent", "value": "plan"}]));
+        assert!(selects_plan_agent(&plan));
+        assert!(!selects_plan_agent(&selection(json!([{"id": "agent", "value": "build"}]))));
+        assert_eq!(
+            without_plan_agent_selection(&defaulted, plan.clone()),
+            selection(json!([{"id": "effort", "value": "low"}, {"id": "agent", "value": "build"}])),
+            "the stored Plan agent dispatches as the default agent"
+        );
+        assert_eq!(
+            without_plan_agent_selection(&only_plan, plan),
+            selection(json!([{"id": "effort", "value": "low"}])),
+            "with no agent select left, the agent option goes"
+        );
+        let uncatalogued = selection(json!([{"id": "agent", "value": "plan"}]));
+        assert_eq!(
+            without_plan_agent_selection(&[], uncatalogued),
+            selection(json!(null)),
+            "an uncatalogued model drops it too"
+        );
+        let build = selection(json!([{"id": "agent", "value": "build"}]));
+        assert_eq!(without_plan_agent_selection(&[], build.clone()), build);
     }
 }

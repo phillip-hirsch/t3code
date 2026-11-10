@@ -354,13 +354,8 @@ impl Workspace {
     /// The composer model's effort-column stops.
     fn picker_effort_stops(&self) -> Vec<EffortStop> {
         let Some(current) = self.composer_model() else { return Vec::new() };
-        let descriptors = self
-            .server_info()
-            .model(&current)
-            .and_then(|m| m.capabilities.as_ref())
-            .map(|c| c.option_descriptors.as_slice())
-            .unwrap_or_default();
-        let controls = effort_controls(descriptors, self.picker_driver(Some(&current)), self.composer_ultrathink);
+        let descriptors = self.composer_descriptors(&current);
+        let controls = effort_controls(&descriptors, self.picker_driver(Some(&current)), self.composer_ultrathink);
         effort_stops(&controls, &current)
     }
 
@@ -660,8 +655,8 @@ impl Workspace {
             (Some(selection), None) => selection.model.clone().into(),
             (None, None) => "Choose model".into(),
         };
-        let descriptors =
-            model.and_then(|m| m.capabilities.as_ref()).map(|c| c.option_descriptors.as_slice()).unwrap_or_default();
+        let descriptors = current.as_ref().map(|s| self.composer_descriptors(s)).unwrap_or_default();
+        let descriptors = descriptors.as_ref();
         let ultrathink = model_label::ultrathink_select(descriptors, self.composer_ultrathink)
             .is_some_and(|primary| model_label::reasoning(descriptors).is_some_and(|r| r.id == primary.id));
         let effort = if ultrathink {
@@ -689,9 +684,7 @@ impl Workspace {
     pub(super) fn render_model_picker(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let current = self.composer_model();
         let provider = current.as_ref().and_then(|s| self.server_info().provider(&s.instance_id));
-        let model = current.as_ref().and_then(|s| self.server_info().model(s));
-        let descriptors =
-            model.and_then(|m| m.capabilities.as_ref()).map(|c| c.option_descriptors.as_slice()).unwrap_or_default();
+        let descriptors = current.as_ref().map(|s| self.composer_descriptors(s)).unwrap_or_default();
         let (name, effort, speed, ultracode) = self.trigger_labels();
         let icon = provider.and_then(|p| crate::assets::provider_icon(&p.driver));
         let open = self.composer_picker_open();
@@ -734,7 +727,7 @@ impl Workspace {
                         )
                     }),
             );
-        let body = open.then(|| self.render_picker_body(current.as_ref(), &name, Some(descriptors), t, cx));
+        let body = open.then(|| self.render_picker_body(current.as_ref(), &name, Some(&descriptors), t, cx));
         self.picker_popover(COMPOSER.into(), trigger, Anchor::BottomRight, None, body, cx)
     }
 

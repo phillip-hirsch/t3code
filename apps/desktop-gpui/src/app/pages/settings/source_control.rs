@@ -2011,9 +2011,15 @@ impl Workspace {
                     },
                 ))
                 .when(!mixed, |el| {
-                    el.children(self.traits_picker(traits_id, &selection, cx, move |this, pick, window, cx| {
-                        set(this, pick.to_json(), window, cx);
-                    }))
+                    el.children(self.traits_picker(
+                        traits_id,
+                        &selection,
+                        crate::model_label::selects_plan_agent(&selection),
+                        cx,
+                        move |this, pick, window, cx| {
+                            set(this, pick.to_json(), window, cx);
+                        },
+                    ))
                 })
             })
             .child(switch(&id.into(), on && !switch_mixed, switch_mixed).on_click(cx.listener(
