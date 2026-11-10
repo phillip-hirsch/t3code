@@ -151,8 +151,13 @@ impl Workspace {
             model_label::without_plan_agent(descriptors).into_owned()
         };
         let (selects, toggles) = trait_controls(&descriptors)?;
-        let label = model_label::effort_label(&descriptors, selection).unwrap_or_else(|| "Options".into());
-        let current = selection.clone();
+        // Without the Plan agent on offer, a stored Plan pick reads and saves as the default agent.
+        let current = if include_plan_agent {
+            selection.clone()
+        } else {
+            model_label::without_plan_agent_selection(&descriptors, selection.clone())
+        };
+        let label = model_label::effort_label(&descriptors, &current).unwrap_or_else(|| "Options".into());
         let view = cx.entity();
         let on_pick: OnPick = Rc::new(on_pick);
         Some(

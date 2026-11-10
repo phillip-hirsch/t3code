@@ -239,6 +239,7 @@ impl Workspace {
                 let projection = self.thread.as_ref().and_then(|t| t.state.projection.as_ref());
                 let running = projection.is_some_and(super::super::model::ThreadProjection::is_running);
                 let can_steer = !projection.is_some_and(super::super::model::ThreadProjection::is_compacting);
+                let model = self.dispatch_model();
                 let command = ThreadMessage {
                     thread_id: &thread_id,
                     text: message_text,
@@ -249,7 +250,7 @@ impl Workspace {
                         running,
                         fresh_arm.is_some() || queues(self.follow_up_behavior(), intent, can_steer),
                     ),
-                    model: self.model_override.as_ref(),
+                    model: model.as_ref(),
                     fresh_context: fresh_arm.is_some(),
                 }
                 .command();
@@ -448,7 +449,7 @@ impl Workspace {
                     "attachments": [],
                     "dispatchMode": {"type": "start_immediately"},
                 });
-                if let Some(model) = &self.model_override {
+                if let Some(model) = self.dispatch_model() {
                     message["modelSelection"] = model.to_json();
                 }
                 commands.push(message);

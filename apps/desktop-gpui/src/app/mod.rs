@@ -1036,6 +1036,15 @@ impl Workspace {
         Some(crate::model_label::without_plan_agent_selection(&descriptors, selection))
     }
 
+    /// The model an existing thread's message carries: the composer's pick, else the thread's own
+    /// when it still names the retired Plan agent (the web dispatches it normalized).
+    pub(super) fn dispatch_model(&self) -> Option<ModelSelection> {
+        let stored = self.stored_composer_model()?;
+        (self.model_override.is_some() || crate::model_label::selects_plan_agent(&stored))
+            .then(|| self.composer_model())
+            .flatten()
+    }
+
     /// The options the composer offers for `selection`'s model: never the `opencode` Plan agent.
     fn composer_descriptors(
         &self,
