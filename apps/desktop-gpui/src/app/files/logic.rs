@@ -639,9 +639,33 @@ pub(super) fn list_entries_input(cwd: &str, folder: &str) -> Value {
     json!({"cwd": cwd, "directoryPath": folder})
 }
 
+/// `FileExplorerPane`'s divider keys: `ArrowLeft` widens and `ArrowRight` narrows by 16px, Home and
+/// End jump to the bounds.
+pub(super) fn explorer_key_width(width: f32, min: f32, max: f32, key: &str) -> Option<f32> {
+    let next = match key {
+        "left" => width + 16.,
+        "right" => width - 16.,
+        "home" => min,
+        "end" => max,
+        _ => return None,
+    };
+    Some(next.clamp(min, max))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explorer_divider_keys_resize_within_bounds() {
+        assert_eq!(explorer_key_width(256., 160., 560., "left"), Some(272.));
+        assert_eq!(explorer_key_width(256., 160., 560., "right"), Some(240.));
+        assert_eq!(explorer_key_width(552., 160., 560., "left"), Some(560.));
+        assert_eq!(explorer_key_width(168., 160., 560., "right"), Some(160.));
+        assert_eq!(explorer_key_width(256., 160., 560., "home"), Some(160.));
+        assert_eq!(explorer_key_width(256., 160., 560., "end"), Some(560.));
+        assert_eq!(explorer_key_width(256., 160., 560., "up"), None);
+    }
 
     #[test]
     fn task_checkboxes_toggle_their_own_marker() {

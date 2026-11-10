@@ -710,6 +710,7 @@ impl Workspace {
             let content_width = if explorer_shown { width - explorer_width } else { width };
             let content = self.render_file_content(&key, &tokens, content_width, window, cx);
             let explorer = explorer_shown.then(|| {
+                let ring = tokens.ring;
                 let tree = self.render_tree(&checkout, Some(&path), reveal, window, cx);
                 div()
                     .id("file-explorer")
@@ -728,13 +729,27 @@ impl Workspace {
                     .child(
                         div()
                             .id("file-explorer-resize")
+                            .tab_index(0)
                             .absolute()
                             .top_0()
                             .bottom_0()
                             .left(px(-3.))
                             .w(px(6.))
                             .cursor_col_resize()
-                            .on_drag(ExplorerResize, |_, _, _, cx| cx.new(|_| Empty)),
+                            .focus_visible(move |s| s.bg(ring))
+                            .on_drag(ExplorerResize, |_, _, _, cx| cx.new(|_| Empty))
+                            .on_key_down(cx.listener(move |this, event: &gpui_kit::KeyDownEvent, _, cx| {
+                                let modifiers = &event.keystroke.modifiers;
+                                if modifiers.alt || modifiers.control || modifiers.platform {
+                                    return;
+                                }
+                                let key = event.keystroke.key.as_str();
+                                if let Some(next) = logic::explorer_key_width(explorer_width, EXPLORER_MIN, max, key) {
+                                    this.files.explorer_width = Some(next);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }
+                            })),
                     )
                     .child(tree)
             });
