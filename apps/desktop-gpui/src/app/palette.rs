@@ -2765,7 +2765,7 @@ fn add_project_entry(environments: &[SharedString]) -> AddProjectEntry {
 
 /// `resolveEnvironmentOptionLabel`: this device keeps its own name unless it is a generic
 /// "Local", else reads "This device"; another environment its name, else its id.
-fn environment_option_label(primary: bool, id: &str, label: Option<&str>) -> String {
+pub(super) fn environment_option_label(primary: bool, id: &str, label: Option<&str>) -> String {
     let label = label.map(str::trim).filter(|label| !label.is_empty());
     if primary {
         let generic = |label: &&str| matches!(label.to_lowercase().as_str(), "local" | "local environment");

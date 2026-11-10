@@ -4,6 +4,7 @@ mod app;
 mod assets;
 mod backend;
 mod browser_history;
+mod browser_import;
 mod caret;
 mod composer_edit;
 mod composer_guard;

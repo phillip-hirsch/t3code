@@ -9,8 +9,12 @@ name = "t3-desktop"
 path = "src/main.rs"
 
 [dependencies]
-# Seals saved secrets on macOS and Linux under a key kept in the OS keyring (`secure_storage`).
+# Seals saved secrets on macOS and Linux under a key kept in the OS keyring (`secure_storage`); it
+# also opens Chromium's Windows cookies when importing them (`browser_import`).
 aes-gcm = "0.10"
+# Chromium's macOS and Linux cookies are AES-128-CBC (`browser_import`); aes-gcm already builds both.
+aes = "0.8"
+cbc = "0.1"
 alacritty_terminal = "0.26"
 anyhow = "1"
 async-channel = "2"
@@ -64,6 +68,8 @@ serde = { version = "1", features = ["derive", "rc"] }
 # Objects keep the server's key order, e.g. provider instances in the order they were added.
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
+# Chromium's cookie key is PBKDF2-HMAC-SHA1 (`browser_import`); a dependency already builds it.
+sha1_smol = "1"
 tokio = { version = "1", features = [
   "rt-multi-thread",
   "macros",
@@ -116,7 +122,8 @@ resvg = { version = "0.46", default-features = false, features = ["text", "syste
 
 [target.'cfg(unix)'.dependencies]
 # SIGTERM for the local server on quit (`backend::LocalServer::stop`), through nix's safe `kill`.
-nix = { version = "0.31", default-features = false, features = ["signal"] }
+# The hostname a browser's profile lock names (`browser_import`).
+nix = { version = "0.31", default-features = false, features = ["hostname", "signal"] }
 
 [target.'cfg(not(windows))'.dependencies]
 # The OS keyring that holds `secure_storage`'s key.

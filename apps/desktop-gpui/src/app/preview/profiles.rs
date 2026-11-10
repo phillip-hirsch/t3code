@@ -5,7 +5,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use gpui_kit::{Context, SharedString, Task, Window};
+use gpui_kit::{App, Context, SharedString, Task, Window};
+use gpui_webview::WebView;
 use serde_json::{Value, json};
 
 use crate::app::Workspace;
@@ -44,6 +45,18 @@ impl Storage {
         };
         builder.with_incognito(matches!(self, Self::Incognito))
     }
+
+    /// A hidden view in this storage, to reach its cookies whether or not a tab of it is open.
+    pub(super) fn hidden_view(&self, window: &mut Window, cx: &mut App) -> Result<WebView, String> {
+        let mut context = self.context();
+        let builder = self
+            .builder(context.as_mut())
+            .with_visible(false)
+            // A focused view would take the keyboard focus with it when it is dropped.
+            .with_focused(false)
+            .with_url("about:blank");
+        super::build_view(builder, window, cx).map_err(|error| error.to_string())
+    }
 }
 
 /// What each environment's connection was last sent with `preview.reportProfiles`.
@@ -78,18 +91,7 @@ impl Workspace {
         let servers = self.browser_servers();
         let storage = Storage::of(Some(&profile_id));
         cx.spawn_in(window, async move |_, cx| {
-            // Clears through a hidden view in the profile's storage, which works whether or not a tab of it is open.
-            let view = cx.update(|window, cx| {
-                let mut context = storage.context();
-                let builder = storage
-                    .builder(context.as_mut())
-                    .with_visible(false)
-                    // A focused view would take the keyboard focus with it when it is dropped.
-                    .with_focused(false)
-                    .with_url("about:blank");
-                super::build_view(builder, window, cx)
-            });
-            let view = view.map_err(|error| error.to_string())?.map_err(|error| error.to_string())?;
+            let view = cx.update(|window, cx| storage.hidden_view(window, cx)).map_err(|error| error.to_string())??;
             let desktop = async {
                 view.raw().clear_all_browsing_data().map_err(|error| error.to_string())?;
                 // WebView2 clears in the background and reports nothing back; dropping the view
@@ -136,8 +138,8 @@ impl Workspace {
     }
 }
 
-/// How long a hidden view stays alive after it asked WebView2 to clear its profile.
-const CLEAR_GRACE: Duration = Duration::from_secs(2);
+/// How long a hidden view stays alive after it asked WebView2 to clear or write its profile's data.
+pub(super) const CLEAR_GRACE: Duration = Duration::from_secs(2);
 
 #[cfg(test)]
 mod tests {

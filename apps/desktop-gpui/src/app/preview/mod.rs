@@ -32,9 +32,12 @@ use crate::preview::{self, Appearance, Applied, NavStatus, Session, ThreadPrevie
 use crate::rpc::RpcClient;
 use crate::theme::{self, Tokens};
 
+mod cookie_import;
 mod empty;
 mod profiles;
 mod server;
+
+pub(super) use cookie_import::{ImportOutcome, ImportTarget, cookie_import_denial};
 
 gpui_kit::actions!(preview, [TogglePreview]);
 
@@ -116,6 +119,8 @@ pub(super) struct PreviewState {
     /// Threads whose session list must be (re)fetched.
     stale: HashSet<String>,
     reported_profiles: profiles::ReportedProfiles,
+    /// Settings › Browser's sources to import cookies from, and an import under way.
+    pub(super) cookie_import: cookie_import::CookieImport,
     /// Agent tabs' streams.
     server: server::ServerStreams,
     /// Pages opened per project, for a blank tab's "Recently used".
@@ -157,6 +162,7 @@ impl PreviewState {
             zoom_focus: cx.focus_handle(),
             stale: HashSet::new(),
             reported_profiles: profiles::ReportedProfiles::default(),
+            cookie_import: cookie_import::CookieImport::default(),
             server: Default::default(),
             history: crate::browser_history::BrowserHistory::load(),
             discovery: Default::default(),

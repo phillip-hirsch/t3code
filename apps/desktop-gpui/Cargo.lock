@@ -8468,6 +8468,7 @@ dependencies = [
 name = "t3-desktop-gpui"
 version = "0.1.0"
 dependencies = [
+ "aes 0.8.4",
  "aes-gcm",
  "alacritty_terminal",
  "anyhow",
@@ -8475,6 +8476,7 @@ dependencies = [
  "async-channel",
  "base64 0.22.1",
  "bytes",
+ "cbc 0.1.2",
  "chrono",
  "env_logger",
  "file_icon_provider",
@@ -8506,6 +8508,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha1_smol",
  "sha2 0.10.9",
  "tokio",
  "tokio-tungstenite",

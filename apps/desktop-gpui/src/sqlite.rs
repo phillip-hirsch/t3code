@@ -2,8 +2,11 @@
 //! with their row counts, and a table's rows a page at a time as text. A database opens from its
 //! bytes into memory, so nothing writes the file and a locked or remote file reads the same way.
 //! Queries block; callers run them off the UI thread.
+//!
+//! [`Snapshot`] reads another app's database file, such as a browser's cookie store.
 
 use std::io::Read as _;
+use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 use rusqlite::types::ValueRef;
@@ -148,9 +151,93 @@ impl Database {
     }
 }
 
+/// A private copy of the database at a path, with its write-ahead log, so another app's live
+/// database is never opened or locked and its uncheckpointed writes still read. The copy is
+/// opened query-only with an untrusted schema, and deleted on drop.
+pub(crate) struct Snapshot {
+    // Declared first so it closes before its folder is deleted.
+    connection: Connection,
+    _copy: CopyDir,
+}
+
+impl Snapshot {
+    pub(crate) fn open(path: &Path) -> Result<Self, String> {
+        let name = path.file_name().ok_or_else(|| format!("{} is not a file.", path.display()))?;
+        let copy = CopyDir::new()?;
+        let target = copy.0.join(name);
+        std::fs::copy(path, &target).map_err(|error| error.to_string())?;
+        let wal = with_suffix(path, "-wal");
+        if wal.is_file() {
+            std::fs::copy(&wal, with_suffix(&target, "-wal")).map_err(|error| error.to_string())?;
+        }
+        let connection = Connection::open(&target).map_err(message)?;
+        connection.execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF;").map_err(message)?;
+        Ok(Self { connection, _copy: copy })
+    }
+
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.connection
+    }
+}
+
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// A new folder only this user can read, removed with what SQLite left in it.
+struct CopyDir(PathBuf);
+
+impl CopyDir {
+    fn new() -> Result<Self, String> {
+        let dir = std::env::temp_dir().join(format!("t3code-sqlite-{}", uuid::Uuid::new_v4()));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(&dir).map_err(|error| error.to_string())?;
+        Ok(Self(dir))
+    }
+}
+
+impl Drop for CopyDir {
+    fn drop(&mut self) {
+        if let Ok(entries) = std::fs::read_dir(&self.0) {
+            for entry in entries.flatten() {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+        let _ = std::fs::remove_dir(&self.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshots_read_a_copy_with_its_wal_and_leave_no_copy_behind() {
+        let dir = std::env::temp_dir().join(format!("t3-gpui-snapshot-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Cookies");
+        let live = Connection::open(&path).unwrap();
+        live.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE cookies(name TEXT); INSERT INTO cookies VALUES ('a'), ('b');",
+        )
+        .unwrap();
+        assert!(with_suffix(&path, "-wal").is_file(), "the rows are still in the log");
+
+        let snapshot = Snapshot::open(&path).unwrap();
+        let count: i64 = snapshot.connection().query_row("SELECT count(*) FROM cookies", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 2);
+        assert!(snapshot.connection().execute("DELETE FROM cookies", []).is_err(), "query only");
+        let copy = snapshot._copy.0.clone();
+        drop(snapshot);
+        assert!(!copy.exists(), "the copy is deleted");
+        drop(live);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// A database built by `sql`, as the bytes of its file.
     fn database(sql: &str) -> Vec<u8> {
