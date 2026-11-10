@@ -518,11 +518,13 @@ impl Workspace {
                 let remove = super::attachments::overlay_button(
                     ElementId::Name(format!("queued-attachment-{id}").into()),
                     IconName::X,
-                )
-                .right(px(4.))
-                .top(px(4.))
-                .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
-                .on_click(cx.listener(move |this, _, _, cx| this.remove_queued_attachment(&id, cx)));
+                );
+                // The overlay variant's `focus-visible:ring-white`.
+                let remove = super::chat::ringed_tab_stop(remove, gpui_kit::white())
+                    .right(px(4.))
+                    .top(px(4.))
+                    .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+                    .on_click(cx.listener(move |this, _, _, cx| this.remove_queued_attachment(&id, cx)));
                 Some(
                     div()
                         .relative()
@@ -810,8 +812,12 @@ pub(super) fn toggle_row(
     let this = this.clone();
     let label = if expanded { "Show fewer".to_owned() } else { format!("Show all {total} queued") };
     let chevron = if expanded { IconName::ChevronUp } else { IconName::ChevronDown };
+    // `InlineButton`'s `focus-visible:outline-2 outline-ring`.
+    let outline = gpui_kit::BoxShadow::new(px(0.), px(0.), t.ring).spread_radius(px(2.));
     let button = h_flex()
         .id("queue-toggle")
+        .tab_index(0)
+        .focus_visible(move |s| s.shadow(vec![outline]))
         .gap(px(4.))
         .cursor_pointer()
         .text_xs()
@@ -826,7 +832,8 @@ pub(super) fn toggle_row(
     h_flex().w_full().justify_end().pr(px(4.)).pb(px(16.)).child(button).into_any_element()
 }
 
-/// `Button size="xs" variant="ghost-muted"` with an optional leading icon.
+/// `Button size="xs" variant="ghost-muted"` with an optional leading icon; unless disabled, a
+/// tab stop that Enter and Space click (`focus-visible:ring-2 ring-inset ring-ring`).
 fn text_button(
     id: String,
     icon: Option<IconName>,
@@ -849,12 +856,14 @@ fn text_button(
             if disabled {
                 el.opacity(0.64)
             } else {
-                el.cursor_pointer().hover(|s| s.bg(t.accent).text_color(t.foreground))
+                super::chat::ringed_tab_stop(el, t.ring)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(t.accent).text_color(t.foreground))
             }
         })
 }
 
-/// `Button size="icon-xs" variant="ghost-muted"`.
+/// `Button size="icon-xs" variant="ghost-muted"`, a tab stop unless disabled.
 fn icon_button(id: String, icon: IconName, disabled: bool, t: &Tokens) -> gpui_kit::Stateful<gpui_kit::Div> {
     div()
         .id(ElementId::Name(id.into()))
@@ -870,7 +879,9 @@ fn icon_button(id: String, icon: IconName, disabled: bool, t: &Tokens) -> gpui_k
             if disabled {
                 el.opacity(0.64)
             } else {
-                el.cursor_pointer().hover(|s| s.bg(t.accent).text_color(t.foreground))
+                super::chat::ringed_tab_stop(el, t.ring)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(t.accent).text_color(t.foreground))
             }
         })
 }
