@@ -34,7 +34,8 @@ pub(super) struct SubagentUi {
     approvals: Vec<ChildApproval>,
     /// Children whose projection is being read, by fetch key.
     fetching: HashSet<String>,
-    responding: Option<String>,
+    /// Approvals whose answer is in flight, by child and request, each on its own like the web's cards.
+    responding: HashSet<(ScopedId, String)>,
     _fetches: Vec<Task<()>>,
     _status_tick: Option<Task<()>>,
 }
@@ -143,10 +144,11 @@ impl Workspace {
 
     fn respond_to_child(&mut self, thread: ScopedId, request_id: String, decision: String, cx: &mut Context<Self>) {
         let Some(client) = self.env_client(&thread.env) else { return };
-        if self.subagents.responding.is_some() || !self.can_operate(&thread.env) {
+        let answering = (thread.clone(), request_id.clone());
+        if self.subagents.responding.contains(&answering) || !self.can_operate(&thread.env) {
             return;
         }
-        self.subagents.responding = Some(request_id.clone());
+        self.subagents.responding.insert(answering.clone());
         if let Some(entry) = self.subagents.approvals.iter_mut().find(|e| e.thread == thread) {
             entry.error = None;
         }
@@ -156,7 +158,7 @@ impl Workspace {
         cx.spawn(async move |this, cx| {
             let result = client.request("orchestration.dispatchCommand", command).await;
             let _ = this.update(cx, |this, cx| {
-                this.subagents.responding = None;
+                this.subagents.responding.remove(&answering);
                 if let Some(entry) = this.subagents.approvals.iter_mut().find(|e| e.thread == thread) {
                     match result {
                         Err(error) => entry.error = Some(error.to_string().into()),
@@ -215,7 +217,8 @@ impl Workspace {
                 },
             );
         let live = request.is_live();
-        let enabled = live && self.subagents.responding.is_none() && self.can_operate(&entry.thread.env);
+        let answering = (entry.thread.clone(), request.id.clone());
+        let enabled = live && !self.subagents.responding.contains(&answering) && self.can_operate(&entry.thread.env);
         let mut actions = h_flex().flex_wrap().items_center().gap(px(8.)).text_xs();
         for (decision, label) in options.iter().filter(|(d, _)| d == "decline" || d == "accept") {
             let (thread, request_id, decision) = (entry.thread.clone(), request.id.clone(), decision.clone());
