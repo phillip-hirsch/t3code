@@ -139,6 +139,16 @@ impl PageSource {
     }
 }
 
+/// The URL a tab's page is rebuilt at: the live page's own (WebKit without the Navigation API
+/// never reports a pushState), else the one the status names (a failed or unfinished load).
+fn rebuild_url(status: &NavStatus, native: Option<String>) -> Option<String> {
+    let native = native.filter(|url| !url.is_empty() && url != "about:blank");
+    match status {
+        NavStatus::Success { .. } => native.or_else(|| status.url().map(str::to_owned)),
+        _ => status.url().map(str::to_owned).or(native),
+    }
+}
+
 impl HostedTab {
     fn loading(&self) -> bool {
         matches!(self.status, NavStatus::Loading { .. })
@@ -957,7 +967,7 @@ impl Workspace {
     /// What `tab`'s view would be built from now: its profile and the page it is on.
     fn page_source(&self, tab: &TabRef, cx: &App) -> Option<PageSource> {
         let hosted = self.preview.tabs.get(tab)?;
-        let url = hosted.status.url().map(str::to_owned).or_else(|| hosted.view.read(cx).raw().url().ok())?;
+        let url = rebuild_url(&hosted.status, hosted.view.read(cx).raw().url().ok())?;
         let session = self.preview.threads.session(tab);
         Some(PageSource {
             storage: profiles::Storage::of(session.and_then(|s| s.profile_id.as_deref())),
@@ -1765,4 +1775,31 @@ fn page_builder<'a>(
             let _ = sender.try_send(PageEvent::OpenLink(url));
             wry::NewWindowResponse::Deny
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_page_is_rebuilt_where_it_is() {
+        let (old, pushed) = ("https://app.test/a".to_owned(), "https://app.test/b".to_owned());
+        let success = NavStatus::Success { url: old.clone(), title: String::new() };
+        // A pushState the status never heard of.
+        assert_eq!(rebuild_url(&success, Some(pushed.clone())), Some(pushed.clone()));
+        assert_eq!(rebuild_url(&success, None), Some(old.clone()));
+        assert_eq!(rebuild_url(&success, Some("about:blank".to_owned())), Some(old.clone()));
+        // A failed load retries its own URL, not the page it failed from.
+        let failed = NavStatus::LoadFailed {
+            url: old.clone(),
+            title: String::new(),
+            code: -105,
+            description: String::new(),
+            download: None,
+        };
+        assert_eq!(rebuild_url(&failed, Some(pushed.clone())), Some(old.clone()));
+        let loading = NavStatus::Loading { url: old.clone(), title: String::new() };
+        assert_eq!(rebuild_url(&loading, Some(pushed.clone())), Some(old));
+        assert_eq!(rebuild_url(&NavStatus::Idle, Some(pushed.clone())), Some(pushed));
+    }
 }
