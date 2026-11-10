@@ -326,8 +326,8 @@ impl Workspace {
                 let group: SharedString = format!("preview-recent-{}", entry.url).into();
                 let (open, remove) = (entry.url.clone(), entry.url.clone());
                 let history_thread = thread.clone();
-                h_flex()
-                    .id(ElementId::Name(group.clone()))
+                let ring = focus_ring(tokens);
+                focusable(h_flex().id(ElementId::Name(group.clone())), tokens)
                     .group(group.clone())
                     .relative()
                     .w_full()
@@ -341,14 +341,17 @@ impl Workspace {
                     .child(favicon())
                     .child(text_block(title.into(), detail.into()))
                     .child(
+                        // Faded, not hidden: GPUI skips a hidden element's focus, so Tab could never reveal it.
                         div()
                             .id(ElementId::Name(format!("{group}-remove").into()))
+                            .tab_index(0)
+                            .focus_visible(move |s| s.opacity(1.).shadow(vec![ring]))
                             .absolute()
                             .right(px(12.))
                             .p_1()
                             .rounded(px(4.))
-                            .invisible()
-                            .group_hover(group, gpui_kit::Styled::visible)
+                            .opacity(0.)
+                            .group_hover(group, |s| s.opacity(1.))
                             .text_color(tokens.muted_foreground)
                             .hover(|s| s.bg(tokens.accent).text_color(tokens.foreground))
                             .tooltip(move |window, cx| {
@@ -372,21 +375,23 @@ impl Workspace {
             .iter()
             .map(|server| {
                 let url = server.url.clone();
-                h_flex()
-                    .id(ElementId::Name(format!("preview-server-{}:{}", server.host, server.port).into()))
-                    .w_full()
-                    .gap_3()
-                    .px_3()
-                    .py_3()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(tokens.accent.opacity(0.4)))
-                    .on_click(cx.listener(move |this, _, window, cx| this.open_in_blank_tab(url.clone(), window, cx)))
-                    .child(favicon())
-                    .child(text_block(
-                        server.process_name.clone().unwrap_or_else(|| "Listening".into()).into(),
-                        format!("{}:{}", server.host, server.port).into(),
-                    ))
-                    .into_any_element()
+                focusable(
+                    h_flex().id(ElementId::Name(format!("preview-server-{}:{}", server.host, server.port).into())),
+                    tokens,
+                )
+                .w_full()
+                .gap_3()
+                .px_3()
+                .py_3()
+                .cursor_pointer()
+                .hover(|s| s.bg(tokens.accent.opacity(0.4)))
+                .on_click(cx.listener(move |this, _, window, cx| this.open_in_blank_tab(url.clone(), window, cx)))
+                .child(favicon())
+                .child(text_block(
+                    server.process_name.clone().unwrap_or_else(|| "Listening".into()).into(),
+                    format!("{}:{}", server.host, server.port).into(),
+                ))
+                .into_any_element()
             })
             .collect();
         div()
@@ -688,6 +693,16 @@ impl Workspace {
         })
         .detach();
     }
+}
+
+/// A `<button>` row: a Tab stop that Enter and Space click, with `focus-visible:ring-2 ring-inset ring-ring`.
+fn focusable(element: gpui_kit::Stateful<gpui_kit::Div>, tokens: &Tokens) -> gpui_kit::Stateful<gpui_kit::Div> {
+    let ring = focus_ring(tokens);
+    element.tab_index(0).focus_visible(move |s| s.shadow(vec![ring]))
+}
+
+fn focus_ring(tokens: &Tokens) -> gpui_kit::BoxShadow {
+    gpui_kit::BoxShadow::new(px(0.), px(0.), tokens.ring).spread_radius(px(2.)).inset()
 }
 
 /// `formatRelativeElapsed`.
