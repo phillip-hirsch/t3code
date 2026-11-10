@@ -56,7 +56,7 @@ impl Workspace {
 
     /// Searches the server for the box's query in the filter's projects, unless that search
     /// already ran.
-    pub(super) fn refresh_sidebar_search(&mut self, cx: &mut Context<Self>) {
+    pub(in crate::app) fn refresh_sidebar_search(&mut self, cx: &mut Context<Self>) {
         let query = self.sidebar.search.read(cx).value().to_string();
         let projects = self.scoped_projects().map(|scoped| super::older_settled::search_projects(&scoped));
         self.search_messages(query, SearchScope { projects, labels: None }, Self::sidebar_messages, cx);

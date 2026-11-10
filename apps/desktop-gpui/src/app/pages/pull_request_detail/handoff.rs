@@ -191,8 +191,9 @@ impl Workspace {
         self.pull_requests.panel.as_ref().is_some_and(|p| p.handoff.is_some())
     }
 
-    fn set_pr_handoff(&mut self, kind: Option<String>) {
-        if let Some(panel) = self.pull_requests.panel.as_mut() {
+    /// Marks the handoff of the pull request `key` names, shown or parked in its tab.
+    fn set_pr_handoff(&mut self, key: &str, kind: Option<String>) {
+        if let Some(panel) = self.pr_panel(key) {
             panel.handoff = kind;
         }
     }
@@ -272,7 +273,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(detail) = self.pull_requests.panel.as_ref().and_then(|p| p.detail.clone()) else { return };
+        let Some(panel) = self.pull_requests.panel.as_ref() else { return };
+        let (Some(detail), key) = (panel.detail.clone(), panel.reference.key()) else { return };
         if self.pr_handoff_busy() {
             return;
         }
@@ -298,8 +300,9 @@ impl Workspace {
             task,
             mode,
         };
-        self.set_pr_handoff(Some(kind));
-        self.prepare_pr_checkout(request, |this| this.set_pr_handoff(None), window, cx);
+        self.set_pr_handoff(&key, Some(kind));
+        // The tab that started it settles, though another may be shown by then.
+        self.prepare_pr_checkout(request, move |this| this.set_pr_handoff(&key, None), window, cx);
     }
 
     /// `startHandoff`'s checkout: a new draft in the project, the pull request checked out for it,
@@ -307,7 +310,7 @@ impl Workspace {
     pub(in crate::app) fn prepare_pr_checkout(
         &mut self,
         request: CheckoutRequest,
-        settled: fn(&mut Workspace),
+        settled: impl FnOnce(&mut Workspace) + 'static,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {

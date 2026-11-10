@@ -107,6 +107,9 @@ impl Workspace {
             let seed = self.pull_requests.entry_for(reference);
             self.open_pull_request_panel(reference.clone(), seed, cx);
             self.follow_pull_requests(cx);
+        } else {
+            // The surface shows its pull request again after a socket came up while it was away.
+            self.read_unread_shown_pr(cx);
         }
         let thread = self.open_thread_shell().map(|shell| PanelThread {
             id: shell.id.clone(),

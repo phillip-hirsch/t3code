@@ -343,6 +343,7 @@ impl Workspace {
             self.subscribe_shell(environment_id, window, cx);
         }
         self.sync_pull_request_refreshes(cx);
+        self.rerun_searches_on_reconnect(cx);
     }
 
     /// A config that never comes must not keep the thread list away: the shell subscribes
@@ -434,6 +435,7 @@ impl Workspace {
                 this.sync_draft_workspace(cx);
                 this.sync_lineage_titles(cx);
                 this.sync_older_settled_counts(&batch_id, cx);
+                this.rerun_message_searches(cx);
             },
         );
         if let Some(session) = self.session_mut(&environment_id) {

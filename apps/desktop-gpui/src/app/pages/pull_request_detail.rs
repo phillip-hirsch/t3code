@@ -94,6 +94,9 @@ pub(in crate::app) struct Panel {
     activity_error: Option<SharedString>,
     detail_loading: bool,
     activity_loading: bool,
+    /// The sockets the detail and the guide were last asked on (see [`Panel::needs_detail_read`]).
+    detail_read_on: Option<crate::rpc::SocketId>,
+    guide_read_on: Option<crate::rpc::SocketId>,
     refreshing: bool,
     tab: Tab,
     timeline_newest: bool,
@@ -178,6 +181,8 @@ impl Panel {
             activity_error: None,
             detail_loading: false,
             activity_loading: false,
+            detail_read_on: None,
+            guide_read_on: None,
             refreshing: false,
             tab: Tab::Summary,
             timeline_newest: true,
@@ -234,6 +239,20 @@ impl Panel {
 
     pub(super) fn reference(&self) -> &Reference {
         &self.reference
+    }
+
+    /// Whether to read the detail on `socket`: none has landed and none runs, and a failure stands
+    /// until a new socket, as the web's queries rerun when their session changes.
+    fn needs_detail_read(&self, socket: &crate::rpc::SocketId) -> bool {
+        self.detail.is_none() && !self.detail_loading && self.detail_read_on.as_ref() != Some(socket)
+    }
+
+    /// [`Self::needs_detail_read`] for the guide, while its tab shows.
+    fn needs_guide_read(&self, socket: &crate::rpc::SocketId) -> bool {
+        self.tab == Tab::Guide
+            && self.guide.is_none()
+            && !self.guide_loading
+            && self.guide_read_on.as_ref() != Some(socket)
     }
 
     fn set_activity(&mut self, activity: Activity) {
@@ -510,7 +529,7 @@ impl Workspace {
     fn read_pr_reads_of(&mut self, key: &str, detail: bool, cx: &mut Context<Self>) {
         let Some(client) = self.pull_request_client_of(key) else { return };
         let Some(panel) = self.pr_panel_ref(key) else { return };
-        let reference = panel.reference.to_json();
+        let (reference, socket) = (panel.reference.to_json(), client.socket_id());
         let mut detail_input = reference.clone();
         detail_input["allowStale"] = json!(false);
         let (detail_client, detail_key, key) = (client.clone(), key.to_owned(), key.to_owned());
@@ -577,6 +596,7 @@ impl Workspace {
         let Some(panel) = self.pr_panel(&key) else { return };
         if detail {
             panel.detail_loading = true;
+            panel.detail_read_on = Some(socket);
             panel._detail_read = detail_read;
         }
         panel.activity_loading = true;
