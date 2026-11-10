@@ -462,7 +462,7 @@ pub(super) struct RightPanel {
     revealed_tab: Option<(Target, Surface, usize)>,
     observation: Option<Observation>,
     /// The pull request each thread showed at the last read (`observedThreadPullRequests`).
-    observed_pull_requests: HashMap<String, Option<crate::pull_request_detail::Reference>>,
+    observed_pull_requests: HashMap<Target, Option<crate::pull_request_detail::Reference>>,
     /// The branch diff's picked comparison target per thread; none is Automatic.
     base_refs: HashMap<Target, String>,
     base_picker: diff_base::BasePicker,
@@ -1152,13 +1152,11 @@ impl Workspace {
             self.right_panel.observation = None;
             return;
         };
-        let Target::Thread { id: thread_id, .. } = &target else { return };
-        let thread_id = thread_id.clone();
         let revision = self.right_panel.panels.get(&target).map_or(0, |panel| panel.user_revision);
         let projection = self.open_projection();
         let running = projection.and_then(ThreadProjection::interruptible_run).map(|run| run.id.clone());
-        let mut observation = observe(self.right_panel.observation.as_ref(), &thread_id, running.as_deref(), revision);
-        let pull_requests = self.observe_proactive_pull_requests(&thread_id, &mut observation, cx);
+        let mut observation = observe(self.right_panel.observation.as_ref(), &target, running.as_deref(), revision);
+        let pull_requests = self.observe_proactive_pull_requests(&target, &mut observation, cx);
         let projection = self.open_projection();
         let Some(projection) = projection else {
             self.right_panel.observation = Some(observation);
@@ -1199,12 +1197,12 @@ impl Workspace {
     /// open (the list when there are several). `true` while the thread has any.
     fn observe_proactive_pull_requests(
         &mut self,
-        thread_id: &str,
+        target: &Target,
         observation: &mut Observation,
         cx: &mut Context<Self>,
     ) -> bool {
         let linked = self.thread_pull_request_target();
-        let previous = self.right_panel.observed_pull_requests.insert(thread_id.to_owned(), linked.clone()).flatten();
+        let previous = self.right_panel.observed_pull_requests.insert(target.clone(), linked.clone()).flatten();
         let shown = self.active_surface().cloned();
         // `shouldRetargetThreadPullRequestPanel`.
         let follow = match (&previous, &linked, &shown) {
@@ -1220,9 +1218,8 @@ impl Workspace {
             self.proactive_panels_enabled() && key.is_some() && observation.target_key.as_ref() != Some(&key);
         observation.target_key = Some(key.clone());
         let revision = observation.revision;
-        let Some(target) = self.thread_target(thread_id) else { return false };
         // This runs on every thread update; only a tab it opens is saved.
-        let panel = self.right_panel.panels.entry(target).or_default();
+        let panel = self.right_panel.panels.entry(target.clone()).or_default();
         let mut changed = false;
         if let (true, Some(linked)) = (follow, &linked) {
             changed |= panel.open_proactive(Surface::PullRequest(linked.clone()), revision, true);
@@ -3227,7 +3224,8 @@ fn workspace_mutation_id(
 /// What the proactive panel last saw of the open thread (`ProactivePanelObservation`).
 #[derive(Clone, Debug, PartialEq)]
 struct Observation {
-    thread_id: String,
+    /// The thread, with its environment (`scopedThreadKey`).
+    thread: Target,
     /// The running turn at the last read; `None` before the first, when a just-completed turn still opens.
     running: Option<Option<String>>,
     /// The turn the user's last panel choice belongs to.
@@ -3240,11 +3238,11 @@ struct Observation {
 
 /// `observeProactivePanelUserChoice`: a panel choice made since the thread opened or its
 /// current turn started outranks a proactive open.
-fn observe(previous: Option<&Observation>, thread_id: &str, running: Option<&str>, revision: u64) -> Observation {
-    let same = previous.filter(|previous| previous.thread_id == thread_id);
+fn observe(previous: Option<&Observation>, thread: &Target, running: Option<&str>, revision: u64) -> Observation {
+    let same = previous.filter(|previous| &previous.thread == thread);
     let new_turn = same.is_some_and(|previous| running.is_some() && running != previous.user_turn.as_deref());
     Observation {
-        thread_id: thread_id.to_owned(),
+        thread: thread.clone(),
         running: same.and_then(|previous| previous.running.clone()),
         user_turn: running.map(str::to_owned).or_else(|| same.and_then(|previous| previous.user_turn.clone())),
         target_key: same.and_then(|previous| previous.target_key.clone()),
@@ -3905,7 +3903,8 @@ mod tests {
     #[test]
     fn a_completed_turn_opens_its_diff_once_unless_the_user_chose_a_panel() {
         // The turn runs, then settles: the diff opens for a big enough checkpoint.
-        let running = observe(None, "t", Some("r1"), 0);
+        let thread = |env: &str| Target::Thread { env: env.to_owned().into(), id: "t".into() };
+        let running = observe(None, &thread("a"), Some("r1"), 0);
         assert_eq!((running.revision, running.user_turn.as_deref()), (0, Some("r1")));
         let previous = Some(Some("r1"));
         assert!(turn_just_completed(previous, None, "r1", true));
@@ -3936,9 +3935,12 @@ mod tests {
         assert!(!panel.open && panel.proactive_diff_run.as_deref() == Some("r2"));
 
         // A choice before the next turn starts is superseded once it runs.
-        let next = observe(Some(&running), "t", Some("r3"), 1);
+        let next = observe(Some(&running), &thread("a"), Some("r3"), 1);
         assert_eq!(next.revision, 1);
-        assert_eq!(observe(Some(&next), "t", None, 2).revision, 1, "choices during the turn still count");
+        assert_eq!(observe(Some(&next), &thread("a"), None, 2).revision, 1, "choices during the turn still count");
+        // The same thread id on another environment is another thread.
+        let other = observe(Some(&next), &thread("b"), None, 2);
+        assert_eq!((other.revision, other.running, other.user_turn), (2, None, None));
     }
 
     #[test]
