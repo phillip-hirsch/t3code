@@ -106,9 +106,10 @@ impl Workspace {
     /// `discardComposerDraft`: clears the draft and offers to undo it.
     pub(super) fn discard_draft(&mut self, target: Target, window: &mut Window, cx: &mut Context<Self>) {
         let on_screen = self.target.as_ref() == Some(&target);
-        let (prompt, attachments, records) = if let Some(question) = self.question.as_mut().filter(|_| on_screen) {
-            // The editor holds the question's answer; the prompt waits in the card.
-            take_parked(question)
+        let (prompt, attachments, records) = if on_screen && !self.composer_holds_prompt(&target) {
+            // A question card or queued message's edit holds the editor; the prompt waits beside it.
+            let Some((prompt, attachments, records)) = self.set_aside_prompt(&target) else { return };
+            (std::mem::take(prompt), std::mem::take(attachments), std::mem::take(records))
         } else if on_screen {
             let prompt = self.composer.read(cx).value().to_string();
             let attachments = std::mem::take(&mut self.attachments);
@@ -140,8 +141,13 @@ impl Workspace {
     pub(super) fn restore_discarded(&mut self, discarded: Discarded, window: &mut Window, cx: &mut Context<Self>) {
         let Discarded { target, prompt, attachments, records } = discarded;
         let on_screen = self.target.as_ref() == Some(&target);
-        let fresh = match self.question.as_ref().filter(|_| on_screen) {
-            Some(question) => !question.prompt.trim().is_empty() || !question.prompt_attachments.is_empty(),
+        let held = on_screen && !self.composer_holds_prompt(&target);
+        let set_aside = match &self.question {
+            Some(question) => Some((question.prompt.as_str(), question.prompt_attachments.as_slice())),
+            None => self.queue_edit_draft().map(|(prompt, attachments, _)| (prompt, attachments)),
+        };
+        let fresh = match set_aside.filter(|_| held) {
+            Some((prompt, attachments)) => !prompt.trim().is_empty() || !attachments.is_empty(),
             None if on_screen => !self.composer.read(cx).value().trim().is_empty() || !self.attachments.is_empty(),
             None => self.composer_drafts.get(&target).is_some_and(ComposerDraft::has_content),
         };
@@ -150,8 +156,10 @@ impl Workspace {
             cx.notify();
             return;
         }
-        if let Some(question) = self.question.as_mut().filter(|_| on_screen) {
-            (question.prompt, question.prompt_attachments, question.prompt_records) = (prompt, attachments, records);
+        if held {
+            if let Some((held_prompt, held_attachments, held_records)) = self.set_aside_prompt(&target) {
+                (*held_prompt, *held_attachments, *held_records) = (prompt, attachments, records);
+            }
         } else if on_screen {
             self.attachments = attachments;
             self.context.records = records;
