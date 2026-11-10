@@ -12,7 +12,7 @@ use gpui_kit::{
 };
 
 use super::actions::UndoAction;
-use super::{ROW_GROUP, icon, project_icon, row_id, text_sm, text_xs, tooltip};
+use super::{NavRow, ROW_GROUP, icon, project_icon, row_id, text_sm, text_xs, tooltip};
 use crate::app::composer::ComposerDraft;
 use crate::app::{Target, Workspace};
 use crate::model::{ProjectShell, ScopedId, ThreadShell};
@@ -184,8 +184,17 @@ impl Workspace {
         cx.notify();
     }
 
+    /// A row's Discard draft button: a keyboard press leaves focus on the list, not on the gone button.
+    pub(super) fn discard_row_draft(&mut self, target: Target, window: &mut Window, cx: &mut Context<Self>) {
+        let from_keyboard = self.sidebar.row_control.is_focused(window);
+        self.discard_draft(target, window, cx);
+        if from_keyboard {
+            self.sidebar.list_focus.focus(window, cx);
+        }
+    }
+
     /// The draft row's right-click menu (`buildDraftActionMenuItems`).
-    fn draft_menu(
+    pub(super) fn draft_menu(
         &self,
         project: Option<&ProjectShell>,
         row: &DraftRow,
@@ -244,6 +253,9 @@ impl Workspace {
         let key = row.project.clone();
         let target = row.target.clone();
         let draft_id = row.target.draft_id().map(ToString::to_string).unwrap_or_default();
+        // The keyboard row's button takes Tab from the list and shows while focused (`focus-visible`).
+        let keyboard = self.sidebar.ring_row.as_ref() == Some(&NavRow::Draft(target.clone()));
+        let ring = crate::app::chat::focus_ring(tokens);
         let discard = div()
             .id(row_id("draft-discard", &key.env, &draft_id))
             .flex()
@@ -251,14 +263,22 @@ impl Workspace {
             .px(px(4.))
             .rounded(px(6.))
             .cursor_pointer()
-            .invisible()
-            .group_hover(ROW_GROUP, gpui_kit::Styled::visible)
+            .map(|el| {
+                if keyboard {
+                    el.track_focus(&self.sidebar.row_control)
+                        .opacity(0.)
+                        .focus_visible(move |s| s.opacity(1.).shadow(vec![ring]))
+                        .group_hover(ROW_GROUP, |s| s.opacity(1.))
+                } else {
+                    el.invisible().group_hover(ROW_GROUP, gpui_kit::Styled::visible)
+                }
+            })
             .text_color(tokens.muted_foreground)
             .hover(|s| s.text_color(tokens.foreground))
             .tooltip(tooltip("Discard draft"))
             .on_click(cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
-                this.discard_draft(target.clone(), window, cx);
+                this.discard_row_draft(target.clone(), window, cx);
             }))
             .child(Icon::new(IconName::X).size(px(12.)));
         let open = row.target.clone();

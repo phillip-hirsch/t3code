@@ -125,7 +125,7 @@ impl Workspace {
                         pull_requests,
                     };
                     let found = search::match_thread(&tokens, &subject, typos)?;
-                    let used = search::ThreadUse::of(thread, self.local_opened_at(&thread.id));
+                    let used = search::ThreadUse::of(thread, self.local_opened_at(thread));
                     let score = found.quality * used.boost(now);
                     Some((*at, found, score))
                 })

@@ -121,7 +121,9 @@ impl Workspace {
             Some(Target::Thread { .. }) => {
                 self.thread.as_ref()?.state.projection.as_ref().and_then(|p| p.thread.worktree_path.clone())
             }
-            Some(Target::Draft { project_id, .. }) => self.draft_reused_worktree(project_id),
+            Some(Target::Draft { .. }) => {
+                self.draft_workspace.existing_worktree(self.target.as_ref()).map(str::to_owned)
+            }
             None => None,
         };
         worktree.or_else(|| self.target_project().map(|p| p.workspace_root.clone()))

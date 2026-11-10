@@ -978,10 +978,11 @@ impl Workspace {
             self.landed = true;
             if self.target.is_none()
                 && !self.welcome_owns_home()
-                && let Some(project_id) =
-                    crate::inbox::most_recent_project(&self.shell.projects, &self.shell.threads).map(|p| p.id.clone())
+                && let Some((env, project_id)) =
+                    crate::inbox::most_recent_project(&self.shell.projects, &self.shell.threads)
+                        .map(|p| (p.environment_id.clone(), p.id.clone()))
             {
-                self.start_draft(project_id, window, cx);
+                self.start_draft_in(env, project_id, window, cx);
             }
         }
         if self.welcome_owns_home() {
@@ -1119,7 +1120,9 @@ impl Workspace {
         if let Some(thread) = self.preview_thread() {
             self.load_previews(thread, window, cx);
         }
-        self.open_visit(&thread_id, cx);
+        if let Some(thread) = self.target.as_ref().and_then(Target::thread_key) {
+            self.open_visit(thread, cx);
+        }
         self.focus_composer(window, cx);
         self.notify_sidebar(cx);
         cx.notify();
@@ -1276,9 +1279,9 @@ impl Workspace {
             Some(Target::Thread { .. }) => {
                 self.thread.as_ref()?.state.projection.as_ref()?.thread.model_selection.clone()
             }
-            Some(Target::Draft { project_id, .. }) => {
-                let default =
-                    self.server_info().new_thread_model(self.shell.projects.iter().find(|p| &p.id == project_id))?;
+            Some(Target::Draft { env, project_id, .. }) => {
+                let project = self.shell.project(&ScopedId::new(env.clone(), project_id.as_str()));
+                let default = self.server_info().new_thread_model(project)?;
                 Some(self.draft_usage_fallback(&default).map_or(default, |fallback| fallback.selection))
             }
             None => None,
@@ -1311,11 +1314,11 @@ impl Workspace {
             return Some(selection.clone());
         }
         match self.target.as_ref()? {
-            Target::Thread { id, .. } => {
-                self.shell.threads.iter().find(|thread| &thread.id == id)?.model_selection.clone()
+            Target::Thread { env, id } => {
+                self.shell.thread(&ScopedId::new(env.clone(), id.as_str()))?.model_selection.clone()
             }
-            Target::Draft { project_id, .. } => {
-                let project = self.shell.projects.iter().find(|p| &p.id == project_id);
+            Target::Draft { env, project_id, .. } => {
+                let project = self.shell.project(&ScopedId::new(env.clone(), project_id.as_str()));
                 crate::new_thread::draft_carried_model(self.server_info(), project, crate::timestamp::now_ms())
             }
         }
@@ -1345,7 +1348,7 @@ impl Workspace {
             let Some(run) = projection.interruptible_run() else { return };
             json!({"type": "run.interrupt", "commandId": new_id(), "threadId": thread_id, "runId": run.id, "holdQueue": true})
         };
-        self.dispatch_on(client, vec![command], cx);
+        self.dispatch_in_order(client, vec![command], cx);
     }
 
     /// `runtime-request.respond` for the open thread; `response` holds `decision`, `feedback` or `answers`.
@@ -1395,18 +1398,14 @@ impl Workspace {
     }
 
     fn dispatch(&mut self, command: Value, cx: &mut Context<Self>) {
-        self.dispatch_in_order(vec![command], cx);
+        let Some(client) = self.command_client(&command) else { return };
+        self.dispatch_in_order(client, vec![command], cx);
     }
 
-    /// Dispatches dependent commands one after another, stopping at the first failure.
-    fn dispatch_in_order(&mut self, commands: Vec<Value>, cx: &mut Context<Self>) {
-        let Some(client) = commands.first().and_then(|command| self.command_client(command)) else { return };
-        self.dispatch_on(client, commands, cx);
-    }
-
-    /// [`Self::dispatch_in_order`] on `client`, the socket of the environment the commands' thread
-    /// lives on, for callers that know it: a bare thread id can name a thread on two environments.
-    fn dispatch_on(&mut self, client: RpcClient, commands: Vec<Value>, cx: &mut Context<Self>) {
+    /// Dispatches dependent commands one after another on `client`, the socket of the environment
+    /// the commands' thread lives on (a bare thread id can name a thread on two environments),
+    /// stopping at the first failure.
+    fn dispatch_in_order(&mut self, client: RpcClient, commands: Vec<Value>, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             for command in commands {
                 if let Err(error) = client.request("orchestration.dispatchCommand", command).await {

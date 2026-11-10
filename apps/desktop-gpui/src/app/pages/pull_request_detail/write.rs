@@ -115,6 +115,8 @@ struct Picker {
     kind: PickerKind,
     search: Entity<InputState>,
     candidates: Option<Result<Value, String>>,
+    /// The candidates read in flight; a newer read replaces it, so an older answer never lands last.
+    _candidates: Option<Task<()>>,
     pending: Option<String>,
     /// The reviewer query once typing settles.
     debounced: String,
@@ -122,6 +124,8 @@ struct Picker {
     /// The host's answers past the first page, by query (`reviewerSearch`), and those in flight.
     searches: HashMap<String, Result<Value, String>>,
     searching: HashSet<String>,
+    /// Bumped when a pick makes the searches stale, so one still in flight is dropped.
+    searches_epoch: u64,
     /// The candidate the arrow keys rest on, which Enter picks; the first after each keystroke.
     highlight: Option<usize>,
     scroll: ScrollHandle,
@@ -147,7 +151,10 @@ pub(super) struct WriteState {
     replies: HashMap<String, Entity<TextareaState>>,
     editing: Option<Editing>,
     saving: bool,
-    thread_pending: bool,
+    /// The title's own save, apart from the description's and comments' (`PullRequestTitleEditor`).
+    title_saving: bool,
+    /// Conversations whose resolve or reply is in flight, each on its own like the web's cards.
+    thread_pending: HashSet<String>,
     /// Reactions pressed and not yet read back, by subject and content.
     pub(super) reactions: HashMap<(String, String), bool>,
     reaction_picker: Option<String>,
@@ -225,6 +232,11 @@ fn summary_shortcut_verdict(
 /// Forgejo needs a summary to request changes (`reviewSummaryRequired`).
 fn summary_required(provider: &str) -> bool {
     provider == "forgejo"
+}
+
+/// A conversation's Fix waits while that conversation's resolve or reply is in flight.
+fn finding_pending(write: &WriteState, finding: &logic::Finding) -> bool {
+    matches!(finding, logic::Finding::Thread(thread) if write.thread_pending.contains(&thread.id))
 }
 
 /// Where a line draft opens: path, old path, anchor, range start, picked lines and excerpt.
@@ -321,6 +333,12 @@ impl Workspace {
         done: impl FnOnce(&mut Workspace, &str, bool, &mut Window, &mut Context<Workspace>) + 'static,
     ) {
         let (Some(client), Some(key)) = (self.pull_request_client(), self.shown_pr_key()) else { return };
+        // The write grant can be lost while an editor or form stays open (`permissionAtom`).
+        if !self.pr_panel_writable(&key) {
+            done(self, &key, false, window, cx);
+            cx.notify();
+            return;
+        }
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request(method, input).await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -1089,7 +1107,7 @@ impl Workspace {
         resolve.then(|| {
             let (id, resolved) = (thread.id.clone(), thread.is_resolved);
             ghost_button(ElementId::Name(format!("pr-thread-resolve:{id}").into()), t)
-                .disabled(panel.write.thread_pending)
+                .disabled(panel.write.thread_pending.contains(&thread.id))
                 .child(if resolved { "Unresolve" } else { "Resolve" })
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.set_pr_thread_resolved(id.clone(), !resolved, window, cx);
@@ -1113,7 +1131,7 @@ impl Workspace {
         Some(
             ghost_button(ElementId::Name(format!("pr-fix:{key}").into()), t)
                 .flex_none()
-                .disabled(panel.write.thread_pending || panel.handoff.is_some())
+                .disabled(finding_pending(&panel.write, &finding) || panel.handoff.is_some())
                 .child(Icon::new(Lucide::Hammer).with_size(px(12.)))
                 .child(if preparing { "Preparing..." } else { label })
                 .on_click(cx.listener(move |this, _, window, cx| this.fix_pr_finding(&finding, window, cx))),
@@ -1149,8 +1167,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(mut input) = self.pr_ref_json() else { return };
-        let Some(write) = self.pr_write().filter(|w| !w.thread_pending) else { return };
-        write.thread_pending = true;
+        let Some(write) = self.pr_write().filter(|w| !w.thread_pending.contains(&thread_id)) else { return };
+        write.thread_pending.insert(thread_id.clone());
         input["threadId"] = json!(thread_id);
         input["resolved"] = json!(resolved);
         self.run_pr_write(
@@ -1160,9 +1178,9 @@ impl Workspace {
             None,
             window,
             cx,
-            |this, key, _, _, _| {
+            move |this, key, _, _, _| {
                 if let Some(write) = this.pr_write_of(key) {
-                    write.thread_pending = false;
+                    write.thread_pending.remove(&thread_id);
                 }
             },
         );
@@ -1184,7 +1202,7 @@ impl Workspace {
         match panel.write.replies.get(&thread.id) {
             Some(input) => {
                 let empty = text_of(input, cx).trim().is_empty();
-                let pending = panel.write.thread_pending;
+                let pending = panel.write.thread_pending.contains(&thread.id);
                 let (cancel, send) = (id.clone(), id.clone());
                 Some(
                     v_flex()
@@ -1251,13 +1269,13 @@ impl Workspace {
     /// Posts one conversation's reply; only that conversation's box closes once it lands.
     fn send_pr_reply(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(mut payload) = self.pr_ref_json() else { return };
-        let Some(write) = self.pr_write().filter(|w| !w.thread_pending) else { return };
+        let Some(write) = self.pr_write().filter(|w| !w.thread_pending.contains(thread_id)) else { return };
         let Some(input) = write.replies.get(thread_id).cloned() else { return };
         let body = text_of(&input, cx).trim().to_owned();
         if body.is_empty() {
             return;
         }
-        write.thread_pending = true;
+        write.thread_pending.insert(thread_id.to_owned());
         payload["threadId"] = json!(thread_id);
         payload["body"] = json!(body);
         let thread_id = thread_id.to_owned();
@@ -1270,7 +1288,7 @@ impl Workspace {
             cx,
             move |this, key, ok, _, _| {
                 if let Some(write) = this.pr_write_of(key) {
-                    write.thread_pending = false;
+                    write.thread_pending.remove(&thread_id);
                     if ok && write.replies.get(&thread_id) == Some(&input) {
                         write.replies.remove(&thread_id);
                     }
@@ -1350,6 +1368,7 @@ impl Workspace {
 
     /// `PullRequestMarkdownEditor`: Write and Preview, then Cancel and Save.
     pub(super) fn render_pr_editor(&mut self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let writable = self.shown_pr_key().is_some_and(|key| self.pr_panel_writable(&key));
         let editing = self.pull_requests.panel.as_ref()?.write.editing.as_ref()?;
         let (input, preview, description, saving) = (
             editing.input.clone(),
@@ -1416,7 +1435,7 @@ impl Workspace {
                         ))
                         .child(
                             xs_outline("pr-editor-save", t)
-                                .disabled(saving || (empty && !description))
+                                .disabled(saving || !writable || (empty && !description))
                                 .child(if saving { "Saving..." } else { "Save" })
                                 .on_click(cx.listener(|this, _, window, cx| this.save_pr_edit(window, cx))),
                         ),
@@ -1449,7 +1468,7 @@ impl Workspace {
     fn save_pr_title(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let current = self.pull_requests.panel.as_ref().and_then(|p| p.detail.as_ref()).map(|d| d.title.clone());
         let Some(mut payload) = self.pr_ref_json() else { return };
-        let Some(write) = self.pr_write().filter(|w| !w.saving) else { return };
+        let Some(write) = self.pr_write().filter(|w| !w.title_saving) else { return };
         let Some(input) = write.title.clone() else { return };
         let title = input.read(cx).value().trim().to_owned();
         if title.is_empty() || Some(&title) == current.as_ref() {
@@ -1457,7 +1476,7 @@ impl Workspace {
             cx.notify();
             return;
         }
-        write.saving = true;
+        write.title_saving = true;
         payload["title"] = json!(title);
         self.run_pr_write(
             "pullRequests.update",
@@ -1469,7 +1488,7 @@ impl Workspace {
             // A refused title stays in the editor to try again.
             |this, key, ok, _, _| {
                 if let Some(write) = this.pr_write_of(key) {
-                    write.saving = false;
+                    write.title_saving = false;
                     if ok {
                         write.title = None;
                     }
@@ -1479,7 +1498,7 @@ impl Workspace {
     }
 
     fn cancel_pr_title_edit(&mut self, cx: &mut Context<Self>) {
-        if let Some(write) = self.pr_write().filter(|w| !w.saving) {
+        if let Some(write) = self.pr_write().filter(|w| !w.title_saving) {
             write.title = None;
             cx.notify();
         }
@@ -1487,9 +1506,11 @@ impl Workspace {
 
     /// The title being renamed, with Cancel and Save under it; Escape cancels.
     pub(super) fn render_pr_title_input(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let write = &self.pull_requests.panel.as_ref()?.write;
+        let panel = self.pull_requests.panel.as_ref()?;
+        let writable = self.pr_panel_writable(&panel.reference.key());
+        let write = &panel.write;
         let input = write.title.as_ref()?;
-        let saving = write.saving;
+        let saving = write.title_saving;
         let empty = input.read(cx).value().trim().is_empty();
         Some(
             v_flex()
@@ -1515,7 +1536,7 @@ impl Workspace {
                         )
                         .child(
                             xs_outline("pr-title-save", t)
-                                .disabled(saving || empty)
+                                .disabled(saving || !writable || empty)
                                 .child(if saving { "Saving..." } else { "Save" })
                                 .on_click(cx.listener(|this, _, window, cx| this.save_pr_title(window, cx))),
                         ),
@@ -1714,11 +1735,13 @@ impl Workspace {
                 kind,
                 search,
                 candidates: None,
+                _candidates: None,
                 pending: None,
                 debounced: String::new(),
                 _debounce: None,
                 searches: HashMap::new(),
                 searching: HashSet::new(),
+                searches_epoch: 0,
                 highlight: Some(0),
                 scroll: ScrollHandle::new(),
             });
@@ -1737,7 +1760,7 @@ impl Workspace {
         } else {
             "pullRequests.labelCandidates"
         };
-        cx.spawn(async move |this, cx| {
+        let read = cx.spawn(async move |this, cx| {
             let result = client.request(method, input).await;
             let _ = this.update(cx, |this, cx| {
                 let Some(picker) = this.pr_panel(&key).and_then(|p| p.write.picker.as_mut()).filter(|p| p.kind == kind)
@@ -1748,8 +1771,10 @@ impl Workspace {
                 this.search_pr_reviewers(&key, cx);
                 cx.notify();
             });
-        })
-        .detach();
+        });
+        if let Some(picker) = self.pr_write().and_then(|w| w.picker.as_mut()).filter(|p| p.kind == kind) {
+            picker._candidates = Some(read);
+        }
         cx.notify();
     }
 
@@ -1791,10 +1816,14 @@ impl Workspace {
             return;
         }
         input["query"] = json!(query);
+        let epoch = picker.searches_epoch;
         cx.spawn(async move |this, cx| {
             let result = client.request("pullRequests.reviewerCandidates", input).await;
             let _ = this.update(cx, |this, cx| {
                 let Some(picker) = this.pr_write_of(&key).and_then(|w| w.picker.as_mut()) else { return };
+                if picker.searches_epoch != epoch {
+                    return;
+                }
                 picker.searching.remove(&query);
                 picker.searches.insert(query, result.map_err(|error| list_logic::error_message(&error)));
                 cx.notify();
@@ -1849,6 +1878,8 @@ impl Workspace {
                 // what was typed, so the one on screen is read again too.
                 if let Some(picker) = this.pr_write_of(key).and_then(|w| w.picker.as_mut()) {
                     picker.searches.clear();
+                    picker.searching.clear();
+                    picker.searches_epoch += 1;
                 }
                 this.read_pr_picker_candidates(kind, cx);
             }

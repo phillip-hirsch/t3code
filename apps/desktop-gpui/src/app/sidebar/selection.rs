@@ -342,39 +342,29 @@ impl Workspace {
         }
         let ids = ids.to_vec();
         let count = ids.len();
-        // `deleteSelectedThreadEntries`: a failure leaves the rest deleting and its row selected.
-        let run = move |this: &mut Self, cx: &mut Context<Self>| {
+        // `deleteSelectedThreadEntries`: each goes through `deleteThread`, one after another, so a
+        // worktree the batch already freed is offered for removal; a failure leaves the rest
+        // deleting and its row selected.
+        let run = move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
             // `checkThreadOperations` after the question: a grant can go while it is open.
             if !this.check_thread_operations(&ids, cx) {
                 return;
             }
-            let steps: Vec<_> = ids
-                .iter()
-                .filter_map(|id| {
-                    let command = Self::thread_command_value("thread.delete", &id.id, json!({}));
-                    let environment = id.env.clone();
-                    let (client, side_chats) =
-                        (this.env_client(&environment)?, this.listed_side_chats(&environment, &id.id));
-                    Some((id.clone(), environment, side_chats, client, command))
-                })
-                .collect();
-            cx.spawn(async move |this, cx| {
-                let (mut deleted, mut forget, mut first_error) = (HashSet::new(), Vec::new(), None);
-                for (id, environment, side_chats, client, command) in steps {
-                    match client.request("orchestration.dispatchCommand", command).await {
-                        Ok(_) => {
-                            forget.push((environment, id.clone(), side_chats));
-                            deleted.insert(id);
+            cx.spawn_in(window, async move |this, cx| {
+                let (mut deleted, mut first_error) = (HashSet::new(), None);
+                for id in &ids {
+                    let Ok(Some(plan)) = this.update(cx, |this, _| this.delete_plan(id, &deleted)) else { continue };
+                    match super::actions::run_delete(&this, plan, cx).await {
+                        Ok(true) => {
+                            deleted.insert(id.clone());
                         }
+                        Ok(false) => {}
                         Err(error) => {
-                            first_error.get_or_insert(error.to_string());
+                            first_error.get_or_insert(error);
                         }
                     }
                 }
                 let _ = this.update(cx, |this, cx| {
-                    for (environment, id, side_chats) in &forget {
-                        this.forget_deleted_thread(environment, &id.id, side_chats, cx);
-                    }
                     if let Some(error) = first_error {
                         let message = super::actions::failure_message(Some("Failed to delete threads"), &error);
                         this.error = Some(message.into());
@@ -390,7 +380,7 @@ impl Workspace {
             .detach();
         };
         if self.client_settings.values.get("confirmThreadDelete").as_bool() == Some(false) {
-            run(self, cx);
+            run(self, window, cx);
             return;
         }
         let message = format!(
@@ -399,9 +389,9 @@ This permanently clears conversation history for these threads.",
             plural(count)
         );
         let answer = super::super::confirm::confirm(&message, true, window, cx);
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             if answer.await == Ok(true) {
-                let _ = this.update(cx, run);
+                let _ = this.update_in(cx, run);
             }
         })
         .detach();

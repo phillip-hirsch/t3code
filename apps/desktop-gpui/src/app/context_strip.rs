@@ -20,7 +20,9 @@ use serde_json::{Value, json};
 
 use super::banners::{Variant, composer_banner, corner_action};
 use super::composer::{control_button, runtime_modes};
+use super::git::SOURCE_CONTROL_WRITE;
 use super::{Target, Workspace};
+use crate::model::ScopedId;
 use crate::new_thread::{self, DraftWorkspace, EnvMode, WorkspaceChoice};
 use crate::theme::Tokens;
 
@@ -84,6 +86,7 @@ pub(super) enum PermissionsForm {
 /// The draft's workspace: what the controls picked and what they read.
 #[derive(Default)]
 pub(super) struct DraftWorkspaceState {
+    env: Option<SharedString>,
     project_id: Option<String>,
     /// The draft the picks belong to; another draft of the project starts without them.
     draft: Option<super::draft_sessions::DraftId>,
@@ -104,6 +107,8 @@ pub(super) struct DraftWorkspaceState {
     /// The picker row Enter picks (`autoHighlight`); `None` until a search or the arrows set one.
     branch_highlight: Option<usize>,
     branch_scroll: ScrollHandle,
+    /// "Start from remote" in the picker's footer, which Tab reaches from the search.
+    origin_focus: Option<gpui_kit::FocusHandle>,
     /// The permissions popover that is open, by element id, and the mode it previews.
     permissions_open: Option<&'static str>,
     permissions_preview: Option<&'static str>,
@@ -116,10 +121,18 @@ pub(super) struct DraftWorkspaceState {
 }
 
 impl DraftWorkspaceState {
-    /// The existing worktree the draft of `project_id` picked (the web draft's `worktreePath`).
-    pub(super) fn existing_worktree(&self, project_id: &str) -> Option<&str> {
+    /// Whether these picks are `target`'s: the same draft, in the same project on the same environment.
+    pub(super) fn is_for(&self, target: Option<&Target>) -> bool {
+        matches!(target, Some(Target::Draft { env, project_id, draft })
+            if self.env.as_ref() == Some(env)
+                && self.project_id.as_ref() == Some(project_id)
+                && self.draft.as_ref() == Some(draft))
+    }
+
+    /// The existing worktree `target`'s draft picked (the web draft's `worktreePath`).
+    pub(super) fn existing_worktree(&self, target: Option<&Target>) -> Option<&str> {
         let path = self.choice.existing_worktree.as_ref()?;
-        (self.project_id.as_deref() == Some(project_id)).then_some(path.as_str())
+        self.is_for(target).then_some(path.as_str())
     }
 }
 
@@ -164,6 +177,37 @@ impl RefSearch {
     }
 }
 
+/// A started thread's checkout when a branch change began: the change lands on it, wherever
+/// the user went meanwhile (`setThreadBranch`'s captured thread).
+struct ThreadCheckout {
+    thread: ScopedId,
+    worktree: Option<String>,
+    live_sessions: Vec<String>,
+}
+
+/// `resolvePreviousWorktreeSeed` over the threads of `project` (on its environment): the newest
+/// open one in a worktree other than `current`, with its branch.
+fn previous_worktree_seed(
+    threads: &[crate::model::ThreadShell],
+    project: &ScopedId,
+    current: Option<&str>,
+) -> Option<(String, Option<String>)> {
+    threads
+        .iter()
+        .filter(|t| {
+            t.environment_id == project.env
+                && t.project_id == project.id
+                && t.archived_at.is_none()
+                && t.deleted_at.is_none()
+        })
+        .filter_map(|t| {
+            let path = t.worktree_path.as_deref().filter(|path| Some(*path) != current)?;
+            Some((t.updated_at.as_str(), path.to_owned(), t.branch.clone()))
+        })
+        .max_by(|a, b| a.0.cmp(b.0))
+        .map(|(_, path, branch)| (path, branch))
+}
+
 /// One row of the branch picker: "Checkout pull request" for the reference the search names, a
 /// ref, or "Create new ref".
 enum BranchItem {
@@ -172,23 +216,50 @@ enum BranchItem {
     Create(String),
 }
 
+/// What the picker's environment lets this client do with refs: `canWriteSourceControl`, and
+/// `canUpdateThreadBranch` (a started thread records its branch through orchestration).
+#[derive(Clone, Copy)]
+struct BranchGrants {
+    write: bool,
+    update: bool,
+}
+
+impl BranchGrants {
+    /// `canChangeThreadBranch`: creating a ref or checking out a pull request.
+    fn change(self) -> bool {
+        self.write && self.update
+    }
+
+    /// A ref row (`BranchPickerRefItem`'s `disabled`): a worktree base or a ref another worktree
+    /// has checked out is only recorded, anything else switches the checkout.
+    fn pick(self, records_only: bool) -> bool {
+        self.update && (self.write || records_only)
+    }
+}
+
 /// `shouldLoadNextBranchPageAfterScroll`'s distance from the end.
 const NEXT_PAGE_DISTANCE: f32 = 96.;
 
 impl Workspace {
     /// Loads the draft's default workspace mode and refs when the draft or its project changes.
     pub(super) fn sync_draft_workspace(&mut self, cx: &mut Context<Self>) {
-        let Some(Target::Draft { project_id, draft, .. }) = self.target.clone() else { return };
-        let state = &self.draft_workspace;
-        if state.project_id.as_ref() == Some(&project_id) && state.draft.as_ref() == Some(&draft) {
+        let Some(target) = self.target.clone() else { return };
+        let Target::Draft { env, project_id, draft } = &target else { return };
+        if self.draft_workspace.is_for(Some(&target)) {
             return;
         }
-        // Reset first, so nothing from the previous draft survives; send.rs resolves the
-        // workspace itself when this never loads.
-        self.draft_workspace =
-            DraftWorkspaceState { project_id: Some(project_id.clone()), draft: Some(draft), ..Default::default() };
-        let (Some(client), Some(project)) = (self.client(), self.shell.projects.iter().find(|p| p.id == project_id))
-        else {
+        // Reset first, so nothing from the previous draft survives but the picks this draft made;
+        // send.rs resolves the workspace itself when this never loads.
+        self.stash_draft_workspace();
+        self.draft_workspace = DraftWorkspaceState {
+            env: Some(env.clone()),
+            project_id: Some(project_id.clone()),
+            choice: self.drafts.workspace(draft),
+            draft: Some(draft.clone()),
+            ..Default::default()
+        };
+        let key = crate::model::ScopedId::new(env.clone(), project_id.as_str());
+        let (Some(client), Some(project)) = (self.env_client(env), self.shell.project(&key)) else {
             return;
         };
         let has_threads = self.shell.project_has_threads(project);
@@ -199,7 +270,7 @@ impl Workspace {
             let mode = workspace.default_mode(&client).await;
             let refs = new_thread::list_refs(&client, &cwd).await;
             let _ = this.update(cx, |this, cx| {
-                if this.draft_workspace.project_id.as_ref() != Some(&project_id) {
+                if !this.draft_workspace.is_for(Some(&target)) {
                     return;
                 }
                 this.draft_workspace.default_mode = Some(mode);
@@ -212,6 +283,16 @@ impl Workspace {
         }));
     }
 
+    /// Hands the open draft's workspace picks to its session, which keeps and saves them.
+    pub(super) fn stash_draft_workspace(&mut self) {
+        let state = &self.draft_workspace;
+        let (Some(env), Some(project_id), Some(draft)) = (&state.env, &state.project_id, &state.draft) else {
+            return;
+        };
+        let project = crate::model::ScopedId::new(env.clone(), project_id.as_str());
+        self.drafts.set_workspace(draft, &project, state.choice.clone());
+    }
+
     /// The branch picker's combobox keys: Escape closes it, Up and Down highlight, Enter picks.
     pub(super) fn draft_workspace_key(
         &mut self,
@@ -220,6 +301,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> bool {
         if !self.draft_workspace.branch_open || keystroke.modifiers.modified() {
+            return false;
+        }
+        // Enter and Space on the focused "Start from remote" are that switch's.
+        let on_origin = self.draft_workspace.origin_focus.as_ref().is_some_and(|f| f.is_focused(window));
+        if on_origin && matches!(keystroke.key.as_str(), "enter" | "space") {
             return false;
         }
         match keystroke.key.as_str() {
@@ -244,6 +330,10 @@ impl Workspace {
                 let Some(index) = self.draft_workspace.branch_highlight else { return false };
                 match self.branch_items().into_iter().nth(index) {
                     Some(BranchItem::Ref(item)) => {
+                        let (_, worktree_base, _) = self.branch_trigger();
+                        if !self.branch_grants().pick(worktree_base || item["worktreePath"].as_str().is_some()) {
+                            return true;
+                        }
                         let name = item["name"].as_str().unwrap_or_default().to_owned();
                         self.select_branch(name, window, cx);
                     }
@@ -268,10 +358,10 @@ impl Workspace {
         let query = state.branch_query.to_lowercase();
         let sanitized = new_thread::sanitize_new_ref_name(&query);
         let exact = refs.iter().any(|r| r["name"].as_str() == Some(state.branch_pages.query.as_str()));
-        let create =
-            (!query.is_empty() && !exact && !worktree_base).then(|| BranchItem::Create(state.branch_query.clone()));
-        let checkout = self
-            .can_checkout_pull_request()
+        let can_change = self.branch_grants().change();
+        let create = (can_change && !query.is_empty() && !exact && !worktree_base)
+            .then(|| BranchItem::Create(state.branch_query.clone()));
+        let checkout = (can_change && self.can_checkout_pull_request())
             .then(|| crate::pull_request_checkout::parse_reference(&state.branch_query))
             .flatten()
             .map(BranchItem::Checkout);
@@ -287,6 +377,19 @@ impl Workspace {
             )
             .chain(create)
             .collect()
+    }
+
+    /// [`BranchGrants`] on the environment of the picker's thread or draft.
+    fn branch_grants(&self) -> BranchGrants {
+        match &self.target {
+            Some(Target::Thread { env, .. }) => {
+                BranchGrants { write: self.env_grants(env, SOURCE_CONTROL_WRITE), update: self.can_operate(env) }
+            }
+            Some(Target::Draft { env, .. }) => {
+                BranchGrants { write: self.env_grants(env, SOURCE_CONTROL_WRITE), update: true }
+            }
+            None => BranchGrants { write: false, update: false },
+        }
     }
 
     /// "Checkout pull request" picked: the picker closes, the composer takes focus, and the
@@ -309,9 +412,14 @@ impl Workspace {
         };
         let (Some(client), Some(cwd)) = (self.client(), self.composer_cwd()) else { return };
         let query = self.draft_workspace.branch_pages.query.clone();
+        let origin = self.target.clone();
         let task = cx.spawn(async move |this, cx| {
             let page = new_thread::list_ref_page(&client, &cwd, &query, cursor).await;
             let _ = this.update(cx, |this, cx| {
+                // The picker's search or its thread or draft moved on while the page loaded.
+                if this.target != origin || this.composer_cwd().as_ref() != Some(&cwd) {
+                    return;
+                }
                 let pages = &mut this.draft_workspace.branch_pages;
                 if pages.query != query {
                     return;
@@ -374,7 +482,7 @@ impl Workspace {
     fn refresh_refs(&mut self, cx: &mut Context<Self>) {
         let (Some(client), Some(cwd)) = (self.client(), self.composer_cwd()) else { return };
         let thread = matches!(self.target, Some(Target::Thread { .. }));
-        let project_id = self.draft_workspace.project_id.clone();
+        let origin = self.target.clone();
         let environment = self.active_environment().cloned();
         cx.spawn(async move |this, cx| {
             let refs = new_thread::list_refs(&client, &cwd).await;
@@ -386,12 +494,18 @@ impl Workspace {
                         return;
                     }
                 };
-                let state = &mut this.draft_workspace;
-                if !thread && state.project_id != project_id {
+                if !thread && !this.draft_workspace.is_for(origin.as_ref()) {
                     return;
                 }
+                // The open picker is still the one these refs were read for.
+                let here = this.target == origin && this.composer_cwd().as_ref() == Some(&cwd);
+                let state = &mut this.draft_workspace;
                 // An open picker without a search or further pages lists the fresh first page.
-                if state.branch_open && state.branch_pages.query.is_empty() && state.branch_pages.pages.len() <= 1 {
+                if here
+                    && state.branch_open
+                    && state.branch_pages.query.is_empty()
+                    && state.branch_pages.pages.len() <= 1
+                {
                     state.branch_pages.pages = vec![refs.clone()];
                 }
                 if thread {
@@ -415,12 +529,6 @@ impl Workspace {
             }
             _ => self.draft_workspace.refs.as_ref(),
         }
-    }
-
-    /// The previous worktree a draft of `project_id` reuses, once picked.
-    pub(super) fn draft_reused_worktree(&self, project_id: &str) -> Option<String> {
-        let state = &self.draft_workspace;
-        state.choice.existing_worktree.clone().filter(|_| state.project_id.as_deref() == Some(project_id))
     }
 
     pub(super) fn draft_env_mode(&self) -> EnvMode {
@@ -473,16 +581,11 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The newest other thread of this project that ran in a worktree (`resolvePreviousWorktreeSeed`).
+    /// The newest other thread of the draft's project that ran in a worktree.
     fn previous_worktree(&self) -> Option<(String, Option<String>)> {
-        let Some(Target::Draft { project_id, .. }) = &self.target else { return None };
-        self.shell
-            .threads
-            .iter()
-            .filter(|t| &t.project_id == project_id && t.archived_at.is_none() && t.deleted_at.is_none())
-            .filter_map(|t| Some((t.updated_at.as_str(), t.worktree_path.clone()?, t.branch.clone())))
-            .max_by(|a, b| a.0.cmp(b.0))
-            .map(|(_, path, branch)| (path, branch))
+        let Some(Target::Draft { env, project_id, .. }) = &self.target else { return None };
+        let current = self.draft_workspace.existing_worktree(self.target.as_ref());
+        previous_worktree_seed(&self.shell.threads, &ScopedId::new(env.clone(), project_id.as_str()), current)
     }
 
     fn pick_previous_worktree(&mut self, path: String, branch: Option<String>, cx: &mut Context<Self>) {
@@ -505,9 +608,13 @@ impl Workspace {
 
     /// Worktree mode just records the base; local mode switches the checkout (`vcs.switchRef`).
     fn select_branch(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let grants = self.branch_grants();
+        if !grants.update {
+            return;
+        }
         self.draft_workspace.branch_open = false;
-        if let Some(Target::Thread { id: thread_id, .. }) = self.target.clone() {
-            self.select_thread_branch(thread_id, name, cx);
+        if let Some(thread) = self.target.as_ref().and_then(Target::thread_key) {
+            self.select_thread_branch(thread, name, cx);
             self.focus_composer(window, cx);
             return;
         }
@@ -526,24 +633,30 @@ impl Workspace {
             cx.notify();
             return;
         }
+        if !grants.write {
+            return;
+        }
         self.run_ref_command("vcs.switchRef", json!({"cwd": root, "refName": name}), name, "Failed to switch ref.", cx);
     }
 
-    /// `setDraftThreadContext` after a git action created `branch` for the draft of `project_id`.
-    pub(super) fn set_draft_branch(&mut self, project_id: &str, branch: String, cx: &mut Context<Self>) {
-        if self.draft_workspace.project_id.as_deref() == Some(project_id) {
+    /// `setDraftThreadContext` after a git action created `branch` for `draft`.
+    pub(super) fn set_draft_branch(&mut self, draft: &Target, branch: String, cx: &mut Context<Self>) {
+        if self.draft_workspace.is_for(Some(draft)) {
             self.draft_workspace.choice.branch = Some(branch);
             cx.notify();
         }
     }
 
     fn create_branch(&mut self, name: String, cx: &mut Context<Self>) {
+        if !self.branch_grants().change() {
+            return;
+        }
         self.draft_workspace.branch_open = false;
         let cwd = self.composer_cwd();
-        if let Some(Target::Thread { id: thread_id, .. }) = self.target.clone() {
+        if let Some(thread) = self.target.as_ref().and_then(Target::thread_key) {
             let worktree = self.open_projection().and_then(|p| p.thread.worktree_path.clone());
             let input = json!({"cwd": cwd, "refName": name, "switchRef": true});
-            self.run_thread_ref_command(thread_id, "vcs.createRef", input, name, worktree, cx);
+            self.run_thread_ref_command(thread, "vcs.createRef", input, name, worktree, cx);
             return;
         }
         self.run_ref_command(
@@ -565,14 +678,13 @@ impl Workspace {
     ) {
         let Some(client) = self.client() else { return };
         self.draft_workspace.choice.branch = Some(name.clone());
-        let project_id = self.draft_workspace.project_id.clone();
         let origin = self.target.clone();
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = client.request(method, input).await;
             let _ = this.update(cx, |this, cx| {
                 // The draft moved on while the ref switched.
-                if this.draft_workspace.project_id != project_id {
+                if !this.draft_workspace.is_for(origin.as_ref()) {
                     return;
                 }
                 match result {
@@ -617,6 +729,9 @@ impl Workspace {
         // The checkout's first page until `refresh_refs` brings a fresh one.
         let pages = self.refs().cloned().into_iter().collect();
         let state = &mut self.draft_workspace;
+        if state.origin_focus.is_none() {
+            state.origin_focus = Some(cx.focus_handle().tab_stop(true));
+        }
         state.branch_query.clear();
         state.branch_highlight = None;
         state.branch_open = true;
@@ -627,7 +742,7 @@ impl Workspace {
 
     /// `selectBranch` on a started thread: reuse the worktree that has the ref checked
     /// out, else switch the thread's checkout (`resolveBranchSelectionTarget`).
-    fn select_thread_branch(&mut self, thread_id: String, name: String, cx: &mut Context<Self>) {
+    fn select_thread_branch(&mut self, thread: ScopedId, name: String, cx: &mut Context<Self>) {
         let Some(root) = self.target_project().map(|p| p.workspace_root.clone()) else { return };
         let active = self.open_projection().and_then(|p| p.thread.worktree_path.clone());
         let picked = self.find_ref(&name);
@@ -635,33 +750,40 @@ impl Workspace {
         let is_default = picked.as_ref().is_some_and(|r| r["isDefault"].as_bool() == Some(true));
         if let Some(path) = elsewhere {
             let next = (!is_within(&root, &path)).then_some(path);
-            self.set_thread_branch(&thread_id, &name, next, cx);
+            if let Some(checkout) = self.thread_checkout(&thread) {
+                self.set_thread_branch(&checkout, &name, next, cx);
+            }
+            return;
+        }
+        if !self.branch_grants().write {
             return;
         }
         let next = active.filter(|_| !is_default);
         let checkout = next.clone().unwrap_or(root);
         let input = json!({"cwd": checkout, "refName": name});
-        self.run_thread_ref_command(thread_id, "vcs.switchRef", input, name, next, cx);
+        self.run_thread_ref_command(thread, "vcs.switchRef", input, name, next, cx);
     }
 
     fn run_thread_ref_command(
         &mut self,
-        thread_id: String,
+        thread: ScopedId,
         method: &'static str,
         input: Value,
         name: String,
         worktree: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.thread_client(&thread_id) else { return };
-        let origin = self.thread_target(&thread_id);
+        let (Some(client), Some(checkout)) = (self.env_client(&thread.env), self.thread_checkout(&thread)) else {
+            return;
+        };
+        let origin = Some(Target::Thread { env: thread.env, id: thread.id });
         cx.spawn(async move |this, cx| {
             let result = client.request(method, input).await;
             let _ = this.update(cx, |this, cx| {
                 match result {
                     Ok(value) => {
                         let switched = value.get("refName").and_then(Value::as_str).map(str::to_owned);
-                        this.set_thread_branch(&thread_id, &switched.unwrap_or(name), worktree, cx);
+                        this.set_thread_branch(&checkout, &switched.unwrap_or(name), worktree, cx);
                         this.refresh_refs(cx);
                     }
                     Err(error) => {
@@ -679,21 +801,42 @@ impl Workspace {
         .detach();
     }
 
+    /// The open thread's checkout as a branch change starts on it.
+    fn thread_checkout(&self, thread: &ScopedId) -> Option<ThreadCheckout> {
+        let open = self.target.as_ref().and_then(Target::thread_key);
+        let projection = self.open_projection().filter(|_| open.as_ref() == Some(thread))?;
+        let live = projection.provider_sessions.iter().filter(|s| !matches!(s.status.as_str(), "stopped" | "error"));
+        Some(ThreadCheckout {
+            thread: thread.clone(),
+            worktree: projection.thread.worktree_path.clone(),
+            live_sessions: live.map(|s| s.id.clone()).collect(),
+        })
+    }
+
     /// `setThreadBranch`: a move to another checkout detaches the live provider
-    /// sessions first, then the thread records its branch and worktree.
-    fn set_thread_branch(&mut self, thread_id: &str, branch: &str, worktree: Option<String>, cx: &mut Context<Self>) {
-        let Some(projection) = self.open_projection() else { return };
+    /// sessions first, then the thread records its branch and worktree, on its own environment.
+    fn set_thread_branch(
+        &mut self,
+        checkout: &ThreadCheckout,
+        branch: &str,
+        worktree: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        // The grant can be lost while the ref switched.
+        if !self.can_operate(&checkout.thread.env) {
+            return;
+        }
+        let Some(client) = self.env_client(&checkout.thread.env) else { return };
+        let thread_id = &checkout.thread.id;
         let mut commands = Vec::new();
-        if worktree != projection.thread.worktree_path {
+        if worktree != checkout.worktree {
             let command_id = super::new_id();
-            for session in
-                projection.provider_sessions.iter().filter(|s| !matches!(s.status.as_str(), "stopped" | "error"))
-            {
+            for session in &checkout.live_sessions {
                 commands.push(json!({
                     "type": "provider-session.detach",
-                    "commandId": format!("{command_id}:detach:{}", session.id),
+                    "commandId": format!("{command_id}:detach:{session}"),
                     "threadId": thread_id,
-                    "providerSessionId": session.id,
+                    "providerSessionId": session,
                     "reason": "client-requested",
                 }));
             }
@@ -705,7 +848,7 @@ impl Workspace {
             "branch": branch,
             "worktreePath": worktree,
         }));
-        self.dispatch_in_order(commands, cx);
+        self.dispatch_in_order(client, commands, cx);
     }
 
     /// `shouldShowComposerContextStrip`: always under a draft; under a started thread
@@ -979,6 +1122,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let items = self.branch_items();
+        let grants = self.branch_grants();
         let highlight = self.draft_workspace.branch_highlight;
         let empty = items.is_empty();
         let rows = items.into_iter().enumerate().map(|(index, item)| {
@@ -1032,6 +1176,7 @@ impl Workspace {
                 None
             };
             let checked = selected == Some(name.as_str());
+            let enabled = grants.pick(worktree_base || r["worktreePath"].as_str().is_some());
             let pick = name.clone();
             let copy = name.clone();
             h_flex()
@@ -1042,7 +1187,8 @@ impl Workspace {
                 .gap(px(8.))
                 .rounded(px(4.))
                 .text_sm()
-                .cursor_pointer()
+                .when(enabled, gpui_kit::Styled::cursor_pointer)
+                .when(!enabled, |el| el.opacity(0.64))
                 .when(checked, |el| el.bg(t.foreground.opacity(0.08)))
                 .when(highlighted, |el| el.bg(t.foreground.opacity(0.09)))
                 .on_mouse_move(hover)
@@ -1056,7 +1202,9 @@ impl Workspace {
                         .text_color(t.muted_foreground)
                         .child(badge)
                 }))
-                .on_click(cx.listener(move |this, _, window, cx| this.select_branch(pick.clone(), window, cx)))
+                .when(enabled, |el| {
+                    el.on_click(cx.listener(move |this, _, window, cx| this.select_branch(pick.clone(), window, cx)))
+                })
                 .context_menu(copy_menu("Copy branch name", "Branch name copied", copy))
                 .into_any_element()
         });
@@ -1106,6 +1254,10 @@ impl Workspace {
                 el.child(
                     h_flex()
                         .id("start-from-remote")
+                        .when_some(self.draft_workspace.origin_focus.as_ref(), |el, focus| {
+                            let ring = gpui_kit::BoxShadow::new(px(0.), px(0.), t.ring).spread_radius(px(1.)).inset();
+                            el.track_focus(focus).focus_visible(move |s| s.shadow(vec![ring]))
+                        })
                         .px(px(12.))
                         .py(px(8.))
                         .gap(px(6.))
@@ -1462,19 +1614,64 @@ fn step_highlight(current: Option<usize>, count: usize, down: bool) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use super::super::Target;
+    use super::super::draft_sessions::DraftId;
     use super::{
-        DraftWorkspaceState, RefSearch, clipboard_path, runtime_mode_denial, runtime_mode_fallback, step_highlight,
-        step_permission,
+        BranchGrants, DraftWorkspaceState, RefSearch, clipboard_path, previous_worktree_seed, runtime_mode_denial,
+        runtime_mode_fallback, step_highlight, step_permission,
     };
+    use crate::model::ScopedId;
     use serde_json::json;
 
     #[test]
-    fn a_draft_uses_the_worktree_it_picked_for_its_own_project() {
-        let mut state = DraftWorkspaceState { project_id: Some("p".into()), ..Default::default() };
-        assert_eq!(state.existing_worktree("p"), None);
+    fn a_draft_uses_the_worktree_it_picked_for_itself_only() {
+        let draft = |env: &str, project: &str, id: &str| {
+            Some(Target::Draft {
+                env: env.to_owned().into(),
+                project_id: project.into(),
+                draft: DraftId::from_saved(id.into()),
+            })
+        };
+        let mut state = DraftWorkspaceState {
+            env: Some("a".into()),
+            project_id: Some("p".into()),
+            draft: Some(DraftId::from_saved("d1".into())),
+            ..Default::default()
+        };
+        assert_eq!(state.existing_worktree(draft("a", "p", "d1").as_ref()), None);
         state.choice.existing_worktree = Some("/repo/wt".into());
-        assert_eq!(state.existing_worktree("p"), Some("/repo/wt"));
-        assert_eq!(state.existing_worktree("other"), None, "another project's draft keeps its root");
+        assert_eq!(state.existing_worktree(draft("a", "p", "d1").as_ref()), Some("/repo/wt"));
+        assert_eq!(state.existing_worktree(draft("a", "other", "d1").as_ref()), None, "another project keeps its root");
+        assert_eq!(state.existing_worktree(draft("a", "p", "d2").as_ref()), None, "another draft keeps its root");
+        assert_eq!(state.existing_worktree(draft("b", "p", "d1").as_ref()), None, "another environment keeps its root");
+        assert!(!state.is_for(None));
+    }
+
+    #[test]
+    fn the_previous_worktree_comes_from_the_drafts_own_environment() {
+        let thread = |env: &str, id: &str, updated: &str, worktree: Option<&str>| -> crate::model::ThreadShell {
+            let value = json!({
+                "id": id, "projectId": "p", "title": id, "status": "idle", "worktreePath": worktree,
+                "branch": format!("{env}-{id}"), "createdAt": updated, "updatedAt": updated,
+                "lineage": {"rootThreadId": id},
+            });
+            crate::model::ThreadShell {
+                environment_id: env.to_owned().into(),
+                ..serde_json::from_value(value).unwrap()
+            }
+        };
+        let threads = [
+            thread("a", "old", "2026-11-01T00:00:00.000Z", Some("/a/old")),
+            thread("a", "plain", "2026-11-04T00:00:00.000Z", None),
+            thread("a", "open", "2026-11-02T00:00:00.000Z", Some("/a/open")),
+            thread("b", "newest", "2026-11-03T00:00:00.000Z", Some("/b/newest")),
+        ];
+        let on_a = ScopedId::new("a", "p");
+        let seed = previous_worktree_seed(&threads, &on_a, None);
+        assert_eq!(seed, Some(("/a/open".into(), Some("a-open".into()))), "not B's newer worktree");
+        let seed = previous_worktree_seed(&threads, &on_a, Some("/a/open"));
+        assert_eq!(seed, Some(("/a/old".into(), Some("a-old".into()))), "not the worktree it already uses");
+        assert_eq!(previous_worktree_seed(&threads, &ScopedId::new("c", "p"), None), None);
     }
 
     #[test]
@@ -1526,6 +1723,17 @@ mod tests {
             "a denied focus restarts"
         );
         assert_eq!(step_permission(&[], None, "down"), None);
+    }
+
+    #[test]
+    fn ref_rows_need_the_grants_their_pick_uses() {
+        let grants = |write, update| BranchGrants { write, update };
+        assert!(grants(true, true).change() && grants(true, true).pick(false));
+        assert!(!grants(true, false).change(), "a thread without operate cannot record a new ref");
+        assert!(!grants(true, false).pick(true), "nor record a reused worktree");
+        assert!(!grants(false, true).change());
+        assert!(!grants(false, true).pick(false), "switching the checkout needs write");
+        assert!(grants(false, true).pick(true), "recording a base or reused worktree does not");
     }
 
     #[test]

@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::Target;
 use crate::model::ScopedId;
+use crate::new_thread::WorkspaceChoice;
 
 /// One draft's identity (`DraftId`), unique across runs like the web's.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -51,6 +52,13 @@ struct Session {
     /// The id its thread launches with (`DraftSessionState.threadId`), assigned once by its first
     /// terminal or its send, so both share it; it goes when the draft launches or goes.
     thread_id: Option<String>,
+    /// `branch`, `worktreePath`, `envMode` and `startFromOrigin`, for `project`.
+    workspace: WorkspaceChoice,
+}
+
+/// `createDraftThreadState` on another project: the branch and worktree were the old one's.
+fn moved(choice: WorkspaceChoice) -> WorkspaceChoice {
+    WorkspaceChoice { branch: None, existing_worktree: None, ..choice }
 }
 
 #[derive(Default)]
@@ -67,8 +75,14 @@ impl DraftSessions {
     pub(super) fn create(&mut self, project: ScopedId) -> DraftId {
         let id = DraftId::new();
         self.last_created = crate::timestamp::now_ms().max(self.last_created + 1);
-        self.sessions
-            .insert(id.clone(), Session { project, created: self.last_created, promoted: false, thread_id: None });
+        let session = Session {
+            project,
+            created: self.last_created,
+            promoted: false,
+            thread_id: None,
+            workspace: Default::default(),
+        };
+        self.sessions.insert(id.clone(), session);
         id
     }
 
@@ -90,6 +104,17 @@ impl DraftSessions {
     pub(super) fn launching_with(&self, thread_id: &str) -> Option<&DraftId> {
         let mut live = self.sessions.iter().filter(|(_, session)| !session.promoted);
         live.find(|(_, session)| session.thread_id.as_deref() == Some(thread_id)).map(|(draft, _)| draft)
+    }
+
+    /// The workspace picks `draft` made for its project.
+    pub(super) fn workspace(&self, draft: &DraftId) -> WorkspaceChoice {
+        self.sessions.get(draft).map(|session| session.workspace.clone()).unwrap_or_default()
+    }
+
+    /// Keeps the picks `draft` made while it was in `project`.
+    pub(super) fn set_workspace(&mut self, draft: &DraftId, project: &ScopedId, choice: WorkspaceChoice) {
+        let Some(session) = self.sessions.get_mut(draft) else { return };
+        session.workspace = if session.project == *project { choice } else { moved(choice) };
     }
 
     /// `project`'s draft, unless it launched its thread.
@@ -115,8 +140,11 @@ impl DraftSessions {
     /// any other project it was the draft of. The project's previous draft keeps its own identity.
     pub(super) fn assign(&mut self, project: ScopedId, draft: &DraftId) {
         self.by_project.retain(|key, mapped| mapped != draft || *key == project);
-        if let Some(session) = self.sessions.get_mut(draft) {
+        if let Some(session) = self.sessions.get_mut(draft)
+            && session.project != project
+        {
             session.project = project.clone();
+            session.workspace = moved(std::mem::take(&mut session.workspace));
         }
         self.by_project.insert(project, draft.clone());
     }
@@ -171,6 +199,7 @@ impl DraftSessions {
                 created_at: session.created,
                 project_draft: mapped(id),
                 thread_id: session.thread_id.clone(),
+                workspace: session.workspace.clone(),
             })
             .collect();
         saved.sort_by_key(|session| session.created_at);
@@ -191,7 +220,13 @@ impl DraftSessions {
                 self.by_project.insert(project.clone(), id.clone());
             }
             self.last_created = self.last_created.max(saved.created_at);
-            let session = Session { project, created: saved.created_at, promoted: false, thread_id: saved.thread_id };
+            let session = Session {
+                project,
+                created: saved.created_at,
+                promoted: false,
+                thread_id: saved.thread_id,
+                workspace: saved.workspace,
+            };
             self.sessions.insert(id.clone(), session);
             restored.push(id);
         }
@@ -212,6 +247,8 @@ pub(super) struct SavedSession {
     project_draft: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     thread_id: Option<String>,
+    #[serde(default)]
+    workspace: WorkspaceChoice,
 }
 
 impl SavedSession {
@@ -223,6 +260,7 @@ impl SavedSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::new_thread::EnvMode;
 
     fn project(id: &str) -> ScopedId {
         ScopedId::new("local", id)
@@ -328,6 +366,42 @@ mod tests {
         drafts.restore(earlier.saved(|_| false));
         assert_eq!(drafts.of_project(&project("web")), Some(&now));
         assert!(drafts.is_live(&old));
+    }
+
+    fn checkout() -> WorkspaceChoice {
+        WorkspaceChoice {
+            mode: Some(EnvMode::Worktree),
+            branch: Some("feature".into()),
+            existing_worktree: Some("/repo/wt".into()),
+            start_from_origin: Some(true),
+        }
+    }
+
+    #[test]
+    fn each_draft_keeps_its_workspace_picks_and_a_moved_one_drops_its_checkout() {
+        let mut drafts = DraftSessions::default();
+        let first = drafts.create(project("web"));
+        let second = drafts.create(project("web"));
+        drafts.set_workspace(&first, &project("web"), checkout());
+        assert_eq!(drafts.workspace(&first), checkout());
+        assert_eq!(drafts.workspace(&second), WorkspaceChoice::default(), "another draft of the project");
+        drafts.assign(project("api"), &first);
+        let moved = WorkspaceChoice { branch: None, existing_worktree: None, ..checkout() };
+        assert_eq!(drafts.workspace(&first), moved, "the mode stays, the checkout was the old project's");
+        drafts.set_workspace(&first, &project("web"), checkout());
+        assert_eq!(drafts.workspace(&first), moved, "picks made before the move");
+    }
+
+    #[test]
+    fn a_saved_draft_comes_back_with_its_workspace_picks() {
+        let mut drafts = DraftSessions::default();
+        let draft = drafts.create(project("web"));
+        drafts.assign(project("web"), &draft);
+        drafts.set_workspace(&draft, &project("web"), checkout());
+        let saved = serde_json::to_value(drafts.saved(|_| false)).unwrap();
+        let mut next = DraftSessions::default();
+        next.restore(serde_json::from_value(saved).unwrap());
+        assert_eq!(next.workspace(&draft), checkout());
     }
 
     #[test]

@@ -26,6 +26,7 @@ use super::super::sidebar::now_ms;
 use super::pull_request_detail::{PanelThread, breakdown, toast_error};
 use super::pull_requests::speed_actions::{self, RowSpeed};
 use super::pull_requests::{checks_glyph, glyph, relative_time, review_glyph, tone};
+use crate::model::ScopedId;
 use crate::pull_request_detail::Reference;
 use crate::pull_requests::Entry;
 use crate::theme::{self, Tokens};
@@ -241,14 +242,13 @@ impl Workspace {
 impl Workspace {
     /// Pull requests link to threads where the environment reports capabilities
     /// (`threadPullRequestLinkMode`).
-    pub(in crate::app) fn pull_request_linking(&self, thread_id: &str) -> bool {
-        let environment = self.thread_environment(thread_id);
-        environment.and_then(|e| self.env_info(&e)).is_some_and(|info| !info.capabilities.is_null())
+    pub(in crate::app) fn pull_request_linking(&self, thread: &ScopedId) -> bool {
+        self.env_info(&thread.env).is_some_and(|info| !info.capabilities.is_null())
     }
 
     fn open_link_pull_request_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(thread_id) = self.open_thread_shell().map(|shell| shell.id.clone()) {
-            self.open_link_pull_request(thread_id, window, cx);
+        if let Some(thread) = self.open_thread_shell().map(ScopedId::of_thread) {
+            self.open_link_pull_request(thread, window, cx);
         }
     }
 
@@ -256,13 +256,12 @@ impl Workspace {
     /// and the command palette open this one dialog.
     pub(in crate::app) fn open_link_pull_request(
         &mut self,
-        thread_id: String,
+        thread: ScopedId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(shell) = self.shell.threads.iter().find(|t| t.id == thread_id) else { return };
-        let identity =
-            self.shell.projects.iter().find(|p| p.id == shell.project_id).and_then(|p| p.repository_identity.clone());
+        let Some(shell) = self.shell.thread(&thread) else { return };
+        let identity = self.shell.project(&ScopedId::thread_project(shell)).and_then(|p| p.repository_identity.clone());
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("Pull request URL or #42"));
         input.update(cx, |input, cx| input.focus(window, cx));
         let workspace = cx.entity().downgrade();
@@ -281,7 +280,7 @@ impl Workspace {
             dirty: false,
             pending: false,
             error: None,
-            thread_id,
+            thread,
             identity,
             workspace,
         });
@@ -297,7 +296,7 @@ struct LinkPullRequestForm {
     dirty: bool,
     pending: bool,
     error: Option<SharedString>,
-    thread_id: String,
+    thread: ScopedId,
     identity: Option<crate::model::RepositoryIdentity>,
     workspace: WeakEntity<Workspace>,
     _subscription: Subscription,
@@ -316,7 +315,7 @@ impl LinkPullRequestForm {
         if self.pending {
             return;
         }
-        let client = self.workspace.upgrade().and_then(|w| w.read(cx).thread_client(&self.thread_id));
+        let client = self.workspace.upgrade().and_then(|w| w.read(cx).env_client(&self.thread.env));
         let Some(client) = client else {
             self.error = Some("The pull request is not available in this environment.".into());
             return;
@@ -324,7 +323,7 @@ impl LinkPullRequestForm {
         self.error = None;
         self.pending = true;
         let command = json!({
-            "type": "thread.pull-request.link", "commandId": super::super::new_id(), "threadId": self.thread_id,
+            "type": "thread.pull-request.link", "commandId": super::super::new_id(), "threadId": self.thread.id,
             "host": link.host, "repository": link.repository, "number": link.number, "url": link.url, "source": "manual",
         });
         cx.spawn_in(window, async move |this, cx| {

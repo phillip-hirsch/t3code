@@ -1109,7 +1109,7 @@ impl Workspace {
                 // Changing a started thread needs `orchestration:operate` on its environment.
                 let Some((client, _, thread_id)) = self.pane_client(ChatPane::Main, cx) else { return };
                 let command = json!({"type": "thread.runtime-mode.set", "commandId": new_id(), "threadId": thread_id, "runtimeMode": mode});
-                self.dispatch_on(client, vec![command], cx);
+                self.dispatch_in_order(client, vec![command], cx);
             }
             _ => self.runtime_mode_override = Some(mode.to_owned()),
         }

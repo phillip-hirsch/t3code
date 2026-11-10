@@ -183,9 +183,7 @@ impl Workspace {
     /// `PullRequestHostVideo` for host media, else `MediaVideoPlayer` on the URL as written.
     fn render_pr_body_video(&mut self, key: &str, url: &str, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let Some(panel) = self.pull_requests.panel.as_ref() else { return div().into_any_element() };
-        let Some(environment) = self.project_environment(&panel.reference.project_id) else {
-            return div().into_any_element();
-        };
+        let environment: SharedString = panel.reference.environment_id.clone().into();
         let target = panel.detail.as_ref().filter(|detail| !detail.workspace_root.is_empty());
         let playable = match (body_logic::host_media(url), target) {
             (Some(media), Some(detail)) => Playable::Asset {
@@ -223,8 +221,8 @@ impl Workspace {
             .as_ref()
             .filter(|detail| !detail.workspace_root.is_empty())
             .map(|detail| (detail.workspace_root.clone(), detail.repository.clone()));
-        let client = self.project_client(&panel.reference.project_id);
-        let base = self.project_endpoint(&panel.reference.project_id).map(|endpoint| endpoint.http_base.clone());
+        let client = self.env_client(&panel.reference.environment_id);
+        let base = self.env_endpoint(&panel.reference.environment_id).map(|endpoint| endpoint.http_base.clone());
         let connection = client.zip(base);
         for destination in image_destinations(markdown) {
             if media_kind(&destination).is_some() || !images.claim(&destination) {

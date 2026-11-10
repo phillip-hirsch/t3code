@@ -464,7 +464,7 @@ impl Workspace {
             && self.can_operate(&env)
             && let Some(client) = self.env_client(&env)
         {
-            self.dispatch_on(client, vec![delete_command(thread_id, true)], cx);
+            self.dispatch_in_order(client, vec![delete_command(thread_id, true)], cx);
         }
     }
 
@@ -681,7 +681,7 @@ impl Workspace {
             let Some(run) = projection.interruptible_run() else { return };
             json!({"type": "run.interrupt", "commandId": new_id(), "threadId": thread_id, "runId": run.id, "holdQueue": true})
         };
-        self.dispatch_on(client, vec![command], cx);
+        self.dispatch_in_order(client, vec![command], cx);
     }
 
     /// Why Bring back is unavailable (`bringBackBlockedReason`), else the run it merges.

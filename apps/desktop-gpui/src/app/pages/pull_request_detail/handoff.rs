@@ -325,6 +325,8 @@ impl Workspace {
         window.push_notification(Notification::info("").title(format!("Preparing the {term} checkout...")), cx);
         // The checkout is made for the thread, so the draft's thread id exists first.
         self.start_draft_in(request.environment_id.clone().into(), request.project_id.clone(), window, cx);
+        // The draft itself, not only its project: another draft there must not take the checkout.
+        let started = self.target.clone();
         let Some(thread_id) = self.terminal_thread(cx) else {
             settled(self);
             return;
@@ -366,7 +368,8 @@ impl Workspace {
                     on_head: value["isOnPullRequestHead"].as_bool() != Some(false),
                 };
                 let (branch, worktree, on_head) = (&prepared.branch, &prepared.worktree_path, prepared.on_head);
-                if !matches!(&this.target, Some(Target::Draft { env, project_id: p, .. }) if *p == project_id && *env == environment_id) {
+                let on_draft = matches!(&this.target, Some(Target::Draft { env, project_id: p, .. }) if *p == project_id && *env == environment_id);
+                if !on_draft || this.target != started {
                     toast_error(
                         window,
                         cx,

@@ -54,7 +54,7 @@ struct Host {
 /// The host's mark (`SourceControlIcon`); the unknown host draws the pull request glyph.
 fn host_icon(kind: Option<&str>, size: f32, color: Hsla) -> AnyElement {
     match kind {
-        Some(kind @ ("github" | "gitlab" | "bitbucket" | "azure-devops" | "forgejo" | "gitcafe")) => {
+        Some(kind @ ("github" | "cursor-origin" | "gitlab" | "bitbucket" | "azure-devops" | "forgejo" | "gitcafe")) => {
             host_mark(kind, size, color)
         }
         _ => Icon::new(Lucide::GitPullRequest).with_size(px(size)).text_color(color).into_any_element(),

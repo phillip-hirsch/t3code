@@ -176,7 +176,7 @@ impl Workspace {
     pub(super) fn logical_project_environments(&self) -> Vec<EnvironmentOption> {
         let Some(project) = self.target_project() else { return Vec::new() };
         let groups = self.project_groups();
-        let Some(group) = groups.iter().find(|g| g.contains(&project.id)) else { return Vec::new() };
+        let Some(group) = groups.iter().find(|g| g.contains_project(project)) else { return Vec::new() };
         let scratch_draft = group.members[0].is_scratch && matches!(self.target, Some(Target::Draft { .. }));
         let mut options: Vec<EnvironmentOption> = Vec::new();
         if scratch_draft {
@@ -237,7 +237,7 @@ impl Workspace {
     /// The draft is a "No project" draft (`activeProjectIsScratch`), which never auto-balances.
     pub(super) fn draft_is_scratch(&self) -> bool {
         let Some(project) = self.target_project() else { return false };
-        self.project_groups().iter().any(|g| g.contains(&project.id) && g.members[0].is_scratch)
+        self.project_groups().iter().any(|g| g.contains_project(project) && g.members[0].is_scratch)
     }
 
     fn selection(&self) -> Option<&Selection> {

@@ -316,6 +316,10 @@ impl Workspace {
         let Some(key) = self.shown_pr_key() else { return };
         let Some(client) = self.pull_request_client_of(&key) else { return };
         let now = now_ms();
+        // `checkEnvironmentScope` at execution: a grant can go while the button shows.
+        if self.pull_requests.panel.as_ref().is_none_or(|p| !self.can_write_pr_guide(&p.reference)) {
+            return;
+        }
         let Some(panel) = self.pr_panel(&key) else { return };
         if panel.guide_starting || panel.guide.as_deref().is_some_and(is_running) {
             return;
