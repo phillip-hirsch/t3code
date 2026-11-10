@@ -1596,7 +1596,7 @@ impl Workspace {
 
 /// `workspaceRelativeFilePath(path, root)`: `path` relative to `root`, `"."` for the root itself,
 /// `None` outside it. Windows and UNC roots compare case-insensitively, POSIX roots do not.
-fn workspace_relative_file_path(path: &str, root: &str) -> Option<String> {
+pub(super) fn workspace_relative_file_path(path: &str, root: &str) -> Option<String> {
     if root.is_empty() {
         return None;
     }

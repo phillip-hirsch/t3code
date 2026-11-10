@@ -1143,6 +1143,9 @@ async fn run_request(
             if let Err(refusal) = ask(this, key, format!("Send this message from {server}?\n{text}"), cx).await {
                 return Outcome::Refused(refusal);
             }
+            if !this.read_with(cx, |this, _| this.can_operate(&scope.environment)).unwrap_or(false) {
+                return Outcome::Refused("Messages are not available here.".into());
+            }
             // `startThreadTurn` with `dispatchMode: "queue"`: after whatever the thread is running.
             let command = json!({
                 "type": "message.dispatch",

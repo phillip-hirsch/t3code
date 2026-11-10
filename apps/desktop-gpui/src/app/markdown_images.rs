@@ -47,8 +47,11 @@ struct Slot {
     main: bool,
     side: bool,
     generation: u64,
-    /// The workspace mutation a workspace file was read at; `None` for a source that cannot change.
-    revision: Option<Revision>,
+    /// The workspace mutation each pane's thread was at when it last read a workspace file, by
+    /// [`pane_index`]; `None` for a source that cannot change or a pane that has not asked.
+    revisions: [Option<Revision>; 2],
+    /// The rows (by view key) that show it, to remeasure once it loads.
+    rows: Vec<SharedString>,
     /// How to load it again, for a source an environment serves.
     reload: Option<Reload>,
     /// Its load failed; one an environment serves loads again once that environment reconnects.
@@ -72,6 +75,13 @@ impl Reload {
         match self {
             Self::Row { env, .. } | Self::Attachment { env } => env,
         }
+    }
+}
+
+fn pane_index(pane: ChatPane) -> usize {
+    match pane {
+        ChatPane::Main => 0,
+        ChatPane::Side => 1,
     }
 }
 
@@ -102,17 +112,20 @@ impl ImageCache {
     /// [`Self::claim`] for an image `pane` shows, which it then holds until it releases: the
     /// load to start, or `None` when the cache has already seen it.
     pub(super) fn claim_for(&self, pane: ChatPane, destination: &str) -> Option<Claim> {
-        self.claim_with(pane, destination, None, None)
+        self.claim_with(pane, destination, None, None, None)
     }
 
     /// [`Self::claim_for`] for a source read at `revision`, as the web keys a workspace file's
-    /// URL by it: a slot read at another revision loads again, keeping its image meanwhile.
+    /// URL by it: a slot `pane` read at another revision loads again, keeping its image
+    /// meanwhile. Each pane is its own thread with its own revisions, as the web's side chat is
+    /// its own `ChatView`. `row` is the row that shows it.
     fn claim_with(
         &self,
         pane: ChatPane,
         destination: &str,
         revision: Option<&Revision>,
         reload: Option<Reload>,
+        row: Option<&SharedString>,
     ) -> Option<Claim> {
         let mut cache = self.0.lock().ok()?;
         cache.side_claimed |= pane == ChatPane::Side;
@@ -121,38 +134,52 @@ impl ImageCache {
         if let Some(slot) = cache.slots.get_mut(destination) {
             slot.main |= main;
             slot.side |= side;
-            if revision.is_none() || slot.revision.as_ref() == revision {
+            if let Some(row) = row.filter(|row| !slot.rows.contains(row)) {
+                slot.rows.push(row.clone());
+            }
+            let read_at = &mut slot.revisions[pane_index(pane)];
+            if revision.is_none() || read_at.as_ref() == revision {
                 return None;
             }
-            slot.revision = revision.cloned();
+            *read_at = revision.cloned();
             slot.generation = generation;
             slot.failed = false;
         } else {
-            let revision = revision.cloned();
-            let slot = Slot { image: None, main, side, generation, revision, reload, failed: false };
+            let mut revisions = [None, None];
+            revisions[pane_index(pane)] = revision.cloned();
+            let rows = row.into_iter().cloned().collect();
+            let slot = Slot { image: None, main, side, generation, revisions, rows, reload, failed: false };
             cache.slots.insert(destination.to_owned(), slot);
         }
         cache.next += 1;
         Some(Claim { destination: destination.to_owned(), generation })
     }
 
-    /// The workspace files read before `revision`, to load again.
-    fn stale(&self, revision: &Revision) -> Vec<Reload> {
+    /// The workspace files `pane` read before `revision`, to load again through one of its rows.
+    fn stale(&self, pane: ChatPane, revision: &Revision) -> Vec<Reload> {
         let Ok(cache) = self.0.lock() else { return Vec::new() };
-        let stale = cache.slots.values().filter(|slot| slot.revision.as_ref().is_some_and(|r| r != revision));
-        stale.filter_map(|slot| slot.reload.clone()).collect()
+        let stale = cache
+            .slots
+            .values()
+            .filter(|slot| slot.revisions[pane_index(pane)].as_ref().is_some_and(|r| r != revision));
+        stale
+            .filter_map(|slot| {
+                let Some(Reload::Row { env, destination, source, .. }) = slot.reload.clone() else { return None };
+                let key = slot.rows.iter().find(|row| view_pane(row).0 == pane)?.clone();
+                Some(Reload::Row { env, key, destination, source })
+            })
+            .collect()
     }
 
-    /// Fills the slot `claim` started; a load whose slot was released, or claimed again since,
-    /// keeps nothing. The row that first showed a reloaded image, to remeasure too.
-    pub(super) fn fill(&self, claim: Claim, image: Arc<Image>) -> Option<SharedString> {
-        let mut cache = self.0.lock().ok()?;
-        let slot = cache.slots.get_mut(&claim.destination).filter(|s| s.generation == claim.generation)?;
+    /// Fills the slot `claim` started, naming the rows that show it; a load whose slot was
+    /// released, or claimed again since, keeps nothing.
+    pub(super) fn fill(&self, claim: Claim, image: Arc<Image>) -> Vec<SharedString> {
+        let Ok(mut cache) = self.0.lock() else { return Vec::new() };
+        let Some(slot) = cache.slots.get_mut(&claim.destination).filter(|s| s.generation == claim.generation) else {
+            return Vec::new();
+        };
         slot.image = Some(image);
-        match slot.reload.as_ref()? {
-            Reload::Row { key, .. } => Some(key.clone()),
-            Reload::Attachment { .. } => None,
-        }
+        slot.rows.clone()
     }
 
     /// Marks the slot `claim` started failed, so parses do not retry it until a reconnect.
@@ -195,6 +222,8 @@ impl ImageCache {
         }
         cache.slots.retain(|_, slot| {
             slot.side = false;
+            slot.revisions[pane_index(ChatPane::Side)] = None;
+            slot.rows.retain(|row| view_pane(row).0 == ChatPane::Main);
             slot.main
         });
     }
@@ -334,14 +363,54 @@ fn decode_entities(value: &str) -> String {
     value.replace("&quot;", "\"").replace("&#39;", "'").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
 }
 
+/// `isWindowsAbsolutePath`: a UNC share, or a drive (`C:`, `C:\`, `C:/`).
 fn is_windows_absolute(path: &str) -> bool {
     let bytes = path.as_bytes();
-    bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'\\' | b'/')
+    path.starts_with("\\\\")
+        || (bytes.len() > 1
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes.get(2).is_none_or(|b| matches!(b, b'\\' | b'/')))
+}
+
+/// `stripSlashPrefixedWindowsDrive`: a file URL writes `C:/x` as `/C:/x`.
+fn strip_slash_drive(path: String) -> String {
+    let bytes = path.as_bytes();
+    let prefixed = bytes.len() > 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':';
+    if prefixed && matches!(bytes[3], b'\\' | b'/') { path[1..].to_owned() } else { path }
+}
+
+/// `parseFileUrlHref`'s path: another host than this one names a UNC share.
+fn file_url_path(href: &str) -> Option<String> {
+    let url = url::Url::parse(href).ok()?;
+    let path = match url.host_str().filter(|host| !host.is_empty() && !host.eq_ignore_ascii_case("localhost")) {
+        Some(host) => format!("\\\\{host}{}", url.path().replace('/', "\\")),
+        None => url.path().to_owned(),
+    };
+    (!path.is_empty()).then_some(path)
+}
+
+/// `markdownDestinationHostPath`: the percent-decoded path a destination names on the host, or
+/// `None` for a `file:` URL that does not parse.
+fn host_path(source: &str, file_url: bool) -> Option<String> {
+    let path =
+        if file_url { file_url_path(source)? } else { source.split(['?', '#']).next().unwrap_or_default().to_owned() };
+    let decoded = crate::thread_links::decode_uri_component(&path).unwrap_or(path);
+    Some(strip_slash_drive(decoded))
+}
+
+/// `hostFileSource`: rendering is not a click, so a network path loads only from the project's own share.
+fn host_file(path: String, workspace_root: Option<&str>) -> Source {
+    let network = path.len() > 1 && path.as_bytes()[..2].iter().all(|b| matches!(b, b'\\' | b'/'));
+    let inside =
+        || workspace_root.is_some_and(|root| super::context_strip::workspace_relative_file_path(&path, root).is_some());
+    if network && !inside() { Source::Blocked } else { Source::WorkspaceFile(path) }
 }
 
 /// `classifyMarkdownImageSource`, plus decoding data URLs for the native view.
 pub(super) fn classify(destination: &str, workspace_root: Option<&str>) -> Source {
-    let source = destination.trim();
+    let trimmed = destination.trim();
+    let source = trimmed.strip_prefix('<').and_then(|rest| rest.strip_suffix('>')).unwrap_or(trimmed);
     if source.is_empty() || source.starts_with('#') || source.starts_with('?') {
         return Source::Blocked;
     }
@@ -355,25 +424,22 @@ pub(super) fn classify(destination: &str, workspace_root: Option<&str>) -> Sourc
     if lower.starts_with("data:") {
         return data_url(source).map_or(Source::Blocked, |(format, bytes)| Source::Data(format, bytes));
     }
-    let path = source.strip_prefix("file://").unwrap_or(source);
-    let path = path.split(['?', '#']).next().unwrap_or_default();
-    // A network share loads only from inside the project's own.
-    if path.starts_with("\\\\") || path.starts_with("//") {
-        return match workspace_root {
-            Some(root) if path.strip_prefix(root).is_some_and(|rest| rest.starts_with(['\\', '/'])) => {
-                Source::WorkspaceFile(path.to_owned())
-            }
-            _ => Source::Blocked,
-        };
+    let file_url = lower.starts_with("file:");
+    let Some(path) = host_path(source, file_url) else { return Source::Blocked };
+    if file_url {
+        return host_file(path, workspace_root);
     }
-    if path.starts_with('/') || is_windows_absolute(path) {
-        let path = if lower.starts_with("file:///") && is_windows_absolute(&path[1..]) { &path[1..] } else { path };
-        return Source::WorkspaceFile(path.to_owned());
+    if path.is_empty() {
+        return Source::Blocked;
     }
-    let has_scheme = path.find(':').is_some_and(|colon| {
-        colon > 0 && path[..colon].chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
+    if path.starts_with('/') || is_windows_absolute(&path) {
+        return host_file(path, workspace_root);
+    }
+    let has_scheme = path.split_once(':').is_some_and(|(scheme, _)| {
+        scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
     });
-    if has_scheme || path.starts_with("~/") || path.starts_with("~\\") || path.is_empty() {
+    if has_scheme || path.starts_with("~/") || path.starts_with("~\\") {
         return Source::Blocked;
     }
     let Some(root) = workspace_root else { return Source::Blocked };
@@ -441,11 +507,23 @@ impl Workspace {
         self.load_sources(key, sources, cx);
     }
 
-    /// Loads again the workspace images read before the open thread's latest workspace
+    /// Loads again the workspace images each pane read before its thread's latest workspace
     /// mutation, as the web mints a new URL for each `workspaceMutationId`.
     pub(super) fn refresh_workspace_images(&mut self, cx: &mut Context<Self>) {
-        let stale = self.markdown_images.stale(&self.current_workspace_mutation());
-        self.reload_images(stale, cx);
+        for pane in [ChatPane::Main, ChatPane::Side] {
+            let stale = self.markdown_images.stale(pane, &self.pane_workspace_mutation(pane));
+            self.reload_images(stale, cx);
+        }
+    }
+
+    /// The workspace mutation of the thread `pane` shows: the side chat is a thread of its own.
+    fn pane_workspace_mutation(&self, pane: ChatPane) -> Revision {
+        match pane {
+            ChatPane::Main => self.current_workspace_mutation(),
+            ChatPane::Side => {
+                self.side_chat_projection().map_or((None, None), super::right_panel::projection_workspace_mutation)
+            }
+        }
     }
 
     /// `environment` reconnected: the images it could not serve load again, as the web's asset
@@ -464,11 +542,16 @@ impl Workspace {
     }
 
     fn load_sources(&mut self, key: &SharedString, sources: Vec<(String, Source)>, cx: &mut Context<Self>) {
-        let thread_id = self.thread.as_ref().map(|t| t.id.clone());
         let cache = self.markdown_images.clone();
         let pane = view_pane(key).0;
-        let revision = self.current_workspace_mutation();
-        let env = self.target.as_ref().map(|target| target.environment().clone());
+        let revision = self.pane_workspace_mutation(pane);
+        let (env, thread_id) = match pane {
+            ChatPane::Main => (
+                self.target.as_ref().map(|target| target.environment().clone()),
+                self.thread.as_ref().map(|t| t.id.clone()),
+            ),
+            ChatPane::Side => self.pane_thread(ChatPane::Side).unzip(),
+        };
         for (destination, source) in sources {
             let revision = matches!(source, Source::WorkspaceFile(_)).then_some(&revision);
             let served = matches!(source, Source::WorkspaceFile(_) | Source::Asset(_));
@@ -476,7 +559,7 @@ impl Workspace {
                 let (key, destination, source) = (key.clone(), destination.clone(), source.clone());
                 Reload::Row { env, key, destination, source }
             });
-            let Some(claim) = cache.claim_with(pane, &destination, revision, reload) else { continue };
+            let Some(claim) = cache.claim_with(pane, &destination, revision, reload, Some(key)) else { continue };
             let resource = match &source {
                 Source::WorkspaceFile(path) => {
                     thread_id.as_ref().map(|id| json!({"_tag": "media-file", "threadId": id, "path": path}))
@@ -532,13 +615,13 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(image) = image else { return cache.fail(claim) };
-        let first_row = cache.fill(claim, image);
+        let rows = cache.fill(claim, image);
         if !cache.same(&self.markdown_images) {
             return;
         }
         self.remeasure_item_rows(key, cx);
-        if let Some(first_row) = first_row.filter(|first| first != key) {
-            self.remeasure_item_rows(&first_row, cx);
+        for row in rows.iter().filter(|row| *row != key) {
+            self.remeasure_item_rows(row, cx);
         }
         cx.notify();
     }
@@ -613,7 +696,7 @@ impl Workspace {
         for id in ids {
             let key = attachment_key(id);
             let reload = Reload::Attachment { env: env.clone() };
-            let Some(claim) = cache.claim_with(pane, &key, None, Some(reload)) else { continue };
+            let Some(claim) = cache.claim_with(pane, &key, None, Some(reload), None) else { continue };
             let resource = json!({"_tag": "attachment", "attachmentId": id});
             let (client, base, cache) = (client.clone(), base.clone(), cache.clone());
             cx.spawn(async move |this, cx| {
@@ -779,13 +862,14 @@ mod tests {
     fn a_failed_load_from_an_environment_retries_when_it_reconnects() {
         let cache = ImageCache::default();
         let revision: Revision = (None, None);
-        let plot = cache.claim_with(ChatPane::Main, "plot.png", Some(&revision), Some(plot_reload("remote"))).unwrap();
+        let plot =
+            cache.claim_with(ChatPane::Main, "plot.png", Some(&revision), Some(plot_reload("remote")), None).unwrap();
         cache.fail(plot);
         let attachment = Some(Reload::Attachment { env: "remote".into() });
-        cache.fail(cache.claim_with(ChatPane::Main, "t3-attachment:a", None, attachment).unwrap());
+        cache.fail(cache.claim_with(ChatPane::Main, "t3-attachment:a", None, attachment, None).unwrap());
         cache.fail(cache.claim_for(ChatPane::Main, "https://x.dev/a.png").unwrap());
         assert!(
-            cache.claim_with(ChatPane::Main, "plot.png", Some(&revision), Some(plot_reload("remote"))).is_none(),
+            cache.claim_with(ChatPane::Main, "plot.png", Some(&revision), Some(plot_reload("remote")), None).is_none(),
             "a failed load waits for a reconnect, not the next parse"
         );
         assert!(cache.take_failed("local").is_empty(), "another environment's reconnect retries nothing");
@@ -793,7 +877,9 @@ mod tests {
             cache.take_failed("remote").iter().map(reload_destination).map(str::to_owned).collect();
         retried.sort();
         assert_eq!(retried, ["attachment", "plot.png"]);
-        assert!(cache.claim_with(ChatPane::Main, "plot.png", Some(&revision), Some(plot_reload("remote"))).is_some());
+        assert!(
+            cache.claim_with(ChatPane::Main, "plot.png", Some(&revision), Some(plot_reload("remote")), None).is_some()
+        );
         assert!(cache.claim_for(ChatPane::Main, "t3-attachment:a").is_some());
         assert!(cache.claim_for(ChatPane::Main, "https://x.dev/a.png").is_none(), "a web image stays failed");
     }
@@ -804,23 +890,59 @@ mod tests {
         let cache = ImageCache::default();
         let (before, after): (Revision, Revision) = ((Some("edit-1".into()), None), (Some("edit-2".into()), None));
         let reload = || Some(plot_reload("local"));
-        let first = cache.claim_with(ChatPane::Main, "plot.png", Some(&before), reload()).unwrap();
+        let row = SharedString::from("reply");
+        let first = cache.claim_with(ChatPane::Main, "plot.png", Some(&before), reload(), Some(&row)).unwrap();
         let old = png();
         cache.fill(first.clone(), old.clone());
-        assert!(cache.claim_with(ChatPane::Main, "plot.png", Some(&before), reload()).is_none());
-        assert!(cache.stale(&before).is_empty());
+        assert!(cache.claim_with(ChatPane::Main, "plot.png", Some(&before), reload(), Some(&row)).is_none());
+        assert!(cache.stale(ChatPane::Main, &before).is_empty());
         let web = cache.claim_for(ChatPane::Main, "https://x.dev/a.png").unwrap();
         cache.fill(web, png());
-        let stale: Vec<_> = cache.stale(&after).iter().map(reload_destination).map(str::to_owned).collect();
+        let stale: Vec<_> =
+            cache.stale(ChatPane::Main, &after).iter().map(reload_destination).map(str::to_owned).collect();
         assert_eq!(stale, ["plot.png"], "only the workspace file reloads");
-        let again = cache.claim_with(ChatPane::Main, "plot.png", Some(&after), reload()).unwrap();
-        assert!(cache.stale(&after).is_empty());
+        let again = cache.claim_with(ChatPane::Main, "plot.png", Some(&after), reload(), Some(&row)).unwrap();
+        assert!(cache.stale(ChatPane::Main, &after).is_empty());
         assert!(Arc::ptr_eq(&cache.get("plot.png").unwrap(), &old), "the old image shows while it reloads");
         cache.fill(first, png());
         assert!(Arc::ptr_eq(&cache.get("plot.png").unwrap(), &old), "the earlier read keeps nothing");
         let new = png();
         cache.fill(again, new.clone());
         assert!(Arc::ptr_eq(&cache.get("plot.png").unwrap(), &new));
+    }
+
+    #[test]
+    fn each_pane_reloads_a_workspace_file_on_its_own_mutations() {
+        let cache = ImageCache::default();
+        let (main, side) = (SharedString::from("reply"), super::super::chat::view_key(ChatPane::Side, "reply"));
+        let (main_at, side_at, side_later): (Revision, Revision, Revision) =
+            ((Some("main-1".into()), None), (Some("side-1".into()), None), (Some("side-2".into()), None));
+        let first =
+            cache.claim_with(ChatPane::Main, "plot.png", Some(&main_at), Some(plot_reload("local")), Some(&main));
+        cache.fill(first.unwrap(), BLANK.clone());
+        let side_read = cache.claim_with(ChatPane::Side, "plot.png", Some(&side_at), None, Some(&side));
+        assert!(side_read.is_some(), "the side chat reads the file at its own revision");
+        cache.fill(side_read.unwrap(), BLANK.clone());
+        assert!(cache.stale(ChatPane::Main, &main_at).is_empty());
+        assert!(cache.stale(ChatPane::Side, &side_at).is_empty(), "the panes do not undo each other's reads");
+        let stale = cache.stale(ChatPane::Side, &side_later);
+        let keys = stale.iter().map(|r| match r {
+            Reload::Row { key, destination, .. } => (key.clone(), destination.as_str()),
+            Reload::Attachment { .. } => unreachable!(),
+        });
+        assert_eq!(keys.collect::<Vec<_>>(), [(side.clone(), "plot.png")], "a side edit reloads through a side row");
+        assert!(cache.claim_with(ChatPane::Side, "plot.png", Some(&side_later), None, Some(&side)).is_some());
+        assert!(cache.claim_with(ChatPane::Main, "plot.png", Some(&main_at), None, Some(&main)).is_none());
+    }
+
+    #[test]
+    fn a_finished_load_names_every_row_that_shows_it() {
+        let cache = ImageCache::default();
+        let (first, second) = (SharedString::from("reply-1"), SharedString::from("reply-2"));
+        let claim = cache.claim_with(ChatPane::Main, "https://x.dev/a.png", None, None, Some(&first)).unwrap();
+        assert!(cache.claim_with(ChatPane::Main, "https://x.dev/a.png", None, None, Some(&second)).is_none());
+        assert!(cache.claim_with(ChatPane::Main, "https://x.dev/a.png", None, None, Some(&first)).is_none());
+        assert_eq!(cache.fill(claim, BLANK.clone()), [first, second]);
     }
 
     #[test]
@@ -836,6 +958,38 @@ mod tests {
         let share = Some(r"\\srv\proj");
         assert_eq!(classify(r"\\srv\proj\a.png", share), Source::WorkspaceFile(r"\\srv\proj\a.png".into()));
         assert_eq!(classify(r"\\srv\proj-secrets\a.png", share), Source::Blocked);
+        assert_eq!(classify(r"\\srv\proj\..\secrets\a.png", share), Source::Blocked);
+        assert_eq!(classify("docs/a.png", share), Source::WorkspaceFile(r"\\srv\proj\docs\a.png".into()));
+        assert_eq!(
+            classify("file:///workspace/project/image%20one.png", None),
+            Source::WorkspaceFile("/workspace/project/image one.png".into())
+        );
+        assert_eq!(
+            classify("docs/plot%20one.png", Some("/repo")),
+            Source::WorkspaceFile("/repo/docs/plot one.png".into())
+        );
+        assert_eq!(classify("/repo/100%.png", None), Source::WorkspaceFile("/repo/100%.png".into()));
+        assert_eq!(classify("file:///C:/repo/a%20b.png", None), Source::WorkspaceFile("C:/repo/a b.png".into()));
+        assert_eq!(classify("/C:/repo/a.png", None), Source::WorkspaceFile("C:/repo/a.png".into()));
+        assert_eq!(classify("<docs/a b.png>", Some("/repo")), Source::WorkspaceFile("/repo/docs/a b.png".into()));
+        assert_eq!(
+            classify("file://server/share/image.png", Some(r"\\server\share")),
+            Source::WorkspaceFile(r"\\server\share\image.png".into())
+        );
+        assert_eq!(classify("image.png", None), Source::Blocked);
+        assert_eq!(classify("file://%", None), Source::Blocked);
+        // Loading these makes Windows send the user's NTLM credentials to the named host.
+        let project = Some(r"\\server\share\project");
+        for source in [
+            "file://attacker.test/share/cat.jpg",
+            r"\\attacker.test\share\cat.jpg",
+            r"/\attacker.test\share\cat.jpg",
+            "file:/%5Cattacker.test%5Cshare%5Ccat.jpg",
+            "/%5C%5Cattacker.test/share/cat.jpg",
+            r"\\server\other\cat.jpg",
+        ] {
+            assert_eq!(classify(source, project), Source::Blocked, "{source}");
+        }
         assert_eq!(
             classify("data:image/png;base64,iVBO", None),
             Source::Data(ImageFormat::Png, vec![0x89, 0x50, 0x4e])
