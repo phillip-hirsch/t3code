@@ -219,6 +219,7 @@ impl Workspace {
             || self.sending
             || self.target_rewinding()
             || self.runtime_mode_ceiling().is_some()
+            || self.clone_send_block().is_some()
         {
             return;
         }

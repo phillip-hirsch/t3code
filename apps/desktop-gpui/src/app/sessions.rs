@@ -311,6 +311,7 @@ impl Workspace {
             self.subscribe_terminal_metadata(environment_id.clone(), &client, window, cx),
             self.subscribe_previews(&environment_id, &client, window, cx),
             self.subscribe_device_state(environment_id.clone(), &client, window, cx),
+            self.subscribe_project_clones(environment_id.clone(), &client, window, cx),
         ];
         if !config_known {
             streams.push(self.subscribe_shell_without_config(environment_id.clone(), window, cx));
@@ -585,17 +586,20 @@ impl Workspace {
     /// A removed project's drafts go with it, the open one too.
     pub(super) fn forget_project_drafts(&mut self, project_id: &str, cx: &mut Context<Self>) {
         let Some(env) = self.project_environment(project_id) else { return };
+        self.forget_scoped_project_drafts(&ScopedId::new(env, project_id), cx);
+    }
+
+    /// [`Self::forget_project_drafts`] for a project the shell may no longer list.
+    pub(super) fn forget_scoped_project_drafts(&mut self, project: &ScopedId, cx: &mut Context<Self>) {
         let of_project = |target: &Target| match target {
-            Target::Draft { env: draft_env, project_id: draft_project, .. } => {
-                *draft_env == env && draft_project == project_id
-            }
+            Target::Draft { env, project_id, .. } => *env == project.env && *project_id == project.id,
             Target::Thread { .. } => false,
         };
         self.composer_drafts.retain(|target, _| !of_project(target));
         if self.target.as_ref().is_some_and(of_project) {
             self.target = None;
         }
-        self.drafts.forget_project(&ScopedId::new(env, project_id));
+        self.drafts.forget_project(project);
         self.drafts_changed(cx);
     }
 

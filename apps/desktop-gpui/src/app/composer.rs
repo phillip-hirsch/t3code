@@ -1262,6 +1262,8 @@ impl Workspace {
         }
         let disabled_reason: Option<SharedString> = if self.attachments_busy() {
             Some("Attachment(s) still uploading".into())
+        } else if let Some(reason) = self.clone_send_block() {
+            Some(reason.into())
         } else {
             // An answer to an open question still goes through.
             self.runtime_mode_ceiling().filter(|_| self.question.is_none()).map(|(denial, _)| denial.into())
@@ -1528,6 +1530,7 @@ impl Workspace {
             .chain(self.render_fallback_banner(t, cx))
             .chain(self.render_recovery_banner(t, cx))
             .chain(self.render_extension_status_banner(t))
+            .chain(self.render_clone_banner(t, cx))
             .chain(self.render_fresh_session_banner(t, cx))
             .chain(self.render_branch_banner(t, cx))
             .chain(self.render_runtime_mode_ceiling_banner(t, cx))

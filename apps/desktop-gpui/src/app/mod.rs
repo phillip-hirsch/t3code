@@ -70,6 +70,7 @@ mod palette_actions;
 mod plan_actions;
 mod positions;
 mod preview;
+mod project_clone;
 mod prompt_stash;
 mod queue;
 mod quit;
@@ -370,6 +371,8 @@ pub struct Workspace {
     fresh_sessions: fresh_session::FreshSessions,
     /// Window bounds persistence and other desktop shell state.
     desktop: desktop::DesktopShell,
+    /// Each environment's project clones and their toasts.
+    clones: project_clone::ProjectClones,
     /// Running threads synced in the background.
     keep_alive: keep_alive::KeepAlive,
     /// Paired remote environments and their background connections.
@@ -568,6 +571,7 @@ impl Workspace {
             banners: Default::default(),
             fresh_sessions: Default::default(),
             desktop,
+            clones: project_clone::ProjectClones::default(),
             keep_alive: Default::default(),
             saved_environments,
             _subscriptions: subscriptions,
@@ -1079,6 +1083,7 @@ impl Workspace {
         self.notify_sidebar(cx);
         cx.notify();
         self.record_location();
+        self.sync_clone_toasts(window, cx);
     }
 
     fn reset_timeline(&mut self, cx: &mut Context<Self>) {

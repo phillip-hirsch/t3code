@@ -1,10 +1,11 @@
 //! The command palette (`apps/web/src/components/CommandPalette*.tsx`): actions,
 //! recent threads, search over threads, projects and settings, message hits,
 //! "New thread in…", and the add-project flow (browse a folder, or pick one
-//! with the native dialog, then `projects.mutate`).
+//! with the native dialog, then `projects.mutate`; or clone a Git URL or a host's repository,
+//! then `projectClone.start`).
 //!
 //! Go to file and Search project contents open the child searches in `files/`.
-//! Actions this client has no surface for yet (guest sharing, new project, clone, WSL folders) are left
+//! Actions this client has no surface for yet (guest sharing, new project, WSL folders) are left
 //! out, and the theme list has no environment-published themes.
 
 use std::cell::RefCell;
@@ -30,11 +31,15 @@ use serde_json::{Value, json};
 use super::keymap;
 use super::pages::Page;
 use super::palette_actions::github_repository;
+use super::project_clone::paths as clone_paths;
+use super::source_control;
 use super::{Target, Workspace, new_id, project_name};
 use crate::inbox;
 use crate::model::{ProjectShell, ScopedId};
 use crate::search::{self, Field, Weighted};
 use crate::theme::Tokens;
+
+mod clone_flow;
 
 const RECENT_LIMIT: usize = 12;
 const THREAD_LIMIT: usize = 20;
@@ -144,6 +149,8 @@ pub(super) enum View {
     /// The sources of [`Palette::add_environment`].
     AddProjectSources,
     Browse,
+    /// A clone source's repository field, then where to clone it ([`Palette::clone`]).
+    Clone,
     /// "Change theme" (`theme.select`).
     Themes,
     /// "Change appearance".
@@ -166,6 +173,8 @@ enum Run {
     AddProjectIn(SharedString),
     /// "Local folder": browse a folder on this environment (`startAddProjectBrowse`).
     BrowseIn(SharedString),
+    /// "Git URL" (`None`) or a host's repository: clone on this environment (`startAddProjectClone`).
+    CloneFrom(SharedString, Option<&'static str>),
     Settings(&'static str),
     /// One setting: its section, scrolled to its row.
     Setting(&'static crate::settings::SearchItem),
@@ -225,6 +234,8 @@ impl Run {
 enum RowIcon {
     Lucide(IconName),
     Project(ScopedId),
+    /// A source control host's mark.
+    Host(&'static str),
 }
 
 #[derive(Clone)]
@@ -275,6 +286,8 @@ struct Row {
     quality: f32,
     /// Shown dimmed, and neither highlighted nor run (`DisabledCommandPaletteResultRow`).
     disabled: bool,
+    /// A clone source that is not set up: Setup Required, with how (`titleTrailingContent`).
+    setup: Option<SharedString>,
     /// Listed after the other rows of its group (`secondary`).
     secondary: bool,
 }
@@ -298,6 +311,7 @@ impl Row {
             data_terms: Vec::new(),
             quality: 0.,
             disabled: false,
+            setup: None,
             secondary: false,
         }
     }
@@ -340,7 +354,7 @@ pub(super) struct Palette {
     scroll: ScrollHandle,
     browse: Browse,
     messages: MessageSearch,
-    placeholder: &'static str,
+    placeholder: SharedString,
     /// The app is dark: the theme list marks the dark appearance's theme as current.
     dark: bool,
     /// The root view's Threads group, ranked once per query and shell change.
@@ -355,6 +369,14 @@ pub(super) struct Palette {
     new_thread_order: RefCell<Option<Vec<String>>>,
     /// The environment "Add project" adds on (`addProjectEnvironmentId`), once one is picked.
     add_environment: Option<SharedString>,
+    /// The clone flow, once a clone source is picked (`addProjectCloneFlow`).
+    clone: Option<CloneFlow>,
+    /// A repository lookup or a clone start is on its way (`isRemoteProjectPending`).
+    clone_pending: bool,
+    _clone_task: Option<Task<()>>,
+    /// `server.discoverSourceControl` for an add-project environment: clone sources' readiness.
+    discovery: Option<(SharedString, Option<Value>)>,
+    _discovery_task: Option<Task<()>>,
     /// Tab stays inside the palette while it is open (the web's modal dialog).
     trap: FocusHandle,
     _subscription: Subscription,
@@ -561,6 +583,43 @@ fn submit_path(browse: Option<&Browse>, query: &str) -> Option<String> {
     resolved.or_else(|| (!query.trim().is_empty()).then(|| query.trim().to_owned()))
 }
 
+/// `AddProjectCloneFlow`: where a clone happens and what it clones.
+#[derive(Clone, Debug, PartialEq)]
+struct CloneFlow {
+    environment: SharedString,
+    /// The host kind; `None` is a Git URL.
+    source: Option<&'static str>,
+    /// The resolved repository, once the flow moved on to its destination (`step: "confirm"`).
+    confirm: Option<CloneTarget>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct CloneTarget {
+    /// What the user typed.
+    input: String,
+    /// The looked-up repository's `nameWithOwner` and web URL.
+    repository: Option<(String, String)>,
+    remote_url: String,
+}
+
+impl CloneFlow {
+    /// `remoteProjectButtonLabel`.
+    fn submit_label(&self) -> &'static str {
+        if self.source.is_some() { "Lookup" } else { "Continue" }
+    }
+}
+
+/// Whether the view browses folders for `query`: the browse view, a path typed at the root, or
+/// the clone destination (`getFilesystemBrowsePath(…).isBrowsing`).
+fn browses(palette: &Palette, query: &str) -> bool {
+    match palette.view {
+        View::Browse => true,
+        View::Root => is_browse_query(query),
+        View::Clone => palette.clone.as_ref().is_some_and(|flow| flow.confirm.is_some()) && is_browse_query(query),
+        _ => false,
+    }
+}
+
 pub(super) fn filter_entries<'a>(entries: &'a [(String, String)], leaf: &str) -> Vec<&'a (String, String)> {
     let lower = leaf.to_lowercase();
     entries
@@ -594,7 +653,7 @@ impl Workspace {
             scroll: ScrollHandle::new(),
             browse: Browse::default(),
             messages: MessageSearch::default(),
-            placeholder: "",
+            placeholder: SharedString::default(),
             dark: crate::theme::tokens(cx).dark,
             threads: None,
             message_order: MessageOrder::default(),
@@ -602,6 +661,11 @@ impl Workspace {
             project_order: RefCell::default(),
             new_thread_order: RefCell::default(),
             add_environment: None,
+            clone: None,
+            clone_pending: false,
+            _clone_task: None,
+            discovery: None,
+            _discovery_task: None,
             trap: cx.focus_handle(),
             _subscription: subscription,
         });
@@ -665,14 +729,7 @@ impl Workspace {
         let start = match view {
             // `getAddProjectInitialQueryForEnvironment`: the browse environment's base folder.
             View::Browse => {
-                let environment = self.browse_environment();
-                let info = environment.as_deref().and_then(|environment| self.env_info(environment));
-                let base = info
-                    .and_then(|info| info.settings.get("addProjectBaseDirectory").as_str())
-                    .unwrap_or_default()
-                    .trim()
-                    .trim_end_matches(['/', '\\']);
-                if base.is_empty() { "~/".to_owned() } else { format!("{base}/") }
+                self.browse_environment().map_or_else(|| "~/".to_owned(), |env| self.add_project_base(&env))
             }
             _ => String::new(),
         };
@@ -681,6 +738,9 @@ impl Workspace {
         palette.view = view;
         palette.highlight = None;
         self.set_palette_query(&start, window, cx);
+        if matches!(view, View::AddProject | View::AddProjectSources) {
+            self.load_palette_discovery(cx);
+        }
     }
 
     /// The environment the add-project flow browses and adds on: the one picked, else the first
@@ -784,21 +844,31 @@ impl Workspace {
         let Some((view, query)) = palette.stack.pop() else { return };
         palette.view = view;
         palette.highlight = None;
+        // `popView`: Back leaves the clone flow, and drops what it was waiting on.
+        palette.clone = None;
+        palette.clone_pending = false;
+        palette._clone_task = None;
         self.set_palette_query(&query, window, cx);
     }
 
     fn palette_query_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let query = self.palette_query(cx);
         let Some(palette) = &mut self.palette else { return };
-        let browsing = palette.view == View::Browse || (palette.view == View::Root && is_browse_query(&query));
-        let placeholder = match (browsing, palette.stack.is_empty()) {
-            (true, true) => "Enter project path (e.g. ~/projects/my-app)",
-            (true, false) => "Enter path (e.g. ~/projects/my-app)",
-            (false, true) => "Search commands, projects, and threads...",
-            (false, false) => "Search...",
+        let browsing = browses(palette, &query);
+        let placeholder: SharedString = match (&palette.clone, browsing, palette.stack.is_empty()) {
+            // `remoteProjectInputPlaceholder`.
+            (Some(CloneFlow { source: None, confirm: None, .. }), ..) => "Enter Git clone URL".into(),
+            (Some(CloneFlow { source: Some(kind), confirm: None, .. }), ..) => {
+                let host = source_control::definition(kind);
+                format!("Enter {} repository ({})", host.label, host.path_hint).into()
+            }
+            (_, true, true) => "Enter project path (e.g. ~/projects/my-app)".into(),
+            (_, true, false) => "Enter path (e.g. ~/projects/my-app)".into(),
+            (_, false, true) => "Search commands, projects, and threads...".into(),
+            (_, false, false) => "Search...".into(),
         };
         if palette.placeholder != placeholder {
-            palette.placeholder = placeholder;
+            palette.placeholder = placeholder.clone();
             let input = palette.input.clone();
             input.update(cx, |input, cx| input.set_placeholder(placeholder, window, cx));
         }
@@ -1375,7 +1445,7 @@ impl Workspace {
 
     fn palette_groups(&self, query: &str) -> Vec<Group> {
         let Some(palette) = &self.palette else { return Vec::new() };
-        if palette.view == View::Browse || (palette.view == View::Root && is_browse_query(query)) {
+        if browses(palette, query) {
             return self.browse_groups(query);
         }
         let (actions_only, search_query) = actions_filter(query);
@@ -1399,13 +1469,16 @@ impl Workspace {
                     vec![Group { label: "Environments", rows: scope(self.add_project_environment_rows()) }]
                 }
                 AddProjectEntry::Sources(environment) => {
-                    vec![Group { label: "Sources", rows: scope(vec![local_folder_row(environment)]) }]
+                    vec![Group { label: "Sources", rows: scope(self.add_project_source_rows(environment)) }]
                 }
             },
             View::AddProjectSources => {
-                let rows = palette.add_environment.clone().map(local_folder_row).into_iter().collect();
+                let rows =
+                    palette.add_environment.clone().map(|env| self.add_project_source_rows(env)).unwrap_or_default();
                 vec![Group { label: "Sources", rows: scope(rows) }]
             }
+            // The repository field lists nothing; the destination lists folders while it is a path.
+            View::Clone => return Vec::new(),
             View::Root | View::Browse => return self.search_groups(query, true),
         };
         if submenu_falls_back(&scoped, query) {
@@ -1602,8 +1675,7 @@ impl Workspace {
     /// Ranks the root view's threads for `query` unless the last ranking still holds.
     fn rank_palette_threads(&mut self, query: &str) {
         let Some(palette) = &self.palette else { return };
-        let browsing = palette.view == View::Browse || (palette.view == View::Root && is_browse_query(query));
-        if browsing || actions_filter(query).0 {
+        if browses(palette, query) || actions_filter(query).0 {
             return;
         }
         let now = super::sidebar::now_ms();
@@ -1676,41 +1748,86 @@ impl Workspace {
             return Vec::new();
         }
         let (directory, leaf) = split_browse(query);
+        // A clone's own folder stays at the end of its destination while the user browses.
+        let pinned = self.pinned_clone_folder();
+        let case_sensitive = !self.browse_on_windows();
+        let filter = pinned.as_deref().map_or(leaf, |pinned| clone_paths::pinned_filter(leaf, pinned, case_sensitive));
         let mut rows = Vec::new();
-        if leaf.is_empty()
+        if filter.is_empty()
             && let Some(parent) = up_path(directory)
         {
-            rows.push(Row::new("browse-up", RowIcon::Lucide(IconName::CornerLeftUp), "..", Run::BrowseTo(parent)));
+            let up = match pinned.as_deref() {
+                Some(pinned) => clone_paths::clone_destination_path(&parent, pinned),
+                None => parent,
+            };
+            rows.push(Row::new("browse-up", RowIcon::Lucide(IconName::CornerLeftUp), "..", Run::BrowseTo(up)));
         }
         if let Some(browse) = self.current_browse(directory) {
-            for (name, _) in filter_entries(&browse.entries, leaf) {
+            for (name, _) in filter_entries(&browse.entries, filter) {
+                let to = match pinned.as_deref() {
+                    Some(pinned) => clone_paths::clone_destination_browse_path(directory, name, pinned, case_sensitive),
+                    None => browse_into(directory, name),
+                };
                 rows.push(Row::new(
                     format!("dir-{name}"),
                     RowIcon::Lucide(IconName::Folder),
                     name.clone(),
-                    Run::BrowseTo(browse_into(directory, name)),
+                    Run::BrowseTo(to),
                 ));
             }
         }
-        vec![Group { label: "Directories", rows }]
+        let label = if pinned.is_some() { "Select where to clone" } else { "Directories" };
+        vec![Group { label, rows }]
+    }
+
+    /// `pinnedCloneDirectoryName`: the clone's own folder at its destination step.
+    fn pinned_clone_folder(&self) -> Option<String> {
+        let flow = self.palette.as_ref()?.clone.as_ref()?;
+        let target = flow.confirm.as_ref()?;
+        let repository = target.repository.as_ref().map_or(target.remote_url.as_str(), |(name, _)| name.as_str());
+        let name =
+            clone_paths::clone_directory_leaf_name(&target.remote_url, self.ghq_layout(&flow.environment), repository);
+        (!name.is_empty()).then_some(name)
+    }
+
+    /// `ghqCloneLayout` on the environment.
+    fn ghq_layout(&self, environment: &str) -> bool {
+        self.env_info(environment).is_some_and(|info| info.settings.get("ghqCloneLayout").as_bool() == Some(true))
+    }
+
+    /// The browse environment runs Windows, whose folder names match without case.
+    fn browse_on_windows(&self) -> bool {
+        let environment = self.browse_environment();
+        let os = environment.as_deref().and_then(|env| self.env_info(env)).and_then(|info| info.platform_os.as_deref());
+        os.is_some_and(is_windows_platform)
+    }
+
+    /// `getAddProjectInitialQueryForEnvironment`: the environment's base folder to browse from.
+    fn add_project_base(&self, environment: &str) -> String {
+        let info = self.env_info(environment);
+        let base = info.and_then(|info| info.settings.get("addProjectBaseDirectory").as_str());
+        clone_paths::add_project_initial_query(base)
     }
 
     /// Whether Enter can add the typed path and whether that creates its folder
     /// (`canSubmitBrowsePath`, `willCreateProjectPath`).
     fn browse_submit(&self, query: &str) -> BrowseSubmit {
         let connected = self.browse_environment().is_some_and(|environment| self.env_client(&environment).is_some());
-        let can_submit = connected && !self.relative_needs_project(query);
         let Some(palette) = &self.palette else { return BrowseSubmit::default() };
+        let cloning = palette.clone.as_ref().filter(|flow| flow.confirm.is_some());
+        let can_clone = cloning.is_none_or(|flow| self.can_clone_on(&flow.environment) && !palette.clone_pending);
+        let can_submit = connected && !self.relative_needs_project(query) && can_clone;
         let (directory, leaf) = split_browse(query);
         let browse = self.current_browse(directory);
         let settled = browse.is_some_and(|browse| !browse.loading);
+        let case_sensitive = cloning.is_none() || !self.browse_on_windows();
         // A folder that could not be read is one Enter creates.
         let found = browse.is_some_and(|browse| {
             browse.error.is_none()
                 && if leaf.is_empty() {
                     browse.parent.is_some()
                 } else {
-                    browse.entries.iter().any(|(name, _)| name == leaf)
+                    browse.entries.iter().any(|(name, _)| clone_paths::names_match(name, leaf, case_sensitive))
                 }
         });
         let will_create = can_submit && settled && !query.trim().is_empty() && palette.highlight.is_none() && !found;
@@ -1725,8 +1842,7 @@ impl Workspace {
         }
         let Some(palette) = &self.palette else { return false };
         let query = palette.input.read(cx).value().to_string();
-        let browsing = palette.view == View::Browse || (palette.view == View::Root && is_browse_query(&query));
-        if !browsing || self.relative_needs_project(&query) {
+        if !browses(palette, &query) || self.relative_needs_project(&query) {
             return false;
         }
         let highlighted = palette.highlight.and_then(|index| {
@@ -1737,10 +1853,20 @@ impl Workspace {
             (Some(Run::BrowseTo(path)), _) => Some(path),
             (_, None) => None,
             (_, Some(browse)) => {
+                let pinned = self.pinned_clone_folder();
+                let case_sensitive = !self.browse_on_windows();
+                let filter =
+                    pinned.as_deref().map_or(leaf, |pinned| clone_paths::pinned_filter(leaf, pinned, case_sensitive));
                 let names: Vec<&str> =
-                    filter_entries(&browse.entries, leaf).into_iter().map(|(name, _)| name.as_str()).collect();
-                tab_completion(&names, leaf).map(|(name, complete)| {
-                    if complete { browse_into(directory, &name) } else { format!("{directory}{name}") }
+                    filter_entries(&browse.entries, filter).into_iter().map(|(name, _)| name.as_str()).collect();
+                // A clone's destination only enters whole folders, keeping its own folder last.
+                tab_completion(&names, filter).and_then(|(name, complete)| match (complete, pinned.as_deref()) {
+                    (true, Some(pinned)) => {
+                        Some(clone_paths::clone_destination_browse_path(directory, &name, pinned, case_sensitive))
+                    }
+                    (true, None) => Some(browse_into(directory, &name)),
+                    (false, Some(_)) => None,
+                    (false, None) => Some(format!("{directory}{name}")),
                 })
             }
         };
@@ -1758,8 +1884,12 @@ impl Workspace {
 
     /// Adds the typed path as a project on the browse environment.
     fn submit_browse_path(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if let (Some(environment), Some(path)) = (self.browse_environment(), self.browse_submit_path(query)) {
-            self.add_project(environment, &path, window, cx);
+        let cloning =
+            self.palette.as_ref().and_then(|palette| palette.clone.as_ref()).is_some_and(|flow| flow.confirm.is_some());
+        match (self.browse_environment(), self.browse_submit_path(query)) {
+            (Some(_), Some(path)) if cloning => self.submit_clone_destination(&path, window, cx),
+            (Some(environment), Some(path)) => self.add_project(environment, &path, window, cx),
+            _ => {}
         }
     }
 
@@ -1784,6 +1914,9 @@ impl Workspace {
                     palette.add_environment = Some(environment);
                 }
                 return self.push_palette_view(View::Browse, window, cx);
+            }
+            Run::CloneFrom(environment, source) => {
+                return self.start_add_project_clone(environment, source, window, cx);
             }
             _ => {}
         }
@@ -1830,7 +1963,8 @@ impl Workspace {
             | Run::FileSearch(_)
             | Run::AddProject
             | Run::AddProjectIn(_)
-            | Run::BrowseIn(_) => {}
+            | Run::BrowseIn(_)
+            | Run::CloneFrom(..) => {}
         }
     }
 
@@ -1989,8 +2123,7 @@ impl Workspace {
         let Some(query) = self.palette.as_ref().map(|p| p.input.read(cx).value().to_string()) else { return };
         self.prepare_palette(&query);
         let Some(palette) = &self.palette else { return };
-        let view = palette.view;
-        let browsing = view == View::Browse || (view == View::Root && is_browse_query(&query));
+        let browsing = browses(palette, &query);
         let groups = self.palette_groups(&query);
         // A disabled row is not an item: the arrows, Enter and the pointer pass over it.
         let rows: Vec<&Row> = groups.iter().flat_map(|g| g.rows.iter()).filter(|r| !r.disabled).collect();
@@ -2034,8 +2167,12 @@ impl Workspace {
         } else {
             modifiers.control && !modifiers.platform
         };
+        let repository_step = self.palette.as_ref().is_some_and(|palette| {
+            palette.view == View::Clone && palette.clone.as_ref().is_some_and(|flow| flow.confirm.is_none())
+        });
         match event.keystroke.key.as_str() {
             "escape" => self.close_palette(window, cx),
+            "enter" if repository_step => self.submit_clone_repository(window, cx),
             "up" | "down" if !rows.is_empty() => {
                 let last = rows.len() - 1;
                 let next = match (event.keystroke.key.as_str(), highlight) {
@@ -2087,7 +2224,7 @@ impl Workspace {
         let palette = self.palette.as_ref()?;
         let tokens = *crate::theme::tokens(cx);
         let view = palette.view;
-        let browsing = view == View::Browse || (view == View::Root && is_browse_query(&query));
+        let browsing = browses(palette, &query);
         let in_submenu = !palette.stack.is_empty();
         // Only `highlightedItemValue` paints; Enter still runs the first row when it is `None`.
         let highlight = palette.highlight;
@@ -2113,29 +2250,101 @@ impl Workspace {
             Icon::new(IconName::Search).size(px(16.)).text_color(muted.opacity(0.8)).into_any_element()
         };
         let submit = browsing.then(|| self.browse_submit(&query));
-        // `CommandPaletteSubmitButton`: the trailing Add / Create & Add button while browsing.
-        let accessory = submit.map(|submit| {
-            let (label, shortcut) = browse_submit_labels(submit.will_create, highlight.is_some(), keymap::MAC);
-            let tooltip = format!("{label} ({shortcut})");
-            let query = query.clone();
-            let button = Button::new("palette-browse-submit")
+        let flow = palette.clone.as_ref().filter(|_| view == View::Clone);
+        let repository_step = flow.filter(|flow| flow.confirm.is_none());
+        let cloning_to = flow.and_then(|flow| flow.confirm.as_ref().map(|target| (flow, target)));
+        let pending = palette.clone_pending;
+        // `CommandPaletteSubmitButton`: the trailing Add / Create & Add button while browsing, and
+        // the clone flow's Continue / Lookup and Clone / Create & Clone.
+        let accessory = if let Some(flow) = repository_step {
+            let label = if pending { "Working" } else { flow.submit_label() };
+            let can_submit = !pending && !query.trim().is_empty() && self.env_client(&flow.environment).is_some();
+            let button = Button::new("palette-clone-submit")
                 .outline()
                 .xsmall()
                 .tab_stop(false)
                 .label(label)
-                .child(super::model_picker::kbd(&shortcut, &tokens))
-                .disabled(!submit.can_submit)
-                .tooltip(tooltip)
-                .on_click(cx.listener(move |this, _, window, cx| this.submit_browse_path(&query, window, cx)));
-            div().absolute().right(px(2.)).top_0().bottom_0().flex().items_center().child(button)
-        });
+                .child(super::model_picker::kbd("Enter", &tokens))
+                .disabled(!can_submit)
+                .tooltip(format!("{} (Enter)", flow.submit_label()))
+                .on_click(cx.listener(|this, _, window, cx| this.submit_clone_repository(window, cx)));
+            Some(div().absolute().right(px(2.)).top_0().bottom_0().flex().items_center().child(button))
+        } else {
+            submit.map(|submit| {
+                let (label, shortcut) = browse_submit_labels(submit.will_create, highlight.is_some(), keymap::MAC);
+                let tooltip = match cloning_to {
+                    Some((flow, _)) if !self.can_clone_on(&flow.environment) => {
+                        "This connection needs permission to write source control and add projects.".to_owned()
+                    }
+                    Some(_) => format!("{} ({shortcut})", clone_submit_label(label)),
+                    None => format!("{label} ({shortcut})"),
+                };
+                let label = match cloning_to {
+                    Some(_) if pending => "Cloning",
+                    Some(_) => clone_submit_label(label),
+                    None => label,
+                };
+                let query = query.clone();
+                let button = Button::new("palette-browse-submit")
+                    .outline()
+                    .xsmall()
+                    .tab_stop(false)
+                    .label(label)
+                    .child(super::model_picker::kbd(&shortcut, &tokens))
+                    .disabled(!submit.can_submit)
+                    .tooltip(tooltip)
+                    .on_click(cx.listener(move |this, _, window, cx| this.submit_browse_path(&query, window, cx)));
+                div().absolute().right(px(2.)).top_0().bottom_0().flex().items_center().child(button)
+            })
+        };
         // `browseInputEndPaddingClass`: room for the button's widest label.
         let input_end = match submit {
+            _ if repository_step.is_some() => px(128.),
             Some(submit) if submit.will_create => px(144.),
             Some(_) if highlight.is_some() => px(112.),
             Some(_) => px(88.),
             None => px(0.),
         };
+        // `RemoteRepositorySummary`: what the destination step clones.
+        let summary = cloning_to.map(|(flow, target)| {
+            let icon = match flow.source {
+                Some(kind) => source_control::definition(kind).mark(16., muted),
+                None => Icon::new(IconName::Link).size(px(16.)).text_color(muted).into_any_element(),
+            };
+            let (title, description) = match &target.repository {
+                Some((name, url)) => (name.clone(), url.clone()),
+                None => (target.input.clone(), target.remote_url.clone()),
+            };
+            v_flex()
+                .flex_none()
+                .p(px(8.))
+                .pb_0()
+                .child(
+                    div()
+                        .px(px(8.))
+                        .py(px(6.))
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(muted)
+                        .child("Repository"),
+                )
+                .child(
+                    h_flex()
+                        .min_h(px(32.))
+                        .items_center()
+                        .gap(px(8.))
+                        .px(px(8.))
+                        .py(px(6.))
+                        .child(div().flex_none().self_start().h(px(20.)).pt(px(2.)).child(icon))
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .child(div().truncate().text_sm().text_color(fg).child(title))
+                                .child(div().truncate().text_xs().text_color(muted.opacity(0.85)).child(description)),
+                        ),
+                )
+        });
         let input_row = h_flex().flex_none().h(px(46.)).px(px(8.)).py(px(6.)).child(
             h_flex()
                 .size_full()
@@ -2174,7 +2383,7 @@ impl Workspace {
             }
             for row in &group.rows {
                 if row.disabled {
-                    list.push(self.render_disabled_palette_row(row, &tokens));
+                    list.push(self.render_disabled_palette_row(row, &tokens, cx));
                     continue;
                 }
                 let highlighted = highlight == Some(index);
@@ -2199,7 +2408,15 @@ impl Workspace {
             None
         };
         let empty = (total_rows == 0).then(|| {
-            let text = if browsing && self.relative_needs_project(&query) {
+            let text = if let Some(flow) = repository_step {
+                if flow.source.is_none() {
+                    "Enter a Git clone URL and press Enter to continue."
+                } else {
+                    "Enter a repository path and press Enter to look it up."
+                }
+            } else if cloning_to.is_some() {
+                "Choose a destination path and press Enter to clone."
+            } else if browsing && self.relative_needs_project(&query) {
                 "Relative paths require an active project."
             } else if submit.is_some_and(|submit| submit.will_create) {
                 "Press Enter to create this folder and add it as a project."
@@ -2248,7 +2465,9 @@ impl Workspace {
                 h_flex()
                     .gap(px(12.))
                     .child(hint(vec!["↑".into(), "↓".into()], "Navigate"))
-                    .when(!adds, |el| el.child(hint(vec!["Enter".into()], "Select")))
+                    .when(!adds, |el| {
+                        el.child(hint(vec!["Enter".into()], repository_step.map_or("Select", CloneFlow::submit_label)))
+                    })
                     .when(in_submenu, |el| el.child(hint(vec!["Backspace".into()], "Back")))
                     .child(hint(vec!["Esc".into()], "Close")),
             )
@@ -2305,6 +2524,7 @@ impl Workspace {
                             cx.listener(|this, event: &KeyDownEvent, window, cx| this.palette_key(event, window, cx)),
                         )
                         .child(input_row)
+                        .children(summary)
                         .children(
                             status.map(|text| div().px(px(16.)).py(px(12.)).text_sm().text_color(muted).child(text)),
                         )
@@ -2344,6 +2564,7 @@ impl Workspace {
                 Some(project) => super::sidebar::project_icon(project, tokens, false, 16., self.favicon(project)),
                 None => div().size(px(16.)).into_any_element(),
             },
+            RowIcon::Host(kind) => source_control::definition(kind).mark(16., tokens.muted_foreground),
         }
     }
 
@@ -2401,8 +2622,39 @@ impl Workspace {
         line.into_any_element()
     }
 
-    /// `DisabledCommandPaletteResultRow`: the icon, title and description at 64% opacity.
-    fn render_disabled_palette_row(&self, row: &Row, tokens: &Tokens) -> AnyElement {
+    /// `DisabledCommandPaletteResultRow`: the icon, title and description at 64% opacity, and a
+    /// clone source's Setup Required, which opens Source control settings.
+    fn render_disabled_palette_row(&self, row: &Row, tokens: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+        let setup = row.setup.clone().map(|hint| {
+            let warning = tokens.warning;
+            let ring = tokens.ring;
+            div()
+                .id(SharedString::from(format!("{}-setup", row.key)))
+                .flex_none()
+                .ml_auto()
+                .h(px(20.))
+                .px(px(5.))
+                .flex()
+                .items_center()
+                .rounded(px(4.))
+                .border_1()
+                .border_color(warning.opacity(0.32))
+                .bg(warning.opacity(0.08))
+                .text_size(px(11.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(tokens.warning_foreground)
+                .cursor_pointer()
+                .tab_index(0)
+                .focus_visible(move |style| style.border_color(ring))
+                .hover(move |s| s.border_color(warning.opacity(0.4)).bg(warning.opacity(0.16)))
+                .child("Setup Required")
+                .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(hint.clone()).build(window, cx))
+                .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.close_palette(window, cx);
+                    this.open_settings("source-control", cx);
+                }))
+        });
         let description = match &row.description {
             Some(Description::Text(text)) => Some(text.clone()),
             _ => None,
@@ -2436,6 +2688,7 @@ impl Workspace {
                             .child(text)
                     })),
             )
+            .children(setup)
             .into_any_element()
     }
 
@@ -2703,6 +2956,11 @@ fn browse_submit_labels(will_create: bool, highlighted: bool, mac: bool) -> (&'s
     let shortcut =
         if highlighted { format!("{} Enter", if mac { "\u{2318}" } else { "Ctrl" }) } else { "Enter".to_owned() };
     (label, shortcut)
+}
+
+/// The clone destination's words for [`browse_submit_labels`]' label (`submitActionLabel`).
+fn clone_submit_label(label: &str) -> &'static str {
+    if label == "Create & Add" { "Create & Clone" } else { "Clone" }
 }
 
 /// What a shortcut pressed in the palette does (`handleKeyDown`).

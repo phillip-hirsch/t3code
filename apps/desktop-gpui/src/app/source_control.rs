@@ -86,6 +86,11 @@ pub(crate) fn definition(kind: &str) -> &'static HostDefinition {
     HOSTS.iter().find(|host| host.kind == kind).unwrap_or(&HOSTS[0])
 }
 
+/// `defaultCloneTransport`: GitHub, Cursor Origin and Forgejo clone over HTTPS, the rest over SSH.
+pub(crate) fn clones_over_https(kind: &str) -> bool {
+    matches!(definition(kind).kind, "github" | "cursor-origin" | "forgejo")
+}
+
 /// Whether a host can be used now, and what to do about it when it can't.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Readiness {
@@ -99,7 +104,6 @@ pub(crate) enum Surface {
     /// The publish wizard: "Open Settings -> Source control".
     Publish,
     /// Add project's clone sources: "Open Source Control settings".
-    #[cfg_attr(not(test), expect(dead_code, reason = "the add-project clone flow reads it"))]
     AddProject,
 }
 
@@ -151,7 +155,6 @@ pub(crate) fn readiness(discovery: Option<&Value>, kind: &str, surface: Surface)
 
 /// `buildPaletteRemoteSourceReadiness`: the add-project wording, with a server hint's
 /// "Open source control settings" pointed at the Settings path.
-#[cfg_attr(not(test), expect(dead_code, reason = "the palette's add-project flow reads it"))]
 pub(crate) fn palette_readiness(discovery: Option<&Value>, kind: &str) -> Readiness {
     let mut entry = readiness(discovery, kind, Surface::AddProject);
     entry.hint = entry.hint.map(|hint| hint.replace("Open source control settings", "Open Settings -> Source control"));
