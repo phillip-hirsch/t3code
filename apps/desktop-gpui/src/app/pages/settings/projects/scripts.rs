@@ -7,6 +7,7 @@ use gpui_kit::{Context, Keystroke, SharedString, Task, Window};
 use serde::Deserialize as _;
 use serde_json::{Map, Value, json};
 
+use super::groups::{ProjectGroup, narrow};
 use crate::app::Workspace;
 use crate::app::pages::settings::connections::logic::SETTINGS_WRITE;
 use crate::model::{ProjectScript, ProjectShell, ScopedId, ServerInfo, T3ProjectFile, T3ProjectFileScript};
@@ -511,6 +512,25 @@ pub(in crate::app) fn importable_scripts<'a>(
         .collect()
 }
 
+/// `ProjectActionsSettings`'s targets (the scope's members): the checkouts of `project`'s group
+/// that the picked machine and checkout keep, or just `project` when no group holds it.
+pub(super) fn settings_script_targets(
+    groups: &[ProjectGroup],
+    project: &ScopedId,
+    machine: Option<&str>,
+    checkout: Option<&str>,
+) -> Vec<ScopedId> {
+    groups
+        .iter()
+        .find(|group| group.members.iter().any(|m| project.is_project(&m.project)))
+        .map(|group| {
+            let scoped = narrow(group, machine, checkout).group;
+            scoped.members.iter().map(|m| ScopedId::of_project(&m.project)).collect::<Vec<_>>()
+        })
+        .filter(|targets| !targets.is_empty())
+        .unwrap_or_else(|| vec![project.clone()])
+}
+
 impl Workspace {
     /// The config of the environment the project lives on, which holds its actions and their
     /// shortcuts (`useProjectScriptEditing`'s `environmentId`), whatever Settings is scoped to.
@@ -574,19 +594,19 @@ impl Workspace {
         })
     }
 
-    /// The checkouts an action edit writes: on the Projects settings page, every checkout of the
-    /// project's group, like the web's targets; elsewhere just the one project.
+    /// The checkouts an action edit writes: on the Projects settings page, the scoped checkouts
+    /// of the project's group, like the web's targets; elsewhere just the one project.
     pub(super) fn script_targets(&self, project: &ScopedId) -> Vec<ScopedId> {
         if self.settings.as_deref() != Some("projects") {
             return vec![project.clone()];
         }
-        self.settings_project_groups()
-            .into_iter()
-            .find(|group| group.members.iter().any(|m| project.is_project(&m.project)))
-            .map_or_else(
-                || vec![project.clone()],
-                |group| group.members.iter().map(|m| ScopedId::of_project(&m.project)).collect(),
-            )
+        let scope = &self.settings_ui.scope;
+        settings_script_targets(
+            &self.settings_project_groups(),
+            project,
+            scope.machine.as_deref(),
+            scope.checkout.as_deref(),
+        )
     }
 
     /// Runs one write per target in turn; each reads the settings the previous one left.
@@ -781,6 +801,39 @@ mod tests {
             ids(scripts_with(&settings, &project("b", vec![]), "lint", &input)),
             [("test".into(), "run test".into()), ("lint".into(), "bun lint".into())]
         );
+    }
+
+    #[test]
+    fn settings_edits_write_only_the_scoped_checkouts() {
+        let member = |environment: &str, root: &str| {
+            let mut project = project("p", vec![]);
+            project.environment_id = environment.into();
+            project.workspace_root = root.into();
+            super::super::groups::Member { project, physical_key: format!("{environment}:{root}"), is_scratch: false }
+        };
+        let group = ProjectGroup {
+            key: "repo".into(),
+            display_name: "repo".into(),
+            members: vec![member("a", "/p"), member("b", "/p"), member("b", "/p2")],
+            project_ids: vec!["p".into()],
+            project_refs: vec![("a".into(), "p".into()), ("b".into(), "p".into())],
+            pinned: false,
+            archived: false,
+        };
+        let groups = [group];
+        let targets = |project: &ScopedId, machine, checkout| {
+            settings_script_targets(&groups, project, machine, checkout)
+                .into_iter()
+                .map(|target| format!("{}/{}", target.env, target.id))
+                .collect::<Vec<_>>()
+        };
+        let on_b = ScopedId::new("b", "p");
+        assert_eq!(targets(&on_b, None, None), ["a/p", "b/p", "b/p"]);
+        assert_eq!(targets(&on_b, Some("b"), None), ["b/p", "b/p"]);
+        assert_eq!(targets(&on_b, Some("b"), Some("b:/p")), ["b/p"]);
+        // Outside any group the edit stays on the one project.
+        let alone = ScopedId::new("c", "q");
+        assert_eq!(targets(&alone, Some("b"), None), ["c/q"]);
     }
 
     #[test]
