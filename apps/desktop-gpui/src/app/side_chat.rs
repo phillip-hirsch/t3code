@@ -287,9 +287,10 @@ impl Workspace {
     }
 
     /// `sideChatsOffered`: the launcher lists Side chat; whether it can start is
-    /// [`Self::side_chat_disabled_reason`].
+    /// [`Self::side_chat_disabled_reason`]. Forking needs `orchestration:operate` (`canOperateThread`).
     pub(super) fn side_chats_offered(&self) -> bool {
         matches!(self.side_chat_origin(), Some(Origin::Thread | Origin::Draft))
+            && self.target.as_ref().is_some_and(|target| self.can_operate(target.environment()))
             && self.server_info().capability("sideChats")
     }
 
@@ -325,9 +326,13 @@ impl Workspace {
         if self.side_chat_disabled_reason().is_some() || self.side_chat.starting {
             return;
         }
-        let (Some(client), Some(Target::Thread { env, id: source })) = (self.client(), self.target.clone()) else {
+        let Some(Target::Thread { env, id: source }) = self.target.clone() else { return };
+        if !self.can_operate(&env) {
+            self.error = Some(NOT_OPERATE.into());
+            cx.notify();
             return;
-        };
+        }
+        let Some(client) = self.env_client(&env) else { return };
         let origin = Target::Thread { env, id: source.clone() };
         self.side_chat.starting = true;
         let target = new_id();
@@ -406,6 +411,10 @@ impl Workspace {
         if let Some(reason) = self.side_chat_disabled_reason() {
             warn("Side chat not started", reason, window, cx);
             return true;
+        }
+        // Where side chats aren't offered, the text goes out as a message (`onSideChat` unset).
+        if !self.side_chats_offered() {
+            return false;
         }
         if self.has_attachments() {
             warn("Side chats take text only", "Remove the attachments and context, then send it again.", window, cx);
