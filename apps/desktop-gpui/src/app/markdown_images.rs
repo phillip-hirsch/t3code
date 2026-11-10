@@ -51,17 +51,28 @@ struct Slot {
     revision: Option<Revision>,
     /// How to load it again, for a source an environment serves.
     reload: Option<Reload>,
+    /// Its load failed; one an environment serves loads again once that environment reconnects.
+    failed: bool,
 }
 
 /// `workspaceMutationId`: the thread's last settled file-writing item and newest turn completion.
 pub(super) type Revision = (Option<String>, Option<String>);
 
-/// A load to start again: an image a markdown or tool row (by its view key) shows.
+/// A load to start again, from the environment `env`.
 #[derive(Clone, Debug)]
-pub(super) struct Reload {
-    key: SharedString,
-    destination: String,
-    source: Source,
+pub(super) enum Reload {
+    /// An image a markdown or tool row (by its view key) shows.
+    Row { env: SharedString, key: SharedString, destination: String, source: Source },
+    /// An image attachment, whose tile asks for it again once its slot is gone.
+    Attachment { env: SharedString },
+}
+
+impl Reload {
+    fn env(&self) -> &str {
+        match self {
+            Self::Row { env, .. } | Self::Attachment { env } => env,
+        }
+    }
 }
 
 /// The load a new slot started, which fills that slot and no later one at its destination.
@@ -115,9 +126,11 @@ impl ImageCache {
             }
             slot.revision = revision.cloned();
             slot.generation = generation;
+            slot.failed = false;
         } else {
             let revision = revision.cloned();
-            cache.slots.insert(destination.to_owned(), Slot { image: None, main, side, generation, revision, reload });
+            let slot = Slot { image: None, main, side, generation, revision, reload, failed: false };
+            cache.slots.insert(destination.to_owned(), slot);
         }
         cache.next += 1;
         Some(Claim { destination: destination.to_owned(), generation })
@@ -136,7 +149,33 @@ impl ImageCache {
         let mut cache = self.0.lock().ok()?;
         let slot = cache.slots.get_mut(&claim.destination).filter(|s| s.generation == claim.generation)?;
         slot.image = Some(image);
-        Some(slot.reload.as_ref()?.key.clone())
+        match slot.reload.as_ref()? {
+            Reload::Row { key, .. } => Some(key.clone()),
+            Reload::Attachment { .. } => None,
+        }
+    }
+
+    /// Marks the slot `claim` started failed, so parses do not retry it until a reconnect.
+    fn fail(&self, claim: Claim) {
+        if let Ok(mut cache) = self.0.lock()
+            && let Some(slot) = cache.slots.get_mut(&claim.destination).filter(|s| s.generation == claim.generation)
+        {
+            slot.failed = true;
+        }
+    }
+
+    /// Forgets the failed loads `environment` serves, for the caller to start again.
+    fn take_failed(&self, environment: &str) -> Vec<Reload> {
+        let Ok(mut cache) = self.0.lock() else { return Vec::new() };
+        let mut retries = Vec::new();
+        cache.slots.retain(|_, slot| match &slot.reload {
+            Some(reload) if slot.failed && reload.env() == environment => {
+                retries.push(reload.clone());
+                false
+            }
+            _ => true,
+        });
+        retries
     }
 
     /// Fills a slot [`Self::claim`] started.
@@ -409,9 +448,18 @@ impl Workspace {
         self.reload_images(stale, cx);
     }
 
+    /// `environment` reconnected: the images it could not serve load again, as the web's asset
+    /// URL queries run again once their connection settles.
+    pub(super) fn retry_failed_images(&mut self, environment: &str, cx: &mut Context<Self>) {
+        let retries = self.markdown_images.take_failed(environment);
+        self.reload_images(retries, cx);
+    }
+
     fn reload_images(&mut self, reloads: Vec<Reload>, cx: &mut Context<Self>) {
-        for Reload { key, destination, source } in reloads {
-            self.load_sources(&key, vec![(destination, source)], cx);
+        for reload in reloads {
+            if let Reload::Row { key, destination, source, .. } = reload {
+                self.load_sources(&key, vec![(destination, source)], cx);
+            }
         }
     }
 
@@ -420,10 +468,14 @@ impl Workspace {
         let cache = self.markdown_images.clone();
         let pane = view_pane(key).0;
         let revision = self.current_workspace_mutation();
+        let env = self.target.as_ref().map(|target| target.environment().clone());
         for (destination, source) in sources {
             let revision = matches!(source, Source::WorkspaceFile(_)).then_some(&revision);
-            let reload =
-                revision.map(|_| Reload { key: key.clone(), destination: destination.clone(), source: source.clone() });
+            let served = matches!(source, Source::WorkspaceFile(_) | Source::Asset(_));
+            let reload = env.clone().filter(|_| served).map(|env| {
+                let (key, destination, source) = (key.clone(), destination.clone(), source.clone());
+                Reload::Row { env, key, destination, source }
+            });
             let Some(claim) = cache.claim_with(pane, &destination, revision, reload) else { continue };
             let resource = match &source {
                 Source::WorkspaceFile(path) => {
@@ -479,7 +531,7 @@ impl Workspace {
         key: &SharedString,
         cx: &mut Context<Self>,
     ) {
-        let Some(image) = image else { return };
+        let Some(image) = image else { return cache.fail(claim) };
         let first_row = cache.fill(claim, image);
         if !cache.same(&self.markdown_images) {
             return;
@@ -556,10 +608,12 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let (Some(client), Some(base)) = (self.client(), self.http_base().map(str::to_owned)) else { return };
+        let Some(env) = self.target.as_ref().map(|target| target.environment().clone()) else { return };
         let cache = self.markdown_images.clone();
         for id in ids {
             let key = attachment_key(id);
-            let Some(claim) = cache.claim_for(pane, &key) else { continue };
+            let reload = Reload::Attachment { env: env.clone() };
+            let Some(claim) = cache.claim_with(pane, &key, None, Some(reload)) else { continue };
             let resource = json!({"_tag": "attachment", "attachmentId": id});
             let (client, base, cache) = (client.clone(), base.clone(), cache.clone());
             cx.spawn(async move |this, cx| {
@@ -577,7 +631,7 @@ impl Workspace {
                     let format = mime.as_deref().and_then(format_for).or_else(|| sniff(&bytes))?;
                     Some(Arc::new(Image::from_bytes(format, bytes)))
                 });
-                let Some(image) = image else { return };
+                let Some(image) = image else { return cache.fail(claim) };
                 cache.fill(claim, image);
                 let _ = this.update(cx, |this, cx| {
                     if cache.same(&this.markdown_images) {
@@ -709,15 +763,47 @@ mod tests {
         assert!(cache.get("late.png").is_some());
     }
 
+    fn plot_reload(env: &str) -> Reload {
+        let source = Source::WorkspaceFile("/repo/plot.png".into());
+        Reload::Row { env: env.to_owned().into(), key: "main:reply".into(), destination: "plot.png".into(), source }
+    }
+
+    fn reload_destination(reload: &Reload) -> &str {
+        match reload {
+            Reload::Row { destination, .. } => destination,
+            Reload::Attachment { .. } => "attachment",
+        }
+    }
+
+    #[test]
+    fn a_failed_load_from_an_environment_retries_when_it_reconnects() {
+        let cache = ImageCache::default();
+        let revision: Revision = (None, None);
+        let plot = cache.claim_with(ChatPane::Main, "plot.png", Some(&revision), Some(plot_reload("remote"))).unwrap();
+        cache.fail(plot);
+        let attachment = Some(Reload::Attachment { env: "remote".into() });
+        cache.fail(cache.claim_with(ChatPane::Main, "t3-attachment:a", None, attachment).unwrap());
+        cache.fail(cache.claim_for(ChatPane::Main, "https://x.dev/a.png").unwrap());
+        assert!(
+            cache.claim_with(ChatPane::Main, "plot.png", Some(&revision), Some(plot_reload("remote"))).is_none(),
+            "a failed load waits for a reconnect, not the next parse"
+        );
+        assert!(cache.take_failed("local").is_empty(), "another environment's reconnect retries nothing");
+        let mut retried: Vec<_> =
+            cache.take_failed("remote").iter().map(reload_destination).map(str::to_owned).collect();
+        retried.sort();
+        assert_eq!(retried, ["attachment", "plot.png"]);
+        assert!(cache.claim_with(ChatPane::Main, "plot.png", Some(&revision), Some(plot_reload("remote"))).is_some());
+        assert!(cache.claim_for(ChatPane::Main, "t3-attachment:a").is_some());
+        assert!(cache.claim_for(ChatPane::Main, "https://x.dev/a.png").is_none(), "a web image stays failed");
+    }
+
     #[test]
     fn a_workspace_file_loads_again_after_a_workspace_mutation() {
         let png = || Arc::new(Image::from_bytes(ImageFormat::Png, BLANK.bytes().to_vec()));
         let cache = ImageCache::default();
         let (before, after): (Revision, Revision) = ((Some("edit-1".into()), None), (Some("edit-2".into()), None));
-        let reload = || {
-            let source = Source::WorkspaceFile("/repo/plot.png".into());
-            Some(Reload { key: "main:reply".into(), destination: "plot.png".into(), source })
-        };
+        let reload = || Some(plot_reload("local"));
         let first = cache.claim_with(ChatPane::Main, "plot.png", Some(&before), reload()).unwrap();
         let old = png();
         cache.fill(first.clone(), old.clone());
@@ -725,7 +811,7 @@ mod tests {
         assert!(cache.stale(&before).is_empty());
         let web = cache.claim_for(ChatPane::Main, "https://x.dev/a.png").unwrap();
         cache.fill(web, png());
-        let stale: Vec<_> = cache.stale(&after).into_iter().map(|r| r.destination).collect();
+        let stale: Vec<_> = cache.stale(&after).iter().map(reload_destination).map(str::to_owned).collect();
         assert_eq!(stale, ["plot.png"], "only the workspace file reloads");
         let again = cache.claim_with(ChatPane::Main, "plot.png", Some(&after), reload()).unwrap();
         assert!(cache.stale(&after).is_empty());
