@@ -1041,7 +1041,9 @@ impl Workspace {
         let approvals = self.shown_approvals();
         let first_approval = approvals.first().map(|(request, _)| *request);
         let placeholder = self.placeholder(first_approval);
-        let suggestion = self.offered_prompt_suggestion(first_approval.is_some());
+        let suggestion = self
+            .offered_prompt_suggestion(first_approval.is_some())
+            .map(|text| super::composer_suggestion::suggested_placeholder(text, &t, window));
         let outline = if t.dark { white(0.05) } else { black(0.08) };
         let view = cx.weak_entity();
         let chip_view = view.clone();
@@ -1167,8 +1169,7 @@ impl Workspace {
                                             .line_height(px(t.fonts.prompt_size * PROMPT_LEADING))
                                             .text_color(t.muted_foreground)
                                             .map(|el| match suggestion {
-                                                Some(text) => el
-                                                    .child(super::composer_suggestion::suggested_placeholder(text, &t)),
+                                                Some(suggested) => el.child(suggested),
                                                 None => el.child(placeholder),
                                             }),
                                     )

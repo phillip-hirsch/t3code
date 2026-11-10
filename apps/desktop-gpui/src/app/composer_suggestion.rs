@@ -3,7 +3,11 @@
 
 use std::collections::HashSet;
 
-use gpui_kit::{Context, FontWeight, HighlightStyle, IntoElement, Keystroke, SharedString, StyledText, Task, Window};
+use gpui_kit::{
+    BorderStyle, Bounds, Context, Edges, Font, FontWeight, IntoElement, Keystroke, ParentElement as _, Pixels,
+    SharedString, Styled as _, StyledText, Task, TextAlign, TextRun, Window, canvas, div, font, point, px, quad, rems,
+    size, transparent_black,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -80,19 +84,57 @@ fn suggestion_key(keystroke: &Keystroke) -> Option<SuggestionKey> {
     }
 }
 
-/// The placeholder with the suggestion's Tab hint as its inline suffix (`placeholderSuffix`), so
-/// the hint follows the last wrapped line. A text run cannot draw `Kbd`'s outline; its weight
-/// and a key-cap tint keep the hint distinct.
-pub(super) fn suggested_placeholder(text: SharedString, t: &Tokens) -> impl IntoElement {
-    const HINT: &str = "\u{a0}⇥\u{a0}Tab\u{a0}";
-    let start = text.len() + 1;
-    let hint = HighlightStyle {
-        color: Some(t.muted_foreground),
-        font_weight: Some(FontWeight::MEDIUM),
-        background_color: Some(t.foreground.opacity(0.07)),
-        ..Default::default()
+/// The placeholder with the suggestion's `<Kbd variant="outline">⇥ Tab</Kbd>` as its inline
+/// suffix (`placeholderSuffix`). Text cannot hold a box, so the text ends in a non-breaking gap
+/// the key's width, which wraps with it, and the key is painted into that gap.
+pub(super) fn suggested_placeholder(text: SharedString, t: &Tokens, window: &Window) -> impl IntoElement {
+    const KEY: &str = "⇥ Tab";
+    const NBSP: &str = "\u{a0}";
+    let rem = |value: f32| rems(value).to_pixels(window.rem_size());
+    let shape = |text: &str, font: Font, size: Pixels| {
+        let run = TextRun {
+            len: text.len(),
+            font,
+            color: t.muted_foreground,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        window.text_system().shape_line(text.to_owned().into(), size, &[run], None)
     };
-    StyledText::new(format!("{text} {HINT}")).with_highlights([(start..start + HINT.len(), hint)])
+    // `h-5 min-w-5 px-1.5 rounded border border-b-2 font-medium text-xs`, after `ml-2`.
+    let label = shape(KEY, Font { weight: FontWeight::MEDIUM, ..font(t.fonts.sans) }, rem(0.75));
+    let (label_height, margin, radius) = (rem(1.), rem(0.5), rem(0.25));
+    let key = size((label.width + rem(0.75) + px(2.)).max(rem(1.25)), rem(1.25));
+    let prompt = shape(NBSP, font(t.fonts.composer), px(t.fonts.prompt_size));
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a few gap characters")]
+    let gap = ((margin + key.width) / prompt.width.max(px(1.))).ceil() as usize;
+    let text_end = text.len();
+    let styled = StyledText::new(format!("{text} {}", NBSP.repeat(gap)));
+    let layout = styled.layout().clone();
+    let border = t.foreground.opacity(0.15);
+    let paint_key = canvas(
+        |_, _, _| {},
+        move |_, (), window, cx| {
+            let (Some(end), Some(gap)) = (layout.position_for_index(text_end), layout.position_for_index(text_end + 1))
+            else {
+                return;
+            };
+            // After the text on its row, or at the start of the row the gap wrapped to.
+            let left = if gap.y == end.y { end.x } else { gap.x } + margin;
+            // `align-[1px]`: the key's baseline sits 1px above the prompt's.
+            let baseline = gap.y + (layout.line_height() - prompt.ascent - prompt.descent) / 2. + prompt.ascent;
+            let label_top = baseline - px(1.) - (label_height - label.ascent - label.descent) / 2. - label.ascent;
+            // The label's line is centred between the 1px top and 2px bottom borders.
+            let top = label_top - px(1.) - (key.height - px(3.) - label_height) / 2.;
+            let edges = Edges { top: px(1.), right: px(1.), bottom: px(2.), left: px(1.) };
+            let bounds = Bounds::new(point(left, top), key);
+            window.paint_quad(quad(bounds, radius, transparent_black(), edges, border, BorderStyle::Solid));
+            let origin = point(left + (key.width - label.width) / 2., label_top);
+            let _ = label.paint(origin, label_height, TextAlign::Left, None, window, cx);
+        },
+    );
+    div().relative().child(styled).child(paint_key.absolute().size_full())
 }
 
 impl Workspace {
