@@ -102,6 +102,8 @@ pub(in crate::app) struct WelcomeState {
     /// The Codex instance whose setup card is open, and its last listed status.
     codex_setup: Option<String>,
     last_codex: Option<Value>,
+    /// Each visit and each Codex choice bump it; a save that finishes after another moves nothing.
+    codex_choice: u64,
     /// "Use existing CLI" opens this instance's terminal once Codex has checked the CLI.
     cli_terminal_for: Option<String>,
     terminal: Option<SetupTerminal>,
@@ -279,6 +281,7 @@ impl Workspace {
 
     /// Opening the page asks the computer to check its agents again and looks for projects.
     pub(super) fn welcome_opened(&mut self, cx: &mut Context<Self>) {
+        self.welcome.codex_choice += 1;
         let Some(environment) = self.welcome_environment() else { return };
         self.welcome_refresh_providers(environment, None, cx);
         if !self.welcome.scan.pending {
@@ -489,6 +492,7 @@ impl Workspace {
     /// Codex's card: "Continue with ChatGPT" (`managed`) or "Use existing CLI" (`existing`). Signing
     /// in with ChatGPT continues on the instance's Settings page, where its runtime installs.
     fn welcome_codex_mode(&mut self, instance_id: String, managed: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.welcome.codex_choice += 1;
         let Some(environment) = self.welcome_environment() else { return };
         let Some(info) = self.env_info(&environment) else { return };
         let Some(provider) = info.providers_json.iter().find(|p| logic::instance_id(p) == instance_id) else { return };
@@ -514,15 +518,18 @@ impl Workspace {
         instance["config"] = config;
         let id = instance_id.clone();
         let target = environment.clone();
+        let choice = self.welcome.codex_choice;
         self.welcome_upsert_instance(
             environment,
             instance_id,
             instance,
             "Could not save Codex setup".into(),
             move |this, saved, _, cx| {
+                let current =
+                    this.page == Some(Page::Welcome) && this.settings.is_none() && this.welcome.codex_choice == choice;
                 if !saved {
                     this.welcome.cli_terminal_for = None;
-                } else if managed {
+                } else if managed && current {
                     this.open_provider_settings(target, id, cx);
                 }
             },
