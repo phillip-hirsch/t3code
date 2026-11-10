@@ -1283,6 +1283,8 @@ pub struct Window {
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
+    /// t3code: the interface scale [`Window::set_ui_scale`] set.
+    ui_scale: f32,
     pub(crate) bounds_observers: SingleSubscriberSet<AnyObserver>,
     appearance: WindowAppearance,
     pub(crate) appearance_observers: SingleSubscriberSet<AnyObserver>,
@@ -2258,7 +2260,10 @@ impl Window {
             let mut cx = cx.to_async();
             Box::new(move |event| {
                 handle
-                    .update(&mut cx, |_, window, cx| window.dispatch_event(event, cx))
+                    .update(&mut cx, |_, window, cx| {
+                        let event = event.scaled_down(window.ui_scale);
+                        window.dispatch_event(event, cx)
+                    })
                     .with_context(|| {
                         format!("dispatching input for window {:?}", handle.window_id())
                     })
@@ -2407,6 +2412,7 @@ impl Window {
             modifiers,
             capslock,
             scale_factor,
+            ui_scale: 1.0,
             bounds_observers: SingleSubscriberSet::new(),
             appearance,
             appearance_observers: SingleSubscriberSet::new(),
@@ -2748,7 +2754,9 @@ impl Window {
     /// - `Some(&[])` is an empty region, so the window receives no pointer or touch input.
     /// - `None` resets the region to the default, so the whole window receives input again.
     pub fn set_input_region(&self, region: Option<&[Bounds<Pixels>]>) {
-        self.platform_window.set_input_region(region);
+        let scaled: Option<Vec<Bounds<Pixels>>> =
+            region.map(|rects| rects.iter().map(|r| r.map(|v| v * self.ui_scale)).collect());
+        self.platform_window.set_input_region(scaled.as_deref());
     }
 
     /// Return the `WindowBounds` to indicate that how a window should be opened
@@ -3018,9 +3026,10 @@ impl Window {
     /// the platform window, then notifies observers. Normally called automatically
     /// by the platform's resize callback, but exposed publicly for test infrastructure.
     pub fn bounds_changed(&mut self, cx: &mut App) {
-        self.scale_factor = self.platform_window.scale_factor();
-        self.viewport_size = self.platform_window.content_size();
-        self.mouse_position = self.platform_window.mouse_position();
+        let ui_scale = self.ui_scale;
+        self.scale_factor = self.platform_window.scale_factor() * ui_scale;
+        self.viewport_size = self.platform_window.content_size().map(|v| v.scale_down(ui_scale));
+        self.mouse_position = self.platform_window.mouse_position().map(|v| v.scale_down(ui_scale));
 
         self.refresh();
 
@@ -3102,7 +3111,13 @@ impl Window {
 
     /// Returns the regions of this window obscured by system UI and the keyboard.
     pub fn insets(&self) -> WindowInsets {
-        self.platform_window.insets()
+        let insets = self.platform_window.insets();
+        let scale = |v: &Pixels| v.scale_down(self.ui_scale);
+        WindowInsets {
+            safe_area: insets.safe_area.map(scale),
+            ime: insets.ime.map(scale),
+            corner_radii: insets.corner_radii.map(scale),
+        }
     }
 
     /// Renders the current frame's scene to a texture and returns the pixel data as an RGBA image.
@@ -3176,7 +3191,9 @@ impl Window {
     /// During drawing this is a consistent frame snapshot. Outside drawing it
     /// reflects the latest platform sample, not a synchronous geometry query.
     pub fn visual_viewport_bounds(&self) -> Bounds<Pixels> {
-        self.platform_window.visual_viewport_bounds()
+        self.platform_window
+            .visual_viewport_bounds()
+            .map(|v| v.scale_down(self.ui_scale))
     }
 
     /// Returns a conservative rectangle avoiding platform-known obscured content.
@@ -3184,7 +3201,7 @@ impl Window {
     /// Intersects the visual viewport with the full layout area inset by system
     /// safe areas and keyboard occlusion. Unknown overlays cannot be excluded.
     pub fn fully_visible_bounds(&self) -> Bounds<Pixels> {
-        let insets = self.platform_window.insets().effective();
+        let insets = self.insets().effective();
         let viewport = self.viewport_size();
         let left = insets.left.max(Pixels::ZERO).min(viewport.width);
         let top = insets.top.max(Pixels::ZERO).min(viewport.height);
@@ -3237,7 +3254,8 @@ impl Window {
 
     /// Opens the native title bar context menu, useful when implementing client side decorations (Wayland and X11)
     pub fn show_window_menu(&self, position: Point<Pixels>) {
-        self.platform_window.show_window_menu(position)
+        self.platform_window
+            .show_window_menu(position.map(|v| v * self.ui_scale))
     }
 
     /// Handle window movement for Linux and macOS.
@@ -3251,12 +3269,13 @@ impl Window {
     /// When using client side decorations, set this to the width of the invisible decorations (Wayland and X11)
     pub fn set_client_inset(&mut self, inset: Pixels) {
         self.client_inset = Some(inset);
-        self.platform_window.set_client_inset(inset);
+        self.platform_window.set_client_inset(inset * self.ui_scale);
     }
 
     /// Sets the client-drawn corner radii so platform effects can match the window's shape.
     pub fn set_client_corner_radii(&mut self, radii: Corners<Pixels>) {
-        self.platform_window.set_client_corner_radii(radii);
+        self.platform_window
+            .set_client_corner_radii(radii.map(|v| *v * self.ui_scale));
     }
 
     /// Returns the client_inset value by [`Self::set_client_inset`].
@@ -3336,6 +3355,24 @@ impl Window {
     /// be rendered as two pixels on screen.
     pub fn scale_factor(&self) -> f32 {
         self.scale_factor
+    }
+
+    /// t3code: the interface scale, like a browser's page zoom: 1 by default.
+    pub fn ui_scale(&self) -> f32 {
+        self.ui_scale
+    }
+
+    /// t3code: scales the whole interface, like a browser's page zoom. The window's logical
+    /// pixels become the platform's divided by `scale`: [`Window::scale_factor`] and the
+    /// rasterization follow it, the viewport, input positions and pixel scroll deltas shrink by
+    /// it, and what goes back to the platform (IME and window-menu positions, the client inset,
+    /// input regions) grows by it. Window bounds and sizes stay in the platform's units.
+    pub fn set_ui_scale(&mut self, scale: f32, cx: &mut App) {
+        if !scale.is_finite() || scale <= 0.0 || scale == self.ui_scale {
+            return;
+        }
+        self.ui_scale = scale;
+        self.bounds_changed(cx);
     }
 
     /// Overrides the display scale factor for tests.
@@ -7010,7 +7047,10 @@ impl Window {
         self.on_next_frame(|window, cx| {
             if let Some(mut input_handler) = window.platform_window.take_input_handler() {
                 if let Some(bounds) = input_handler.selected_bounds(window, cx) {
-                    window.platform_window.update_ime_position(bounds);
+                    let scale = window.ui_scale;
+                    window
+                        .platform_window
+                        .update_ime_position(bounds.map(|v| v * scale));
                 }
                 window.platform_window.set_input_handler(input_handler);
             }
@@ -8980,6 +9020,72 @@ mod tests {
                 (scale_factor, expected_bounds, resized_size)
             );
         }
+    }
+
+    #[test]
+    fn ui_scale_scales_the_interface_against_the_platform_window() {
+        use crate::{ScrollDelta, ScrollEvent};
+
+        type Seen = Rc<RefCell<Vec<(Point<Pixels>, Point<Pixels>)>>>;
+        struct ScrollTarget(Seen);
+        impl Render for ScrollTarget {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let seen = self.0.clone();
+                div().size_full().on_scroll(move |event, _, _| {
+                    seen.borrow_mut()
+                        .push((event.position, event.delta.pixel_delta(px(1.))));
+                })
+            }
+        }
+
+        let mut cx = TestAppContext::single();
+        let seen = Seen::default();
+        let window = cx.add_window({
+            let seen = seen.clone();
+            move |_, _| ScrollTarget(seen)
+        });
+        let handle: AnyWindowHandle = window.into();
+        let state = |cx: &mut TestAppContext| {
+            cx.update_window(handle, |_, window, _| {
+                (window.scale_factor(), window.bounds(), window.viewport_size())
+            })
+            .unwrap()
+        };
+        let (platform_scale, bounds, viewport) = state(&mut cx);
+
+        cx.update_window(handle, |_, window, cx| {
+            window.set_ui_scale(2.0, cx);
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        assert_eq!(
+            state(&mut cx),
+            (platform_scale * 2.0, bounds, viewport.map(|v| v * 0.5))
+        );
+
+        cx.test_window(handle)
+            .simulate_input(PlatformInput::Scroll(ScrollEvent {
+                position: point(px(200.), px(100.)),
+                delta: ScrollDelta::Pixels(point(px(0.), px(30.))),
+                ..Default::default()
+            }));
+        assert_eq!(
+            *seen.borrow(),
+            [(point(px(100.), px(50.)), point(px(0.), px(15.)))]
+        );
+        let mouse = cx
+            .update_window(handle, |_, window, _| window.mouse_position())
+            .unwrap();
+        assert_eq!(mouse, point(px(100.), px(50.)));
+
+        // A resize keeps the scale; going back to 1 shows the platform's size again.
+        let resized = size(px(800.), px(600.));
+        cx.simulate_window_resize(handle, resized);
+        assert_eq!(state(&mut cx).2, size(px(400.), px(300.)));
+        cx.update_window(handle, |_, window, cx| window.set_ui_scale(1.0, cx))
+            .unwrap();
+        assert_eq!(state(&mut cx).0, platform_scale);
+        assert_eq!(state(&mut cx).2, resized);
     }
 
     /// Platforms that stop requesting frames for idle windows (currently web)
