@@ -319,6 +319,7 @@ fn failure_message(error: &RpcError, tags: &[&str]) -> SharedString {
     "Could not answer the request. Try again.".into()
 }
 
+const ANSWER_LINK: &str = "peerLinks.answerRequest";
 const SECRET_TAGS: [&str; 2] = ["SecretRequestError", "EnvironmentAuthorizationError"];
 const LINK_TAGS: [&str; 3] = ["PeerLinkRequestError", "EnvironmentAuthorizationError", "PeerPairingCodeError"];
 
@@ -506,17 +507,17 @@ impl Workspace {
     }
 
     fn decline_link(&mut self, key: &RequestKey, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.access_client(&key.env) else { return };
+        let input = json!({"threadId": key.thread, "turnItemId": key.item, "answer": {"type": "decline"}});
+        let Some(client) = self.access_client(&key.env, ANSWER_LINK, &input) else { return };
         if !self.requests.busy.insert(key.clone()) {
             return;
         }
         self.requests.errors.remove(key);
         self.leave_answered_card(key, window, cx);
         cx.notify();
-        let input = json!({"threadId": key.thread, "turnItemId": key.item, "answer": {"type": "decline"}});
         let key = key.clone();
         cx.spawn(async move |this, cx| {
-            let result = client.request("peerLinks.answerRequest", input).await;
+            let result = client.request(ANSWER_LINK, input).await;
             let _ = this.update(cx, |this, cx| {
                 this.requests.busy.remove(&key);
                 if let Err(error) = result {
@@ -700,7 +701,8 @@ fn link_card(
     let state = workspace.read(cx);
     let busy = state.requests.busy.contains(key);
     let error = state.requests.errors.get(key).cloned();
-    let answerable = state.manages_access(&key.env).then(|| key.env.clone());
+    let answer = json!({"threadId": key.thread, "turnItemId": key.item});
+    let answerable = state.env_permits(&key.env, ANSWER_LINK, &answer).then(|| key.env.clone());
     let RequestKind::Link { label, url, .. } = &card.kind else { return div().into_any_element() };
     let title = if card.picks_machine() {
         "Link a machine to this environment".to_owned()
@@ -929,8 +931,8 @@ impl LinkDialog {
     }
 
     /// The host's socket now, while this session may answer link requests there.
-    fn host_client(&self, cx: &App) -> Option<RpcClient> {
-        self.workspace.upgrade()?.read(cx).access_client(&self.host)
+    fn host_client(&self, payload: &Value, cx: &App) -> Option<RpcClient> {
+        self.workspace.upgrade()?.read(cx).access_client(&self.host, ANSWER_LINK, payload)
     }
 
     fn ready(&self, plan: &LinkPlan, cx: &App) -> bool {
@@ -976,7 +978,7 @@ impl LinkDialog {
     }
 
     fn submit(&mut self, plan: &LinkPlan, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy || !self.ready(plan, cx) || self.host_client(cx).is_none() {
+        if self.busy || !self.ready(plan, cx) || self.host_client(&Value::Null, cx).is_none() {
             return;
         }
         let mint = (!plan.use_existing).then(|| self.mint_endpoint(plan, cx)).flatten();
@@ -1016,9 +1018,9 @@ impl LinkDialog {
                 return;
             };
             // Minting can outlast the connection the dialog opened on.
-            let Ok(client) = this.update(cx, |this, cx| this.host_client(cx)) else { return };
+            let Ok(client) = this.update(cx, |this, cx| this.host_client(&input, cx)) else { return };
             let result = match client {
-                Some(client) => client.request("peerLinks.answerRequest", input).await,
+                Some(client) => client.request(ANSWER_LINK, input).await,
                 None => Err(RpcError::Disconnected("no connection that manages access on the host".into())),
             };
             let _ = this.update_in(cx, |this, window, cx| {

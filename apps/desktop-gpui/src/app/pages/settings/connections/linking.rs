@@ -222,8 +222,13 @@ impl Workspace {
 
     /// `environment_id`'s socket now, while this session may change its links: read when a
     /// request runs, since a dialog can stay open through a reconnect.
-    pub(in crate::app) fn access_client(&self, environment_id: &str) -> Option<RpcClient> {
-        self.env_client(environment_id).filter(|_| self.manages_access(environment_id))
+    pub(in crate::app) fn access_client(
+        &self,
+        environment_id: &str,
+        method: &str,
+        payload: &Value,
+    ) -> Option<RpcClient> {
+        self.env_client(environment_id).filter(|_| self.env_permits(environment_id, method, payload))
     }
 
     /// Where this client can mint a pairing code on `environment_id`: connected there, with a

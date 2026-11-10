@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 
 use super::super::widgets::{RowFrame, section_with_action};
 use super::linking::{ANOTHER_ADDRESS, LinkableMachine, machine_badge, mint_link_code};
-use super::logic::{self, ACCESS_READ, ACCESS_WRITE, LinkTone};
+use super::logic::{self, ACCESS_READ, LinkTone};
 use super::ui::{self, Size, Variant, WebButton, text_sm, text_xs};
 use super::{error_toast, success_toast};
 use crate::app::Workspace;
@@ -121,7 +121,8 @@ impl Workspace {
         t: &Tokens,
     ) -> AnyElement {
         let s = state.read(cx);
-        let can_link = self.env_grants(&host.id, ACCESS_WRITE);
+        let can_link = self.env_permits(&host.id, "peerLinks.link", &Value::Null);
+        let can_unlink = self.env_permits(&host.id, "peerLinks.unlink", &Value::Null);
         let row_host = host.clone();
         let action = can_link.then(|| {
             let state = state.downgrade();
@@ -147,7 +148,7 @@ impl Workspace {
             ],
             Some(Ok(links)) => {
                 let now = now_ms();
-                links.iter().map(|link| linked_row(state, s, link, can_link, &row_host, now, t)).collect()
+                links.iter().map(|link| linked_row(state, s, link, can_unlink, &row_host, now, t)).collect()
             }
         };
         section_with_action(id, title, action, rows, t)
@@ -162,9 +163,9 @@ struct LinkHost {
 }
 
 impl LinkHost {
-    /// The socket that links and unlinks, while this session may.
-    fn client(&self, cx: &App) -> Option<RpcClient> {
-        self.workspace.upgrade()?.read(cx).access_client(&self.id)
+    /// The socket that sends `method` with `payload`, while this session may.
+    fn client(&self, method: &str, payload: &Value, cx: &App) -> Option<RpcClient> {
+        self.workspace.upgrade()?.read(cx).access_client(&self.id, method, payload)
     }
 
     /// The socket that lists the links.
@@ -246,14 +247,15 @@ fn confirm_forget(
             .ok_variant(gpui_kit::component::button::ButtonVariant::Danger)
             .on_ok(move |_, window, cx| {
                 let (state, host, id) = (state.clone(), host.clone(), id.clone());
-                let Some(rpc) = host.client(cx) else { return true };
+                let input = json!({ "environmentId": id });
+                let Some(rpc) = host.client("peerLinks.unlink", &input, cx) else { return true };
                 let _ = state.update(cx, |s, cx| {
                     s.forgetting = Some(id.clone());
                     cx.notify();
                 });
                 window
                     .spawn(cx, async move |cx| {
-                        let result = rpc.request("peerLinks.unlink", json!({ "environmentId": id })).await;
+                        let result = rpc.request("peerLinks.unlink", input).await;
                         let _ = cx.update(|window, cx| {
                             let client = host.reader(cx);
                             let _ = state.update(cx, |s, cx| {
@@ -368,7 +370,7 @@ impl LinkForm {
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let plan = link_form_plan(&self.machines(cx), self.choice.as_deref());
         let host = self.host();
-        if self.busy || !self.ready(&plan, cx) || host.client(cx).is_none() {
+        if self.busy || !self.ready(&plan, cx) || host.client("peerLinks.link", &Value::Null, cx).is_none() {
             return;
         }
         let mint = self.mint_endpoint(&plan, cx);
@@ -401,7 +403,7 @@ impl LinkForm {
                 return;
             };
             // Minting can outlast the connection the dialog opened on.
-            let Ok(client) = this.update(cx, |_, cx| host.client(cx)) else { return };
+            let Ok(client) = this.update(cx, |_, cx| host.client("peerLinks.link", &input, cx)) else { return };
             let result = match client {
                 Some(client) => client.request("peerLinks.link", input).await,
                 None => Err(RpcError::Disconnected("no connection that manages access on the host".into())),
