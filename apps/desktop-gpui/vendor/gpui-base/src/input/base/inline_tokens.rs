@@ -423,6 +423,29 @@ macro_rules! token_api {
                     this.replace_text_in_ranges_selecting(edits, Some(select), window, cx);
                 });
             }
+            /// Swap the tokens of the unchanged text outside the undo history, keeping the
+            /// selection unless a new token now covers part of it.
+            pub fn retokenize(
+                &mut self,
+                content: InputContent,
+                cx: &mut Context<Self>,
+            ) -> Result<(), InlineTokenError> {
+                self.check_token_mode()?;
+                if self.text != content.text.as_ref() {
+                    return Err(InlineTokenError::TextMismatch);
+                }
+                if self.token_spans() == content.tokens.as_slice() {
+                    return Ok(());
+                }
+                self.install_tokens(content);
+                self.document_revision = self.document_revision.wrapping_add(1);
+                let selected = self.selected_range();
+                if self.normalize_token_range(selected.clone()) != selected {
+                    self.set_selected_range(selected, cx);
+                }
+                cx.notify();
+                Ok(())
+            }
             pub fn tokens(&self) -> &[InlineTokenSpan] {
                 self.token_spans()
             }

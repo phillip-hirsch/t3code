@@ -12061,6 +12061,32 @@ mod tests {
     }
 
     #[gpui::test]
+    fn test_retokenize_keeps_history_and_moves_a_covered_caret(cx: &mut TestAppContext) {
+        use crate::input::{InlineToken, InputContent};
+        let view = multi_line(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("say hi", window, cx);
+                state.replace_ranges(&[(0..0, "ok ".to_string())], 4..4, window, cx);
+                let content = InputContent::new("ok say hi")
+                    .with_token(3..6, InlineToken::new("t", "say"))
+                    .unwrap();
+                state.retokenize(content, cx).unwrap();
+                assert_eq!(state.tokens().len(), 1);
+                assert_eq!(state.selected_range(), 6..6);
+                assert!(state.retokenize(InputContent::new("other"), cx).is_err());
+
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "say hi");
+                assert_eq!(state.tokens()[0].range(), 0..3);
+            });
+        });
+    }
+
+    #[gpui::test]
     fn test_multi_cursor_undo_redo_different_line_lengths(cx: &mut TestAppContext) {
         let view = multi_line(cx);
         let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);

@@ -229,6 +229,52 @@ impl Workspace {
         self.sync_composer_marks(cx);
     }
 
+    /// Brings the composer's skill and model chips in line with the lists it knows once they load
+    /// or change (`skillChipReplacements`), outside the undo history and keeping the selection.
+    pub(super) fn reconcile_composer_chips(&mut self, cx: &mut Context<Self>) {
+        let state = self.composer.read(cx);
+        let (text, spans) = (state.value(), state.tokens().to_vec());
+        if spans.is_empty() && !text.contains(composer_text::is_currency) && !text.contains("model:") {
+            return;
+        }
+        let skills = self.skill_names();
+        let tokens: Vec<_> =
+            spans.iter().map(|s| (s.range(), s.token().id().as_ref(), s.token().label().as_ref())).collect();
+        let (stale, fresh) = composer_text::reconcile_chips(
+            &text,
+            &tokens,
+            |name| skills.iter().any(|s| s == name),
+            |instance_id, model| self.model_mention(instance_id, model).map(|m| m.label),
+        );
+        if stale.is_empty() && fresh.is_empty() {
+            return;
+        }
+        let mut next: Vec<_> = spans
+            .iter()
+            .filter(|span| !stale.contains(&span.range()))
+            .map(|span| (span.range(), span.token().clone()))
+            .chain(fresh.into_iter().map(|(range, chip)| {
+                let token = InlineToken::new(chip.id(), &text[range.clone()]).with_label(chip.label().to_owned());
+                (range, token)
+            }))
+            .collect();
+        next.sort_by_key(|(range, _)| range.start);
+        let mut content = InputContent::new(text);
+        for (range, token) in next {
+            content = match content.clone().with_token(range, token) {
+                Ok(next) => next,
+                Err(_) => content,
+            };
+        }
+        self.chip_ids = content.tokens().iter().map(|s| s.token().id().to_string()).collect();
+        self.composer.update(cx, |composer, cx| {
+            if let Err(error) = composer.retokenize(content, cx) {
+                log::warn!("composer chips not reconciled: {error:?}");
+            }
+        });
+        self.sync_composer_marks(cx);
+    }
+
     /// Pasted file links, known skills and models, and context links arrive as chips (`handlePaste`);
     /// `false` leaves a paste without any, or one into code, to the editor.
     pub(super) fn paste_chips(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {

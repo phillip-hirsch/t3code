@@ -255,6 +255,37 @@ pub fn chips_with_models(
     found
 }
 
+/// `skillChipReplacements`, once the known skills or models change: which `tokens` (each its
+/// range, token id and label) go back to text, and which runs of `text` become skill or model
+/// chips. Other chips stay; a model chip whose name changed comes back relabelled.
+pub fn reconcile_chips(
+    text: &str,
+    tokens: &[(Range<usize>, &str, &str)],
+    is_skill: impl Fn(&str) -> bool,
+    model_label: impl Fn(&str, &str) -> Option<String>,
+) -> (Vec<Range<usize>>, ChipSpans) {
+    let stale: Vec<Range<usize>> = tokens
+        .iter()
+        .filter(|(_, id, label)| match Chip::from_id(id) {
+            Some(Chip::Skill { name }) => !is_skill(&name),
+            Some(Chip::Model { instance_id, model, .. }) => {
+                model_label(&instance_id, &model).as_deref() != Some(*label)
+            }
+            _ => false,
+        })
+        .map(|(range, ..)| range.clone())
+        .collect();
+    let kept: Vec<&Range<usize>> = tokens.iter().map(|(range, ..)| range).filter(|r| !stale.contains(r)).collect();
+    let fresh = chips_with_models(text, &is_skill, &model_label)
+        .into_iter()
+        .filter(|(range, chip)| {
+            matches!(chip, Chip::Skill { .. } | Chip::Model { .. })
+                && !kept.iter().any(|other| other.start < range.end && range.start < other.end)
+        })
+        .collect();
+    (stale, fresh)
+}
+
 const MODEL_PREFIX: &str = "model:";
 
 /// `formatComposerModelMention`: the prompt text naming a provider instance's model for the
@@ -676,6 +707,27 @@ mod tests {
             Chip::from_id(&gpt_chip().id()),
             Some(Chip::Model { instance_id: "codex".into(), model: "gpt-6.1".into(), label: String::new() })
         );
+    }
+
+    #[test]
+    fn chips_follow_the_skills_and_models_that_load_or_go() {
+        let text = "$review model:codex/gpt-6.1 x";
+        let skill = |name: &str| name == "review";
+        let none = |_: &str, _: &str| None;
+        let review = (0..7, "skill:review", "review");
+        let gpt = (8..27, "model:codex/gpt-6.1", "GPT-6.1");
+        assert_eq!(
+            reconcile_chips(text, &[], skill, codex_model),
+            (vec![], vec![(0..7, Chip::Skill { name: "review".into() }), (8..27, gpt_chip())]),
+            "text restored before the lists loaded"
+        );
+        assert_eq!(reconcile_chips(text, &[review.clone(), gpt.clone()], skill, codex_model), (vec![], vec![]));
+        assert_eq!(reconcile_chips(text, &[review.clone(), gpt], |_| false, none), (vec![0..7, 8..27], vec![]));
+        let renamed = (8..27, "model:codex/gpt-6.1", "GPT-6");
+        let (stale, fresh) = reconcile_chips(text, &[review, renamed.clone()], skill, codex_model);
+        assert_eq!((stale, fresh), (vec![renamed.0.clone()], vec![(renamed.0, gpt_chip())]));
+        let pasted = (0..27, "paste:1", "Pasted text");
+        assert_eq!(reconcile_chips(text, &[pasted], skill, codex_model), (vec![], vec![]), "inside another chip");
     }
 
     #[test]

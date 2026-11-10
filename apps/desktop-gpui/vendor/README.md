@@ -237,6 +237,14 @@ leaves, which `replace_text_in_ranges_selecting` in `src/input/base/state.rs` se
 records its cursors, so redo restores that caret rather than one per range. Test there:
 `test_replace_ranges_redo_restores_chosen_selection`.
 
+**Tokens change under unchanged text.** When an environment's skills or models load or change,
+the composer turns plain `$name` and `model:` text into chips and stale chips back into text, as
+the web does outside its undo history. `set_value` would clear the history and the selection;
+each token replacement would add an undo step. The patch, in `src/input/base/inline_tokens.rs`:
+`retokenize`, which installs new tokens over the same text, bumps the document revision so the
+token layout remeasures, and moves only a caret a new token covers. Test in
+`src/input/base/state.rs`: `test_retokenize_keeps_history_and_moves_a_covered_caret`.
+
 **Code block actions span the top row.** The web's code block header puts the language on the
 left and its buttons on the right. 0.9.0 pins the actions to the block's top-right corner at their
 own width, so the row could span the block only when the caller knew its width. The patch anchors

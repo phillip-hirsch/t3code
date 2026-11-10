@@ -326,6 +326,8 @@ impl Workspace {
         self.model_explicit = true;
         self.sticky_model.clone_from(&self.model_override);
         self.refresh_menu_items(cx);
+        // Another provider brings its own skills.
+        self.reconcile_composer_chips(cx);
         // A pick on another harness shows its pending handoff at the timeline's end.
         self.refresh_rows(cx);
         self.apply_thread_model_pick(window, cx);
