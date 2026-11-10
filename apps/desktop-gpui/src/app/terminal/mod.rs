@@ -37,6 +37,7 @@ pub(in crate::app) use self::session::{Launch, SessionEvent, TerminalSession};
 use super::draft_sessions::DraftId;
 use super::titlebar::icon;
 use super::{Target, Workspace};
+use crate::model::ScopedId;
 use crate::rpc::RpcClient;
 use crate::theme::{self, Tokens};
 
@@ -454,6 +455,11 @@ impl Workspace {
         DrawerKey { env: env.map(|env| env.to_string()), thread_id: thread_id.to_owned() }
     }
 
+    /// The thread a drawer's key names, on its environment.
+    fn drawer_target(&self, key: &DrawerKey) -> Option<Target> {
+        Some(Target::Thread { env: key.env.clone()?.into(), id: key.thread_id.clone() })
+    }
+
     fn shown_drawer_key(&self) -> Option<DrawerKey> {
         self.shown_terminal_thread().map(|thread_id| self.drawer_key(thread_id))
     }
@@ -475,14 +481,14 @@ impl Workspace {
 
     /// Where new terminals start: the thread's worktree, else its project root.
     fn terminal_launch(&self) -> Option<Launch> {
-        let (project_id, worktree_path) = match self.target.as_ref()? {
-            Target::Thread { id, .. } => {
-                let thread = self.shell.threads.iter().find(|t| &t.id == id)?;
-                (thread.project_id.as_str(), thread.worktree_path.clone())
+        let (env, project_id, worktree_path) = match self.target.as_ref()? {
+            Target::Thread { env, id } => {
+                let thread = self.shell.thread(&ScopedId::new(env.clone(), id.clone()))?;
+                (env, thread.project_id.as_str(), thread.worktree_path.clone())
             }
-            Target::Draft { project_id, .. } => (project_id.as_str(), None),
+            Target::Draft { env, project_id, .. } => (env, project_id.as_str(), None),
         };
-        let project = self.shell.projects.iter().find(|p| p.id == project_id)?;
+        let project = self.shell.project(&ScopedId::new(env.clone(), project_id))?;
         Some(Launch {
             cwd: worktree_path.clone().unwrap_or_else(|| project.workspace_root.clone()),
             worktree_path,
@@ -491,10 +497,25 @@ impl Workspace {
         })
     }
 
-    /// `canOperateTerminal`: the thread's environment lets this client start, type into, resize
-    /// and close its terminals.
+    /// `canOperateTerminal`: the environment of `thread_id`'s drawer lets this client start, type
+    /// into, resize and close its terminals.
     pub(super) fn terminal_operable(&self, thread_id: &str) -> bool {
-        self.terminals_operable_on(self.thread_environment(thread_id).as_deref())
+        self.drawer_operable(&self.drawer_key(thread_id))
+    }
+
+    fn drawer_operable(&self, key: &DrawerKey) -> bool {
+        self.terminals_operable_on(key.env.as_deref())
+    }
+
+    /// The socket of the environment a drawer's terminals run on.
+    fn drawer_client(&self, key: &DrawerKey) -> Option<RpcClient> {
+        self.env_client(key.env.as_deref()?)
+    }
+
+    /// The socket `thread_id`'s terminals run on: its drawer's environment, not the first one
+    /// listing a thread with that id.
+    fn terminal_client(&self, thread_id: &str) -> Option<RpcClient> {
+        self.drawer_client(&self.drawer_key(thread_id))
     }
 
     /// `canOperateTerminal` on `env`, which a drawer's key names.
@@ -625,7 +646,7 @@ impl Workspace {
             }
             None => self.launch_terminal_with(thread_id.clone(), Place::New, launch, Some(input), cx),
         };
-        let environment = self.thread_environment(&thread_id);
+        let environment = self.drawer_key(&thread_id).env;
         let preview = self.preview_thread_of(&thread_id);
         match run.preview_url.clone().map(|url| self.resolve_server_url(environment.as_deref(), url)).zip(preview) {
             Some((url, thread)) => cx
@@ -650,7 +671,7 @@ impl Workspace {
         then_write: Option<String>,
         cx: &mut Context<Self>,
     ) -> Task<bool> {
-        if self.thread_client(&thread_id).is_none() || !self.terminal_operable(&thread_id) {
+        if self.terminal_client(&thread_id).is_none() || !self.terminal_operable(&thread_id) {
             return Task::ready(false);
         }
         let terminal_id = self.next_terminal_id(&thread_id);
@@ -682,14 +703,14 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Task<bool> {
         // A terminal runs on its thread's environment (a draft's is the open one).
-        let Some(client) = self.thread_client(&thread_id).filter(|_| self.terminal_operable(&thread_id)) else {
+        let Some(client) = self.terminal_client(&thread_id).filter(|_| self.terminal_operable(&thread_id)) else {
             return Task::ready(false);
         };
         self.terminals.focus_later(&thread_id, &terminal_id);
         let payload = launch.payload(&thread_id, &terminal_id);
         let origin = match self.terminals.draft_of(&thread_id) {
             Some(draft) => self.drafts.target(draft),
-            None => self.thread_target(&thread_id),
+            None => self.drawer_target(&self.drawer_key(&thread_id)),
         }
         .or_else(|| self.target.clone());
         cx.spawn(async move |this, cx| {
@@ -723,7 +744,7 @@ impl Workspace {
     /// `confirmTerminalClose`, then [`Self::close_terminal`].
     fn request_close_terminal(&mut self, terminal_id: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(key) = self.shown_drawer_key() else { return };
-        if !self.terminal_operable(&key.thread_id) {
+        if !self.drawer_operable(&key) {
             return;
         }
         let label = self.terminals.label(&key.thread_id, &terminal_id);
@@ -744,7 +765,7 @@ impl Workspace {
                     window.defer(cx, move |_, cx| {
                         // The grant is read again: it may have changed while the dialog was open.
                         let _ = workspace.update(cx, |this, cx| {
-                            if this.terminal_operable(&key.thread_id) {
+                            if this.drawer_operable(&key) {
                                 this.close_terminal(&key, &terminal_id, cx);
                             }
                         });
@@ -757,7 +778,7 @@ impl Workspace {
     /// Ends the session and deletes its history; a failed close types `exit`.
     fn close_terminal(&mut self, key: &DrawerKey, terminal_id: &str, cx: &mut Context<Self>) {
         let thread_id = key.thread_id.as_str();
-        self.close_panel_terminal(thread_id, terminal_id);
+        self.close_panel_terminal(key, terminal_id);
         // Only a shown drawer hands focus on, as the web's `visible` guard does.
         let shown = self.shown_drawer_key().as_ref() == Some(key);
         if let Some(drawer) = self.terminals.drawer_mut(key) {
@@ -767,7 +788,7 @@ impl Workspace {
                 self.terminals.focus_later(thread_id, &active);
             }
         }
-        if let Some(client) = self.thread_client(thread_id) {
+        if let Some(client) = self.drawer_client(key) {
             let (thread_id, terminal_id) = (thread_id.to_owned(), terminal_id.to_owned());
             cx.background_spawn(async move {
                 let close = json!({"threadId": thread_id, "terminalId": terminal_id, "deleteHistory": true});
@@ -889,7 +910,7 @@ impl Workspace {
         let thread_id = key.thread_id.as_str();
         match event {
             // `handleSessionExited`: only a client that may operate the terminal cleans it up.
-            SessionEvent::Exited if self.terminal_operable(thread_id) => {
+            SessionEvent::Exited if self.drawer_operable(key) => {
                 self.close_terminal(key, terminal_id, cx);
             }
             SessionEvent::Exited => {}

@@ -77,7 +77,7 @@ impl Workspace {
     /// `addTerminalSurface`: a new terminal in a tab of its own.
     pub(in crate::app) fn add_terminal_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(thread_id), Some(launch)) = (self.terminal_thread(true), self.terminal_launch()) else { return };
-        if self.thread_client(&thread_id).is_none() || !self.terminal_operable(&thread_id) {
+        if self.terminal_client(&thread_id).is_none() || !self.terminal_operable(&thread_id) {
             return;
         }
         let terminal_id = self.next_terminal_id(&thread_id);
@@ -127,7 +127,8 @@ impl Workspace {
     }
 
     /// Drops a closed terminal from its tab; the tab closes with its last terminal.
-    pub(super) fn close_panel_terminal(&mut self, thread_id: &str, terminal_id: &str) {
+    pub(super) fn close_panel_terminal(&mut self, key: &super::DrawerKey, terminal_id: &str) {
+        let thread_id = key.thread_id.as_str();
         let shown = self.shown_terminal_thread() == Some(thread_id);
         let mut emptied = Vec::new();
         for (surface, group) in self.terminals.panel.iter_mut().filter(|(_, g)| g.thread_id == thread_id) {
@@ -145,7 +146,7 @@ impl Workspace {
                 None => emptied.push(surface.clone()),
             }
         }
-        let target = self.thread_target(thread_id);
+        let target = self.drawer_target(key);
         for surface in emptied {
             self.terminals.panel.remove(&surface);
             if let Some(target) = &target {
@@ -204,9 +205,10 @@ impl Workspace {
                 format!("This stops their running processes and clears their histories: {}.", quoted.join(", ")),
             )
         };
+        let key = self.drawer_key(&group.thread_id);
         let workspace = cx.weak_entity();
         window.open_alert_dialog(cx, move |alert, _, _| {
-            let (workspace, group, surface) = (workspace.clone(), group.clone(), surface.clone());
+            let (workspace, group, surface, key) = (workspace.clone(), group.clone(), surface.clone(), key.clone());
             alert
                 .title(title.clone())
                 .description(description.clone())
@@ -216,13 +218,14 @@ impl Workspace {
                 .centered()
                 .width(px(512.))
                 .on_ok(move |_, window, cx| {
-                    let (workspace, group, surface) = (workspace.clone(), group.clone(), surface.clone());
+                    let (workspace, group, surface, key) =
+                        (workspace.clone(), group.clone(), surface.clone(), key.clone());
                     window.defer(cx, move |_, cx| {
                         // The grant is read again: it may have changed while the dialog was open.
                         let _ = workspace.update(cx, |this, cx| {
-                            if this.terminal_operable(&group.thread_id) {
+                            if this.drawer_operable(&key) {
                                 for id in &group.terminal_ids {
-                                    this.close_terminal(&this.drawer_key(&group.thread_id), id, cx);
+                                    this.close_terminal(&key, id, cx);
                                 }
                             } else {
                                 this.drop_terminal_surface(surface);
