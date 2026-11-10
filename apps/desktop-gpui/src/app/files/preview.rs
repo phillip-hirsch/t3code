@@ -1159,8 +1159,7 @@ impl Workspace {
     ) -> AnyElement {
         let muted = tokens.muted_foreground;
         let action = |id: &'static str, icon: IconName, label: &'static str| {
-            div()
-                .id(id)
+            crate::app::chat::focusable(div().id(id), tokens)
                 .size(px(24.))
                 .flex_none()
                 .flex()
