@@ -306,7 +306,7 @@ impl Workspace {
             Some(Target::Draft { env, project_id, .. }) if *env == source.env && *project_id == source.id
         );
         self.settings = None;
-        if on_source && self.page.is_none() {
+        if on_source && self.page.is_none() && !self.target_sending() {
             self.move_draft_by_hand(target.env, target.id, cx);
             self.focus_composer(window, cx);
         } else {

@@ -966,7 +966,7 @@ impl Workspace {
                 // A draft that moved on meanwhile stays where it is.
                 let Some(project_id) = project_id.filter(|_| this.target == origin) else { return };
                 let empty = this.composer.read(cx).value().trim().is_empty() && this.attachments.is_empty();
-                if empty {
+                if empty || this.target_sending() {
                     this.start_draft_in(env, project_id, window, cx);
                 } else {
                     this.move_draft_to_project(env, project_id, cx);
