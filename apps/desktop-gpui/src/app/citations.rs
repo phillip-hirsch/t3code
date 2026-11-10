@@ -25,6 +25,7 @@ use super::send::Intent;
 use super::{Target, Workspace};
 use crate::assistant_citations::{self, AssistantCitation, Dismissal, MAX_COMMENT_LENGTH, MAX_TEXT_LENGTH, js_len};
 use crate::composer_text::{self, Chip};
+use crate::model::ThreadState;
 use crate::theme::{Tokens, tokens};
 use crate::timeline::Row;
 
@@ -623,11 +624,7 @@ impl Workspace {
         let env = SharedString::from(citation.environment_id.clone());
         let here =
             matches!(&self.target, Some(Target::Thread { env: e, id }) if *e == env && *id == citation.thread_id);
-        if !here && !self.shell.threads.iter().any(|t| t.environment_id == env && t.id == citation.thread_id) {
-            let (title, message) = UNAVAILABLE;
-            window.push_notification(Notification::warning(message).title(title), cx);
-            return;
-        }
+        // The shell lists only some threads; whether the reply exists is known once its thread loads.
         let thread_id = citation.thread_id.clone();
         self.citations.reveal = Some((citation, window.window_handle()));
         if !here {
@@ -639,30 +636,27 @@ impl Workspace {
     /// Shows the reply a pending citation names once its thread's timeline is in: opens what
     /// folds it, scrolls to it and highlights the quote.
     pub(super) fn reveal_pending_citation(&mut self, cx: &mut Context<Self>) {
+        self.settle_pending_citation(false, cx);
+    }
+
+    /// `reveal_pending_citation`, told whether the cited thread could not be read.
+    pub(super) fn settle_pending_citation(&mut self, load_failed: bool, cx: &mut Context<Self>) {
         let Some((citation, _)) = &self.citations.reveal else { return };
         let here = matches!(&self.target, Some(Target::Thread { env, id })
             if **env == *citation.environment_id && *id == citation.thread_id);
-        if !here {
+        let Some(thread) = self.thread.as_ref().filter(|_| here) else {
             self.citations.reveal = None;
             return;
-        }
-        let Some(projection) = self.open_projection() else { return };
-        let item = projection
-            .visible_turn_items
-            .iter()
-            .map(|row| row.item.as_ref())
-            .find(|item| item.raw.get("messageId").and_then(Value::as_str) == Some(&citation.message_id));
-        let found = item.map(|item| (item.id.clone(), item.item_type == "assistant_message"));
+        };
+        let found = cited_reply(&thread.state, load_failed, &citation.message_id);
         let Some((citation, window)) = self.citations.reveal.take() else { return };
         let item_id = match found {
-            Some((item_id, true)) => item_id,
-            Some((_, false)) => {
-                let message = "The selected text is still saved in your citation.";
-                toast_later(window, "The citation does not refer to an assistant response", message, cx);
+            CitedReply::Found(item_id) => item_id,
+            CitedReply::Loading => {
+                self.citations.reveal = Some((citation, window));
                 return;
             }
-            None => {
-                let (title, message) = UNAVAILABLE;
+            CitedReply::Failed((title, message)) => {
                 toast_later(window, title, message, cx);
                 return;
             }
@@ -777,6 +771,41 @@ const UNAVAILABLE: (&str, &str) = (
     "The cited response is unavailable",
     "It may have been removed. The selected text is still saved in your citation.",
 );
+const COULD_NOT_LOAD: (&str, &str) = (
+    "Could not load the cited response",
+    "Load earlier turns, then click the citation to try again. Your saved quote is unchanged.",
+);
+const NOT_ASSISTANT: (&str, &str) =
+    ("The citation does not refer to an assistant response", "The selected text is still saved in your citation.");
+
+/// Where a citation stands against its thread as loaded so far (`loadCitedHistory`).
+#[derive(Debug, PartialEq)]
+enum CitedReply {
+    Loading,
+    /// The reply's timeline item.
+    Found(String),
+    /// The toast's title and message.
+    Failed((&'static str, &'static str)),
+}
+
+fn cited_reply(state: &ThreadState, load_failed: bool, message_id: &str) -> CitedReply {
+    if state.deleted {
+        return CitedReply::Failed(UNAVAILABLE);
+    }
+    let Some(projection) = &state.projection else {
+        return if load_failed { CitedReply::Failed(COULD_NOT_LOAD) } else { CitedReply::Loading };
+    };
+    let item = projection
+        .visible_turn_items
+        .iter()
+        .map(|row| row.item.as_ref())
+        .find(|item| item.raw.get("messageId").and_then(Value::as_str) == Some(message_id));
+    match item {
+        Some(item) if item.item_type == "assistant_message" => CitedReply::Found(item.id.clone()),
+        Some(_) => CitedReply::Failed(NOT_ASSISTANT),
+        None => CitedReply::Failed(UNAVAILABLE),
+    }
+}
 
 /// `AssistantCitationQuote`: the quote as a block quote, then the comment.
 fn quote_preview(text: &str, comment: Option<&str>, t: &Tokens) -> AnyElement {
@@ -820,4 +849,47 @@ pub(super) fn citation_chip(label: SharedString, size: f32, selected: bool, t: &
                 .hover(move |s| s.bg(gpui_kit::Hsla::from(accent).opacity(0.17)))
                 .child(Icon::new(Lucide::Pencil).with_size(px(size * 0.85))),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn loaded(items: &[(&str, &str, &str)]) -> ThreadState {
+        let items: Vec<_> = items
+            .iter()
+            .enumerate()
+            .map(|(i, (id, item_type, message_id))| json!({"id": id, "type": item_type, "threadId": "t", "runId": "r1", "nodeId": null, "ordinal": i, "status": "completed", "updatedAt": "x", "messageId": message_id}))
+            .collect();
+        let rows: Vec<_> = items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| json!({"position": i, "visibility": "local", "sourceThreadId": "t", "sourceItemId": item["id"], "item": item}))
+            .collect();
+        let projection = json!({"thread": {"id": "t", "projectId": "p", "title": "t"}, "runs": [{"id": "r1", "status": "completed", "ordinal": 1}], "turnItems": items, "visibleTurnItems": rows});
+        let mut state = ThreadState::default();
+        state.apply(&json!({"kind": "snapshot", "snapshotSequence": 1, "projection": projection})).unwrap();
+        state
+    }
+
+    #[test]
+    fn a_citation_waits_for_its_thread_before_calling_the_reply_unavailable() {
+        let unloaded = ThreadState::default();
+        assert_eq!(cited_reply(&unloaded, false, "m1"), CitedReply::Loading);
+        assert_eq!(cited_reply(&unloaded, true, "m1"), CitedReply::Failed(COULD_NOT_LOAD));
+
+        let mut state = loaded(&[("u", "user_message", "m0"), ("a", "assistant_message", "m1")]);
+        assert_eq!(cited_reply(&state, false, "m1"), CitedReply::Found("a".into()));
+        assert_eq!(cited_reply(&state, false, "m0"), CitedReply::Failed(NOT_ASSISTANT));
+        assert_eq!(cited_reply(&state, false, "gone"), CitedReply::Failed(UNAVAILABLE));
+
+        state.deleted = true;
+        assert_eq!(
+            cited_reply(&state, false, "m1"),
+            CitedReply::Failed(UNAVAILABLE),
+            "a deleted thread keeps its rows"
+        );
+    }
 }

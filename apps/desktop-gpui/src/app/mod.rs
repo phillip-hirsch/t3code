@@ -914,11 +914,13 @@ impl Workspace {
                     this.error = Some(
                         "Couldn't read this thread from the server. Open another thread and come back to retry.".into(),
                     );
+                    this.settle_pending_citation(true, cx);
                 } else if thread.state.projection.is_some() {
                     thread.retried = false;
                 }
                 let Some(thread) = this.thread.as_ref() else { return };
                 if thread.state.deleted {
+                    this.reveal_pending_citation(cx);
                     this.close_thread(window, cx);
                     return;
                 }
