@@ -175,9 +175,9 @@ impl TaskEditor {
             None => unreachable!("the editor opens from a live workspace"),
         };
         let webhook = cx.new(|cx| WebhookFields::new(context, task_json.clone(), window, cx));
-        let cwd = workspace.upgrade().and_then(|w| {
-            w.read(cx).shell.projects.iter().find(|p| p.id == draft.project_id).map(|p| p.workspace_root.clone())
-        });
+        let project = crate::model::ScopedId::new(environment.clone(), draft.project_id.as_str());
+        let cwd =
+            workspace.upgrade().and_then(|w| w.read(cx).shell.project(&project).map(|p| p.workspace_root.clone()));
         let worktree = cx.new(|cx| NewWorktreeMode::new(client.clone(), cwd, task_json.as_ref(), window, cx));
         let on_text = |field: fn(&mut DraftState) -> &mut String| {
             move |this: &mut Self,
@@ -395,9 +395,9 @@ impl TaskEditor {
     }
 
     fn sync_worktree_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let cwd = self.workspace.upgrade().and_then(|w| {
-            w.read(cx).shell.projects.iter().find(|p| p.id == self.draft.project_id).map(|p| p.workspace_root.clone())
-        });
+        let project = crate::model::ScopedId::new(self.environment.clone(), self.draft.project_id.as_str());
+        let cwd =
+            self.workspace.upgrade().and_then(|w| w.read(cx).shell.project(&project).map(|p| p.workspace_root.clone()));
         self.worktree.update(cx, |mode, cx| mode.set_project(cwd, window, cx));
     }
 
