@@ -159,6 +159,16 @@ impl BrowserHistory {
         changed
     }
 
+    /// Moves the entries kept under `legacy` to `key` when `key` has none.
+    pub fn adopt(&mut self, legacy: &str, key: &str) -> bool {
+        if legacy == key || self.by_project_key.contains_key(key) {
+            return false;
+        }
+        let Some(entries) = self.by_project_key.remove(legacy) else { return false };
+        self.by_project_key.insert(key.to_owned(), entries);
+        true
+    }
+
     pub fn remove(&mut self, project_key: &str, url: &str) {
         if let Some(entries) = self.by_project_key.get_mut(project_key) {
             let key = visit_key(url);
@@ -208,6 +218,20 @@ mod tests {
         assert_eq!(history.recent("p", 1)[0].title.as_deref(), Some("Docs"));
         history.remove("p", "https://example.com/docs/");
         assert!(history.recent("p", 8).is_empty());
+    }
+
+    #[test]
+    fn entries_under_a_bare_id_move_to_the_new_key_once() {
+        let mut history = BrowserHistory::default();
+        history.record_visit("p1", "https://example.com/", 1);
+        assert!(history.adopt("p1", "env:/src/app"));
+        assert_eq!(history.recent("env:/src/app", 8).len(), 1);
+        assert!(history.recent("p1", 8).is_empty());
+        // A key with its own entries keeps them.
+        history.record_visit("p1", "https://other.test/", 2);
+        assert!(!history.adopt("p1", "env:/src/app"));
+        assert_eq!(history.recent("env:/src/app", 8)[0].url, "https://example.com/");
+        assert!(!history.adopt("env:/src/app", "env:/src/app"));
     }
 
     #[test]
