@@ -36,13 +36,14 @@ const ROW_HEIGHT: f32 = 32.;
 const METER_ROW_HEIGHT: f32 = 24.;
 /// A section's 8px top and 10px bottom padding.
 const SECTION_PADDING: f32 = 18.;
-/// A section heading: 32px plus its 4px bottom margin.
-const HEADING_HEIGHT: f32 = 36.;
 /// A workflow without agents yet: one `text-2xs` line in `py-1.5`.
 const NO_AGENTS_HEIGHT: f32 = 26.;
 /// `ThreadLineageRowList`: `max-h-[13.5rem]`, or `max-h-[min(28rem,55dvh)]` with a workflow open.
 const LINEAGE_LIST_MAX: f32 = 216.;
 const LINEAGE_WORKFLOW_LIST_MAX: f32 = 448.;
+/// Slots of the card's `sections` that scroll as they grow.
+const LINEAGE_SLOT: usize = 4;
+const SIDE_CHATS_SLOT: usize = 5;
 
 /// The card's opaque stand-ins for `dropdown-glass` (the popover at `--glass-opacity`
 /// over the canvas); GPUI has no backdrop blur.
@@ -98,6 +99,21 @@ fn resolve_density(available: f32, full: f32, compact: f32) -> Density {
     } else {
         Density::Essential
     }
+}
+
+/// The card height `resolve_density` weighs at `density`: each shown section with its
+/// padding, plus the card's border. Like the web's measure it leaves out Lineage and Side
+/// chats, which scroll as they grow, so a long list cannot drop the card below full.
+fn fitting_height(sections: &[Option<Section>], density: Density) -> f32 {
+    sections
+        .iter()
+        .enumerate()
+        .filter(|(slot, _)| *slot != LINEAGE_SLOT && *slot != SIDE_CHATS_SLOT)
+        .filter_map(|(_, section)| section.as_ref())
+        .filter(|section| section.min_density <= density)
+        .map(|section| section.height + SECTION_PADDING)
+        .sum::<f32>()
+        + 2.
 }
 
 /// One label | bar | value row of the usage grid (`ThreadDetailsUsage.tsx` `UsageRow`).
@@ -316,11 +332,11 @@ impl Workspace {
             self.usage_section(&tokens, &colors).filter(|_| self.details_item_shown("usage")),
             self.context_section(&tokens, &colors).filter(|_| self.details_item_shown("context")),
         ];
-        let height_at = |density: Density| {
-            let shown = sections.iter().flatten().filter(|s| s.min_density <= density);
-            shown.map(|s| s.height + SECTION_PADDING).sum::<f32>() + 2.
-        };
-        let density = resolve_density(available, height_at(Density::Full), height_at(Density::Compact));
+        let density = resolve_density(
+            available,
+            fitting_height(&sections, Density::Full),
+            fitting_height(&sections, Density::Compact),
+        );
         if density != Density::Full {
             sections[0] = self.workspace_section_at(density, &tokens, &colors, cx);
             sections[1] = self.version_control_section_at(density, &tokens, &colors, cx);
@@ -1353,8 +1369,6 @@ impl Workspace {
             0 => "Lineage".into(),
             running => format!("Lineage · {running} running").into(),
         };
-        let mut rows = 0usize;
-        let mut extra = 0.;
         // A lone "Previous agents" row names itself; the heading returns for status or actions.
         let show_heading = running > 0 || can_detach || parent.is_some() || !active.is_empty() || delegated.is_some();
         let mut section = v_flex().when(show_heading, |el| {
@@ -1363,23 +1377,18 @@ impl Workspace {
         });
         if let Some(from) = delegated {
             section = section.child(self.delegated_from_row(from, thread, tokens, colors, cx));
-            rows += 1;
         }
         if let Some(parent) = parent {
             section =
                 section.child(self.relationship_row(parent, "icons/corner-left-up.svg", false, tokens, colors, cx));
-            rows += 1;
         }
         if !active.is_empty() {
-            let (element, height) =
-                self.lineage_list("details-active-agents", active, viewport_height, tokens, colors, cx);
-            section = section.child(element);
-            extra += height;
+            section =
+                section.child(self.lineage_list("details-active-agents", active, viewport_height, tokens, colors, cx));
         }
         if !previous.is_empty() {
             let expanded = self.lineage_expanded.as_ref() == Some(id);
             let thread_id = id.clone();
-            rows += 1;
             section = section.child(
                 row(colors)
                     .id("details-previous-agents")
@@ -1410,17 +1419,18 @@ impl Workspace {
                     })),
             );
             if expanded {
-                let (element, height) =
-                    self.lineage_list("details-previous-agents-list", previous, viewport_height, tokens, colors, cx);
-                section = section.child(element);
-                extra += height;
+                section = section.child(self.lineage_list(
+                    "details-previous-agents-list",
+                    previous,
+                    viewport_height,
+                    tokens,
+                    colors,
+                    cx,
+                ));
             }
         }
-        Some(Section {
-            height: rows as f32 * ROW_HEIGHT + extra + if show_heading { HEADING_HEIGHT } else { 0. },
-            element: section.into_any_element(),
-            min_density: Density::Full,
-        })
+        // Left out of the density estimate (`fitting_height`).
+        Some(Section { height: 0., element: section.into_any_element(), min_density: Density::Full })
     }
 
     /// `ThreadRelationshipsControl`'s Side chats: the open thread's side chats, which open in
@@ -1446,15 +1456,11 @@ impl Workspace {
                 .iter()
                 .map(|row| self.relationship_row(row, "icons/messages-square.svg", true, tokens, colors, cx)),
         );
-        Some(Section {
-            height: side_chats.len() as f32 * ROW_HEIGHT + HEADING_HEIGHT,
-            element: section.into_any_element(),
-            min_density: Density::Full,
-        })
+        // Left out of the density estimate (`fitting_height`).
+        Some(Section { height: 0., element: section.into_any_element(), min_density: Density::Full })
     }
 
-    /// `ThreadLineageRowList`: a group's rows, scrolling past its cap so an open workflow
-    /// cannot push Lineage out of the card; and the height it takes.
+    /// `ThreadLineageRowList`: a group's rows, scrolling past its cap.
     fn lineage_list(
         &self,
         id: &'static str,
@@ -1463,36 +1469,25 @@ impl Workspace {
         tokens: &Tokens,
         colors: &CardColors,
         cx: &mut Context<Self>,
-    ) -> (AnyElement, f32) {
+    ) -> AnyElement {
         let workflow_open = rows
             .iter()
             .filter_map(|row| row.workflow.as_ref())
             .any(|group| self.lineage.open_workflows.contains(&group.subagent_id));
         let max = if workflow_open { LINEAGE_WORKFLOW_LIST_MAX.min(viewport_height * 0.55) } else { LINEAGE_LIST_MAX };
-        let mut height = 0.;
-        let mut list = div().id(id).max_h(px(max)).overflow_y_scroll();
-        for row in rows {
-            let (element, row_height) = self.agent_row(row, tokens, colors, cx);
-            list = list.child(element);
-            height += row_height;
-        }
-        (list.into_any_element(), f32::min(height, max))
+        div()
+            .id(id)
+            .max_h(px(max))
+            .overflow_y_scroll()
+            .children(rows.iter().map(|row| self.agent_row(row, tokens, colors, cx)))
+            .into_any_element()
     }
 
-    /// A subagent's row, or a workflow's with its agents under it; and the height it takes.
-    fn agent_row(
-        &self,
-        child: &Relative,
-        tokens: &Tokens,
-        colors: &CardColors,
-        cx: &mut Context<Self>,
-    ) -> (AnyElement, f32) {
+    /// A subagent's row, or a workflow's with its agents under it.
+    fn agent_row(&self, child: &Relative, tokens: &Tokens, colors: &CardColors, cx: &mut Context<Self>) -> AnyElement {
         match &child.workflow {
             Some(group) => self.workflow_row(child, group, tokens, colors, cx),
-            None => (
-                self.relationship_row(child, "icons/bot.svg", false, tokens, colors, cx).into_any_element(),
-                ROW_HEIGHT,
-            ),
+            None => self.relationship_row(child, "icons/bot.svg", false, tokens, colors, cx).into_any_element(),
         }
     }
 
@@ -1505,7 +1500,7 @@ impl Workspace {
         tokens: &Tokens,
         colors: &CardColors,
         cx: &mut Context<Self>,
-    ) -> (AnyElement, f32) {
+    ) -> AnyElement {
         let id = &group.subagent_id;
         let split: SharedString = format!("details-workflow-{id}").into();
         let expanded = self.lineage.open_workflows.contains(id);
@@ -1620,24 +1615,20 @@ impl Workspace {
             .children(stop)
             .child(div().w(px(1.)).h(px(16.)).flex_none().group_hover(split, move |style| style.bg(line)))
             .child(chevron);
-        let mut height = ROW_HEIGHT;
         let mut list = v_flex().pl(px(26.));
         if expanded {
             let now = crate::timestamp::now_ms();
             for phase in &group.phases {
                 let open = lineage::phase_is_open(&self.lineage, id, phase);
                 list = list.child(phase_header(id, phase, open, now, tokens, colors, cx));
-                height += ROW_HEIGHT;
                 if open {
                     for member in &phase.members {
                         list = list.child(workflow_member_row(id, member, &group.driver, now, tokens, colors, cx));
-                        height += ROW_HEIGHT;
                     }
                 }
             }
             for member in &group.unphased {
                 list = list.child(workflow_member_row(id, member, &group.driver, now, tokens, colors, cx));
-                height += ROW_HEIGHT;
             }
             if group.phases.is_empty() && group.unphased.is_empty() {
                 list = list.child(
@@ -1650,10 +1641,9 @@ impl Workspace {
                         .text_color(tokens.muted_foreground.opacity(0.7))
                         .child("No agents yet"),
                 );
-                height += NO_AGENTS_HEIGHT;
             }
         }
-        (v_flex().child(head).when(expanded, |el| el.child(list)).into_any_element(), height)
+        v_flex().child(head).when(expanded, |el| el.child(list)).into_any_element()
     }
 
     /// One related thread; a running subagent's row shows Stop on hover.
@@ -2556,6 +2546,18 @@ mod tests {
         assert_eq!(resolve_density(400., 300., 200.), Density::Full);
         assert_eq!(resolve_density(250., 300., 200.), Density::Compact);
         assert_eq!(resolve_density(150., 300., 200.), Density::Essential);
+    }
+
+    #[test]
+    fn scrolling_lineage_and_side_chats_do_not_count_toward_density() {
+        let section = |height| Some(Section { element: div().into_any_element(), height, min_density: Density::Full });
+        let mut sections: [Option<Section>; 8] = Default::default();
+        sections[0] = section(100.);
+        sections[LINEAGE_SLOT] = section(1000.);
+        sections[SIDE_CHATS_SLOT] = section(1000.);
+        let full = fitting_height(&sections, Density::Full);
+        assert_eq!(full, 100. + SECTION_PADDING + 2.);
+        assert_eq!(resolve_density(200., full, fitting_height(&sections, Density::Compact)), Density::Full);
     }
 
     #[test]
