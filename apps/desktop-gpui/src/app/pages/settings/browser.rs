@@ -1,7 +1,6 @@
 //! Settings › Browser (`BrowserSettingsPanel` in `apps/web/src/components/settings/IntegrationsSettings.tsx`).
 //!
-//! Left out until this client has what they configure: the recordings' key and mouse press
-//! overlays (it doesn't record its own tabs) and importing cookies from other browsers.
+//! Left out until this client has what it configures: importing cookies from other browsers.
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -119,7 +118,19 @@ impl Workspace {
             .description("Maximum recording rate. 30 fps saves CPU and storage; 60 fps is smoother.")
             .setting("browserRecordingFrameRate")
             .control(rate_select);
-        let recordings = [self.setting_row(view, frame_rate, window, cx)];
+        let key_presses = SettingRow::new("browser-recording-key-presses")
+            .description("Show pressed keys and shortcuts in new recordings. Password fields are excluded.")
+            .setting("browserRecordingShowKeyPresses")
+            .switch();
+        let mouse_presses = SettingRow::new("browser-recording-mouse-presses")
+            .description("Highlight mouse presses and held buttons in new recordings.")
+            .setting("browserRecordingShowMousePresses")
+            .switch();
+        let recordings = [
+            self.setting_row(view, frame_rate, window, cx),
+            self.setting_row(view, key_presses, window, cx),
+            self.setting_row(view, mouse_presses, window, cx),
+        ];
 
         let sections = [
             settings_section("browser-agent-access", "Agent access", [agent_access], &t),
