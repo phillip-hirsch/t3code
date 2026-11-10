@@ -210,11 +210,10 @@ impl Workspace {
     /// The markdown source a message parses: its `$skill` tokens and the `model:` references
     /// this environment knows become chip links.
     pub(super) fn with_skill_links(&self, text: &str) -> String {
-        let skills = text.contains(|c: char| crate::composer_text::is_currency(c));
-        if !skills && !text.contains("model:") {
+        if !may_hold_chips(text) {
             return text.to_owned();
         }
-        let skills = if skills { self.markdown_skills() } else { Vec::new() };
+        let skills = if text.contains(crate::composer_text::is_currency) { self.markdown_skills() } else { Vec::new() };
         skill_links(text, &skills, |instance_id, model| {
             self.model_mention(instance_id, model).map(|m| (m.label, m.driver))
         })
@@ -487,6 +486,11 @@ fn opens_in_browser_by_default(path: &str) -> bool {
 /// `resolveExternalWebLink`: only http(s) links get the menu.
 fn is_web_link(url: &str) -> bool {
     url.starts_with("https://") || url.starts_with("http://") || url.starts_with("//")
+}
+
+/// Whether `text` can name a skill or model chip at all.
+pub(super) fn may_hold_chips(text: &str) -> bool {
+    text.contains(crate::composer_text::is_currency) || text.contains("model:")
 }
 
 /// `matchInlineSkills` over prose: each `$name` of a known skill, outside code, becomes

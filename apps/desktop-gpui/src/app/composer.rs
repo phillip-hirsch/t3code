@@ -229,6 +229,14 @@ impl Workspace {
         self.sync_composer_marks(cx);
     }
 
+    /// The skills or models chips resolve against may have changed: the composer's chips and
+    /// the messages that name one catch up.
+    pub(super) fn chip_lists_changed(&mut self, cx: &mut Context<Self>) {
+        self.reconcile_composer_chips(cx);
+        self.markdown.chips_changed();
+        cx.notify();
+    }
+
     /// Brings the composer's skill and model chips in line with the lists it knows once they load
     /// or change (`skillChipReplacements`), outside the undo history and keeping the selection.
     pub(super) fn reconcile_composer_chips(&mut self, cx: &mut Context<Self>) {

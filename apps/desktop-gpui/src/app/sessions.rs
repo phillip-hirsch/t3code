@@ -282,7 +282,7 @@ impl Workspace {
                 this.notify_sidebar(cx);
                 // Skills arrive with provider updates.
                 this.refresh_menu_items(cx);
-                this.reconcile_composer_chips(cx);
+                this.chip_lists_changed(cx);
             },
         );
         let mut streams = vec![

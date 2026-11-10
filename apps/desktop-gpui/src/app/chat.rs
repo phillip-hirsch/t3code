@@ -130,14 +130,22 @@ impl Workspace {
         text: &SharedString,
         cx: &mut Context<Self>,
     ) -> Entity<TextViewState> {
-        if let Some(state) = self.markdown.0.get(&key).filter(|state| state.text == *text) {
-            return state.view.clone();
+        let chips = self.markdown.1;
+        let cached = self.markdown.0.get(&key).map(|state| (&*state.text, state.chips));
+        let reuse = markdown_reuse(cached, text, chips);
+        if reuse == Reuse::Keep {
+            return self.markdown.0[&key].view.clone();
         }
         let source = self.with_skill_links(text);
+        let source_hash = hash_source(&source);
         self.load_markdown_images(&key, &source, cx);
         if let Some(state) = self.markdown.0.get_mut(&key) {
-            state.text = text.clone();
-            state.view.update(cx, |view, cx| view.set_text(&source, cx));
+            state.chips = chips;
+            if reuse == Reuse::Rebuild || state.source_hash != source_hash {
+                state.text = text.clone();
+                state.source_hash = source_hash;
+                state.view.update(cx, |view, cx| view.set_text(&source, cx));
+            }
             return state.view.clone();
         }
         let view = cx.new(|cx| TextViewState::markdown(&source, cx));
@@ -153,9 +161,9 @@ impl Workspace {
             }
             this.paint_find(&row_key, cx);
         });
-        self.markdown
-            .0
-            .insert(key.clone(), MarkdownState { view: view.clone(), text: text.clone(), nowrap: false, _changed });
+        let state =
+            MarkdownState { view: view.clone(), text: text.clone(), source_hash, chips, nowrap: false, _changed };
+        self.markdown.0.insert(key.clone(), state);
         self.paint_find(&key, cx);
         view
     }
@@ -220,15 +228,53 @@ impl Workspace {
 /// screen reported a near-empty height that the list kept: the scroll extent
 /// came up short, the tail never resumed and "Scroll to end" stuck. Owned, a
 /// parse survives scrolling, and a landed parse remeasures its row.
+///
+/// The second field counts changes to the skills and models chips resolve against, so a
+/// message that names one rebuilds once they change and other messages stay parsed.
 #[derive(Default)]
-pub(super) struct MarkdownStates(HashMap<SharedString, MarkdownState>);
+pub(super) struct MarkdownStates(HashMap<SharedString, MarkdownState>, u64);
+
+impl MarkdownStates {
+    pub(super) fn chips_changed(&mut self) {
+        self.1 = self.1.wrapping_add(1);
+    }
+}
 
 struct MarkdownState {
     view: Entity<TextViewState>,
     text: SharedString,
+    /// The chip-linked source it parsed, hashed.
+    source_hash: u64,
+    /// [`MarkdownStates`]' chip count when it parsed.
+    chips: u64,
     /// The code-block wrap toggle is off (`wordWrap` defaults on).
     nowrap: bool,
     _changed: Subscription,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Reuse {
+    Keep,
+    /// The chip lists changed under text that can name a skill or model.
+    Recheck,
+    Rebuild,
+}
+
+/// What a cached message's markdown needs before it shows `text` with chip count `chips`.
+fn markdown_reuse(cached: Option<(&str, u64)>, text: &str, chips: u64) -> Reuse {
+    match cached {
+        Some((cached, _)) if cached != text => Reuse::Rebuild,
+        None => Reuse::Rebuild,
+        Some((_, seen)) if seen != chips && super::markdown_ui::may_hold_chips(text) => Reuse::Recheck,
+        Some(_) => Reuse::Keep,
+    }
+}
+
+fn hash_source(source: &str) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    source.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// The key a row's markdown is cached under: its message id, or `thought:{entry}`.
@@ -2835,6 +2881,18 @@ fn detail_entry(detail: &DetailEntry, this: &WeakEntity<Workspace>, t: &Tokens, 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_messages_that_can_name_a_chip_recheck_when_the_lists_change() {
+        use super::{Reuse, markdown_reuse};
+        let mention = "Try model:codex/gpt-6.1 next";
+        assert_eq!(markdown_reuse(None, mention, 0), Reuse::Rebuild);
+        assert_eq!(markdown_reuse(Some((mention, 0)), mention, 0), Reuse::Keep);
+        assert_eq!(markdown_reuse(Some((mention, 0)), mention, 1), Reuse::Recheck, "models arrived");
+        assert_eq!(markdown_reuse(Some(("Use $design", 0)), "Use $design", 1), Reuse::Recheck);
+        assert_eq!(markdown_reuse(Some(("plain", 0)), "plain", 1), Reuse::Keep, "nothing to chip");
+        assert_eq!(markdown_reuse(Some(("plain", 1)), "plain more", 1), Reuse::Rebuild);
+    }
+
     use super::*;
 
     #[test]
