@@ -84,6 +84,7 @@ pub(super) enum PermissionsForm {
 /// The draft's workspace: what the controls picked and what they read.
 #[derive(Default)]
 pub(super) struct DraftWorkspaceState {
+    env: Option<SharedString>,
     project_id: Option<String>,
     /// The draft the picks belong to; another draft of the project starts without them.
     draft: Option<super::draft_sessions::DraftId>,
@@ -178,17 +179,26 @@ const NEXT_PAGE_DISTANCE: f32 = 96.;
 impl Workspace {
     /// Loads the draft's default workspace mode and refs when the draft or its project changes.
     pub(super) fn sync_draft_workspace(&mut self, cx: &mut Context<Self>) {
-        let Some(Target::Draft { project_id, draft, .. }) = self.target.clone() else { return };
+        let Some(Target::Draft { env, project_id, draft }) = self.target.clone() else { return };
         let state = &self.draft_workspace;
-        if state.project_id.as_ref() == Some(&project_id) && state.draft.as_ref() == Some(&draft) {
+        if state.env.as_ref() == Some(&env)
+            && state.project_id.as_ref() == Some(&project_id)
+            && state.draft.as_ref() == Some(&draft)
+        {
             return;
         }
-        // Reset first, so nothing from the previous draft survives; send.rs resolves the
-        // workspace itself when this never loads.
-        self.draft_workspace =
-            DraftWorkspaceState { project_id: Some(project_id.clone()), draft: Some(draft), ..Default::default() };
-        let (Some(client), Some(project)) = (self.client(), self.shell.projects.iter().find(|p| p.id == project_id))
-        else {
+        // Reset first, so nothing from the previous draft survives but the picks this draft made;
+        // send.rs resolves the workspace itself when this never loads.
+        self.stash_draft_workspace();
+        self.draft_workspace = DraftWorkspaceState {
+            env: Some(env.clone()),
+            project_id: Some(project_id.clone()),
+            choice: self.drafts.workspace(&draft),
+            draft: Some(draft.clone()),
+            ..Default::default()
+        };
+        let key = crate::model::ScopedId::new(env.clone(), project_id.as_str());
+        let (Some(client), Some(project)) = (self.env_client(&env), self.shell.project(&key)) else {
             return;
         };
         let has_threads = self.shell.project_has_threads(project);
@@ -199,7 +209,11 @@ impl Workspace {
             let mode = workspace.default_mode(&client).await;
             let refs = new_thread::list_refs(&client, &cwd).await;
             let _ = this.update(cx, |this, cx| {
-                if this.draft_workspace.project_id.as_ref() != Some(&project_id) {
+                let state = &this.draft_workspace;
+                if state.env.as_ref() != Some(&env)
+                    || state.project_id.as_ref() != Some(&project_id)
+                    || state.draft.as_ref() != Some(&draft)
+                {
                     return;
                 }
                 this.draft_workspace.default_mode = Some(mode);
@@ -210,6 +224,16 @@ impl Workspace {
                 cx.notify();
             });
         }));
+    }
+
+    /// Hands the open draft's workspace picks to its session, which keeps and saves them.
+    pub(super) fn stash_draft_workspace(&mut self) {
+        let state = &self.draft_workspace;
+        let (Some(env), Some(project_id), Some(draft)) = (&state.env, &state.project_id, &state.draft) else {
+            return;
+        };
+        let project = crate::model::ScopedId::new(env.clone(), project_id.as_str());
+        self.drafts.set_workspace(draft, &project, state.choice.clone());
     }
 
     /// The branch picker's combobox keys: Escape closes it, Up and Down highlight, Enter picks.

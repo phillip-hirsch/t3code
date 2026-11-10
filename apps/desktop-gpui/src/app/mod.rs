@@ -1131,7 +1131,7 @@ impl Workspace {
         if listed && self.drafts.is_live(draft) {
             self.open_draft(target, window, cx);
         } else {
-            self.start_draft(project_id.clone(), window, cx);
+            self.start_draft_in(env.clone(), project_id.clone(), window, cx);
         }
     }
 

@@ -461,6 +461,7 @@ impl Workspace {
     /// The save for the drafts as they stand, unless the last one already holds them.
     fn next_draft_save(&mut self, cx: &App) -> Option<Write> {
         let dir = self.draft_store.dir.clone()?;
+        self.stash_draft_workspace();
         let (file, blobs) = self.draft_snapshot(cx);
         let document = serde_json::to_value(&file).inspect_err(|e| log::warn!("composer drafts: {e}")).ok()?;
         if self.draft_store.latest.as_ref().is_some_and(|latest| latest.document == document) {

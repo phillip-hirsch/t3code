@@ -14,7 +14,8 @@ use crate::rpc::RpcClient;
 /// `VCS_REF_LIST_LIMIT` in `apps/web/src/state/queries.ts`.
 const REF_LIST_LIMIT: u32 = 100;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum EnvMode {
     Local,
     Worktree,
@@ -140,7 +141,8 @@ pub fn sanitize_new_ref_name(raw: &str) -> String {
 }
 
 /// What the draft's workspace controls picked.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct WorkspaceChoice {
     pub mode: Option<EnvMode>,
     /// Worktree mode: the base branch. Local mode: the branch switched to.
