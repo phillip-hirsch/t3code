@@ -334,14 +334,54 @@ fn decode_entities(value: &str) -> String {
     value.replace("&quot;", "\"").replace("&#39;", "'").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
 }
 
+/// `isWindowsAbsolutePath`: a UNC share, or a drive (`C:`, `C:\`, `C:/`).
 fn is_windows_absolute(path: &str) -> bool {
     let bytes = path.as_bytes();
-    bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'\\' | b'/')
+    path.starts_with("\\\\")
+        || (bytes.len() > 1
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes.get(2).is_none_or(|b| matches!(b, b'\\' | b'/')))
+}
+
+/// `stripSlashPrefixedWindowsDrive`: a file URL writes `C:/x` as `/C:/x`.
+fn strip_slash_drive(path: String) -> String {
+    let bytes = path.as_bytes();
+    let prefixed = bytes.len() > 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':';
+    if prefixed && matches!(bytes[3], b'\\' | b'/') { path[1..].to_owned() } else { path }
+}
+
+/// `parseFileUrlHref`'s path: another host than this one names a UNC share.
+fn file_url_path(href: &str) -> Option<String> {
+    let url = url::Url::parse(href).ok()?;
+    let path = match url.host_str().filter(|host| !host.is_empty() && !host.eq_ignore_ascii_case("localhost")) {
+        Some(host) => format!("\\\\{host}{}", url.path().replace('/', "\\")),
+        None => url.path().to_owned(),
+    };
+    (!path.is_empty()).then_some(path)
+}
+
+/// `markdownDestinationHostPath`: the percent-decoded path a destination names on the host, or
+/// `None` for a `file:` URL that does not parse.
+fn host_path(source: &str, file_url: bool) -> Option<String> {
+    let path =
+        if file_url { file_url_path(source)? } else { source.split(['?', '#']).next().unwrap_or_default().to_owned() };
+    let decoded = crate::thread_links::decode_uri_component(&path).unwrap_or(path);
+    Some(strip_slash_drive(decoded))
+}
+
+/// `hostFileSource`: rendering is not a click, so a network path loads only from the project's own share.
+fn host_file(path: String, workspace_root: Option<&str>) -> Source {
+    let network = path.len() > 1 && path.as_bytes()[..2].iter().all(|b| matches!(b, b'\\' | b'/'));
+    let inside =
+        || workspace_root.is_some_and(|root| super::context_strip::workspace_relative_file_path(&path, root).is_some());
+    if network && !inside() { Source::Blocked } else { Source::WorkspaceFile(path) }
 }
 
 /// `classifyMarkdownImageSource`, plus decoding data URLs for the native view.
 pub(super) fn classify(destination: &str, workspace_root: Option<&str>) -> Source {
-    let source = destination.trim();
+    let trimmed = destination.trim();
+    let source = trimmed.strip_prefix('<').and_then(|rest| rest.strip_suffix('>')).unwrap_or(trimmed);
     if source.is_empty() || source.starts_with('#') || source.starts_with('?') {
         return Source::Blocked;
     }
@@ -355,25 +395,22 @@ pub(super) fn classify(destination: &str, workspace_root: Option<&str>) -> Sourc
     if lower.starts_with("data:") {
         return data_url(source).map_or(Source::Blocked, |(format, bytes)| Source::Data(format, bytes));
     }
-    let path = source.strip_prefix("file://").unwrap_or(source);
-    let path = path.split(['?', '#']).next().unwrap_or_default();
-    // A network share loads only from inside the project's own.
-    if path.starts_with("\\\\") || path.starts_with("//") {
-        return match workspace_root {
-            Some(root) if path.strip_prefix(root).is_some_and(|rest| rest.starts_with(['\\', '/'])) => {
-                Source::WorkspaceFile(path.to_owned())
-            }
-            _ => Source::Blocked,
-        };
+    let file_url = lower.starts_with("file:");
+    let Some(path) = host_path(source, file_url) else { return Source::Blocked };
+    if file_url {
+        return host_file(path, workspace_root);
     }
-    if path.starts_with('/') || is_windows_absolute(path) {
-        let path = if lower.starts_with("file:///") && is_windows_absolute(&path[1..]) { &path[1..] } else { path };
-        return Source::WorkspaceFile(path.to_owned());
+    if path.is_empty() {
+        return Source::Blocked;
     }
-    let has_scheme = path.find(':').is_some_and(|colon| {
-        colon > 0 && path[..colon].chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
+    if path.starts_with('/') || is_windows_absolute(&path) {
+        return host_file(path, workspace_root);
+    }
+    let has_scheme = path.split_once(':').is_some_and(|(scheme, _)| {
+        scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
     });
-    if has_scheme || path.starts_with("~/") || path.starts_with("~\\") || path.is_empty() {
+    if has_scheme || path.starts_with("~/") || path.starts_with("~\\") {
         return Source::Blocked;
     }
     let Some(root) = workspace_root else { return Source::Blocked };
@@ -836,6 +873,38 @@ mod tests {
         let share = Some(r"\\srv\proj");
         assert_eq!(classify(r"\\srv\proj\a.png", share), Source::WorkspaceFile(r"\\srv\proj\a.png".into()));
         assert_eq!(classify(r"\\srv\proj-secrets\a.png", share), Source::Blocked);
+        assert_eq!(classify(r"\\srv\proj\..\secrets\a.png", share), Source::Blocked);
+        assert_eq!(classify("docs/a.png", share), Source::WorkspaceFile(r"\\srv\proj\docs\a.png".into()));
+        assert_eq!(
+            classify("file:///workspace/project/image%20one.png", None),
+            Source::WorkspaceFile("/workspace/project/image one.png".into())
+        );
+        assert_eq!(
+            classify("docs/plot%20one.png", Some("/repo")),
+            Source::WorkspaceFile("/repo/docs/plot one.png".into())
+        );
+        assert_eq!(classify("/repo/100%.png", None), Source::WorkspaceFile("/repo/100%.png".into()));
+        assert_eq!(classify("file:///C:/repo/a%20b.png", None), Source::WorkspaceFile("C:/repo/a b.png".into()));
+        assert_eq!(classify("/C:/repo/a.png", None), Source::WorkspaceFile("C:/repo/a.png".into()));
+        assert_eq!(classify("<docs/a b.png>", Some("/repo")), Source::WorkspaceFile("/repo/docs/a b.png".into()));
+        assert_eq!(
+            classify("file://server/share/image.png", Some(r"\\server\share")),
+            Source::WorkspaceFile(r"\\server\share\image.png".into())
+        );
+        assert_eq!(classify("image.png", None), Source::Blocked);
+        assert_eq!(classify("file://%", None), Source::Blocked);
+        // Loading these makes Windows send the user's NTLM credentials to the named host.
+        let project = Some(r"\\server\share\project");
+        for source in [
+            "file://attacker.test/share/cat.jpg",
+            r"\\attacker.test\share\cat.jpg",
+            r"/\attacker.test\share\cat.jpg",
+            "file:/%5Cattacker.test%5Cshare%5Ccat.jpg",
+            "/%5C%5Cattacker.test/share/cat.jpg",
+            r"\\server\other\cat.jpg",
+        ] {
+            assert_eq!(classify(source, project), Source::Blocked, "{source}");
+        }
         assert_eq!(
             classify("data:image/png;base64,iVBO", None),
             Source::Data(ImageFormat::Png, vec![0x89, 0x50, 0x4e])
