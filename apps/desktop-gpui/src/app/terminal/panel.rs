@@ -9,23 +9,61 @@ use gpui_kit::{
     div, px,
 };
 
-use super::Workspace;
 use super::layout::{self, Split};
+use super::{DrawerKey, Workspace};
 use crate::app::right_panel::Surface;
 use crate::theme;
 
 #[derive(Clone, Debug)]
-pub(in crate::app) struct PanelGroup {
-    pub thread_id: String,
+pub(super) struct PanelGroup {
+    /// The thread on its environment: same-id threads on two environments have their own tabs.
+    pub key: DrawerKey,
     pub terminal_ids: Vec<String>,
     pub active: String,
     pub split: Split,
 }
 
 impl super::Terminals {
-    /// Every panel tab's terminal ids for `thread_id`.
-    pub(super) fn panel_ids(&self, thread_id: &str) -> Vec<String> {
-        self.panel.values().filter(|g| g.thread_id == thread_id).flat_map(|g| g.terminal_ids.clone()).collect()
+    /// Every panel tab's terminal ids for `key`'s thread.
+    pub(super) fn panel_ids(&self, key: &DrawerKey) -> Vec<String> {
+        self.panel.values().filter(|g| g.key == *key).flat_map(|g| g.terminal_ids.clone()).collect()
+    }
+
+    /// Makes `terminal_id` active in `key`'s tab holding it; whether a tab changed.
+    pub(super) fn activate_in_panel(&mut self, key: &DrawerKey, terminal_id: &str) -> bool {
+        let mut changed = false;
+        for group in self.panel.values_mut().filter(|g| g.key == *key) {
+            if group.terminal_ids.iter().any(|id| id == terminal_id) && group.active != terminal_id {
+                group.active = terminal_id.to_owned();
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Drops a closed terminal from `key`'s tabs, handing a shown tab's focus on. Returns the tabs
+    /// it emptied, which are removed.
+    pub(super) fn remove_from_panel(&mut self, key: &DrawerKey, terminal_id: &str, shown: bool) -> Vec<String> {
+        let mut emptied = Vec::new();
+        for (surface, group) in self.panel.iter_mut().filter(|(_, g)| g.key == *key) {
+            let Some(index) = group.terminal_ids.iter().position(|id| id == terminal_id) else { continue };
+            group.terminal_ids.remove(index);
+            match group.terminal_ids.get(index.min(group.terminal_ids.len().saturating_sub(1))) {
+                Some(next) => {
+                    if group.active == terminal_id {
+                        group.active = next.clone();
+                    }
+                    if shown {
+                        self.focus_pending = Some((key.clone(), group.active.clone()));
+                    }
+                }
+                None => emptied.push(surface.clone()),
+            }
+        }
+        for surface in &emptied {
+            self.panel.remove(surface);
+        }
+        emptied
     }
 }
 
@@ -37,9 +75,9 @@ impl Workspace {
     }
 
     /// The terminals the shown panel tab mounts.
-    pub(super) fn shown_panel_terminals(&self, thread_id: &str) -> Vec<String> {
+    pub(super) fn shown_panel_terminals(&self, key: &DrawerKey) -> Vec<String> {
         self.active_panel_group()
-            .filter(|(_, g)| g.thread_id == thread_id)
+            .filter(|(_, g)| g.key == *key)
             .map(|(_, g)| g.terminal_ids.clone())
             .unwrap_or_default()
     }
@@ -47,7 +85,9 @@ impl Workspace {
     /// The panel tab and terminal holding keyboard focus: terminal commands act there instead of
     /// on the drawer, as the web routes them by focus owner.
     fn focused_panel_terminal(&self, window: &Window, cx: &Context<Self>) -> Option<(String, String)> {
-        self.terminals.panel.iter().find_map(|(surface, group)| {
+        // The mounted panes are the shown thread's; a same-id thread's tab may reuse their ids.
+        let shown = self.shown_drawer_key()?;
+        self.terminals.panel.iter().filter(|(_, group)| group.key == shown).find_map(|(surface, group)| {
             group.terminal_ids.iter().find_map(|id| {
                 let pane = self.terminals.panes.get(id)?;
                 pane.session.read(cx).focus.is_focused(window).then(|| (surface.clone(), id.clone()))
@@ -80,29 +120,30 @@ impl Workspace {
         if self.terminal_client(&thread_id).is_none() || !self.terminal_operable(&thread_id) {
             return;
         }
-        let terminal_id = self.next_terminal_id(&thread_id);
+        let key = self.drawer_key(&thread_id);
+        let terminal_id = self.next_terminal_id(&key);
         let surface = format!("terminal-{}", super::super::new_id());
         let group = PanelGroup {
-            thread_id: thread_id.clone(),
+            key: key.clone(),
             terminal_ids: vec![terminal_id.clone()],
             active: terminal_id.clone(),
             split: Split::Horizontal,
         };
         self.terminals.panel.insert(surface.clone(), group);
         self.open_surface(Surface::Terminal(surface), window, cx);
-        self.open_terminal_session(thread_id, terminal_id, launch, None, cx).detach();
+        self.open_terminal_session(key, terminal_id, launch, None, cx).detach();
     }
 
     /// `splitPanelTerminal`: another terminal in the tab's group, up to four.
     pub(super) fn split_panel_terminal(&mut self, surface: &str, split: Split, _: &mut Window, cx: &mut Context<Self>) {
         let Some(launch) = self.terminal_launch() else { return };
-        let Some(thread_id) = self.terminals.panel.get(surface).map(|g| g.thread_id.clone()) else { return };
-        if !self.terminal_operable(&thread_id)
+        let Some(key) = self.terminals.panel.get(surface).map(|g| g.key.clone()) else { return };
+        if !self.drawer_operable(&key)
             || self.terminals.panel.get(surface).is_some_and(|g| g.terminal_ids.len() >= layout::MAX_PER_GROUP)
         {
             return;
         }
-        let terminal_id = self.next_terminal_id(&thread_id);
+        let terminal_id = self.next_terminal_id(&key);
         if let Some(group) = self.terminals.panel.get_mut(surface) {
             let at = group
                 .terminal_ids
@@ -113,52 +154,30 @@ impl Workspace {
             group.active = terminal_id.clone();
             group.split = split;
         }
-        self.open_terminal_session(thread_id, terminal_id, launch, None, cx).detach();
+        self.open_terminal_session(key, terminal_id, launch, None, cx).detach();
         cx.notify();
     }
 
-    pub(super) fn activate_panel_terminal(&mut self, thread_id: &str, terminal_id: &str, cx: &mut Context<Self>) {
-        for group in self.terminals.panel.values_mut().filter(|g| g.thread_id == thread_id) {
-            if group.terminal_ids.iter().any(|id| id == terminal_id) && group.active != terminal_id {
-                group.active = terminal_id.to_owned();
-                cx.notify();
-            }
+    pub(super) fn activate_panel_terminal(&mut self, key: &DrawerKey, terminal_id: &str, cx: &mut Context<Self>) {
+        if self.terminals.activate_in_panel(key, terminal_id) {
+            cx.notify();
         }
     }
 
     /// Drops a closed terminal from its tab; the tab closes with its last terminal.
-    pub(super) fn close_panel_terminal(&mut self, key: &super::DrawerKey, terminal_id: &str) {
-        let thread_id = key.thread_id.as_str();
-        let shown = self.shown_terminal_thread() == Some(thread_id);
-        let mut emptied = Vec::new();
-        for (surface, group) in self.terminals.panel.iter_mut().filter(|(_, g)| g.thread_id == thread_id) {
-            let Some(index) = group.terminal_ids.iter().position(|id| id == terminal_id) else { continue };
-            group.terminal_ids.remove(index);
-            match group.terminal_ids.get(index.min(group.terminal_ids.len().saturating_sub(1))) {
-                Some(next) => {
-                    if group.active == terminal_id {
-                        group.active = next.clone();
-                    }
-                    if shown {
-                        self.terminals.focus_pending = Some((thread_id.to_owned(), group.active.clone()));
-                    }
-                }
-                None => emptied.push(surface.clone()),
-            }
-        }
-        let target = self.drawer_target(key);
+    pub(super) fn close_panel_terminal(&mut self, key: &DrawerKey, terminal_id: &str) {
+        let shown = self.shown_drawer_key().as_ref() == Some(key);
+        let emptied = self.terminals.remove_from_panel(key, terminal_id, shown);
+        let Some(target) = self.drawer_target(key) else { return };
         for surface in emptied {
-            self.terminals.panel.remove(&surface);
-            if let Some(target) = &target {
-                self.drop_surface(target, &Surface::Terminal(surface));
-            }
+            self.drop_surface(&target, &Surface::Terminal(surface));
         }
     }
 
     /// The tab's label: its active terminal's.
     pub(in crate::app) fn terminal_surface_title(&self, surface: &str) -> SharedString {
         match self.terminals.panel.get(surface) {
-            Some(group) => self.terminals.label(&group.thread_id, &group.active).into(),
+            Some(group) => self.terminals.label(&group.key.thread_id, &group.active).into(),
             None => "Terminal".into(),
         }
     }
@@ -180,18 +199,18 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let group = self.terminals.panel.get(&surface).cloned();
-        let Some(group) = group.filter(|group| self.terminal_operable(&group.thread_id)) else {
+        let Some(group) = group.filter(|group| self.drawer_operable(&group.key)) else {
             self.drop_terminal_surface(surface);
             cx.notify();
             return;
         };
-        let mut labels: Vec<String> = vec![self.terminals.label(&group.thread_id, &group.active)];
+        let mut labels: Vec<String> = vec![self.terminals.label(&group.key.thread_id, &group.active)];
         labels.extend(
             group
                 .terminal_ids
                 .iter()
                 .filter(|id| **id != group.active)
-                .map(|id| self.terminals.label(&group.thread_id, id)),
+                .map(|id| self.terminals.label(&group.key.thread_id, id)),
         );
         let (title, description) = if labels.len() == 1 {
             (
@@ -205,7 +224,7 @@ impl Workspace {
                 format!("This stops their running processes and clears their histories: {}.", quoted.join(", ")),
             )
         };
-        let key = self.drawer_key(&group.thread_id);
+        let key = group.key.clone();
         let workspace = cx.weak_entity();
         window.open_alert_dialog(cx, move |alert, _, _| {
             let (workspace, group, surface, key) = (workspace.clone(), group.clone(), surface.clone(), key.clone());
@@ -256,7 +275,7 @@ impl Workspace {
         let panes = self.render_pane_group(&group.terminal_ids, &group.active, group.split == Split::Vertical, &tokens);
         let side = if has_sidebar {
             let sidebar = super::SidebarModel {
-                thread_id: &group.thread_id,
+                key: &group.key,
                 groups: vec![(surface, group.terminal_ids.as_slice(), group.split)],
                 active: &group.active,
                 limit,
