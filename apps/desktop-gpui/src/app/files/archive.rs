@@ -519,56 +519,54 @@ fn archive_row(
 ) -> AnyElement {
     let muted = tokens.muted_foreground;
     let (click_key, click) = (key.clone(), child.clone());
-    h_flex()
-        .id(ElementId::Name(format!("archive-row:{}:{}", child.path, child.directory).into()))
-        .h(px(ROW_HEIGHT))
-        .w_full()
-        .text_xs()
-        .border_b_1()
-        .border_color(tokens.border.opacity(0.6))
-        .cursor_pointer()
-        .hover(|s| s.bg(tokens.muted.opacity(0.4)))
-        .on_click(cx.listener(move |this, _, window, cx| {
-            if click.directory {
-                if let Some(archive) = this.archive_mut(&click_key) {
-                    archive.set_folder(format!("{}/", click.path));
-                }
-                cx.notify();
-            } else {
-                this.open_archive_entry(&click_key, click.path.clone(), window, cx);
+    crate::app::chat::focusable(
+        h_flex().id(ElementId::Name(format!("archive-row:{}:{}", child.path, child.directory).into())),
+        tokens,
+    )
+    .h(px(ROW_HEIGHT))
+    .w_full()
+    .text_xs()
+    .border_b_1()
+    .border_color(tokens.border.opacity(0.6))
+    .cursor_pointer()
+    .hover(|s| s.bg(tokens.muted.opacity(0.4)))
+    .on_click(cx.listener(move |this, _, window, cx| {
+        if click.directory {
+            if let Some(archive) = this.archive_mut(&click_key) {
+                archive.set_folder(format!("{}/", click.path));
             }
-        }))
-        .child(
-            h_flex()
-                .flex_1()
-                .min_w_0()
-                .gap(px(8.))
-                .px(px(12.))
-                .child(
-                    Icon::new(if child.directory { IconName::Folder } else { IconName::File })
-                        .size(px(16.))
-                        .flex_none()
-                        .text_color(muted),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .child(child.path[folder.len().min(child.path.len())..].to_owned()),
-                ),
-        )
-        .child(div().w(px(80.)).flex_none().px(px(12.)).text_right().text_color(muted).child(format_size(child.size)))
-        .child(
-            div()
-                .w(px(112.))
-                .flex_none()
-                .px(px(12.))
-                .text_right()
-                .text_color(muted)
-                .child(child.modified.clone().unwrap_or_else(|| "-".into())),
-        )
-        .into_any_element()
+            cx.notify();
+        } else {
+            this.open_archive_entry(&click_key, click.path.clone(), window, cx);
+        }
+    }))
+    .child(
+        h_flex()
+            .flex_1()
+            .min_w_0()
+            .gap(px(8.))
+            .px(px(12.))
+            .child(
+                Icon::new(if child.directory { IconName::Folder } else { IconName::File })
+                    .size(px(16.))
+                    .flex_none()
+                    .text_color(muted),
+            )
+            .child(
+                div().flex_1().min_w_0().truncate().child(child.path[folder.len().min(child.path.len())..].to_owned()),
+            ),
+    )
+    .child(div().w(px(80.)).flex_none().px(px(12.)).text_right().text_color(muted).child(format_size(child.size)))
+    .child(
+        div()
+            .w(px(112.))
+            .flex_none()
+            .px(px(12.))
+            .text_right()
+            .text_color(muted)
+            .child(child.modified.clone().unwrap_or_else(|| "-".into())),
+    )
+    .into_any_element()
 }
 
 #[cfg(test)]

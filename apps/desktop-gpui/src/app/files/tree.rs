@@ -603,8 +603,7 @@ impl Workspace {
             .bg(tokens.background)
             .child(subheader)
             .children(error.map(|error| {
-                div()
-                    .id("files-error")
+                crate::app::chat::focusable(div().id("files-error"), &tokens)
                     .p(px(16.))
                     .text_xs()
                     .line_height(gpui_kit::relative(1.625))
