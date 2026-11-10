@@ -274,6 +274,18 @@ impl Terminals {
         }
     }
 
+    /// Drops a closed terminal from `key`'s drawer. Only a shown drawer that held it hands focus
+    /// on, as the web's `visible` guard does; a panel tab's close focuses within its tab.
+    fn close_in_drawer(&mut self, key: &DrawerKey, terminal_id: &str, shown: bool) {
+        let Some(drawer) = self.drawer_mut(key) else { return };
+        let held = drawer.terminal_ids.iter().any(|id| id == terminal_id);
+        drawer.close(terminal_id);
+        if drawer.open && shown && held {
+            let active = drawer.active_id.clone();
+            self.focus_later(key, &active);
+        }
+    }
+
     /// Drops `key`'s drawer only: another environment's and an unadopted legacy one stay.
     fn remove_drawer(&mut self, key: &DrawerKey) -> bool {
         if self.drawers.remove(key).is_none() {
@@ -790,15 +802,8 @@ impl Workspace {
     fn close_terminal(&mut self, key: &DrawerKey, terminal_id: &str, cx: &mut Context<Self>) {
         let thread_id = key.thread_id.as_str();
         self.close_panel_terminal(key, terminal_id);
-        // Only a shown drawer hands focus on, as the web's `visible` guard does.
         let shown = self.shown_drawer_key().as_ref() == Some(key);
-        if let Some(drawer) = self.terminals.drawer_mut(key) {
-            drawer.close(terminal_id);
-            if drawer.open && shown {
-                let active = drawer.active_id.clone();
-                self.terminals.focus_later(key, &active);
-            }
-        }
+        self.terminals.close_in_drawer(key, terminal_id, shown);
         if let Some(client) = self.drawer_client(key) {
             let (thread_id, terminal_id) = (thread_id.to_owned(), terminal_id.to_owned());
             cx.background_spawn(async move {
@@ -1840,5 +1845,22 @@ mod tests {
         assert!(terminals.panel.contains_key("b-tab"), "B's tab stays open");
         assert_eq!(terminals.panel["a-split"].terminal_ids, ["term-2"]);
         assert_eq!(terminals.take_focus(&a), None, "a hidden drawer's close moves no focus");
+    }
+
+    #[test]
+    fn closing_a_panel_terminal_keeps_focus_in_its_tab_over_an_open_drawer() {
+        let mut terminals = Terminals::default();
+        let key = DrawerKey::new("a", "t");
+        terminals.drawer(&key).place("term-1", Place::New);
+        terminals.panel.insert("tab".into(), panel_group("a", "t", &["term-2", "term-3"]));
+
+        terminals.remove_from_panel(&key, "term-3", true);
+        terminals.close_in_drawer(&key, "term-3", true);
+        assert_eq!(terminals.take_focus(&key).as_deref(), Some("term-2"), "the tab's sibling, not the drawer's shell");
+
+        terminals.drawer(&key).place("term-4", Place::Split(Split::Horizontal));
+        terminals.remove_from_panel(&key, "term-4", true);
+        terminals.close_in_drawer(&key, "term-4", true);
+        assert_eq!(terminals.take_focus(&key).as_deref(), Some("term-1"), "a drawer terminal hands focus on");
     }
 }
