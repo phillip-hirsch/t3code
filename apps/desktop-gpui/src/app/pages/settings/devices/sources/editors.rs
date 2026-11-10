@@ -785,7 +785,7 @@ impl EasEditor {
                 _ => {}
             }
         }));
-        let mut editor = Self {
+        let editor = Self {
             workspace,
             environments,
             check_on,
@@ -814,7 +814,8 @@ impl EasEditor {
         } else {
             json!({"hostId": editor.host.id})
         };
-        editor.run_check(input, window, cx);
+        // Deferred: the editor is built inside a Workspace update, and the check reads Workspace.
+        cx.defer_in(window, move |this, window, cx| this.run_check(input, window, cx));
         editor
     }
 
@@ -1195,7 +1196,7 @@ impl SimlockEditor {
             }));
             tokens.push(TokenField { seed, input, token, valid: true, generation: 0, identity: None });
         }
-        let mut editor = Self {
+        let editor = Self {
             workspace,
             environments,
             host,
@@ -1209,10 +1210,13 @@ impl SimlockEditor {
             busy: false,
             _subscriptions: subscriptions,
         };
-        if is_new {
-            editor.detect_gateway(window, cx);
-        }
-        editor.check_identities(window, cx);
+        // Deferred: the editor is built inside a Workspace update, and the checks read Workspace.
+        cx.defer_in(window, move |this, window, cx| {
+            if is_new {
+                this.detect_gateway(window, cx);
+            }
+            this.check_identities(window, cx);
+        });
         editor
     }
 
