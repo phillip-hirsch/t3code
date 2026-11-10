@@ -30,13 +30,15 @@ use serde_json::{Map, Value, json};
 
 use super::super::fields::textarea_body;
 use super::super::model_select::{generates_text, muted, resolve_text_generation};
+use super::super::providers::writing_providers;
 use super::super::widgets::{
     ROW_SELECT_MIN_WIDTH, SelectWidth, SettingRow, SettingsView, section_with_action, settings_section, switch,
 };
 use crate::app::Workspace;
 use crate::app::pages::settings::connections::logic::SETTINGS_WRITE;
-use crate::model::ModelSelection;
+use crate::model::{ModelSelection, Provider};
 use crate::rpc::RpcClient;
+use crate::settings::scope;
 use crate::theme::{Tokens, tokens};
 
 const MERGE_METHODS: &[(&str, &str)] =
@@ -118,6 +120,13 @@ const HOSTS: &[HostDefinition] = &[
                 revoke_url: "https://github.com/settings/apps/authorizations",
             }),
         }),
+        fields: &[],
+    },
+    HostDefinition {
+        kind: "cursor-origin",
+        label: "Cursor Origin",
+        icon: "icons/app/source-control/cursor-origin.svg",
+        credentials: None,
         fields: &[],
     },
     HostDefinition {
@@ -1840,25 +1849,52 @@ impl Workspace {
             },
         );
 
+        // The models resolve on the settings environment's target, against that environment's
+        // providers and settings.
+        let environment = self.settings_environment();
+        let target = settings_target(&view.targets, environment.as_deref());
+        let project_id = target.and_then(|target| target.project_id.as_deref());
+        let selection = |key: &str| -> Option<ModelSelection> {
+            let value = target.map_or_else(|| view.value(key), |target| target.settings.get(key));
+            serde::Deserialize::deserialize(value).ok()
+        };
+        let stored_text = selection("textGenerationModelSelection");
+        let writer = selection("sourceControlWriterModelSelection");
+        // Text generators may write source control text, but never review guides.
+        let generators =
+            self.text_generation_targets(environment.as_ref(), &[writer.as_ref(), stored_text.as_ref()], cx);
+        self.refresh_picker_extra("writer-model", &generators);
+        let generator_config = |id: &str| self.settings_info().settings.get("textGenerators").get(id).cloned();
         let providers = &self.settings_info().providers;
-        let usable: Vec<&crate::model::Provider> =
-            providers.iter().filter(|p| p.is_selectable() && generates_text(p)).collect();
-        let stored_text: Option<ModelSelection> =
-            serde::Deserialize::deserialize(view.value("textGenerationModelSelection")).ok();
-        let default_selection = resolve_text_generation(stored_text.as_ref(), providers);
-        let writer: Option<ModelSelection> =
-            serde::Deserialize::deserialize(view.value("sourceControlWriterModelSelection")).ok();
-        let writer_usable = writer.as_ref().filter(|w| usable.iter().any(|p| p.instance_id == w.instance_id));
-        let active = resolve_text_generation(writer_usable.or(stored_text.as_ref()), providers);
-        let can_dedicate =
-            default_selection.as_ref().is_some_and(|s| usable.iter().any(|p| p.instance_id == s.instance_id));
+        let configured = self.settings_info().settings.get("textGenerators");
+        let writer_providers = project_writers(
+            writing_providers(providers, configured, &generators),
+            &self.settings_info().settings,
+            project_id,
+        );
+        let runs = |list: &[&Provider], s: &ModelSelection| {
+            list.iter().any(|p| p.instance_id == s.instance_id && p.is_selectable() && generates_text(p))
+        };
+        let default_selection = resolve_text_generation(stored_text.as_ref(), &writer_providers);
+        let writer_usable = writer.as_ref().filter(|w| runs(&writer_providers, w));
+        let active = resolve_text_generation(writer_usable.or(stored_text.as_ref()), &writer_providers);
+        let can_dedicate = default_selection.as_ref().is_some_and(|s| runs(&writer_providers, s));
         let guides = view.bool("reviewGuidesEnabled");
         let guide_control = (guides && connected).then(|| {
-            let guide: Option<ModelSelection> =
-                serde::Deserialize::deserialize(view.value("reviewGuideModelSelection")).ok();
+            let guide = selection("reviewGuideModelSelection");
             let mixed = view.mixed(&["reviewGuideModelSelection"]);
-            let guide_usable = guide.as_ref().filter(|g| usable.iter().any(|p| p.instance_id == g.instance_id));
-            let guide_selection = guide_usable.cloned().or_else(|| active.clone());
+            let guide_selection = review_guide_selection(
+                &self.settings_info().settings,
+                project_id,
+                providers,
+                [guide.as_ref(), writer.as_ref(), stored_text.as_ref()],
+            );
+            let can_guide = guide_selection.is_some();
+            // Turning it on starts from the writer, unless that is a text generator.
+            let seed = match &active {
+                Some(active) if generator_config(&active.instance_id).is_some() => guide_selection.clone(),
+                active => active.clone(),
+            };
             self.dedicated_model_control(
                 DedicatedModel {
                     id: "review-guide-model",
@@ -1867,11 +1903,12 @@ impl Workspace {
                     on: guide.is_some(),
                     mixed,
                     switch_mixed: mixed,
-                    selection: guide_selection.filter(|_| (guide.is_some() || mixed) && can_dedicate),
-                    enable_with: active.clone(),
+                    selection: guide_selection.filter(|_| (guide.is_some() || mixed) && can_guide),
+                    enable_with: seed,
                     check_enable: true,
-                    dimmed: guide.is_none() && !can_dedicate,
+                    dimmed: guide.is_none() && !can_guide,
                     note: None,
+                    extra: None,
                 },
                 cx,
             )
@@ -1892,6 +1929,7 @@ impl Workspace {
                     check_enable: false,
                     dimmed: false,
                     note,
+                    extra: Some(generators.clone()),
                 },
                 cx,
             )
@@ -1925,7 +1963,7 @@ impl Workspace {
             rows.push(row(
                 self,
                 SettingRow::new("review-guide-model")
-                    .description("Model that reads a pull request to write its review guide. It reads the change itself over many steps, so a stronger model helps. Off uses the source control writer model.")
+                    .description("Must be a coding agent: it reads the pull request over many steps. Off uses the writer model, or Codex or Claude if that model is a text generator.")
                     .setting("reviewGuideModelSelection")
                     .control(control),
             ));
@@ -2041,6 +2079,7 @@ impl Workspace {
             check_enable,
             dimmed,
             note,
+            extra,
         } = row;
         let set = move |this: &mut Self, value: Value, window: &mut Window, cx: &mut Context<Self>| {
             this.update_settings(json!({ key: value }), window, cx);
@@ -2059,11 +2098,12 @@ impl Workspace {
             .gap(px(8.))
             .children(note)
             .when_some(selection, |el, selection| {
-                el.child(self.model_picker(
+                el.child(self.model_picker_among(
                     id,
                     Some(&selection),
                     mixed.then_some("Mixed"),
                     generates_text,
+                    extra,
                     cx,
                     move |this, pick, window, cx| {
                         let pick = ModelSelection { options: None, ..pick };
@@ -2071,9 +2111,15 @@ impl Workspace {
                     },
                 ))
                 .when(!mixed, |el| {
-                    el.children(self.traits_picker(traits_id, &selection, cx, move |this, pick, window, cx| {
-                        set(this, pick.to_json(), window, cx);
-                    }))
+                    el.children(self.traits_picker(
+                        traits_id,
+                        &selection,
+                        crate::model_label::selects_plan_agent(&selection),
+                        cx,
+                        move |this, pick, window, cx| {
+                            set(this, pick.to_json(), window, cx);
+                        },
+                    ))
                 })
             })
             .child(switch(&id.into(), on && !switch_mixed, switch_mixed).on_click(cx.listener(
@@ -2102,7 +2148,8 @@ fn vcs_icon(kind: &str) -> Option<&'static str> {
 
 /// A host or VCS mark at 18px: GitHub's is one color and follows the text, the rest are drawn as is.
 fn source_control_icon(path: &'static str, t: &Tokens) -> AnyElement {
-    if path.ends_with("/github.svg") {
+    // GitHub's and Cursor's marks are one color and follow the text.
+    if path.ends_with("/github.svg") || path.ends_with("/cursor-origin.svg") {
         svg().path(path).size(px(18.)).text_color(t.foreground.opacity(0.8)).into_any_element()
     } else {
         img(path).size(px(18.)).into_any_element()
@@ -2207,6 +2254,47 @@ struct DedicatedModel {
     check_enable: bool,
     dimmed: bool,
     note: Option<gpui_kit::Div>,
+    /// `Some` for a writing picker: the text generators it offers beside the coding agents.
+    extra: Option<Rc<[Provider]>>,
+}
+
+/// The writing providers `project_id` may run (`resolveTextGenerationSelectionEnabled`): a text
+/// generator by its own switch, a coding agent by the project's provider overrides.
+fn project_writers<'a>(
+    mut writers: Vec<&'a Provider>,
+    settings: &crate::settings::Settings,
+    project_id: Option<&str>,
+) -> Vec<&'a Provider> {
+    writers.retain(|p| scope::text_generation_selection_enabled(settings, project_id, &p.instance_id));
+    writers
+}
+
+/// `resolveReviewGuideModelSelection` over the coding agents `project_id` may run: the guide's
+/// own agent, else the writer while it runs, else the text generation model, each kept only if
+/// an agent. Selections are `[guide, writer, text generation]`.
+fn review_guide_selection(
+    settings: &crate::settings::Settings,
+    project_id: Option<&str>,
+    providers: &[Provider],
+    [guide, writer, text]: [Option<&ModelSelection>; 3],
+) -> Option<ModelSelection> {
+    let generator = |id: &str| settings.get("textGenerators").get(id);
+    let agents: Vec<&Provider> =
+        providers.iter().filter(|p| scope::provider_instance_enabled(settings, project_id, &p.instance_id)).collect();
+    let runs = |s: &&ModelSelection| {
+        agents.iter().any(|p| p.instance_id == s.instance_id && p.is_selectable() && generates_text(p))
+    };
+    let guide = guide.filter(|g| generator(&g.instance_id).is_none()).filter(runs);
+    let writer = writer.filter(|w| match generator(&w.instance_id) {
+        Some(generator) => generator["enabled"] != false,
+        None => runs(w),
+    });
+    resolve_text_generation(guide.or(writer).or(text), &agents)
+}
+
+/// `useSettingsScope().target`: the target on the settings environment, else the first.
+fn settings_target<'t>(targets: &'t [scope::Target], environment: Option<&str>) -> Option<&'t scope::Target> {
+    targets.iter().find(|t| Some(t.environment_id.as_str()) == environment).or(targets.first())
 }
 
 /// `styleFieldMixed`: the selected targets differ in one writing-style field.
@@ -2233,6 +2321,62 @@ mod tests {
         assert!(style_field_mixed(&targets, "customInstructions"));
         assert!(!style_field_mixed(&targets[..1], "customInstructions"));
         assert!(!style_field_mixed(&[], "mode"));
+    }
+
+    #[test]
+    fn writer_and_review_guide_skip_agents_the_project_turned_off() {
+        let settings = crate::settings::Settings::layered(
+            &Default::default(),
+            &json!({
+                "textGenerators": {"gen": {"kind": "openaiCompatible", "baseUrl": "https://api.test", "enabled": true}},
+                "projectSettingsOverrides": {"p": {"providerInstances": {"codex": {"enabled": false}}}}
+            }),
+        );
+        let providers: Vec<Provider> = serde_json::from_value(json!([
+            {"instanceId": "codex", "driver": "codex", "enabled": true, "status": "ready", "models": [{"slug": "gpt"}]},
+            {"instanceId": "claudeAgent", "driver": "claudeAgent", "enabled": true, "status": "ready",
+                "models": [{"slug": "claude-haiku-5-5"}]}
+        ]))
+        .unwrap();
+        let generators: Vec<Provider> = serde_json::from_value(json!([
+            {"instanceId": "gen", "driver": "openai", "enabled": true, "status": "ready", "models": [{"slug": "m"}]}
+        ]))
+        .unwrap();
+        let pick = |instance: &str, model: &str| ModelSelection {
+            instance_id: instance.into(),
+            model: model.into(),
+            options: None,
+        };
+        let (generator, codex) = (pick("gen", "m"), pick("codex", "gpt"));
+        let guide = |project: Option<&str>, selections: [Option<&ModelSelection>; 3]| {
+            review_guide_selection(&settings, project, &providers, selections).map(|s| s.instance_id)
+        };
+        assert_eq!(guide(None, [None, Some(&generator), None]).as_deref(), Some("codex"));
+        assert_eq!(guide(Some("p"), [None, Some(&generator), None]).as_deref(), Some("claudeAgent"));
+        assert_eq!(guide(Some("p"), [Some(&codex), None, None]).as_deref(), Some("claudeAgent"), "the guide's own");
+        assert_eq!(guide(Some("p"), [None, Some(&codex), None]).as_deref(), Some("claudeAgent"), "the writer");
+
+        let writers = |project: Option<&str>| {
+            let all = writing_providers(&providers, settings.get("textGenerators"), &generators);
+            project_writers(all, &settings, project).iter().map(|p| p.instance_id.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(writers(None), ["codex", "claudeAgent", "gen"]);
+        assert_eq!(writers(Some("p")), ["claudeAgent", "gen"]);
+
+        // A grouped scope lists the remote checkout first; the settings environment's own is used.
+        let target = |environment: &str, project: &str| scope::Target {
+            environment_id: environment.into(),
+            project_id: Some(project.into()),
+            settings: settings.clone(),
+            sources: Default::default(),
+        };
+        let targets = [target("remote", "r"), target("primary", "p")];
+        let project = |environment| settings_target(&targets, environment).and_then(|t| t.project_id.as_deref());
+        assert_eq!(project(Some("primary")), Some("p"));
+        assert_eq!(guide(project(Some("primary")), [None, Some(&generator), None]).as_deref(), Some("claudeAgent"));
+        assert_eq!(writers(project(Some("primary"))), ["claudeAgent", "gen"]);
+        assert_eq!(project(Some("elsewhere")), Some("r"), "else the first target");
+        assert_eq!(project(None), Some("r"));
     }
 
     #[test]

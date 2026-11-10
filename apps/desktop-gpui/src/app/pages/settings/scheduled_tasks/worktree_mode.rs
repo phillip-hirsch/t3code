@@ -120,6 +120,14 @@ impl NewWorktreeMode {
         }
     }
 
+    /// A task leaving its thread for the project checkout's place starts from the remote.
+    pub(super) fn start_from_origin(&mut self, cx: &mut Context<Self>) {
+        if !self.start_from_origin {
+            self.start_from_origin = true;
+            cx.notify();
+        }
+    }
+
     /// The upsert's `workspaceStrategy`.
     pub(super) fn strategy(&self) -> Value {
         strategy(&self.base_ref, self.start_from_origin)

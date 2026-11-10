@@ -94,7 +94,30 @@ fn idle_compaction_mode<'a>(settings: &'a crate::settings::Settings, instance_id
     }
 }
 
+/// A conversation worth compacting: a user message other than a bare `/compact`.
+fn has_compactable_conversation(projection: &crate::model::ThreadProjection) -> bool {
+    projection.visible_turn_items.iter().map(|row| &row.item).any(|item| {
+        item.item_type == "user_message"
+            && (item.str("text").is_some_and(|text| !text.trim().eq_ignore_ascii_case("/compact"))
+                || item.raw.get("attachments").and_then(|a| a.as_array()).is_some_and(|a| !a.is_empty()))
+    })
+}
+
 impl Workspace {
+    /// `compactThreadUnavailable`: the open thread cannot compact now, before a send.
+    pub(super) fn compact_unavailable(&self, projection: &crate::model::ThreadProjection) -> bool {
+        let compactable =
+            self.composer_provider().is_some_and(|p| p.slash_commands.iter().any(|c| c.name == "compact"));
+        !compactable
+            || self.client().is_none()
+            || projection.is_running()
+            || self.sending
+            || self.target_rewinding()
+            || !projection.pending_approvals().is_empty()
+            || !projection.pending_user_inputs().is_empty()
+            || !has_compactable_conversation(projection)
+    }
+
     /// The open thread's used tokens and when compacting them is offered, before the clock.
     fn resume_compaction(&self) -> Option<(u64, i64)> {
         if !matches!(self.target, Some(Target::Thread { .. })) {

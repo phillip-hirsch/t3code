@@ -189,7 +189,6 @@ impl Workspace {
         self.menu.loading = !has_snapshot && cwd.is_some();
         let Some(provider) = self.composer_provider() else { return };
         let (skills, commands) = composer_search::provider_lists(provider, cwd.as_deref());
-        let (plan_mode, _) = self.interaction_mode();
         let at_start = trigger.range.start == 0;
         let fresh_session = self.fresh_session_command_available();
         let side_chat = self.side_chat_menu_state();
@@ -197,15 +196,9 @@ impl Workspace {
         let slash_skills = if self.client_settings.values.bool("showSkillsInSlashMenu") { skills } else { &[] };
         let items = match trigger.kind {
             TriggerKind::Skill => composer_search::skill_items(skills, &trigger.query),
-            _ => composer_search::slash_items(
-                slash_skills,
-                commands,
-                &trigger.query,
-                at_start,
-                plan_mode,
-                side_chat,
-                fresh_session,
-            ),
+            _ => {
+                composer_search::slash_items(slash_skills, commands, &trigger.query, at_start, side_chat, fresh_session)
+            }
         };
         self.menu.highlighted = self.menu.highlighted.min(items.len().saturating_sub(1));
         self.menu.items = Rc::from(items);
@@ -452,7 +445,7 @@ impl Workspace {
             // `/side` waits for its prompt; it does nothing while side chats can't start.
             MenuAction::SideChat(_) if self.side_chat_disabled_reason().is_some() => return,
             MenuAction::SideChat(command) => (format!("/{command} "), None),
-            MenuAction::Model | MenuAction::Mode(_) | MenuAction::Clear => (String::new(), None),
+            MenuAction::Model | MenuAction::Clear => (String::new(), None),
             // `environmentContextRecord`: the record rebuilds from the reference at send.
             MenuAction::Environment { environment_id, .. } => {
                 let id = format!("environment_{environment_id}");
@@ -492,7 +485,6 @@ impl Workspace {
         });
         match item.action {
             MenuAction::Model => self.open_model_picker(window, cx),
-            MenuAction::Mode(mode) => self.set_interaction_mode(mode, window, cx),
             MenuAction::Clear => self.arm_fresh_session(cx),
             _ if usage_limits => {
                 self.open_usage_limits(window, cx);

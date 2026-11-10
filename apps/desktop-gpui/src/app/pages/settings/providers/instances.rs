@@ -533,6 +533,8 @@ struct EnvRow {
     value: Value,
     sensitive: bool,
     redacted: Option<bool>,
+    /// Added in this editor rather than seeded from saved settings.
+    added: bool,
 }
 
 impl EnvironmentDraft {
@@ -541,8 +543,10 @@ impl EnvironmentDraft {
         if self.instance.as_deref() == Some(instance) && self.seen == incoming {
             return;
         }
-        let echo = self.instance.as_deref() == Some(instance) && self.last_published.as_deref() == Some(incoming);
+        let same_instance = self.instance.as_deref() == Some(instance);
+        let echo = same_instance && self.last_published.as_deref() == Some(incoming);
         if !echo {
+            let previous = std::mem::take(&mut self.rows);
             self.rows = incoming
                 .iter()
                 .map(|v| {
@@ -555,9 +559,19 @@ impl EnvironmentDraft {
                         value: secret.or_else(|| v.get("value")).cloned().unwrap_or(json!("")),
                         sensitive: secret.is_some() || v["sensitive"] != false,
                         redacted: v.get("valueRedacted").and_then(Value::as_bool),
+                        added: false,
                     }
                 })
                 .collect();
+            if same_instance {
+                // Keep rows the server never acknowledged, even across an external reseed.
+                let named = |list: &[Value], name: &str| list.iter().any(|v| v["name"] == name);
+                let unpublished: Vec<EnvRow> = previous
+                    .into_iter()
+                    .filter(|row| row.added && !named(&self.seen, &row.name) && !named(incoming, &row.name))
+                    .collect();
+                self.rows.extend(unpublished);
+            }
         }
         self.instance = Some(instance.to_owned());
         self.seen = incoming.to_vec();
@@ -1735,6 +1749,7 @@ impl Workspace {
                         value: json!(""),
                         sensitive: true,
                         redacted: None,
+                        added: true,
                     });
                     cx.notify();
                 });
@@ -2228,11 +2243,70 @@ mod tests {
     fn environment_draft_publishes_valid_rows() {
         let mut draft = EnvironmentDraft::default();
         draft.reconcile("codex", &[json!({"name": "A", "value": "1", "sensitive": false})]);
-        draft.rows.push(EnvRow { id: 99, name: String::new(), value: json!(""), sensitive: true, redacted: None });
+        draft.rows.push(EnvRow {
+            id: 99,
+            name: String::new(),
+            value: json!(""),
+            sensitive: true,
+            redacted: None,
+            added: true,
+        });
         assert_eq!(draft.published(), Some(vec![json!({"name": "A", "value": "1", "sensitive": false})]));
         draft.rows[1].name = "1bad".into();
         assert_eq!(draft.published(), None);
         assert!(is_variable_name("_OK1") && !is_variable_name("") && !is_variable_name("A-B"));
+    }
+
+    #[test]
+    fn environment_draft_keeps_unpublished_rows_across_external_writes() {
+        let names = |draft: &EnvironmentDraft| draft.rows.iter().map(|r| r.name.clone()).collect::<Vec<_>>();
+        let typed = |draft: &mut EnvironmentDraft, name: &str| {
+            draft.next_id += 1;
+            let row = EnvRow {
+                id: draft.next_id,
+                name: name.into(),
+                value: json!(""),
+                sensitive: true,
+                redacted: None,
+                added: true,
+            };
+            draft.rows.push(row);
+        };
+        let other = json!({"name": "OTHER_VAR", "value": "", "sensitive": true, "valueRedacted": true});
+
+        // A typed row and an unpublishable one survive a write from elsewhere.
+        let mut draft = EnvironmentDraft::default();
+        draft.reconcile("codex", &[]);
+        typed(&mut draft, "KEEP_ME_TYPED");
+        typed(&mut draft, "KEEP-ME");
+        draft.reconcile("codex", std::slice::from_ref(&other));
+        assert_eq!(names(&draft), ["OTHER_VAR", "KEEP_ME_TYPED", "KEEP-ME"]);
+
+        // A published row that comes back redacted is not duplicated.
+        let mut draft = EnvironmentDraft::default();
+        draft.reconcile("codex", &[]);
+        typed(&mut draft, "STORE_ME");
+        draft.last_published = draft.published();
+        typed(&mut draft, "UNPUBLISHED_ONE");
+        draft.reconcile("codex", &[json!({"name": "STORE_ME", "value": "", "sensitive": true, "valueRedacted": true})]);
+        assert_eq!(names(&draft), ["STORE_ME", "UNPUBLISHED_ONE"]);
+
+        // An acknowledged row goes when another client deletes it.
+        let mut draft = EnvironmentDraft::default();
+        draft.reconcile("codex", &[]);
+        typed(&mut draft, "PUBLISH_ME");
+        draft.last_published = draft.published();
+        draft.reconcile("codex", &[json!({"name": "PUBLISH_ME", "value": "", "sensitive": true})]);
+        assert_eq!(names(&draft), ["PUBLISH_ME"]);
+        draft.reconcile("codex", &[]);
+        assert!(draft.rows.is_empty());
+
+        // Rows typed for one instance stay with it.
+        let mut draft = EnvironmentDraft::default();
+        draft.reconcile("codex", &[]);
+        typed(&mut draft, "MINE");
+        draft.reconcile("claudeAgent", std::slice::from_ref(&other));
+        assert_eq!(names(&draft), ["OTHER_VAR"]);
     }
 
     #[test]

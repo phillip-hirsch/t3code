@@ -95,9 +95,6 @@ struct SavedDraft {
     model_selection: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     runtime_mode: Option<String>,
-    /// Build or Plan as picked.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    interaction_mode: Option<String>,
 }
 
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -118,7 +115,6 @@ struct Live<'a> {
     attachments: &'a [Attachment],
     records: Option<&'a ContextRecords>,
     selection: Option<&'a ComposerSelection>,
-    interaction: Option<&'static str>,
 }
 
 /// What a save writes: the document, and the bytes of every attachment it names by file name.
@@ -147,10 +143,8 @@ fn snapshot(mut drafts: Vec<Live<'_>>, sessions: &DraftSessions) -> (DraftFile, 
             let model =
                 (live.selection.filter(|s| s.explicit)).and_then(|s| s.model.as_ref()).map(ModelSelection::to_json);
             let runtime_mode = live.selection.and_then(|s| s.runtime_mode.clone());
-            // A thread remembers its mode on the server; a draft's pick lives only here.
-            let draft_mode = live.interaction.is_some() && live.target.draft_id().is_some();
             let empty = live.prompt.is_empty() && live.attachments.is_empty();
-            if empty && model.is_none() && runtime_mode.is_none() && !draft_mode {
+            if empty && model.is_none() && runtime_mode.is_none() {
                 return None;
             }
             let attachments = (live.attachments.iter())
@@ -172,7 +166,6 @@ fn snapshot(mut drafts: Vec<Live<'_>>, sessions: &DraftSessions) -> (DraftFile, 
                 records: live.records.map(|records| records.referenced(live.prompt)).unwrap_or_default(),
                 model_selection: model,
                 runtime_mode,
-                interaction_mode: live.interaction.map(str::to_owned),
             })
         })
         .collect();
@@ -378,9 +371,6 @@ impl Workspace {
                     ComposerSelection { explicit: model.is_some(), model, runtime_mode: saved.runtime_mode };
                 self.composer_selections.entry(target.clone()).or_insert(selection);
             }
-            if let Some(mode) = &saved.interaction_mode {
-                self.composer_ui.restore_interaction(target.clone(), mode);
-            }
             if !saved.prompt.is_empty() || !attachments.is_empty() {
                 let draft = ComposerDraft::Prompt(saved.prompt, attachments, records);
                 self.composer_drafts.insert(target.clone(), draft);
@@ -509,12 +499,9 @@ impl Workspace {
                 attachments: live_attachments,
                 records: live_records,
                 selection: live_selection.as_ref(),
-                interaction: self.composer_ui.interaction(target),
             });
         }
-        let others = (self.composer_drafts.keys())
-            .chain(self.composer_selections.keys())
-            .chain(self.composer_ui.interaction_targets());
+        let others = self.composer_drafts.keys().chain(self.composer_selections.keys());
         let mut seen: HashSet<&Target> = self.target.iter().collect();
         for target in others {
             if !seen.insert(target) {
@@ -530,8 +517,7 @@ impl Workspace {
                 None => ("", &[][..], None),
             };
             let selection = self.composer_selections.get(target);
-            let interaction = self.composer_ui.interaction(target);
-            drafts.push(Live { target, prompt, attachments, records, selection, interaction });
+            drafts.push(Live { target, prompt, attachments, records, selection });
         }
         snapshot(drafts, &self.drafts)
     }
@@ -554,7 +540,7 @@ mod tests {
     }
 
     fn live<'a>(target: &'a Target, prompt: &'a str, attachments: &'a [Attachment]) -> Live<'a> {
-        Live { target, prompt, attachments, records: None, selection: None, interaction: None }
+        Live { target, prompt, attachments, records: None, selection: None }
     }
 
     fn thread(id: &str) -> Target {
@@ -585,7 +571,7 @@ mod tests {
         records.extend([record.clone(), unreferenced]);
         let prompt = format!("fix it {}", crate::composer_text::context_link("terminal", "terminal_1", "ls"));
         let drafts = vec![
-            Live { interaction: Some("plan"), records: Some(&records), ..live(&open, &prompt, &[]) },
+            Live { records: Some(&records), ..live(&open, &prompt, &[]) },
             Live { selection: Some(&selection), ..live(&draft, "draft text", &attachments) },
         ];
         let (file, blobs) = snapshot(drafts, &sessions);
@@ -600,7 +586,6 @@ mod tests {
         assert_eq!(restored.len(), 2);
         let (draft_entry, thread_entry) = (&restored[1], &restored[0]);
         assert_eq!(thread_entry.records, [record]);
-        assert_eq!(thread_entry.interaction_mode.as_deref(), Some("plan"));
         assert_eq!(draft_entry.target, SavedTarget::of(&draft));
         assert_eq!(draft_entry.model_selection, Some(json!({"instanceId": "codex", "model": "gpt"})));
         assert_eq!(draft_entry.runtime_mode.as_deref(), Some("full-access"));
@@ -628,7 +613,7 @@ mod tests {
             live(&launched, "launched text", &[]),
             live(&unmapped_empty, "", &[]),
             live(&unmapped_written, "kept", &[]),
-            Live { selection: Some(&inherited), interaction: Some("default"), ..live(&sent, "", &[]) },
+            Live { selection: Some(&inherited), ..live(&sent, "", &[]) },
         ];
         let (file, _) = snapshot(drafts, &sessions);
         let targets: Vec<&SavedTarget> = file.drafts.iter().map(|d| &d.target).collect();
@@ -650,7 +635,6 @@ mod tests {
                 records: Vec::new(),
                 model_selection: None,
                 runtime_mode: None,
-                interaction_mode: None,
             }],
             sessions: Vec::new(),
         };

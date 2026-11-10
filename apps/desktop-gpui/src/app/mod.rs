@@ -39,7 +39,6 @@ mod compact_send;
 mod composer;
 mod composer_fit;
 mod composer_menu;
-mod composer_meter;
 mod composer_plan;
 mod composer_rich;
 mod confirm;
@@ -257,8 +256,8 @@ pub struct Workspace {
     /// Requests that arrived mid-typing, kept out of sight for now.
     typing_guard: crate::composer_guard::TypingGuard,
     _typing_idle: Option<Task<()>>,
-    /// Tab stops of the composer's attach, stop and primary (send, resume, submit) controls.
-    composer_action_focus: [gpui_kit::FocusHandle; 5],
+    /// Tab stops of the composer's attach, stop, primary (send, resume, submit) and compact controls.
+    composer_action_focus: [gpui_kit::FocusHandle; 4],
     /// Composer text and question drafts of the targets not on screen.
     composer_drafts: HashMap<Target, composer::ComposerDraft>,
     /// Every draft's identity and the draft each project opens.
@@ -1190,13 +1189,27 @@ impl Workspace {
     /// The model the next message runs on.
     fn composer_model(&self) -> Option<ModelSelection> {
         let selection = self.stored_composer_model()?;
-        let descriptors = self.server_info().model(&selection).and_then(|m| m.capabilities.as_ref());
-        Some(match descriptors {
-            Some(capabilities) => {
-                crate::model_label::with_legacy_ultracode(&capabilities.option_descriptors, selection)
-            }
-            None => selection,
-        })
+        let descriptors = self.composer_descriptors(&selection);
+        let selection = crate::model_label::with_legacy_ultracode(&descriptors, selection);
+        Some(crate::model_label::without_plan_agent_selection(&descriptors, selection))
+    }
+
+    /// The model an existing thread's message carries: the composer's pick, else the thread's own
+    /// when it still names the retired Plan agent (the web dispatches it normalized).
+    pub(super) fn dispatch_model(&self) -> Option<ModelSelection> {
+        let stored = self.stored_composer_model()?;
+        (self.model_override.is_some() || crate::model_label::selects_plan_agent(&stored))
+            .then(|| self.composer_model())
+            .flatten()
+    }
+
+    /// The options the composer offers for `selection`'s model: never the `opencode` Plan agent.
+    fn composer_descriptors(
+        &self,
+        selection: &ModelSelection,
+    ) -> std::borrow::Cow<'_, [crate::model::OptionDescriptor]> {
+        let model = self.server_info().model(selection).and_then(|m| m.capabilities.as_ref());
+        crate::model_label::without_plan_agent(model.map(|c| c.option_descriptors.as_slice()).unwrap_or_default())
     }
 
     fn stored_composer_model(&self) -> Option<ModelSelection> {

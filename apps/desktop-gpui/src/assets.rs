@@ -16,6 +16,10 @@ const APP_ICONS: &[(&str, &[u8])] = &[
     ("icons/app/muse.svg", include_bytes!("../assets/icons/muse.svg")),
     ("icons/app/pi.svg", include_bytes!("../assets/icons/pi.svg")),
     ("icons/app/fx.svg", include_bytes!("../assets/icons/fx.svg")),
+    // Text generator brand marks from Simple Icons (CC0), as the web's `Icons.tsx` draws them.
+    ("icons/app/anthropic.svg", include_bytes!("../assets/icons/anthropic.svg")),
+    ("icons/app/openrouter.svg", include_bytes!("../assets/icons/openrouter.svg")),
+    ("icons/app/ollama.svg", include_bytes!("../assets/icons/ollama.svg")),
     ("icons/app/send.svg", include_bytes!("../assets/icons/send.svg")),
     ("icons/app/t3-wordmark.svg", include_bytes!("../assets/icons/t3-wordmark.svg")),
     ("icons/app/t3.svg", include_bytes!("../assets/icons/t3.svg")),
@@ -279,6 +283,11 @@ pub fn provider_icon(driver: &str) -> Option<(&'static str, Option<Hsla>)> {
         "muse" => Some(("icons/app/muse.svg", Some(rgb(0x0081fb).into()))),
         "pi" => Some(("icons/app/pi.svg", None)),
         "fx" => Some(("icons/app/fx.svg", None)),
+        // Text generators, by the service they reach (`textGeneratorBrand`).
+        "openai" => Some(("icons/app/openai.svg", None)),
+        "anthropic" => Some(("icons/app/anthropic.svg", None)),
+        "openrouter" => Some(("icons/app/openrouter.svg", None)),
+        "ollama" => Some(("icons/app/ollama.svg", None)),
         _ => None,
     }
 }

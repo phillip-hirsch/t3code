@@ -4,10 +4,12 @@ use std::rc::Rc;
 
 use crate::app::pages::settings::widgets::Switch;
 use chrono::{DateTime, Local, NaiveTime, Timelike as _, Utc};
+use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::date_picker::{DatePicker, DatePickerEvent, DatePickerState};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState};
 use gpui_kit::component::time_field::{TimeField, TimeFieldEvent, TimeFieldState, TimePrecision};
 use gpui_kit::component::{Disableable as _, Sizable as _, WindowExt as _, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -19,8 +21,8 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use super::logic::{
-    self, DraftError, DraftState, MIN_INTERVAL_MS, Schedule, ScheduleMode, ScheduledTask, ThreadMode, WEEKDAY_LABELS,
-    WEEKDAY_ORDER, WEEKDAY_SHORT, WorkspaceMode,
+    self, DestinationChoice, DraftError, DraftState, MIN_INTERVAL_MS, NEW_THREAD_DESTINATION, Schedule, ScheduleMode,
+    ScheduledTask, ThreadMode, WEEKDAY_LABELS, WEEKDAY_ORDER, WEEKDAY_SHORT, WorkspaceMode,
 };
 use super::webhooks::{self, DEFAULT_WEBHOOK_PROMPT, WebhookContext, WebhookFields};
 use super::worktree_mode::{self, NewWorktreeMode};
@@ -76,7 +78,42 @@ pub(super) struct TaskEditor {
     worktree: Entity<NewWorktreeMode>,
     /// The stored task last handed to `webhook`, so a list refresh reaches it once.
     webhook_task: Option<Value>,
+    /// The destination thread picker, while the Destination field shows it.
+    destination: Option<DestinationPicker>,
     _subscriptions: Vec<Subscription>,
+}
+
+type DestinationSelect = SelectState<SearchableVec<DestinationChoice>>;
+
+/// The searchable destination thread picker (`ScheduledTaskDestination`'s combobox).
+struct DestinationPicker {
+    /// What the rows were last derived from, and whether the menu was open, so a render reads the
+    /// shell only when one changed.
+    key: (u64, SharedString, String, String, ThreadMode, bool),
+    /// The rows the select shows, in order ([`logic::destination_rows_stale`]).
+    rows: Vec<DestinationChoice>,
+    state: Entity<DestinationSelect>,
+    _subscription: Subscription,
+}
+
+impl SelectItem for DestinationChoice {
+    type Value = String;
+
+    fn title(&self) -> SharedString {
+        self.label.clone().into()
+    }
+
+    fn value(&self) -> &String {
+        &self.value
+    }
+
+    fn matches(&self, query: &str) -> bool {
+        DestinationChoice::matches(self, query)
+    }
+
+    fn render(&self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        div().min_w_0().truncate().child(self.label.clone())
+    }
 }
 
 /// The projects on `environment` that `scope` offers (`projectsOn`).
@@ -198,6 +235,7 @@ impl TaskEditor {
             webhook,
             worktree,
             webhook_task: task_json,
+            destination: None,
             _subscriptions: subscriptions,
         }
     }
@@ -229,6 +267,7 @@ impl TaskEditor {
             return;
         }
         let projects = scoped_projects(workspace.read(cx), &self.scope, &environment);
+        self.draft.unbind_from_thread();
         self.draft.project_id = logic::default_project_id(&projects, self.scope.is_project());
         self.draft.model_key.clear();
         self.draft.base_model_selection = None;
@@ -242,6 +281,111 @@ impl TaskEditor {
         self.environment = environment;
         self.client = client;
         cx.notify();
+    }
+
+    /// Every Destination and Project change goes through here, so a thread the task leaves is
+    /// unbound (`unbindDraftFromThread`) and the worktree fields follow.
+    fn change_destination(
+        &mut self,
+        change: impl FnOnce(&mut DraftState),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (project, workspace_mode) = (self.draft.project_id.clone(), self.draft.workspace_mode);
+        change(&mut self.draft);
+        if self.draft.project_id != project {
+            self.sync_worktree_project(window, cx);
+        }
+        if workspace_mode == WorkspaceMode::Root && self.draft.workspace_mode == WorkspaceMode::Worktree {
+            self.worktree.update(cx, NewWorktreeMode::start_from_origin);
+        }
+        cx.notify();
+    }
+
+    /// A row picked in the destination thread picker: "New thread each run", or one of the
+    /// project's threads (`onSelect`). The current thread is already the destination.
+    fn pick_destination(&mut self, value: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.saving {
+            return;
+        }
+        if value == NEW_THREAD_DESTINATION {
+            self.change_destination(
+                |draft| {
+                    draft.unbind_from_thread();
+                    draft.thread_mode = ThreadMode::NewThread;
+                },
+                window,
+                cx,
+            );
+            return;
+        }
+        let Some(workspace) = self.workspace.upgrade() else { return };
+        let projects = self.projects(cx);
+        let Some(project) = self.selected_project(&projects).map(|p| p.id.clone()) else { return };
+        let movable = workspace.read(cx).shell.threads.iter().any(|t| {
+            t.environment_id == self.environment
+                && t.id == value
+                && t.project_id == project
+                && t.archived_at.is_none()
+                && t.deleted_at.is_none()
+                && t.is_listed()
+        });
+        if movable && value != self.draft.thread_id {
+            self.change_destination(|draft| draft.move_to_thread(value, &project), window, cx);
+        }
+    }
+
+    /// Keeps the destination picker on the shell's threads and the draft's destination; it is
+    /// dropped while the Destination field hides it.
+    fn sync_destination(&mut self, shown: bool, project_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade().filter(|_| shown) else {
+            self.destination = None;
+            return;
+        };
+        let open = self.destination.as_ref().is_some_and(|picker| picker.state.read(cx).is_open());
+        let key = (
+            workspace.read(cx).shell.revision,
+            self.environment.clone(),
+            project_id.to_owned(),
+            self.draft.thread_id.clone(),
+            self.draft.thread_mode,
+            open,
+        );
+        if self.destination.as_ref().is_some_and(|picker| picker.key == key) {
+            return;
+        }
+        let (choices, selected) = {
+            let threads = &workspace.read(cx).shell.threads;
+            let choices = logic::destination_choices(threads, &self.environment, project_id, &self.draft);
+            (choices, logic::destination_current(threads, &self.environment, &self.draft).1)
+        };
+        if let Some(picker) = &mut self.destination {
+            picker.key = key;
+            let state = picker.state.clone();
+            if logic::destination_rows_stale(&picker.rows, &choices, open) {
+                picker.rows = choices.clone();
+                state.update(cx, |state, cx| state.set_items(SearchableVec::new(choices), window, cx));
+            }
+            if state.read(cx).selected_value() != selected.as_ref() {
+                state.update(cx, |state, cx| match &selected {
+                    Some(value) => state.set_selected_value(value, window, cx),
+                    None => state.set_selected_index(None, window, cx),
+                });
+            }
+            return;
+        }
+        let index = choices
+            .iter()
+            .position(|choice| Some(&choice.value) == selected.as_ref())
+            .map(gpui_kit::component::IndexPath::new);
+        let rows = choices.clone();
+        let state = cx.new(|cx| SelectState::new(SearchableVec::new(choices), index, window, cx).searchable(true));
+        let subscription = cx.subscribe_in(&state, window, |this, _, event: &SelectEvent<_>, window, cx| {
+            if let SelectEvent::Confirm(Some(value)) = event {
+                this.pick_destination(value, window, cx);
+            }
+        });
+        self.destination = Some(DestinationPicker { key, rows, state, _subscription: subscription });
     }
 
     fn set_saving(&mut self, saving: bool, cx: &mut Context<Self>) {
@@ -498,7 +642,11 @@ impl Render for TaskEditor {
         let projects = self.projects(cx);
         let project = self.selected_project(&projects);
         let selection = self.active_selection(project, cx);
-        let (offers_once, denial, env_label, machine, destination, environments) = {
+        let offers_thread_modes = self.offers_thread_modes(cx);
+        let picks_thread = !offers_thread_modes || self.draft.thread_mode != ThreadMode::NewThread;
+        let project_id = project.map(|p| p.id.clone()).unwrap_or_default();
+        self.sync_destination(picks_thread, &project_id, window, cx);
+        let (offers_once, denial, env_label, machine, environments) = {
             let workspace = workspace.read(cx);
             // `connectedEnvironments`: the selected environments this client is connected to.
             let environments: Vec<(SharedString, String, &'static str)> = self
@@ -513,30 +661,19 @@ impl Render for TaskEditor {
                 })
                 .collect();
             let Some(info) = workspace.env_info(&self.environment) else { return div().into_any_element() };
-            let destination = (!self.draft.thread_id.is_empty() && self.draft.thread_mode != ThreadMode::NewThread)
-                .then(|| {
-                    workspace
-                        .shell
-                        .threads
-                        .iter()
-                        .find(|thread| thread.id == self.draft.thread_id)
-                        .map(|thread| thread.title.trim().to_owned())
-                        .filter(|title| !title.is_empty())
-                        .unwrap_or_else(|| format!("Thread {}", self.draft.thread_id))
-                });
             (
                 self.offers_once(info.capability("oneTimeSchedules")),
                 logic::webhook_denial(&info.managed_policy),
                 info.environment_label.clone().unwrap_or_else(|| "Unavailable environment".into()),
                 machine_icon(info.machine_kind()),
-                destination,
                 environments,
             )
         };
         let disabled = self.saving;
         let draft = &self.draft;
         let thread_mode = draft.thread_mode;
-        let thread_mode_select = self.offers_thread_modes(cx).then(|| {
+        let bound = !draft.thread_id.is_empty();
+        let thread_mode_select = offers_thread_modes.then(|| {
             select_trigger(&"scheduled-task-destination".into(), thread_mode.label(), 0., &t)
                 .w_full()
                 .disabled(disabled)
@@ -545,15 +682,43 @@ impl Render for TaskEditor {
                     move |mut menu, window, _| {
                         for mode in ThreadMode::ALL {
                             menu = menu.item(PopupMenuItem::new(mode.label()).checked(mode == thread_mode).on_click(
-                                window.listener_for(&editor, move |this: &mut TaskEditor, _, _, cx| {
-                                    this.draft.thread_mode = mode;
-                                    cx.notify();
+                                window.listener_for(&editor, move |this: &mut TaskEditor, _, window, cx| {
+                                    this.change_destination(|draft| draft.set_thread_mode(mode), window, cx);
                                 }),
                             ));
                         }
                         menu
                     }
                 })
+        });
+        // `ComboboxTrigger` as an outline `sm` button: the thread icon, the destination, the chevron.
+        let thread_picker = self.destination.as_ref().map(|picker| {
+            let select = t
+                .breakpoint
+                .control_text(Select::new(&picker.state).small())
+                .w_full()
+                .h(px(t.breakpoint.pick(32., 28.)))
+                .pl(px(29.))
+                .pr(px(9.))
+                .menu_width(px(320.))
+                .menu_max_h(px(288.))
+                .placeholder("Started by the first run")
+                .search_placeholder("Search all threads...")
+                .disabled(disabled || !connected)
+                .empty(|_, cx| {
+                    div()
+                        .p(px(8.))
+                        .text_sm()
+                        .text_color(theme::tokens(cx).muted_foreground)
+                        .child("No threads found.")
+                        .into_any_element()
+                });
+            let select = if offers_thread_modes { select.accessibility_label("Destination thread") } else { select };
+            div().relative().w_full().child(select).child(
+                div().absolute().left(px(10.)).top_0().bottom_0().flex().items_center().child(
+                    gpui_kit::component::Icon::new(Lucide::MessageSquare).size(px(14.)).text_color(t.muted_foreground),
+                ),
+            )
         });
 
         // Runs on: a new task can move to any connected environment the scope selects.
@@ -611,9 +776,7 @@ impl Render for TaskEditor {
                         let id = id.clone();
                         menu = menu.item(PopupMenuItem::new(label).checked(id == selected_project_id).on_click(
                             window.listener_for(&editor, move |this: &mut TaskEditor, _, window, cx| {
-                                this.draft.project_id = id.clone();
-                                this.sync_worktree_project(window, cx);
-                                cx.notify();
+                                this.change_destination(|draft| draft.change_project(&id), window, cx);
                             }),
                         ));
                     }
@@ -663,7 +826,8 @@ impl Render for TaskEditor {
                 PickHost {
                     environment: Some(self.environment.clone()),
                     current: selection.clone(),
-                    include: |_| true,
+                    include: Rc::new(|_: &crate::model::Provider| true),
+                    extra: None,
                     on_pick,
                 },
                 cx,
@@ -805,14 +969,13 @@ impl Render for TaskEditor {
                     .child(field(
                         "Destination",
                         None,
-                        div().flex().flex_col().gap(px(6.)).children(thread_mode_select).child(
+                        div().flex().flex_col().gap(px(6.)).children(thread_mode_select).children(thread_picker).child(
                             div()
                                 .flex()
                                 .flex_col()
                                 .gap(px(4.))
                                 .text_sm()
-                                .children(destination.as_ref().map(|title| div().child(title.clone())))
-                                .child(div().text_color(t.muted_foreground).child(thread_mode.detail(destination.is_some())))
+                                .child(div().text_color(t.muted_foreground).child(thread_mode.detail(bound)))
                                 .when(thread_mode != ThreadMode::NewThread, |this| {
                                     this.child(
                                         div().text_color(t.muted_foreground).child("Deleting the thread also deletes this task."),

@@ -14,7 +14,7 @@ use gpui_kit::{
 use serde_json::Value;
 
 use crate::app::Workspace;
-use crate::app::model_picker::{OnPick, PickHost};
+use crate::app::model_picker::{OnPick, PickHost, generator_owns};
 use crate::model::{ModelSelection, OptionChoice, OptionDescriptor, Provider};
 use crate::model_label;
 use crate::theme::{Tokens, tokens};
@@ -58,11 +58,27 @@ impl Workspace {
         cx: &mut Context<Self>,
         on_pick: impl Fn(&mut Self, ModelSelection, &mut Window, &mut Context<Self>) + 'static,
     ) -> AnyElement {
+        self.model_picker_among(id, selection, label, include, None, cx, on_pick)
+    }
+
+    /// [`Self::model_picker`] that also offers `extra` providers, such as text generators,
+    /// in place of instances with the same id.
+    pub(in crate::app) fn model_picker_among(
+        &self,
+        id: impl Into<SharedString>,
+        selection: Option<&ModelSelection>,
+        label: Option<&str>,
+        include: fn(&Provider) -> bool,
+        extra: Option<Rc<[Provider]>>,
+        cx: &mut Context<Self>,
+        on_pick: impl Fn(&mut Self, ModelSelection, &mut Window, &mut Context<Self>) + 'static,
+    ) -> AnyElement {
         let id = id.into();
         let environment = self.settings_environment();
-        let trigger = self.model_picker_trigger(id.clone(), selection, label, environment.as_deref(), cx);
+        let trigger =
+            self.picker_trigger_among(id.clone(), selection, label, environment.as_deref(), extra.as_deref(), cx);
         let on_pick: OnPick = Rc::new(on_pick);
-        let host = PickHost { environment, current: selection.cloned(), include, on_pick };
+        let host = PickHost { environment, current: selection.cloned(), include: Rc::new(include), extra, on_pick };
         self.undocked_model_picker(id, trigger, host, cx)
     }
 
@@ -76,13 +92,33 @@ impl Workspace {
         environment: Option<&str>,
         cx: &App,
     ) -> Button {
+        self.picker_trigger_among(id, selection, label, environment, None, cx)
+    }
+
+    /// [`Self::model_picker_trigger`], finding the selection's provider in `extra` first.
+    pub(in crate::app) fn picker_trigger_among(
+        &self,
+        id: SharedString,
+        selection: Option<&ModelSelection>,
+        label: Option<&str>,
+        environment: Option<&str>,
+        extra: Option<&[Provider]>,
+        cx: &App,
+    ) -> Button {
         let t = *tokens(cx);
         let info = environment.and_then(|environment| self.env_info(environment));
-        let provider = selection.and_then(|s| info?.provider(&s.instance_id));
-        let model = selection.and_then(|s| info?.model(s));
+        let provider = selection.and_then(|s| {
+            let listed = info?.provider(&s.instance_id);
+            let Some(extra) = extra else { return listed };
+            let configured = info?.settings.get("textGenerators");
+            let listed = listed.filter(|p| !generator_owns(p, configured, extra));
+            extra.iter().find(|p| p.instance_id == s.instance_id).or(listed)
+        });
+        let model = selection.zip(provider).and_then(|(s, p)| p.models.iter().find(|m| m.slug == s.model));
         let name: SharedString = match (label, provider.zip(model), selection) {
             (Some(label), ..) => label.to_owned().into(),
             (None, Some((provider, model)), _) => model_label::trigger_model_name(model, &provider.driver).into(),
+            (None, None, Some(selection)) if selection.model.is_empty() => "Choose model".into(),
             (None, None, Some(selection)) => selection.model.clone().into(),
             (None, None, None) => "Select a model".into(),
         };
@@ -97,19 +133,31 @@ impl Workspace {
     }
 
     /// `TraitsPicker` with prompt-injected effort left out: every select's choices, then each
-    /// on/off option. `None` when the model has nothing to pick (`hasAnyControls`).
+    /// on/off option. `None` when the model has nothing to pick (`hasAnyControls`). The `opencode`
+    /// Plan agent shows only with `include_plan_agent`.
     pub(in crate::app) fn traits_picker(
         &self,
         id: impl Into<ElementId>,
         selection: &ModelSelection,
+        include_plan_agent: bool,
         cx: &mut Context<Self>,
         on_pick: impl Fn(&mut Self, ModelSelection, &mut Window, &mut Context<Self>) + 'static,
     ) -> Option<AnyElement> {
         let t = *tokens(cx);
-        let descriptors = self.settings_info().model(selection)?.capabilities.as_ref()?.option_descriptors.clone();
+        let descriptors = &self.settings_info().model(selection)?.capabilities.as_ref()?.option_descriptors;
+        let descriptors = if include_plan_agent {
+            descriptors.clone()
+        } else {
+            model_label::without_plan_agent(descriptors).into_owned()
+        };
         let (selects, toggles) = trait_controls(&descriptors)?;
-        let label = model_label::effort_label(&descriptors, selection).unwrap_or_else(|| "Options".into());
-        let current = selection.clone();
+        // Without the Plan agent on offer, a stored Plan pick reads and saves as the default agent.
+        let current = if include_plan_agent {
+            selection.clone()
+        } else {
+            model_label::without_plan_agent_selection(&descriptors, selection.clone())
+        };
+        let label = model_label::effort_label(&descriptors, &current).unwrap_or_else(|| "Options".into());
         let view = cx.entity();
         let on_pick: OnPick = Rc::new(on_pick);
         Some(
@@ -220,19 +268,20 @@ fn default_text_generation_model(driver: &str) -> Option<&'static str> {
 
 /// `resolveAppModelSelectionState`: the stored text-generation model while its provider can
 /// generate text, else the first such provider's cheap default. Options carry over only when
-/// the stored provider is kept.
+/// the stored provider is kept. A provider without models resolves with an empty model, so the
+/// picker still offers the others.
 pub(in crate::app) fn resolve_text_generation(
     selection: Option<&ModelSelection>,
-    providers: &[Provider],
+    providers: &[&Provider],
 ) -> Option<ModelSelection> {
-    let usable = |p: &&Provider| p.is_selectable() && generates_text(p);
-    let selected = selection.and_then(|s| providers.iter().filter(usable).find(|p| p.instance_id == s.instance_id));
-    let provider = selected.or_else(|| providers.iter().find(usable))?;
+    let usable = |p: &&&Provider| p.is_selectable() && generates_text(p);
+    let selected =
+        selection.and_then(|s| providers.iter().filter(usable).find(|p| p.instance_id == s.instance_id).copied());
+    let provider = selected.or_else(|| providers.iter().find(usable).copied())?;
     let has = |slug: &&str| provider.models.iter().any(|m| m.slug == *slug);
     let kept = selected.and(selection).map(|s| s.model.as_str()).filter(has);
-    let model = kept
-        .or_else(|| default_text_generation_model(&provider.driver).filter(has))
-        .or_else(|| provider.default_model())?;
+    let cheap = default_text_generation_model(&provider.driver);
+    let model = kept.or_else(|| cheap.filter(has)).or_else(|| provider.default_model()).or(cheap).unwrap_or_default();
     Some(ModelSelection {
         instance_id: provider.instance_id.clone(),
         model: model.to_owned(),
@@ -273,6 +322,7 @@ mod tests {
         .unwrap();
         let effort = vec![json!({"id": "reasoningEffort", "value": "low"})];
         let stored = ModelSelection { instance_id: "codex".into(), model: "gpt-6-luna".into(), options: Some(effort) };
+        let providers: Vec<&Provider> = providers.iter().collect();
         let resolved = resolve_text_generation(Some(&stored), &providers).unwrap();
         assert_eq!(
             (resolved.instance_id.as_str(), resolved.model.as_str(), resolved.options),
@@ -280,5 +330,15 @@ mod tests {
         );
         let kept = ModelSelection { instance_id: "claude".into(), model: "claude-opus-5-5".into(), options: None };
         assert_eq!(resolve_text_generation(Some(&kept), &providers).unwrap(), kept);
+
+        // A generator whose models failed to load still resolves, so the picker can reach the next.
+        let generators: Vec<Provider> = serde_json::from_value(json!([
+            {"instanceId": "a", "driver": "openaiCompatible", "enabled": true, "status": "error", "models": []},
+            {"instanceId": "b", "driver": "openaiCompatible", "enabled": true, "models": [{"slug": "m"}]}
+        ]))
+        .unwrap();
+        let generators: Vec<&Provider> = generators.iter().collect();
+        let empty = ModelSelection { instance_id: "a".into(), model: String::new(), options: None };
+        assert_eq!(resolve_text_generation(None, &generators), Some(empty));
     }
 }

@@ -172,11 +172,6 @@ pub struct Provider {
     /// Empty means every runtime mode.
     #[serde(default)]
     pub supported_runtime_modes: Vec<String>,
-    /// `false` hides the composer's Plan toggle.
-    #[serde(default)]
-    pub show_interaction_mode_toggle: Option<bool>,
-    #[serde(default)]
-    pub reports_context_window: Option<bool>,
     #[serde(default)]
     pub message: Option<String>,
     #[serde(default)]
@@ -1469,7 +1464,7 @@ pub struct RollbackFailure {
     pub message: String,
 }
 
-/// The token counts behind the context meter: `ThreadTokenUsageSnapshot` on a
+/// A context window's token counts: `ThreadTokenUsageSnapshot` on a
 /// provider thread, `OrchestrationV2ProviderTurnTokenUsage` on a provider turn.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1481,35 +1476,9 @@ pub struct TokenUsage {
     pub auto_compact_threshold: Option<u64>,
     #[serde(default)]
     pub updated_at: Option<String>,
-    #[serde(default)]
-    pub total_processed_tokens: Option<u64>,
-    #[serde(default)]
-    pub compacts_automatically: Option<bool>,
-    #[serde(default)]
-    pub cost: Option<UsageCost>,
     /// How long the provider keeps the prompt cache; a live turn's usage reports it.
     #[serde(default)]
     pub prompt_cache_ttl_ms: Option<u64>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct UsageCost {
-    pub amount: f64,
-    pub currency: String,
-}
-
-/// `OrchestrationV2PlanArtifact`; a paged projection moves the markdown to its turn item.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PlanArtifact {
-    pub id: String,
-    pub kind: String,
-    #[serde(default)]
-    pub run_id: Option<String>,
-    #[serde(default)]
-    pub status: String,
-    #[serde(default)]
-    pub markdown: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1810,8 +1779,6 @@ pub struct ThreadProjection {
     #[serde(default, deserialize_with = "lossy")]
     pub provider_sessions: Vec<ProviderSession>,
     #[serde(default, deserialize_with = "lossy")]
-    pub plans: Vec<PlanArtifact>,
-    #[serde(default, deserialize_with = "lossy")]
     pub subagents: Vec<Subagent>,
 }
 
@@ -1899,8 +1866,7 @@ impl ThreadProjection {
         self.context_window().map(|(usage, _)| usage)
     }
 
-    /// `context_usage` and whether it is a live turn report, which always compacts
-    /// automatically and carries no totals.
+    /// `context_usage` and whether it is a live turn report.
     pub fn context_window(&self) -> Option<(Cow<'_, TokenUsage>, bool)> {
         let mut latest: Option<&TokenUsage> = None;
         for usage in self.provider_turns.iter().filter_map(|turn| turn.token_usage.as_ref()) {
@@ -1941,7 +1907,7 @@ impl ThreadProjection {
         serde_json::from_value(transfer["sourceTokenUsage"].clone()).ok()
     }
 
-    /// The newest compaction's after count, with its before count as the total processed.
+    /// The newest compaction's after count.
     fn compaction_usage(&self) -> Option<TokenUsage> {
         self.visible_turn_items.iter().rev().filter(|row| row.item.item_type == "compaction").find_map(|row| {
             let item = &row.item.raw;
@@ -1950,9 +1916,6 @@ impl ThreadProjection {
                 max_tokens: None,
                 auto_compact_threshold: None,
                 updated_at: item["startedAt"].as_str().or_else(|| item["updatedAt"].as_str()).map(str::to_owned),
-                total_processed_tokens: item["beforeTokenCount"].as_u64(),
-                compacts_automatically: Some(true),
-                cost: None,
                 prompt_cache_ttl_ms: None,
             })
         })
@@ -1974,34 +1937,6 @@ impl ThreadProjection {
             Some(session) if session.status != "stopped" => &session.extension_statuses,
             _ => &[],
         }
-    }
-
-    /// `findLatestProposedPlan` for the latest run, with the markdown a paged
-    /// projection moved to the plan's turn item.
-    pub fn latest_proposed_plan(&self) -> Option<(&PlanArtifact, &str)> {
-        let plan_item = |plan: &PlanArtifact| {
-            self.turn_items.iter().rev().find(|item| {
-                matches!(item.item_type.as_str(), "proposed_plan" | "todo_list") && item.str("planId") == Some(&plan.id)
-            })
-        };
-        let time = |plan: &PlanArtifact| -> String {
-            if let Some(updated) = plan_item(plan).and_then(|item| item.str("updatedAt")) {
-                return updated.to_owned();
-            }
-            let run = self.runs.iter().find(|run| Some(&run.id) == plan.run_id.as_ref());
-            run.and_then(|run| run.completed_at.clone().or_else(|| run.started_at.clone())).unwrap_or_default()
-        };
-        let latest_run = self.runs.iter().max_by_key(|run| run.ordinal).map(|run| &run.id);
-        let proposed = || self.plans.iter().filter(|plan| plan.kind == "proposed_plan");
-        let in_run = proposed().any(|plan| plan.run_id.as_ref() == latest_run && latest_run.is_some());
-        let plan = proposed()
-            .filter(|plan| !in_run || plan.run_id.as_ref() == latest_run)
-            .max_by(|a, b| time(a).cmp(&time(b)).then_with(|| a.id.cmp(&b.id)))?;
-        let markdown = match plan.markdown.as_str() {
-            "" => plan_item(plan).and_then(|item| item.str("markdown")).unwrap_or_default(),
-            markdown => markdown,
-        };
-        Some((plan, markdown))
     }
 
     /// `threadHasStarted`: it ran, holds items, or has a provider session.
@@ -2167,7 +2102,6 @@ impl ThreadProjection {
             }
             "checkpoint.captured" => upsert(&mut self.checkpoints, Checkpoint::deserialize(payload)?, |c| &c.id),
             "node.updated" => upsert(&mut self.nodes, ExecutionNode::deserialize(payload)?, |n| &n.id),
-            "plan.updated" => upsert(&mut self.plans, PlanArtifact::deserialize(payload)?, |p| &p.id),
             "subagent.updated" => upsert(&mut self.subagents, Subagent::deserialize(payload)?, |a| &a.id),
             "provider-session.attached" | "provider-session.updated" => {
                 upsert(&mut self.provider_sessions, ProviderSession::deserialize(payload)?, |s| &s.id);
@@ -2777,8 +2711,7 @@ mod tests {
         };
         let compacted = projection(json!({}));
         let (usage, live) = compacted.context_window().unwrap();
-        assert_eq!((usage.used_tokens, usage.total_processed_tokens, live), (1200, Some(9000), false));
-        assert_eq!(usage.compacts_automatically, Some(true), "a compaction without counts is skipped");
+        assert_eq!((usage.used_tokens, live), (1200, false), "a compaction without counts is skipped");
         let transfer = |status: &str, strategy: &str| {
             json!({"contextTransfers": [{"type": "fork", "targetThreadId": "t", "sourceThreadId": "src",
                 "sourcePoint": {"runId": "r1"}, "sourceProviderInstanceId": "codex", "status": status,
@@ -2821,29 +2754,6 @@ mod tests {
             None,
             "a child node's failure"
         );
-    }
-
-    #[test]
-    fn latest_proposed_plan_prefers_the_latest_run_and_reads_paged_markdown() {
-        let mut value = projection(&[]);
-        value["runs"] = json!([{"id": "r1", "status": "completed", "ordinal": 1}, {"id": "r2", "status": "completed", "ordinal": 2}]);
-        value["plans"] = json!([
-            {"id": "a", "kind": "proposed_plan", "runId": "r1", "status": "active", "markdown": "# Old"},
-            {"id": "b", "kind": "proposed_plan", "runId": "r2", "status": "active", "markdown": "", "detailInTurnItem": true},
-            {"id": "c", "kind": "todo_list", "runId": "r2", "status": "active", "steps": []}
-        ]);
-        value["turnItems"] = json!([
-            {"id": "i", "type": "proposed_plan", "threadId": "t", "planId": "b", "markdown": "# New", "updatedAt": "2026-01-01T00:00:00Z"}
-        ]);
-        let projection = ThreadProjection::deserialize(&value).unwrap();
-        let (plan, markdown) = projection.latest_proposed_plan().unwrap();
-        assert_eq!((plan.id.as_str(), markdown), ("b", "# New"));
-
-        // Without a plan in the latest run, any run's plan counts.
-        value["plans"] =
-            json!([{"id": "a", "kind": "proposed_plan", "runId": "r1", "status": "superseded", "markdown": "# A"}]);
-        let projection = ThreadProjection::deserialize(&value).unwrap();
-        assert_eq!(projection.latest_proposed_plan().map(|(p, _)| p.status.as_str()), Some("superseded"));
     }
 
     #[test]

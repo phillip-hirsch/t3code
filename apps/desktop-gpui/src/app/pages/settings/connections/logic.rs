@@ -644,10 +644,21 @@ pub(super) fn secret_provider_uses(settings: &Value, provider: &str) -> Vec<Secr
             add(format!("usage-limit:{id}:managementKey:"), format!("{owner} · Management Key"));
         }
     }
-    for host in settings["easDeviceHosts"].as_array().into_iter().flatten() {
-        if reads_from(&host["accessToken"], provider) {
-            let (id, label) = (host["id"].as_str().unwrap_or_default(), host["label"].as_str().unwrap_or_default());
-            add(format!("eas:{id}:accessToken:"), format!("{label} · Access Token"));
+    for (id, generator) in settings["textGenerators"].as_object().unwrap_or(&empty) {
+        if reads_from(&generator["apiKey"], provider) {
+            let owner = generator["label"].as_str().or(generator["baseUrl"].as_str()).unwrap_or_default();
+            add(format!("text-generator:{id}:apiKey:"), format!("{owner} · Api Key"));
+        }
+    }
+    for (hosts, kind, key, field) in [
+        ("easDeviceHosts", "eas", "accessToken", "Access Token"),
+        ("simlockDeviceHosts", "simlock", "agentToken", "Agent Token"),
+    ] {
+        for host in settings[hosts].as_array().into_iter().flatten() {
+            if reads_from(&host[key], provider) {
+                let (id, label) = (host["id"].as_str().unwrap_or_default(), host["label"].as_str().unwrap_or_default());
+                add(format!("{kind}:{id}:{key}:"), format!("{label} · {field}"));
+            }
         }
     }
     uses
@@ -843,7 +854,13 @@ mod tests {
                 "bitbucket": {"apiToken": op("op://bb")},
             },
             "usageLimitSources": {"proxy": {"kind": "cliproxy", "url": "https://proxy", "managementKey": op("op://m")}},
+            "textGenerators": {
+                "openrouter": {"kind": "openaiCompatible", "baseUrl": "https://openrouter.ai/api/v1", "apiKey": op("op://or")},
+                "local": {"kind": "openaiCompatible", "label": "Local", "baseUrl": "http://localhost:11434/v1", "apiKey": ""},
+            },
             "easDeviceHosts": [{"id": "eas", "label": "EAS Simulator", "accessToken": op("op://e")}],
+            "simlockDeviceHosts": [{"kind": "simlock", "id": "pool", "label": "Simlock Pool",
+                "gatewayUrl": "https://simlock.test", "agentToken": op("op://simlock")}],
         });
         let labels: Vec<String> = secret_provider_uses(&settings, "op").into_iter().map(|u| u.label).collect();
         assert_eq!(
@@ -855,7 +872,9 @@ mod tests {
                 "GitHub · github.com",
                 "Bitbucket · API token",
                 "https://proxy · Management Key",
+                "https://openrouter.ai/api/v1 · Api Key",
                 "EAS Simulator · Access Token",
+                "Simlock Pool · Agent Token",
             ]
         );
         assert!(secret_provider_uses(&settings, "missing").is_empty());

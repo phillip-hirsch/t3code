@@ -294,6 +294,8 @@ pub(in crate::app) struct SettingsUi {
     focused_field: Option<fields::FieldFlush>,
     /// Each connected environment's session check, for its `settings:write` grant.
     grants: HashMap<String, (gpui_kit::Task<()>, connections::SessionLoad)>,
+    /// Each environment's text generator model lists, shared by the pickers that offer them.
+    text_generators: providers::TextGeneratorCatalog,
     _search_subscription: Subscription,
 }
 
@@ -353,6 +355,7 @@ impl SettingsUi {
             nav_reveal: Rc::default(),
             focused_field: None,
             grants: HashMap::new(),
+            text_generators: providers::TextGeneratorCatalog::default(),
             _search_subscription: subscription,
         }
     }
@@ -395,7 +398,7 @@ const RESTORE: &[(&str, &[&str])] = &[
     ("Rich text composer", &["composerRichTextEnabled"]),
     ("Send shortcut", &["sendShortcut"]),
     ("Follow-up behavior", &["followUpBehavior"]),
-    ("Context window indicator", &["contextWindowMeterEnabled"]),
+    ("Tool calls in chat", &["toolCallVisibility"]),
     ("Response streaming", &["responseStreamingMode"]),
     ("Provider update checks", &["enableProviderUpdateChecks"]),
     ("Continue threads after restarts", &["continueThreadsAfterServerUpdate"]),
@@ -646,7 +649,20 @@ impl Workspace {
     }
 
     fn settings_results(&self, cx: &gpui_kit::App) -> Vec<&'static SearchItem> {
-        search::search(&self.settings_ui.search.read(cx).value(), search::shipped())
+        let mut results = search::search(&self.settings_ui.search.read(cx).value(), search::shipped());
+        results.retain(|item| self.setting_offered(item));
+        results
+    }
+
+    /// Whether the connected environments offer an item that depends on them
+    /// (`useAvailableSettingsSearchItems`); the rest follow the build (`search::available`).
+    pub(in crate::app) fn setting_offered(&self, item: &SearchItem) -> bool {
+        (!item.fast_worktree_checkout_only
+            || self.sessions.iter().any(|s| s.is_connected() && s.server_info.capability("fastWorktreeCheckout")))
+            && (!item.text_generators_only
+                || self.sessions.iter().any(|s| {
+                    !s.server_info.config.is_null() && providers::text_generators_allowed(&s.server_info.managed_policy)
+                }))
     }
 
     /// Opens the result's section and scrolls its row into view (`handleSearchResultClick`).

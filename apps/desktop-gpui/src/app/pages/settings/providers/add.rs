@@ -1055,75 +1055,7 @@ impl AddProviderWizard {
 impl AddProviderWizard {
     fn render_steps(&self, t: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
         let disabled = self.busy(cx) || self.created.is_some();
-        let steps = self.steps();
-        h_flex()
-            .gap(px(4.))
-            .p(px(4.))
-            .rounded(px(12.))
-            .bg(if t.dark { white(0.04) } else { t.background })
-            .border_1()
-            .border_color(if t.dark { white(0.05) } else { black(0.05) })
-            .children(steps.iter().enumerate().map(|(index, label)| {
-                let current = index == self.step;
-                let done = index < self.step;
-                let badge = div()
-                    .size(px(20.))
-                    .flex_none()
-                    .rounded_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_sm()
-                    .font_weight(FontWeight::MEDIUM)
-                    .border_1()
-                    .map(|badge| {
-                        if done {
-                            badge
-                                .bg(t.primary)
-                                .border_color(t.primary)
-                                .text_color(t.primary_foreground)
-                                .child(Icon::new(IconName::Check).size(px(14.)).text_color(t.primary_foreground))
-                        } else if current {
-                            badge
-                                .bg(t.primary.opacity(0.1))
-                                .border_color(t.primary.opacity(0.3))
-                                .text_color(t.primary)
-                                .child((index + 1).to_string())
-                        } else {
-                            badge
-                                .bg(if t.dark { white(0.05) } else { t.card })
-                                .border_color(if t.dark { white(0.1) } else { black(0.1) })
-                                .text_color(t.muted_foreground)
-                                .child((index + 1).to_string())
-                        }
-                    });
-                h_flex()
-                    .id(SharedString::from(format!("add-provider-step-{label}")))
-                    .flex_1()
-                    .min_w_0()
-                    .gap(px(8.))
-                    .px(px(10.))
-                    .py(px(8.))
-                    .rounded(px(8.))
-                    .when(current, |step| {
-                        step.bg(t.card).border_1().border_color(if t.dark { white(0.05) } else { black(0.05) })
-                    })
-                    .when(!disabled, |step| {
-                        step.cursor_pointer()
-                            .when(!current, |step| step.hover(|s| s.bg(t.card)))
-                            .on_click(cx.listener(move |this, _, window, cx| this.navigate(index, window, cx)))
-                    })
-                    .child(badge)
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(if current { t.foreground } else { t.muted_foreground })
-                            .child(*label),
-                    )
-            }))
+        wizard_steps("add-provider-step", self.steps(), self.step, move |_| !disabled, t, cx, Self::navigate)
     }
 
     fn render_option_grid(
@@ -1619,7 +1551,87 @@ impl Render for AddProviderWizard {
     }
 }
 
-fn panel(t: &Tokens) -> Div {
+/// `WizardSteps`: numbered steps, done ones checked; `enabled` steps navigate on click.
+pub(super) fn wizard_steps<V: 'static>(
+    id_prefix: &'static str,
+    steps: &'static [&'static str],
+    step: usize,
+    enabled: impl Fn(usize) -> bool,
+    t: &Tokens,
+    cx: &mut Context<V>,
+    navigate: fn(&mut V, usize, &mut Window, &mut Context<V>),
+) -> impl IntoElement {
+    h_flex()
+        .gap(px(4.))
+        .p(px(4.))
+        .rounded(px(12.))
+        .bg(if t.dark { white(0.04) } else { t.background })
+        .border_1()
+        .border_color(if t.dark { white(0.05) } else { black(0.05) })
+        .children(steps.iter().enumerate().map(|(index, label)| {
+            let current = index == step;
+            let done = index < step;
+            let badge = div()
+                .size(px(20.))
+                .flex_none()
+                .rounded_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_sm()
+                .font_weight(FontWeight::MEDIUM)
+                .border_1()
+                .map(|badge| {
+                    if done {
+                        badge
+                            .bg(t.primary)
+                            .border_color(t.primary)
+                            .text_color(t.primary_foreground)
+                            .child(Icon::new(IconName::Check).size(px(14.)).text_color(t.primary_foreground))
+                    } else if current {
+                        badge
+                            .bg(t.primary.opacity(0.1))
+                            .border_color(t.primary.opacity(0.3))
+                            .text_color(t.primary)
+                            .child((index + 1).to_string())
+                    } else {
+                        badge
+                            .bg(if t.dark { white(0.05) } else { t.card })
+                            .border_color(if t.dark { white(0.1) } else { black(0.1) })
+                            .text_color(t.muted_foreground)
+                            .child((index + 1).to_string())
+                    }
+                });
+            h_flex()
+                .id(SharedString::from(format!("{id_prefix}-{label}")))
+                .flex_1()
+                .min_w_0()
+                .gap(px(8.))
+                .px(px(10.))
+                .py(px(8.))
+                .rounded(px(8.))
+                .when(current, |step| {
+                    step.bg(t.card).border_1().border_color(if t.dark { white(0.05) } else { black(0.05) })
+                })
+                .when(enabled(index), |step| {
+                    step.cursor_pointer()
+                        .when(!current, |step| step.hover(|s| s.bg(t.card)))
+                        .on_click(cx.listener(move |this, _, window, cx| navigate(this, index, window, cx)))
+                })
+                .child(badge)
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(if current { t.foreground } else { t.muted_foreground })
+                        .child(*label),
+                )
+        }))
+}
+
+pub(super) fn panel(t: &Tokens) -> Div {
     v_flex()
         .min_w_0()
         .gap(px(16.))
@@ -1630,7 +1642,7 @@ fn panel(t: &Tokens) -> Div {
         .border_color(if t.dark { white(0.05) } else { black(0.05) })
 }
 
-fn footer() -> Div {
+pub(super) fn footer() -> Div {
     h_flex().justify_end().gap(px(8.)).px(px(24.)).py(px(16.))
 }
 
@@ -1644,11 +1656,11 @@ pub(super) fn provider_glyph(driver: &str, size: gpui_kit::Pixels, t: &Tokens) -
     }
 }
 
-fn white(alpha: f32) -> Hsla {
+pub(super) fn white(alpha: f32) -> Hsla {
     gpui_kit::hsla(0., 0., 1., alpha)
 }
 
-fn black(alpha: f32) -> Hsla {
+pub(super) fn black(alpha: f32) -> Hsla {
     gpui_kit::hsla(0., 0., 0., alpha)
 }
 

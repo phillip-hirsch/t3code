@@ -356,16 +356,12 @@ where
     }
 
     /// Replace the delegate (item data) for the select state.
-    pub fn set_items(&mut self, items: D, window: &mut Window, cx: &mut Context<Self>)
+    pub fn set_items(&mut self, mut items: D, window: &mut Window, cx: &mut Context<Self>)
     where
         D: SearchableListDelegate + 'static,
     {
         let mut selection = self.state.selection.clone();
         self.state.list.update(cx, |list, cx| {
-            let cursor = list
-                .selected_index()
-                .and_then(|ix| list.delegate().delegate.item(ix))
-                .and_then(|item| items.position(item.value()));
             // A value the new items no longer have is dropped, as
             // `set_selected_value` does, rather than kept at an index that
             // now points at another item.
@@ -380,6 +376,16 @@ where
                 *item = replacement.clone();
                 true
             });
+            // The committed selection indexes every item; the cursor indexes the rows a
+            // search being typed still shows.
+            let query = list.query_input.read(cx).value().trim().to_string();
+            if !query.is_empty() {
+                items.perform_search(&query, window, cx).detach();
+            }
+            let cursor = list
+                .selected_index()
+                .and_then(|ix| list.delegate().delegate.item(ix))
+                .and_then(|item| items.position(item.value()));
             list.delegate_mut().delegate = items;
             list.set_selected_index(cursor, window, cx);
             list.delegate_mut()
@@ -393,6 +399,11 @@ where
     /// Get the current selected index.
     pub fn selected_index(&self, cx: &App) -> Option<IndexPath> {
         self.state.list.read(cx).selected_index()
+    }
+
+    /// Whether the menu is open.
+    pub fn is_open(&self) -> bool {
+        self.state.is_open()
     }
 
     /// Get the current selected value.
@@ -1107,6 +1118,31 @@ mod tests {
             assert_eq!(state.read(cx).selected_value(), None);
             assert!(state.read(cx).state.selection.is_empty());
             assert!(list.read(cx).delegate().selection_snapshot.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn replacing_items_keeps_the_search_being_typed(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| {
+            let items = SearchableVec::new(vec!["Rust", "Go", "C++"]);
+            let state = cx.new(|cx| {
+                SelectState::new(items, Some(IndexPath::new(1)), window, cx).searchable(true)
+            });
+            let list = state.read(cx).state.list.clone();
+            list.update(cx, |list, cx| {
+                list.set_query("Ru", window, cx);
+                list.set_selected_index(Some(IndexPath::new(0)), window, cx);
+            });
+            let replaced = SearchableVec::new(vec!["Ruby", "Rust", "Go", "C++"]);
+            state.update(cx, |state, cx| state.set_items(replaced, window, cx));
+
+            assert_eq!(list.read(cx).query_input.read(cx).value(), "Ru");
+            assert_eq!(list.read(cx).delegate().delegate.items_count(0), 2);
+            assert_eq!(state.read(cx).selected_index(cx), Some(IndexPath::new(1)));
+            assert_eq!(state.read(cx).selected_value(), Some(&"Go"));
+            assert_eq!(state.read(cx).state.selection[0].0, IndexPath::new(2));
         });
     }
 

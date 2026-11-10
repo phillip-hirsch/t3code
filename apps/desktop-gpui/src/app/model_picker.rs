@@ -44,8 +44,19 @@ pub(in crate::app) struct PickHost {
     /// The environment whose providers and model preferences it lists; `None` is the open chat's.
     pub environment: Option<SharedString>,
     pub current: Option<ModelSelection>,
-    pub include: fn(&Provider) -> bool,
+    pub include: Rc<dyn Fn(&Provider) -> bool>,
+    /// `Some` for a settings writing picker: the enabled text generators it offers after the
+    /// environment's providers, in place of every instance a generator owns.
+    pub extra: Option<Rc<[Provider]>>,
     pub on_pick: OnPick,
+}
+
+/// Whether a writing picker drops coding agent `provider`: a text generator owns its id when it
+/// is configured in `configured` (the environment's `textGenerators`), even disabled, or offered
+/// in `extra` (`useTextGenerationTargets`; the server routes that id to the generator).
+pub(in crate::app) fn generator_owns(provider: &Provider, configured: &Value, extra: &[Provider]) -> bool {
+    let id = provider.instance_id.as_str();
+    configured.get(id).is_some() || extra.iter().any(|g| g.instance_id == id)
 }
 
 /// The providers a started thread may continue on when its provider cannot hand off
@@ -169,6 +180,16 @@ impl PickerState {
         self.open = None;
         self.host = None;
     }
+
+    /// Hands picker `id`, while open, its host's latest extra providers: generator models
+    /// arrive after it opens.
+    fn refresh_extra(&mut self, id: &str, extra: &Rc<[Provider]>) {
+        if self.open.as_deref() == Some(id)
+            && let Some(host) = &mut self.host
+        {
+            host.extra = Some(extra.clone());
+        }
+    }
 }
 
 impl Workspace {
@@ -178,6 +199,11 @@ impl Workspace {
 
     pub(super) fn composer_picker_open(&self) -> bool {
         self.picker.open.as_deref() == Some(COMPOSER)
+    }
+
+    /// [`PickerState::refresh_extra`], for each render that rebuilds `id`'s extra providers.
+    pub(in crate::app) fn refresh_picker_extra(&mut self, id: &str, extra: &Rc<[Provider]>) {
+        self.picker.refresh_extra(id, extra);
     }
 
     pub(super) fn open_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -242,7 +268,7 @@ impl Workspace {
 
     /// The driver of `current`'s provider in the open picker's environment.
     fn picker_driver(&self, current: Option<&ModelSelection>) -> &str {
-        let provider = current.and_then(|s| self.picker_info()?.provider(&s.instance_id));
+        let provider = current.and_then(|s| self.picker_provider(&s.instance_id));
         provider.map_or("", |p| p.driver.as_str())
     }
 
@@ -268,6 +294,21 @@ impl Workspace {
             Some(environment) => self.env_info(environment),
             None => Some(self.server_info()),
         }
+    }
+
+    /// The open picker's environment's providers, with its host's extra ones in place of
+    /// instances a text generator owns.
+    fn picker_providers(&self) -> impl Iterator<Item = &Provider> {
+        let extra = self.picker.host.as_ref().and_then(|host| host.extra.as_deref());
+        let listed = self.picker_info().into_iter().flat_map(move |info| {
+            let configured = info.settings.get("textGenerators");
+            info.providers.iter().filter(move |p| extra.is_none_or(|extra| !generator_owns(p, configured, extra)))
+        });
+        listed.chain(extra.into_iter().flatten())
+    }
+
+    fn picker_provider(&self, instance_id: &str) -> Option<&Provider> {
+        self.picker_providers().find(|p| p.instance_id == instance_id)
     }
 
     /// The providers the open picker offers: its host's, else those the open thread may continue on.
@@ -318,13 +359,8 @@ impl Workspace {
     /// The composer model's effort-column stops.
     fn picker_effort_stops(&self) -> Vec<EffortStop> {
         let Some(current) = self.composer_model() else { return Vec::new() };
-        let descriptors = self
-            .server_info()
-            .model(&current)
-            .and_then(|m| m.capabilities.as_ref())
-            .map(|c| c.option_descriptors.as_slice())
-            .unwrap_or_default();
-        let controls = effort_controls(descriptors, self.picker_driver(Some(&current)), self.composer_ultrathink);
+        let descriptors = self.composer_descriptors(&current);
+        let controls = effort_controls(&descriptors, self.picker_driver(Some(&current)), self.composer_ultrathink);
         effort_stops(&controls, &current)
     }
 
@@ -488,7 +524,7 @@ impl Workspace {
                 .filter(move |m| !Self::model_hidden(info, p, m) && (ready || kept_unavailable(p, m)))
                 .map(move |m| (p, m))
         };
-        let providers = info.providers.iter().filter(|p| self.picker_includes(p));
+        let providers = self.picker_providers().filter(|p| self.picker_includes(p));
         if !self.picker.query.is_empty() {
             let mut scored: Vec<(i64, bool, usize, Row)> = providers
                 .flat_map(models)
@@ -606,9 +642,7 @@ impl Workspace {
         let tab = self.picker_tab(current.as_ref());
         let tabs: Vec<Tab> = std::iter::once(Tab::Favorites)
             .chain(
-                self.picker_info()
-                    .into_iter()
-                    .flat_map(|info| info.providers.iter())
+                self.picker_providers()
                     .filter(|p| p.enabled && self.picker_includes(p))
                     .filter(|p| p.availability.as_deref() != Some("unavailable") && p.status == "ready")
                     .map(|p| Tab::Provider(p.instance_id.clone())),
@@ -647,8 +681,8 @@ impl Workspace {
             (Some(selection), None) => selection.model.clone().into(),
             (None, None) => "Choose model".into(),
         };
-        let descriptors =
-            model.and_then(|m| m.capabilities.as_ref()).map(|c| c.option_descriptors.as_slice()).unwrap_or_default();
+        let descriptors = current.as_ref().map(|s| self.composer_descriptors(s)).unwrap_or_default();
+        let descriptors = descriptors.as_ref();
         let ultrathink = model_label::ultrathink_select(descriptors, self.composer_ultrathink)
             .is_some_and(|primary| model_label::reasoning(descriptors).is_some_and(|r| r.id == primary.id));
         let effort = if ultrathink {
@@ -694,9 +728,7 @@ impl Workspace {
     pub(super) fn render_model_picker(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let current = self.composer_model();
         let provider = current.as_ref().and_then(|s| self.server_info().provider(&s.instance_id));
-        let model = current.as_ref().and_then(|s| self.server_info().model(s));
-        let descriptors =
-            model.and_then(|m| m.capabilities.as_ref()).map(|c| c.option_descriptors.as_slice()).unwrap_or_default();
+        let descriptors = current.as_ref().map(|s| self.composer_descriptors(s)).unwrap_or_default();
         let (name, effort, speed, ultracode) = self.trigger_labels();
         let fanout = self.model_fanout();
         let label: SharedString =
@@ -778,7 +810,7 @@ impl Workspace {
                         )
                     }),
             );
-        let body = open.then(|| self.render_picker_body(current.as_ref(), &name, Some(descriptors), t, cx));
+        let body = open.then(|| self.render_picker_body(current.as_ref(), &name, Some(&descriptors), t, cx));
         self.picker_popover(COMPOSER.into(), trigger, Anchor::BottomRight, None, body, cx)
     }
 
@@ -1037,7 +1069,7 @@ impl Workspace {
 
     /// `ChatGptSharingControl`: why a managed ChatGPT connection has no Fast or Ultrafast.
     fn render_chatgpt_sharing(&self, current: Option<&ModelSelection>, t: &Tokens) -> Option<AnyElement> {
-        let provider = current.and_then(|s| self.picker_info()?.provider(&s.instance_id))?;
+        let provider = current.and_then(|s| self.picker_provider(&s.instance_id))?;
         if !super::pages::settings::uses_chatgpt_sharing(&provider.auth) {
             return None;
         }
@@ -1090,8 +1122,7 @@ impl Workspace {
                 this.picker.highlighted = None;
                 cx.notify();
             }));
-        let listed = self.picker_info().into_iter().flat_map(|info| info.providers.iter());
-        let providers = listed.filter(|p| p.enabled && self.picker_includes(p)).map(|p| {
+        let providers = self.picker_providers().filter(|p| p.enabled && self.picker_includes(p)).map(|p| {
             let ready = p.availability.as_deref() != Some("unavailable") && p.status == "ready";
             // A provider needing setup opens its tab, which offers the setup.
             let selectable = ready || (self.picker.host.is_none() && offers_setup(p));
@@ -1814,6 +1845,32 @@ mod tests {
         assert_eq!(effort_entry(&switches, false), None, "a pick lands only on levels");
         assert_eq!(effort_entry(&switches, true), Some(0), "ArrowRight takes any stop");
         assert_eq!(effort_entry(&[], true), None);
+    }
+
+    #[test]
+    fn an_open_picker_takes_its_hosts_latest_extra_providers() {
+        let generator = |models: Value| -> Rc<[Provider]> {
+            let provider = json!({"instanceId": "g", "driver": "openai", "models": models});
+            Rc::from([serde_json::from_value::<Provider>(provider).unwrap()])
+        };
+        let loading = generator(json!([]));
+        let loaded = generator(json!([{"slug": "m"}]));
+        let host = PickHost {
+            environment: None,
+            current: None,
+            include: Rc::new(|_: &Provider| true),
+            extra: Some(loading.clone()),
+            on_pick: Rc::new(|_, _, _, _| {}),
+        };
+        let mut state = PickerState { open: Some("writer".into()), host: Some(host), ..PickerState::default() };
+        let models = |state: &PickerState| state.host.as_ref().unwrap().extra.as_ref().unwrap()[0].models.len();
+        state.refresh_extra("other", &loaded);
+        assert_eq!(models(&state), 0, "another picker's render leaves it alone");
+        state.refresh_extra("writer", &loaded);
+        assert_eq!(models(&state), 1, "models discovered after opening are listed");
+        state.dismiss();
+        state.refresh_extra("writer", &loading);
+        assert!(state.host.is_none(), "a closed picker gets no host back");
     }
 
     #[test]

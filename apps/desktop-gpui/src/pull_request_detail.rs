@@ -1648,6 +1648,7 @@ pub fn checkout_command(provider: &str, number: u64) -> Option<String> {
         "github" => Some(format!("gh pr checkout {number}")),
         "gitlab" => Some(format!("glab mr checkout {number}")),
         "azure-devops" => Some(format!("az repos pr checkout --id {number}")),
+        "cursor-origin" => Some(format!("origin pr checkout {number}")),
         _ => None,
     }
 }
@@ -2409,8 +2410,23 @@ fn route_match(segments: &[&str], route: &[&[&str]], repository: impl Fn(&[&str]
     })
 }
 
-/// `sourceControlClients.parseChangeRequestUrl`: the git.cafe and Azure DevOps routes claim a link
-/// first, then `/pull/`, `/-/merge_requests/`, `/pulls/` and Bitbucket's `/pull-requests/`.
+/// Cursor Origin's git host, which its projects key under; its browser pages live on cursor.com.
+const CURSOR_ORIGIN_GIT_HOST: &str = "origin.cursor.com";
+pub const CURSOR_ORIGIN_WEB_BASE_URL: &str = "https://cursor.com/codebase";
+
+/// Cursor Origin's `/codebase/{owner}/{repo}/pull/{number}`, with anything after the number.
+fn cursor_origin_route(segments: &[&str]) -> Option<(String, u64)> {
+    let ["codebase", owner, repo, "pull", number, ..] = segments else { return None };
+    if owner.is_empty() || repo.is_empty() || number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let number: u64 = number.parse().ok().filter(|n| (1..=9_007_199_254_740_991).contains(n))?;
+    Some((format!("{owner}/{repo}"), number))
+}
+
+/// `sourceControlClients.parseChangeRequestUrl`: the git.cafe, Cursor Origin and Azure DevOps
+/// routes claim a link first, then `/pull/`, `/-/merge_requests/`, `/pulls/` and Bitbucket's
+/// `/pull-requests/`.
 pub fn parse_change_request(url: &str) -> Option<ChangeRequestLink> {
     let parsed = url::Url::parse(url.trim()).ok()?;
     if !matches!(parsed.scheme(), "http" | "https") {
@@ -2428,6 +2444,17 @@ pub fn parse_change_request(url: &str) -> Option<ChangeRequestLink> {
     let azure = |repo: &[&str]| repo.len() >= 2 && repo[repo.len() - 2] == "_git";
     let bitbucket = hostname == "bitbucket.org" || hostname.split('.').any(|label| label == "bitbucket");
     let gitcafe = matches!(hostname.as_str(), "git.cafe" | "staging.git.cafe");
+    if matches!(hostname.as_str(), "cursor.com" | "www.cursor.com")
+        && let Some((repository, number)) = cursor_origin_route(&segments)
+    {
+        return Some(ChangeRequestLink {
+            provider: "cursor-origin",
+            host: CURSOR_ORIGIN_GIT_HOST.to_owned(),
+            repository_url: format!("{CURSOR_ORIGIN_WEB_BASE_URL}/{repository}"),
+            repository: repository.to_lowercase(),
+            number,
+        });
+    }
     let (provider, host, (repository, number)) = None
         .or_else(|| {
             gitcafe
@@ -3194,6 +3221,23 @@ mod tests {
             parse_change_request("https://github.com/Acme/App/pull/12?x=1").map(|l| l.repository_url),
             Some("https://github.com/Acme/App".into())
         );
+        for url in [
+            "https://cursor.com/codebase/Acme.Team/Web-App/pull/42",
+            "http://www.cursor.com/codebase/Acme.Team/Web-App/pull/42/files?w=1#diff",
+        ] {
+            let link = parse_change_request(url).expect(url);
+            assert_eq!(
+                (link.provider, link.host.as_str(), link.repository.as_str(), link.number),
+                ("cursor-origin", "origin.cursor.com", "acme.team/web-app", 42),
+                "Cursor Origin reads under its git host, not as GitHub's /pull/: {url}"
+            );
+        }
+        assert_eq!(
+            parse_change_request("https://cursor.com/codebase/acme/web/pull/42").map(|l| l.repository_url),
+            Some("https://cursor.com/codebase/acme/web".into())
+        );
+        assert_eq!(parse("https://cursor.com/codebase/acme/web"), None);
+        assert_eq!(parse("https://www.cursor.com/updates/pull/42"), None);
         assert_eq!(parse("https://github.com/acme/app/issues/12"), None);
         assert_eq!(parse("https://github.com/acme/app/pull/12x"), None);
         assert_eq!(parse("https://github.com/acme/app/pull/0"), None);

@@ -578,6 +578,16 @@ their own width with `min-w-(--anchor-width) max-w-(--available-width)`; 0.9.0's
 `menu_width` used that width alone, so a wide trigger had a narrower popup. In `src/select.rs` a
 set width is at least the trigger's and at most the window's less the 8px margins.
 
+**A select says whether its menu is open.** The scheduled task editor's Destination picker
+replaces its rows in recency order only while the menu is closed, so rows don't move under the
+cursor. 0.9.0 keeps the open state private; `src/select.rs` adds `SelectState::is_open`.
+
+**Replacing a select's items keeps the search being typed.** The Destination picker replaces its
+rows when a thread is added, removed or renamed, even while its menu is open. 0.9.0's
+`SelectState::set_items` shows every new row while the typed query stays in the search field;
+`src/select.rs` runs the query over the new items before showing them. Test:
+`replacing_items_keeps_the_search_being_typed`.
+
 **Switches can be mixed.** gpui-base's `Switch` reports only on or off; `src/switch.rs` (in
 gpui-base) adds `mixed`, exposed as `aria-checked="mixed"` like the web's mixed `Switch`.
 

@@ -1,5 +1,6 @@
 //! Settings › Providers (`apps/web/src/components/settings/ProviderSettingsPanel.tsx`): the
-//! provider instances listed beside the selected one's editor, then Advanced.
+//! provider instances listed beside the selected one's editor, usage hubs, text generators, then
+//! Advanced.
 //!
 //! The native client talks to one environment, which is the web's single-primary-device case, so
 //! there are no device tabs. Advanced uses the shared settings rows; everything else here is
@@ -17,6 +18,8 @@ mod codex_callback;
 mod drivers;
 mod instances;
 mod models;
+mod text_generators;
+pub(super) use text_generators::{TextGeneratorCatalog, text_generators_allowed, writing_providers};
 mod usage_sources;
 
 use std::collections::{HashMap, HashSet};
@@ -386,10 +389,13 @@ impl Workspace {
             })
             .child(card);
         let content = [
-            providers.into_any_element(),
-            self.render_usage_limit_sources(cx),
-            self.render_providers_advanced(window, cx).into_any_element(),
-        ];
+            Some(providers.into_any_element()),
+            Some(self.render_usage_limit_sources(cx)),
+            self.render_text_generators(cx),
+            Some(self.render_providers_advanced(window, cx).into_any_element()),
+        ]
+        .into_iter()
+        .flatten();
         self.settings_page("providers", &view, content, cx)
     }
 

@@ -14,6 +14,7 @@
       "logsAfterDays": null
     },
     "worktreesDirectory": "",
+    "fastWorktreeCheckout": false,
     "previousWorktreesDirectories": [],
     "responseStreamingMode": "paragraph",
     "enableProviderUpdateChecks": true,
@@ -119,6 +120,7 @@
     },
     "sourceControlHosts": {},
     "usageLimitSources": {},
+    "textGenerators": {},
     "secretProviders": {},
     "usagePriceOverrides": {},
     "usageModelAliases": {}
@@ -171,8 +173,6 @@
     "providerModelPreferences": {},
     "pullRequestMergeMethodOverrides": {},
     "pullRequestLinksOpenInApp": true,
-    "planModeEnabled": false,
-    "contextWindowMeterEnabled": false,
     "composerRichTextEnabled": true,
     "sendShortcut": "enter",
     "followUpBehavior": "steer",
@@ -183,7 +183,6 @@
     "toolCallVisibility": "showAll",
     "threadDetailsUsageEnabled": false,
     "threadDetailsItems": {},
-    "legacySidebarEnabled": false,
     "sidebarWorkingShelfEnabled": true,
     "sidebarProjectGroupingMode": "repository",
     "sidebarProjectGroupingOverrides": {},
@@ -481,20 +480,21 @@
       "id": "boring-sidebar",
       "title": "Boring sidebar (group by project)",
       "to": "labs",
-      "searchTerms": ["beta folders project tree legacy old classic sidebar"]
+      "searchTerms": ["beta folders project tree classic sidebar"]
     },
     {
       "id": "boring-sidebar-multiline",
       "title": "Two-line folder rows",
       "to": "labs",
+      "targetId": "boring-sidebar",
       "searchTerms": ["beta boring sidebar folder rows multiline branch pull request details"]
     },
     {
       "id": "tool-call-visibility",
       "title": "Tool calls in chat",
-      "to": "labs",
+      "to": "chat",
       "searchTerms": [
-        "beta hide tool calls commands edits searches work log activity quiet chat zen final answers only"
+        "hide tool calls commands edits searches work log activity quiet chat zen final answers only"
       ]
     },
     {
@@ -519,6 +519,14 @@
       "searchTerms": [
         "beta alpha simlock callstack simulator emulator ios android pool lease gateway"
       ]
+    },
+    {
+      "id": "worktree-fast-checkout",
+      "title": "Fast worktree checkout",
+      "to": "labs",
+      "scope": "environment",
+      "fastWorktreeCheckoutOnly": true,
+      "searchTerms": ["beta fast worktree checkout clone apfs copy-on-write cache macos speed"]
     },
     {
       "id": "auto-settle-inactive-threads",
@@ -794,18 +802,6 @@
       "id": "open-source-licenses",
       "title": "Open source licenses",
       "to": "about"
-    },
-    {
-      "id": "legacy-plan-mode",
-      "title": "Plan mode (legacy)",
-      "to": "labs",
-      "searchTerms": ["build plan composer old"]
-    },
-    {
-      "id": "legacy-context-window-indicator",
-      "title": "Context window indicator (legacy)",
-      "to": "labs",
-      "searchTerms": ["composer meter usage tokens circle old"]
     },
     {
       "id": "keybindings",
@@ -1475,6 +1471,16 @@
         "usage sources CLIProxyAPI CLI proxy hub quota subscription limits management key add remove"
       ],
       "providerSettingsOnly": true
+    },
+    {
+      "id": "text-generators",
+      "title": "Text generators",
+      "to": "providers",
+      "searchTerms": [
+        "model api api key openai openrouter anthropic ollama lm studio custom endpoint base url thread titles commit messages"
+      ],
+      "providerSettingsOnly": true,
+      "textGeneratorsOnly": true
     },
     {
       "id": "provider-health-check-interval",

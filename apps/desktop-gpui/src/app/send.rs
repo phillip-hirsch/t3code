@@ -11,7 +11,6 @@ use serde_json::{Value, json};
 
 use super::attachments::ATTACHMENT_ONLY_PROMPT;
 use super::composer::ComposerDraft;
-use super::composer_plan;
 use super::{Target, Workspace, draft_title, new_id};
 use crate::model::{ModelSelection, ThreadProjection};
 use crate::new_thread::{self, DraftWorkspace};
@@ -130,8 +129,6 @@ struct ThreadMessage<'a> {
     dispatch: (Value, Option<&'static str>),
     /// Omitted, the server keeps the thread's own model.
     model: Option<&'a ModelSelection>,
-    /// The plan a build-mode follow-up implements.
-    source_plan: Option<&'a str>,
     /// Starts a new provider session without the thread's earlier context (`/clear`).
     fresh_context: bool,
 }
@@ -158,9 +155,6 @@ impl ThreadMessage<'_> {
         }
         if let Some(context) = self.context {
             command["context"] = context;
-        }
-        if let Some(plan_id) = self.source_plan {
-            command["sourcePlanRef"] = json!({"threadId": self.thread_id, "planId": plan_id});
         }
         if self.fresh_context {
             command["freshContext"] = true.into();
@@ -236,17 +230,7 @@ impl Workspace {
         }
         // Read once: an arm made while this send is in flight belongs to the next message.
         let fresh_arm = self.fresh_session_arm().filter(|_| fresh_session);
-        let (plan_ui, interaction_mode) = self.interaction_mode();
-        // `/plan` or `/default` alone switches modes without sending.
-        if let Some(mode) =
-            composer_plan::standalone_slash_command(&text).filter(|_| plan_ui && !self.has_attachments())
-        {
-            self.set_composer_text("", window, cx);
-            self.set_interaction_mode(mode, window, cx);
-            return;
-        }
-        let follow_up = self.plan_follow_up_target().filter(|_| fresh_arm.is_none());
-        if (text.is_empty() && !self.has_attachments() && follow_up.is_none())
+        if (text.is_empty() && !self.has_attachments())
             || self.sending
             || self.target_rewinding()
             || self.runtime_mode_ceiling().is_some()
@@ -282,23 +266,17 @@ impl Workspace {
         let mut settings_commands = Vec::new();
         // A stale Claude session compacts first, then this message queues behind that run.
         let mut compact_command = None;
-        let mut sent_mode = None;
         let mut pending_send = None;
         let (method, mut payload, new_thread_id, workspace) = match target {
             Target::Thread { id: thread_id, .. } => {
-                // A plan follow-up refines in plan mode, or implements in build mode (`resolvePlanFollowUpSubmission`).
-                let (message_text, interaction_mode) = match &follow_up {
-                    Some((_, markdown)) => composer_plan::plan_follow_up(&text, markdown),
-                    None => (message_text, interaction_mode),
-                };
-                settings_commands.extend(self.interaction_mode_command(&thread_id, interaction_mode));
-                sent_mode = Some(interaction_mode);
+                settings_commands.extend(self.interaction_mode_command(&thread_id));
                 let projection = self.thread.as_ref().and_then(|t| t.state.projection.as_ref());
                 let running = projection.is_some_and(super::super::model::ThreadProjection::is_running);
                 let can_steer = !projection.is_some_and(super::super::model::ThreadProjection::is_compacting);
+                let model = self.dispatch_model();
                 // Feedback answers an approval, so there is no turn to compact before.
                 let compacts = !text_is_feedback && self.compacts_before_send(&text, fresh_arm.is_some());
-                compact_command = compacts.then(|| compact_before(&thread_id, self.model_override.as_ref()));
+                compact_command = compacts.then(|| compact_before(&thread_id, model.as_ref()));
                 let command = ThreadMessage {
                     thread_id: &thread_id,
                     text: message_text,
@@ -310,11 +288,7 @@ impl Workspace {
                         running || compacts,
                         compacts || fresh_arm.is_some() || queues(self.follow_up_behavior(), intent, can_steer),
                     ),
-                    model: self.model_override.as_ref(),
-                    source_plan: follow_up
-                        .as_ref()
-                        .filter(|_| interaction_mode == "default")
-                        .map(|(plan_id, _)| plan_id.as_str()),
+                    model: model.as_ref(),
                     fresh_context: fresh_arm.is_some(),
                 }
                 .command();
@@ -377,7 +351,7 @@ impl Workspace {
                     "generateTitle": true,
                     "modelSelection": model.to_json(),
                     "runtimeMode": self.runtime_mode(),
-                    "interactionMode": interaction_mode,
+                    "interactionMode": "default",
                     "workspaceStrategy": strategy.unwrap_or_else(|| json!({"type": "root"})),
                     "initialMessage": initial,
                 });
@@ -444,9 +418,6 @@ impl Workspace {
                         }
                         if fresh_arm.is_some() {
                             this.disarm_fresh_session(&origin, fresh_arm);
-                        }
-                        if let Some(mode) = sent_mode {
-                            this.remember_interaction_mode(origin.clone(), mode);
                         }
                         this.record_prompt_sent(window, cx);
                         if new_thread_id.is_some() {
@@ -529,8 +500,7 @@ impl Workspace {
             None if !held => return,
             None => commands.push(queue_resume()),
             Some(run) => {
-                let (_, mode) = self.interaction_mode();
-                commands.extend(self.interaction_mode_command(&thread_id, mode));
+                commands.extend(self.interaction_mode_command(&thread_id));
                 let mut message = json!({
                     "type": "message.dispatch",
                     "commandId": new_id(),
@@ -543,7 +513,7 @@ impl Workspace {
                     "attachments": [],
                     "dispatchMode": {"type": "start_immediately"},
                 });
-                if let Some(model) = &self.model_override {
+                if let Some(model) = self.dispatch_model() {
                     message["modelSelection"] = model.to_json();
                 }
                 commands.push(message);
@@ -603,7 +573,7 @@ mod tests {
 
     #[test]
     fn a_thread_message_carries_what_the_server_reads() {
-        fn message<'a>(model: Option<&'a ModelSelection>, source_plan: Option<&'a str>) -> ThreadMessage<'a> {
+        fn message(model: Option<&ModelSelection>) -> ThreadMessage<'_> {
             ThreadMessage {
                 thread_id: "t1",
                 text: "hi".into(),
@@ -611,7 +581,6 @@ mod tests {
                 context: Some(json!({"version": 1, "records": []})),
                 dispatch: dispatch_fields(true, queues("steer", Intent::Foreground, true)),
                 model,
-                source_plan,
                 fresh_context: false,
             }
         }
@@ -622,7 +591,7 @@ mod tests {
             command
         };
         assert_eq!(
-            without_ids(message(None, None).command()),
+            without_ids(message(None).command()),
             json!({
                 "type": "message.dispatch", "createdBy": "user", "creationSource": "web", "threadId": "t1",
                 "text": "hi", "attachments": [{"id": "a1"}], "dispatchMode": {"type": "start_immediately"},
@@ -630,17 +599,16 @@ mod tests {
             })
         );
         let model = ModelSelection { instance_id: "codex".into(), model: "gpt".into(), options: None };
-        let command = message(Some(&model), Some("p1")).command();
+        let command = message(Some(&model)).command();
         assert_eq!(command["modelSelection"], model.to_json());
-        assert_eq!(command["sourcePlanRef"], json!({"threadId": "t1", "planId": "p1"}));
         let queued = ThreadMessage {
             dispatch: dispatch_fields(true, queues("queue", Intent::Foreground, true)),
-            ..message(None, None)
+            ..message(None)
         };
         let queued = queued.command();
         assert!(queued.get("deliveryIntent").is_none(), "a queued message has no delivery intent");
         assert!(queued.get("freshContext").is_none());
-        let fresh = ThreadMessage { fresh_context: true, ..message(None, None) };
+        let fresh = ThreadMessage { fresh_context: true, ..message(None) };
         assert_eq!(fresh.command()["freshContext"], true);
     }
 

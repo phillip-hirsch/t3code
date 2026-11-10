@@ -355,11 +355,12 @@ fn project_overrides(settings: &Settings, project: Option<&Project>) -> Map<Stri
     let mut resolved = Map::new();
     for key in &contract().project_scoped_keys {
         let Some(value) = overrides.remove(key) else { continue };
+        let enabled = |instance: &str| match key.as_str() {
+            "textGenerationModelSelection" => text_generation_selection_enabled(settings, project_id, instance),
+            _ => provider_instance_enabled(settings, project_id, instance),
+        };
         let names_disabled_instance = matches!(key.as_str(), "textGenerationModelSelection" | "defaultModelSelection")
-            && value
-                .get("instanceId")
-                .and_then(Value::as_str)
-                .is_some_and(|instance| !provider_instance_enabled(settings, project_id, instance));
+            && value.get("instanceId").and_then(Value::as_str).is_some_and(|instance| !enabled(instance));
         if !names_disabled_instance {
             resolved.insert(key.clone(), value);
         }
@@ -402,6 +403,15 @@ pub fn provider_instance_enabled(settings: &Settings, project_id: Option<&str>, 
         Some(config) => instance_enabled(config),
         // `isUnconfiguredDefaultInstanceEnabled`.
         None => matches!(instance, "codex" | "claudeAgent"),
+    }
+}
+
+/// `resolveTextGenerationSelectionEnabled`: a text generator by that id decides, ahead of any
+/// provider instance.
+pub fn text_generation_selection_enabled(settings: &Settings, project_id: Option<&str>, instance: &str) -> bool {
+    match settings.get("textGenerators").get(instance) {
+        Some(generator) => generator.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+        None => provider_instance_enabled(settings, project_id, instance),
     }
 }
 
@@ -1116,6 +1126,19 @@ mod tests {
         }));
         let target = resolve_project_settings("env-1", &s, Some(&project("p1")), None);
         assert_eq!(target.source("defaultModelSelection"), Source::Environment);
+
+        // A text generator names no provider instance; its own switch decides.
+        let generator = |enabled: bool| {
+            settings(json!({
+                "projectSettingsFolded": true,
+                "textGenerators": {"openrouter": {"kind": "openaiCompatible", "baseUrl": "https://openrouter.ai/api/v1", "enabled": enabled}},
+                "projectSettingsOverrides": {"p1": {"textGenerationModelSelection": {"instanceId": "openrouter", "model": "m"}}},
+            }))
+        };
+        let on = resolve_project_settings("env-1", &generator(true), Some(&project("p1")), None);
+        assert_eq!(on.source("textGenerationModelSelection"), Source::Project);
+        let off = resolve_project_settings("env-1", &generator(false), Some(&project("p1")), None);
+        assert_eq!(off.source("textGenerationModelSelection"), Source::Environment);
     }
 
     #[test]

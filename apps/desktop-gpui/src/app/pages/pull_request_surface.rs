@@ -425,6 +425,7 @@ fn stack_tip(link: &PullRequestLink, native: bool, size: usize) -> String {
             "github" => "GitHub",
             "gitlab" => "GitLab",
             "gitcafe" => "GitCafe",
+            "cursor-origin" => "Cursor Origin",
             "forgejo" => "Forgejo",
             "bitbucket" => "Bitbucket",
             "azure-devops" => "Azure DevOps",
