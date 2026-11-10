@@ -169,6 +169,53 @@ pub(crate) fn sorted_by_readiness(discovery: Option<&Value>, surface: Surface) -
     hosts
 }
 
+/// `NewProjectPublishTarget`: a ready host a new project can publish to, and the owner its
+/// repository goes under (`None` names the host's own default).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PublishTarget {
+    pub host: &'static HostDefinition,
+    pub owner: Option<String>,
+}
+
+/// `newRepositoryOwner(account)`: where a host puts a new repository, or `None` for a host that
+/// needs more than an account to place one (a workspace, a project).
+fn new_repository_owner(kind: &str, account: Option<&str>) -> Option<Option<String>> {
+    match kind {
+        "github" | "gitlab" | "cursor-origin" => Some(account.map(str::to_owned)),
+        "forgejo" | "gitcafe" => account.map(|account| Some(account.to_owned())),
+        _ => None,
+    }
+}
+
+/// `getNewProjectPublishTargets`: the ready hosts, in registry order, that can place a repository.
+pub(crate) fn new_project_publish_targets(discovery: Option<&Value>) -> Vec<PublishTarget> {
+    HOSTS
+        .iter()
+        .filter(|host| readiness(discovery, host.kind, Surface::AddProject).ready)
+        .filter_map(|host| {
+            let owner = new_repository_owner(host.kind, auth_account(discovery, host.kind))?;
+            Some(PublishTarget { host, owner })
+        })
+        .collect()
+}
+
+/// `getNewProjectPublishTarget`: the picked host while it is a target, else the first.
+pub(crate) fn new_project_publish_target<'a>(
+    targets: &'a [PublishTarget],
+    kind: Option<&str>,
+) -> Option<&'a PublishTarget> {
+    targets.iter().find(|target| Some(target.host.kind) == kind).or_else(|| targets.first())
+}
+
+/// `getNewProjectRepository`: `owner/folder` for the project's folder, or the folder alone.
+pub(crate) fn new_project_repository(owner: Option<&str>, workspace_root: &str) -> String {
+    let folder = workspace_root.split(['/', '\\']).rfind(|segment| !segment.is_empty()).unwrap_or_default();
+    match owner {
+        Some(owner) if !owner.is_empty() => format!("{owner}/{folder}"),
+        _ => folder.to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -247,6 +294,27 @@ mod tests {
         let kinds: Vec<_> =
             sorted_by_readiness(Some(&discovery), Surface::Publish).iter().map(|host| host.kind).collect();
         assert_eq!(kinds, ["bitbucket", "gitlab", "azure-devops", "cursor-origin", "forgejo", "gitcafe", "github"]);
+    }
+
+    #[test]
+    fn new_projects_publish_to_ready_hosts_that_can_place_a_repository() {
+        let discovery = json!({"sourceControlProviders": [
+            item("github", "available", signed_in("octo")),
+            item("gitlab", "available", json!({"status": "unknown", "account": {"_tag": "None"}})),
+            item("forgejo", "available", json!({"status": "unknown", "account": {"_tag": "None"}})),
+            item("bitbucket", "available", signed_in("me")),
+            item("gitcafe", "missing", signed_in("me")),
+        ]});
+        let targets = new_project_publish_targets(Some(&discovery));
+        let found: Vec<_> = targets.iter().map(|t| (t.host.kind, t.owner.as_deref())).collect();
+        // Forgejo needs an account to place one, Bitbucket a workspace, and GitCafe is not installed.
+        assert_eq!(found, [("github", Some("octo")), ("gitlab", None)]);
+        assert!(new_project_publish_targets(None).is_empty(), "nothing before discovery answers");
+        assert_eq!(new_project_publish_target(&targets, Some("gitlab")).map(|t| t.host.kind), Some("gitlab"));
+        assert_eq!(new_project_publish_target(&targets, Some("forgejo")).map(|t| t.host.kind), Some("github"));
+        assert_eq!(new_project_publish_target(&[], None), None);
+        assert_eq!(new_project_repository(Some("octo"), "/home/me/T3 Projects/my-app/"), "octo/my-app");
+        assert_eq!(new_project_repository(None, "C:\\T3 Projects\\my-app"), "my-app");
     }
 
     #[test]

@@ -39,7 +39,7 @@ impl Workspace {
     }
 
     /// The environment's discovery, once [`Self::load_palette_discovery`] answered for it.
-    fn palette_discovery(&self, environment: &str) -> Option<&Value> {
+    pub(super) fn palette_discovery(&self, environment: &str) -> Option<&Value> {
         let (env, discovery) = self.palette.as_ref()?.discovery.as_ref()?;
         (env == environment).then_some(discovery.as_ref()).flatten()
     }
@@ -69,11 +69,13 @@ impl Workspace {
         }));
     }
 
-    /// `buildAddProjectSourceGroups`: Local folder, Git URL, then each host, ready ones first;
-    /// one that is not set up is listed dimmed with Setup Required.
+    /// `buildAddProjectSourceGroups`: New project where the machine has a folder for them, Local
+    /// folder, Git URL, then each host, ready ones first; one that is not set up is listed dimmed
+    /// with Setup Required.
     pub(super) fn add_project_source_rows(&self, environment: SharedString) -> Vec<Row> {
         let discovery = self.palette_discovery(&environment);
-        let mut rows = vec![local_folder_row(environment.clone())];
+        let mut rows: Vec<Row> = self.new_project_source_row(&environment).into_iter().collect();
+        rows.push(local_folder_row(environment.clone()));
         let url = Run::CloneFrom(environment.clone(), None);
         let mut row =
             Row::new(format!("add-project:{environment}:url"), RowIcon::Lucide(IconName::Link), "Git URL", url);

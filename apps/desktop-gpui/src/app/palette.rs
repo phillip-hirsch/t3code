@@ -2,11 +2,11 @@
 //! recent threads, search over threads, projects and settings, message hits,
 //! "New thread in…", and the add-project flow (browse a folder, or pick one
 //! with the native dialog, then `projects.mutate`; or clone a Git URL or a host's repository,
-//! then `projectClone.start`).
+//! then `projectClone.start`), and New project (`projects.createNew`).
 //!
 //! Go to file and Search project contents open the child searches in `files/`.
-//! Actions this client has no surface for yet (guest sharing, new project, WSL folders) are left
-//! out, and the theme list has no environment-published themes.
+//! Actions this client has no surface for yet (guest sharing, WSL folders) are left out, and the
+//! theme list has no environment-published themes.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -40,6 +40,7 @@ use crate::search::{self, Field, Weighted};
 use crate::theme::Tokens;
 
 mod clone_flow;
+mod new_project;
 
 const RECENT_LIMIT: usize = 12;
 const THREAD_LIMIT: usize = 20;
@@ -151,6 +152,8 @@ pub(super) enum View {
     Browse,
     /// A clone source's repository field, then where to clone it ([`Palette::clone`]).
     Clone,
+    /// New project's name, machine and repository option ([`Palette::new_project`]).
+    NewProject,
     /// "Change theme" (`theme.select`).
     Themes,
     /// "Change appearance".
@@ -175,6 +178,16 @@ enum Run {
     BrowseIn(SharedString),
     /// "Git URL" (`None`) or a host's repository: clone on this environment (`startAddProjectClone`).
     CloneFrom(SharedString, Option<&'static str>),
+    /// The root's "New project" (`openNewProjectFlow`).
+    NewProject,
+    /// A machine's "New project" source (`startNewProject`).
+    NewProjectIn(SharedString),
+    /// New project's machine.
+    NewProjectMachine(SharedString),
+    /// New project's private repository toggle.
+    NewProjectPublish,
+    /// New project's "Add existing project".
+    NewProjectExisting,
     Settings(&'static str),
     /// One setting: its section, scrolled to its row.
     Setting(&'static crate::settings::SearchItem),
@@ -290,6 +303,10 @@ struct Row {
     setup: Option<SharedString>,
     /// Listed after the other rows of its group (`secondary`).
     secondary: bool,
+    /// The chosen option of its group, marked with a check.
+    checked: bool,
+    /// A toggle row's checkbox and whether it is on.
+    toggle: Option<bool>,
 }
 
 impl Row {
@@ -313,6 +330,8 @@ impl Row {
             disabled: false,
             setup: None,
             secondary: false,
+            checked: false,
+            toggle: None,
         }
     }
 }
@@ -371,6 +390,8 @@ pub(super) struct Palette {
     add_environment: Option<SharedString>,
     /// The clone flow, once a clone source is picked (`addProjectCloneFlow`).
     clone: Option<CloneFlow>,
+    /// The New project flow, while it is open (`newProjectFlow`).
+    new_project: Option<new_project::NewProjectFlow>,
     /// A repository lookup or a clone start is on its way (`isRemoteProjectPending`).
     clone_pending: bool,
     _clone_task: Option<Task<()>>,
@@ -662,6 +683,7 @@ impl Workspace {
             new_thread_order: RefCell::default(),
             add_environment: None,
             clone: None,
+            new_project: None,
             clone_pending: false,
             _clone_task: None,
             discovery: None,
@@ -738,7 +760,7 @@ impl Workspace {
         palette.view = view;
         palette.highlight = None;
         self.set_palette_query(&start, window, cx);
-        if matches!(view, View::AddProject | View::AddProjectSources) {
+        if matches!(view, View::AddProject | View::AddProjectSources | View::NewProject) {
             self.load_palette_discovery(cx);
         }
     }
@@ -807,14 +829,7 @@ impl Workspace {
             .map(|option| {
                 let key = format!("add-project-environment:{}", option.id);
                 let run = Run::AddProjectIn(option.id.clone());
-                let mut row = Row::new(key, RowIcon::Lucide(option.machine), option.label.clone(), run);
-                let description = if option.primary { "This device".into() } else { option.id.clone() };
-                row.description = Some(Description::Text(description));
-                row.data_terms = vec![option.label.into(), option.id];
-                if option.primary {
-                    row.terms = &["this device"];
-                }
-                row
+                environment_row(option, key, run)
             })
             .collect()
     }
@@ -848,6 +863,7 @@ impl Workspace {
         palette.clone = None;
         palette.clone_pending = false;
         palette._clone_task = None;
+        self.leave_new_project();
         self.set_palette_query(&query, window, cx);
     }
 
@@ -856,6 +872,7 @@ impl Workspace {
         let Some(palette) = &mut self.palette else { return };
         let browsing = browses(palette, &query);
         let placeholder: SharedString = match (&palette.clone, browsing, palette.stack.is_empty()) {
+            _ if palette.view == View::NewProject => "Project name".into(),
             // `remoteProjectInputPlaceholder`.
             (Some(CloneFlow { source: None, confirm: None, .. }), ..) => "Enter Git clone URL".into(),
             (Some(CloneFlow { source: Some(kind), confirm: None, .. }), ..) => {
@@ -1282,6 +1299,7 @@ impl Workspace {
         row.terms = &["search project", "find in files", "grep", "content search", "text search"];
         row.shortcut = self.shortcut("projectSearch.toggle");
         rows.push(row);
+        rows.extend(self.new_project_row());
         rows.push(add_project_row());
         let mut row = lucide("change-theme", IconName::Palette, "Change theme", Run::Open(View::Themes));
         row.chevron = true;
@@ -1479,6 +1497,8 @@ impl Workspace {
             }
             // The repository field lists nothing; the destination lists folders while it is a path.
             View::Clone => return Vec::new(),
+            // The query is the name, so the flow's rows are never filtered.
+            View::NewProject => return self.new_project_groups(query),
             View::Root | View::Browse => return self.search_groups(query, true),
         };
         if submenu_falls_back(&scoped, query) {
@@ -1918,6 +1938,13 @@ impl Workspace {
             Run::CloneFrom(environment, source) => {
                 return self.start_add_project_clone(environment, source, window, cx);
             }
+            Run::NewProject => return self.open_new_project_flow(window, cx),
+            Run::NewProjectIn(environment) => {
+                return self.start_new_project(environment.clone(), Some(environment), window, cx);
+            }
+            Run::NewProjectMachine(environment) => return self.switch_new_project_environment(environment, cx),
+            Run::NewProjectPublish => return self.toggle_new_project_publish(cx),
+            Run::NewProjectExisting => return self.show_existing_project_sources(window, cx),
             _ => {}
         }
         self.close_palette(window, cx);
@@ -1964,7 +1991,12 @@ impl Workspace {
             | Run::AddProject
             | Run::AddProjectIn(_)
             | Run::BrowseIn(_)
-            | Run::CloneFrom(..) => {}
+            | Run::CloneFrom(..)
+            | Run::NewProject
+            | Run::NewProjectIn(_)
+            | Run::NewProjectMachine(_)
+            | Run::NewProjectPublish
+            | Run::NewProjectExisting => {}
         }
     }
 
@@ -2170,9 +2202,17 @@ impl Workspace {
         let repository_step = self.palette.as_ref().is_some_and(|palette| {
             palette.view == View::Clone && palette.clone.as_ref().is_some_and(|flow| flow.confirm.is_none())
         });
+        let new_project = self.palette.as_ref().is_some_and(|palette| palette.view == View::NewProject);
         match event.keystroke.key.as_str() {
             "escape" => self.close_palette(window, cx),
             "enter" if repository_step => self.submit_clone_repository(window, cx),
+            // Enter creates unless a row is highlighted; Mod+Enter creates regardless.
+            "enter" if new_project && (highlight.is_none() || primary_modifier) => self.submit_new_project(window, cx),
+            "enter" if new_project => {
+                if let Some(run) = highlight.and_then(|i| rows.get(i)).map(|row| row.run.clone()) {
+                    self.run_palette_row(run, window, cx);
+                }
+            }
             "up" | "down" if !rows.is_empty() => {
                 let last = rows.len() - 1;
                 let next = match (event.keystroke.key.as_str(), highlight) {
@@ -2254,9 +2294,15 @@ impl Workspace {
         let repository_step = flow.filter(|flow| flow.confirm.is_none());
         let cloning_to = flow.and_then(|flow| flow.confirm.as_ref().map(|target| (flow, target)));
         let pending = palette.clone_pending;
-        // `CommandPaletteSubmitButton`: the trailing Add / Create & Add button while browsing, and
-        // the clone flow's Continue / Lookup and Clone / Create & Clone.
-        let accessory = if let Some(flow) = repository_step {
+        let new_project = view == View::NewProject;
+        let highlighted_run = highlight
+            .and_then(|i| groups.iter().flat_map(|g| g.rows.iter()).filter(|r| !r.disabled).nth(i))
+            .map(|r| &r.run);
+        // `CommandPaletteSubmitButton`: the trailing Add / Create & Add button while browsing, the
+        // clone flow's Continue / Lookup and Clone / Create & Clone, and New project's Create.
+        let accessory = if new_project {
+            self.render_new_project_submit(&query, highlighted_run, &tokens, cx).map(|button| div().child(button))
+        } else if let Some(flow) = repository_step {
             let label = if pending { "Working" } else { flow.submit_label() };
             let can_submit = !pending && !query.trim().is_empty() && self.env_client(&flow.environment).is_some();
             let button = Button::new("palette-clone-submit")
@@ -2299,13 +2345,15 @@ impl Workspace {
         };
         // `browseInputEndPaddingClass`: room for the button's widest label.
         let input_end = match submit {
-            _ if repository_step.is_some() => px(128.),
+            _ if new_project && highlight.is_some() => px(152.),
+            _ if repository_step.is_some() || new_project => px(128.),
             Some(submit) if submit.will_create => px(144.),
             Some(_) if highlight.is_some() => px(112.),
             Some(_) => px(88.),
             None => px(0.),
         };
         // `RemoteRepositorySummary`: what the destination step clones.
+        let new_project_summary = self.render_new_project_summary(&query, &tokens);
         let summary = cloning_to.map(|(flow, target)| {
             let icon = match flow.source {
                 Some(kind) => source_control::definition(kind).mark(16., muted),
@@ -2466,7 +2514,10 @@ impl Workspace {
                     .gap(px(12.))
                     .child(hint(vec!["↑".into(), "↓".into()], "Navigate"))
                     .when(!adds, |el| {
-                        el.child(hint(vec!["Enter".into()], repository_step.map_or("Select", CloneFlow::submit_label)))
+                        let label = self
+                            .new_project_footer_label(highlighted_run)
+                            .unwrap_or_else(|| repository_step.map_or("Select", CloneFlow::submit_label));
+                        el.child(hint(vec!["Enter".into()], label))
                     })
                     .when(in_submenu, |el| el.child(hint(vec!["Backspace".into()], "Back")))
                     .child(hint(vec!["Esc".into()], "Close")),
@@ -2524,6 +2575,7 @@ impl Workspace {
                             cx.listener(|this, event: &KeyDownEvent, window, cx| this.palette_key(event, window, cx)),
                         )
                         .child(input_row)
+                        .children(new_project_summary)
                         .children(summary)
                         .children(
                             status.map(|text| div().px(px(16.)).py(px(12.)).text_sm().text_color(muted).child(text)),
@@ -2858,6 +2910,16 @@ impl Workspace {
                     .text_color(tokens.sidebar.secondary_label)
                     .child(shortcut)
             }))
+            .when(row.checked, |el| {
+                el.child(
+                    div().flex_none().child(Icon::new(IconName::Check).size(px(16.)).text_color(muted.opacity(0.7))),
+                )
+            })
+            .children(row.toggle.map(|on| {
+                let picker =
+                    matches!(row.run, Run::NewProjectPublish).then(|| self.render_publish_host_picker(tokens, cx));
+                h_flex().flex_none().gap(px(8.)).children(picker.flatten()).child(toggle_box(on, tokens))
+            }))
             .when(row.chevron, |el| {
                 el.child(
                     div()
@@ -3078,6 +3140,33 @@ fn connect_environment_row() -> Row {
     row.description = Some(Description::Text("No connected environment can add a project".into()));
     row.terms = &["connect", "environment", "connection", "settings"];
     row
+}
+
+/// `buildEnvironmentItem`: an environment's row, which runs `run`.
+fn environment_row(option: AddEnvironment, key: String, run: Run) -> Row {
+    let mut row = Row::new(key, RowIcon::Lucide(option.machine), option.label.clone(), run);
+    let description = if option.primary { "This device".into() } else { option.id.clone() };
+    row.description = Some(Description::Text(description));
+    row.data_terms = vec![option.label.into(), option.id];
+    if option.primary {
+        row.terms = &["this device"];
+    }
+    row
+}
+
+/// A toggle row's checkbox; the row takes the clicks and keys, so the box is no tab stop.
+fn toggle_box(on: bool, t: &Tokens) -> AnyElement {
+    div()
+        .size(px(16.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(4.))
+        .border_1()
+        .map(|el| if on { el.bg(t.primary).border_color(t.primary) } else { el.bg(t.background).border_color(t.input) })
+        .when(on, |el| el.child(Icon::new(IconName::Check).size(px(12.)).text_color(t.primary_foreground)))
+        .into_any_element()
 }
 
 /// The "Local folder" source of `environment`.

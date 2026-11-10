@@ -222,6 +222,59 @@ pub(crate) fn clone_destination_path(directory: &str, name: &str) -> String {
     if base.ends_with('\\') { format!("{base}{}", name.replace('/', "\\")) } else { format!("{base}{name}") }
 }
 
+/// The letter an accented Latin letter decomposes to (NFKD minus its combining marks).
+fn base_letter(c: char) -> Option<char> {
+    const FOLDS: &[(&str, char)] = &[
+        ("ÀÁÂÃÄÅàáâãäåĀāĂăĄą", 'a'),
+        ("ÇçĆćĈĉĊċČč", 'c'),
+        ("Ďď", 'd'),
+        ("ÈÉÊËèéêëĒēĔĕĖėĘęĚě", 'e'),
+        ("ĜĝĞğĠġĢģ", 'g'),
+        ("Ĥĥ", 'h'),
+        ("ÌÍÎÏìíîïĨĩĪīĬĭĮįİ", 'i'),
+        ("Ĵĵ", 'j'),
+        ("Ķķ", 'k'),
+        ("ĹĺĻļĽľ", 'l'),
+        ("ÑñŃńŅņŇň", 'n'),
+        ("ÒÓÔÕÖòóôõöŌōŎŏŐő", 'o'),
+        ("ŔŕŖŗŘř", 'r'),
+        ("ŚśŜŝŞşŠš", 's'),
+        ("ŢţŤť", 't'),
+        ("ÙÚÛÜùúûüŨũŪūŬŭŮůŰűŲų", 'u'),
+        ("Ŵŵ", 'w'),
+        ("ÝýÿŶŷŸ", 'y'),
+        ("ŹźŻżŽž", 'z'),
+    ];
+    FOLDS.iter().find(|(letters, _)| letters.contains(c)).map(|(_, base)| *base)
+}
+
+/// `newProjectFolderName` (`shared/src/path.ts`): the name as a lowercase slug of at most 64
+/// characters, "project" when nothing is left, and never a name Windows reserves.
+pub(crate) fn new_project_folder_name(name: &str) -> String {
+    let mut slug = String::new();
+    for c in name.chars().map(|c| base_letter(c).unwrap_or(c)).flat_map(char::to_lowercase) {
+        if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            slug.push(c);
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    // Every character is ASCII, so any length is a char boundary.
+    slug.truncate(64);
+    let slug = slug.trim_end_matches('-');
+    if slug.is_empty() {
+        return "project".to_owned();
+    }
+    let numbered = |prefix: &str| slug.strip_prefix(prefix).is_some_and(|n| matches!(n.as_bytes(), [b'1'..=b'9']));
+    let reserved = matches!(slug, "con" | "prn" | "aux" | "nul") || numbered("com") || numbered("lpt");
+    if reserved { format!("{slug}-project") } else { slug.to_owned() }
+}
+
+/// `getNewProjectPathPreview`: where a new project named `name` goes below its root.
+pub(crate) fn new_project_path_preview(root: &str, name: &str) -> String {
+    clone_destination_path(root, &new_project_folder_name(name))
+}
+
 /// `getCloneDestinationBrowsePath`: entering a folder keeps the clone's own folder at the end,
 /// unless the folder entered is it.
 pub(crate) fn clone_destination_browse_path(
@@ -370,6 +423,24 @@ mod tests {
         assert_eq!(clone_destination_browse_path("C:\\x\\repo", "src", "repo", false), "C:\\x\\src\\repo");
         assert_eq!(pinned_filter("Repo", "repo", false), "");
         assert_eq!(pinned_filter("Repo", "repo", true), "Repo");
+    }
+
+    #[test]
+    fn new_projects_get_a_safe_slug_below_their_root() {
+        assert_eq!(new_project_folder_name("  My App!! "), "my-app");
+        assert_eq!(new_project_folder_name("Café Déjà Vu"), "cafe-deja-vu");
+        assert_eq!(new_project_folder_name("--x__y--"), "x-y");
+        assert_eq!(new_project_folder_name("日本"), "project");
+        assert_eq!(new_project_folder_name("CON"), "con-project");
+        assert_eq!(new_project_folder_name("lpt3"), "lpt3-project");
+        assert_eq!(new_project_folder_name("com10"), "com10");
+        assert_eq!(
+            new_project_folder_name(&format!("{}-b", "a".repeat(63))),
+            "a".repeat(63),
+            "cut at 64, then trimmed"
+        );
+        assert_eq!(new_project_path_preview("/home/me/T3 Projects", "My App"), "/home/me/T3 Projects/my-app");
+        assert_eq!(new_project_path_preview("C:\\Users\\me\\T3 Projects\\", ""), "C:\\Users\\me\\T3 Projects\\project");
     }
 
     #[test]
