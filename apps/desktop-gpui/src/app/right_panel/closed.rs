@@ -5,13 +5,14 @@
 
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
-use gpui_kit::{App, Context, Window};
+use gpui_kit::{App, Context, SharedString, Window};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::Surface;
 use super::stored::StoredTarget;
 use crate::app::{Target, Workspace, pages};
+use crate::environments::SavedEnvironment;
 use crate::preview;
 use crate::pull_request_detail::Reference;
 
@@ -236,6 +237,11 @@ fn owning_draft(environment_id: &str, current: Option<Target>) -> Option<Target>
     current.filter(|target| target.environment().as_ref() == environment_id)
 }
 
+/// `environmentCatalog.entries.has`: the primary and every saved environment, enabled or not.
+fn environment_listed(environment_id: &str, primary: Option<&str>, saved: &[SavedEnvironment]) -> bool {
+    primary == Some(environment_id) || saved.iter().any(|e| e.environment_id == environment_id)
+}
+
 /// The order a close records its tabs in: the one that was active last, so it reopens first.
 pub(super) fn closed_in_order<T: PartialEq>(mut closed: Vec<T>, active: Option<&T>) -> Vec<T> {
     if let Some(index) = active.and_then(|active| closed.iter().position(|s| s == active)) {
@@ -328,7 +334,7 @@ impl Workspace {
         }
     }
 
-    fn reopen_owner_state(&self, view: &ClosedView, catalog_ready: bool) -> OwnerState {
+    fn reopen_owner_state(&self, view: &ClosedView, catalog_ready: bool, cx: &App) -> OwnerState {
         let Some(owner) = view.owner() else {
             // The Pull requests page is always there to reopen on.
             let ClosedView::PullRequestTab { reference } = view else { return OwnerState::default() };
@@ -358,8 +364,13 @@ impl Workspace {
             ClosedView::Browser { tab_id, .. } => panel.surfaces.contains(&Surface::Browser(tab_id.clone())),
             ClosedView::PullRequestTab { .. } => false,
         });
+        let saved = self.saved_environments.read(cx);
         OwnerState {
-            environment_known: self.session(environment).is_some(),
+            environment_known: environment_listed(
+                environment,
+                self.primary_environment().map(SharedString::as_ref),
+                saved.environments(),
+            ),
             catalog_ready,
             owner_exists,
             side_chat_exists,
@@ -412,7 +423,7 @@ impl Workspace {
         }
         let catalog_ready = self.environment_catalog_ready(cx);
         let (drop, restore) = plan_next_reopen(self.right_panel.closed.history.entries(), |view| {
-            self.reopen_owner_state(view, catalog_ready)
+            self.reopen_owner_state(view, catalog_ready, cx)
         });
         let restore = restore
             .and_then(|id| self.right_panel.closed.history.entries().iter().find(|entry| entry.id == id).cloned());
@@ -613,6 +624,21 @@ mod tests {
         assert_eq!(owning_draft("a", Some(draft("b", "p"))), None, "the draft moved to another machine");
         assert_eq!(owning_draft("a", Some(draft("a", "q"))), Some(draft("a", "q")), "it opens where it is now");
         assert_eq!(owning_draft("a", None), None, "a sent or removed draft owns nothing");
+    }
+
+    #[test]
+    fn a_disabled_saved_environment_stays_in_the_catalog() {
+        let saved = |id: &str, enabled| SavedEnvironment {
+            environment_id: id.into(),
+            label: id.into(),
+            enabled,
+            routes: Vec::new(),
+        };
+        let catalog = [saved("on", true), saved("off", false)];
+        assert!(environment_listed("off", Some("local"), &catalog), "re-enabling it reopens its tabs");
+        assert!(environment_listed("on", None, &catalog));
+        assert!(environment_listed("local", Some("local"), &[]));
+        assert!(!environment_listed("gone", Some("local"), &catalog));
     }
 
     #[test]
