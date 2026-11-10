@@ -3,6 +3,7 @@
 //! `hooks/useThreadActionMenu.ts`, `components/threadActionMenu.logic.ts`,
 //! `SidebarThreadUndoNotice.tsx`).
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use gpui_kit::assets::IconName as Lucide;
@@ -616,8 +617,22 @@ impl Workspace {
         if !self.check_thread_operations([key], cx) {
             return;
         }
-        let (Some(client), Some(thread)) = (self.env_client(&key.env), self.thread(key)) else { return };
-        let was_open = self.is_open_thread(key);
+        let Some(plan) = self.delete_plan(key, &HashSet::new()) else { return };
+        cx.spawn_in(window, async move |this, cx| {
+            if let Err(error) = run_delete(&this, plan, cx).await {
+                let _ = this.update(cx, |this, cx| {
+                    this.error = Some(failure_message(Some("Failed to delete thread"), &error).into());
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// What deleting `key` takes, read now. A worktree is only its own once no thread outside
+    /// `deleted` (this batch's deletions so far) uses it.
+    pub(super) fn delete_plan(&self, key: &ScopedId, deleted: &HashSet<ScopedId>) -> Option<DeletePlan> {
+        let (Some(client), Some(thread)) = (self.env_client(&key.env), self.thread(key)) else { return None };
         let sort_order =
             self.client_settings.values.get("sidebarThreadSortOrder").as_str().unwrap_or_default().to_owned();
         let fallback = fallback_after_delete(&self.shell.threads, key, &sort_order, now_ms()).map(ScopedId::of_thread);
@@ -628,7 +643,9 @@ impl Workspace {
         let removable = project.filter(|p| {
             scratch_root.as_deref() != Some(crate::project_groups::normalize_path(&p.workspace_root).as_str())
         });
-        let siblings: Vec<_> = self.shell.threads.iter().filter(|t| t.environment_id == environment).collect();
+        let siblings: Vec<_> = (self.shell.threads.iter())
+            .filter(|t| t.environment_id == environment && !deleted.iter().any(|d| d.is_thread(t)))
+            .collect();
         let orphan = orphaned_worktree(&siblings, &key.id)
             .filter(|_| removable.is_some() && self.env_grants(&environment, "source-control:write"));
         let automatic = removable.is_some_and(|p| {
@@ -641,82 +658,17 @@ impl Workspace {
         // nobody else uses the worktree.
         let ask_server = info.config.get("shellThreadFamilies").and_then(Value::as_bool) == Some(true)
             || self.shell.older_settled(&environment).is_some();
-        let has_runtime = Facts::new(thread, &std::collections::HashMap::new()).runtime_status().is_some();
-        let project_root = removable.map(|p| p.workspace_root.clone());
-        let side_chats = self.listed_side_chats(&environment, &key.id);
-        let key = key.clone();
-        let thread_id = key.id.clone();
-        cx.spawn_in(window, async move |this, cx| {
-            let mut orphan = orphan.filter(|_| !automatic);
-            if let (Some(path), true) = (&orphan, ask_server) {
-                let occupants =
-                    client.request("orchestration.getWorktreeThreadIds", json!({"worktreePath": path})).await;
-                let alone = occupants.ok().and_then(|value| {
-                    let ids = value["threadIds"].as_array()?.clone();
-                    Some(ids.iter().all(|id| id.as_str() == Some(&thread_id)))
-                });
-                if alone != Some(true) {
-                    orphan = None;
-                }
-            }
-            let mut remove = false;
-            if let Some(path) = &orphan {
-                let message = format!(
-                    "This thread is the only one linked to this worktree:\n{}\n\nDelete the worktree too?",
-                    worktree_display(path)
-                );
-                let Ok(answer) =
-                    this.update_in(cx, |_, window, cx| super::super::confirm::confirm(&message, true, window, cx))
-                else {
-                    return;
-                };
-                let Ok(agreed) = answer.await else { return };
-                remove = agreed;
-            }
-            if has_runtime {
-                stop_provider_sessions(&client, &thread_id).await;
-            }
-            let command = Self::thread_command_value("thread.delete", &thread_id, json!({}));
-            if let Err(error) = client.request("orchestration.dispatchCommand", command).await {
-                let _ = this.update(cx, |this, cx| {
-                    this.error = Some(failure_message(Some("Failed to delete thread"), &error.to_string()).into());
-                    cx.notify();
-                });
-                return;
-            }
-            let removing = this.update_in(cx, |this, window, cx| {
-                this.expire_undo(&key);
-                this.forget_thread_panel(&environment, &thread_id);
-                if was_open {
-                    this.land_after_delete(&key, fallback, window, cx);
-                }
-                this.forget_deleted_thread(&environment, &thread_id, &side_chats, cx);
-                remove && this.env_grants(&environment, "source-control:write")
-            });
-            let (Some(path), Some(root), Ok(true)) = (orphan.filter(|_| remove), project_root, removing) else {
-                return;
-            };
-            let removed = client
-                .request("vcs.removeWorktree", json!({"cwd": root, "path": path, "force": true}))
-                .await
-                .map_err(|error| {
-                    ("Failed to delete worktree", format!("Could not remove {}. {error}", worktree_display(&path)))
-                });
-            let failure = match removed {
-                Ok(_) => client
-                    .request("vcs.refreshStatus", json!({"cwd": root}))
-                    .await
-                    .err()
-                    .map(|error| ("Worktree deleted, but Git status refresh failed", error.to_string())),
-                Err(failure) => Some(failure),
-            };
-            if let Some((title, description)) = failure {
-                let _ = this.update_in(cx, |_, window, cx| {
-                    window.push_notification(Notification::error(description).title(title), cx);
-                });
-            }
+        Some(DeletePlan {
+            client,
+            key: key.clone(),
+            was_open: self.is_open_thread(key),
+            fallback,
+            orphan: orphan.filter(|_| !automatic),
+            ask_server,
+            has_runtime: Facts::new(thread, &std::collections::HashMap::new()).runtime_status().is_some(),
+            project_root: removable.map(|p| p.workspace_root.clone()),
+            side_chats: self.listed_side_chats(&environment, &key.id),
         })
-        .detach();
     }
 
     /// Runs `then` at once when the question's setting is off, else once the user agrees.
@@ -1104,6 +1056,90 @@ fn worktree_display(path: &str) -> &str {
 
 /// `stopThreadSession`: detaches each provider session the thread holds; failures don't stop
 /// the delete, which detaches them on the server too.
+/// What deleting one thread takes, from [`Workspace::delete_plan`].
+pub(super) struct DeletePlan {
+    client: RpcClient,
+    key: ScopedId,
+    was_open: bool,
+    fallback: Option<ScopedId>,
+    orphan: Option<String>,
+    ask_server: bool,
+    has_runtime: bool,
+    project_root: Option<String>,
+    side_chats: Vec<String>,
+}
+
+/// Runs a [`DeletePlan`]: asks about the worktree only this thread uses, stops its provider
+/// sessions, deletes it, then removes the worktree if asked to. `Ok(false)` when the question
+/// went unanswered and nothing was deleted; `Err` carries the delete's failure.
+pub(super) async fn run_delete(
+    this: &WeakEntity<Workspace>,
+    plan: DeletePlan,
+    cx: &mut gpui_kit::AsyncWindowContext,
+) -> Result<bool, String> {
+    let DeletePlan { client, key, was_open, fallback, mut orphan, ask_server, has_runtime, project_root, side_chats } =
+        plan;
+    let (environment, thread_id) = (key.env.clone(), key.id.clone());
+    if let (Some(path), true) = (&orphan, ask_server) {
+        let occupants = client.request("orchestration.getWorktreeThreadIds", json!({"worktreePath": path})).await;
+        let alone = occupants.ok().and_then(|value| {
+            let ids = value["threadIds"].as_array()?.clone();
+            Some(ids.iter().all(|id| id.as_str() == Some(&thread_id)))
+        });
+        if alone != Some(true) {
+            orphan = None;
+        }
+    }
+    let mut remove = false;
+    if let Some(path) = &orphan {
+        let message = format!(
+            "This thread is the only one linked to this worktree:\n{}\n\nDelete the worktree too?",
+            worktree_display(path)
+        );
+        let Ok(answer) = this.update_in(cx, |_, window, cx| super::super::confirm::confirm(&message, true, window, cx))
+        else {
+            return Ok(false);
+        };
+        let Ok(agreed) = answer.await else { return Ok(false) };
+        remove = agreed;
+    }
+    if has_runtime {
+        stop_provider_sessions(&client, &thread_id).await;
+    }
+    let command = Workspace::thread_command_value("thread.delete", &thread_id, json!({}));
+    client.request("orchestration.dispatchCommand", command).await.map_err(|error| error.to_string())?;
+    let removing = this.update_in(cx, |this, window, cx| {
+        this.expire_undo(&key);
+        this.forget_thread_panel(&environment, &thread_id);
+        if was_open {
+            this.land_after_delete(&key, fallback, window, cx);
+        }
+        this.forget_deleted_thread(&environment, &thread_id, &side_chats, cx);
+        remove && this.env_grants(&environment, "source-control:write")
+    });
+    let (Some(path), Some(root), Ok(true)) = (orphan.filter(|_| remove), project_root, removing) else {
+        return Ok(true);
+    };
+    let removed =
+        client.request("vcs.removeWorktree", json!({"cwd": root, "path": path, "force": true})).await.map_err(
+            |error| ("Failed to delete worktree", format!("Could not remove {}. {error}", worktree_display(&path))),
+        );
+    let failure = match removed {
+        Ok(_) => client
+            .request("vcs.refreshStatus", json!({"cwd": root}))
+            .await
+            .err()
+            .map(|error| ("Worktree deleted, but Git status refresh failed", error.to_string())),
+        Err(failure) => Some(failure),
+    };
+    if let Some((title, description)) = failure {
+        let _ = this.update_in(cx, |_, window, cx| {
+            window.push_notification(Notification::error(description).title(title), cx);
+        });
+    }
+    Ok(true)
+}
+
 async fn stop_provider_sessions(client: &crate::rpc::RpcClient, thread_id: &str) {
     let Ok(projection) = client.request("orchestration.getThreadProjection", json!({"threadId": thread_id})).await
     else {
