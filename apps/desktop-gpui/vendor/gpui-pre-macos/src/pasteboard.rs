@@ -25,6 +25,8 @@ pub struct Pasteboard {
     inner: Retained<NSPasteboard>,
     text_hash_type: Retained<NSString>,
     metadata_type: Retained<NSString>,
+    /// `NSPasteboardTypeHTML`, named so reading it needs no `unsafe` extern static.
+    html_type: Retained<NSString>,
 }
 
 impl Pasteboard {
@@ -51,6 +53,7 @@ impl Pasteboard {
             inner,
             text_hash_type: NSString::from_str("zed-text-hash"),
             metadata_type: NSString::from_str("zed-metadata"),
+            html_type: NSString::from_str("public.html"),
         }
     }
 
@@ -150,7 +153,15 @@ impl Pasteboard {
                 }
             });
 
-        Some(ClipboardEntry::String(ClipboardString { text, metadata }))
+        let html = self
+            .data_for_type(&self.html_type)
+            .and_then(|bytes| String::from_utf8(bytes).ok());
+
+        Some(ClipboardEntry::String(ClipboardString {
+            text,
+            metadata,
+            html,
+        }))
     }
 
     fn data_for_type(&self, kind: &NSString) -> Option<Vec<u8>> {
@@ -181,6 +192,7 @@ impl Pasteboard {
                 let mut combined = ClipboardString {
                     text: String::new(),
                     metadata: None,
+                    html: None,
                 };
 
                 for entry in item.entries {
@@ -189,6 +201,9 @@ impl Pasteboard {
                             combined.text.push_str(&text.text());
                             if combined.metadata.is_none() {
                                 combined.metadata = text.metadata;
+                            }
+                            if combined.html.is_none() {
+                                combined.html = text.html;
                             }
                         }
                         _ => {}
@@ -218,6 +233,11 @@ impl Pasteboard {
                 self.inner
                     .setData_forType(Some(&metadata_bytes), &self.metadata_type);
             }
+        }
+        if let Some(html) = string.html.as_ref() {
+            let html_bytes = NSData::with_bytes(html.as_bytes());
+            self.inner
+                .setData_forType(Some(&html_bytes), &self.html_type);
         }
     }
 
@@ -342,6 +362,14 @@ mod tests {
             pasteboard.write(item.clone());
             assert_eq!(pasteboard.read(), Some(item));
         }
+
+        let item = ClipboardItem {
+            entries: vec![ClipboardEntry::String(
+                ClipboardString::new("5".to_string()).with_html("<b>5</b>".to_string()),
+            )],
+        };
+        pasteboard.write(item.clone());
+        assert_eq!(pasteboard.read(), Some(item));
     }
 
     #[test]

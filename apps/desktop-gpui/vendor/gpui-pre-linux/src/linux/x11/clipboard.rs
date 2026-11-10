@@ -47,7 +47,7 @@ use x11rb::{
     wrapper::ConnectionExt as _,
 };
 
-use gpui::{ClipboardItem, Image, ImageFormat, hash};
+use gpui::{ClipboardEntry, ClipboardItem, ClipboardString, Image, ImageFormat, hash};
 use strum::IntoEnumIterator;
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -77,7 +77,7 @@ x11rb::atom_manager! {
         TEXT,
         TEXT_MIME_UNKNOWN: b"text/plain",
 
-        // HTML: b"text/html",
+        HTML: b"text/html",
         // URI_LIST: b"text/uri-list",
 
         PNG__MIME: ImageFormat::mime_type(ImageFormat::Png ).as_bytes(),
@@ -981,16 +981,22 @@ impl Clipboard {
         Ok(Self { inner: ctx })
     }
 
+    /// Owns `selection` with `message`, and `html` as `text/html` beside it when given.
     pub(crate) fn set_text(
         &self,
         message: Cow<'_, str>,
+        html: Option<&str>,
         selection: ClipboardKind,
         wait: WaitConfig,
     ) -> Result<()> {
-        let data = vec![ClipboardData {
+        let mut data = vec![ClipboardData {
             bytes: message.into_owned().into_bytes(),
             format: self.inner.atoms.UTF8_STRING,
         }];
+        data.extend(html.map(|html| ClipboardData {
+            bytes: html.as_bytes().to_vec(),
+            format: self.inner.atoms.HTML,
+        }));
         self.inner.write(data, selection, wait)
     }
 
@@ -1069,7 +1075,16 @@ impl Clipboard {
         } else {
             String::from_utf8(result.bytes).map_err(|_| Error::ConversionFailure)?
         };
-        Ok(ClipboardItem::new_string(text))
+        let html = (self.inner.read(&[self.inner.atoms.HTML], selection).ok())
+            .filter(|data| data.format == self.inner.atoms.HTML)
+            .and_then(|data| String::from_utf8(data.bytes).ok());
+        Ok(ClipboardItem {
+            entries: vec![ClipboardEntry::String(ClipboardString {
+                text,
+                metadata: None,
+                html,
+            })],
+        })
     }
 
     pub fn is_owner(&self, selection: ClipboardKind) -> bool {

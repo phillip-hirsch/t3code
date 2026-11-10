@@ -429,6 +429,7 @@ impl Workspace {
                 match result {
                     Ok(_) => {
                         if !text_is_feedback {
+                            this.forget_full_history(&origin);
                             this.clear_usage_limits_for(&origin);
                         }
                         if fresh_arm.is_some() {

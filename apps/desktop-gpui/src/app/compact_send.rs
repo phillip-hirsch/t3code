@@ -172,6 +172,11 @@ impl Workspace {
         self.compact_offer().filter(|_| !self.keeps_full_history())
     }
 
+    /// A turn sent from `target` started: its next send offers compaction again.
+    pub(super) fn forget_full_history(&mut self, target: &Target) {
+        self.composer_ui.compact.full_history.remove(target);
+    }
+
     fn toggle_keep_full_history(&mut self, cx: &mut Context<Self>) {
         let Some(target) = self.target.clone() else { return };
         let history = &mut self.composer_ui.compact.full_history;
