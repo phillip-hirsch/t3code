@@ -43,6 +43,15 @@ pub(super) enum ChatPane {
     Side,
 }
 
+/// A pane showing one environment's thread: what that timeline's views, viewers and their async
+/// work belong to. They go once the pane shows something else, as the web unmounts them.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct PaneOwner {
+    pub(super) pane: ChatPane,
+    pub(super) env: SharedString,
+    pub(super) thread: String,
+}
+
 /// The side chat tab on screen, subscribed while it shows.
 pub(super) struct SideChatView {
     /// The parent thread's environment, which the side chat lives on.
@@ -953,6 +962,15 @@ impl Workspace {
             },
             ChatPane::Side => self.side_chat.view.as_ref().map(|view| (view.env.clone(), view.thread_id.clone())),
         }
+    }
+
+    pub(super) fn pane_owner(&self, pane: ChatPane) -> Option<PaneOwner> {
+        let (env, thread) = self.pane_thread(pane)?;
+        Some(PaneOwner { pane, env, thread })
+    }
+
+    pub(super) fn owner_shown(&self, owner: &PaneOwner) -> bool {
+        self.pane_shows(owner.pane, &owner.env, &owner.thread)
     }
 
     pub(super) fn side_chat_question(&self) -> Option<&QuestionDraft> {
