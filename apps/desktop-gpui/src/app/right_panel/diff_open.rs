@@ -173,7 +173,8 @@ pub(super) fn header(
     tokens: &Tokens,
     scheme: DiffColorScheme,
     suffix: Option<AnyElement>,
-    cx: &App,
+    window: &mut Window,
+    cx: &mut App,
 ) -> AnyElement {
     let name: SharedString = match (file.original_path(), file.modified_path()) {
         (Some(old), Some(new)) if old != new => format!("{old} → {new}").into(),
@@ -197,7 +198,7 @@ pub(super) fn header(
     };
     let path = file.path().clone();
     let collapsed = state.read(cx).is_file_collapsed(&path);
-    let copy = copy_path_button(&path, &view, tokens, cx);
+    let copy = copy_path_button(&path, &view, tokens, window, cx);
     let (open_path, menu_path, fold_path, fold_view) = (path.clone(), path.clone(), path, view.clone());
     let menu_view = view.clone();
     // `[data-title]:hover`: the code foreground mixed 16% toward primary.
@@ -241,11 +242,22 @@ pub(super) fn header(
         .into_any_element()
 }
 
-/// `DiffFilePathCopyButton` (`icon-micro`, `ghost-muted`): shown on the header's hover, it
-/// copies the path and shows a check and "Copied" for a moment.
-fn copy_path_button(path: &SharedString, view: &Entity<Workspace>, tokens: &Tokens, cx: &App) -> AnyElement {
+/// `DiffFilePathCopyButton` (`icon-micro`, `ghost-muted`): shown on the header's hover or
+/// while focused, it copies the path and shows a check and "Copied" for a moment. Hidden, it
+/// stays a Tab stop, as the web's `opacity: 0` button does.
+fn copy_path_button(
+    path: &SharedString,
+    view: &Entity<Workspace>,
+    tokens: &Tokens,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
     let id: SharedString = format!("diff-copy-path:{path}").into();
+    let focus =
+        window.use_keyed_state(SharedString::from(format!("{id}:focus")), cx, |_, cx| cx.focus_handle().tab_stop(true));
+    let focus = focus.read(cx).clone();
     let copied = view.read(cx).copy_feedback.is(&id);
+    let ring = tokens.ring;
     let (accent, foreground) = (tokens.accent, tokens.foreground);
     let glyph = if copied {
         Icon::new(IconName::Check).text_color(tokens.success_foreground)
@@ -263,9 +275,15 @@ fn copy_path_button(path: &SharedString, view: &Entity<Workspace>, tokens: &Toke
         .justify_center()
         .rounded(px(4.))
         .cursor_pointer()
+        .track_focus(&focus)
+        .border_1()
+        .border_color(gpui_kit::transparent_black())
+        .focus_visible(move |style| style.border_color(ring))
         .text_color(tokens.muted_foreground)
         .hover(move |style| style.bg(accent).text_color(foreground))
-        .when(!copied, |el| el.invisible().group_hover(HEADER_GROUP, gpui_kit::Styled::visible))
+        .when(!copied && !focus.is_focused(window), |el| {
+            el.opacity(0.).group_hover(HEADER_GROUP, |style| style.opacity(1.))
+        })
         .child(glyph.size(px(12.)))
         .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
         .on_click(move |_, _, cx| {

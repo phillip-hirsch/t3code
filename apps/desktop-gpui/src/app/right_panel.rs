@@ -2999,7 +2999,7 @@ impl Workspace {
                             );
                             // A custom header replaces the kit's, suffix included, so the file's load status goes in it.
                             let diff = Diff::new(&self.right_panel.diff)
-                                .render_header(move |file, _, cx| {
+                                .render_header(move |file, window, cx| {
                                     let status =
                                         states.get(file.path()).map(|load| diff_file_status(file.path(), *load, &view));
                                     let stat = stats.as_ref().and_then(|stats| stats.get(file.path()));
@@ -3011,6 +3011,7 @@ impl Workspace {
                                         &header_tokens,
                                         scheme,
                                         status,
+                                        window,
                                         cx,
                                     )
                                 })
