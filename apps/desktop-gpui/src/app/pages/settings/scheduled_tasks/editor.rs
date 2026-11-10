@@ -826,7 +826,7 @@ impl Render for TaskEditor {
                 PickHost {
                     environment: Some(self.environment.clone()),
                     current: selection.clone(),
-                    include: |_| true,
+                    include: Rc::new(|_: &crate::model::Provider| true),
                     extra: None,
                     on_pick,
                 },

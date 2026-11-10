@@ -36,6 +36,7 @@ use crate::app::request_cards::{
 };
 use crate::model::{ModelSelection, Provider};
 use crate::rpc::RpcError;
+use crate::settings::{Settings, scope};
 use crate::theme::{Tokens, tokens};
 
 const LIST_MODELS: &str = "server.listTextGeneratorModels";
@@ -354,6 +355,14 @@ pub(in crate::app::pages::settings) fn writing_providers<'a>(
         .filter(|p| generates_text(p) && !generator_owns(p, configured, generators))
         .chain(generators)
         .collect()
+}
+
+/// The writing providers the machine-wide tasks may use: those the environment itself enables,
+/// with no project's overrides (`providerInstanceEntriesFor(…, null)`).
+fn task_choices<'a>(settings: &Settings, providers: &'a [Provider], generators: &'a [Provider]) -> Vec<&'a Provider> {
+    let mut choices = writing_providers(providers, settings.get("textGenerators"), generators);
+    choices.retain(|p| scope::text_generation_selection_enabled(settings, None, &p.instance_id));
+    choices
 }
 
 fn selection_of(value: &Value) -> Option<ModelSelection> {
@@ -1216,14 +1225,27 @@ impl GeneratorWizard {
         };
         let picker = workspace.update(cx, |w, cx| {
             let extra = w.text_generation_targets(Some(&environment), &[Some(&selection)], cx);
+            let allowed: Vec<String> = w.env_info(&environment).map_or_else(Vec::new, |info| {
+                task_choices(&info.settings, &info.providers, &extra).iter().map(|p| p.instance_id.clone()).collect()
+            });
             let id = SharedString::from(format!("text-generator-task-{key}"));
             w.refresh_picker_extra(&id, &extra);
             let trigger =
                 w.picker_trigger_among(id.clone(), Some(&selection), None, Some(&environment), Some(&extra), cx);
-            let pick_environment = environment.clone();
+            let (pick_environment, pick_extra) = (environment.clone(), extra.clone());
             let on_pick: OnPick = Rc::new(
-                move |w: &mut Workspace, picked: ModelSelection, _: &mut Window, cx: &mut Context<Workspace>| {
+                move |w: &mut Workspace, picked: ModelSelection, window: &mut Window, cx: &mut Context<Workspace>| {
                     if !w.environment_grants(&pick_environment, SETTINGS_WRITE) {
+                        return;
+                    }
+                    let Some(info) = w.env_info(&pick_environment) else { return };
+                    let offered = task_choices(&info.settings, &info.providers, &pick_extra)
+                        .iter()
+                        .any(|p| p.instance_id == picked.instance_id && p.is_selectable());
+                    if !offered {
+                        let label = info.environment_label.as_deref().unwrap_or("this environment");
+                        let reason = format!("This model is unavailable on {label}.");
+                        window.push_notification(Notification::error(reason).title("Model not saved"), cx);
                         return;
                     }
                     let picked = ModelSelection { options: None, ..picked };
@@ -1234,7 +1256,7 @@ impl GeneratorWizard {
             let host = PickHost {
                 environment: Some(environment.clone()),
                 current: Some(selection.clone()),
-                include: generates_text,
+                include: Rc::new(move |p: &Provider| allowed.contains(&p.instance_id)),
                 extra: Some(extra),
                 on_pick,
             };
@@ -1677,6 +1699,19 @@ mod tests {
             .map(|p| (p.instance_id.as_str(), p.driver.as_str()))
             .collect();
         assert_eq!(ids, [("codex", "codex"), ("openrouter", "openrouter")]);
+
+        // The tasks are machine-wide: a project turning Codex back on does not offer it.
+        let settings = Settings::layered(
+            &Default::default(),
+            &json!({
+                "providerInstances": {"codex": {"enabled": false}},
+                "projectSettingsOverrides": {"p": {"providerInstances": {"codex": {"enabled": true}}}},
+                "textGenerators": configured,
+            }),
+        );
+        let choices: Vec<&str> =
+            task_choices(&settings, &providers, &generators).iter().map(|p| p.instance_id.as_str()).collect();
+        assert_eq!(choices, ["openrouter"]);
     }
 
     #[test]

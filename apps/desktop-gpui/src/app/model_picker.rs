@@ -44,7 +44,7 @@ pub(in crate::app) struct PickHost {
     /// The environment whose providers and model preferences it lists; `None` is the open chat's.
     pub environment: Option<SharedString>,
     pub current: Option<ModelSelection>,
-    pub include: fn(&Provider) -> bool,
+    pub include: Rc<dyn Fn(&Provider) -> bool>,
     /// `Some` for a settings writing picker: the enabled text generators it offers after the
     /// environment's providers, in place of every instance a generator owns.
     pub extra: Option<Rc<[Provider]>>,
@@ -1776,7 +1776,7 @@ mod tests {
         let host = PickHost {
             environment: None,
             current: None,
-            include: |_| true,
+            include: Rc::new(|_: &Provider| true),
             extra: Some(loading.clone()),
             on_pick: Rc::new(|_, _, _, _| {}),
         };

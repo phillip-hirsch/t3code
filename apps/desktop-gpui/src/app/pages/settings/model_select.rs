@@ -78,7 +78,7 @@ impl Workspace {
         let trigger =
             self.picker_trigger_among(id.clone(), selection, label, environment.as_deref(), extra.as_deref(), cx);
         let on_pick: OnPick = Rc::new(on_pick);
-        let host = PickHost { environment, current: selection.cloned(), include, extra, on_pick };
+        let host = PickHost { environment, current: selection.cloned(), include: Rc::new(include), extra, on_pick };
         self.undocked_model_picker(id, trigger, host, cx)
     }
 
