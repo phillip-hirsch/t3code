@@ -435,39 +435,37 @@ pub(super) fn gate_bindings(write: &mut ScriptsWrite, can_write_settings: bool) 
     Ok(())
 }
 
-/// Every script id the environment knows, so a new one never collides (`submit`).
-fn known_script_ids(settings: &Value, projects: &[ProjectShell], project: &ProjectShell) -> Vec<String> {
-    let mut ids: Vec<String> = projects.iter().flat_map(|p| p.scripts.iter().map(|s| s.id.clone())).collect();
-    ids.extend(scripts_at(settings.get("defaultProjectScripts")).unwrap_or_default().into_iter().map(|s| s.id));
-    if let Some(overrides) = settings.get("projectSettingsOverrides").and_then(Value::as_object) {
-        for entry in overrides.values() {
-            ids.extend(scripts_at(entry.get("defaultProjectScripts")).unwrap_or_default().into_iter().map(|s| s.id));
-        }
-    }
-    ids.extend(project.scripts.iter().map(|s| s.id.clone()));
-    ids
-}
-
-/// The list after saving `input` as `script_id` (a new script when `None`), and the id it saved under.
-pub(super) fn scripts_after_save(
-    settings: &Value,
+/// The id a save writes: `script_id`, or a new one that no project and no target's settings
+/// already use (`submit`), since every target gets the same id.
+pub(super) fn script_id_for_save(
+    target_settings: &[&Value],
     projects: &[ProjectShell],
-    project: &ProjectShell,
     script_id: Option<&str>,
     input: &ScriptInput,
-) -> (String, Vec<ProjectScript>) {
-    let ids = known_script_ids(settings, projects, project);
-    let id =
-        script_id.map_or_else(|| next_project_script_id(&input.name, ids.iter().map(String::as_str)), str::to_owned);
-    let saved = build_project_script(&id, input);
-    let mut scripts: Vec<ProjectScript> = resolve_project_scripts(settings, project)
-        .into_iter()
-        .map(|script| if script.id == id { saved.clone() } else { release_claimed_roles(script, input) })
-        .collect();
-    if script_id.is_none() {
-        scripts.push(saved);
+) -> String {
+    if let Some(id) = script_id {
+        return id.to_owned();
     }
-    (id, scripts)
+    let mut ids: Vec<String> = projects.iter().flat_map(|p| p.scripts.iter().map(|s| s.id.clone())).collect();
+    for settings in target_settings {
+        ids.extend(scripts_at(settings.get("defaultProjectScripts")).unwrap_or_default().into_iter().map(|s| s.id));
+        if let Some(overrides) = settings.get("projectSettingsOverrides").and_then(Value::as_object) {
+            for entry in overrides.values() {
+                ids.extend(
+                    scripts_at(entry.get("defaultProjectScripts")).unwrap_or_default().into_iter().map(|s| s.id),
+                );
+            }
+        }
+    }
+    next_project_script_id(&input.name, ids.iter().map(String::as_str))
+}
+
+/// What the Actions section shows across its targets, each read with its own environment's
+/// settings: whether any lists other actions than `scripts`, and whether any keeps its own list.
+pub(super) fn scoped_scripts_state(scripts: &[ProjectScript], targets: &[(&Value, &ProjectShell)]) -> (bool, bool) {
+    let mixed = targets.iter().any(|(settings, project)| resolve_project_scripts(settings, project) != scripts);
+    let overridden = targets.iter().any(|(settings, project)| has_project_scripts_override(settings, &project.id));
+    (mixed, overridden)
 }
 
 /// The project's list with `input` saved as `id`, added when the project lacks it, so every
@@ -634,11 +632,16 @@ impl Workspace {
         input: &ScriptInput,
         cx: &mut Context<Self>,
     ) -> Task<Result<(), String>> {
-        let Some(project) = self.shell.project(project_key) else {
+        if self.shell.project(project_key).is_none() {
             return Task::ready(Err("Project not found.".into()));
-        };
-        let (id, _) =
-            scripts_after_save(&self.project_info(project).settings, &self.shell.projects, project, script_id, input);
+        }
+        let targets = self.script_targets(project_key);
+        let settings: Vec<&Value> = targets
+            .iter()
+            .filter_map(|target| self.shell.project(target))
+            .map(|project| &*self.project_info(project).settings)
+            .collect();
+        let id = script_id_for_save(&settings, &self.shell.projects, script_id, input);
         let input = input.clone();
         self.write_targets(
             project_key,
@@ -837,6 +840,22 @@ mod tests {
     }
 
     #[test]
+    fn each_target_reads_its_own_environments_actions() {
+        // One project id on two environments, each overriding the list differently.
+        let on_a = project("p", vec![]);
+        let mut on_b = project("p", vec![]);
+        on_b.environment_id = "b".into();
+        let a = json!({"projectSettingsOverrides": {"p": {"defaultProjectScripts": [script("lint")]}}});
+        let b = json!({"projectSettingsOverrides": {"p": {"defaultProjectScripts": [script("test")]}}});
+        let scripts = resolve_project_scripts(&a, &on_a);
+        assert_eq!(scoped_scripts_state(&scripts, &[(&a, &on_a), (&b, &on_b)]), (true, true));
+        assert_eq!(scoped_scripts_state(&scripts, &[(&a, &on_a), (&a, &on_b)]), (false, true));
+        let inherits = json!({"defaultProjectScripts": [script("lint")]});
+        assert_eq!(scoped_scripts_state(&scripts, &[(&a, &on_a), (&inherits, &on_b)]), (false, true));
+        assert_eq!(scoped_scripts_state(&scripts, &[(&inherits, &on_b)]), (false, false));
+    }
+
+    #[test]
     fn script_ids_normalize_and_avoid_collisions() {
         assert_eq!(next_project_script_id("Run Tests!", []), "run-tests");
         assert_eq!(next_project_script_id("  ", []), "script");
@@ -908,12 +927,20 @@ mod tests {
             run_on_worktree_create: true,
             ..Default::default()
         };
-        let (id, scripts) = scripts_after_save(&settings, std::slice::from_ref(&shell), &shell, None, &input);
+        let projects = std::slice::from_ref(&shell);
+        let id = script_id_for_save(&[&settings], projects, None, &input);
         assert_eq!(id, "setup-2");
         assert_eq!(
-            scripts.iter().map(|s| (s.id.as_str(), s.run_on_worktree_create)).collect::<Vec<_>>(),
+            scripts_with(&settings, &shell, &id, &input)
+                .iter()
+                .map(|s| (s.id.as_str(), s.run_on_worktree_create))
+                .collect::<Vec<_>>(),
             [("setup", false), ("setup-2", true)]
         );
+        // Another target's environment already uses the id, so the save picks the next one.
+        let other = json!({"projectSettingsOverrides": {"p": {"defaultProjectScripts": [script("setup-2")]}}});
+        assert_eq!(script_id_for_save(&[&settings, &other], projects, None, &input), "setup-3");
+        assert_eq!(script_id_for_save(&[&settings, &other], projects, Some("setup"), &input), "setup");
     }
 
     #[test]
