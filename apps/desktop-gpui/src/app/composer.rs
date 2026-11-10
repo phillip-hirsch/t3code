@@ -147,7 +147,7 @@ fn adds_chip(before: &[String], now: &[String]) -> bool {
 }
 
 /// A failed message first, then whatever was typed after it.
-fn merge_prompt(failed: String, newer: &str) -> String {
+pub(super) fn merge_prompt(failed: String, newer: &str) -> String {
     if newer.trim().is_empty() { failed } else { format!("{failed}\n\n{newer}") }
 }
 

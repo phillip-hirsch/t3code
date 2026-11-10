@@ -23,6 +23,7 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use super::attachments::QuestionDraft;
+use super::composer::merge_prompt;
 use super::right_panel::Surface;
 use super::titlebar::icon;
 use super::{Target, Workspace, new_id};
@@ -143,6 +144,14 @@ impl SideChats {
         self.models.remove(&key);
         if self.view.as_ref().is_some_and(|view| view.is(env, thread_id)) {
             self.view = None;
+        }
+    }
+
+    /// A failed send's text, back with the side chat's saved draft ahead of anything kept since.
+    fn give_back(&mut self, key: Key, text: String) {
+        match self.drafts.entry(key).or_insert_with(|| SideDraft::Prompt(String::new())) {
+            SideDraft::Prompt(prompt) => *prompt = merge_prompt(text, prompt),
+            SideDraft::Question(question) => question.prompt = merge_prompt(text, &question.prompt),
         }
     }
 
@@ -595,10 +604,9 @@ impl Workspace {
                 }
                 if let Some(view) = this.side_chat.view.as_mut().filter(|v| v.is(&key.0, &key.1)) {
                     view.sending = false;
-                    // Gives the text back rather than lose it.
-                    if result.is_err() && view.composer.read(cx).value().is_empty() {
-                        this.set_pane_text(ChatPane::Side, text.clone(), window, cx);
-                    }
+                }
+                if result.is_err() {
+                    this.give_back_side_chat(key.clone(), text.clone(), window, cx);
                 }
                 if let Err(error) = result {
                     this.set_error_from(origin.as_ref(), error.to_string().into());
@@ -608,6 +616,21 @@ impl Workspace {
         })
         .detach();
         cx.notify();
+    }
+
+    /// A failed send's text back in its side chat, ahead of anything typed there since: in the
+    /// composer, set aside under an open question, or kept until its tab shows again.
+    fn give_back_side_chat(&mut self, key: Key, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.side_chat.view.as_mut().filter(|view| view.is(&key.0, &key.1)) else {
+            self.side_chat.give_back(key, text);
+            return;
+        };
+        if let Some(question) = &mut view.question {
+            question.prompt = merge_prompt(text, &question.prompt);
+            return;
+        }
+        let merged = merge_prompt(text, &view.composer.read(cx).value());
+        self.set_pane_text(ChatPane::Side, merged, window, cx);
     }
 
     fn stop_side_chat(&mut self, cx: &mut Context<Self>) {
@@ -1326,6 +1349,23 @@ mod tests {
         card.drafts.insert("b".into(), typed);
         card.index = 1;
         card
+    }
+
+    #[test]
+    fn a_failed_send_returns_to_its_side_chat_off_screen() {
+        let key = |id: &str| (SharedString::from("e"), id.to_owned());
+        let mut side_chats = SideChats::default();
+        side_chats.drafts.insert(key("typed"), SideDraft::Prompt("newer".into()));
+        side_chats.drafts.insert(key("asking"), SideDraft::Question(answered_card()));
+        for id in ["typed", "asking", "empty"] {
+            side_chats.give_back(key(id), "failed".into());
+        }
+        let mut restored = |id: &str| side_chats.drafts.remove(&key(id)).expect(id).restore();
+        assert_eq!(restored("typed").0, "failed\n\nnewer");
+        assert_eq!(restored("empty").0, "failed");
+        let (text, card) = restored("asking");
+        let card = card.expect("the question keeps the editor");
+        assert_eq!((text.as_str(), card.prompt.as_str()), ("typed", "failed\n\nparked prompt"));
     }
 
     #[test]
