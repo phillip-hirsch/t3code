@@ -120,6 +120,14 @@ impl WrapMap {
         self.wrapper.set_inline_metrics(metrics, cx);
     }
 
+    pub(super) fn set_line_styles(
+        &mut self,
+        styles: std::rc::Rc<[super::text_wrapper::WrapLineStyle]>,
+        cx: &mut App,
+    ) {
+        self.wrapper.set_line_styles(styles, cx);
+    }
+
     pub(super) fn on_layout_changed(&mut self, wrap_width: Option<Pixels>, cx: &mut App) {
         self.wrapper.set_wrap_width(wrap_width, cx);
     }

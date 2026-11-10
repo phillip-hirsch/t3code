@@ -17,12 +17,13 @@ use gpui_kit::component::{Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, App, AppContext as _, ClickEvent, Context, ElementId, Entity, Font, FontWeight, HighlightStyle, Hsla,
     InteractiveElement as _, IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _,
-    StyleRefinement, Styled as _, Subscription, TextRun, WeakEntity, Window, div, linear_color_stop, linear_gradient,
-    prelude::FluentBuilder as _, px, relative, rems, rgb,
+    StyleRefinement, Styled as _, Subscription, Task, TextRun, WeakEntity, Window, div, linear_color_stop,
+    linear_gradient, prelude::FluentBuilder as _, px, relative, rems, rgb,
 };
 
 use gpui_kit::assets::IconName;
 
+use super::side_chat::ChatPane;
 use super::{Target, Workspace, message_actions};
 use crate::theme::{self, Tokens};
 use crate::timeline::{self, DetailEntry, Row, Steer, WorkRow, WorkRowKind};
@@ -98,7 +99,7 @@ impl Workspace {
                     .child(
                         MessageScroller::new("timeline", self.scroller.clone(), move |index, window, cx| {
                             match rows.get(index) {
-                                Some(row) => render_row(row, &this, lane_width, window, cx),
+                                Some(row) => render_row(row, ChatPane::Main, &this, lane_width, window, cx),
                                 None => div().into_any_element(),
                             }
                         })
@@ -191,26 +192,7 @@ impl Workspace {
 
     /// Keeps a once-a-second repaint alive while a "Working for …" row shows.
     pub(super) fn sync_working_tick(&mut self, rows: &[Row], cx: &mut Context<Self>) {
-        let working = rows.iter().any(|row| match row {
-            Row::Working { started_at: Some(_) } => true,
-            Row::Now(line) => line.ticks(),
-            Row::Workflow { row, .. } => row.phases.iter().flat_map(|p| &p.2).chain(&row.unphased).any(|c| c.live),
-            Row::SubagentGroup { cards, .. } => cards.iter().any(|c| c.live),
-            Row::WorktreeSetup { snapshot, .. } => snapshot.phase == "running",
-            _ => false,
-        });
-        if !working {
-            self._working_tick = None;
-        } else if self._working_tick.is_none() {
-            self._working_tick = Some(cx.spawn(async move |this, cx| {
-                loop {
-                    cx.background_executor().timer(Duration::from_secs(1)).await;
-                    if this.update(cx, |_, cx| cx.notify()).is_err() {
-                        break;
-                    }
-                }
-            }));
-        }
+        sync_tick(&mut self._working_tick, rows, cx);
     }
 }
 
@@ -723,6 +705,30 @@ fn centered_note(text: &'static str, t: &Tokens) -> AnyElement {
         .into_any_element()
 }
 
+/// Keeps `tick` repainting once a second while `rows` show a running clock.
+pub(super) fn sync_tick(tick: &mut Option<Task<()>>, rows: &[Row], cx: &mut Context<Workspace>) {
+    let working = rows.iter().any(|row| match row {
+        Row::Working { started_at: Some(_) } => true,
+        Row::Now(line) => line.ticks(),
+        Row::Workflow { row, .. } => row.phases.iter().flat_map(|p| &p.2).chain(&row.unphased).any(|c| c.live),
+        Row::SubagentGroup { cards, .. } => cards.iter().any(|c| c.live),
+        Row::WorktreeSetup { snapshot, .. } => snapshot.phase == "running",
+        _ => false,
+    });
+    if !working {
+        *tick = None;
+    } else if tick.is_none() {
+        *tick = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+}
+
 /// A row in the lane (the scroller insets rows to it); owns its bottom space.
 pub(super) fn lane(bottom: f32, child: impl IntoElement) -> gpui_kit::Div {
     div().w_full().pb(px(bottom)).child(child)
@@ -741,6 +747,7 @@ fn toggle(this: &WeakEntity<Workspace>, key: SharedString) -> impl Fn(&ClickEven
 
 pub(super) fn render_row(
     row: &Row,
+    pane: ChatPane,
     this: &WeakEntity<Workspace>,
     lane_width: f32,
     window: &mut Window,
@@ -914,9 +921,9 @@ pub(super) fn render_row(
                 .on_click(toggle(this, key.clone()));
             lane(8., button).into_any_element()
         }
-        Row::Queued { message, last } => super::queue::queued_row(message, *last, this, &t, cx),
-        Row::QueueToggle { total, expanded } => super::queue::toggle_row(*total, *expanded, this, &t),
-        Row::Now(line) => super::thread_now::now_row(line, this, lane_width, &t, window, cx),
+        Row::Queued { message, last } => super::queue::queued_row(message, *last, pane, this, &t, cx),
+        Row::QueueToggle { total, expanded } => super::queue::toggle_row(*total, *expanded, pane, this, &t),
+        Row::Now(line) => super::thread_now::now_row(line, pane, this, lane_width, &t, window, cx),
         Row::Workflow { row, expanded } => {
             lane(16., super::workflow::workflow_row(row, *expanded, this, lane_width, &t, cx)).into_any_element()
         }
@@ -940,9 +947,9 @@ pub(super) fn render_row(
         Row::Handoff(handoff) => lane(8., handoff_divider(handoff, this, &t, cx)).into_any_element(),
         Row::Approval { request_id, .. } => this
             .update(cx, |workspace, cx| {
-                let approvals = workspace.open_projection().map(|p| p.pending_approvals()).unwrap_or_default();
+                let approvals = workspace.pane_projection(pane).map(|p| p.pending_approvals()).unwrap_or_default();
                 let (request, item) = approvals.into_iter().find(|(request, _)| request.id == request_id.as_ref())?;
-                Some(workspace.render_approval(request, item, &t, cx))
+                Some(workspace.render_approval(pane, request, item, &t, cx))
             })
             .ok()
             .flatten()
@@ -2040,7 +2047,7 @@ pub(super) fn inline_code_style(t: &Tokens) -> StyleRefinement {
 
 /// `.chat-markdown` (`index.css:1866-2280`) and `MarkdownCodeBlock.tsx`.
 /// The code block fill: `input/32` in dark mode, `secondary` in light.
-fn code_background(t: &Tokens) -> Hsla {
+pub(super) fn code_background(t: &Tokens) -> Hsla {
     if t.dark { alpha(t.input, 0.32) } else { t.secondary }
 }
 
@@ -2168,6 +2175,11 @@ fn pierre_theme(dark: bool) -> Arc<HighlightTheme> {
         "style": { "editor.foreground": fg, "syntax": syntax },
     });
     Arc::new(serde_json::from_value(theme).expect("valid highlight theme"))
+}
+
+/// The Pierre highlight theme for the appearance, which the composer's code blocks use too.
+pub(super) fn highlight_theme(dark: bool) -> Arc<HighlightTheme> {
+    if dark { PIERRE_DARK.clone() } else { PIERRE_LIGHT.clone() }
 }
 
 /// Shared so every text view reuses one highlighter cache.

@@ -441,7 +441,11 @@ impl Workspace {
         let (Some(trigger), Some(item)) = (self.menu.trigger.clone(), self.menu.items.get(index).cloned()) else {
             return;
         };
+        // `/usage-limits` opens the panel and leaves nothing behind.
+        let usage_limits = matches!(&item.action, MenuAction::Command { name } if name == "usage-limits")
+            && self.usage_limits_offered();
         let (replacement, chip) = match &item.action {
+            _ if usage_limits => (String::new(), None),
             MenuAction::File { path, .. } => (composer_text::file_link(path), Some(Chip::File { path: path.clone() })),
             MenuAction::Skill { name, .. } => (format!("${name}"), Some(Chip::Skill { name: name.clone() })),
             MenuAction::Command { name } => (format!("/{name} "), None),
@@ -468,7 +472,11 @@ impl Workspace {
         self.composer.update(cx, |state, cx| {
             let text = state.value();
             let typed = if chip.is_some() { format!("{replacement} ") } else { replacement.clone() };
-            let range = composer_text::extend_for_trailing_space(&text, trigger.range.clone(), &typed);
+            let range = if usage_limits {
+                trigger.range.clone()
+            } else {
+                composer_text::extend_for_trailing_space(&text, trigger.range.clone(), &typed)
+            };
             match chip {
                 Some(chip) => {
                     let token = InlineToken::new(chip.id(), replacement).with_label(chip.label().to_owned());
@@ -486,6 +494,9 @@ impl Workspace {
             MenuAction::Model => self.open_model_picker(window, cx),
             MenuAction::Mode(mode) => self.set_interaction_mode(mode, window, cx),
             MenuAction::Clear => self.arm_fresh_session(cx),
+            _ if usage_limits => {
+                self.open_usage_limits(window, cx);
+            }
             _ => {}
         }
         self.sync_composer_empty(cx);

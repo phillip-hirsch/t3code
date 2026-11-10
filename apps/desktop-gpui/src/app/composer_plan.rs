@@ -43,6 +43,14 @@ pub(super) struct ComposerUi {
         std::cell::RefCell<Option<(super::composer::FooterText, super::composer_fit::ControlsWidths)>>,
     /// The chip under the pointer and its window bounds, for its details tooltip.
     pub(super) chip_hover: Option<(String, gpui_kit::Bounds<gpui_kit::Pixels>)>,
+    /// The rich editor's Markdown presentation and its code language picker.
+    pub(super) rich: super::composer_rich::RichUi,
+    /// The models each draft starts at once.
+    pub(super) fanout: super::fanout::FanoutState,
+    /// Compacting an idle thread before its next send.
+    pub(super) compact: super::compact_send::CompactState,
+    /// `/usage-limits`' panel in the banner dock.
+    pub(super) usage_limits: super::pages::UsageLimitsPanel,
 }
 
 /// `resolveComposerInteractionMode`: whether the toggle shows, and the mode sends use.

@@ -1286,6 +1286,9 @@ pub struct TokenUsage {
     pub compacts_automatically: Option<bool>,
     #[serde(default)]
     pub cost: Option<UsageCost>,
+    /// How long the provider keeps the prompt cache; a live turn's usage reports it.
+    #[serde(default)]
+    pub prompt_cache_ttl_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1498,6 +1501,9 @@ pub struct RuntimeRequest {
     pub status: String,
     #[serde(default)]
     pub response_capability: Value,
+    /// A resolved question's answers, keyed by question.
+    #[serde(default)]
+    pub answers: Value,
 }
 
 impl RuntimeRequest {
@@ -1741,6 +1747,7 @@ impl ThreadProjection {
                 total_processed_tokens: item["beforeTokenCount"].as_u64(),
                 compacts_automatically: Some(true),
                 cost: None,
+                prompt_cache_ttl_ms: None,
             })
         })
     }

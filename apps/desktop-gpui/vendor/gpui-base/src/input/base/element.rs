@@ -23,6 +23,7 @@ use crate::{
 
 use super::{
     InputBaseState, PrepaintCaretGeometry, RangeDecorationStyle, TextDecoration,
+    TextPresentation,
     layout::{LastLayout, WhitespaceIndicators},
     mode::LayoutMode,
     tab_stops::{expand_tabs, expanded_width, tab_stop_width},
@@ -62,6 +63,27 @@ const MAX_HIGHLIGHT_LINE_LENGTH: usize = 10_000;
 const MIN_LINE_NUMBER_DIGITS: usize = 3;
 const MAX_LINE_NUMBER_DIGITS: usize = 7;
 const MAX_DISPLAYED_LINE_NUMBER: usize = 9_999_999;
+
+/// What a textarea draws over its text, unless the text is masked or empty.
+fn active_presentation<M: InputModeKind>(state: &InputBaseState<M>) -> Option<&TextPresentation> {
+    if state.masked || state.text.len() == 0 {
+        return None;
+    }
+    state.extras.presentation().map(|(presentation, _)| presentation)
+}
+
+/// Token and replacement widths in one ascending list; they never overlap.
+fn merge_inline_metrics(
+    tokens: &Rc<[(Range<usize>, Pixels)]>,
+    replacements: &[(Range<usize>, Pixels)],
+) -> Rc<[(Range<usize>, Pixels)]> {
+    if replacements.is_empty() {
+        return tokens.clone();
+    }
+    let mut merged: Vec<_> = tokens.iter().chain(replacements).cloned().collect();
+    merged.sort_by_key(|(range, _)| range.start);
+    Rc::from(merged)
+}
 
 fn line_number_len(total_lines: usize) -> usize {
     (total_lines.max(1).ilog10() as usize + 1).clamp(MIN_LINE_NUMBER_DIGITS, MAX_LINE_NUMBER_DIGITS)
@@ -2028,6 +2050,27 @@ impl<M: InputModeKind> TextElement<M> {
     ) -> std::collections::HashMap<usize, (AnyElement, Size<Pixels>)> {
         let style = window.text_style();
         let state = self.state.read(cx);
+        let presentation = active_presentation(state);
+        let extra = presentation
+            .map(|presentation| presentation.inline_metrics(&state.text, width))
+            .unwrap_or_default();
+        let styles = presentation.map_or_else(|| Rc::from([]), TextPresentation::wrap_styles);
+        self.state.update(cx, |state, cx| {
+            state.display_map.set_line_styles(styles, cx);
+            if !state.tokens_visible() {
+                state
+                    .display_map
+                    .set_inline_metrics(Rc::from(extra.as_slice()), cx);
+            }
+            if state.mode.is_auto_grow() {
+                let rows = state.mode.rows();
+                state.mode.update_auto_grow(&state.display_map);
+                if state.mode.rows() != rows {
+                    cx.notify();
+                }
+            }
+        });
+        let state = self.state.read(cx);
         let key = (
             style.font(),
             style.font_size.to_pixels(window.rem_size()),
@@ -2050,7 +2093,9 @@ impl<M: InputModeKind> TextElement<M> {
                 return Default::default();
             }
             self.state.update(cx, |state, cx| {
-                state.display_map.set_inline_metrics(Rc::from([]), cx)
+                state
+                    .display_map
+                    .set_inline_metrics(Rc::from(extra.as_slice()), cx)
             });
             let mut exit = self.state.update(cx, |state, _| {
                 state.token_bounds.clear();
@@ -2187,7 +2232,7 @@ impl<M: InputModeKind> TextElement<M> {
                         .unwrap_or_default();
                 }
             }
-            let metrics = cache.metrics.clone();
+            let metrics = merge_inline_metrics(&cache.metrics, &extra);
             state.token_layout_cache = Some(cache);
             state.display_map.set_inline_metrics(metrics, cx);
             if state.mode.is_auto_grow() {
@@ -2201,25 +2246,49 @@ impl<M: InputModeKind> TextElement<M> {
         elements
     }
 
+    /// Rows of fragments: shaped text between tokens and replaced ranges, which take the
+    /// widths they were measured or set at. A presentation's line style sets the line's
+    /// font family and size and indents its rows.
     fn layout_token_lines(
         state: &InputBaseState<M>,
         last_layout: &LastLayout,
         font_size: Pixels,
         runs: &[TextRun],
+        max_width: Pixels,
         window: &mut Window,
     ) -> Vec<LineLayout> {
         use crate::input::display_map::{InlineFragment, InputLine};
-        let spans = state.token_spans();
-        let cache = state
+        let token_metrics = state
             .token_layout_cache
             .as_ref()
-            .expect("tokens measured before shaping");
+            .filter(|_| state.tokens_visible())
+            .map(|cache| cache.metrics.clone())
+            .unwrap_or_else(|| Rc::from([]));
+        let presentation = active_presentation(state);
+        let extra = presentation
+            .map(|presentation| presentation.inline_metrics(&state.text, max_width))
+            .unwrap_or_default();
+        let spans = merge_inline_metrics(&token_metrics, &extra);
+        let base_font_size = font_size;
         let mut run_offset = 0;
         last_layout
             .visible_buffer_lines
             .iter()
             .map(|&row| {
                 let line_start = state.text.line_start_offset(row);
+                let line_style =
+                    presentation.and_then(|presentation| presentation.line_style(line_start));
+                let font_size = base_font_size * line_style.map_or(1., |style| style.scale);
+                let family = line_style.and_then(|style| style.family.clone());
+                let runs_for_range = |runs: &[TextRun], offset: usize, range: &Range<usize>| {
+                    let mut runs = runs_for_range(runs, offset, range);
+                    if let Some(family) = &family {
+                        for run in &mut runs {
+                            run.font.family = family.clone();
+                        }
+                    }
+                    runs
+                };
                 let text: String = state.text.slice_line(row).into();
                 let ranges = if state.is_single_line() {
                     smallvec::smallvec![0..text.len()]
@@ -2236,13 +2305,15 @@ impl<M: InputModeKind> TextElement<M> {
                     let mut fragments = Vec::new();
                     let mut offset = range.start;
                     let mut x = px(0.);
-                    let first =
-                        spans.partition_point(|s| s.range().end <= line_start + range.start);
-                    for span in spans[first..]
+                    // Empty ranges at the row's start still belong to it.
+                    let first = spans.partition_point(|(span, _)| {
+                        span.end <= line_start + range.start && span.start < line_start + range.start
+                    });
+                    for (span, width) in spans[first..]
                         .iter()
-                        .take_while(|s| s.range().start < line_start + range.end)
+                        .take_while(|(span, _)| span.start < line_start + range.end)
                     {
-                        let local = span.range().start - line_start..span.range().end - line_start;
+                        let local = span.start - line_start..span.end - line_start;
                         if offset < local.start {
                             let part = offset..local.start;
                             let shaped = window.text_system().shape_line(
@@ -2260,7 +2331,7 @@ impl<M: InputModeKind> TextElement<M> {
                             });
                             x += width;
                         }
-                        let width = cache.widths.get(span.token()).copied().unwrap_or_default();
+                        let width = *width;
                         fragments.push(InlineFragment {
                             range: local.start - range.start..local.end - range.start,
                             x,
@@ -2302,6 +2373,7 @@ impl<M: InputModeKind> TextElement<M> {
                 LineLayout::new()
                     .inline_lines(lines)
                     .wrap_indent(wrap_indent)
+                    .indent(line_style.map_or(px(0.), |style| style.indent))
             })
             .collect()
     }
@@ -2442,6 +2514,155 @@ impl<M: InputModeKind> TextElement<M> {
         out
     }
 
+    /// A presentation's replaced ranges that draw something: inline ones where their range
+    /// starts, gutter ones in their line's indent.
+    fn prepaint_replacements(
+        &self,
+        layout: &LastLayout,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Vec<AnyElement> {
+        let state = self.state.read(cx);
+        let Some(presentation) = active_presentation(state) else {
+            return Vec::new();
+        };
+        let max_width = (bounds.size.width - layout.line_number_width - RIGHT_MARGIN).max(px(1.));
+        let mut placements = Vec::new();
+        let mut y = layout.visible_top;
+        for (ix, &row) in layout.visible_buffer_lines.iter().enumerate() {
+            let start = state.text.line_start_offset(row);
+            let end = state.text.line_end_offset(row);
+            let Some(line) = layout.lines.get(ix) else {
+                break;
+            };
+            let replacements = &presentation.replacements;
+            let first = replacements.partition_point(|item| item.range().end < start);
+            for item in replacements[first..]
+                .iter()
+                .take_while(|item| item.range().start <= end)
+            {
+                let Some(render) = item.renderer().cloned() else {
+                    continue;
+                };
+                let (origin, width) = if item.is_gutter() {
+                    let indent = presentation
+                        .line_style(start)
+                        .map_or(px(0.), |style| style.indent);
+                    let x = layout.alignment_offset(line.longest_width);
+                    (point(x, px(0.)), indent)
+                } else {
+                    let Some(position) =
+                        line.position_for_index(item.range().start - start, layout, false)
+                    else {
+                        continue;
+                    };
+                    (
+                        position,
+                        presentation.replacement_width(item, &state.text, max_width),
+                    )
+                };
+                if width <= px(0.) {
+                    continue;
+                }
+                placements.push((
+                    super::InlineReplacementContext::new(item.range(), width, layout.line_height),
+                    render,
+                    bounds.origin + origin + point(layout.line_number_width, y),
+                ));
+            }
+            y += line.size(layout.line_height).height;
+        }
+        placements
+            .into_iter()
+            .map(|(context, render, origin)| {
+                let mut element = render(&context, window, cx);
+                element.layout_as_root(
+                    size(
+                        gpui::AvailableSpace::Definite(context.width()),
+                        gpui::AvailableSpace::Definite(context.line_height()),
+                    ),
+                    window,
+                    cx,
+                );
+                element.prepaint_at(origin, window, cx);
+                element
+            })
+            .collect()
+    }
+
+    /// A presentation's backdrops over the visible rows of the lines they span.
+    fn layout_backdrops(
+        &self,
+        layout: &LastLayout,
+        bounds: Bounds<Pixels>,
+        cx: &App,
+    ) -> Vec<PaintQuad> {
+        let state = self.state.read(cx);
+        let Some(presentation) = active_presentation(state) else {
+            return Vec::new();
+        };
+        if presentation.backdrops.is_empty() || layout.lines.is_empty() {
+            return Vec::new();
+        }
+        let mut rows = Vec::with_capacity(layout.lines.len());
+        let mut y = layout.visible_top;
+        for (line, &row) in layout.lines.iter().zip(&layout.visible_buffer_lines) {
+            let height = line.size(layout.line_height).height;
+            rows.push((row, y, y + height));
+            y += height;
+        }
+        let (first, last) = (rows[0].0, rows[rows.len() - 1].0);
+        let text_left = bounds.origin.x + layout.line_number_width;
+        let text_width = bounds.size.width - layout.line_number_width;
+        presentation
+            .backdrops
+            .iter()
+            .filter_map(|backdrop| {
+                let start = state.text.offset_to_point(backdrop.range.start).row;
+                let end = state.text.offset_to_point(backdrop.range.end).row;
+                if end < first || start > last {
+                    return None;
+                }
+                let shown = rows
+                    .iter()
+                    .filter(|(row, _, _)| (start..=end).contains(row));
+                let top = shown.clone().map(|(_, top, _)| *top).min()?;
+                let bottom = shown.map(|(_, _, bottom)| *bottom).max()?;
+                // A block running past the viewport keeps its rounded ends out of view.
+                let top = if start < first {
+                    top - layout.line_height
+                } else {
+                    top
+                };
+                let bottom = if end > last {
+                    bottom + layout.line_height
+                } else {
+                    bottom
+                };
+                let width = backdrop
+                    .width
+                    .unwrap_or(text_width - backdrop.left)
+                    .max(px(0.));
+                Some(gpui::quad(
+                    Bounds::new(
+                        point(text_left + backdrop.left, bounds.origin.y + top),
+                        size(width, bottom - top),
+                    ),
+                    backdrop.radius,
+                    backdrop.background,
+                    if backdrop.border.is_some() {
+                        px(1.)
+                    } else {
+                        px(0.)
+                    },
+                    backdrop.border.unwrap_or_default(),
+                    gpui::BorderStyle::Solid,
+                ))
+            })
+            .collect()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn layout_lines(
         state: &InputBaseState<M>,
@@ -2451,11 +2672,19 @@ impl<M: InputModeKind> TextElement<M> {
         runs: &[TextRun],
         bg_segments: &[(Range<usize>, Hsla)],
         whitespace_indicators: Option<WhitespaceIndicators>,
+        max_width: Pixels,
         window: &mut Window,
     ) -> Vec<LineLayout> {
         let is_single_line = state.is_single_line();
-        if state.tokens_visible() {
-            return Self::layout_token_lines(state, last_layout, font_size, runs, window);
+        if state.tokens_visible() || active_presentation(state).is_some() {
+            return Self::layout_token_lines(
+                state,
+                last_layout,
+                font_size,
+                runs,
+                max_width,
+                window,
+            );
         }
 
         let tab_stop = tab_stop_width(
@@ -2738,6 +2967,8 @@ pub(super) struct PrepaintState {
     /// The lines of entire lines.
     last_layout: LastLayout,
     token_elements: Vec<AnyElement>,
+    /// A presentation's blocks, painted behind the text.
+    backdrops: Vec<PaintQuad>,
     /// The lines only contains the visible lines in the viewport, based on `visible_range`.
     ///
     /// The child is the soft lines.
@@ -3202,6 +3433,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
             &runs,
             &document_colors,
             whitespace_indicators,
+            (bounds.size.width - line_number_width - RIGHT_MARGIN).max(px(1.)),
             window,
         );
 
@@ -3266,7 +3498,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 .longest_line_width
                 .set(Some((key, longest_line_width)));
         }
-        if state.tokens_visible() {
+        if state.tokens_visible() || active_presentation(state).is_some() {
             longest_line_width = if let Some(width) = wrap_width {
                 width
             } else {
@@ -3515,9 +3747,13 @@ impl<M: InputModeKind> Element for TextElement<M> {
             cx,
         );
 
-        let token_elements = self.prepaint_tokens(&last_layout, bounds, token_elements, window, cx);
+        let mut token_elements =
+            self.prepaint_tokens(&last_layout, bounds, token_elements, window, cx);
+        let backdrops = self.layout_backdrops(&last_layout, bounds, cx);
+        token_elements.extend(self.prepaint_replacements(&last_layout, bounds, window, cx));
         PrepaintState {
             token_elements,
+            backdrops,
             hitbox,
             bounds,
             last_layout,
@@ -3624,6 +3860,10 @@ impl<M: InputModeKind> Element for TextElement<M> {
         } else {
             px(0.)
         };
+
+        for quad in std::mem::take(&mut prepaint.backdrops) {
+            window.paint_quad(quad);
+        }
 
         // Paint glyph backgrounds
         //

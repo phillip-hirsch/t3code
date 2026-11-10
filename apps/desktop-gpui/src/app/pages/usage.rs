@@ -2,6 +2,7 @@
 //! over the last main view). Cost and Tokens read `server.getUsageSummary`; Limits shows the
 //! subscription windows providers report, refreshed through `server.refreshProviders`.
 
+mod composer_limits;
 mod prices;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -28,6 +29,8 @@ use super::super::Workspace;
 use super::super::sidebar::now_ms;
 use crate::theme::{self, Tokens};
 use crate::usage::{self as logic, Merged, PeriodKey, Pool, PoolWindow, Summary, Window as UsageWindow};
+
+pub(in crate::app) use composer_limits::UsageLimitsPanel;
 
 /// Limits re-probe on their own at most this often; the refresh button always does.
 const LIMITS_AUTO_REFRESH_MS: i64 = 5 * 60_000;
@@ -78,6 +81,29 @@ pub(in crate::app) struct UsageState {
     card: SegmentCard,
     /// Each limit segment's focus handle, by [`segment_key`].
     segment_focus: HashMap<String, FocusHandle>,
+    /// The model row whose dialog is open (`selectedUsageModelKeyAtom`), by [`model_key`].
+    model: Option<String>,
+    /// That model's buckets merged, with the summary, model key and hidden providers they came from.
+    model_merged: RefCell<Option<ModelMerge>>,
+    model_chart: RefCell<Option<Rc<ChartData>>>,
+    model_hover: Option<(usize, Pixels, Pixels)>,
+    /// Each model row's focus handle, by [`model_key`].
+    model_focus: HashMap<String, FocusHandle>,
+    model_dialog_focus: Option<FocusHandle>,
+}
+
+type ModelMerge = (Rc<Summary>, String, Vec<String>, Rc<Merged>);
+
+/// Which usage chart: the page's, or the model dialog's.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChartSlot {
+    Page,
+    Model,
+}
+
+/// A model row's key, `provider:model` as the web's.
+fn model_key(model: &logic::ModelTotals) -> String {
+    format!("{}:{}", model.provider, model.model)
 }
 
 /// A connected environment, its socket and what a read there is priced and filtered with.
@@ -323,6 +349,12 @@ impl Default for UsageState {
             chart: RefCell::default(),
             card: SegmentCard::default(),
             segment_focus: HashMap::new(),
+            model: None,
+            model_merged: RefCell::default(),
+            model_chart: RefCell::default(),
+            model_hover: None,
+            model_focus: HashMap::new(),
+            model_dialog_focus: None,
         }
     }
 }
@@ -452,6 +484,13 @@ impl UsageState {
         self.failures.iter().find(|(id, _)| self.is_selected(id)).map(|(_, message)| message.as_str())
     }
 
+    fn chart_hover(&mut self, slot: ChartSlot) -> &mut Option<(usize, Pixels, Pixels)> {
+        match slot {
+            ChartSlot::Page => &mut self.hover,
+            ChartSlot::Model => &mut self.model_hover,
+        }
+    }
+
     fn hidden_drivers(&self) -> Vec<&'static str> {
         logic::PROVIDERS.iter().filter(|p| self.hidden.iter().any(|h| h == p.0)).map(|p| p.2).collect()
     }
@@ -467,6 +506,8 @@ fn scan_settings(info: &crate::model::ServerInfo) -> Value {
 impl Workspace {
     pub(in crate::app) fn usage_opened(&mut self, cx: &mut Context<Self>) {
         self.usage.focus_on_render = true;
+        // The dialog host unmounts with the page, which clears its pick.
+        self.usage.model = None;
         self.usage.limits_now = now_ms();
         if self.usage.metric == "limits" {
             self.refresh_limits(true, cx);
@@ -484,7 +525,10 @@ impl Workspace {
         self.usage.metric = metric;
         self.save_usage_preferences();
         self.usage.hover = None;
+        self.usage.model_hover = None;
         if metric == "limits" {
+            // Limits unmounts the model dialog's host.
+            self.usage.model = None;
             self.usage.limits_now = now_ms();
             self.refresh_limits(true, cx);
         } else {
@@ -832,7 +876,242 @@ impl Workspace {
                             ),
                     ),
             )
+            .children(self.render_usage_model_dialog(&t, window, cx))
             .into_any_element()
+    }
+
+    fn open_usage_model(&mut self, key: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.usage.model = Some(key);
+        self.usage.model_hover = None;
+        let focus = self.usage.model_dialog_focus.get_or_insert_with(|| cx.focus_handle()).clone();
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    /// Closes the model dialog, focus back on its row.
+    fn close_usage_model(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(key) = self.usage.model.take()
+            && let Some(row) = self.usage.model_focus.get(&key)
+        {
+            window.focus(row, cx);
+        }
+        cx.notify();
+    }
+
+    /// Escape closes the model dialog before the page.
+    pub(in crate::app) fn usage_model_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.usage.model.is_none() {
+            return false;
+        }
+        self.close_usage_model(window, cx);
+        true
+    }
+
+    /// The selected model's buckets merged, reused while the summary and hidden providers hold.
+    fn model_merge(&self, summary: &Rc<Summary>, key: &str, model: &logic::ModelTotals) -> Rc<Merged> {
+        let mut held = self.usage.model_merged.borrow_mut();
+        if let Some((from, held_key, hidden, merged)) = held.as_ref()
+            && Rc::ptr_eq(from, summary)
+            && held_key == key
+            && *hidden == self.usage.hidden
+        {
+            return merged.clone();
+        }
+        let keep = |bucket: &logic::Bucket| bucket.provider == model.provider && bucket.model == model.model;
+        let merged = Rc::new(logic::merge_where(summary, &self.usage.hidden, keep));
+        *held = Some((summary.clone(), key.to_owned(), self.usage.hidden.clone(), merged.clone()));
+        merged
+    }
+
+    /// `UsageModelDialog`: one model's history, rates and breakdowns, and "Set price" for its
+    /// unpriced tokens.
+    fn render_usage_model_dialog(&self, t: &Tokens, win: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let usage = &self.usage;
+        if usage.metric == "limits" {
+            return None;
+        }
+        let key = usage.model.clone()?;
+        let model = usage.merged.models.iter().find(|m| model_key(m) == key)?.clone();
+        let (summary, shown_window) = usage.summary.clone()?;
+        let focus = usage.model_dialog_focus.clone()?;
+        let merged = self.model_merge(&summary, &key, &model);
+        let sm = f32::from(win.viewport_size().width) >= SM;
+        let unknown = model.cost_unknown();
+        let stats: Vec<(&str, String)> = [
+            Some(("Cost", if unknown { "Unpriced".to_owned() } else { logic::format_usd(model.cost_usd) })),
+            Some(("Tokens", logic::format_tokens(model.total_tokens as f64))),
+            model.cost_per_million().map(|v| ("Per 1M tokens", logic::format_usd(v))),
+            model.cache_hit_rate().map(|rate| ("Cache hit", logic::format_percent(rate))),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let stats = div().grid().grid_cols(if sm { 4 } else { 2 }).gap_x(px(24.)).gap_y(px(16.)).children(
+            stats.into_iter().map(|(label, value)| {
+                v_flex()
+                    .min_w_0()
+                    .gap(px(2.))
+                    .child(div().text_xs().text_color(t.muted_foreground).child(label))
+                    .child(div().text_2xl().font_weight(FontWeight::SEMIBOLD).text_color(t.foreground).child(value))
+            }),
+        );
+        // Unpriced cost is unknown, not zero, so its trend shows tokens.
+        let chart_tokens = unknown || usage.tokens();
+        let provider: &'static str =
+            logic::PROVIDERS.iter().map(|p| p.0).find(|kind| *kind == model.provider).unwrap_or_default();
+        let providers = [provider];
+        let chart = self
+            .render_usage_chart(&merged, &shown_window, &providers, chart_tokens, ChartSlot::Model, t, cx)
+            .into_any_element();
+        let ink = |share: f32| mix(t.foreground, t.background, share);
+        let mut bars = Vec::new();
+        if !unknown {
+            let [input, read, write, output, other] = merged.category;
+            bars.push(share_bar(
+                "Cost by type",
+                vec![
+                    ("Input", input, ink(0.6)),
+                    ("Cache read", read, ink(0.3)),
+                    ("Cache write", write, ink(0.72)),
+                    ("Output", output, ink(1.)),
+                    ("Other", if other >= 0.005 { other } else { 0. }, ink(0.44)),
+                ],
+                false,
+                None,
+                t,
+            ));
+        }
+        let tokens = model.tokens;
+        bars.push(share_bar(
+            "Tokens by type",
+            vec![
+                ("Input", tokens.uncached_input_tokens as f64, ink(0.6)),
+                ("Cache read", tokens.cached_input_tokens as f64, ink(0.3)),
+                ("Cache write", tokens.cache_creation_tokens as f64, ink(0.72)),
+                ("Output", tokens.output_tokens as f64, ink(1.)),
+            ],
+            true,
+            None,
+            t,
+        ));
+        let speed = merged.speed;
+        if speed.fast + speed.ultrafast > 0. {
+            bars.push(share_bar(
+                "Cost by speed",
+                vec![
+                    ("Standard", speed.standard, ink(0.34)),
+                    ("Fast", speed.fast, ink(0.66)),
+                    ("Ultrafast", speed.ultrafast, ink(1.)),
+                ],
+                false,
+                Some(logic::format_usd(speed.premium)),
+                t,
+            ));
+        }
+        let description = if unknown {
+            logic::provider_label(&model.provider).to_owned()
+        } else {
+            format!("{} · {} of cost", logic::provider_label(&model.provider), logic::format_percent(model.cost_share))
+        };
+        let set_price = model.model.clone();
+        let footer = (model.unpriced_tokens > 0.).then(|| {
+            h_flex()
+                .flex_none()
+                .justify_between()
+                .gap(px(8.))
+                .px(px(24.))
+                .pb(px(24.))
+                .pt(px(16.))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(t.muted_foreground)
+                        .child(format!("{} tokens have no known price", logic::format_tokens(model.unpriced_tokens))),
+                )
+                .child(Button::new("usage-model-set-price").primary().label("Set price").on_click(cx.listener(
+                    move |this, _, window, cx| {
+                        this.usage.model = None;
+                        this.open_model_prices(Some(set_price.clone()), window, cx);
+                        cx.notify();
+                    },
+                )))
+        });
+        Some(
+            div()
+                .id("usage-model-dialog")
+                .absolute()
+                .inset_0()
+                .occlude()
+                .bg(gpui_kit::black().opacity(0.32))
+                .flex()
+                .items_center()
+                .justify_center()
+                .p(px(16.))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.close_usage_model(window, cx);
+                    }),
+                )
+                .child(
+                    v_flex()
+                        .id("usage-model-panel")
+                        .relative()
+                        .w_full()
+                        .max_w(px(768.))
+                        .max_h_full()
+                        .overflow_hidden()
+                        .rounded(px(16.))
+                        .border_1()
+                        .border_color(t.border)
+                        .bg(t.popover)
+                        .shadow_lg()
+                        .text_color(t.foreground)
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .focus_trap("usage-model-trap", &focus)
+                        .child(
+                            v_flex()
+                                .flex_none()
+                                .gap(px(8.))
+                                .p(px(24.))
+                                .pr(px(48.))
+                                .child(
+                                    h_flex().gap(px(8.)).children(provider_mark(&model.provider, 20., t)).child(
+                                        div()
+                                            .min_w_0()
+                                            .text_xl()
+                                            .line_height(relative(1.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(model.model.clone()),
+                                    ),
+                                )
+                                .child(div().text_sm().text_color(t.muted_foreground).child(description)),
+                        )
+                        .child(
+                            ghost_icon_button("usage-model-close", Lucide::X, 16., t)
+                                .absolute()
+                                .top(px(8.))
+                                .right(px(8.))
+                                .tooltip("Close")
+                                .on_click(cx.listener(|this, _, window, cx| this.close_usage_model(window, cx))),
+                        )
+                        .child(
+                            div().id("usage-model-scroll").flex_1().min_h_0().overflow_y_scroll().child(
+                                v_flex().px(px(24.)).pb(px(24.)).gap(px(32.)).child(stats).child(chart).child(
+                                    div()
+                                        .grid()
+                                        .grid_cols(if sm { 2 } else { 1 })
+                                        .gap_x(px(40.))
+                                        .gap_y(px(32.))
+                                        .children(bars.into_iter().map(|bar| div().min_w_0().child(bar))),
+                                ),
+                            ),
+                        )
+                        .children(footer),
+                )
+                .into_any_element(),
+        )
     }
 
     fn render_usage_header(
@@ -1086,6 +1365,11 @@ impl Workspace {
         if usage.needs_reread(self.usage_scan_settings_changed()) {
             let view = cx.entity();
             cx.defer(move |cx| view.update(cx, |this, cx| this.read_usage(false, cx)));
+        }
+        let keys: Vec<String> = self.usage.merged.models.iter().map(model_key).collect();
+        self.usage.model_focus.retain(|key, _| keys.contains(key));
+        for key in keys {
+            self.usage.model_focus.entry(key).or_insert_with(|| cx.focus_handle().tab_stop(true));
         }
         let usage = &self.usage;
         match (&usage.summary, usage.error()) {
@@ -1353,7 +1637,7 @@ impl Workspace {
             .min_w_0()
             .gap(px(12.))
             .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(chart_title))
-            .child(self.render_usage_chart(&merged, window, &providers, t, cx));
+            .child(self.render_usage_chart(&merged, window, &providers, tokens, ChartSlot::Page, t, cx));
         overview = overview.child(summary_and_chart(lg, summary_column, chart));
 
         let metric = |label: &str, value: String| {
@@ -1429,19 +1713,22 @@ impl Workspace {
             .into_any_element()
     }
 
+    #[expect(clippy::too_many_arguments, reason = "the page's and the model dialog's charts differ in each")]
     fn render_usage_chart(
         &self,
         merged: &Rc<Merged>,
         window: &UsageWindow,
         providers: &[&'static str],
+        tokens: bool,
+        slot: ChartSlot,
         t: &Tokens,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let tokens = self.usage.tokens();
         let tz = Local;
         let hour12 = self.hour12();
         let data = {
-            let mut held = self.usage.chart.borrow_mut();
+            let cache = if slot == ChartSlot::Page { &self.usage.chart } else { &self.usage.model_chart };
+            let mut held = cache.borrow_mut();
             let fresh = |d: &&Rc<ChartData>| {
                 Rc::ptr_eq(&d.key.0, merged) && d.key.1 == *window && d.key.2 == providers && d.key.3 == tokens
             };
@@ -1456,7 +1743,7 @@ impl Workspace {
         let series = data.series.clone();
         let format = move |value: f64| if tokens { logic::format_tokens(value) } else { logic::format_usd(value) };
         let grid = t.border;
-        let hover = self.usage.hover;
+        let hover = if slot == ChartSlot::Page { self.usage.hover } else { self.usage.model_hover };
         let hover_x = hover.map(|(index, ..)| index as f32 * step_x);
         let muted = t.muted_foreground;
         let bounds_cell: Rc<Cell<Option<Bounds<Pixels>>>> = Rc::default();
@@ -1607,7 +1894,7 @@ impl Workspace {
             .child(
                 h_flex().gap(px(8.)).child(axis).child(
                     div()
-                        .id("usage-chart")
+                        .id(if slot == ChartSlot::Page { "usage-chart" } else { "usage-model-chart" })
                         .relative()
                         .flex_1()
                         .h(px(224.))
@@ -1629,14 +1916,15 @@ impl Workspace {
                                 )]
                                 let index = (fraction * (period_count - 1) as f32).round() as usize;
                                 let next = Some((index, local.x, local.y));
-                                if this.usage.hover != next {
-                                    this.usage.hover = next;
+                                let hover = this.usage.chart_hover(slot);
+                                if *hover != next {
+                                    *hover = next;
                                     cx.notify();
                                 }
                             })
                         })
-                        .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                            if !hovered && this.usage.hover.take().is_some() {
+                        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                            if !hovered && this.usage.chart_hover(slot).take().is_some() {
                                 cx.notify();
                             }
                         })),
@@ -1760,13 +2048,23 @@ impl Workspace {
                 #[expect(clippy::cast_possible_truncation, reason = "a 0..=1 share; f32 is what GPUI lays out with")]
                 let bar = (value > 0. && peak > 0.).then(|| (value / peak) as f32);
                 let share = model.share(tokens).map(logic::format_percent).unwrap_or_default();
+                let key = model_key(model);
+                let focus = usage.model_focus.get(&key);
+                let row_hover = Hsla { a: 0.5, ..t.muted };
                 table = table.child(
                     h_flex()
                         .id(ElementId::Name(format!("usage-model-{}-{}", model.provider, model.model).into()))
                         .border_b_1()
                         .border_color(row_border)
                         .text_color(t.muted_foreground)
-                        .hover(|s| s.bg(Hsla { a: 0.5, ..t.muted }))
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(row_hover))
+                        .focus_visible(move |s| s.bg(row_hover))
+                        .when_some(focus, gpui_kit::InteractiveElement::track_focus)
+                        // A click, Enter or Space opens the model's dialog.
+                        .on_click(
+                            cx.listener(move |this, _, window, cx| this.open_usage_model(key.clone(), window, cx)),
+                        )
                         .child(div().w(px(32.)).pl(px(8.)).py(px(10.)).text_xs().child((index + 1).to_string()))
                         .child(
                             v_flex()
@@ -1854,7 +2152,8 @@ fn usage_error(error: &crate::rpc::RpcError) -> String {
     }
 }
 
-/// Tailwind's `md` and `lg` viewport breakpoints.
+/// Tailwind's `sm`, `md` and `lg` viewport breakpoints.
+const SM: f32 = 640.;
 const MD: f32 = 768.;
 const LG: f32 = 1024.;
 

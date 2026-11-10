@@ -21,7 +21,6 @@ use serde_json::{Value, json};
 use crate::backend;
 use crate::environments::{BackendStatus, PrimaryBackend};
 use crate::model::{ModelSelection, ProjectShell, ServerInfo, ShellState, ThreadState};
-use crate::requests::QuestionDraft;
 use crate::rpc::{self, ConnectOptions, RpcClient, RpcError, RpcStream, StreamEvent};
 use crate::runtime;
 use crate::timeline::{self, Row};
@@ -33,11 +32,13 @@ mod banners;
 mod changed_files;
 mod chat;
 mod commands;
+mod compact_send;
 mod composer;
 mod composer_fit;
 mod composer_menu;
 mod composer_meter;
 mod composer_plan;
+mod composer_rich;
 mod confirm;
 mod context_records;
 mod context_strip;
@@ -45,6 +46,7 @@ mod desktop;
 mod details;
 mod draft_picker;
 pub(crate) mod environments;
+mod fanout;
 mod files;
 mod find;
 mod fresh_session;
@@ -212,12 +214,12 @@ pub struct Workspace {
     /// The transcript lane's width last frame; a change reflows its rows (see `render_body`).
     timeline_lane_width: std::cell::Cell<f32>,
     /// The question card's drafts, for the first pending question.
-    question: Option<QuestionDraft>,
+    question: Option<attachments::QuestionDraft>,
     /// Requests that arrived mid-typing, kept out of sight for now.
     typing_guard: crate::composer_guard::TypingGuard,
     _typing_idle: Option<Task<()>>,
     /// Tab stops of the composer's attach, stop and primary (send, resume, submit) controls.
-    composer_action_focus: [gpui_kit::FocusHandle; 4],
+    composer_action_focus: [gpui_kit::FocusHandle; 5],
     /// Composer text and question drafts of the targets not on screen.
     composer_drafts: HashMap<Target, composer::ComposerDraft>,
     /// The model and permissions picks of the targets not on screen (`composerDraftStore`).
@@ -248,7 +250,7 @@ pub struct Workspace {
     /// Files from the OS are being dragged over the chat canvas.
     dragging_files: bool,
     /// Targets whose dropped or picked files are still being read, one entry per read.
-    reading_attachments: Vec<Target>,
+    reading_attachments: Vec<attachments::Origin>,
     /// Attachments whose chip was deleted, kept until the editor's undo history ends.
     retained_attachments: Vec<attachments::Attachment>,
     /// The open draft's context records, behind its `t3-context://` chips.
@@ -381,8 +383,11 @@ impl Workspace {
                 InputEvent::Blur => this.release_typing_hold(true, window, cx),
                 InputEvent::PressEnter { .. } => {}
             }),
-            // Caret moves re-read the completion trigger.
-            cx.observe(&composer, |this, _, cx| this.sync_trigger(cx)),
+            // Caret moves re-read the completion trigger and what the rich editor shows as source.
+            cx.observe(&composer, |this, _, cx| {
+                this.sync_trigger(cx);
+                this.sync_composer_look(false, cx);
+            }),
             // Ahead of GPUI's bindings, the terminal and text fields: the composer's menus, then the keymap.
             cx.intercept_keystrokes({
                 let this = weak;
@@ -550,6 +555,7 @@ impl Workspace {
             _subscriptions: subscriptions,
         };
         workspace.sync_snap_shot(window, cx);
+        workspace.resume_snap_shot_setup(window, cx);
         workspace.sync_saved_sessions(window, cx);
         workspace
     }
@@ -812,8 +818,9 @@ impl Workspace {
                 this.refresh_rows(cx);
                 this.refresh_thread_find(cx);
                 this.sync_typing_guard(window, cx);
-                this.sync_question(window, cx);
-                this.sync_queue_edit(window, cx);
+                this.sync_question(side_chat::ChatPane::Main, window, cx);
+                this.sync_queue_edit(side_chat::ChatPane::Main, window, cx);
+                this.sync_resume_compaction(cx);
                 this.observe_proactive_panels(cx);
             },
         ));
@@ -881,9 +888,9 @@ impl Workspace {
         self.insert_worktree_setup(&mut new_rows);
         // The footer: a pending handoff, what the thread is doing now, then the queue.
         new_rows.extend(self.pending_handoff_row());
-        new_rows.extend(self.now_rows(cx));
-        let mut queue = self.queue_rows();
-        self.load_queue_images(cx);
+        new_rows.extend(self.now_rows(side_chat::ChatPane::Main, cx));
+        let mut queue = self.queue_rows(side_chat::ChatPane::Main);
+        self.load_queue_images(side_chat::ChatPane::Main, cx);
         if !queued.is_empty() {
             let at = queue.iter().position(|row| matches!(row, Row::QueueToggle { .. })).unwrap_or(queue.len());
             if let Some(Row::Queued { last, .. }) = at.checked_sub(1).and_then(|i| queue.get_mut(i)) {
@@ -1130,24 +1137,13 @@ impl Workspace {
 
     /// `runtime-request.respond` for the open thread; `response` holds `decision`, `feedback` or `answers`.
     fn respond_command(&self, request_id: &str, response: Value) -> Option<Value> {
-        let thread = self.thread.as_ref()?;
-        let mut command = json!({
-            "type": "runtime-request.respond",
-            "commandId": new_id(),
-            "threadId": thread.id,
-            "requestId": request_id,
-        });
-        if let (Some(command), Value::Object(fields)) = (command.as_object_mut(), response) {
-            command.extend(fields);
-        }
-        Some(command)
+        Some(respond_value(&self.thread.as_ref()?.id, request_id, response))
     }
 
-    /// Answers a runtime request; `response` holds `decision`, `feedback` or `answers`.
-    fn respond(&mut self, request_id: String, response: Value, cx: &mut Context<Self>) {
-        let (Some(command), Some(client)) = (self.respond_command(&request_id, response), self.client()) else {
-            return;
-        };
+    /// Answers a runtime request in the pane's thread; `response` holds `decision`, `feedback` or `answers`.
+    fn respond(&mut self, pane: side_chat::ChatPane, request_id: String, response: Value, cx: &mut Context<Self>) {
+        let Some((client, thread_id)) = self.pane_client(pane, cx) else { return };
+        let command = respond_value(&thread_id, &request_id, response);
         self.responding = Some(request_id.clone());
         cx.spawn(async move |this, cx| {
             let result = client.request("orchestration.dispatchCommand", command).await;
@@ -1155,7 +1151,9 @@ impl Workspace {
                 if this.responding.as_ref() == Some(&request_id) {
                     this.responding = None;
                 }
-                if let Err(error) = result {
+                if let Err(error) = result
+                    && this.pane_shows(pane, &thread_id)
+                {
                     this.error = Some(error.to_string().into());
                 }
                 cx.notify();
@@ -1189,6 +1187,20 @@ impl Workspace {
 
 fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+/// `runtime-request.respond` in `thread_id`, with `response`'s fields.
+fn respond_value(thread_id: &str, request_id: &str, response: Value) -> Value {
+    let mut command = json!({
+        "type": "runtime-request.respond",
+        "commandId": new_id(),
+        "threadId": thread_id,
+        "requestId": request_id,
+    });
+    if let (Some(command), Value::Object(fields)) = (command.as_object_mut(), response) {
+        command.extend(fields);
+    }
+    command
 }
 
 fn draft_title(text: &str) -> String {
@@ -1279,7 +1291,7 @@ impl Render for Workspace {
                     return;
                 }
                 if this.page.is_some_and(pages::Page::is_modal) && event.keystroke.key == "escape" {
-                    if !this.usage_card_escape(cx) {
+                    if !this.usage_model_escape(window, cx) && !this.usage_card_escape(cx) {
                         this.close_page(cx);
                     }
                     cx.stop_propagation();

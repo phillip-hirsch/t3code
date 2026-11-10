@@ -377,14 +377,15 @@ impl Workspace {
         let Some((client, http_base)) = connected else {
             return import_failed(&name, "The environment it came from is not connected.", window, cx);
         };
-        self.reading_attachments.push(origin.clone());
+        let Some(reading) = self.attachment_origin() else { return };
+        self.reading_attachments.push(reading.clone());
         cx.notify();
         let file = json!({"type": kind, "id": attachment_id, "name": name, "mimeType": mime});
         let imported = ImportedFile { kind, name, mime, local_id };
         cx.spawn_in(window, async move |this, cx| {
             let downloaded = super::message_actions::download_attachments(&client, &http_base, vec![file]).await;
             let _ = this.update_in(cx, |this, window, cx| {
-                if let Some(at) = this.reading_attachments.iter().position(|target| *target == origin) {
+                if let Some(at) = this.reading_attachments.iter().position(|busy| *busy == reading) {
                     this.reading_attachments.swap_remove(at);
                 }
                 match downloaded.ok().and_then(|mut files| files.pop()) {

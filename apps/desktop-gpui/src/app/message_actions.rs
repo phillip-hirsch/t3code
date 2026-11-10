@@ -236,7 +236,10 @@ impl Workspace {
                 attachments.extend(files);
             }
             // An open question holds the editor; its prompt waits for it to close.
-            ComposerDraft::Question(question) => merge(&mut question.prompt),
+            ComposerDraft::Question(question) => {
+                merge(&mut question.prompt);
+                question.prompt_attachments.extend(files);
+            }
         }
         if here {
             self.restore_composer(window, cx);

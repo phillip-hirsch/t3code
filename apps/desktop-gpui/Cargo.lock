@@ -4955,6 +4955,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dae608c151f68243f2b000364e1f7b186d9c29845f7d2d85bd31b9ad77ad552b"
 
 [[package]]
+name = "macos-accessibility-client"
+version = "0.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c33254f6f9b60b98eff934c3664530e5058ff7173e0c6b12419a17d5461e7145"
+dependencies = [
+ "core-foundation 0.10.1",
+ "core-foundation-sys",
+]
+
+[[package]]
 name = "malloc_buf"
 version = "0.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8406,6 +8416,7 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "apple-native-keyring-store",
+ "ashpd",
  "async-channel",
  "base64 0.22.1",
  "bytes",
@@ -8426,6 +8437,7 @@ dependencies = [
  "keyring-core",
  "lb-wry",
  "log",
+ "macos-accessibility-client",
  "markdown",
  "markup5ever_rcdom",
  "nix",

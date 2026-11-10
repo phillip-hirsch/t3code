@@ -437,6 +437,10 @@ impl Workspace {
     }
 
     fn set_env_mode(&mut self, mode: EnvMode, cx: &mut Context<Self>) {
+        // Several models each take a new worktree, whatever the mode (`onEnvModeChange`).
+        if self.model_fanout().is_some() {
+            return;
+        }
         let choice = &mut self.draft_workspace.choice;
         choice.mode = Some(mode);
         choice.existing_worktree = None;

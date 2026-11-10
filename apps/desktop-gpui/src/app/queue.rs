@@ -16,6 +16,7 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use super::attachments::{ATTACHMENT_ONLY_PROMPT, Attachment, MAX_ATTACHMENTS};
+use super::side_chat::ChatPane;
 use super::{Target, Workspace, new_id};
 use crate::composer_context::ContextRecords;
 use crate::queue::{self, QueueState, QueuedMessage};
@@ -66,20 +67,46 @@ pub(crate) fn rows(state: &QueueState, show_all: bool) -> Vec<Row> {
     rows
 }
 
+impl QueueUi {
+    /// Ends an edit, handing back the draft it set aside.
+    pub(super) fn take_edit_draft(&mut self) -> Option<(String, Vec<Attachment>, ContextRecords)> {
+        self.edit.take().map(|edit| edit.saved)
+    }
+}
+
 impl Workspace {
-    /// The queue rows for the open thread; also ends an edit whose run left the queue.
-    pub(super) fn queue_rows(&mut self) -> Vec<Row> {
-        let archived = self.thread.as_ref().is_some_and(|thread| {
-            self.shell.threads.iter().any(|t| t.id == thread.id && (t.archived_at.is_some() || t.deleted_at.is_some()))
-        });
-        let state = match self.thread.as_ref().and_then(|t| t.state.projection.as_ref()) {
-            Some(projection) => queue::derive(projection, archived),
-            None => QueueState::default(),
-        };
-        if *self.queue.state != state {
-            self.queue.state = Rc::new(state);
+    fn queue_ui(&self, pane: ChatPane) -> Option<&QueueUi> {
+        match pane {
+            ChatPane::Main => Some(&self.queue),
+            ChatPane::Side => self.side_chat.view.as_ref().map(|view| &view.queue),
         }
-        rows(&self.queue.state, self.queue.show_all)
+    }
+
+    fn queue_ui_mut(&mut self, pane: ChatPane) -> Option<&mut QueueUi> {
+        match pane {
+            ChatPane::Main => Some(&mut self.queue),
+            ChatPane::Side => self.side_chat.view.as_mut().map(|view| &mut view.queue),
+        }
+    }
+
+    /// The pane's queue rows.
+    pub(super) fn queue_rows(&mut self, pane: ChatPane) -> Vec<Row> {
+        let state = match (self.pane_thread(pane), self.pane_projection(pane)) {
+            (Some((_, id)), Some(projection)) => {
+                let archived = self
+                    .shell
+                    .threads
+                    .iter()
+                    .any(|t| t.id == id && (t.archived_at.is_some() || t.deleted_at.is_some()));
+                queue::derive(projection, archived)
+            }
+            _ => QueueState::default(),
+        };
+        let Some(ui) = self.queue_ui_mut(pane) else { return Vec::new() };
+        if *ui.state != state {
+            ui.state = Rc::new(state);
+        }
+        rows(&ui.state, ui.show_all)
     }
 
     pub(super) fn editing_queued(&self) -> bool {
@@ -92,27 +119,37 @@ impl Workspace {
 
     /// The thread's draft, while a queued message holds the composer; see `stash_composer`.
     pub(super) fn take_queue_edit_draft(&mut self) -> Option<(String, Vec<Attachment>, ContextRecords)> {
-        self.queue.edit.take().map(|edit| edit.saved)
+        self.queue.take_edit_draft()
     }
 
-    fn edit_blocked_reason(&self) -> Option<&'static str> {
-        self.question.is_some().then_some("Answer the question to edit queued messages")
+    /// A queued message open in the pane's composer: whether its save is in flight.
+    pub(super) fn pane_queue_edit(&self, pane: ChatPane) -> Option<bool> {
+        self.queue_ui(pane)?.edit.as_ref().map(|edit| edit.saving)
     }
 
-    fn toggle_queue(&mut self, cx: &mut Context<Self>) {
-        self.queue.show_all = !self.queue.show_all;
-        self.refresh_rows(cx);
+    fn edit_blocked_reason(&self, pane: ChatPane) -> Option<&'static str> {
+        let asking = match pane {
+            ChatPane::Main => self.question.is_some(),
+            ChatPane::Side => self.side_chat_projection().is_some_and(|p| !p.pending_user_inputs().is_empty()),
+        };
+        asking.then_some("Answer the question to edit queued messages")
+    }
+
+    fn toggle_queue(&mut self, pane: ChatPane, cx: &mut Context<Self>) {
+        let Some(ui) = self.queue_ui_mut(pane) else { return };
+        ui.show_all = !ui.show_all;
+        self.refresh_pane_rows(pane, cx);
         cx.notify();
     }
 
     /// "Send now": starts a turn when idle, else steers it into the running one.
-    fn send_queued(&mut self, run_id: SharedString, cx: &mut Context<Self>) {
-        let state = self.queue.state.clone();
+    fn send_queued(&mut self, pane: ChatPane, run_id: SharedString, cx: &mut Context<Self>) {
+        let Some(ui) = self.queue_ui(pane).filter(|ui| ui.busy.is_none()) else { return };
+        let state = ui.state.clone();
         let Some(message) = state.queued.iter().find(|q| q.run_id == run_id) else { return };
-        if !state.can_send(message) || self.queue.busy.is_some() {
+        if !state.can_send(message) {
             return;
         }
-        let Some(thread_id) = self.thread.as_ref().map(|t| t.id.clone()) else { return };
         let command = match (state.can_send_now, &state.active_run_id) {
             (true, _) => json!({"type": "queued-run.start", "runId": run_id}),
             (false, Some(active)) => {
@@ -120,32 +157,40 @@ impl Workspace {
             }
             (false, None) => return,
         };
-        self.dispatch_queue_command(run_id, thread_id, command, cx);
+        self.dispatch_queue_command(pane, run_id, command, cx);
     }
 
-    fn remove_queued(&mut self, run_id: SharedString, cx: &mut Context<Self>) {
-        let Some(thread_id) = self.thread.as_ref().map(|t| t.id.clone()) else { return };
+    fn remove_queued(&mut self, pane: ChatPane, run_id: SharedString, cx: &mut Context<Self>) {
+        if self.queue_ui(pane).is_none_or(|ui| ui.busy.is_some()) {
+            return;
+        }
         let command = json!({"type": "queued-run.cancel", "runId": run_id});
-        self.dispatch_queue_command(run_id, thread_id, command, cx);
+        self.dispatch_queue_command(pane, run_id, command, cx);
     }
 
     fn dispatch_queue_command(
         &mut self,
+        pane: ChatPane,
         run_id: SharedString,
-        thread_id: String,
         mut command: Value,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.client() else { return };
+        let Some((client, thread_id)) = self.pane_client(pane, cx) else { return };
         command["commandId"] = new_id().into();
-        command["threadId"] = thread_id.into();
-        self.queue.busy = Some(run_id);
+        command["threadId"] = thread_id.clone().into();
+        let Some(ui) = self.queue_ui_mut(pane) else { return };
+        ui.busy = Some(run_id.clone());
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = client.request("orchestration.dispatchCommand", command).await;
             let _ = this.update(cx, |this, cx| {
-                this.queue.busy = None;
-                if let Err(error) = result {
+                // Run ids are unique, so this frees only the pane that sent it.
+                if let Some(ui) = this.queue_ui_mut(pane).filter(|ui| ui.busy.as_ref() == Some(&run_id)) {
+                    ui.busy = None;
+                }
+                if let Err(error) = result
+                    && this.pane_shows(pane, &thread_id)
+                {
                     this.error = Some(error.to_string().into());
                 }
                 cx.notify();
@@ -154,13 +199,22 @@ impl Workspace {
         .detach();
     }
 
-    /// Opens a queued message in the composer, setting the thread's draft aside.
-    fn begin_queue_edit(&mut self, message: &QueuedMessage, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(thread_id) = self.thread.as_ref().map(|t| t.id.clone()) else { return };
-        if !message.editable || self.queue.busy.is_some() || self.edit_blocked_reason().is_some() {
+    /// Opens a queued message in the pane's composer, setting its draft aside.
+    fn begin_queue_edit(
+        &mut self,
+        pane: ChatPane,
+        message: &QueuedMessage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((_, thread_id)) = self.pane_thread(pane) else { return };
+        if !message.editable
+            || self.queue_ui(pane).is_none_or(|ui| ui.busy.is_some())
+            || self.edit_blocked_reason(pane).is_some()
+        {
             return;
         }
-        let item = self.thread.as_ref().and_then(|t| t.state.projection.as_ref()).and_then(|projection| {
+        let item = self.pane_projection(pane).and_then(|projection| {
             projection.turn_items.iter().rev().find(|item| {
                 item.item_type == "user_message" && item.str("messageId") == Some(message.message_id.as_ref())
             })
@@ -169,21 +223,27 @@ impl Workspace {
             item.and_then(|i| i.raw.get("attachments")).and_then(Value::as_array).cloned().unwrap_or_default();
         let records =
             item.and_then(|i| i.raw.pointer("/context/records")).and_then(Value::as_array).cloned().unwrap_or_default();
-        let saved = match self.queue.edit.take() {
-            Some(edit) => edit.saved,
-            None => (
+        let previous = self.queue_ui_mut(pane).and_then(QueueUi::take_edit_draft);
+        let saved = match (previous, pane) {
+            (Some(saved), _) => saved,
+            (None, ChatPane::Main) => (
                 self.composer.read(cx).value().to_string(),
                 std::mem::take(&mut self.attachments),
                 self.take_context_records(),
             ),
+            // Side chats take text only.
+            (None, ChatPane::Side) => (self.pane_text(pane, cx), Vec::new(), ContextRecords::default()),
         };
-        self.attachments.clear();
-        // Its chips show and copy from the records it was queued with.
-        let mut held = ContextRecords::default();
-        held.extend(records.iter().filter(|record| record.get("attachmentId").is_none()).cloned());
-        self.context.records = held;
+        if pane == ChatPane::Main {
+            self.attachments.clear();
+            // Its chips show and copy from the records it was queued with.
+            let mut held = ContextRecords::default();
+            held.extend(records.iter().filter(|record| record.get("attachmentId").is_none()).cloned());
+            self.context.records = held;
+        }
         let text = queue::edit_text(&message.text).to_owned();
-        self.queue.edit = Some(QueueEdit {
+        let Some(ui) = self.queue_ui_mut(pane) else { return };
+        ui.edit = Some(QueueEdit {
             thread_id,
             run_id: message.run_id.clone(),
             original: text.clone(),
@@ -193,47 +253,61 @@ impl Workspace {
             saved,
             saving: false,
         });
-        self.queue.show_all = true;
-        self.set_composer_text(text, window, cx);
-        self.refresh_rows(cx);
-        self.focus_composer(window, cx);
+        ui.show_all = true;
+        self.set_pane_text(pane, text, window, cx);
+        self.refresh_pane_rows(pane, cx);
+        self.focus_pane_composer(pane, window, cx);
         cx.notify();
     }
 
-    fn cancel_queue_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some((text, attachments, records)) = self.take_queue_edit_draft() {
-            self.attachments = attachments;
-            self.context.records = records;
-            self.set_composer_text(text, window, cx);
-            self.focus_composer(window, cx);
+    fn cancel_queue_edit(&mut self, pane: ChatPane, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((text, attachments, records)) = self.queue_ui_mut(pane).and_then(QueueUi::take_edit_draft) {
+            if pane == ChatPane::Main {
+                self.attachments = attachments;
+                self.context.records = records;
+            }
+            self.set_pane_text(pane, text, window, cx);
+            self.focus_pane_composer(pane, window, cx);
         }
         cx.notify();
     }
 
     /// The composer's send while editing: `queued-run.edit` with the new text, plus
     /// any attachments added in the composer (`submitQueuedRunEdit`).
-    pub(super) fn save_queue_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
-        let Some(edit) = self.queue.edit.as_ref().filter(|edit| !edit.saving) else { return };
-        let text = self.composer.read(cx).value().trim().to_owned();
-        if edit.attachments.len() + self.attachments.len() > MAX_ATTACHMENTS {
+    pub(super) fn save_queue_edit(&mut self, pane: ChatPane, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(edit) = self.queue_ui(pane).and_then(|ui| ui.edit.as_ref()).filter(|edit| !edit.saving) else {
+            return;
+        };
+        let (thread_id, run_id) = (edit.thread_id.clone(), edit.run_id.clone());
+        let (kept, removed_attachment) = (edit.attachments.clone(), edit.removed_attachment);
+        let kept_records = retained_records(&edit.records, &edit.attachments);
+        // Only the open thread's composer holds attachments; a side chat's edit keeps the queued ones.
+        let main = pane == ChatPane::Main;
+        let text = self.pane_text(pane, cx).trim().to_owned();
+        let added_count = if main { self.attachments.len() } else { 0 };
+        if kept.len() + added_count > MAX_ATTACHMENTS {
             self.error = Some(format!("A message can have at most {MAX_ATTACHMENTS} attachments.").into());
             cx.notify();
             return;
         }
-        if text.is_empty() && edit.attachments.is_empty() && self.attachments.is_empty() {
+        if text.is_empty() && kept.is_empty() && added_count == 0 {
+            return;
+        }
+        let Some((client, shown)) = self.pane_client(pane, cx) else { return };
+        // An edit left over from another thread is never sent to this one.
+        if shown != thread_id {
             return;
         }
         let mut command = json!({
             "type": "queued-run.edit",
             "commandId": new_id(),
-            "threadId": edit.thread_id,
-            "runId": edit.run_id,
+            "threadId": thread_id,
+            "runId": run_id,
         });
-        let mut has_attachments = !edit.attachments.is_empty();
-        let mut added_records = self.message_context_records(&text);
+        let mut has_attachments = !kept.is_empty();
+        let mut added_records = if main { self.message_context_records(&text) } else { Vec::new() };
         // Absent attachments keep the queued ones, so only an added or removed one sends the set.
-        if self.has_attachments() || edit.removed_attachment {
+        if main && (self.has_attachments() || removed_attachment) {
             let (added, context) = match self.attachment_payload(&text) {
                 Ok(payload) => payload,
                 Err(reason) => {
@@ -244,32 +318,35 @@ impl Workspace {
             };
             has_attachments |= !added.is_empty();
             added_records = context.as_ref().and_then(|c| c["records"].as_array()).cloned().unwrap_or_default();
-            command["attachments"] = edit.attachments.iter().cloned().chain(added).collect::<Vec<_>>().into();
+            command["attachments"] = kept.into_iter().chain(added).collect::<Vec<_>>().into();
         }
-        let records = merge_records(&retained_records(&edit.records, &edit.attachments), added_records);
+        let records = merge_records(&kept_records, added_records);
         if !records.is_empty() {
             command["context"] = json!({"version": 1, "records": records});
         }
         command["text"] =
             if text.is_empty() && has_attachments { ATTACHMENT_ONLY_PROMPT.to_owned() } else { text }.into();
-        let run_id = edit.run_id.clone();
-        if let Some(edit) = self.queue.edit.as_mut() {
+        if let Some(edit) = self.queue_ui_mut(pane).and_then(|ui| ui.edit.as_mut()) {
             edit.saving = true;
         }
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("orchestration.dispatchCommand", command).await;
             let _ = this.update_in(cx, |this, window, cx| {
-                // The edit was cancelled or begun again while this save ran.
-                let current = this.queue.edit.as_mut().filter(|edit| edit.run_id == run_id);
+                // The edit was cancelled, begun again, or its pane moved on while this save ran.
+                let current =
+                    this.queue_ui_mut(pane).and_then(|ui| ui.edit.as_mut()).filter(|edit| edit.run_id == run_id);
                 match (result, current) {
-                    (Ok(_), Some(_)) => this.cancel_queue_edit(window, cx),
+                    (Ok(_), Some(_)) => this.cancel_queue_edit(pane, window, cx),
                     (Err(error), current) => {
                         log::warn!("saving the edited queued message: {error}");
+                        let shown = current.is_some();
                         if let Some(edit) = current {
                             edit.saving = false;
                         }
-                        this.error = Some("Could not save the edited queued message.".into());
+                        if shown {
+                            this.error = Some("Could not save the edited queued message.".into());
+                        }
                     }
                     (Ok(_), None) => {}
                 }
@@ -287,9 +364,9 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Loads the queue's image thumbnails not seen yet.
-    pub(super) fn load_queue_images(&mut self, cx: &mut Context<Self>) {
-        let state = self.queue.state.clone();
+    /// Loads the pane's queue image thumbnails not seen yet.
+    pub(super) fn load_queue_images(&mut self, pane: ChatPane, cx: &mut Context<Self>) {
+        let Some(state) = self.queue_ui(pane).map(|ui| ui.state.clone()) else { return };
         let images = state.queued.iter().flat_map(|message| message.images.iter().map(|image| image.id.as_ref()));
         self.load_attachment_images(images, cx);
     }
@@ -346,23 +423,29 @@ impl Workspace {
     }
 
     /// The run started or was cancelled elsewhere: a changed edit moves into the
-    /// thread's draft when that is empty, else it's dropped (`onRunLeftQueue`).
-    pub(super) fn sync_queue_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(edit) = self.queue.edit.as_ref().filter(|edit| !edit.saving) else { return };
-        if self.queue.state.queued.iter().any(|q| q.run_id == edit.run_id)
-            || self.thread.as_ref().is_none_or(|t| t.state.projection.is_none())
-        {
+    /// pane's draft when that is empty, else it's dropped (`onRunLeftQueue`).
+    pub(super) fn sync_queue_edit(&mut self, pane: ChatPane, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ui) = self.queue_ui(pane) else { return };
+        let Some(edit) = ui.edit.as_ref().filter(|edit| !edit.saving) else { return };
+        if ui.state.queued.iter().any(|q| q.run_id == edit.run_id) || self.pane_projection(pane).is_none() {
             return;
         }
-        let text = self.composer.read(cx).value().to_string();
-        let changed = text.trim() != edit.original.trim() || self.has_attachments();
+        let text = self.pane_text(pane, cx);
+        let attached = pane == ChatPane::Main && self.has_attachments();
+        let changed = text.trim() != edit.original.trim() || attached;
         let keep = changed && edit.saved.0.trim().is_empty() && edit.saved.1.is_empty();
-        let title = self.thread.as_ref().and_then(|t| t.state.projection.as_ref()).map(|p| p.thread.title.clone());
-        let Some(edit) = self.queue.edit.take() else { return };
+        let title = self.pane_projection(pane).map(|p| p.thread.title.clone());
+        let Some((saved_text, saved_attachments, saved_records)) =
+            self.queue_ui_mut(pane).and_then(QueueUi::take_edit_draft)
+        else {
+            return;
+        };
         if !keep {
-            self.attachments = edit.saved.1;
-            self.context.records = edit.saved.2;
-            self.set_composer_text(edit.saved.0, window, cx);
+            if pane == ChatPane::Main {
+                self.attachments = saved_attachments;
+                self.context.records = saved_records;
+            }
+            self.set_pane_text(pane, saved_text, window, cx);
         }
         if changed {
             let place = title.map(|title| format!(" in “{title}”")).unwrap_or_default();
@@ -377,34 +460,38 @@ impl Workspace {
         cx.notify();
     }
 
-    /// `thread.steerQueuedMessage`: sends the first queued message now.
-    pub(super) fn steer_next_queued(&mut self, cx: &mut Context<Self>) -> bool {
+    /// `thread.steerQueuedMessage`: sends the open thread's first queued message now.
+    pub(super) fn steer_next_queued(&mut self, window: &Window, cx: &mut Context<Self>) -> bool {
         let Some(next) = self.queue.state.queued.first() else { return false };
-        if !matches!(self.target, Some(Target::Thread { .. })) || !self.queue.state.can_send(next) {
+        if !matches!(self.target, Some(Target::Thread { .. }))
+            || !self.queue.state.can_send(next)
+            || self.side_chat_focused(window, cx)
+        {
             return false;
         }
-        self.send_queued(next.run_id.clone(), cx);
+        self.send_queued(ChatPane::Main, next.run_id.clone(), cx);
         true
     }
 
-    /// `thread.editQueuedMessage`: opens the last queued message, from an empty caret start.
+    /// `thread.editQueuedMessage`: opens the open thread's last queued message, from an empty caret start.
     pub(super) fn edit_latest_queued(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(latest) = self.queue.state.queued.last().cloned() else { return false };
         let at_start = self.composer.read(cx).cursor() == 0;
         if !latest.editable
             || !at_start
+            || self.side_chat_focused(window, cx)
             || self.queue.edit.is_some()
-            || self.edit_blocked_reason().is_some()
+            || self.edit_blocked_reason(ChatPane::Main).is_some()
             || self.queue.busy.is_some()
         {
             return false;
         }
-        self.begin_queue_edit(&latest, window, cx);
+        self.begin_queue_edit(ChatPane::Main, &latest, window, cx);
         true
     }
 
-    pub(super) fn on_steer_queued(&mut self, _: &SteerQueuedMessage, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.steer_next_queued(cx) {
+    pub(super) fn on_steer_queued(&mut self, _: &SteerQueuedMessage, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.steer_next_queued(window, cx) {
             cx.propagate();
         }
     }
@@ -439,16 +526,17 @@ fn merge_records(kept: &[Value], added: Vec<Value>) -> Vec<Value> {
 pub(super) fn queued_row(
     message: &Rc<QueuedMessage>,
     last: bool,
+    pane: ChatPane,
     this: &WeakEntity<Workspace>,
     t: &Tokens,
     cx: &App,
 ) -> AnyElement {
     let Some(workspace) = this.upgrade() else { return div().into_any_element() };
     let workspace = workspace.read(cx);
-    let ui = &workspace.queue;
+    let Some(ui) = workspace.queue_ui(pane) else { return div().into_any_element() };
     let editing = ui.edit.as_ref().is_some_and(|edit| edit.run_id == message.run_id);
     let busy = ui.busy.is_some();
-    let blocked = workspace.edit_blocked_reason();
+    let blocked = workspace.edit_blocked_reason(pane);
     // Sent but not queued on the server yet: no run to act on.
     let pending = message.run_id.is_empty();
     let id = if pending { &message.message_id } else { &message.run_id };
@@ -510,7 +598,7 @@ pub(super) fn queued_row(
                 .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
                 .when(!busy, |el| {
                     el.on_click(move |_, _, cx| {
-                        let _ = this.update(cx, |w, cx| w.send_queued(run.clone(), cx));
+                        let _ = this.update(cx, |w, cx| w.send_queued(pane, run.clone(), cx));
                     })
                 }),
         );
@@ -519,7 +607,7 @@ pub(super) fn queued_row(
         let this = this.clone();
         controls = controls.child(div().px(px(4.)).text_color(t.foreground).child("Editing in the composer")).child(
             text_button(format!("queued-cancel:{id}"), None, "Cancel", false, t).on_click(move |_, window, cx| {
-                let _ = this.update(cx, |w, cx| w.cancel_queue_edit(window, cx));
+                let _ = this.update(cx, |w, cx| w.cancel_queue_edit(pane, window, cx));
             }),
         );
     } else if !pending {
@@ -545,7 +633,7 @@ pub(super) fn queued_row(
                     .tooltip(move |window, cx| Tooltip::new(edit_tooltip.clone()).build(window, cx))
                     .when(!edit_disabled, |el| {
                         el.on_click(move |_, window, cx| {
-                            let _ = edit_this.update(cx, |w, cx| w.begin_queue_edit(&edit_message, window, cx));
+                            let _ = edit_this.update(cx, |w, cx| w.begin_queue_edit(pane, &edit_message, window, cx));
                         })
                     }),
             )
@@ -554,7 +642,7 @@ pub(super) fn queued_row(
                     .tooltip(|window, cx| Tooltip::new("Remove from queue").build(window, cx))
                     .when(!busy, |el| {
                         el.on_click(move |_, _, cx| {
-                            let _ = remove_this.update(cx, |w, cx| w.remove_queued(run.clone(), cx));
+                            let _ = remove_this.update(cx, |w, cx| w.remove_queued(pane, run.clone(), cx));
                         })
                     }),
             );
@@ -581,7 +669,13 @@ pub(super) fn queued_row(
 }
 
 /// "Show all N queued" / "Show fewer".
-pub(super) fn toggle_row(total: usize, expanded: bool, this: &WeakEntity<Workspace>, t: &Tokens) -> AnyElement {
+pub(super) fn toggle_row(
+    total: usize,
+    expanded: bool,
+    pane: ChatPane,
+    this: &WeakEntity<Workspace>,
+    t: &Tokens,
+) -> AnyElement {
     let this = this.clone();
     let label = if expanded { "Show fewer".to_owned() } else { format!("Show all {total} queued") };
     let chevron = if expanded { IconName::ChevronUp } else { IconName::ChevronDown };
@@ -595,7 +689,7 @@ pub(super) fn toggle_row(total: usize, expanded: bool, this: &WeakEntity<Workspa
         .child(label)
         .child(Icon::new(chevron).size(px(14.)))
         .on_click(move |_, _, cx| {
-            let _ = this.update(cx, super::Workspace::toggle_queue);
+            let _ = this.update(cx, |w, cx| w.toggle_queue(pane, cx));
         });
     // `gap-2` above, the section's `pb-4` below.
     h_flex().w_full().justify_end().pr(px(4.)).pb(px(16.)).child(button).into_any_element()

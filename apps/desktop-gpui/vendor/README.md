@@ -158,6 +158,41 @@ draft brings them back. 0.9.0's `Copy` and `Cut` always write plain text. The pa
 text to the entry's metadata, and `copy` and `cut` write `ClipboardItem::new_string_with_metadata`
 when it returns some. One test, `test_copy_and_cut_carry_the_copy_metadata`.
 
+**A textarea can draw a presentation over its text.** The rich composer keeps its text as
+Markdown source and draws it the way the web's Tiptap editor renders it: delimiters hidden away
+from the caret, list markers and checkboxes in place of their syntax, headings larger, code in the
+code font inside a frame. 0.9.0's textarea can only restyle ranges (decorations) and lay out
+atomic tokens. The patch adds `TextPresentation`, set with `TextareaState::set_presentation`: none
+of it enters the text, its history or the caret's movement, and an edit drops what it touches
+and shifts what follows until the caller sets it again.
+
+- Replaced ranges (`InlineReplacement`): hidden (no width), drawn inline at a width (clamped to
+  the row), or drawn in the line's indent (a list marker). They wrap and lay out as zero- or
+  fixed-width elements beside the tokens, with the same `LineFragment::element` path.
+- Line styles (`LineStyle`): a line's font family, a size relative to the input's, and an indent
+  on every row; the wrapper measures and narrows the line with them. Rows keep the input's
+  line height.
+- Backdrops (`BlockBackdrop`): a filled, optionally bordered and rounded rectangle behind the
+  rows of the lines a range spans, or a bar beside them, painted before the text.
+
+Files:
+
+- `src/input/base/presentation.rs` (new): the types, `set_presentation` (which drops ranges off
+  character boundaries, across lines or over tokens), `adjust_for_edit`; one test,
+  `edits_drop_what_they_touch_and_shift_what_follows`.
+- `src/input/base/kind.rs`: `TextareaExtras` holds the presentation and a revision;
+  `InputExtras::presentation`; `TextareaMode`'s annotation hooks reset and shift it.
+- `src/input/base/element.rs`: `measure_tokens` merges replaced widths into the inline metrics
+  and passes line styles to the wrapper; a textarea with a presentation lays out through
+  `layout_token_lines`, which takes the widths from the merged metrics and applies each line's
+  family, size and indent; `prepaint_replacements` draws replacements, `layout_backdrops` the
+  backdrops, painted under the glyph backgrounds.
+- `src/input/editor/display_map/text_wrapper.rs`: `WrapLineStyle`, `TextWrapper::set_line_styles`
+  (rewraps only the lines whose style changed) and the styled wrap; `LineLayout::indent`, added
+  to every visual row's offset. `wrap_map.rs`, `display_map.rs` and `display_map/mod.rs` pass it
+  through.
+- `src/input/mod.rs`: exports the types.
+
 **Toasts above dialogs.** Dialogs paint in a deferred pass (priority `10 + layer`), but 0.9.0's
 `ToastStack` paints in the normal pass, so a toast raised while a dialog is open (an error from
 the dialog itself) is hidden under it; the web app's toasts draw above dialogs. The patch paints
