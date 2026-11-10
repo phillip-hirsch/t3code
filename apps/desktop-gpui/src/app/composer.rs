@@ -1562,7 +1562,7 @@ impl Workspace {
                 )
                 .into_any_element();
         }
-        let sendable = !self.composer_empty || self.has_attachments();
+        let sendable = !self.composer_empty || self.has_attachments() || self.queue_edit_keeps_attachments();
         let can_resume = self.can_resume();
         let editing = self.editing_queued();
         if running && !sendable && !editing {

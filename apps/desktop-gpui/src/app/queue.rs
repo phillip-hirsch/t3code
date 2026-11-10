@@ -197,6 +197,11 @@ impl Workspace {
         self.queue.edit.is_some()
     }
 
+    /// The queued message open in the composer still carries attachments (`existingAttachmentCount`).
+    pub(super) fn queue_edit_keeps_attachments(&self) -> bool {
+        self.queue.edit.as_ref().is_some_and(|edit| !edit.attachments.is_empty())
+    }
+
     pub(super) fn saving_queue_edit(&self) -> bool {
         self.queue.edit.as_ref().is_some_and(|edit| edit.saving)
     }
