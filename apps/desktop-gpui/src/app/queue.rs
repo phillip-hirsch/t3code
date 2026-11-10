@@ -180,7 +180,7 @@ impl Workspace {
         mut command: Value,
         cx: &mut Context<Self>,
     ) {
-        let Some((client, thread_id)) = self.pane_client(pane, cx) else { return };
+        let Some((client, env, thread_id)) = self.pane_client(pane, cx) else { return };
         command["commandId"] = new_id().into();
         command["threadId"] = thread_id.clone().into();
         let Some(ui) = self.queue_ui_mut(pane) else { return };
@@ -194,7 +194,7 @@ impl Workspace {
                     ui.busy = None;
                 }
                 if let Err(error) = result
-                    && this.pane_shows(pane, &thread_id)
+                    && this.pane_shows(pane, &env, &thread_id)
                 {
                     this.error = Some(error.to_string().into());
                 }
@@ -298,7 +298,7 @@ impl Workspace {
         if text.is_empty() && kept.is_empty() && added_count == 0 {
             return;
         }
-        let Some((client, shown)) = self.pane_client(pane, cx) else { return };
+        let Some((client, _, shown)) = self.pane_client(pane, cx) else { return };
         // An edit left over from another thread is never sent to this one.
         if shown != thread_id {
             return;

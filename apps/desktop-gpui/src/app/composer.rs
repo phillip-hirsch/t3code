@@ -1005,7 +1005,7 @@ impl Workspace {
     }
 
     fn dismiss_question(&mut self, pane: ChatPane, request_id: String, cx: &mut Context<Self>) {
-        let Some((_, thread_id)) = self.pane_client(pane, cx) else { return };
+        let Some((_, _, thread_id)) = self.pane_client(pane, cx) else { return };
         let command = json!({"type": "thread.user-input.dismiss", "commandId": new_id(), "threadId": thread_id, "requestId": request_id});
         self.dispatch(command, cx);
     }

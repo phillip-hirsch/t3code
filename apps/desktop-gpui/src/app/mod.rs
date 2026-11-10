@@ -1318,7 +1318,7 @@ impl Workspace {
 
     /// Answers a runtime request in the pane's thread; `response` holds `decision`, `feedback` or `answers`.
     fn respond(&mut self, pane: side_chat::ChatPane, request_id: String, response: Value, cx: &mut Context<Self>) {
-        let Some((client, thread_id)) = self.pane_client(pane, cx) else { return };
+        let Some((client, env, thread_id)) = self.pane_client(pane, cx) else { return };
         let command = respond_value(&thread_id, &request_id, response);
         self.responding = Some(request_id.clone());
         cx.spawn(async move |this, cx| {
@@ -1328,7 +1328,7 @@ impl Workspace {
                     this.responding = None;
                 }
                 if let Err(error) = result
-                    && this.pane_shows(pane, &thread_id)
+                    && this.pane_shows(pane, &env, &thread_id)
                 {
                     this.error = Some(error.to_string().into());
                 }

@@ -161,7 +161,7 @@ impl Workspace {
         if !self.server_info().capability("threadForceStop") {
             return;
         }
-        let Some((client, thread_id)) = self.pane_client(pane, cx) else { return };
+        let Some((client, _, thread_id)) = self.pane_client(pane, cx) else { return };
         if !self.now.force_stopping.insert(thread_id.clone()) {
             return;
         }
@@ -190,7 +190,7 @@ impl Workspace {
 
     /// Stops the background work a finished run left running (`handleStopBackgroundWork`).
     fn stop_background_work(&mut self, pane: ChatPane, cx: &mut Context<Self>) {
-        let Some((_, thread_id)) = self.pane_thread(pane) else { return };
+        let Some((env, thread_id)) = self.pane_thread(pane) else { return };
         if self.background_stop_pending(&thread_id) {
             return;
         }
@@ -202,7 +202,7 @@ impl Workspace {
             let Some(run) = self.pane_projection(pane).and_then(|p| p.runs.last()) else { return };
             json!({"type": "run.interrupt", "commandId": new_id(), "threadId": thread_id, "runId": run.id, "holdQueue": true})
         };
-        let Some((client, _)) = self.pane_client(pane, cx) else { return };
+        let Some((client, ..)) = self.pane_client(pane, cx) else { return };
         let stop = BackgroundStop { task_ids, accepted: false, _retry: None };
         self.now.background_stops.insert(thread_id.clone(), stop);
         cx.notify();
@@ -212,7 +212,7 @@ impl Workspace {
                 match result {
                     Err(error) => {
                         this.now.background_stops.remove(&thread_id);
-                        if this.pane_shows(pane, &thread_id) {
+                        if this.pane_shows(pane, &env, &thread_id) {
                             this.error = Some(error.to_string().into());
                         }
                     }
@@ -247,7 +247,7 @@ impl Workspace {
         if self.pane_sending(pane) {
             return;
         }
-        let Some((client, thread_id)) = self.pane_client(pane, cx) else { return };
+        let Some((client, env, thread_id)) = self.pane_client(pane, cx) else { return };
         let running = self.pane_projection(pane).is_some_and(super::super::model::ThreadProjection::is_running);
         let mut command = json!({
             "type": "message.dispatch",
@@ -267,7 +267,7 @@ impl Workspace {
         cx.spawn(async move |this, cx| {
             if client.request("orchestration.dispatchCommand", command).await.is_err() {
                 let _ = this.update(cx, |this, cx| {
-                    if this.pane_shows(pane, &thread_id) {
+                    if this.pane_shows(pane, &env, &thread_id) {
                         this.error = Some(failure.into());
                     }
                     cx.notify();
@@ -279,7 +279,7 @@ impl Workspace {
 
     /// Wake now / Un-settle from the status line, with the web's failure toasts.
     fn change_status(&mut self, pane: ChatPane, kind: &'static str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((client, thread_id)) = self.pane_client(pane, cx) else { return };
+        let Some((client, _, thread_id)) = self.pane_client(pane, cx) else { return };
         if self.now.status_busy.contains(&thread_id) {
             return;
         }
@@ -316,7 +316,7 @@ impl Workspace {
 
     /// `useAcknowledgeThreadWoke`: marks the thread visited at the time it woke.
     fn acknowledge_pane_woke(&mut self, pane: ChatPane, woke_at: SharedString, cx: &mut Context<Self>) {
-        let Some((_, thread_id)) = self.pane_client(pane, cx) else { return };
+        let Some((_, _, thread_id)) = self.pane_client(pane, cx) else { return };
         let command =
             json!({"type": "thread.visit", "commandId": new_id(), "threadId": thread_id, "visitedAt": woke_at});
         self.dispatch(command, cx);

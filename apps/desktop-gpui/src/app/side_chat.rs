@@ -541,7 +541,7 @@ impl Workspace {
         let key = (view.env.clone(), view.thread_id.clone());
         let model = self.side_chat.models.get(&key);
         let command = turn_command(&view.thread_id, &text, running, follow_up, model);
-        let Some((client, _)) = self.pane_client(ChatPane::Side, cx) else { return };
+        let Some((client, ..)) = self.pane_client(ChatPane::Side, cx) else { return };
         let origin = self.target.clone();
         if let Some(view) = self.side_chat.view.as_mut() {
             view.sending = true;
@@ -946,11 +946,14 @@ impl Workspace {
         self.side_chat.view.as_mut().map(|view| &mut view.question)
     }
 
-    /// Whether the pane still shows `thread_id`, for a result that arrives later.
-    pub(super) fn pane_shows(&self, pane: ChatPane, thread_id: &str) -> bool {
+    /// Whether the pane still shows `env`'s `thread_id`, for a result that arrives later. Thread
+    /// ids can repeat across environments (an imported thread).
+    pub(super) fn pane_shows(&self, pane: ChatPane, env: &str, thread_id: &str) -> bool {
         match pane {
-            ChatPane::Main => matches!(&self.target, Some(Target::Thread { id, .. }) if id == thread_id),
-            ChatPane::Side => self.side_chat.view.as_ref().is_some_and(|view| view.thread_id == thread_id),
+            ChatPane::Main => {
+                matches!(&self.target, Some(Target::Thread { env: shown, id }) if shown == env && id == thread_id)
+            }
+            ChatPane::Side => self.side_chat.view.as_ref().is_some_and(|view| view.is(env, thread_id)),
         }
     }
 
@@ -963,14 +966,18 @@ impl Workspace {
 
     /// The socket that changes the pane's thread, on the environment it lives on, and that
     /// thread. Without `orchestration:operate` there it says so and gives none.
-    pub(super) fn pane_client(&mut self, pane: ChatPane, cx: &mut Context<Self>) -> Option<(RpcClient, String)> {
+    pub(super) fn pane_client(
+        &mut self,
+        pane: ChatPane,
+        cx: &mut Context<Self>,
+    ) -> Option<(RpcClient, SharedString, String)> {
         let (env, thread_id) = self.pane_thread(pane)?;
         if !self.can_operate(&env) {
             self.error = Some(NOT_OPERATE.into());
             cx.notify();
             return None;
         }
-        Some((self.env_client(&env)?, thread_id))
+        Some((self.env_client(&env)?, env, thread_id))
     }
 
     /// Whether this connection may change side chats on the parent thread's environment
