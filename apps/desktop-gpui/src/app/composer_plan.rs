@@ -24,6 +24,8 @@ pub(super) struct ComposerUi {
     pub(super) compact: super::compact_send::CompactState,
     /// `/usage-limits`' panel in the banner dock.
     pub(super) usage_limits: super::pages::UsageLimitsPanel,
+    /// The open question's pending auto-advance after an option pick; dropping it cancels it.
+    pub(super) question_advance: Option<gpui_kit::Task<()>>,
 }
 
 impl super::Workspace {

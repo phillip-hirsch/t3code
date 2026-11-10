@@ -520,6 +520,8 @@ impl Workspace {
     /// `sync_question` drops a restored question once the thread shows it resolved.
     pub(super) fn restore_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_draft_workspace(cx);
+        // The question coming back is not the one a pick on another target was advancing.
+        self.composer_ui.question_advance = None;
         self.typing_guard.reset();
         self._typing_idle = None;
         self.sync_typing_guard(window, cx);
@@ -872,6 +874,18 @@ impl Workspace {
         self.question_slot(pane)?.as_mut()
     }
 
+    /// Replaces the pane's pending auto-advance; `None` cancels it, like the web clearing its
+    /// timer when the active question changes or the card unmounts.
+    fn set_question_advance(&mut self, pane: ChatPane, task: Option<gpui_kit::Task<()>>) {
+        let slot = match pane {
+            ChatPane::Main => Some(&mut self.composer_ui.question_advance),
+            ChatPane::Side => self.side_chat_advance_slot(),
+        };
+        if let Some(slot) = slot {
+            *slot = task;
+        }
+    }
+
     /// Opens a fresh draft when the pane's first pending question changes. The editor
     /// then holds the question's answer, and the prompt waits in the draft
     /// until the last question closes.
@@ -884,6 +898,7 @@ impl Workspace {
             return;
         }
         let next = first.and_then(|(request, item)| QuestionDraft::new(request.id.clone(), requests::questions(item)));
+        self.set_question_advance(pane, None);
         let Some(previous) = self.question_slot(pane).map(Option::take) else { return };
         // The open thread's composer lists the question on screen's attachments; side chats take none.
         let main = pane == ChatPane::Main;
@@ -920,6 +935,7 @@ impl Workspace {
 
     /// Shows question `index` of the pane's card, with its attachments in the composer.
     fn show_question(&mut self, pane: ChatPane, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_question_advance(pane, None);
         match pane {
             ChatPane::Main => {
                 let Some(question) = self.question.as_mut() else { return };
@@ -1028,7 +1044,8 @@ impl Workspace {
         let at = (shown, draft.request_id.clone(), draft.index);
         self.set_pane_text(pane, String::new(), window, cx);
         cx.notify();
-        if advance {
+        // A pick replaces the previous one's timer, as the web's does.
+        let task = advance.then(|| {
             cx.spawn_in(window, async move |this, cx| {
                 cx.background_executor().timer(AUTO_ADVANCE).await;
                 let _ = this.update_in(cx, |this, window, cx| {
@@ -1038,8 +1055,8 @@ impl Workspace {
                     }
                 });
             })
-            .detach();
-        }
+        });
+        self.set_question_advance(pane, task);
     }
 
     fn dismiss_question(&mut self, pane: ChatPane, request_id: String, cx: &mut Context<Self>) {

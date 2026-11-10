@@ -61,6 +61,8 @@ pub(super) struct SideChatView {
     /// The question card's drafts for the side chat's first pending question; the editor holds
     /// its custom answer meanwhile.
     question: Option<QuestionDraft>,
+    /// The question's pending auto-advance after an option pick; dropping it cancels it.
+    question_advance: Option<Task<()>>,
     /// Repaints the footer's and timeline's clocks once a second while one runs.
     _tick: Option<Task<()>>,
     _subscription: Option<Task<()>>,
@@ -466,6 +468,7 @@ impl Workspace {
             queue: Default::default(),
             now: Default::default(),
             question: None,
+            question_advance: None,
             _tick: None,
             _subscription: Some(subscription),
             _events: events,
@@ -955,6 +958,10 @@ impl Workspace {
 
     pub(super) fn side_chat_question_slot(&mut self) -> Option<&mut Option<QuestionDraft>> {
         self.side_chat.view.as_mut().map(|view| &mut view.question)
+    }
+
+    pub(super) fn side_chat_advance_slot(&mut self) -> Option<&mut Option<Task<()>>> {
+        self.side_chat.view.as_mut().map(|view| &mut view.question_advance)
     }
 
     /// Whether the pane still shows `env`'s `thread_id`, for a result that arrives later. Thread
