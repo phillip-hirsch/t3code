@@ -13,27 +13,59 @@ use crate::app::Workspace;
 use crate::preview::{self, Partition};
 use crate::rpc::RpcClient;
 
-/// A profile's WebView2 storage: its own user data folder, like Electron's session partitions.
+/// A profile's storage, kept apart like Electron's session partitions.
 pub(super) enum Storage {
     Default,
     Incognito,
-    Folder(PathBuf),
+    /// `dir` is the user data folder (`WebView2`, `WebKitGTK`); `store` the data store (macOS).
+    Folder {
+        dir: PathBuf,
+        #[cfg_attr(
+            all(not(target_os = "macos"), not(test)),
+            expect(dead_code, reason = "only WKWebView keeps a profile by store identifier")
+        )]
+        store: [u8; 16],
+    },
+}
+
+/// Why a custom profile can't be opened here: it would share the default profile's data.
+pub(in crate::app) const CUSTOM_PROFILES_UNAVAILABLE: &str =
+    "Browser profiles need macOS 14 or later. On this Mac they would share the default profile's cookies.";
+
+/// Whether this machine can keep a custom profile's data apart. `WKWebView` takes a store of its
+/// own from macOS 14 on; before that wry silently gives it the default store.
+#[cfg(target_os = "macos")]
+pub(in crate::app) fn custom_profiles_available() -> bool {
+    objc2_foundation::NSProcessInfo::processInfo().operatingSystemVersion().majorVersion >= 14
+}
+
+/// `WebView2` and `WebKitGTK` keep each profile in its own data folder.
+#[cfg(not(target_os = "macos"))]
+pub(in crate::app) fn custom_profiles_available() -> bool {
+    true
 }
 
 impl Storage {
-    pub(super) fn of(profile_id: Option<&str>) -> Self {
-        match preview::partition(profile_id) {
-            Partition::Default => Self::Default,
-            Partition::Incognito => Self::Incognito,
+    pub(super) fn of(profile_id: Option<&str>) -> Result<Self, &'static str> {
+        Self::resolve(preview::partition(profile_id), crate::settings::userdata_dir(), custom_profiles_available())
+    }
+
+    fn resolve(partition: Partition, userdata: Option<PathBuf>, custom_profiles: bool) -> Result<Self, &'static str> {
+        match partition {
+            Partition::Default => Ok(Self::Default),
+            Partition::Incognito => Ok(Self::Incognito),
+            Partition::Folder(_) if !custom_profiles => Err(CUSTOM_PROFILES_UNAVAILABLE),
             // Without a home folder a profile must not fall back to the default's cookies.
-            Partition::Folder(name) => crate::settings::userdata_dir()
-                .map_or(Self::Incognito, |dir| Self::Folder(dir.join("browser-profiles").join(name))),
+            Partition::Folder(store) => Ok(userdata.map_or(Self::Incognito, |userdata| Self::Folder {
+                dir: userdata.join("browser-profiles").join(crate::hex::lower_hex(&store)),
+                store,
+            })),
         }
     }
 
     pub(super) fn context(&self) -> Option<wry::WebContext> {
         match self {
-            Self::Folder(dir) => Some(wry::WebContext::new(Some(dir.clone()))),
+            Self::Folder { dir, .. } => Some(wry::WebContext::new(Some(dir.clone()))),
             Self::Default | Self::Incognito => None,
         }
     }
@@ -43,7 +75,14 @@ impl Storage {
             Some(context) => wry::WebViewBuilder::new_with_web_context(context),
             None => wry::WebViewBuilder::new(),
         };
-        builder.with_incognito(matches!(self, Self::Incognito))
+        let builder = builder.with_incognito(matches!(self, Self::Incognito));
+        // WKWebView ignores the data folder; only a store identifier keeps the profile apart.
+        #[cfg(target_os = "macos")]
+        if let Self::Folder { store, .. } = self {
+            use wry::WebViewBuilderExtDarwin as _;
+            return builder.with_data_store_identifier(*store);
+        }
+        builder
     }
 
     /// A hidden view in this storage, to reach its cookies whether or not a tab of it is open.
@@ -89,10 +128,17 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Task<Result<(), String>> {
         let servers = self.browser_servers();
-        let storage = Storage::of(Some(&profile_id));
+        // A profile this Mac can't open has no store of its own here, and the default's isn't its to clear.
+        let storage = Storage::of(Some(&profile_id)).ok();
         cx.spawn_in(window, async move |_, cx| {
-            let view = cx.update(|window, cx| storage.hidden_view(window, cx)).map_err(|error| error.to_string())??;
+            let view = match storage {
+                Some(storage) => Some(
+                    cx.update(|window, cx| storage.hidden_view(window, cx)).map_err(|error| error.to_string())??,
+                ),
+                None => None,
+            };
             let desktop = async {
+                let Some(view) = view else { return Ok(()) };
                 view.raw().clear_all_browsing_data().map_err(|error| error.to_string())?;
                 // WebView2 clears in the background and reports nothing back; dropping the view
                 // early could cut that short.
@@ -156,5 +202,18 @@ mod tests {
         assert!(reported.record(&a, &json!({"profiles": [1]})), "a change is sent again");
         reported.forget("a");
         assert!(reported.record(&a, &json!({"profiles": [1]})), "a reconnect is sent again");
+    }
+
+    #[test]
+    fn a_custom_profile_gets_its_own_store_or_is_refused() {
+        let home = Some(PathBuf::from("home"));
+        let work = || preview::partition(Some("profile-work"));
+        let Ok(Storage::Folder { dir, store }) = Storage::resolve(work(), home.clone(), true) else { panic!() };
+        assert_eq!(dir, PathBuf::from("home").join("browser-profiles").join(crate::hex::lower_hex(&store)));
+        assert!(matches!(Storage::resolve(work(), None, true), Ok(Storage::Incognito)), "never the default's data");
+        assert_eq!(Storage::resolve(work(), home.clone(), false).err(), Some(CUSTOM_PROFILES_UNAVAILABLE));
+        assert!(matches!(Storage::resolve(preview::partition(None), home.clone(), false), Ok(Storage::Default)));
+        let incognito = preview::partition(Some(preview::INCOGNITO_PROFILE_ID));
+        assert!(matches!(Storage::resolve(incognito, home, false), Ok(Storage::Incognito)));
     }
 }

@@ -163,10 +163,12 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
   "NSResponder",
   "NSWorkspace",
 ] }
-# The system locale and forced 12/24-hour clock (`timestamp::system_locale`) read through it too.
+# The system locale and forced 12/24-hour clock (`timestamp::system_locale`) read through it too,
+# and the macOS version that decides whether browser profiles get stores of their own.
 objc2-foundation = { version = "0.3", default-features = false, features = [
   "std",
   "NSLocale",
+  "NSProcessInfo",
   "NSString",
   "NSUserDefaults",
 ] }

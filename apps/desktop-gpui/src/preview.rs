@@ -1204,8 +1204,9 @@ pub enum Partition {
     Default,
     /// In memory, gone when the app closes.
     Incognito,
-    /// A folder of its own, named by a hash so any id makes a short, valid name.
-    Folder(String),
+    /// A store of its own, keyed by a hash of the id: the folder's name (`WebView2`, `WebKitGTK`) and
+    /// the `WKWebsiteDataStore` identifier (macOS).
+    Folder([u8; 16]),
 }
 
 pub fn partition(profile_id: Option<&str>) -> Partition {
@@ -1213,7 +1214,11 @@ pub fn partition(profile_id: Option<&str>) -> Partition {
     match profile_id {
         None | Some(DEFAULT_PROFILE_ID) => Partition::Default,
         Some(INCOGNITO_PROFILE_ID) => Partition::Incognito,
-        Some(id) => Partition::Folder(crate::hex::lower_hex(&sha2::Sha256::digest(id.as_bytes())[..16])),
+        Some(id) => {
+            let mut store = [0; 16];
+            store.copy_from_slice(&sha2::Sha256::digest(id.as_bytes())[..16]);
+            Partition::Folder(store)
+        }
     }
 }
 
@@ -1500,9 +1505,12 @@ mod tests {
 
         assert_eq!(partition(None), Partition::Default);
         assert_eq!(partition(Some("incognito")), Partition::Incognito);
-        let Partition::Folder(folder) = partition(Some("profile-work")) else { panic!() };
-        assert_eq!(folder.len(), 32);
-        assert_ne!(partition(Some("profile-home")), Partition::Folder(folder));
+        assert_eq!(partition(Some("default")), Partition::Default, "the default profile keeps the default store");
+        let Partition::Folder(store) = partition(Some("profile-work")) else { panic!() };
+        // Pinned: a profile's folder and macOS store keep this key across releases.
+        assert_eq!(crate::hex::lower_hex(&store), "fe994b29faae4f113655296d74acd42f");
+        assert_eq!(partition(Some("profile-work")), Partition::Folder(store), "stable");
+        assert_ne!(partition(Some("profile-home")), Partition::Folder(store), "distinct per profile");
 
         let report = profile_report(&stored);
         assert_eq!(report["defaultProfileId"], "profile-work");
