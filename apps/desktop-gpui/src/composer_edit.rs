@@ -386,6 +386,11 @@ fn fence_around<'a>(blocks: &'a [Fence], selection: &Range<usize>) -> Option<&'a
     })
 }
 
+/// Each fenced block of `text`, fences included, which holds no chips (a `codeBlock` node).
+pub fn fenced_ranges(text: &str) -> Vec<Range<usize>> {
+    fences(text).into_iter().map(|block| block.open.start..block.close.map_or(block.code.end, |c| c.end)).collect()
+}
+
 /// Whether all of `selection` sits in one fenced block's code, where a paste stays verbatim.
 pub fn in_code_block(text: &str, selection: Range<usize>) -> bool {
     fence_around(&fences(text), &selection).is_some()

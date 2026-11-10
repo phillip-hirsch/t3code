@@ -233,9 +233,10 @@ pub fn chips(text: &str, is_skill: impl Fn(&str) -> bool) -> Vec<(Range<usize>, 
 
 /// [`chips`], plus the `model:` references `model_label` knows, labelled by it. Like a
 /// `$skill`, a reference chips only once whitespace follows it, so `gpt-6` cannot chip on the
-/// way to `gpt-6.1` (`collectModelTokens`).
+/// way to `gpt-6.1` (`collectModelTokens`). In `rich` text, fenced code stays as written.
 pub fn chips_with_models(
     text: &str,
+    rich: bool,
     is_skill: impl Fn(&str) -> bool,
     model_label: impl Fn(&str, &str) -> Option<String>,
 ) -> ChipSpans {
@@ -251,6 +252,10 @@ pub fn chips_with_models(
         let Some(label) = model_label(&mention.instance_id, &mention.model) else { continue };
         found.push((range, Chip::Model { instance_id: mention.instance_id, model: mention.model, label }));
     }
+    if rich && text.contains(['`', '~']) {
+        let code = crate::composer_edit::fenced_ranges(text);
+        found.retain(|(range, _)| !code.iter().any(|block| block.start < range.end && range.start < block.end));
+    }
     found.sort_by_key(|(range, _)| range.start);
     found
 }
@@ -260,6 +265,7 @@ pub fn chips_with_models(
 /// chips. Other chips stay; a model chip whose name changed comes back relabelled.
 pub fn reconcile_chips(
     text: &str,
+    rich: bool,
     tokens: &[(Range<usize>, &str, &str)],
     is_skill: impl Fn(&str) -> bool,
     model_label: impl Fn(&str, &str) -> Option<String>,
@@ -276,7 +282,7 @@ pub fn reconcile_chips(
         .map(|(range, ..)| range.clone())
         .collect();
     let kept: Vec<&Range<usize>> = tokens.iter().map(|(range, ..)| range).filter(|r| !stale.contains(r)).collect();
-    let fresh = chips_with_models(text, &is_skill, &model_label)
+    let fresh = chips_with_models(text, rich, &is_skill, &model_label)
         .into_iter()
         .filter(|(range, chip)| {
             matches!(chip, Chip::Skill { .. } | Chip::Model { .. })
@@ -388,6 +394,7 @@ pub type ChipSpans = Vec<(Range<usize>, Chip)>;
 pub fn pasted_chips(
     text: &str,
     after_space: bool,
+    rich: bool,
     is_skill: impl Fn(&str) -> bool,
     model_label: impl Fn(&str, &str) -> Option<String>,
 ) -> Option<(String, ChipSpans)> {
@@ -397,6 +404,7 @@ pub fn pasted_chips(
             "{text}
 "
         ),
+        rich,
         is_skill,
         model_label,
     )
@@ -646,16 +654,20 @@ mod tests {
     fn pasted_mentions_and_skills_become_chips_kept_apart_from_their_neighbours() {
         let skill = |name: &str| name == "review";
         let none = |_: &str, _: &str| None;
-        assert_eq!(pasted_chips("plain words", false, skill, none), None);
-        let (text, found) = pasted_chips("[a.rs](src/a.rs)", false, skill, none).unwrap();
+        assert_eq!(pasted_chips("plain words", false, true, skill, none), None);
+        let (text, found) = pasted_chips("[a.rs](src/a.rs)", false, true, skill, none).unwrap();
         assert_eq!(text, " [a.rs](src/a.rs) ");
         assert_eq!(found, [(1..17, Chip::File { path: "src/a.rs".into() })]);
-        let (text, found) = pasted_chips("see $review", true, skill, none).unwrap();
+        let (text, found) = pasted_chips("see $review", true, true, skill, none).unwrap();
         assert_eq!((text.as_str(), found), ("see $review ", vec![(4..11, Chip::Skill { name: "review".into() })]));
-        assert_eq!(pasted_chips("$unknown", true, skill, none), None, "only a skill the provider offers");
-        let (text, found) = pasted_chips("model:codex/gpt-6.1", false, skill, codex_model).unwrap();
+        assert_eq!(pasted_chips("$unknown", true, true, skill, none), None, "only a skill the provider offers");
+        let (text, found) = pasted_chips("model:codex/gpt-6.1", false, true, skill, codex_model).unwrap();
         assert_eq!(text, " model:codex/gpt-6.1 ", "a model chip is spaced like a mention");
         assert_eq!(found, [(1..20, gpt_chip())]);
+        let fenced = "```\nmodel:codex/gpt-6.1 $review\n```";
+        assert_eq!(pasted_chips(fenced, false, true, skill, codex_model), None, "code stays as written");
+        let (_, found) = pasted_chips(fenced, false, false, skill, codex_model).unwrap();
+        assert_eq!(found.len(), 2, "plain text has no code blocks");
     }
 
     fn codex_model(instance_id: &str, model: &str) -> Option<String> {
@@ -696,11 +708,14 @@ mod tests {
 
     #[test]
     fn a_known_model_reference_chips_once_whitespace_follows_it() {
-        let found = |text: &str| chips_with_models(text, |_| false, codex_model);
+        let found = |text: &str| chips_with_models(text, true, |_| false, codex_model);
         assert_eq!(found("Ask model:codex/gpt-6.1 now"), [(4..23, gpt_chip())]);
         assert_eq!(found("Ask model:openai/gpt-4o now"), [], "only a model the environment offers");
         assert_eq!(found("Ask model:codex/gpt-6.1"), [], "still being typed");
-        let both = chips_with_models("$review model:codex/gpt-6.1 x", |name| name == "review", codex_model);
+        assert_eq!(found("```\nAsk model:codex/gpt-6.1 now\n```\n"), [], "inside a fenced block");
+        assert_eq!(found("~~~sh\nAsk model:codex/gpt-6.1 now"), [], "inside an unclosed block");
+        assert_eq!(found("```\nx\n```\nAsk model:codex/gpt-6.1 now"), [(14..33, gpt_chip())], "after one");
+        let both = chips_with_models("$review model:codex/gpt-6.1 x", true, |name| name == "review", codex_model);
         assert_eq!(both, [(0..7, Chip::Skill { name: "review".into() }), (8..27, gpt_chip())]);
         assert_eq!(gpt_chip().id(), "model:codex/gpt-6.1");
         assert_eq!(
@@ -717,17 +732,19 @@ mod tests {
         let review = (0..7, "skill:review", "review");
         let gpt = (8..27, "model:codex/gpt-6.1", "GPT-6.1");
         assert_eq!(
-            reconcile_chips(text, &[], skill, codex_model),
+            reconcile_chips(text, true, &[], skill, codex_model),
             (vec![], vec![(0..7, Chip::Skill { name: "review".into() }), (8..27, gpt_chip())]),
             "text restored before the lists loaded"
         );
-        assert_eq!(reconcile_chips(text, &[review.clone(), gpt.clone()], skill, codex_model), (vec![], vec![]));
-        assert_eq!(reconcile_chips(text, &[review.clone(), gpt], |_| false, none), (vec![0..7, 8..27], vec![]));
+        assert_eq!(reconcile_chips(text, true, &[review.clone(), gpt.clone()], skill, codex_model), (vec![], vec![]));
+        assert_eq!(reconcile_chips(text, true, &[review.clone(), gpt], |_| false, none), (vec![0..7, 8..27], vec![]));
         let renamed = (8..27, "model:codex/gpt-6.1", "GPT-6");
-        let (stale, fresh) = reconcile_chips(text, &[review, renamed.clone()], skill, codex_model);
+        let (stale, fresh) = reconcile_chips(text, true, &[review, renamed.clone()], skill, codex_model);
         assert_eq!((stale, fresh), (vec![renamed.0.clone()], vec![(renamed.0, gpt_chip())]));
         let pasted = (0..27, "paste:1", "Pasted text");
-        assert_eq!(reconcile_chips(text, &[pasted], skill, codex_model), (vec![], vec![]), "inside another chip");
+        assert_eq!(reconcile_chips(text, true, &[pasted], skill, codex_model), (vec![], vec![]), "inside another chip");
+        let fenced = format!("```\n{text}\n```");
+        assert_eq!(reconcile_chips(&fenced, true, &[], skill, codex_model), (vec![], vec![]), "code stays as written");
     }
 
     #[test]

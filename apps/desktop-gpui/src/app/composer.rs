@@ -210,6 +210,7 @@ impl Workspace {
         let mut content = InputContent::new(text.clone());
         let chips = composer_text::chips_with_models(
             &text,
+            self.client_settings.values.bool("composerRichTextEnabled"),
             |name| skills.iter().any(|s| s == name),
             |instance_id, model| self.model_mention(instance_id, model).map(|m| m.label),
         );
@@ -250,6 +251,7 @@ impl Workspace {
             spans.iter().map(|s| (s.range(), s.token().id().as_ref(), s.token().label().as_ref())).collect();
         let (stale, fresh) = composer_text::reconcile_chips(
             &text,
+            self.client_settings.values.bool("composerRichTextEnabled"),
             &tokens,
             |name| skills.iter().any(|s| s == name),
             |instance_id, model| self.model_mention(instance_id, model).map(|m| m.label),
@@ -297,6 +299,7 @@ impl Workspace {
         let Some((text, found)) = composer_text::pasted_chips(
             text,
             after_space,
+            rich,
             |name| skills.iter().any(|s| s == name),
             |instance_id, model| self.model_mention(instance_id, model).map(|m| m.label),
         ) else {
