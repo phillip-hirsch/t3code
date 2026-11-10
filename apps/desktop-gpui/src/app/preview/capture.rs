@@ -72,6 +72,10 @@ struct Recording {
 }
 
 impl Captures {
+    pub(super) fn is_recording(&self, tab: &TabRef) -> bool {
+        self.recording(tab).is_some()
+    }
+
     fn recording(&self, tab: &TabRef) -> Option<&Recording> {
         self.recording.as_ref().filter(|recording| recording.tab == *tab)
     }

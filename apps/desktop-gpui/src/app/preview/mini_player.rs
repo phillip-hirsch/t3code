@@ -293,8 +293,9 @@ impl Workspace {
             return Some(measure.into_any_element());
         };
         let server = session.server_hosted();
-        // A tab this client hosts can also pop into its separate window.
-        let pill = pill_width(if server { 2 } else { 3 });
+        let recording = self.preview.capture.is_recording(&tab);
+        // A tab this client hosts can also pop into its separate window; a recording adds its dot.
+        let pill = pill_width(if server { 2 } else { 3 } + u8::from(recording));
         self.preview.mini.shown =
             Some(Shown { thread: thread.clone(), tab_id: mini.tab_id.clone(), frame, source, pill });
         let open = self.preview.mini.hovered
@@ -374,6 +375,18 @@ impl Workspace {
                 cx.listener(|this, event: &MouseDownEvent, _, cx| this.begin_mini_gesture(None, event, cx)),
             )
             .on_drag(MiniDrag, |_, _, _, cx| cx.new(|_| Empty))
+            // The web's dot pulses; a static one keeps the player from repainting every frame.
+            .when(recording, |pill| {
+                pill.child(
+                    div()
+                        .size(px(24.))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(div().size(px(8.)).rounded_full().bg(tokens.error)),
+                )
+            })
             .child(
                 icon_button("mini-open-in-panel", IconName::PanelRight, true, &tokens, cx)
                     .tooltip("Open in right panel")
@@ -414,7 +427,7 @@ impl Workspace {
             .rounded_full()
             .border_1()
             .border_color(tokens.background.opacity(0.7))
-            .bg(tokens.foreground.opacity(0.25))
+            .bg(if recording { tokens.error } else { tokens.foreground.opacity(0.25) })
             .shadow_sm();
         let handle = div()
             .id("mini-handle")
