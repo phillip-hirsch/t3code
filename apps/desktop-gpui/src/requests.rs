@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
+use crate::composer_context::ContextRecords;
 use crate::model::TurnItem;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -96,6 +97,8 @@ pub struct QuestionDraft<A> {
     pub prompt: String,
     /// The prompt's attachments, set aside with it.
     pub prompt_attachments: Vec<A>,
+    /// The context records the prompt's chips name, set aside with it.
+    pub prompt_records: ContextRecords,
     /// The attachments of questions other than the one on screen, whose are the composer's.
     pub attachments: HashMap<String, Vec<A>>,
 }
@@ -121,6 +124,7 @@ impl<A> QuestionDraft<A> {
             collapsed: false,
             prompt: String::new(),
             prompt_attachments: Vec::new(),
+            prompt_records: ContextRecords::default(),
             attachments: HashMap::new(),
         })
     }

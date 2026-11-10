@@ -78,8 +78,7 @@ impl Workspace {
 
     /// Whether the open composer takes a comment on `key`'s file now.
     pub(super) fn can_comment_on_file(&self, key: &FileKey) -> bool {
-        self.target.as_ref().is_some_and(|target| self.draft_records(target).is_some())
-            && self.file_draft(key).is_none()
+        self.target.as_ref().is_some_and(|target| self.takes_context(target)) && self.file_draft(key).is_none()
     }
 
     /// Marks the commented lines in the gutter, redrawing only when the comments changed.

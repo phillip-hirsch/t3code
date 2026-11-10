@@ -179,7 +179,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(selection) = self.right_panel.shown.clone() else { return };
-        if self.shown_diff_comment(cx).is_some() || self.draft_records(&selection.0).is_none() {
+        if self.shown_diff_comment(cx).is_some() || !self.takes_context(&selection.0) {
             return;
         }
         let path = range.path().clone();

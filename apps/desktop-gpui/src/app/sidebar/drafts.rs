@@ -109,8 +109,9 @@ impl Workspace {
                 Some(ComposerDraft::Question(mut question)) => {
                     let prompt = std::mem::take(&mut question.prompt);
                     let attachments = std::mem::take(&mut question.prompt_attachments);
+                    let records = std::mem::take(&mut question.prompt_records);
                     self.composer_drafts.insert(target.clone(), ComposerDraft::Question(question));
-                    (prompt, attachments, Default::default())
+                    (prompt, attachments, records)
                 }
                 None => return,
             }
@@ -149,6 +150,7 @@ impl Workspace {
                 Some(ComposerDraft::Question(question)) => {
                     question.prompt = prompt;
                     question.prompt_attachments = attachments;
+                    question.prompt_records = records;
                 }
                 _ => {
                     self.composer_drafts.insert(target, ComposerDraft::Prompt(prompt, attachments, records));

@@ -535,8 +535,10 @@ impl Workspace {
             let message = "The stash file could not be updated, so this entry could still be there after a restart.";
             toast(window, cx, Notification::warning(message).title("Restored prompt may reappear in the stash"));
         }
-        if self.question.is_none() {
-            self.context.records.extend(entry.records.iter().cloned());
+        // An open question holds the composer; the records wait with the prompt.
+        match &mut self.question {
+            Some(question) => question.prompt_records.extend(entry.records.iter().cloned()),
+            None => self.context.records.extend(entry.records.iter().cloned()),
         }
         let mut unreadable = Vec::new();
         let mut over_limit = Vec::new();

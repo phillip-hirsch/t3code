@@ -25,6 +25,21 @@ pub(super) struct ContextState {
     copied: Vec<CopiedAttachment>,
 }
 
+impl ContextState {
+    /// The records leave with the composer's text (a send, a question card taking the editor).
+    pub(super) fn set_aside(&mut self) -> ContextRecords {
+        self.retained = ContextRecords::default();
+        std::mem::take(&mut self.records)
+    }
+
+    /// The composer's text was replaced, which ends its undo history: only the records its new
+    /// chips name stay.
+    fn reset(&mut self, text: &str) {
+        self.retained = ContextRecords::default();
+        self.records.retain_referenced(text);
+    }
+}
+
 struct CopiedAttachment {
     environment: SharedString,
     /// The id the copied record names: its upload's, or its local id before that finished.
@@ -128,26 +143,44 @@ impl Workspace {
         Some(link)
     }
 
-    /// The records of `target`'s draft: the composer's on screen, else the set-aside prompt's.
+    /// Whether `target`'s draft takes new context now: not while a question card holds it.
+    pub(super) fn takes_context(&self, target: &Target) -> bool {
+        if self.target.as_ref() == Some(target) {
+            return self.question.is_none();
+        }
+        matches!(self.composer_drafts.get(target), Some(ComposerDraft::Prompt(..)))
+    }
+
+    /// The records of `target`'s prompt: the composer's on screen, else the set-aside prompt's
+    /// (a draft not on screen, or the prompt a question card holds).
     pub(super) fn draft_records(&self, target: &Target) -> Option<&ContextRecords> {
         if self.target.as_ref() == Some(target) {
-            return self.question.is_none().then_some(&self.context.records);
+            return Some(self.question.as_ref().map_or(&self.context.records, |question| &question.prompt_records));
         }
         match self.composer_drafts.get(target)? {
             ComposerDraft::Prompt(_, _, records) => Some(records),
-            ComposerDraft::Question(_) => None,
+            ComposerDraft::Question(question) => Some(&question.prompt_records),
+        }
+    }
+
+    /// `target`'s prompt and records when the editor doesn't hold them: a draft not on screen,
+    /// or the prompt a question card set aside.
+    fn set_aside_prompt(&mut self, target: &Target) -> Option<(&mut String, &mut ContextRecords)> {
+        if self.target.as_ref() == Some(target) {
+            return self.question.as_mut().map(|question| (&mut question.prompt, &mut question.prompt_records));
+        }
+        match self.composer_drafts.get_mut(target)? {
+            ComposerDraft::Prompt(prompt, _, records) => Some((prompt, records)),
+            ComposerDraft::Question(question) => Some((&mut question.prompt, &mut question.prompt_records)),
         }
     }
 
     /// Replaces a record `target`'s draft holds (a comment whose lines moved), keeping its chip.
     pub(super) fn replace_context_record(&mut self, target: &Target, record: Value, cx: &mut Context<Self>) {
-        let replaced = if self.target.as_ref() == Some(target) {
+        let replaced = if self.target.as_ref() == Some(target) && self.question.is_none() {
             self.context.records.replace(record)
         } else {
-            match self.composer_drafts.get_mut(target) {
-                Some(ComposerDraft::Prompt(_, _, records)) => records.replace(record),
-                _ => false,
-            }
+            self.set_aside_prompt(target).is_some_and(|(_, records)| records.replace(record))
         };
         if replaced {
             cx.notify();
@@ -165,7 +198,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let chip = Chip::Context { kind: kind.to_owned(), id: id.to_owned(), label: String::new() }.id();
-        if self.target.as_ref() == Some(target) {
+        if self.target.as_ref() == Some(target) && self.question.is_none() {
             let state = self.composer.read(cx);
             let spans: Vec<_> = state
                 .tokens()
@@ -181,7 +214,7 @@ impl Workspace {
             }
             self.context.records.remove(id);
             self.sync_composer_empty(cx);
-        } else if let Some(ComposerDraft::Prompt(prompt, _, records)) = self.composer_drafts.get_mut(target) {
+        } else if let Some((prompt, records)) = self.set_aside_prompt(target) {
             let spans = composer_text::chips(prompt, |_| false)
                 .into_iter()
                 .filter(|(_, found)| found.id() == chip)
@@ -225,8 +258,7 @@ impl Workspace {
 
     /// The open composer's records, which leave with its text.
     pub(super) fn take_context_records(&mut self) -> ContextRecords {
-        self.context.retained = ContextRecords::default();
-        std::mem::take(&mut self.context.records)
+        self.context.set_aside()
     }
 
     /// Records going back to the draft they were taken from (a failed send, a cancelled edit),
@@ -235,11 +267,14 @@ impl Workspace {
         if records.is_empty() {
             return;
         }
-        if self.target.as_ref() == Some(origin) {
+        if self.target.as_ref() == Some(origin) && self.question.is_none() {
             self.context.records.extend(records.iter().cloned());
-        } else if let ComposerDraft::Prompt(_, _, held) =
-            self.composer_drafts.entry(origin.clone()).or_insert_with(ComposerDraft::empty)
-        {
+            return;
+        }
+        if self.target.as_ref() != Some(origin) {
+            self.composer_drafts.entry(origin.clone()).or_insert_with(ComposerDraft::empty);
+        }
+        if let Some((_, held)) = self.set_aside_prompt(origin) {
             held.extend(records.iter().cloned());
         }
     }
@@ -256,8 +291,7 @@ impl Workspace {
     /// The composer's text was replaced, which ends its undo history: only the records its new
     /// chips name stay.
     pub(super) fn reset_context_chips(&mut self, text: &str) {
-        self.context.retained = ContextRecords::default();
-        self.context.records.retain_referenced(text);
+        self.context.reset(text);
     }
 
     /// The clipboard fragment for copied `text` (`buildContextClipboardFragment`), remembering
@@ -455,6 +489,21 @@ fn import_failed(name: &str, reason: &str, window: &mut Window, cx: &mut Context
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_question_card_keeps_the_set_aside_prompts_records() {
+        let link = composer_text::context_link("terminal", "terminal_t1", "Shell");
+        let prompt = format!("see {link}");
+        let mut context = ContextState::default();
+        context.records.insert(json!({"version": 1, "kind": "terminal", "contextId": "terminal_t1", "label": "Shell"}));
+        // The card takes the editor, which then shows the answer.
+        let parked = context.set_aside();
+        context.reset("the answer");
+        // It closes: the prompt and its records come back.
+        context.records = parked;
+        context.reset(&prompt);
+        assert!(context.records.get("terminal_t1").is_some(), "the restored chip still sends its terminal output");
+    }
 
     #[test]
     fn a_machine_mention_sends_its_environment_record_once() {

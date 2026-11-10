@@ -868,21 +868,26 @@ impl Workspace {
             (Some(previous), None) => {
                 if main {
                     self.close_question_attachments(previous.attachments, previous.prompt_attachments, cx);
+                    // Ahead of the prompt's text, so its chips find them.
+                    self.context.records = previous.prompt_records;
                 }
                 self.set_pane_text(pane, previous.prompt, window, cx);
             }
             (previous, Some(draft)) => {
-                let (prompt, prompt_attachments) = match previous {
+                let (prompt, prompt_attachments, prompt_records) = match previous {
                     Some(previous) if main => {
                         self.close_question_attachments(previous.attachments, Vec::new(), cx);
-                        (previous.prompt, previous.prompt_attachments)
+                        (previous.prompt, previous.prompt_attachments, previous.prompt_records)
                     }
-                    Some(previous) => (previous.prompt, previous.prompt_attachments),
-                    None if main => (self.pane_text(pane, cx), std::mem::take(&mut self.attachments)),
-                    None => (self.pane_text(pane, cx), Vec::new()),
+                    Some(previous) => (previous.prompt, previous.prompt_attachments, previous.prompt_records),
+                    // Out of reach of the answer's text, which would prune them.
+                    None if main => {
+                        (self.pane_text(pane, cx), std::mem::take(&mut self.attachments), self.take_context_records())
+                    }
+                    None => (self.pane_text(pane, cx), Vec::new(), ContextRecords::default()),
                 };
                 if let Some(slot) = self.question_slot(pane) {
-                    *slot = Some(QuestionDraft { prompt, prompt_attachments, ..draft });
+                    *slot = Some(QuestionDraft { prompt, prompt_attachments, prompt_records, ..draft });
                 }
                 self.load_custom_answer(pane, window, cx);
             }

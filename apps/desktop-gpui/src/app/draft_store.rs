@@ -484,7 +484,9 @@ impl Workspace {
         let editor;
         let (live_prompt, live_attachments, live_records): (&str, &[Attachment], Option<&ContextRecords>) =
             match (&self.question, self.queue_edit_draft()) {
-                (Some(question), _) => (question.prompt.as_str(), question.prompt_attachments.as_slice(), None),
+                (Some(question), _) => {
+                    (question.prompt.as_str(), question.prompt_attachments.as_slice(), Some(&question.prompt_records))
+                }
                 (None, Some((prompt, attachments, records))) => (prompt, attachments, Some(records)),
                 (None, None) => {
                     editor = self.composer.read(cx).value();
@@ -512,7 +514,7 @@ impl Workspace {
                     (prompt.as_str(), attachments.as_slice(), Some(records))
                 }
                 Some(ComposerDraft::Question(question)) => {
-                    (question.prompt.as_str(), question.prompt_attachments.as_slice(), None)
+                    (question.prompt.as_str(), question.prompt_attachments.as_slice(), Some(&question.prompt_records))
                 }
                 None => ("", &[][..], None),
             };
