@@ -398,6 +398,7 @@ impl Workspace {
         {
             return;
         }
+        self.stash_side_citation_comment(window, cx);
         self.side_chat.release_view(cx);
         let (Some(thread_id), Some(client), Some(env)) = (shown, client, env) else { return };
         let draft = self.side_chat.drafts.remove(&(env.clone(), thread_id.to_owned())).unwrap_or_default();

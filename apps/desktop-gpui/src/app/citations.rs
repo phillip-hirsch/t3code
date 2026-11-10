@@ -554,10 +554,11 @@ impl Workspace {
 
     /// The composer's text with the open comment's draft saved into its chip, closing the editor:
     /// a target switch keeps an unsaved comment in the draft it stashes (`onCitationDraftSave`).
+    /// A side chat's editor stays for its view, which saves it when it goes.
     pub(super) fn stash_citation_comment(&mut self, cx: &mut Context<Self>) -> Option<String> {
-        let editor = self.citations.comment.as_ref()?;
+        let editor = self.citations.comment.as_ref().filter(|editor| editor.pane == ChatPane::Main)?;
         let draft = editor.input.read(cx).value().to_string();
-        let chip = self.edited_chip(cx).filter(|_| editor.pane == ChatPane::Main);
+        let chip = self.edited_chip(cx);
         self.drop_citation_comment(cx);
         let (range, citation) = chip?;
         let Dismissal::Commit(comment) =
@@ -568,6 +569,22 @@ impl Workspace {
         let mut prompt = self.composer.read(cx).value().to_string();
         prompt.replace_range(range, &citation.with_comment(&comment).markdown());
         Some(prompt)
+    }
+
+    /// Saves a side chat's open comment into its chip and closes the editor, before the side
+    /// chat's view goes (`onCitationDraftSave`).
+    pub(super) fn stash_side_citation_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.citations.comment.as_ref().filter(|editor| editor.pane == ChatPane::Side) else {
+            return;
+        };
+        let draft = editor.input.read(cx).value().to_string();
+        if let Some((_, citation)) = self.edited_chip(cx)
+            && let Dismissal::Commit(comment) =
+                assistant_citations::resolve_dismissal(false, &draft, citation.comment.as_deref())
+        {
+            self.write_citation_comment(&comment, window, cx);
+        }
+        self.drop_citation_comment(cx);
     }
 
     /// A comment editor whose chip left the composer (a send, a recalled prompt) closes.
