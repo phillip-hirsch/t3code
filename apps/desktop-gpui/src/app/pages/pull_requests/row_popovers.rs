@@ -9,8 +9,8 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, ElementId, Entity, FontWeight, Hsla, InteractiveElement as _, IntoElement, MouseButton,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Task, div,
+    AnyElement, ElementId, Entity, FocusHandle, FontWeight, Hsla, InteractiveElement as _, IntoElement, KeyDownEvent,
+    MouseButton, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Task, div,
     prelude::FluentBuilder as _, px,
 };
 
@@ -25,6 +25,8 @@ pub(super) struct RowPopover {
     read: Read,
     /// The checks' "Show all".
     show_all: bool,
+    /// Each stack layer's focus, in the order the popover lists them.
+    layers: Vec<FocusHandle>,
     _task: Option<Task<()>>,
 }
 
@@ -66,7 +68,8 @@ impl Workspace {
             .filter(|held| kind == Kind::Checks && held.0 == reference_of(entry).key())
             .filter(|held| held.2.elapsed() < super::PREFETCH_FRESH)
             .map(|held| held.1.clone());
-        let mut popover = RowPopover { key: key.clone(), read: Read::Loading, show_all: false, _task: None };
+        let mut popover =
+            RowPopover { key: key.clone(), read: Read::Loading, show_all: false, layers: Vec::new(), _task: None };
         if let Some(detail) = prefetched {
             popover.read = Read::Checks(detail.checks.clone().into());
         } else if let Some(client) = self.env_client(&entry.environment_id) {
@@ -93,6 +96,9 @@ impl Workspace {
                         && *open == kind
                         && popover.key == key
                     {
+                        if let Read::Stack(Some(stack)) = &read {
+                            popover.layers = stack.layers.iter().map(|_| cx.focus_handle().tab_stop(true)).collect();
+                        }
                         popover.read = read;
                         cx.notify();
                     }
@@ -112,6 +118,7 @@ fn row_popover(
     kind: Kind,
     trigger: Button,
     open: bool,
+    focus: Option<&FocusHandle>,
     view: &Entity<Workspace>,
     content: impl Fn(&Workspace, &Tokens, &Entity<Workspace>) -> AnyElement + 'static,
 ) -> AnyElement {
@@ -132,6 +139,7 @@ fn row_popover(
                 .anchor(gpui_kit::Anchor::TopLeft)
                 .trigger(trigger)
                 .open(open)
+                .when_some(focus, Popover::track_focus)
                 .on_open_change(move |open, _, cx| {
                     toggle.update(cx, |this, cx| {
                         if *open {
@@ -168,7 +176,7 @@ pub(super) fn checks_popover(
         .size(px(14.))
         .p_0()
         .child(Icon::new(icon).with_size(px(14.)).text_color(color));
-    row_popover(entry, Kind::Checks, trigger, open, view, move |this, t, view| {
+    row_popover(entry, Kind::Checks, trigger, open, None, view, move |this, t, view| {
         let muted = |text: SharedString| div().text_xs().text_color(t.muted_foreground).child(text).into_any_element();
         let body = match this.row_popover(&key, Kind::Checks).map(|p| (&p.read, p.show_all)) {
             Some((Read::Checks(checks), show_all)) => {
@@ -223,7 +231,8 @@ pub(super) fn stack_popover(
         .child(Icon::new(Lucide::Layers).with_size(px(12.)))
         .child(format!("{position}/{size}"));
     let entry_for_layers = entry.clone();
-    row_popover(entry, Kind::Stack, trigger, open, view, move |this, t, view| {
+    let focus = &workspace.pull_requests.stack_focus;
+    row_popover(entry, Kind::Stack, trigger, open, Some(focus), view, move |this, t, view| {
         let group_label = |text: SharedString| {
             div()
                 .px(px(8.))
@@ -242,12 +251,14 @@ pub(super) fn stack_popover(
                 _ => "Loading stack…".into(),
             };
             return v_flex()
+                .track_focus(&this.pull_requests.stack_focus)
                 .child(group_label(format!("Stack #{number}").into()))
                 .child(group_label(message))
                 .into_any_element();
         };
         let current = entry_for_layers.number;
-        let layers = stack.layers.iter().rev().map(|layer| {
+        let focus = this.row_popover(&key, Kind::Stack).map_or(&[][..], |p| p.layers.as_slice());
+        let layers = stack.layers.iter().rev().zip(focus).map(|(layer, focus)| {
             let reference = Reference { number: layer.number, ..reference_of(&entry_for_layers) };
             let (icon, color, state) = state_glyph(layer.state, layer.is_draft, t);
             let (view, row_key) = (view.clone(), key.clone());
@@ -261,7 +272,9 @@ pub(super) fn stack_popover(
                 .rounded(px(4.))
                 .cursor_pointer()
                 .text_sm()
+                .track_focus(focus)
                 .hover(|s| s.bg(t.accent))
+                .focus_visible(|s| s.bg(t.accent))
                 .child(Icon::new(icon).with_size(px(16.)).text_color(color))
                 .child(
                     v_flex()
@@ -285,10 +298,32 @@ pub(super) fn stack_popover(
                     });
                 })
         });
+        let (keys, keys_row) = (view.clone(), key.clone());
         v_flex()
+            .track_focus(&this.pull_requests.stack_focus)
+            .on_key_down(move |event: &KeyDownEvent, window, cx| {
+                let layers = keys.read(cx).row_popover(&keys_row, Kind::Stack).map(|p| p.layers.clone());
+                let Some(layers) = layers.filter(|layers| !layers.is_empty()) else { return };
+                let at = layers.iter().position(|focus| focus.is_focused(window));
+                let Some(next) = step_layer(at, layers.len(), event.keystroke.key.as_str()) else { return };
+                layers[next].focus(window, cx);
+                cx.stop_propagation();
+            })
             .child(group_label(format!("Stack #{}", stack.number).into()))
             .child(v_flex().id("pr-stack-layers").max_h(px(320.)).overflow_y_scroll().children(layers))
             .child(group_label(format!("↳ {}", stack.base).into()))
             .into_any_element()
     })
+}
+
+/// A menu's arrow keys over `count` items: Down and Up wrap, Home and End jump (Base UI `Menu`).
+fn step_layer(at: Option<usize>, count: usize, key: &str) -> Option<usize> {
+    let last = count.checked_sub(1)?;
+    match (key, at) {
+        ("down", Some(i)) if i < last => Some(i + 1),
+        ("down" | "home", _) => Some(0),
+        ("up", Some(i)) if i > 0 => Some(i - 1),
+        ("up" | "end", _) => Some(last),
+        _ => None,
+    }
 }

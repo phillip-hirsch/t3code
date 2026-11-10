@@ -168,6 +168,8 @@ pub(in crate::app) struct PullRequestsState {
     avatars_unread: bool,
     /// A row's open checks or stack popover and what it read.
     row_popover: Option<(row_popovers::Kind, row_popovers::RowPopover)>,
+    /// The stack popover's layer list, which takes focus as it opens so arrow keys reach the layers.
+    stack_focus: FocusHandle,
     /// Each tab's close button and title, as the web's two buttons: Tab reaches them, Enter or Space presses.
     pub(super) tab_focus: std::collections::HashMap<String, [FocusHandle; 2]>,
     /// The right-click menu on one of the panel's tabs, where it opened.
@@ -244,6 +246,7 @@ impl PullRequestsState {
             row_focus_unheard: false,
             avatars_unread: false,
             row_popover: None,
+            stack_focus: cx.focus_handle(),
             tab_menu: None,
             actions_focus: cx.focus_handle(),
             tab_focus: std::collections::HashMap::new(),
