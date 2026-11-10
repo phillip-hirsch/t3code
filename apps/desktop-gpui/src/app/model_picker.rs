@@ -170,6 +170,16 @@ impl PickerState {
         self.open = None;
         self.host = None;
     }
+
+    /// Hands picker `id`, while open, its host's latest extra providers: generator models
+    /// arrive after it opens.
+    fn refresh_extra(&mut self, id: &str, extra: &Rc<[Provider]>) {
+        if self.open.as_deref() == Some(id)
+            && let Some(host) = &mut self.host
+        {
+            host.extra = extra.clone();
+        }
+    }
 }
 
 impl Workspace {
@@ -179,6 +189,11 @@ impl Workspace {
 
     pub(super) fn composer_picker_open(&self) -> bool {
         self.picker.open.as_deref() == Some(COMPOSER)
+    }
+
+    /// [`PickerState::refresh_extra`], for each render that rebuilds `id`'s extra providers.
+    pub(in crate::app) fn refresh_picker_extra(&mut self, id: &str, extra: &Rc<[Provider]>) {
+        self.picker.refresh_extra(id, extra);
     }
 
     pub(super) fn open_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1737,6 +1752,32 @@ mod tests {
         assert_eq!(effort_entry(&switches, false), None, "a pick lands only on levels");
         assert_eq!(effort_entry(&switches, true), Some(0), "ArrowRight takes any stop");
         assert_eq!(effort_entry(&[], true), None);
+    }
+
+    #[test]
+    fn an_open_picker_takes_its_hosts_latest_extra_providers() {
+        let generator = |models: Value| -> Rc<[Provider]> {
+            let provider = json!({"instanceId": "g", "driver": "openai", "models": models});
+            Rc::from([serde_json::from_value::<Provider>(provider).unwrap()])
+        };
+        let loading = generator(json!([]));
+        let loaded = generator(json!([{"slug": "m"}]));
+        let host = PickHost {
+            environment: None,
+            current: None,
+            include: |_| true,
+            extra: loading.clone(),
+            on_pick: Rc::new(|_, _, _, _| {}),
+        };
+        let mut state = PickerState { open: Some("writer".into()), host: Some(host), ..PickerState::default() };
+        let models = |state: &PickerState| state.host.as_ref().unwrap().extra[0].models.len();
+        state.refresh_extra("other", &loaded);
+        assert_eq!(models(&state), 0, "another picker's render leaves it alone");
+        state.refresh_extra("writer", &loaded);
+        assert_eq!(models(&state), 1, "models discovered after opening are listed");
+        state.dismiss();
+        state.refresh_extra("writer", &loading);
+        assert!(state.host.is_none(), "a closed picker gets no host back");
     }
 
     #[test]

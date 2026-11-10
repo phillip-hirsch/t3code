@@ -1758,6 +1758,7 @@ impl Workspace {
             &[writer.as_ref(), stored_text.as_ref()],
             cx,
         );
+        self.refresh_picker_extra("writer-model", &generators);
         let generator_config = |id: &str| self.settings_info().settings.get("textGenerators").get(id).cloned();
         let providers = &self.settings_info().providers;
         let writer_providers = writing_providers(providers, &generators);

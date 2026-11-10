@@ -934,6 +934,7 @@ impl GeneratorWizard {
         let picker = workspace.update(cx, |w, cx| {
             let extra = w.text_generation_targets(Some(&environment), &[Some(&selection)], cx);
             let id = SharedString::from(format!("text-generator-task-{key}"));
+            w.refresh_picker_extra(&id, &extra);
             let trigger = w.picker_trigger_among(id.clone(), Some(&selection), None, Some(&environment), &extra, cx);
             let pick_environment = environment.clone();
             let on_pick: OnPick = Rc::new(

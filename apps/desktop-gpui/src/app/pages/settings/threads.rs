@@ -645,6 +645,7 @@ impl Workspace {
             serde::Deserialize::deserialize(view.value("textGenerationModelSelection")).ok();
         // Text generators from Providers can write this text too (`useTextGenerationTargets`).
         let generators = self.text_generation_targets(self.settings_environment().as_ref(), &[stored.as_ref()], cx);
+        self.refresh_picker_extra("text-generation-model", &generators);
         let selection =
             resolve_text_generation(stored.as_ref(), &writing_providers(&self.settings_info().providers, &generators));
         let connected = self.settings_client().is_some();
