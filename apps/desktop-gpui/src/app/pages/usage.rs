@@ -778,8 +778,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.env_client(&environment) else { return };
-        if self.usage.redeem_busy(&key) {
+        if self.env_client(&environment).is_none() || self.usage.redeem_busy(&key) {
             return;
         }
         let previous = self.usage.redeemed.iter().position(|r| r.key == key).map(|i| self.usage.redeemed.remove(i));
@@ -793,18 +792,21 @@ impl Workspace {
         );
         cx.spawn(async move |this, cx| {
             let confirmed = answer.await == Ok(0);
-            let _ = this.update(cx, |this, cx| {
-                if confirmed {
+            // The socket and grant are read after the answer: a reconnect while asking replaces both.
+            let client = this.update(cx, |this, cx| {
+                let client = this
+                    .env_client(&environment)
+                    .filter(|_| confirmed && this.env_grants(&environment, composer_limits::PROVIDERS_MANAGE));
+                if client.is_some() {
                     this.usage.set_redeem(&key, &name, RedeemStatus::Running);
                 } else {
                     this.usage.redeemed.retain(|r| r.key != key);
                     this.usage.redeemed.extend(previous);
                 }
                 cx.notify();
+                client
             });
-            if !confirmed {
-                return;
-            }
+            let Ok(Some(client)) = client else { return };
             let status = match client.request("provider.consumeResetCredit", input).await {
                 Ok(result) => logic::reset_outcome_text(&result),
                 Err(error) => error.to_string(),

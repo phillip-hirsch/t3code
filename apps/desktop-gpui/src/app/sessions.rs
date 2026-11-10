@@ -233,6 +233,11 @@ impl Workspace {
         self.session(environment_id)?.endpoint.as_ref()
     }
 
+    /// The socket and address `environment_id` has now.
+    pub(super) fn env_connection(&self, environment_id: &str) -> Option<(RpcClient, Endpoint)> {
+        Some((self.env_client(environment_id)?, self.env_endpoint(environment_id)?.clone()))
+    }
+
     /// The open target's environment's address, for its HTTP routes (`/api/auth/*`).
     pub(super) fn endpoint(&self) -> Option<&Endpoint> {
         self.active_env_session()?.endpoint.as_ref()

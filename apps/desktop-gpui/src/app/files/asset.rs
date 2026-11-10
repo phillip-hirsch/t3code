@@ -144,6 +144,17 @@ impl std::fmt::Display for FetchError {
 }
 
 impl Fetch {
+    /// The same read on `live`, the socket and HTTP origin its environment has now; `None` when
+    /// a signed read has none. A draft's bytes need neither.
+    pub(super) fn with_connection(self, live: Option<(crate::rpc::RpcClient, String)>) -> Option<Self> {
+        match self {
+            Self::Local(bytes) => Some(Self::Local(bytes)),
+            Self::Signed { resource, .. } => {
+                live.map(|(client, http_base)| Self::Signed { client, http_base, resource })
+            }
+        }
+    }
+
     /// The bytes, refused past `limit` with `too_large`, and the `fileRevision` they were signed at.
     pub(super) async fn read(
         self,
@@ -287,14 +298,22 @@ impl Workspace {
             }
         };
         let picked = cx.prompt_for_new_path(&directory, Some(&name));
-        let saving = key.clone();
+        let (saving, env) = (key.clone(), self.file_environment(key));
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(path))) = picked.await else { return };
-            let _ = this.update(cx, |this, cx| {
+            let fetch = this.update(cx, |this, cx| {
+                // Looked up after the dialog: a reconnect while it was open replaced the socket.
+                let live = env.as_deref().and_then(|env| this.env_connection(env));
+                let fetch = fetch.with_connection(live.map(|(client, endpoint)| (client, endpoint.http_base)))?;
                 this.files.saving.insert(saving.clone());
                 cx.notify();
+                Some(fetch)
             });
-            let written = match fetch.read(u64::MAX, "").await {
+            let read = match fetch {
+                Ok(Some(fetch)) => fetch.read(u64::MAX, "").await,
+                _ => Err(FetchError::Unsigned),
+            };
+            let written = match read {
                 Ok((bytes, _)) => {
                     let write = async move { std::fs::write(&path, bytes).map_err(|error| error.to_string()) };
                     cx.background_executor().spawn(write).await
@@ -442,5 +461,27 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
         assert_eq!(runtime.block_on(read_chunked(12)).as_deref(), Some(&b"aaaabbbbcccc"[..]));
         assert_eq!(runtime.block_on(read_chunked(11)), None);
+    }
+
+    #[test]
+    fn a_save_reads_on_the_socket_its_environment_has_after_the_dialog() {
+        let resource = json!({"_tag": "attachment", "attachmentId": "a"});
+        let opened = || Fetch::Signed {
+            client: crate::rpc::RpcClient::unopened(),
+            http_base: "http://old".into(),
+            resource: resource.clone(),
+        };
+        // The environment reconnected while the Save dialog was open.
+        let reconnected = crate::rpc::RpcClient::unopened();
+        let Some(Fetch::Signed { client, http_base, resource: read }) =
+            opened().with_connection(Some((reconnected.clone(), "http://new".into())))
+        else {
+            panic!("a connected environment reads the file");
+        };
+        assert!(client.same_socket(&reconnected));
+        assert_eq!((http_base.as_str(), &read), ("http://new", &resource));
+        assert!(opened().with_connection(None).is_none(), "a disconnected environment reads nothing");
+        let draft = Fetch::Local(bytes::Bytes::from_static(b"draft")).with_connection(None);
+        assert!(matches!(draft, Some(Fetch::Local(_))), "a draft's bytes need no socket");
     }
 }

@@ -888,13 +888,13 @@ impl Workspace {
             _ => {}
         }
         let can_send = self.owner_shown(&key.owner) && self.can_operate(&scope.environment);
-        let Some(client) = self.env_client(&scope.environment) else {
+        if self.env_client(&scope.environment).is_none() {
             self.finish_app_request(key, generation, ticket, Outcome::Failed("Request failed.".into()), cx);
             return;
-        };
+        }
         let key = key.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let outcome = run_request(&this, (&key, generation), &scope, &client, request, can_send, cx).await;
+            let outcome = run_request(&this, (&key, generation), &scope, request, can_send, cx).await;
             let _ = this.update(cx, |this, cx| this.finish_app_request(&key, generation, ticket, outcome, cx));
         })
         .detach();
@@ -1074,28 +1074,32 @@ fn flush(document: &mut Document, cx: &gpui_kit::App) {
     }
 }
 
-/// The work behind a request, on the environment that owns the app.
+/// The work behind a request, on the environment that owns the app. Its socket is looked up
+/// per call, as a reconnect while an approval or Save dialog is open replaces it.
 async fn run_request(
     this: &WeakEntity<Workspace>,
     key: (&AppKey, u64),
     scope: &Scope,
-    client: &crate::rpc::RpcClient,
     request: Request,
     can_send: bool,
     cx: &mut AsyncWindowContext,
 ) -> Outcome {
     let server = &scope.server;
-    let call = |method: &'static str, extra: Map<String, Value>| {
+    let live =
+        |cx: &mut AsyncWindowContext| this.read_with(cx, |this, _| this.env_client(&scope.environment)).ok().flatten();
+    let call = |client: Option<crate::rpc::RpcClient>, method: &'static str, extra: Map<String, Value>| {
         let mut payload = scope.target();
         payload.extend(extra);
-        let client = client.clone();
-        async move { client.request(method, Value::Object(payload)).await.map_err(|e| mcp_apps::failure_message(&e)) }
+        async move {
+            let client = client.ok_or_else(|| "Request failed.".to_owned())?;
+            client.request(method, Value::Object(payload)).await.map_err(|e| mcp_apps::failure_message(&e))
+        }
     };
     match request {
         Request::CallTool { name, arguments } => {
             let mut extra = Map::new();
             extra.insert("name".into(), name.clone().into());
-            let info = match call("mcpApps.toolInfo", extra).await {
+            let info = match call(live(cx), "mcpApps.toolInfo", extra).await {
                 Ok(info) => info,
                 Err(message) => return Outcome::Failed(message),
             };
@@ -1114,12 +1118,12 @@ async fn run_request(
             let mut extra = Map::new();
             extra.insert("name".into(), name.into());
             extra.insert("arguments".into(), Value::Object(arguments));
-            call("mcpApps.callTool", extra).await.map_or_else(Outcome::Failed, Outcome::Done)
+            call(live(cx), "mcpApps.callTool", extra).await.map_or_else(Outcome::Failed, Outcome::Done)
         }
         Request::ReadResource { uri } => {
             let mut extra = Map::new();
             extra.insert("uri".into(), uri.into());
-            call("mcpApps.readResource", extra).await.map_or_else(Outcome::Failed, Outcome::Done)
+            call(live(cx), "mcpApps.readResource", extra).await.map_or_else(Outcome::Failed, Outcome::Done)
         }
         Request::UpdateModelContext { content, structured } => {
             let mut extra = Map::new();
@@ -1130,7 +1134,7 @@ async fn run_request(
                 extra.insert("structuredContent".into(), structured);
             }
             extra.insert("conversationThreadId".into(), scope.conversation.clone().into());
-            call("mcpApps.updateModelContext", extra).await.map_or_else(Outcome::Failed, Outcome::Done)
+            call(live(cx), "mcpApps.updateModelContext", extra).await.map_or_else(Outcome::Failed, Outcome::Done)
         }
         Request::SendMessage { text } => {
             if !can_send {
@@ -1151,6 +1155,7 @@ async fn run_request(
                 "attachments": [],
                 "dispatchMode": {"type": "queue_after_active"},
             });
+            let Some(client) = live(cx) else { return Outcome::Failed("Could not send the app's message.".into()) };
             match client.request("orchestration.dispatchCommand", command).await {
                 Ok(_) => Outcome::Done(json!({})),
                 Err(error) => Outcome::Failed(match &error {
@@ -1175,7 +1180,7 @@ async fn run_request(
                     Download::Link { name, uri } => {
                         let mut extra = Map::new();
                         extra.insert("uri".into(), uri.into());
-                        let read = match call("mcpApps.readResource", extra).await {
+                        let read = match call(live(cx), "mcpApps.readResource", extra).await {
                             Ok(read) => read,
                             Err(message) => return Outcome::Failed(message),
                         };

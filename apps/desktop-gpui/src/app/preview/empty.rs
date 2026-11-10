@@ -660,17 +660,29 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(endpoint) = self.env_endpoint(&tab.thread.environment).cloned() else { return };
+        let environment = tab.thread.environment.clone();
+        if self.env_endpoint(&environment).is_none() {
+            return;
+        }
         let query = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("threadId", &tab.thread.thread_id)
             .append_pair("tabId", &tab.tab_id)
             .append_pair("id", &download.id)
             .finish();
-        let url = format!("{}/api/preview-stream/download?{query}", endpoint.http_base);
         let directory = std::env::home_dir().map(|home| home.join("Downloads")).unwrap_or_default();
         let picked = cx.prompt_for_new_path(&directory, Some(&download.file_name));
-        cx.spawn_in(window, async move |_, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(path))) = picked.await else { return };
+            // Read after the dialog: a reconnect while it was open can replace the address and token.
+            let endpoint = this.read_with(cx, |this, _| this.env_endpoint(&environment).cloned()).ok().flatten();
+            let Some(endpoint) = endpoint else {
+                let _ = cx.update(|window, cx| {
+                    let toast = Notification::error("Reconnect to the environment and try again.");
+                    window.push_notification(toast.title("Could not save file"), cx);
+                });
+                return;
+            };
+            let url = format!("{}/api/preview-stream/download?{query}", endpoint.http_base);
             let fetched = crate::runtime()
                 .spawn(async move {
                     let request = reqwest::Client::new().get(url).bearer_auth(endpoint.bearer_token);
