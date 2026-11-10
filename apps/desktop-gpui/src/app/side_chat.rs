@@ -4,7 +4,7 @@
 //! approvals and question card, and a plain-text composer; Bring back hands its last reply to
 //! the main thread's next message.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
@@ -86,8 +86,9 @@ pub(super) struct SideChats {
     pub(super) view: Option<SideChatView>,
     /// A side chat is being forked; another start waits for it (`pendingRef`).
     starting: bool,
-    bringing_back: bool,
-    deleting: bool,
+    /// Side chats being brought back or deleted, each pane's own (`bringingBack`, `deleting`).
+    bringing_back: HashSet<Key>,
+    deleting: HashSet<Key>,
     /// What side chats not on screen keep of their composer. Ids repeat across environments.
     drafts: HashMap<Key, SideDraft>,
     /// The parent composer's model pick for a side chat that started without a question; its
@@ -260,6 +261,11 @@ fn worktree_pending(worktree_path: Option<&str>, runs: &[Run]) -> bool {
 impl Workspace {
     pub(super) fn shell_thread(&self, thread_id: &str) -> Option<&ThreadShell> {
         self.shell.threads.iter().find(|t| t.id == thread_id)
+    }
+
+    /// A side chat's key: it lives on the open thread's environment.
+    fn side_key(&self, thread_id: &str) -> Option<Key> {
+        Some((self.active_environment()?.clone(), thread_id.to_owned()))
     }
 
     /// A side chat or its parent: on the open thread's environment, as thread ids repeat across them.
@@ -665,10 +671,10 @@ impl Workspace {
 
     fn bring_back(&mut self, parent_id: String, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
         let (Ok(run_id), Some(client)) = (self.bring_back_blocked(&parent_id), self.client()) else { return };
-        if self.side_chat.bringing_back {
+        let Some(key) = self.side_key(&thread_id) else { return };
+        if !self.side_chat.bringing_back.insert(key.clone()) {
             return;
         }
-        self.side_chat.bringing_back = true;
         let command = json!({
             "type": "thread.merge_back",
             "commandId": new_id(),
@@ -681,7 +687,7 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("orchestration.dispatchCommand", command).await;
             let _ = this.update_in(cx, |this, window, cx| {
-                this.side_chat.bringing_back = false;
+                this.side_chat.bringing_back.remove(&key);
                 let notification = match result {
                     Ok(_) => Notification::success("The main thread gets this side chat with your next message there.")
                         .title("Brought back"),
@@ -697,7 +703,8 @@ impl Workspace {
 
     fn delete_side_chat(&mut self, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(title) = self.side_shell(&thread_id).map(|t| t.title.clone()) else { return };
-        if self.side_chat.deleting || !self.side_chat_operable() {
+        let Some(key) = self.side_key(&thread_id) else { return };
+        if self.side_chat.deleting.contains(&key) || !self.side_chat_operable() {
             return;
         }
         let (Some(client), Some(origin)) = (self.client(), self.target.clone()) else { return };
@@ -715,13 +722,16 @@ This permanently clears its conversation history."
             {
                 return;
             }
-            let _ = this.update(cx, |this, cx| {
-                this.side_chat.deleting = true;
+            let started = this.update(cx, |this, cx| {
                 cx.notify();
+                this.side_chat.deleting.insert(key.clone())
             });
+            if !matches!(started, Ok(true)) {
+                return;
+            }
             let result = client.request("orchestration.dispatchCommand", delete_command(&thread_id, false)).await;
             let _ = this.update_in(cx, |this, window, cx| {
-                this.side_chat.deleting = false;
+                this.side_chat.deleting.remove(&key);
                 match result {
                     // Closing the tab keeps its unsent text, so the deleted chat's state goes after.
                     Ok(_) => {
@@ -758,7 +768,9 @@ This permanently clears its conversation history."
         let blocked = self.bring_back_blocked(&parent_id);
         let tooltip: SharedString =
             blocked.as_ref().err().copied().unwrap_or("Adds this side chat to the main thread's next message.").into();
-        let can_bring_back = blocked.is_ok() && !self.side_chat.bringing_back;
+        let key = self.side_key(thread_id);
+        let busy = |set: &HashSet<Key>| key.as_ref().is_some_and(|key| set.contains(key));
+        let can_bring_back = blocked.is_ok() && !busy(&self.side_chat.bringing_back);
         let (bring_parent, bring_thread, delete_thread, close_thread) =
             (parent_id.clone(), thread_id.to_owned(), thread_id.to_owned(), thread_id.to_owned());
         let header = h_flex()
@@ -790,7 +802,7 @@ This permanently clears its conversation history."
                     .ghost()
                     .xsmall()
                     .icon(icon("icons/trash-2.svg"))
-                    .disabled(shell.is_none() || self.side_chat.deleting || !self.side_chat_operable())
+                    .disabled(shell.is_none() || busy(&self.side_chat.deleting) || !self.side_chat_operable())
                     .tooltip("Delete side chat")
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.delete_side_chat(delete_thread.clone(), window, cx);
