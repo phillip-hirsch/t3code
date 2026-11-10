@@ -1474,9 +1474,14 @@ fn open_link_dialog(
     window.open_dialog(cx, move |d, _, cx| {
         let t = theme::tokens(cx);
         let title = dialog.read(cx).title(cx);
+        // The web keeps it open while linking, so the answer is never lost with the dialog.
+        let busy = dialog.read(cx).busy;
         d.entrance(DialogEntrance::None)
             .title(title)
             .w(px(448.))
+            .close_button(!busy)
+            .keyboard(!busy)
+            .overlay_closable(!busy)
             .child(
                 div()
                     .mb(px(16.))

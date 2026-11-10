@@ -14,7 +14,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use url::Url;
 
+use crate::environments::{Address, Route};
 use crate::rpc::{RpcClient, RpcError};
+use crate::ssh::SshTarget;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -57,6 +59,27 @@ pub fn connection_key(primary: bool, environment_id: &str, http_base: &str) -> O
     let tag = if primary { "PrimaryConnectionTarget" } else { "BearerConnectionTarget" };
     let href = |url: &Url| url.as_str().trim_end_matches('/').to_owned();
     Some(json!([tag, environment_id, href(&http), href(&ws)]).to_string())
+}
+
+/// [`connection_key`] for a saved environment over all its routes: one route keys alone, several
+/// as their sorted keys, so reordering keeps trust but adding or changing an address revokes it.
+pub fn saved_connection_key(environment_id: &str, routes: &[Route]) -> Option<String> {
+    let mut keys = routes.iter().map(|route| route_key(environment_id, route)).collect::<Option<Vec<_>>>()?;
+    if keys.len() == 1 {
+        return keys.pop();
+    }
+    // `Array.prototype.sort` orders by UTF-16 code units.
+    keys.sort_by(|a, b| a.encode_utf16().cmp(b.encode_utf16()));
+    Some(json!(keys).to_string())
+}
+
+fn route_key(environment_id: &str, route: &Route) -> Option<String> {
+    match &route.address {
+        Address::Direct(http_base) => connection_key(false, environment_id, http_base),
+        Address::Ssh(SshTarget { alias, hostname, username, port }) => {
+            Some(json!(["SshConnectionTarget", environment_id, alias, hostname, username, port]).to_string())
+        }
+    }
 }
 
 /// `pullRequestRoutingPermissionFor`.
@@ -683,6 +706,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::environments::Credential;
 
     #[test]
     fn grants_follow_the_saved_endpoint() {
@@ -706,6 +730,29 @@ mod tests {
         assert_eq!(stored.len(), 1, "one grant per environment");
         set(&mut stored, "env", key, Permission::Off);
         assert!(stored.is_empty(), "off forgets the grant");
+    }
+
+    #[test]
+    fn saved_environments_are_trusted_over_every_saved_route() {
+        let (credential, target) = (Credential::Missing, SshTarget::alias("box"));
+        let ssh = Route { address: Address::Ssh(SshTarget { username: Some("me".into()), ..target }), credential };
+        let lan = Route::direct("http://192.168.1.10:3773".into(), Credential::Missing);
+        let tailnet = Route::direct("https://box.ts.net".into(), Credential::Missing);
+        let ssh_key = r#"["SshConnectionTarget","env","box","box","me",null]"#;
+        assert_eq!(saved_connection_key("env", std::slice::from_ref(&ssh)).as_deref(), Some(ssh_key));
+        assert_eq!(
+            saved_connection_key("env", std::slice::from_ref(&lan)),
+            connection_key(false, "env", "http://192.168.1.10:3773"),
+            "one route keys as itself"
+        );
+        let both = saved_connection_key("env", &[lan.clone(), ssh.clone()]).unwrap();
+        let lan_key = connection_key(false, "env", "http://192.168.1.10:3773").unwrap();
+        assert_eq!(both, json!([lan_key, ssh_key]).to_string(), "sorted keys of every route");
+        assert_eq!(saved_connection_key("env", &[ssh.clone(), lan.clone()]).unwrap(), both, "reordering keeps trust");
+        let grown = saved_connection_key("env", &[tailnet, lan, ssh.clone()]).unwrap();
+        assert_ne!(grown, both, "adding a route revokes trust");
+        let unkeyable = Route::direct("ftp://box".into(), Credential::Missing);
+        assert_eq!(saved_connection_key("env", &[unkeyable, ssh]), None, "every route must key");
     }
 
     #[test]

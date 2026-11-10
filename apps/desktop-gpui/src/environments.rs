@@ -582,14 +582,6 @@ impl Route {
         }
     }
 
-    /// The bearer session this route's token opens at `http_base`.
-    pub fn endpoint(&self, http_base: &str) -> Option<Endpoint> {
-        match &self.credential {
-            Credential::Token(token) => Some(Endpoint::bearer(http_base, token.clone())),
-            Credential::Missing | Credential::Locked { .. } => None,
-        }
-    }
-
     fn hostname(&self) -> Option<String> {
         let url = Url::parse(self.http_base()?).ok()?;
         Some(normalize_hostname(url.host_str()?))
@@ -1243,20 +1235,63 @@ pub async fn resolve_workspace_endpoint() -> anyhow::Result<(Endpoint, Option<Lo
             anyhow::anyhow!("Saved environments could not be read: {error}")
         })?;
         if !catalog.local_environment_enabled {
-            let endpoint = catalog
-                .environments
-                .iter()
-                .filter(|environment| environment.enabled)
-                .flat_map(|environment| &environment.routes)
-                .find_map(|route| route.endpoint(route.http_base()?));
-            let endpoint = endpoint.ok_or(backend::Unrecoverable(
-                "The local environment is off. Turn it on in Settings › Environments, or add an environment there."
-                    .into(),
-            ))?;
-            return Ok((endpoint, None));
+            return Ok((remote_workspace_endpoint(&catalog).await?, None));
         }
     }
     backend::resolve_endpoint().await
+}
+
+/// The routes the workspace may start through while the local environment is off: every
+/// enabled environment's signed-in routes, in saved order.
+fn remote_workspace_routes(catalog: &Catalog) -> Vec<(&str, &Address, &str)> {
+    let enabled = catalog.environments.iter().filter(|environment| environment.enabled);
+    enabled
+        .flat_map(|environment| {
+            environment.routes.iter().filter_map(|route| match &route.credential {
+                Credential::Token(token) => Some((environment.environment_id.as_str(), &route.address, token.as_str())),
+                Credential::Missing | Credential::Locked { .. } => None,
+            })
+        })
+        .collect()
+}
+
+/// The first of [`remote_workspace_routes`] that answers; an SSH route starts its forward first.
+async fn remote_workspace_endpoint(catalog: &Catalog) -> anyhow::Result<Endpoint> {
+    let mut unreachable = None;
+    for (environment_id, address, token) in remote_workspace_routes(catalog) {
+        let http_base = match address {
+            Address::Direct(http_base) => http_base.clone(),
+            Address::Ssh(target) => match ssh_workspace_base(environment_id, target).await {
+                Ok(http_base) => http_base,
+                Err(error) => {
+                    log::warn!("could not start through {}: {error}", target.alias);
+                    unreachable = Some(error);
+                    continue;
+                }
+            },
+        };
+        return Ok(Endpoint::bearer(&http_base, token.to_owned()));
+    }
+    match unreachable {
+        // Retried: the host may answer on the next attempt.
+        Some(error) => Err(anyhow::anyhow!(error)),
+        None => Err(backend::Unrecoverable(
+            "The local environment is off. Turn it on in Settings › Environments, or add an environment there.".into(),
+        )
+        .into()),
+    }
+}
+
+/// `prepareDesktopSshEnvironment` with the saved token: the forward to `target`, once it
+/// answers as `environment_id`.
+async fn ssh_workspace_base(environment_id: &str, target: &SshTarget) -> Result<String, String> {
+    let bootstrap = crate::ssh::ensure(target, false).await.map_err(|error| error.message)?;
+    // Identity first, before the saved token is sent anywhere.
+    let descriptor = fetch_descriptor(&bootstrap.http_base).await.map_err(|failure| failure.detail)?;
+    if descriptor.environment_id != environment_id {
+        return Err(different_machine(&descriptor.label, "host"));
+    }
+    Ok(bootstrap.http_base)
 }
 
 /// The workspace's environment for the whole app run, started once and shared by every
@@ -1920,7 +1955,7 @@ mod tests {
         let expected = Credential::Locked { stored: stored.as_str().unwrap().into(), error };
         assert_eq!(*credential(&locked.environments[0]), expected);
         assert_eq!(*credential(&locked.environments[1]), Credential::Missing);
-        assert!(locked.environments[0].routes[0].endpoint("https://a").is_none());
+        assert!(remote_workspace_routes(&locked).is_empty(), "a locked token opens no session");
 
         // Rename it, switch it off and pair another environment, then save.
         locked.environments[0].label = "Renamed".into();
@@ -2118,6 +2153,26 @@ mod tests {
 
     fn addresses(environment: &SavedEnvironment) -> Vec<String> {
         environment.routes.iter().map(Route::address_text).collect()
+    }
+
+    #[test]
+    fn with_the_local_environment_off_the_workspace_starts_through_any_signed_in_route() {
+        let mut ssh_only = saved("s", Credential::Missing);
+        ssh_only.routes = vec![ssh_route("box", Credential::Token("token-s".into()))];
+        let off = SavedEnvironment { enabled: false, ..saved("off", Credential::Token("token-off".into())) };
+        let catalog = Catalog {
+            local_environment_enabled: false,
+            environments: vec![off, saved("signed-out", Credential::Missing), ssh_only],
+            ..Catalog::default()
+        };
+        let routes = remote_workspace_routes(&catalog);
+        let ssh = Address::Ssh(SshTarget {
+            alias: "box".into(),
+            hostname: "box.lan".into(),
+            username: Some("me".into()),
+            port: None,
+        });
+        assert_eq!(routes, [("s", &ssh, "token-s")], "an SSH-only environment is a way in");
     }
 
     #[test]
