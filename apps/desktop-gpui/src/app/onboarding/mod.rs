@@ -126,7 +126,7 @@ impl Workspace {
             enabled,
             hydrated,
             completed,
-            bootstrapped: self.shells_bootstrapped(),
+            bootstrapped: self.shells_bootstrapped(cx),
             authoritative: primary.is_some_and(live),
             workspace_authoritative: projects
                 .iter()
