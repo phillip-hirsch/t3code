@@ -320,6 +320,7 @@ impl Workspace {
                     let ((width, height), scale) = preview::fit_viewport(
                         (source.width as f32, source.height as f32),
                         (frame.width as f32, frame.height as f32),
+                        1.,
                     );
                     self.preview.mini_view = Some((tab.clone(), scale));
                     div()

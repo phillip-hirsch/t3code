@@ -1326,7 +1326,9 @@ impl Workspace {
         } else {
             available
         };
-        let fixed = setting.size().map(|size| preview::fit_viewport(size, area));
+        // The page draws at its zoom over the interface's (`resolveBrowserLayoutZoomFactor`).
+        let zoom = session.as_ref().map_or(1., |s| self.tab_look(tab, s).0) / f64::from(window.ui_scale());
+        let fixed = setting.size().map(|size| preview::fit_viewport(size, area, zoom));
         let separated = self.separated(tab);
         // A separated tab counts as shown, so a pick in it lasts; its window draws the page.
         self.preview.panel_view = Some((tab.clone(), fixed.map_or(1., |(_, scale)| scale)));

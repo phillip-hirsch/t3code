@@ -186,11 +186,14 @@ pub const PRESETS: [Preset; 17] = [
     preset("nest-hub-max", "Nest Hub Max", 1280, 800),
 ];
 
-/// A fixed viewport shrunk to fit `available`, never enlarged: its on-screen size and the scale,
-/// which the page zoom also takes so the page still lays out at the viewport's CSS width.
+/// A fixed viewport drawn at `zoom` (`resolveBrowserViewportLayout`), shrunk to fit `available`,
+/// never enlarged: its on-screen size and the scale, which the page zoom also takes so the page
+/// still lays out at the viewport's CSS width.
 /// The server's size is outside data: an empty one counts as 1px, so the scale is never NaN.
-pub fn fit_viewport(viewport: (f32, f32), available: (f32, f32)) -> ((f32, f32), f32) {
-    let (width, height) = (viewport.0.max(1.), viewport.1.max(1.));
+pub fn fit_viewport(viewport: (f32, f32), available: (f32, f32), zoom: f64) -> ((f32, f32), f32) {
+    #[expect(clippy::cast_possible_truncation, reason = "zoom factors fit f32")]
+    let zoom = if zoom.is_finite() && zoom > 0. { zoom as f32 } else { 1. };
+    let (width, height) = (viewport.0.max(1.) * zoom, viewport.1.max(1.) * zoom);
     let scale = (available.0 / width).min(available.1 / height);
     let scale = if scale.is_finite() { scale.clamp(0.05, 1.) } else { 1. };
     ((width * scale, height * scale), scale)
@@ -1487,10 +1490,18 @@ mod tests {
 
     #[test]
     fn fits_fixed_viewports_without_enlarging_them() {
-        assert_eq!(fit_viewport((375., 667.), (500., 900.)), ((375., 667.), 1.));
-        assert_eq!(fit_viewport((820., 1180.), (410., 1180.)), ((410., 590.), 0.5));
-        assert_eq!(fit_viewport((0., 0.), (0., 0.)), ((0.05, 0.05), 0.05), "an empty viewport never makes a NaN size");
-        assert_eq!(fit_viewport((375., 667.), (f32::NAN, f32::NAN)), ((375., 667.), 1.));
+        assert_eq!(fit_viewport((375., 667.), (500., 900.), 1.), ((375., 667.), 1.));
+        assert_eq!(fit_viewport((820., 1180.), (410., 1180.), 1.), ((410., 590.), 0.5));
+        assert_eq!(
+            fit_viewport((0., 0.), (0., 0.), 1.),
+            ((0.05, 0.05), 0.05),
+            "an empty viewport never makes a NaN size"
+        );
+        assert_eq!(fit_viewport((375., 667.), (f32::NAN, f32::NAN), 1.), ((375., 667.), 1.));
+        // At 200% a 390x844 viewport draws 780x1688, so the page still lays out 390 CSS px wide.
+        assert_eq!(fit_viewport((390., 844.), (2000., 2000.), 2.), ((780., 1688.), 1.));
+        assert_eq!(fit_viewport((390., 844.), (390., 2000.), 2.), ((390., 844.), 0.5));
+        assert_eq!(fit_viewport((390., 844.), (2000., 2000.), f64::NAN), ((390., 844.), 1.), "a bad zoom is 1");
     }
 
     #[test]
