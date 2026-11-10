@@ -423,8 +423,8 @@ macro_rules! token_api {
                     this.replace_text_in_ranges_selecting(edits, Some(select), window, cx);
                 });
             }
-            /// Swap the tokens of the unchanged text outside the undo history, keeping the
-            /// selection unless a new token now covers part of it.
+            /// Swap the tokens of the unchanged text outside the undo history, keeping every
+            /// selection and its direction; one a new token covers part of widens over it.
             pub fn retokenize(
                 &mut self,
                 content: InputContent,
@@ -439,9 +439,22 @@ macro_rules! token_api {
                 }
                 self.install_tokens(content);
                 self.document_revision = self.document_revision.wrapping_add(1);
-                let selected = self.selected_range();
-                if self.normalize_token_range(selected.clone()) != selected {
-                    self.set_selected_range(selected, cx);
+                let selections: Vec<_> = self
+                    .selections
+                    .iter()
+                    .map(|selection| {
+                        let range = self.normalize_token_range(selection.start..selection.end);
+                        let mut next = *selection;
+                        if range != (selection.start..selection.end) {
+                            (next.start, next.end, next.column_anchor) = (range.start, range.end, None);
+                        }
+                        next
+                    })
+                    .collect();
+                if selections.iter().ne(self.selections.iter()) {
+                    self.selected_word_range = None;
+                    self.selections.replace_all(selections);
+                    self.selections.merge_overlapping();
                 }
                 cx.notify();
                 Ok(())

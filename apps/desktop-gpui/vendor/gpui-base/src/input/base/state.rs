@@ -12082,6 +12082,19 @@ mod tests {
                 state.undo(&Undo, window, cx);
                 assert_eq!(state.value(), "say hi");
                 assert_eq!(state.tokens()[0].range(), 0..3);
+
+                // Every cursor is normalized, each keeping its direction.
+                state.set_value("say hi you", window, cx);
+                state.set_selected_range_with_direction(1..5, true, cx);
+                state.add_selection(8..8, cx);
+                let content = InputContent::new("say hi you")
+                    .with_token(0..3, InlineToken::new("t", "say"))
+                    .and_then(|content| content.with_token(7..10, InlineToken::new("u", "you")))
+                    .unwrap();
+                state.retokenize(content, cx).unwrap();
+                assert!(state.is_selection_reversed());
+                let ranges: Vec<_> = state.selections.iter().map(|s| s.start..s.end).collect();
+                assert_eq!(ranges, [0..5, 10..10]);
             });
         });
     }
