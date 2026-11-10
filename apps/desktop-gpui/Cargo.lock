@@ -8462,6 +8462,7 @@ dependencies = [
  "futures",
  "getrandom 0.3.4",
  "global-hotkey",
+ "gpui-base",
  "gpui-kit",
  "gpui-pre-windows",
  "gpui-webview",

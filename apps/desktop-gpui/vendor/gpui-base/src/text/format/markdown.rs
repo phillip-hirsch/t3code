@@ -46,7 +46,7 @@ fn flatten_unclaimed_math(node: &mut Node, source: &str, options: &ParseOptions,
     while ix < children.len() {
         let prose = match &children[ix] {
             Node::InlineMath(_) => {
-                let parse_cx = MarkdownParseContext::new(source, cx.offset);
+                let parse_cx = MarkdownParseContext::new(source, cx.offset, &cx.link_refs);
                 if cx
                     .markdown_extensions
                     .parse_inline(&children[ix], &parse_cx)
@@ -793,7 +793,9 @@ fn parse_paragraph(
         paragraph.set_span(span);
     }
 
-    let parse_cx = MarkdownParseContext::new(source, cx.offset);
+    // The source slice, without holding the definitions the parse context borrows.
+    let node_source = |node: &Node| node.position().and_then(|p| source.get(p.start.offset..p.end.offset));
+    let parse_cx = MarkdownParseContext::new(source, cx.offset, &cx.link_refs);
     if let Some(mut custom) = cx.markdown_extensions.parse_inline(node, &parse_cx) {
         if custom.leading
             && let Node::Link(link) = node
@@ -816,7 +818,7 @@ fn parse_paragraph(
             label.covered = true;
         }
         custom.set_span(span);
-        let custom = custom.with_inline_source(parse_cx.node_source(node).unwrap_or_default());
+        let custom = custom.with_inline_source(node_source(node).unwrap_or_default());
         text.push_str(custom.as_text());
         paragraph.push(InlineNode::custom(custom));
         return text;
@@ -925,8 +927,7 @@ fn parse_paragraph(
             // `raw.value` would drop the delimiters and restyle the run as
             // code, silently rewriting what the author typed. Fall back to the
             // original source so unclaimed math stays literal.
-            text = parse_cx
-                .node_source(node)
+            text = node_source(node)
                 .map(str::to_string)
                 .unwrap_or_else(|| raw.value.clone());
             paragraph.push(mapped_inline(source, text.clone(), node, cx));
@@ -1070,7 +1071,7 @@ fn new_span(pos: Option<markdown::unist::Position>, cx: &NodeContext) -> Option<
 
 fn ast_to_node(source: &str, value: mdast::Node, cx: &mut NodeContext) -> BlockNode {
     let span = new_span(value.position().cloned(), cx);
-    let parse_cx = MarkdownParseContext::new(source, cx.offset);
+    let parse_cx = MarkdownParseContext::new(source, cx.offset, &cx.link_refs);
     if let Some(mut node) = cx.markdown_extensions.parse_block(&value, &parse_cx) {
         node.set_span(span);
         return BlockNode::Custom {

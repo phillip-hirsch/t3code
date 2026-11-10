@@ -338,14 +338,19 @@ impl MarkdownPlugin for MarkdownMedia {
     fn parse(
         &self,
         node: &gpui_kit::component::text::markdown_ast::Node,
-        _: &MarkdownParseContext<'_>,
+        cx: &MarkdownParseContext<'_>,
     ) -> Option<MarkdownNode> {
-        let gpui_kit::component::text::markdown_ast::Node::Image(image) = node else { return None };
-        let kind = media_kind(&image.url)?;
-        let alt = image.alt.clone();
+        use gpui_kit::component::text::markdown_ast::Node;
+        let (url, alt) = match node {
+            Node::Image(image) => (image.url.as_str(), image.alt.clone()),
+            // `![clip][v]` plays its definition's destination, as the web's resolved `<img>` does.
+            Node::ImageReference(image) => (cx.definition(&image.identifier)?, image.alt.clone()),
+            _ => return None,
+        };
+        let kind = media_kind(url)?;
         // `markdownImageCopy`.
-        let copy = format!("![{}]({})", alt.replace('\\', "\\\\").replace('[', "\\[").replace(']', "\\]"), image.url);
-        let media = MediaNode { kind, destination: image.url.clone(), alt: alt.clone() };
+        let copy = format!("![{}]({url})", alt.replace('\\', "\\\\").replace('[', "\\[").replace(']', "\\]"));
+        let media = MediaNode { kind, destination: url.to_owned(), alt: alt.clone() };
         Some(MarkdownNode::new("t3-media", media).text(alt).markdown(copy))
     }
 
@@ -929,6 +934,24 @@ mod tests {
         ] {
             assert_eq!(media_kind(destination), kind, "{destination}");
         }
+    }
+
+    #[test]
+    fn media_image_references_play_their_definitions() {
+        use gpui_base::text::editor_host::{BlockNode, parse_markdown};
+        use gpui_kit::component::text::MarkdownExtensions;
+        let plugin = MarkdownMedia { workspace: WeakEntity::new_invalid(), key: "m".into(), background: Hsla::default() };
+        let extensions = std::sync::Arc::new(MarkdownExtensions::default().plugin(plugin));
+        let source = "![clip][V] ![shot][p]\n\n[v]: https://example.com/clip.mp4\n[p]: shot.png";
+        let blocks = parse_markdown(source, extensions).unwrap();
+        let BlockNode::Paragraph(paragraph) = &blocks[0] else { panic!("a paragraph") };
+        let media: Vec<_> = paragraph
+            .children()
+            .iter()
+            .filter_map(|node| node.as_custom()?.data::<MediaNode>())
+            .map(|media| (media.kind, media.destination.as_str(), media.alt.as_str()))
+            .collect();
+        assert_eq!(media, [(MediaKind::Video, "https://example.com/clip.mp4", "clip")]);
     }
 
     #[test]
