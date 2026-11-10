@@ -133,20 +133,25 @@ impl Workspace {
     ) -> AnyElement {
         let preference = load_balancing::preference_for_weight(weights.get(&machine.id).and_then(Value::as_f64));
         let trigger_id = SharedString::from(format!("load-preference-{}", machine.id));
-        let view = cx.entity();
-        let (id, current) = (machine.id.clone(), weights.as_object().cloned().unwrap_or_default());
+        let (view, id) = (cx.entity(), machine.id.clone());
         let trigger = select_trigger(&trigger_id, load_balancing::preference_label(preference), 128., t)
             .min_w(px(ROW_SELECT_MIN_WIDTH))
             .when(!enabled, |button| button.opacity(0.5))
             .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |mut menu, _, _| {
                 for (value, label) in PREFERENCES {
-                    let (view, id, current) = (view.clone(), id.clone(), current.clone());
+                    let (view, id) = (view.clone(), id.clone());
                     menu =
                         menu.item(PopupMenuItem::new(label).checked(value == preference).disabled(!enabled).on_click(
                             move |_, window, cx| {
-                                let mut weights: Map<String, Value> = current.clone();
-                                weights.insert(id.clone(), value.into());
                                 view.update(cx, |this, cx| {
+                                    // The menu can outlive a change to the switch or another weight.
+                                    let values = &this.client_settings.values;
+                                    if !values.bool("loadBalancingEnabled") {
+                                        return;
+                                    }
+                                    let mut weights: Map<String, Value> =
+                                        values.get("loadBalancingWeights").as_object().cloned().unwrap_or_default();
+                                    weights.insert(id.clone(), value.into());
                                     this.update_settings(json!({"loadBalancingWeights": weights}), window, cx);
                                 });
                             },

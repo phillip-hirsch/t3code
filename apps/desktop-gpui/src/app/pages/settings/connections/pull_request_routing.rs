@@ -182,11 +182,13 @@ impl Workspace {
             .disabled(disabled)
             .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |mut menu, _, _| {
                 for (value, label) in PERMISSIONS {
-                    let (view, id, key) = (view.clone(), id.clone(), key.clone());
+                    let (view, id) = (view.clone(), id.clone());
                     menu = menu.item(PopupMenuItem::new(label).checked(value == permission).on_click(
                         move |_, window, cx| {
-                            let Some(key) = key.clone() else { return };
                             view.update(cx, |this, cx| {
+                                // The machine's route now: the menu can outlive a reconnect.
+                                let machine = this.routing_machines(cx).into_iter().find(|m| m.id == id);
+                                let Some(key) = machine.and_then(|m| m.connection_key()) else { return };
                                 this.set_pull_request_routing(id.clone(), key, value, window, cx);
                             });
                         },
