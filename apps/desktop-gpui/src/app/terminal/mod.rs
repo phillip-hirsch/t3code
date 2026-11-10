@@ -410,6 +410,7 @@ impl Workspace {
                 pane.session.update(cx, |session, cx| session.attach(client.clone(), cx));
             }
         }
+        self.reattach_setup_terminal(&environment, client, cx);
         task
     }
 

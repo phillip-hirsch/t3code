@@ -2,8 +2,11 @@
 //! until it can tell a fresh workspace from one in use, then opens the Welcome page or lands
 //! in the app. Finishing setup records `onboardingCompletedAt` in this device's settings.
 
+mod agents;
 mod first_run;
 mod welcome;
+
+pub(in crate::app) use self::welcome::{AgentState, agent_name, onboarding_state};
 
 use std::time::Duration;
 
@@ -34,11 +37,17 @@ pub(super) struct Onboarding {
     /// The primary server's last `welcome` lifecycle event.
     welcome: Option<Welcome>,
     _timeout: Option<Task<()>>,
+    agents: agents::AgentsStage,
 }
 
 impl Onboarding {
     pub(super) fn new(settings: &crate::settings::ClientSettings) -> Self {
-        Self { gate: GateState::initial(completed(settings)), welcome: None, _timeout: None }
+        Self {
+            gate: GateState::initial(completed(settings)),
+            welcome: None,
+            _timeout: None,
+            agents: agents::AgentsStage::default(),
+        }
     }
 
     /// The launch can't yet tell whether to open setup or the app.
@@ -281,8 +290,11 @@ impl Workspace {
                     })
                     .child(if agent_ready { start_button.on_click(cx.listener(start)) } else { start_button }),
             );
-        // `pt-12 sm:pt-20`.
-        let top = if window.viewport_size().width >= px(640.) { 80. } else { 48. };
+        // `pt-12 sm:pt-20`, and the bands' `sm:` grid.
+        let wide = window.viewport_size().width >= px(640.);
+        let top = if wide { 80. } else { 48. };
+        let primary = self.primary_environment().cloned();
+        let agents = primary.map(|environment| self.render_agents(environment, &label, wide, window, cx));
         div()
             .id("welcome-scroll")
             .size_full()
@@ -317,8 +329,8 @@ impl Workspace {
                             .child(div().text_color(t.foreground).child(label))
                             .child("."),
                     )
-                    // The page's sections (agents, projects, phone) are bands under this rule.
-                    .child(div().mt(px(40.)).border_t_1().border_color(t.border.opacity(0.6)))
+                    // The page's sections are bands under this rule.
+                    .child(div().mt(px(40.)).border_t_1().border_color(t.border.opacity(0.6)).children(agents))
                     .child(footer)
                     .child(telemetry_notice(&notice, &t)),
             )

@@ -307,6 +307,21 @@ impl TerminalSession {
         session
     }
 
+    /// A shell outside any thread's drawer (agent setup): attached, without Add to chat.
+    pub fn standalone(
+        thread_id: String,
+        terminal_id: String,
+        launch: Launch,
+        client: RpcClient,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut session = Self::unattached(thread_id, terminal_id, launch, false, window, cx);
+        session.chat = false;
+        session.attach(client, cx);
+        session
+    }
+
     /// A surface its owner feeds with [`Self::write`] and [`Self::reset_and_write`]; typed input
     /// and the grid's size come back as events (`GhosttyTerminalSurface`'s `onData` / `onResize`).
     pub fn sink(id: String, window: &mut Window, cx: &mut Context<Self>) -> Self {
