@@ -1211,7 +1211,7 @@ mod tests {
             let viewers = HashMap::from([("github.com".to_owned(), format!("{environment}-login"))]);
             let next_cursors = cursors.as_object().cloned().unwrap_or_default();
             let entries = vec![entry(number, json!({}))];
-            (environment.to_owned(), ListResult { entries, viewers, next_cursors, ..Default::default() })
+            (environment.to_owned(), ListResult { viewers, entries, next_cursors, ..Default::default() })
         };
         let held = merge_lists(vec![answer("a", 1, json!({})), answer("b", 2, json!({"github.com": "c2"}))]);
         let merged = merge_lists(vec![answer("a", 3, json!({})), ("b".into(), held_answer(&held, "b"))]);
