@@ -100,7 +100,7 @@ impl FaviconPicker {
             }),
             cx.observe(&images, |_, _, cx| cx.notify()),
         ];
-        let mut picker = Self {
+        let picker = Self {
             cwd,
             project_name,
             workspace,
@@ -118,7 +118,8 @@ impl FaviconPicker {
             on_pick,
             _subscriptions: subscriptions,
         };
-        picker.search(cx);
+        // Deferred: the picker is built inside a Workspace update, and the search reads Workspace.
+        cx.defer_in(window, |this, _, cx| this.search(cx));
         picker
     }
 
