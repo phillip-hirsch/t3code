@@ -106,8 +106,13 @@ impl Workspace {
             return false;
         }
         let in_browser = self.preview_thread();
-        let thread_link = in_browser.as_ref().and_then(|open| {
-            let key = crate::model::ScopedId::new(open.environment.clone(), open.thread_id.as_str());
+        // The pane's own thread, as the web's markdown links its `threadRef`.
+        let link_thread = match pane {
+            Some(pane) => self.pane_thread(pane),
+            None => in_browser.as_ref().map(|open| (open.environment.clone(), open.thread_id.clone())),
+        };
+        let thread_link = link_thread.and_then(|(env, id)| {
+            let key = crate::model::ScopedId::new(env, id);
             let thread = self.shell.thread(&key)?;
             let env = &thread.environment_id;
             let supported =
