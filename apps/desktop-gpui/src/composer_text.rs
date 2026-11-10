@@ -192,25 +192,78 @@ pub fn context_link(kind: &str, id: &str, label: &str) -> String {
 
 const CONTEXT_PREFIX: &str = "t3-context://v1/";
 
+/// JavaScript's `\s` and `trimEnd` whitespace (Rust's adds U+0085 and lacks U+FEFF).
+fn is_js_space(c: char) -> bool {
+    matches!(
+        c,
+        '\t' | '\n' | '\u{b}' | '\u{c}' | '\r' | ' ' | '\u{a0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}'
+    )
+}
+
+/// The context links in `text` as the web's `collectComposerContextReferences` finds them: the
+/// `CONTEXT_LINK` pattern `(!?)\[([^\]\n]{0,512})\]\((t3-context://v1/[^\s)]{1,200})\)`, left to
+/// right without overlap, each with its chip id when the href parses (`parseComposerContextHref`).
+/// A match whose href does not parse is still consumed, as `matchAll` does.
+fn context_links(text: &str) -> Vec<(Range<usize>, Option<String>)> {
+    let mut links = Vec::new();
+    if !text.contains("](t3-context:") {
+        return links;
+    }
+    let mut at = 0;
+    while let Some(open) = text[at..].find('[') {
+        let bracket = at + open;
+        // `!?` takes a `!` right before the `[`; with or without it the rest must match.
+        let start = if bracket > at && text[..bracket].ends_with('!') { bracket - 1 } else { bracket };
+        match context_link_at(text, bracket) {
+            Some((end, id)) => {
+                links.push((start..end, id));
+                at = end;
+            }
+            None => at = bracket + 1,
+        }
+    }
+    links
+}
+
+/// The end of a context link whose `[` is at `bracket`, and its chip id if the href parses.
+fn context_link_at(text: &str, bracket: usize) -> Option<(usize, Option<String>)> {
+    let rest = text[bracket..].strip_prefix('[')?;
+    let close = rest.find([']', '\n'])?;
+    if !rest[close..].starts_with(']') || rest[..close].encode_utf16().count() > 512 {
+        return None;
+    }
+    let target = rest[close + 1..].strip_prefix('(')?;
+    let href_len = target.find(|c: char| c == ')' || is_js_space(c)).unwrap_or(target.len());
+    if !target[href_len..].starts_with(')') {
+        return None;
+    }
+    let body = target[..href_len].strip_prefix(CONTEXT_PREFIX)?;
+    if !(1..=200).contains(&body.encode_utf16().count()) {
+        return None;
+    }
+    let end = bracket + 1 + close + 1 + 1 + href_len + 1;
+    let kind_ok = |k: &str| {
+        k.len() <= 40
+            && k.starts_with(|c: char| c.is_ascii_lowercase())
+            && k.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    };
+    let id_ok =
+        |i: &str| (1..=128).contains(&i.len()) && i.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    let id = body
+        .split_once('/')
+        .filter(|(kind, id)| kind_ok(kind) && id_ok(id))
+        .map(|(kind, id)| Chip::Context { kind: kind.to_owned(), id: id.to_owned(), label: String::new() }.id());
+    Some((end, id))
+}
+
 /// `collectInlineContextIds`: the chip id of each context link anywhere in `text`, once, chip or
 /// not (fenced code included).
 pub fn context_reference_ids(text: &str) -> Vec<String> {
     let mut ids: Vec<String> = Vec::new();
-    if !text.contains(CONTEXT_PREFIX) {
-        return ids;
-    }
-    let mut at = 0;
-    while let Some(open) = text[at..].find('[') {
-        let start = at + open;
-        match parse_context_link(&text[start..]).filter(|(_, chip)| !chip.label().contains('\n')) {
-            Some((len, chip)) => {
-                let id = chip.id();
-                if !ids.contains(&id) {
-                    ids.push(id);
-                }
-                at = start + len;
-            }
-            None => at = start + 1,
+    for id in context_links(text).into_iter().filter_map(|(_, id)| id) {
+        if !ids.contains(&id) {
+            ids.push(id);
         }
     }
     ids
@@ -221,29 +274,11 @@ pub fn context_reference_ids(text: &str) -> Vec<String> {
 /// the text as it shrinks: each takes the space after it, else the one before it, and when the
 /// removals end at the end of the text, trailing whitespace goes too.
 pub fn context_reference_removals(text: &str, id: &str) -> Vec<Range<usize>> {
-    let mut found: Vec<Range<usize>> = Vec::new();
-    if !text.contains(CONTEXT_PREFIX) {
-        return found;
-    }
-    let mut at = 0;
-    while let Some(open) = text[at..].find('[') {
-        let bracket = at + open;
-        // An image reference is `![…](…)`: its `!` belongs to it.
-        let bang = (bracket > at && text[..bracket].ends_with('!')).then(|| bracket - 1);
-        let (start, parsed) = match bang.and_then(|s| parse_context_link(&text[s..]).map(|p| (s, p))) {
-            Some((s, p)) => (s, Some(p)),
-            None => (bracket, parse_context_link(&text[bracket..])),
-        };
-        match parsed.filter(|(_, chip)| !chip.label().contains('\n')) {
-            Some((len, chip)) => {
-                if chip.id() == id {
-                    found.push(start..start + len);
-                }
-                at = start + len;
-            }
-            None => at = bracket + 1,
-        }
-    }
+    let found: Vec<Range<usize>> = context_links(text)
+        .into_iter()
+        .filter(|(_, link)| link.as_deref() == Some(id))
+        .map(|(range, _)| range)
+        .collect();
     let mut result = text.to_owned();
     let mut cursor = result.len();
     let mut removals = Vec::with_capacity(found.len() + 1);
@@ -258,7 +293,7 @@ pub fn context_reference_removals(text: &str, id: &str) -> Vec<Range<usize>> {
         cursor = start;
     }
     if !removals.is_empty() && cursor >= result.len() {
-        let trimmed = result.trim_end().len();
+        let trimmed = result.trim_end_matches(is_js_space).len();
         if trimmed < result.len() {
             removals.push(trimmed..result.len());
         }
@@ -892,6 +927,11 @@ mod tests {
         assert_eq!(remove(&format!("x {link}"), image), "x", "the space before it when none follows");
         assert_eq!(remove(&format!("x  {link}"), image), "x", "ending the text trims what trails");
         assert_eq!(remove(&format!("{link} x  "), image), "x  ", "but only then");
+        // The web's pattern: a label ends at the first `]` (no Markdown escapes) and holds no
+        // newline, and an href needs a lowercase kind and a valid id.
+        assert_eq!(remove(&format!("KEEP ![literal\\]{link}"), image), "KEEP ![literal\\]", "only the link");
+        assert!(context_reference_ids("[x](t3-context://v1/Image/img_1)").is_empty(), "kind is lowercase");
+        assert_eq!(remove(&format!("x\u{feff} {link}"), image), "x", "JavaScript's trimEnd set");
         assert!(context_reference_removals(&format!("a {link}"), "context:image/other").is_empty());
         let (stale, fresh) = remount_chips(&fenced, false, &[], skill, codex_model);
         assert_eq!((stale, fresh.len()), (vec![], 2), "skills and models too");
