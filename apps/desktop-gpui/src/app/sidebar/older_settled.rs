@@ -24,8 +24,9 @@ pub(super) struct Shelf {
     pages: HashMap<SharedString, Pages>,
     /// The page read in flight per environment; replacing or dropping it cancels the read.
     reads: HashMap<SharedString, Task<()>>,
-    /// The count read waiting or in flight per environment, with the key it reads for.
-    counts: HashMap<SharedString, (u64, Task<()>)>,
+    /// The count read waiting, in flight or failed per environment, with the key and socket it
+    /// read on.
+    counts: HashMap<SharedString, (u64, crate::rpc::SocketId, Task<()>)>,
 }
 
 /// The shelf's scope on each environment whose shell leaves older settled threads out: the
@@ -80,6 +81,11 @@ impl Shelf {
 
     pub(super) fn failed(&self) -> bool {
         self.pages.values().any(Pages::is_failed)
+    }
+
+    /// Whether `env`'s counts for `key` were asked on `socket`: a failure stands until a new socket.
+    fn count_asked(&self, env: &SharedString, key: u64, socket: &crate::rpc::SocketId) -> bool {
+        self.counts.get(env).is_some_and(|(read, asked, _)| *read == key && asked == socket)
     }
 
     /// Reads failed pages again (a no-op when none failed).
@@ -187,10 +193,11 @@ impl Workspace {
             self.sidebar.older.counts.remove(env);
             return;
         }
-        if self.sidebar.older.counts.get(env).is_some_and(|(read, _)| *read == key) {
+        let Some(client) = self.env_client(env) else { return };
+        let socket = client.socket_id();
+        if self.sidebar.older.count_asked(env, key, &socket) {
             return;
         }
-        let Some(client) = self.env_client(env) else { return };
         let generation = self.shell.generation(env);
         let input = json!({"before": {"settledAt": cut.before}, "limit": 0});
         let id = env.clone();
@@ -206,7 +213,7 @@ impl Workspace {
                 Err(error) => log::warn!("orchestration.getOlderSettledThreads counts: {error}"),
             });
         });
-        self.sidebar.older.counts.insert(env.clone(), (key, task));
+        self.sidebar.older.counts.insert(env.clone(), (key, socket, task));
     }
 
     /// An opened thread the shell left out (an older settled one) gets its row from its family
@@ -290,5 +297,17 @@ mod tests {
         shelf.grow(0, 10);
         let input = shelf.next_reads().pop().map(|read| read.input());
         assert_eq!(input.unwrap()["projectIds"], json!(["p1", "p2"]));
+    }
+
+    #[test]
+    fn a_count_read_for_a_key_is_asked_again_on_a_new_socket() {
+        let (first, second) = (crate::rpc::RpcClient::unopened(), crate::rpc::RpcClient::unopened());
+        let env: SharedString = "a".into();
+        let mut shelf = Shelf::default();
+        assert!(!shelf.count_asked(&env, 7, &first.socket_id()));
+        shelf.counts.insert(env.clone(), (7, first.socket_id(), Task::ready(())));
+        assert!(shelf.count_asked(&env, 7, &first.socket_id()), "running, or failed on this socket");
+        assert!(!shelf.count_asked(&env, 8, &first.socket_id()), "another key");
+        assert!(!shelf.count_asked(&env, 7, &second.socket_id()), "a reconnect asks again");
     }
 }
