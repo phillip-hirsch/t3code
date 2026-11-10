@@ -23,7 +23,7 @@ use crate::model::UsageWindow;
 use crate::theme::Tokens;
 use crate::usage::{self as logic, LimitsReport, ReportAccount};
 
-const PROVIDERS_MANAGE: &str = "providers:manage";
+pub(super) const PROVIDERS_MANAGE: &str = "providers:manage";
 
 /// The panel as opened: which composer state it belongs to and when it opened.
 struct Opened {
@@ -158,7 +158,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(env) = self.target.as_ref().map(|t| t.environment().clone()) else { return };
-        let Some(client) = self.env_client(&env).filter(|_| self.env_grants(&env, PROVIDERS_MANAGE)) else { return };
+        if self.env_client(&env).is_none() || !self.env_grants(&env, PROVIDERS_MANAGE) {
+            return;
+        }
         let busy = self
             .composer_ui
             .usage_limits
@@ -178,21 +180,17 @@ impl Workspace {
                 return;
             }
             let started = this.update(cx, |this, cx| {
-                // Grants change on reconnect, so the confirmation does not carry one over.
-                if !this.env_grants(&env, PROVIDERS_MANAGE) {
-                    return false;
-                }
+                // A reconnect while asking replaces the socket and its grants, so both are read now.
+                let client = this.env_client(&env).filter(|_| this.env_grants(&env, PROVIDERS_MANAGE))?;
                 let account = account.clone();
                 let started = this.composer_ui.usage_limits.with(opened_at, |o| {
                     o.redeems.retain(|(id, _)| *id != account);
                     o.redeems.push((account, None));
                 });
                 cx.notify();
-                started.is_some()
+                started.map(|()| client)
             });
-            if !started.unwrap_or(false) {
-                return;
-            }
+            let Ok(Some(client)) = started else { return };
             let status = match client.request("provider.consumeResetCredit", input).await {
                 Ok(result) => logic::reset_outcome_text(&result),
                 Err(error) => error.to_string(),
