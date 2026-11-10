@@ -1018,7 +1018,7 @@ impl Workspace {
             Some(message) => format!("{message} See the"),
             None => "T3 Code collects anonymous usage data to improve the app. To opt out, see the".to_owned(),
         };
-        let color = t.muted_foreground.opacity(0.7);
+        let (color, ring) = (t.muted_foreground.opacity(0.7), t.ring);
         text_2xs(h_flex())
             .mt_auto()
             .pt(px(48.))
@@ -1026,8 +1026,11 @@ impl Workspace {
             .text_color(color)
             .child(format!("{lead}\u{a0}"))
             .child(
-                div()
-                    .id("welcome-privacy-policy")
+                gpui_kit::base::Button::new("welcome-privacy-policy")
+                    .focus_visible(move |style| {
+                        style.shadow(vec![gpui_kit::BoxShadow::new(px(0.), px(0.), ring).spread_radius(px(2.))])
+                    })
+                    .rounded(px(2.))
                     .cursor_pointer()
                     .underline()
                     .hover(|style| style.text_color(t.muted_foreground))
