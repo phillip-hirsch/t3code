@@ -1283,7 +1283,7 @@ impl Render for Workspace {
                     return;
                 }
                 if this.page.is_some_and(pages::Page::is_modal) && event.keystroke.key == "escape" {
-                    if !this.usage_card_escape(cx) {
+                    if !this.usage_model_escape(window, cx) && !this.usage_card_escape(cx) {
                         this.close_page(cx);
                     }
                     cx.stop_propagation();

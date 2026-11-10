@@ -236,11 +236,27 @@ pub struct ModelTotals {
     pub total_tokens: u64,
     pub records: u64,
     pub unpriced_records: u64,
+    /// Each unpriced record's share of the bucket's tokens.
+    pub unpriced_tokens: f64,
+    pub tokens: TokenTotals,
     pub cost_share: f64,
     pub token_share: f64,
 }
 
 impl ModelTotals {
+    /// `cacheHitRate`: cached input over all input, cache writes counting as misses; `None` without input.
+    pub fn cache_hit_rate(&self) -> Option<f64> {
+        let t = &self.tokens;
+        let input = sum([t.uncached_input_tokens, t.cached_input_tokens, t.cache_creation_tokens]);
+        (input > 0).then(|| t.cached_input_tokens as f64 / input as f64)
+    }
+
+    /// `costPerMillionTokens`: USD per million priced tokens, or `None` when none were priced.
+    pub fn cost_per_million(&self) -> Option<f64> {
+        let priced = self.total_tokens as f64 - self.unpriced_tokens;
+        (priced > 0. && !self.cost_unknown()).then(|| self.cost_usd / priced * 1_000_000.)
+    }
+
     /// Every record lacks rates, so the cost is unknown rather than zero.
     pub fn cost_unknown(&self) -> bool {
         self.records > 0 && self.unpriced_records >= self.records
@@ -390,6 +406,11 @@ pub fn combine(environments: Vec<EnvironmentUsage>) -> Option<(Summary, Vec<Cont
 }
 
 pub fn merge(summary: &Summary, hidden: &[String]) -> Merged {
+    merge_where(summary, hidden, |_| true)
+}
+
+/// [`merge`] over the buckets `keep` takes (`mergeAnsweredUsage`'s `keepBucket`), such as one model's.
+pub fn merge_where(summary: &Summary, hidden: &[String], keep: impl Fn(&Bucket) -> bool) -> Merged {
     fn provider_slot<'a>(providers: &'a mut Vec<ProviderTotals>, kind: &str) -> &'a mut ProviderTotals {
         let index = match providers.iter().position(|p| p.provider == kind) {
             Some(index) => index,
@@ -431,7 +452,7 @@ pub fn merge(summary: &Summary, hidden: &[String]) -> Merged {
         None => owned_providers.contains(&bucket.provider.as_str()),
         Some(path) => owned_sources.contains(&(bucket.provider.as_str(), path.as_str())),
     };
-    for bucket in summary.buckets.iter().filter(|b| owned(b)) {
+    for bucket in summary.buckets.iter().filter(|b| owned(b) && keep(b)) {
         let tokens = bucket.totals.total();
         merged.cost_usd += bucket.cost_usd;
         merged.cache_savings_usd += bucket.cache_savings_usd;
@@ -468,6 +489,14 @@ pub fn merge(summary: &Summary, hidden: &[String]) -> Merged {
         model.total_tokens = model.total_tokens.saturating_add(tokens);
         model.records = model.records.saturating_add(bucket.records);
         model.unpriced_records = model.unpriced_records.saturating_add(bucket.unpriced_records);
+        if bucket.records > 0 {
+            model.unpriced_tokens += tokens as f64 * bucket.unpriced_records as f64 / bucket.records as f64;
+        }
+        let totals = &mut model.tokens;
+        totals.uncached_input_tokens = totals.uncached_input_tokens.saturating_add(bucket.totals.uncached_input_tokens);
+        totals.cached_input_tokens = totals.cached_input_tokens.saturating_add(bucket.totals.cached_input_tokens);
+        totals.cache_creation_tokens = totals.cache_creation_tokens.saturating_add(bucket.totals.cache_creation_tokens);
+        totals.output_tokens = totals.output_tokens.saturating_add(bucket.totals.output_tokens);
         daily.entry(bucket.day.clone()).or_insert_with(|| Period { day: bucket.day.clone(), ..Period::default() }).add(
             &bucket.provider,
             bucket.cost_usd,
@@ -2040,6 +2069,19 @@ mod tests {
 
         let without_claude = merge(&summary, &["claude".to_string()]);
         assert_eq!((without_claude.cost_usd, without_claude.sessions), (1., 3));
+
+        // The model dialog's history: one model's buckets, and its derived rates.
+        let opus = merge_where(&summary, &[], |b| b.provider == "claude" && b.model == "opus");
+        assert_eq!((opus.cost_usd, opus.daily.len(), opus.models.len()), (4., 2, 1));
+        let mut model = opus.models[0].clone();
+        assert_eq!((model.tokens.output_tokens, model.tokens.uncached_input_tokens), (190, 20));
+        assert_eq!(model.cache_hit_rate(), Some(0.));
+        assert_eq!(model.cost_per_million(), Some(4. / 210. * 1_000_000.));
+        model.tokens.uncached_input_tokens = 0;
+        model.tokens.cached_input_tokens = 0;
+        assert_eq!(model.cache_hit_rate(), None, "no input, no rate");
+        model.unpriced_tokens = 210.;
+        assert_eq!(model.cost_per_million(), None, "nothing priced");
 
         let huge = self::summary(
             json!([
