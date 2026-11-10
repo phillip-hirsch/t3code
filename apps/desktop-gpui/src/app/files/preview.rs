@@ -744,6 +744,7 @@ impl Workspace {
                         let right = f32::from(event.bounds.right());
                         let width = (right - f32::from(event.event.position.x)).clamp(EXPLORER_MIN, max);
                         this.files.explorer_width = Some(width);
+                        this.save_explorer_width_later(cx);
                         cx.notify();
                     }))
                     .child(
@@ -766,6 +767,7 @@ impl Workspace {
                                 let key = event.keystroke.key.as_str();
                                 if let Some(next) = logic::explorer_key_width(explorer_width, EXPLORER_MIN, max, key) {
                                     this.files.explorer_width = Some(next);
+                                    this.save_explorer_width_later(cx);
                                     cx.stop_propagation();
                                     cx.notify();
                                 }
@@ -920,6 +922,9 @@ impl Workspace {
                 el.child(action("file-rendered", icon, mode.toggle_label(rendered).into(), rendered).on_click(
                     cx.listener(move |this, _, _, cx| {
                         this.files.set_rendered(&key, mode, !rendered);
+                        if key.in_workspace() {
+                            this.save_file_prefs();
+                        }
                         let request = this.files.reveals.get(&key).map(|(_, request)| *request);
                         if let Some(state) = this.files.previews.get_mut(&key) {
                             state.rendered_reveal = if rendered { None } else { request };
@@ -954,6 +959,7 @@ impl Workspace {
                 el.child(action("file-explorer-toggle", IconName::FolderTree, label.into(), open).on_click(
                     cx.listener(|this, _, _, cx| {
                         this.files.explorer_hidden = !this.files.explorer_hidden;
+                        this.save_file_prefs();
                         cx.notify();
                     }),
                 ))
