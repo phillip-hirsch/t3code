@@ -490,6 +490,32 @@ impl Workspace {
         *slot = merge_prompt(text, slot);
     }
 
+    /// A failed send's attachments, back with `origin`'s prompt wherever it waits: the composer,
+    /// or set aside under an open question or in a draft not on screen.
+    pub(super) fn give_back_attachments(
+        &mut self,
+        origin: &Target,
+        attachments: Vec<Attachment>,
+        cx: &mut Context<Self>,
+    ) {
+        if attachments.is_empty() {
+            return;
+        }
+        let list = if self.target.as_ref() == Some(origin) {
+            match &mut self.question {
+                Some(question) => &mut question.prompt_attachments,
+                None => &mut self.attachments,
+            }
+        } else {
+            match self.composer_drafts.entry(origin.clone()).or_insert_with(ComposerDraft::empty) {
+                ComposerDraft::Prompt(_, kept, _) => kept,
+                ComposerDraft::Question(question) => &mut question.prompt_attachments,
+            }
+        };
+        list.extend(attachments);
+        self.drafts_changed(cx);
+    }
+
     /// Brings back the new target's composer; call after the target changes.
     /// `sync_question` drops a restored question once the thread shows it resolved.
     pub(super) fn restore_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {

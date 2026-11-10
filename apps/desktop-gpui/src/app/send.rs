@@ -10,7 +10,6 @@ use gpui_kit::{Context, Keystroke, SharedString, Window};
 use serde_json::{Value, json};
 
 use super::attachments::ATTACHMENT_ONLY_PROMPT;
-use super::composer::ComposerDraft;
 use super::{Target, Workspace, draft_title, new_id};
 use crate::model::{ModelSelection, ThreadProjection};
 use crate::new_thread::{self, DraftWorkspace};
@@ -462,11 +461,7 @@ impl Workspace {
                             this.give_back_context_records(&origin, sent_records);
                             this.give_back_prompt(&origin, text, window, cx);
                         }
-                        if this.target.as_ref() == Some(&origin) {
-                            this.attachments.extend(sent_attachments);
-                        } else if let Some(ComposerDraft::Prompt(_, kept, _)) = this.composer_drafts.get_mut(&origin) {
-                            kept.extend(sent_attachments);
-                        }
+                        this.give_back_attachments(&origin, sent_attachments, cx);
                     }
                 }
                 this.refresh_rows(cx);
