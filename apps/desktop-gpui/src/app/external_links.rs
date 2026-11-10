@@ -157,8 +157,9 @@ struct Hover {
     id: u64,
     url: SharedString,
     bounds: Bounds<Pixels>,
-    /// The pane and thread whose timeline holds the link; the card goes once the pane shows
-    /// another thread or closes.
+    /// The pane whose timeline holds the link, and with its thread the card's owner: the card
+    /// goes once the pane shows another thread or closes.
+    pane: ChatPane,
     owner: Option<PaneOwner>,
     /// The pull request the link names, in the message's environment; `None` shows the URL tooltip.
     target: Option<(SharedString, Reference)>,
@@ -214,7 +215,7 @@ impl Workspace {
 
     fn resolve_link_hover(&mut self, cx: &mut Context<Self>) {
         let Some(batch) = self.link_hover.batch.take() else { return };
-        let current = self.link_hover.hover.as_ref().map(|hover| hover.url.as_ref());
+        let current = self.link_hover.hover.as_ref().map(|hover| (hover.url.as_ref(), &hover.pane));
         match logic::hover_change(current, batch) {
             HoverChange::Stay((bounds, _)) => {
                 if let Some(hover) = self.link_hover.hover.as_mut() {
@@ -235,6 +236,7 @@ impl Workspace {
                     id,
                     url: url.into(),
                     bounds,
+                    pane,
                     owner,
                     target,
                     over_link: true,

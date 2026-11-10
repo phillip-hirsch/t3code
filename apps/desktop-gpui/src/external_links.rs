@@ -178,11 +178,11 @@ pub enum HoverChange<B> {
 }
 
 /// An entered link wins over a leave in the same event, so a move between two pieces of one
-/// link stays on it.
-pub fn hover_change<B>(current: Option<&str>, batch: HoverBatch<B>) -> HoverChange<B> {
+/// link stays on it. A link is its URL in its place (`P`), so the same URL elsewhere is another.
+pub fn hover_change<B, P: PartialEq>(current: Option<(&str, &P)>, batch: HoverBatch<(B, P)>) -> HoverChange<(B, P)> {
     match batch.entered {
-        Some((url, bounds)) if current == Some(url.as_str()) => HoverChange::Stay(bounds),
-        Some((url, bounds)) => HoverChange::Enter(url, bounds),
+        Some((url, (bounds, place))) if current == Some((url.as_str(), &place)) => HoverChange::Stay((bounds, place)),
+        Some((url, entered)) => HoverChange::Enter(url, entered),
         None if batch.left && current.is_some() => HoverChange::Leave,
         None => HoverChange::Nothing,
     }
@@ -276,12 +276,20 @@ mod tests {
 
     #[test]
     fn an_entered_link_wins_over_a_leave_in_the_same_event() {
-        let batch = |entered: Option<&str>, left| HoverBatch { entered: entered.map(|url| (url.to_owned(), 1)), left };
-        assert_eq!(hover_change(Some("a"), batch(Some("a"), true)), HoverChange::Stay(1), "a wrapped link's next line");
-        assert_eq!(hover_change(Some("a"), batch(Some("b"), true)), HoverChange::Enter("b".into(), 1));
-        assert_eq!(hover_change(None, batch(Some("a"), false)), HoverChange::Enter("a".into(), 1));
-        assert_eq!(hover_change(Some("a"), batch(None, true)), HoverChange::Leave);
-        assert_eq!(hover_change(None, batch(None, true)), HoverChange::Nothing);
+        let batch =
+            |entered: Option<&str>, left| HoverBatch { entered: entered.map(|url| (url.to_owned(), (1, 'm'))), left };
+        let main = |url| Some((url, &'m'));
+        assert_eq!(
+            hover_change(main("a"), batch(Some("a"), true)),
+            HoverChange::Stay((1, 'm')),
+            "a wrapped link's next line"
+        );
+        assert_eq!(hover_change(main("a"), batch(Some("b"), true)), HoverChange::Enter("b".into(), (1, 'm')));
+        assert_eq!(hover_change(None, batch(Some("a"), false)), HoverChange::Enter("a".into(), (1, 'm')));
+        assert_eq!(hover_change(main("a"), batch(None, true)), HoverChange::Leave);
+        assert_eq!(hover_change::<i32, char>(None, batch(None, true)), HoverChange::Nothing);
+        // The same URL in another pane is another link: its card belongs to that pane.
+        assert_eq!(hover_change(Some(("a", &'s')), batch(Some("a"), true)), HoverChange::Enter("a".into(), (1, 'm')));
     }
 
     #[test]

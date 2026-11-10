@@ -103,6 +103,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(environment) = self.active_environment().cloned() else { return };
+        if !self.can_operate(&environment) {
+            self.error = Some(super::side_chat::NOT_OPERATE.into());
+            cx.notify();
+            return;
+        }
         let Some(client) = self.env_client(&environment) else { return };
         let title = self.thread.as_ref().and_then(|t| t.state.projection.as_ref()).map(|p| p.thread.title.clone());
         let target = new_id();
@@ -144,6 +149,12 @@ impl Workspace {
         let (Some(client), Some(http_base)) = (self.client(), self.http_base().map(str::to_owned)) else { return };
         let Some(origin) = self.target.clone() else { return };
         let Some(key) = origin.thread_key() else { return };
+        // The grant can go while the confirmation is open.
+        if !self.can_operate(origin.environment()) {
+            self.error = Some(super::side_chat::NOT_OPERATE.into());
+            cx.notify();
+            return;
+        }
         let Some(thread) = self.thread.as_ref() else { return };
         let Some(projection) = thread.state.projection.as_ref() else { return };
         let Some(message) = projection.visible_turn_items.iter().map(|row| &row.item).find(|i| *i.id == *message_id)
@@ -457,7 +468,7 @@ pub(super) fn user_actions(
         let working = workspace.thread.as_ref().is_some_and(|thread| {
             rewinding || thread.state.projection.as_ref().is_some_and(super::super::model::ThreadProjection::is_running)
         });
-        (workspace.supports_rollback(), working)
+        (workspace.supports_rollback() && workspace.target_can_operate(), working)
     });
     let edit = revert.filter(|_| can_rewind).map(|checkpoint| {
         let (this, id, checkpoint) = (this.clone(), id.clone(), checkpoint.clone());
@@ -521,7 +532,8 @@ pub(super) fn assistant_meta(
             Some(crate::artifact_templates::render_for_copy(&text))
         })
     });
-    let fork = fork.map(|(thread, run)| {
+    let can_fork = this.upgrade().is_some_and(|workspace| workspace.read(cx).target_can_operate());
+    let fork = fork.filter(|_| can_fork).map(|(thread, run)| {
         let (this, thread, run) = (this.clone(), thread.clone(), run.clone());
         let button =
             icon_button(format!("fork:{id}").into(), Icon::new(IconName::GitFork), "Fork from this response", false, t);
