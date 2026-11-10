@@ -196,7 +196,9 @@ impl Workspace {
         let chips: Vec<String> = state.tokens().iter().map(|s| s.token().id().to_string()).collect();
         // A chip an undo or redo brings back may name a skill or model that has gone since.
         let restored = adds_chip(&self.chip_ids, &chips);
-        let previous = std::mem::replace(&mut self.chip_ids, chips);
+        self.chip_ids = chips;
+        let references = composer_text::context_reference_ids(&state.value());
+        let previous = std::mem::replace(&mut self.context_refs, references);
         self.sync_attachment_chips(&previous, cx);
         // A catch-up refused while an IME composition was active runs once a change ends it.
         if restored || self.chip_sync_pending.is_some() {
@@ -279,6 +281,7 @@ impl Workspace {
             };
         }
         self.chip_ids = content.tokens().iter().map(|s| s.token().id().to_string()).collect();
+        self.context_refs = composer_text::context_reference_ids(&text);
         self.chip_sync_pending = None;
         // `set_value` clears the undo history that could bring a deleted chip back.
         self.release_retained_attachments(cx);

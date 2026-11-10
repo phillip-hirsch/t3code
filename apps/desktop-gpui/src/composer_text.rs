@@ -192,6 +192,30 @@ pub fn context_link(kind: &str, id: &str, label: &str) -> String {
 
 const CONTEXT_PREFIX: &str = "t3-context://v1/";
 
+/// `collectInlineContextIds`: the chip id of each context link anywhere in `text`, once, chip or
+/// not (fenced code included).
+pub fn context_reference_ids(text: &str) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    if !text.contains(CONTEXT_PREFIX) {
+        return ids;
+    }
+    let mut at = 0;
+    while let Some(open) = text[at..].find('[') {
+        let start = at + open;
+        match parse_context_link(&text[start..]).filter(|(_, chip)| !chip.label().contains('\n')) {
+            Some((len, chip)) => {
+                let id = chip.id();
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+                at = start + len;
+            }
+            None => at = start + 1,
+        }
+    }
+    ids
+}
+
 /// The file links and known skills in `text` that render as chips: each must
 /// start the text or follow whitespace, and be followed by whitespace
 /// (`FILE_LINK_TOKEN_REGEX`, `SKILL_TOKEN_REGEX`).
@@ -798,6 +822,10 @@ mod tests {
         assert_eq!(remount_chips(refs, true, &chipped, skill, none), (vec![4..20, 21..61], vec![]), "on");
         assert_eq!(remount_chips(refs, false, &[], skill, none), (vec![], vec![(4..20, file), (21..61, image)]), "off");
         assert_eq!(remount_chips(refs, false, &chipped, skill, none), (vec![], vec![]));
+        // An attachment stays while any reference to it does, chip or not (`collectInlineContextIds`).
+        assert_eq!(context_reference_ids(refs), ["context:image/img_1"]);
+        let glued = "x[T](t3-context://v1/thread/a)[T](t3-context://v1/thread/a) [a\nb](t3-context://v1/file/f)";
+        assert_eq!(context_reference_ids(glued), ["context:thread/a"], "once each; a label holds no newline");
         let (stale, fresh) = remount_chips(&fenced, false, &[], skill, codex_model);
         assert_eq!((stale, fresh.len()), (vec![], 2), "skills and models too");
 

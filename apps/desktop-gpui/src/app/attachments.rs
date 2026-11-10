@@ -149,9 +149,9 @@ impl Attachment {
     }
 
     /// `removeComposerImage`: what to ask before removing an image the text still references
-    /// (`chips` are the composer's inline token ids); `None` removes it at once.
-    fn removal_question(&self, chips: &[String]) -> Option<String> {
-        let referenced = self.kind == Kind::Image && chips.contains(&self.chip_id());
+    /// (`references` from [`composer_text::context_reference_ids`]); `None` removes it at once.
+    fn removal_question(&self, references: &[String]) -> Option<String> {
+        let referenced = self.kind == Kind::Image && references.contains(&self.chip_id());
         referenced.then(|| {
             format!(
                 "Remove {} from the message?
@@ -196,8 +196,8 @@ fn find_attachment<'a>(
         .find(|(_, attachment)| attachment.local_id == local_id)
 }
 
-/// Moves attachments whose chip left the text (it was in `previous`, not in `live`) into
-/// `retained`, and retained ones whose chip is back into `attachments`; `None` when nothing
+/// Moves attachments whose reference left the text (it was in `previous`, not in `live`) into
+/// `retained`, and retained ones whose reference is back into `attachments`; `None` when nothing
 /// moved, else the restored attachments that need their upload taken again.
 fn reconcile_chips(
     attachments: &mut Vec<Attachment>,
@@ -751,8 +751,8 @@ impl Workspace {
     /// The remove buttons: an image the text references asks first, as the web does.
     pub(super) fn request_remove_attachment(&mut self, local_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(attachment) = self.attachments.iter().find(|a| a.local_id == local_id) else { return };
-        let chips: Vec<String> = self.composer.read(cx).tokens().iter().map(|s| s.token().id().to_string()).collect();
-        let Some(question) = attachment.removal_question(&chips) else {
+        let references = composer_text::context_reference_ids(&self.composer.read(cx).value());
+        let Some(question) = attachment.removal_question(&references) else {
             self.remove_attachment(local_id, window, cx);
             return;
         };
@@ -791,14 +791,16 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Sets aside attachments whose chip the user deleted from the text, and brings back
-    /// those whose chip an undo restored (`reconcileAttachmentContextReferences`).
-    pub(super) fn sync_attachment_chips(&mut self, previous_chips: &[String], cx: &mut Context<Self>) {
-        let state = self.composer.read(cx);
-        let live: Vec<String> = state.tokens().iter().map(|s| s.token().id().to_string()).collect();
-        let Some(restored) =
-            reconcile_chips(&mut self.attachments, &mut self.retained_attachments, previous_chips, &live)
-        else {
+    /// Sets aside attachments whose reference the user deleted from the text, and brings back
+    /// those whose reference an undo restored (`reconcileAttachmentContextReferences`). Like the
+    /// web's, it reads the text, so a reference rich text shows as fenced code counts too.
+    pub(super) fn sync_attachment_chips(&mut self, previous_references: &[String], cx: &mut Context<Self>) {
+        let Some(restored) = reconcile_chips(
+            &mut self.attachments,
+            &mut self.retained_attachments,
+            previous_references,
+            &self.context_refs,
+        ) else {
             return;
         };
         // An upload that finished while set aside was dropped; take it again.
@@ -1115,6 +1117,16 @@ mod tests {
         assert_eq!(restored, Some(vec!["b".to_owned()]), "only the unfinished upload is taken again");
         assert_eq!((ids(&attachments), ids(&retained)), (vec!["a".to_owned(), "b".to_owned()], vec![]));
         assert_eq!(attachments[0].upload, Upload::Ready("up-a".into()));
+
+        // Rich text leaves a fenced reference as text, not a chip; its text still counts.
+        let link = composer_text::context_link("file", &attachments[0].context_id(), "a.txt");
+        let fenced = composer_text::context_reference_ids(&format!("```\n{link}\n```"));
+        let emptied = composer_text::context_reference_ids("```\n\n```");
+        assert_eq!(fenced, [attachments[0].chip_id()]);
+        assert_eq!(reconcile_chips(&mut attachments, &mut retained, &fenced, &emptied), Some(vec![]));
+        assert_eq!((ids(&attachments), ids(&retained)), (vec!["b".to_owned()], vec!["a".to_owned()]), "not sent");
+        assert_eq!(reconcile_chips(&mut attachments, &mut retained, &emptied, &fenced), Some(vec![]));
+        assert_eq!((ids(&attachments), ids(&retained)), (vec!["b".to_owned(), "a".to_owned()], vec![]), "undone");
     }
 
     #[test]

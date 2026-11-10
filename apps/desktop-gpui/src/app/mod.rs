@@ -236,8 +236,10 @@ pub struct Workspace {
     prompt_stash: prompt_stash::PromptStash,
     /// Where Up/Down prompt history stands.
     prompt_history: Option<crate::composer_text::HistoryPosition>,
-    /// The editor's chip ids after the last edit, to notice deleted attachment chips.
+    /// The editor's chip ids after the last edit, to notice a chip an undo brings back.
     chip_ids: Vec<String>,
+    /// The context links the text held after the last edit, to notice deleted attachment references.
+    context_refs: Vec<String>,
     /// A chip catch-up the composer refused during an IME composition.
     chip_sync_pending: Option<composer::ChipSync>,
     /// The provider instance the composer's and messages' skill chips last resolved against.
@@ -252,7 +254,7 @@ pub struct Workspace {
     dragging_files: bool,
     /// Targets whose dropped or picked files are still being read, one entry per read.
     reading_attachments: Vec<Target>,
-    /// Attachments whose chip was deleted, kept until the editor's undo history ends.
+    /// Attachments whose reference was deleted, kept until the editor's undo history ends.
     retained_attachments: Vec<attachments::Attachment>,
     /// Sent messages their thread doesn't show yet.
     pending_sends: Vec<send::PendingSend>,
@@ -468,6 +470,7 @@ impl Workspace {
             prompt_stash: Default::default(),
             prompt_history: None,
             chip_ids: Vec::new(),
+            context_refs: Vec::new(),
             chip_sync_pending: None,
             chip_provider: None,
             composer_marks: None,
