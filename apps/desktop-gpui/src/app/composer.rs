@@ -1984,14 +1984,12 @@ impl Workspace {
         let draft = self.question(pane)?;
         let (request, item) = self.pending_question_request(pane)?;
         let question = &draft.questions[draft.index];
-        let disabled = request.capability() == Some("not_resumable")
-            || self.pane_responding(pane, &request.id)
-            || !self.pane_can_operate(pane);
+        let disabled = !self.question_answerable(pane);
         let dismissible = item.str("responseMode") == Some("message") || request.capability() == Some("message");
         let collapsed = draft.collapsed;
         let count = draft.questions.len();
-        let header = h_flex()
-            .id("question-toggle")
+        // The toggle, Dismiss and each option are buttons on the web, so Tab reaches them.
+        let header = super::chat::focusable(h_flex().id("question-toggle"), t)
             .w_full()
             .min_h(px(24.))
             .px(px(16.))
@@ -2052,8 +2050,7 @@ impl Workspace {
                     .when(dismissible, |el| {
                         let request_id = request.id.clone();
                         el.child(
-                            icon_box(t)
-                                .id("question-dismiss")
+                            super::chat::focusable(icon_box(t).id("question-dismiss"), t)
                                 .cursor_pointer()
                                 .hover(|s| s.bg(t.accent))
                                 .child(Icon::new(Lucide::X).with_size(px(14.)))
@@ -2089,7 +2086,7 @@ impl Workspace {
                         let value = option.value().to_owned();
                         let selected = requests::is_selected(question, draft_answer, &value);
                         render_option(question, option, index, selected, disabled, t).when(!disabled, |el| {
-                            el.on_click(cx.listener(move |this, _, window, cx| {
+                            super::chat::focusable(el, t).on_click(cx.listener(move |this, _, window, cx| {
                                 this.pick_option(pane, value.clone(), window, cx);
                             }))
                         })
