@@ -3664,10 +3664,11 @@ impl Window {
         self.capslock
     }
 
-    /// Whether the key event being dispatched came from the numeric keypad, for terminals that
-    /// report keypad keys apart (Kitty). `false` on platforms that do not tell (macOS).
-    pub fn key_on_numpad(&self) -> bool {
-        self.platform_window.key_on_numpad()
+    /// What the platform knows about the key event being dispatched beyond its keystroke (its
+    /// physical key), for terminals that encode keys the way browsers report `KeyboardEvent.code`.
+    /// Read it from a key down or key up listener; outside one it describes the last key event.
+    pub fn native_key(&self) -> crate::NativeKey {
+        self.platform_window.native_key()
     }
 
     /// Produces a new frame and assigns it to `rendered_frame`. To actually show

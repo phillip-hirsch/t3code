@@ -62,8 +62,8 @@ pub(super) enum KeyAction {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct KeyInput<'a> {
     pub action: KeyAction,
-    /// GPUI's key name: `"a"`, `"enter"`, `"f5"`, `"["`.
-    pub key: &'a str,
+    /// The key's physical code (`event.code`).
+    pub code: key::Key,
     pub mods: Modifiers,
     /// Modifiers the layout used to produce `text` (`ghosttyConsumedMods`).
     pub consumed: Modifiers,
@@ -71,25 +71,6 @@ pub(super) struct KeyInput<'a> {
     pub text: Option<std::borrow::Cow<'a, str>>,
     /// The key's character without Shift, for Kitty's alternate keys.
     pub unshifted: Option<char>,
-    /// The key is on the numeric keypad (`Numpad*` codes).
-    pub numpad: bool,
-}
-
-/// A key's identity across its press and release (`event.code`): its W3C code, so `/` released
-/// after Shift is still the key that typed `?`, or its name when it has no code.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum KeyId {
-    Code(key::Key),
-    Name(String),
-}
-
-impl KeyId {
-    pub fn of(name: &str, numpad: bool) -> Self {
-        match ghostty_key(name, numpad) {
-            key::Key::Unidentified => Self::Name(name.to_owned()),
-            code => Self::Code(code),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,156 +181,6 @@ fn read_bytes(mut fill: impl FnMut(&mut [u8]) -> Result<usize, Error>) -> Option
             Err(_) => return None,
         }
     }
-}
-
-/// GPUI's key names as Ghostty's W3C key codes (`ghosttyKeyForEvent`), with shifted US
-/// symbols on the key that types them.
-fn ghostty_key(name: &str, numpad: bool) -> key::Key {
-    use key::Key as K;
-    if numpad && let Some(key) = numpad_key(name) {
-        return key;
-    }
-    let mut chars = name.chars();
-    if let (Some(c), None) = (chars.next(), chars.next()) {
-        const LETTERS: [K; 26] = [
-            K::A,
-            K::B,
-            K::C,
-            K::D,
-            K::E,
-            K::F,
-            K::G,
-            K::H,
-            K::I,
-            K::J,
-            K::K,
-            K::L,
-            K::M,
-            K::N,
-            K::O,
-            K::P,
-            K::Q,
-            K::R,
-            K::S,
-            K::T,
-            K::U,
-            K::V,
-            K::W,
-            K::X,
-            K::Y,
-            K::Z,
-        ];
-        const DIGITS: [K; 10] = [
-            K::Digit0,
-            K::Digit1,
-            K::Digit2,
-            K::Digit3,
-            K::Digit4,
-            K::Digit5,
-            K::Digit6,
-            K::Digit7,
-            K::Digit8,
-            K::Digit9,
-        ];
-        let offset = |from: char| usize::try_from(u32::from(c.to_ascii_lowercase()) - u32::from(from)).unwrap_or(0);
-        return match c.to_ascii_lowercase() {
-            'a'..='z' => LETTERS[offset('a')],
-            '0'..='9' => DIGITS[offset('0')],
-            ')' => K::Digit0,
-            '!' => K::Digit1,
-            '@' => K::Digit2,
-            '#' => K::Digit3,
-            '$' => K::Digit4,
-            '%' => K::Digit5,
-            '^' => K::Digit6,
-            '&' => K::Digit7,
-            '*' => K::Digit8,
-            '(' => K::Digit9,
-            '`' | '~' => K::Backquote,
-            '\\' | '|' => K::Backslash,
-            '[' | '{' => K::BracketLeft,
-            ']' | '}' => K::BracketRight,
-            ',' | '<' => K::Comma,
-            '=' | '+' => K::Equal,
-            '-' | '_' => K::Minus,
-            '.' | '>' => K::Period,
-            '\'' | '"' => K::Quote,
-            ';' | ':' => K::Semicolon,
-            '/' | '?' => K::Slash,
-            ' ' => K::Space,
-            _ => K::Unidentified,
-        };
-    }
-    match name {
-        "enter" => K::Enter,
-        "tab" => K::Tab,
-        "space" => K::Space,
-        "escape" => K::Escape,
-        "backspace" => K::Backspace,
-        "delete" => K::Delete,
-        "insert" => K::Insert,
-        "home" => K::Home,
-        "end" => K::End,
-        "pageup" => K::PageUp,
-        "pagedown" => K::PageDown,
-        "up" => K::ArrowUp,
-        "down" => K::ArrowDown,
-        "left" => K::ArrowLeft,
-        "right" => K::ArrowRight,
-        "f1" => K::F1,
-        "f2" => K::F2,
-        "f3" => K::F3,
-        "f4" => K::F4,
-        "f5" => K::F5,
-        "f6" => K::F6,
-        "f7" => K::F7,
-        "f8" => K::F8,
-        "f9" => K::F9,
-        "f10" => K::F10,
-        "f11" => K::F11,
-        "f12" => K::F12,
-        "f13" => K::F13,
-        "f14" => K::F14,
-        "f15" => K::F15,
-        "f16" => K::F16,
-        "f17" => K::F17,
-        "f18" => K::F18,
-        "f19" => K::F19,
-        "f20" => K::F20,
-        "f21" => K::F21,
-        "f22" => K::F22,
-        "f23" => K::F23,
-        "f24" => K::F24,
-        "menu" => K::ContextMenu,
-        _ => K::Unidentified,
-    }
-}
-
-/// A keypad key by the name GPUI gives it: its character on Windows and macOS, and on Linux
-/// its keysym without `KP_`.
-fn numpad_key(name: &str) -> Option<key::Key> {
-    use key::Key as K;
-    Some(match name {
-        "0" => K::Numpad0,
-        "1" => K::Numpad1,
-        "2" => K::Numpad2,
-        "3" => K::Numpad3,
-        "4" => K::Numpad4,
-        "5" => K::Numpad5,
-        "6" => K::Numpad6,
-        "7" => K::Numpad7,
-        "8" => K::Numpad8,
-        "9" => K::Numpad9,
-        "+" | "add" => K::NumpadAdd,
-        "-" | "subtract" => K::NumpadSubtract,
-        "*" | "multiply" => K::NumpadMultiply,
-        "/" | "divide" => K::NumpadDivide,
-        "." | "decimal" => K::NumpadDecimal,
-        "separator" => K::NumpadSeparator,
-        "=" | "equal" => K::NumpadEqual,
-        "enter" => K::NumpadEnter,
-        _ => return None,
-    })
 }
 
 impl Core {
@@ -554,7 +385,7 @@ impl Core {
         };
         self.key_event
             .set_action(action)
-            .set_key(ghostty_key(input.key, input.numpad))
+            .set_key(input.code)
             .set_mods(input.mods.mods())
             .set_consumed_mods(input.consumed.mods())
             .set_composing(false)

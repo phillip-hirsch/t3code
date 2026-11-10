@@ -1564,25 +1564,21 @@ where
         }
         vkey => {
             let keystroke = parse_normal_key(vkey, lparam, modifiers)?;
-            state.last_key_on_numpad.set(is_numpad_key(vkey, lparam));
+            state.last_native_key.set(NativeKey {
+                code: native_key_code(lparam),
+            });
             Some(f(keystroke.0, keystroke.1))
         }
     }
 }
 
-/// The keypad's digits and operators, its Enter (an extended `VK_RETURN`), and with NumLock off
-/// its navigation keys (the dedicated ones are extended).
-fn is_numpad_key(vkey: VIRTUAL_KEY, lparam: LPARAM) -> bool {
-    let extended = lparam.0 & (1 << 24) != 0;
-    match vkey {
-        VK_NUMPAD0 | VK_NUMPAD1 | VK_NUMPAD2 | VK_NUMPAD3 | VK_NUMPAD4 | VK_NUMPAD5
-        | VK_NUMPAD6 | VK_NUMPAD7 | VK_NUMPAD8 | VK_NUMPAD9 | VK_MULTIPLY | VK_ADD
-        | VK_SEPARATOR | VK_SUBTRACT | VK_DECIMAL | VK_DIVIDE => true,
-        VK_RETURN => extended,
-        VK_INSERT | VK_DELETE | VK_HOME | VK_END | VK_PRIOR | VK_NEXT | VK_UP | VK_DOWN
-        | VK_LEFT | VK_RIGHT | VK_CLEAR => !extended,
-        _ => false,
-    }
+/// The key message's scan code (bits 16-23 of `lparam`), with `0xE000` set when the extended-key
+/// bit (24) is; `None` for input synthesized without one.
+fn native_key_code(lparam: LPARAM) -> Option<NativeKeyCode> {
+    let hiword = lparam.hiword();
+    let scan_code = hiword & 0xFF;
+    let extended = if hiword & 0x100 != 0 { 0xE000 } else { 0 };
+    (scan_code != 0).then_some(NativeKeyCode::Windows(scan_code | extended))
 }
 
 fn parse_immutable(vkey: VIRTUAL_KEY) -> Option<String> {

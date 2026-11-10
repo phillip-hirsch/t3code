@@ -108,10 +108,11 @@ fn read_modifiers(native_event: &NSEvent) -> Modifiers {
     }
 }
 
+/// The input, and for a key event its `keyCode`.
 pub(crate) unsafe fn platform_input_from_native(
     native_event: *mut AnyObject,
     window_height: Option<Pixels>,
-) -> Option<PlatformInput> {
+) -> Option<(PlatformInput, Option<CGKeyCode>)> {
     unsafe {
         let native_event = native_event.cast::<NSEvent>().as_ref()?;
         let event_type = native_event.r#type();
@@ -125,7 +126,9 @@ pub(crate) unsafe fn platform_input_from_native(
             _ => {}
         }
 
-        match event_type {
+        let key_code = matches!(event_type, NSEventType::KeyDown | NSEventType::KeyUp)
+            .then(|| native_event.keyCode());
+        let input = match event_type {
             NSEventType::FlagsChanged => {
                 Some(PlatformInput::ModifiersChanged(ModifiersChangedEvent {
                     modifiers: read_modifiers(native_event),
@@ -334,7 +337,8 @@ pub(crate) unsafe fn platform_input_from_native(
                 })
             }),
             _ => None,
-        }
+        };
+        input.map(|input| (input, key_code))
     }
 }
 

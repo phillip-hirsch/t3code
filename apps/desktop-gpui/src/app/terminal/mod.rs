@@ -4,6 +4,7 @@
 
 mod core;
 mod grid;
+mod key_codes;
 mod keys;
 mod layout;
 mod links;

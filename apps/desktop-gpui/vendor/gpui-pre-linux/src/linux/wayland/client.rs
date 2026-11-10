@@ -105,10 +105,10 @@ use gpui::{
     AnyWindowHandle, Bounds, Capslock, CursorStyle, DevicePixels, ExternalDragPayload,
     FileDragPaths, FileDropEvent, ForegroundExecutor, GraphicalEnvironment, KeyDownEvent,
     KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
-    MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, PlatformDisplay,
-    PlatformFrameSignal, PlatformInput, PlatformKeyboardLayout, PlatformWindow, Point, ScrollDelta,
-    ScrollEvent, ScrollSource, SharedString, Size, TouchPhase, WindowButtonLayout, WindowKind,
-    WindowParams, point, px, size,
+    MouseExitEvent, MouseMoveEvent, MouseUpEvent, NativeKey, NativeKeyCode, NavigationDirection,
+    Pixels, PlatformDisplay, PlatformFrameSignal, PlatformInput, PlatformKeyboardLayout,
+    PlatformWindow, Point, ScrollDelta, ScrollEvent, ScrollSource, SharedString, Size, TouchPhase,
+    WindowButtonLayout, WindowKind, WindowParams, point, px, size,
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
@@ -394,8 +394,8 @@ pub(crate) struct WaylandClientState {
     repeat: KeyRepeat,
     pub modifiers: Modifiers,
     pub capslock: Capslock,
-    /// Whether the last key event came from the numeric keypad.
-    pub key_on_numpad: bool,
+    /// What the last key event said about its key besides the keystroke.
+    pub native_key: NativeKey,
     axis_source: AxisSource,
     pub mouse_location: Option<Point<Pixels>>,
     continuous_scroll_delta: Option<Point<Pixels>>,
@@ -1119,7 +1119,7 @@ impl WaylandConnection {
                 platform: false,
             },
             capslock: Capslock { on: false },
-            key_on_numpad: false,
+            native_key: NativeKey::default(),
             scroll_event_received: false,
             axis_source: AxisSource::Wheel,
             mouse_location: None,
@@ -2181,13 +2181,15 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                 let keymap_state = state.keymap_state.as_ref().unwrap();
                 let keycode = Keycode::from(key + MIN_KEYCODE);
                 let keysym = keymap_state.key_get_one_sym(keycode);
-                let on_numpad = keysym.is_keypad_key();
+                let native_key = NativeKey {
+                    code: Some(NativeKeyCode::Xkb(key + MIN_KEYCODE)),
+                };
 
                 match key_state {
                     wl_keyboard::KeyState::Pressed if !keysym.is_modifier_key() => {
                         let mut keystroke =
                             keystroke_from_xkb(keymap_state, state.modifiers, keycode);
-                        state.key_on_numpad = on_numpad;
+                        state.native_key = native_key;
                         if let Some(mut compose) = state.compose_state.take() {
                             compose.feed(keysym);
                             match compose.status() {
@@ -2266,7 +2268,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                                         state.keyboard_focused_window.as_ref().unwrap().clone();
 
                                     drop(state);
-                                    client.borrow_mut().key_on_numpad = on_numpad;
+                                    client.borrow_mut().native_key = native_key;
                                     focused_window.handle_input(input.clone());
 
                                     // If the new scheduled time is in the past the event will repeat as soon as possible
@@ -2282,7 +2284,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                         let input = PlatformInput::KeyUp(KeyUpEvent {
                             keystroke: keystroke_from_xkb(keymap_state, state.modifiers, keycode),
                         });
-                        state.key_on_numpad = on_numpad;
+                        state.native_key = native_key;
 
                         if state.repeat.current_keycode == Some(keycode) {
                             state.repeat.current_keycode = None;
@@ -2326,7 +2328,7 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
                 };
 
                 if let Some(commit_text) = text {
-                    state.key_on_numpad = false;
+                    state.native_key = NativeKey::default();
                     drop(state);
                     // IBus Intercepts keys like `a`, `b`, but those keys are needed for vim mode.
                     // We should only send ASCII characters to Zed, otherwise a user could remap a letter like `か` or `相`.

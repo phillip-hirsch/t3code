@@ -1509,14 +1509,15 @@ impl PlatformWindow for X11Window {
             .unwrap_or_default()
     }
 
-    fn key_on_numpad(&self) -> bool {
+    fn native_key(&self) -> gpui::NativeKey {
         self.0
             .state
             .borrow()
             .client
             .0
             .upgrade()
-            .is_some_and(|ref_cell| ref_cell.borrow().key_on_numpad)
+            .map(|ref_cell| ref_cell.borrow().native_key)
+            .unwrap_or_default()
     }
 
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {

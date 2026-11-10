@@ -6,7 +6,7 @@ use calloop::{
 };
 use collections::HashMap;
 use core::str;
-use gpui::{Capslock, GraphicalEnvironment};
+use gpui::{Capslock, GraphicalEnvironment, NativeKey, NativeKeyCode};
 use gpui_util::ResultExt as _;
 use http_client::Url;
 use log::Level;
@@ -216,8 +216,8 @@ pub struct X11ClientState {
     pub(crate) xim_handler: Option<XimHandler>,
     pub modifiers: Modifiers,
     pub capslock: Capslock,
-    /// Whether the last key event came from the numeric keypad.
-    pub key_on_numpad: bool,
+    /// What the last key event said about its key besides the keystroke.
+    pub native_key: NativeKey,
     // TODO: Can the other updates to `modifiers` be removed so that this is unnecessary?
     // capslock logic was done analog to modifiers
     pub last_modifiers_changed_event: Modifiers,
@@ -510,7 +510,7 @@ impl X11Connection {
                 },
                 modifiers: Modifiers::default(),
                 capslock: Capslock::default(),
-                key_on_numpad: false,
+                native_key: NativeKey::default(),
                 last_modifiers_changed_event: Modifiers::default(),
                 last_capslock_changed_event: Capslock::default(),
                 loop_handle: handle.clone(),
@@ -1162,7 +1162,9 @@ impl X11Client {
                     if keysym.is_modifier_key() {
                         return Some(());
                     }
-                    state.key_on_numpad = keysym.is_keypad_key();
+                    state.native_key = NativeKey {
+                        code: Some(NativeKeyCode::Xkb(u32::from(event.detail))),
+                    };
 
                     if let Some(mut compose_state) = state.compose_state.take() {
                         compose_state.feed(keysym);
@@ -1226,7 +1228,9 @@ impl X11Client {
                     if keysym.is_modifier_key() {
                         return Some(());
                     }
-                    state.key_on_numpad = keysym.is_keypad_key();
+                    state.native_key = NativeKey {
+                        code: Some(NativeKeyCode::Xkb(u32::from(event.detail))),
+                    };
 
                     keystroke
                 };

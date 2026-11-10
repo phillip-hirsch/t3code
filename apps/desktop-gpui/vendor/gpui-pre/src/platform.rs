@@ -1275,10 +1275,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn mouse_position(&self) -> Point<Pixels>;
     fn modifiers(&self) -> Modifiers;
     fn capslock(&self) -> Capslock;
-    /// Whether the key event being dispatched came from the numeric keypad. Platforms that do
-    /// not track it report `false`.
-    fn key_on_numpad(&self) -> bool {
-        false
+    /// What the platform knows about the key event being dispatched beyond its keystroke.
+    /// Platforms that do not track it report nothing.
+    fn native_key(&self) -> NativeKey {
+        NativeKey::default()
     }
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler);
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler>;

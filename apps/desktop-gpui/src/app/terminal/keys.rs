@@ -5,33 +5,64 @@
 
 use std::borrow::Cow;
 
-use gpui_kit::Keystroke;
+use gpui_kit::{Keystroke, NativeKeyCode};
+use libghostty_vt::key::Key;
 
-use super::core::{Core, KeyAction as Press, KeyId, KeyInput, Modifiers};
+use super::core::{Core, KeyAction as Press, KeyInput, Modifiers};
+use super::key_codes;
+
+/// A key's identity across its press and release (`event.code`): the platform's code for the
+/// physical key, so a release matches its press whatever Shift, the layout or Num Lock did in
+/// between. Without one, its W3C code guessed from the name, or the name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum KeyId {
+    Native(NativeKeyCode),
+    Code(Key),
+    Name(String),
+}
+
+/// A key event's physical key: the code the encoder hears and the identity its release matches.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct PhysicalKey {
+    id: KeyId,
+    code: Key,
+}
+
+impl PhysicalKey {
+    /// The key of a keystroke and the platform's code for it (`Window::native_key`).
+    pub fn of(keystroke: &Keystroke, native: Option<NativeKeyCode>) -> Self {
+        let code = key_codes::key_code(&keystroke.key, native);
+        let id = match native {
+            Some(native) => KeyId::Native(native),
+            None if code != Key::Unidentified => KeyId::Code(code),
+            None => KeyId::Name(keystroke.key.clone()),
+        };
+        Self { id, code }
+    }
+}
 
 /// Typing across key events: the keys whose press the program heard, and an IME or dead-key
 /// composition in progress.
 #[derive(Debug, Default)]
 pub(super) struct Keyboard {
-    /// `encodedKeyCodes`: these keys' releases go to the program too.
-    encoded: Vec<KeyId>,
+    /// `encodedKeyCodes`: these keys' releases go to the program too, as the key they pressed.
+    encoded: Vec<(KeyId, Key)>,
     /// The marked text's length in UTF-16 units.
     preedit: usize,
 }
 
 impl Keyboard {
     /// A fresh press proves a release was missed.
-    pub fn forget_missed_release(&mut self, keystroke: &Keystroke, numpad: bool, held: bool) {
+    pub fn forget_missed_release(&mut self, key: &PhysicalKey, held: bool) {
         if !held {
-            self.forget(&KeyId::of(&keystroke.key, numpad));
+            self.forget(&key.id);
         }
     }
 
-    /// Whether the key's press was encoded.
-    fn forget(&mut self, id: &KeyId) -> bool {
-        let before = self.encoded.len();
-        self.encoded.retain(|held| held != id);
-        self.encoded.len() < before
+    /// The code the key's press was encoded with, if it was.
+    fn forget(&mut self, id: &KeyId) -> Option<Key> {
+        let index = self.encoded.iter().position(|(held, _)| held == id)?;
+        Some(self.encoded.remove(index).1)
     }
 
     /// The input handler's marked text: non-empty while the IME or a dead key composes.
@@ -65,24 +96,29 @@ impl Keyboard {
     /// `encodeKey` for a press: bytes for the program, or `None` when there is nothing to send
     /// or the input handler types the text, so IME and dead keys work. The program hears the
     /// release either way.
-    pub fn press(&mut self, core: &mut Core, input: &KeyInput<'_>) -> Option<String> {
-        let data = core.encode_key(input);
+    pub fn press(&mut self, core: &mut Core, key: &PhysicalKey, input: KeyInput<'_>) -> Option<String> {
+        // The US table's guess at Shift's unshifted character, where the key shows it wrong
+        // (German Shift+8 types `(`, which US types with 9), would report another key.
+        let fits = |c: char| c.is_alphabetic() || key_codes::from_name(c.encode_utf8(&mut [0; 4])) == key.code;
+        let unshifted = input.unshifted.filter(|&c| !input.mods.shift || fits(c));
+        let input = KeyInput { code: key.code, unshifted, ..input };
+        let data = core.encode_key(&input);
         if data.is_empty() {
             return None;
         }
-        let id = KeyId::of(input.key, input.numpad);
-        if !self.encoded.contains(&id) {
-            self.encoded.push(id);
+        if !self.encoded.iter().any(|(held, _)| *held == key.id) {
+            self.encoded.push((key.id.clone(), key.code));
         }
         (Some(data.as_str()) != input.text.as_deref()).then_some(data)
     }
 
     /// Kitty sessions that asked for releases hear them, for the keys whose press they heard.
-    pub fn release(&mut self, core: &mut Core, keystroke: &Keystroke, numpad: bool, mac: bool) -> Option<String> {
-        if !self.forget(&KeyId::of(&keystroke.key, numpad)) || self.preedit > 0 {
+    pub fn release(&mut self, core: &mut Core, keystroke: &Keystroke, key: &PhysicalKey, mac: bool) -> Option<String> {
+        let code = self.forget(&key.id)?;
+        if self.preedit > 0 {
             return None;
         }
-        let data = core.encode_key(&KeyInput { numpad, ..key_input(keystroke, Press::Release, mac) });
+        let data = core.encode_key(&KeyInput { code, ..key_input(keystroke, Press::Release, mac) });
         (!data.is_empty()).then_some(data)
     }
 }
@@ -233,7 +269,8 @@ fn produces_character(keystroke: &Keystroke) -> bool {
     single_char(text).is_some_and(|c| !c.is_control())
 }
 
-/// The keystroke as Ghostty's encoder reads a `KeyboardEvent` (`encodeKey`).
+/// The keystroke as Ghostty's encoder reads a `KeyboardEvent` (`encodeKey`); its code is the one the
+/// name guesses until [`Keyboard`] gives it the physical key.
 pub(super) fn key_input(keystroke: &Keystroke, action: Press, mac: bool) -> KeyInput<'_> {
     let m = &keystroke.modifiers;
     let mods = Modifiers { shift: m.shift, ctrl: m.control, alt: m.alt, meta: m.platform };
@@ -256,12 +293,11 @@ pub(super) fn key_input(keystroke: &Keystroke, action: Press, mac: bool) -> KeyI
     };
     KeyInput {
         action,
-        key: &keystroke.key,
+        code: key_codes::from_name(&keystroke.key),
         mods,
         consumed,
         text,
         unshifted: base.and_then(|c| unshifted(c, m.shift)),
-        numpad: false,
     }
 }
 
@@ -322,8 +358,14 @@ mod tests {
         mac: bool,
         /// `KeyDownEvent::prefer_character_input`.
         character_input: bool,
-        /// `Window::key_on_numpad`.
-        numpad: bool,
+        /// `Window::native_key`.
+        native: Option<NativeKeyCode>,
+    }
+
+    impl Platform {
+        fn key(native: NativeKeyCode) -> Self {
+            Self { native: Some(native), mac: matches!(native, NativeKeyCode::Mac(_)), ..Self::default() }
+        }
     }
 
     /// The session's `key_down` for a platform-shaped event.
@@ -333,15 +375,34 @@ mod tests {
         keystroke: &Keystroke,
         platform: Platform,
     ) -> Option<String> {
-        keyboard.forget_missed_release(keystroke, platform.numpad, false);
+        let key = PhysicalKey::of(keystroke, platform.native);
+        keyboard.forget_missed_release(&key, false);
         if keyboard.composing(keystroke, platform.character_input) {
             return None;
         }
         match key_action_on(keystroke, false, core.alt_screen(), false, platform.mac)? {
             KeyAction::Send(data) => Some(data.to_owned()),
-            KeyAction::Encode(input) => keyboard.press(core, &KeyInput { numpad: platform.numpad, ..input }),
+            KeyAction::Encode(input) => keyboard.press(core, &key, input),
             _ => None,
         }
+    }
+
+    /// The session's `key_up` for a platform-shaped event.
+    fn released_as(
+        keyboard: &mut Keyboard,
+        core: &mut Core,
+        keystroke: &Keystroke,
+        platform: Platform,
+    ) -> Option<String> {
+        keyboard.release(core, keystroke, &PhysicalKey::of(keystroke, platform.native), platform.mac)
+    }
+
+    fn released(keyboard: &mut Keyboard, core: &mut Core, keystroke: &Keystroke) -> Option<String> {
+        released_as(keyboard, core, keystroke, Platform::default())
+    }
+
+    fn sent_as(core: &mut Core, keystroke: &Keystroke, platform: Platform) -> Option<String> {
+        pressed_as(&mut Keyboard::default(), core, keystroke, platform)
     }
 
     fn send(spec: &'static str) -> Option<String> {
@@ -456,8 +517,8 @@ mod tests {
         core.write(b"\x1b[>3u");
         let mut keyboard = Keyboard::default();
         assert_eq!(pressed(&mut keyboard, &mut core, &a, false), None);
-        assert_eq!(keyboard.release(&mut core, &a, false, false).as_deref(), Some("\x1b[97;1:3u"));
-        assert_eq!(keyboard.release(&mut core, &a, false, false), None, "one release per press");
+        assert_eq!(released(&mut keyboard, &mut core, &a).as_deref(), Some("\x1b[97;1:3u"));
+        assert_eq!(released(&mut keyboard, &mut core, &a), None, "one release per press");
     }
 
     #[test]
@@ -473,25 +534,89 @@ mod tests {
         // Shift let go first: the key comes up as "/", still the key whose press was heard.
         let mut keyboard = Keyboard::default();
         assert_eq!(pressed(&mut keyboard, &mut core, &question, false).as_deref(), Some("\x1b[47:63;2u"));
-        assert_eq!(keyboard.release(&mut core, &typed("/", Some("/")), false, false).as_deref(), Some("\x1b[47;1:3u"));
+        assert_eq!(released(&mut keyboard, &mut core, &typed("/", Some("/"))).as_deref(), Some("\x1b[47;1:3u"));
+    }
+
+    #[test]
+    fn a_release_matches_its_press_on_every_layout() {
+        use NativeKeyCode::{Mac, Windows, Xkb};
+        let mut core = core(80, 24);
+        core.write(b"\x1b[>15u");
+        // German Shift+7 types `/`; Shift let go first, the key comes up as `7`. Without the
+        // layout's map (`getLayoutMap`) the press is the typed text, as on the web without one.
+        for native in [Windows(0x08), Xkb(16), Mac(0x1a)] {
+            let platform = Platform::key(native);
+            let mut keyboard = Keyboard::default();
+            let slash = with_held_shift(&typed("/", Some("/")), true);
+            assert_eq!(pressed_as(&mut keyboard, &mut core, &slash, platform), None, "{native:?}");
+            let seven = typed("7", Some("7"));
+            let release = released_as(&mut keyboard, &mut core, &seven, platform);
+            assert_eq!(release.as_deref(), Some("\x1b[55;1:3u"), "{native:?}");
+        }
+        // German Shift+8 types `(`, which US types with 9: the key is not 9.
+        let paren = with_held_shift(&typed("(", Some("(")), true);
+        assert_eq!(sent_as(&mut core, &paren, Platform::key(Windows(0x09))), None);
+        assert_eq!(sent_as(&mut core, &paren, Platform::key(Windows(0x0a))).as_deref(), Some("\x1b[57:40;2u"), "US 9");
     }
 
     #[test]
     fn keypad_keys_keep_their_identity() {
+        use NativeKeyCode::{Mac, Windows, Xkb};
         let mut core = core(80, 24);
-        let numpad = Platform { numpad: true, ..Platform::default() };
-        let keypad =
-            |core: &mut Core, keystroke: Keystroke| pressed_as(&mut Keyboard::default(), core, &keystroke, numpad);
-        assert_eq!(keypad(&mut core, typed("1", Some("1"))), None, "legacy sessions get the typed digit");
-        assert_eq!(keypad(&mut core, key("enter")).as_deref(), Some("\r"));
-        assert_eq!(keypad(&mut core, key("end")).as_deref(), Some("\x1b[F"), "NumLock off keeps navigation keys");
-        // Linux names keypad keys by keysym (KP_1 is "1", KP_Add "add"); Windows and macOS by character.
+        let keypad = |core: &mut Core, keystroke: Keystroke, native| sent_as(core, &keystroke, Platform::key(native));
+        // Keypad 1 and Enter on each platform.
+        let ones = [Windows(0x4f), Xkb(87), Mac(0x53)];
+        let enters = [Windows(0xe01c), Xkb(104), Mac(0x4c)];
+        for native in ones {
+            assert_eq!(keypad(&mut core, typed("1", Some("1")), native), None, "legacy sessions get the typed digit");
+        }
+        for native in enters {
+            assert_eq!(keypad(&mut core, key("enter"), native).as_deref(), Some("\r"), "{native:?}");
+        }
         core.write(b"\x1b[>11u");
-        assert_eq!(keypad(&mut core, typed("1", Some("1"))).as_deref(), Some("\x1b[57400u"));
-        assert_eq!(keypad(&mut core, typed("add", Some("+"))).as_deref(), Some("\x1b[57413u"));
-        assert_eq!(keypad(&mut core, typed("+", Some("+"))).as_deref(), Some("\x1b[57413u"));
-        assert_eq!(keypad(&mut core, key("enter")).as_deref(), Some("\x1b[57414u"));
-        assert_eq!(sent(&mut core, &typed("1", Some("1")), false).as_deref(), Some("\x1b[49u"), "the main row's 1");
+        for native in ones {
+            assert_eq!(keypad(&mut core, typed("1", Some("1")), native).as_deref(), Some("\x1b[57400u"), "{native:?}");
+        }
+        for native in enters {
+            assert_eq!(keypad(&mut core, key("enter"), native).as_deref(), Some("\x1b[57414u"), "{native:?}");
+        }
+        // Linux names keypad keys by keysym (KP_Add is "add"); Windows and macOS by character.
+        assert_eq!(keypad(&mut core, typed("add", Some("+")), Xkb(86)).as_deref(), Some("\x1b[57413u"));
+        assert_eq!(keypad(&mut core, typed("+", Some("+")), Windows(0x4e)).as_deref(), Some("\x1b[57413u"));
+        assert_eq!(keypad(&mut core, typed("+", Some("+")), Mac(0x45)).as_deref(), Some("\x1b[57413u"));
+        assert_eq!(
+            keypad(&mut core, typed("1", Some("1")), Mac(0x12)).as_deref(),
+            Some("\x1b[49u"),
+            "the main row's 1"
+        );
+    }
+
+    #[test]
+    fn keypad_keys_with_numlock_off_are_its_navigation_keys() {
+        use NativeKeyCode::{Windows, Xkb};
+        let mut core = core(80, 24);
+        let end = key("end");
+        for native in [Windows(0x4f), Xkb(87)] {
+            assert_eq!(sent_as(&mut core, &end, Platform::key(native)).as_deref(), Some("\x1b[F"), "a shell's End");
+        }
+        let keypad_one = Platform::key(Windows(0x4f));
+        assert_eq!(sent_as(&mut core, &key("up"), Platform::key(Windows(0x48))).as_deref(), Some("\x1b[A"));
+        // Application keypad mode (DECKPAM).
+        core.write(b"\x1b=");
+        assert_eq!(sent_as(&mut core, &end, keypad_one).as_deref(), Some("\x1b[F"));
+        assert_eq!(sent_as(&mut core, &typed("1", Some("1")), keypad_one), None, "digits while mode 1035 is set");
+        core.write(b"\x1b[?1035l");
+        assert_eq!(sent_as(&mut core, &typed("1", Some("1")), keypad_one).as_deref(), Some("\x1bOq"));
+        assert_eq!(sent_as(&mut core, &end, keypad_one).as_deref(), Some("\x1b[F"));
+        core.write(b"\x1b>\x1b[>11u");
+        assert_eq!(sent_as(&mut core, &end, keypad_one).as_deref(), Some("\x1b[57424u"), "KP_END, not END");
+        // NumLock turned off while keypad 1 is held: it comes up as End, still the key pressed.
+        let mut keyboard = Keyboard::default();
+        let one = typed("1", Some("1"));
+        assert_eq!(pressed_as(&mut keyboard, &mut core, &one, keypad_one).as_deref(), Some("\x1b[57400u"));
+        assert_eq!(released_as(&mut keyboard, &mut core, &end, keypad_one).as_deref(), Some("\x1b[57400;1:3u"));
+        // A layout-free name on a remapped key wins over its position (XKB's caps:escape).
+        assert_eq!(sent_as(&mut core, &key("escape"), Platform::key(Xkb(66))).as_deref(), Some("\x1b[27u"));
     }
 
     #[test]
@@ -504,7 +629,7 @@ mod tests {
         keyboard.set_preedit("´");
         assert_eq!(pressed(&mut keyboard, &mut core, &e, false), None);
         assert_eq!(pressed(&mut keyboard, &mut core, &key("enter"), false), None, "Enter commits");
-        assert_eq!(keyboard.release(&mut core, &e, false, false), None);
+        assert_eq!(released(&mut keyboard, &mut core, &e), None);
         assert_eq!(keyboard.commit("é"), Some("é"));
         // Windows gives a dead key its spacing character and asks for character input.
         let dead = Platform { character_input: true, ..Platform::default() };

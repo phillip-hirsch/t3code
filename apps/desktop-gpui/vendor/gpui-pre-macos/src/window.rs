@@ -11,10 +11,11 @@ use gpui::{
     AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, CursorStyle, ExternalDragPayload,
     ExternalPaths, FileDropEvent, ForegroundExecutor, FrameRequestSource, KeyDownEvent, Keystroke,
     Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, PlatformAtlas, PlatformDisplay, PlatformFrameSignal, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
-    SharedString, Size, SystemWindowTab, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControlArea, WindowKind, WindowParams, WindowVisibility, point, px, size,
+    NativeKey, NativeKeyCode, Pixels, PlatformAtlas, PlatformDisplay, PlatformFrameSignal,
+    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel,
+    RequestFrameOptions, SharedString, Size, SystemWindowTab, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind, WindowParams,
+    WindowVisibility, point, px, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -682,6 +683,8 @@ struct MacWindowState {
     transparent_titlebar: bool,
     previous_modifiers_changed_event: Option<PlatformInput>,
     keystroke_for_do_command: Option<Keystroke>,
+    /// The physical key of the key event being dispatched.
+    native_key: NativeKey,
     do_command_handled: Option<bool>,
     external_files_dragged: bool,
     // Whether the next left-mouse click is also the focusing click.
@@ -1149,6 +1152,7 @@ impl MacWindow {
                     .is_none_or(|titlebar| titlebar.appears_transparent),
                 previous_modifiers_changed_event: None,
                 keystroke_for_do_command: None,
+                native_key: NativeKey::default(),
                 do_command_handled: None,
                 external_files_dragged: false,
                 first_mouse: false,
@@ -1720,6 +1724,10 @@ impl PlatformWindow for MacWindow {
                 on: modifiers.contains(NSEventModifierFlags::CapsLock),
             }
         }
+    }
+
+    fn native_key(&self) -> NativeKey {
+        self.0.as_ref().lock().native_key
     }
 
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
@@ -2707,8 +2715,11 @@ extern "C" fn handle_key_event(
     let window_height = lock.content_size().height;
     let event = unsafe { platform_input_from_native(native_event, Some(window_height)) };
 
-    let Some(event) = event else {
+    let Some((event, key_code)) = event else {
         return Bool::NO;
+    };
+    lock.native_key = NativeKey {
+        code: key_code.map(NativeKeyCode::Mac),
     };
 
     let run_callback = |event: PlatformInput| -> Bool {
@@ -2866,7 +2877,8 @@ extern "C" fn handle_view_event(this: &AnyObject, _: Sel, native_event: *mut Any
         }
         _ => {}
     }
-    let event = unsafe { platform_input_from_native(native_event, Some(window_height)) };
+    let event = unsafe { platform_input_from_native(native_event, Some(window_height)) }
+        .map(|(event, _)| event);
 
     if let Some(mut event) = event {
         // AppKit unhides the cursor on the next mouse movement; mirror that here.

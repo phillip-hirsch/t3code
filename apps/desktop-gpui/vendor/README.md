@@ -103,16 +103,18 @@ registered for the current focus, because Windows `WM_CHAR` and IME callbacks re
 handler without checking focus. Pointer events are untouched. Tests:
 `focus_next_skips_an_inert_subtree`, `cached_view_replay_recomputes_inertness`.
 
-**Key events say whether they came from the numeric keypad.** The terminal reports keypad keys
-apart from the main ones (Kitty's `KP_*` codes), as the web does from `KeyboardEvent.code`.
-0.3.11 names a keypad key like its main-row twin (`1`, `+`, `enter`) and keeps no other trace of
-it. A field on `KeyDownEvent` would break the platforms that build it without one (gpui-pre-macos
-is not vendored), so the patch adds `PlatformWindow::key_on_numpad` (default `false`), which the
-Windows and Linux platforms answer for the key event they are dispatching, and
-`Window::key_on_numpad`, which reads it. macOS keeps the default. Files:
+**Key events carry the platform's code for their physical key.** The terminal encodes keys from
+the physical key the way the web does from `KeyboardEvent.code`: a release matches its press on
+any layout, and keypad keys stay keypad keys. 0.3.11's keystrokes carry only a layout-dependent
+name and the typed character (a keypad `1` looks like the main row's). A field on `KeyDownEvent`
+would break every crate that builds one, so the patch adds `PlatformWindow::native_key` (default:
+nothing), which each platform answers for the key event it is dispatching, and
+`Window::native_key`, which reads it. `NativeKey` holds a `NativeKeyCode`: the Windows scan code
+with the extended bit, the XKB keycode, or the macOS `keyCode`. Files:
 
+- `src/platform/keystroke.rs`: `NativeKeyCode` and `NativeKey`.
 - `src/platform.rs`: the trait method.
-- `src/window.rs`: `Window::key_on_numpad`.
+- `src/window.rs`: `Window::native_key`.
 
 The crate's tests need `--features test-support`; run them from a scratch copy outside this
 repository (`cargo test --features test-support --lib`). The copy needs the published crate's
@@ -136,13 +138,12 @@ the environment variable still works. Files:
 - `src/platform.rs`: the `DIRECT_COMPOSITION_DISABLED` flag, its setter, and the check in `WindowsPlatform::new`.
 - `src/gpui_windows.rs`: exports the setter.
 
-**Key events say whether they came from the numeric keypad** (see gpui-pre's patch of that name).
-`handle_key_event` records it for every key message: the `VK_NUMPAD*` and operator keys, an
-extended `VK_RETURN`, and the navigation keys without the extended bit (the keypad with NumLock
-off). Files:
+**Key events carry the platform's code for their physical key** (see gpui-pre's patch of that
+name). `handle_key_event` records the scan code of every key message from its `lparam` (bits
+16-23, with `0xE000` for the extended bit 24). Files:
 
-- `src/events.rs`: `is_numpad_key`, called in `handle_key_event`.
-- `src/window.rs`: `WindowsWindowState::last_key_on_numpad` and `key_on_numpad`.
+- `src/events.rs`: `native_key_code`, called in `handle_key_event`.
+- `src/window.rs`: `WindowsWindowState::last_native_key` and `native_key`.
 
 ## gpui-pre-linux 0.3.11
 
@@ -161,19 +162,27 @@ so saved bounds include no shadow. The app keeps its resize edges for that case
 
 - `src/linux/x11/window.rs`: `request_decorations`, `window_decorations` and `set_client_inset`.
 
-**Key events say whether they came from the numeric keypad** (see gpui-pre's patch of that name).
-Each key press, repeat and release records whether its keysym is a keypad one
-(`Keysym::is_keypad_key`); an IBus commit sent as a key is not. Files:
+**Key events carry the platform's code for their physical key** (see gpui-pre's patch of that
+name). Each key press, repeat and release records its XKB keycode; an IBus commit sent as a key
+has none. Files:
 
-- `src/linux/x11/client.rs`, `src/linux/x11/window.rs`: `X11ClientState::key_on_numpad`, set
-  in the `KeyPress` and `KeyRelease` arms, and `key_on_numpad`.
-- `src/linux/wayland/client.rs`, `src/linux/wayland/window.rs`: `WaylandClientState::key_on_numpad`,
-  set in the keyboard `Key` event, the repeat timer and `CommitString`, and `key_on_numpad`.
+- `src/linux/x11/client.rs`, `src/linux/x11/window.rs`: `X11ClientState::native_key`, set in
+  the `KeyPress` and `KeyRelease` arms, and `native_key`.
+- `src/linux/wayland/client.rs`, `src/linux/wayland/window.rs`: `WaylandClientState::native_key`,
+  set in the keyboard `Key` event, the repeat timer and `CommitString`, and `native_key`.
 
 ## gpui-pre-macos 0.3.11
 
 GPUI's macOS platform (Zed's `gpui_macos`), which gpui-kit pulls in through `gpui-pre-platform`.
-Unmodified.
+
+**Key events carry the platform's code for their physical key** (see gpui-pre's patch of that
+name). `platform_input_from_native` already holds the `NSEvent`; for a key down or up it also
+returns its `keyCode` (a safe `objc2-app-kit` call `parse_keystroke` already makes), and
+`handle_key_event` stores it in the window state before dispatching. No new `unsafe`. Files:
+
+- `src/events.rs`: `platform_input_from_native` returns the key code beside the input.
+- `src/window.rs`: `MacWindowState::native_key`, set in `handle_key_event`; `native_key`; the
+  view-event caller drops the code.
 
 ## gpui-base 0.9.0
 
