@@ -2787,8 +2787,19 @@ pub(super) fn guest_foreground(tokens: &Tokens) -> Hsla {
 /// A project's repo favicon, fetched once per workspace root and favicon path.
 pub(super) enum Favicon {
     Loading,
-    Missing,
+    /// None came on this socket: absent, or the read failed.
+    Missing(crate::rpc::SocketId),
     Ready(Arc<Image>),
+}
+
+/// Whether to fetch a favicon on `socket`: never asked, or missed on an earlier socket, as the
+/// web's signed favicon URL is asked again when its session changes.
+fn wants_favicon(state: Option<&Favicon>, socket: &crate::rpc::SocketId) -> bool {
+    match state {
+        None => true,
+        Some(Favicon::Missing(asked)) => asked != socket,
+        Some(Favicon::Loading | Favicon::Ready(_)) => false,
+    }
 }
 
 impl Workspace {
@@ -2808,13 +2819,14 @@ impl Workspace {
     /// (`createProjectFaviconUrlAtomFamily` in `client-runtime/src/state/assets.ts`).
     fn load_favicons(&mut self, cx: &mut Context<Self>) {
         for project in &self.shell.projects {
-            if self.favicon_state(project).is_some() {
-                continue;
-            }
             let Some(session) = self.session(&project.environment_id) else { continue };
             let (Some(client), Some(endpoint)) = (session.client.clone(), session.endpoint.clone()) else {
                 continue;
             };
+            let socket = client.socket_id();
+            if !wants_favicon(self.favicon_state(project), &socket) {
+                continue;
+            }
             let (environment, root, path) =
                 (project.environment_id.clone(), project.workspace_root.clone(), project.favicon_path.clone());
             self.sidebar
@@ -2829,7 +2841,7 @@ impl Workspace {
                 // Signed with the session token, as the web's image requests carry its cookie.
                 let image = project_icons::fetch(&client, endpoint, resource).await.ok();
                 let _ = this.update(cx, |this, cx| {
-                    let state = image.map_or(Favicon::Missing, Favicon::Ready);
+                    let state = image.map_or(Favicon::Missing(socket), Favicon::Ready);
                     this.sidebar.favicons.entry(environment).or_default().entry(root).or_default().insert(path, state);
                     this.notify_sidebar(cx);
                 });
@@ -2922,6 +2934,16 @@ fn row_probe(active: bool, selected: bool, cx: &App) -> Option<AnyElement> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_missing_favicon_is_asked_again_on_a_new_socket() {
+        let (first, second) = (crate::rpc::RpcClient::unopened(), crate::rpc::RpcClient::unopened());
+        let missing = Favicon::Missing(first.socket_id());
+        assert!(wants_favicon(None, &first.socket_id()));
+        assert!(!wants_favicon(Some(&Favicon::Loading), &first.socket_id()));
+        assert!(!wants_favicon(Some(&missing), &first.socket_id()), "a miss stands on its socket");
+        assert!(wants_favicon(Some(&missing), &second.socket_id()), "a reconnect asks again");
+    }
 
     #[test]
     fn context_menus_open_from_the_menu_key_or_shift_f10() {

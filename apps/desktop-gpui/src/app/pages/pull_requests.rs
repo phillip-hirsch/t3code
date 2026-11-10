@@ -319,6 +319,14 @@ impl Workspace {
         self.follow_pull_requests(cx);
     }
 
+    /// The page shows a list that never read (opened offline, or its read failed): it reads now.
+    pub(super) fn read_unread_pull_requests(&mut self, cx: &mut Context<Self>) {
+        let state = &self.pull_requests;
+        if self.page == Some(super::Page::PullRequests) && state.list.is_none() && !state.loading {
+            self.read_pull_requests(false, cx);
+        }
+    }
+
     /// Changes what the list asks for and reads it again from the first page.
     fn set_pull_request_scope(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut PullRequestsState)) {
         self.cancel_close_sweep(cx);

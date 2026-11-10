@@ -332,7 +332,14 @@ impl Workspace {
         cx: &mut Context<Self>,
         done: impl FnOnce(&mut Workspace, &str, bool, &mut Window, &mut Context<Workspace>) + 'static,
     ) {
-        let (Some(client), Some(key)) = (self.pull_request_client(), self.shown_pr_key()) else { return };
+        let Some(key) = self.shown_pr_key() else { return };
+        // Offline, the write fails like any other, so the caller's pending marks clear.
+        let Some(client) = self.pull_request_client() else {
+            toast_error(window, cx, failure, "The pull request's environment is not connected.");
+            done(self, &key, false, window, cx);
+            cx.notify();
+            return;
+        };
         // The write grant can be lost while an editor or form stays open (`permissionAtom`).
         if !self.pr_panel_writable(&key) {
             done(self, &key, false, window, cx);

@@ -420,6 +420,7 @@ impl Workspace {
                 this.track_visit(cx);
                 this.sync_now(cx);
                 this.sync_child_approvals(cx);
+                this.sync_draft_workspace(cx);
                 this.sync_lineage_titles(cx);
                 this.sync_older_settled_counts(&batch_id, cx);
             },
