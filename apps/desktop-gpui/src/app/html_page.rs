@@ -572,6 +572,13 @@ pub(super) struct HtmlPages {
     theme: Option<(ThemeStamp, Rc<PageTheme>)>,
 }
 
+impl HtmlPages {
+    /// Drops `environment`'s pages that could not load, so they mint again when next drawn.
+    fn forget_failed(&mut self, environment: &str) {
+        self.pages.retain(|key, page| !(page.failed && page.embed.is_none() && key.owner.env == environment));
+    }
+}
+
 /// Where a shell's report came from.
 #[derive(Clone)]
 enum Origin {
@@ -748,6 +755,14 @@ impl Workspace {
         if let Some(page) = self.html_pages.pages.get_mut(&key) {
             page._task = Some(task);
         }
+    }
+
+    /// `environment` (re)connected: the pages and apps that could not load there load again, as
+    /// the web's asset URL queries run again once their connection settles.
+    pub(super) fn retry_failed_embeds(&mut self, environment: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.html_pages.forget_failed(environment);
+        self.retry_failed_mcp_apps(environment, window, cx);
+        cx.notify();
     }
 
     fn html_page_failed(&mut self, key: &PageKey, cx: &mut Context<Self>) {
@@ -1341,6 +1356,34 @@ mod tests {
             json!({"key": "k", "metaKey": false, "ctrlKey": true, "shiftKey": false, "altKey": false})
         );
         assert_eq!(message["params"]["blocked"].as_array().map(Vec::len), Some(3));
+    }
+
+    #[test]
+    fn a_reconnect_forgets_only_that_environments_failed_pages() {
+        let page = |failed| Page {
+            embed: None,
+            url: None,
+            failed,
+            content_height: None,
+            dark: false,
+            theme: None,
+            shortcuts: None,
+            used: 0,
+            _task: None,
+            _messages: None,
+        };
+        let key = |env: &str, attachment: &str| PageKey {
+            owner: PaneOwner { pane: ChatPane::Main, env: env.to_owned().into(), thread: "t".into() },
+            attachment: attachment.to_owned().into(),
+        };
+        let mut pages = HtmlPages::default();
+        pages.pages.insert(key("a", "failed"), page(true));
+        pages.pages.insert(key("a", "loading"), page(false));
+        pages.pages.insert(key("b", "failed"), page(true));
+        pages.forget_failed("a");
+        let mut left: Vec<_> = pages.pages.keys().map(|k| format!("{}/{}", k.owner.env, k.attachment)).collect();
+        left.sort();
+        assert_eq!(left, ["a/loading", "b/failed"]);
     }
 
     #[test]

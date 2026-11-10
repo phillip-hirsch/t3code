@@ -766,6 +766,20 @@ impl Workspace {
         self.remeasure_page_row(&key.attachment, cx);
     }
 
+    /// Opens a fresh document for each app on `environment` whose document could not load.
+    pub(super) fn retry_failed_mcp_apps(&mut self, environment: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let failed: Vec<AppKey> = (self.mcp_apps.apps.iter())
+            .filter(|(key, app)| {
+                key.owner.env == environment
+                    && app.document.as_ref().is_some_and(|doc| doc.failed && doc.embed.is_none())
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in failed {
+            self.open_app_document(&key, window, cx);
+        }
+    }
+
     /// "Show app": a fresh document with a fresh URL and host.
     fn show_mcp_app(&mut self, key: &AppKey, window: &mut Window, cx: &mut Context<Self>) {
         if self.mcp_apps.apps.get(key).is_some_and(|app| app.document.is_none()) {
