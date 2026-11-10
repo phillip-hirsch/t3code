@@ -88,6 +88,11 @@ pub(super) struct PreviewState {
     save: logic::SaveQueue,
     last_change: Instant,
     markdown: Option<Entity<TextViewState>>,
+    /// The rendered Markdown's images by the destination it writes; a workspace mutation drops
+    /// them, as the web mints new URLs for each `workspaceMutationId`.
+    markdown_images: crate::app::markdown_images::ImageCache,
+    /// The `revision` whose images have started loading.
+    images_for: Option<u64>,
     /// The table of a CSV or TSV file's contents, parsed when first shown.
     table: Option<std::rc::Rc<super::table::Table>>,
     /// Bumped whenever `saved` changes, so rendered views rebuild without comparing text.
@@ -122,6 +127,8 @@ impl PreviewState {
             save: logic::SaveQueue::default(),
             last_change: Instant::now(),
             markdown: None,
+            markdown_images: Default::default(),
+            images_for: None,
             table: None,
             revision: 0,
             full: None,
@@ -285,6 +292,10 @@ impl Workspace {
         let changed = state.mutation.as_ref().is_some_and(|m| *m != mutation);
         let dirty = state.save.pending();
         state.mutation = Some(mutation);
+        if changed {
+            state.markdown_images = Default::default();
+            state.images_for = None;
+        }
         if state.kind == logic::FileKind::Image {
             state.load = Load::Image;
             // `workspace-revision`: a mutation fetches the image again, at its fitted size.
@@ -744,6 +755,7 @@ impl Workspace {
                         let right = f32::from(event.bounds.right());
                         let width = (right - f32::from(event.event.position.x)).clamp(EXPLORER_MIN, max);
                         this.files.explorer_width = Some(width);
+                        this.save_explorer_width_later(cx);
                         cx.notify();
                     }))
                     .child(
@@ -766,6 +778,7 @@ impl Workspace {
                                 let key = event.keystroke.key.as_str();
                                 if let Some(next) = logic::explorer_key_width(explorer_width, EXPLORER_MIN, max, key) {
                                     this.files.explorer_width = Some(next);
+                                    this.save_explorer_width_later(cx);
                                     cx.stop_propagation();
                                     cx.notify();
                                 }
@@ -847,6 +860,7 @@ impl Workspace {
             let tooltip: SharedString = if crumb.is_empty() { project_name.clone() } else { crumb.clone().into() };
             let source = source.clone();
             let keep = !folder;
+            let navigable = !current && (!host || logic::is_listable_host_folder(&crumb));
             trail = trail.child(
                 div()
                     .id(ElementId::Name(format!("crumb:{crumb}").into()))
@@ -862,7 +876,7 @@ impl Workspace {
                             el.text_color(tokens.muted_foreground)
                         }
                     })
-                    .when(!current, |el| {
+                    .when(navigable, |el| {
                         crate::app::chat::focusable(el, tokens)
                             .cursor_pointer()
                             .hover(|s| s.text_color(tokens.foreground))
@@ -919,6 +933,9 @@ impl Workspace {
                 el.child(action("file-rendered", icon, mode.toggle_label(rendered).into(), rendered).on_click(
                     cx.listener(move |this, _, _, cx| {
                         this.files.set_rendered(&key, mode, !rendered);
+                        if key.in_workspace() {
+                            this.save_file_prefs();
+                        }
                         let request = this.files.reveals.get(&key).map(|(_, request)| *request);
                         if let Some(state) = this.files.previews.get_mut(&key) {
                             state.rendered_reveal = if rendered { None } else { request };
@@ -953,6 +970,7 @@ impl Workspace {
                 el.child(action("file-explorer-toggle", IconName::FolderTree, label.into(), open).on_click(
                     cx.listener(|this, _, _, cx| {
                         this.files.explorer_hidden = !this.files.explorer_hidden;
+                        this.save_file_prefs();
                         cx.notify();
                     }),
                 ))
@@ -999,6 +1017,9 @@ impl Workspace {
         let editable = key.in_workspace()
             && self.can_write_files(&key.checkout.env, cx) == Some(true)
             && !logic::is_host_path(&key.path);
+        let markdown_links = (render_markdown && key.in_workspace() && logic::is_markdown(&key.path))
+            .then(|| self.load_file_markdown_images(key, cx))
+            .flatten();
         let Some(state) = self.files.previews.get_mut(key) else { return div().into_any_element() };
         let centered = |child: AnyElement| {
             div()
@@ -1166,6 +1187,17 @@ impl Workspace {
                             });
                         }
                     });
+                    let this = cx.entity().downgrade();
+                    let text = TextView::new(&view).when_some(toggle, TextView::on_task_toggle).when_some(
+                        markdown_links,
+                        |text, (images, base)| {
+                            text.image_source(images.resolver()).on_link_click(move |url, event, window, cx| {
+                                let _ = this.update(cx, |this, cx| {
+                                    this.click_file_markdown_link(&base, url, event, window, cx);
+                                });
+                            })
+                        },
+                    );
                     return div()
                         .id("file-markdown")
                         .flex_1()
@@ -1173,7 +1205,7 @@ impl Workspace {
                         .overflow_y_scroll()
                         .px(px(24.))
                         .py(px(16.))
-                        .child(TextView::new(&view).when_some(toggle, TextView::on_task_toggle))
+                        .child(text)
                         .into_any_element();
                 }
                 let Some(editor) = state.editor.clone() else { return div().into_any_element() };
@@ -1470,13 +1502,107 @@ impl Workspace {
         if !key.in_workspace() {
             return self.attachment_resource(key, false);
         }
-        let absolute = logic::absolute_path(&key.checkout.cwd, &key.path);
-        Some(match &self.target {
+        Some(self.workspace_file_resource(key, &logic::absolute_path(&key.checkout.cwd, &key.path)))
+    }
+
+    /// The asset resource for the file at `absolute`, read through `key`'s checkout.
+    fn workspace_file_resource(&self, key: &FileKey, absolute: &str) -> Value {
+        match &self.target {
             Some(Target::Thread { id: thread_id, .. }) => {
                 json!({"_tag": "media-file", "threadId": thread_id, "path": absolute})
             }
             _ => json!({"_tag": "draft-workspace-file", "cwd": key.checkout.cwd, "path": absolute}),
-        })
+        }
+    }
+
+    /// `FileMarkdownPreview`: starts loading the images a rendered document shows, relative ones
+    /// from its folder and files through `key`'s environment, once per revision of its text.
+    /// Returns its image cache and folder.
+    fn load_file_markdown_images(
+        &mut self,
+        key: &FileKey,
+        cx: &mut Context<Self>,
+    ) -> Option<(crate::app::markdown_images::ImageCache, String)> {
+        use crate::app::markdown_images::{Source, classify, fetch_image, image_destinations};
+        let base = logic::markdown_base(&key.checkout.cwd, &key.path);
+        let state = self.files.previews.get_mut(key)?;
+        let images = state.markdown_images.clone();
+        if !matches!(state.load, Load::Text { .. }) || state.images_for == Some(state.revision) {
+            return Some((images, base));
+        }
+        state.images_for = Some(state.revision);
+        let destinations = image_destinations(&state.saved);
+        let env = &key.checkout.env;
+        let (client, endpoint) = (self.env_client(env), self.env_endpoint(env).cloned());
+        for destination in destinations {
+            if crate::app::markdown_media::media_kind(&destination).is_some() || !images.claim(&destination) {
+                continue;
+            }
+            let source = classify(&destination, Some(&base));
+            let resource = match &source {
+                Source::WorkspaceFile(path) => Some(self.workspace_file_resource(key, path)),
+                _ => None,
+            };
+            let (images, client, endpoint) = (images.clone(), client.clone(), endpoint.clone());
+            cx.spawn(async move |this, cx| {
+                let image = match source {
+                    Source::Data(format, bytes) => {
+                        Some(std::sync::Arc::new(gpui_kit::Image::from_bytes(format, bytes)))
+                    }
+                    Source::Direct(url) => fetch_image(url).await,
+                    Source::WorkspaceFile(_) => match (client, endpoint, resource) {
+                        (Some(client), Some(endpoint), Some(resource)) => {
+                            crate::app::pages::settings::code::projects::icon::fetch(&client, endpoint, resource)
+                                .await
+                                .inspect_err(|error| log::debug!("a rendered Markdown image: {error:#}"))
+                                .ok()
+                        }
+                        _ => None,
+                    },
+                    Source::Asset(_) | Source::Blocked => None,
+                };
+                let Some(image) = image else { return };
+                images.store(destination, image);
+                let _ = this.update(cx, |_, cx| cx.notify());
+            })
+            .detach();
+        }
+        Some((images, base))
+    }
+
+    /// A link in a rendered document (`ChatMarkdown` with `imageBaseDir`): a file, relative to
+    /// the document's folder, opens as a chat file link does; any other link as a chat link.
+    fn click_file_markdown_link(
+        &mut self,
+        base: &str,
+        url: &str,
+        event: &gpui_kit::ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::app::side_chat::ChatPane;
+        let right =
+            matches!(event, gpui_kit::ClickEvent::Mouse(click) if click.up.button == gpui_kit::MouseButton::Right);
+        let secondary = event.modifiers().secondary(cx);
+        if crate::thread_links::parse(url).is_some() {
+            let environment = self.active_environment().map(ToString::to_string);
+            let destination = crate::app::markdown_ui::thread_link_destination(url, environment.as_deref(), self);
+            if let Some((env, thread_id)) = destination {
+                self.select_thread_in(env, thread_id, window, cx);
+            }
+            return;
+        }
+        match logic::markdown_file_link(base, url) {
+            Some((target, _)) if right => {
+                self.open_file_menu(target, Some(ChatPane::Main), event.position(), window, cx);
+            }
+            Some((target, line)) => self.open_file_chip(ChatPane::Main, &target, line, secondary, window, cx),
+            None if right => {
+                self.open_link_menu(url, Some(ChatPane::Main), event.position(), window, cx);
+            }
+            None if !secondary && self.open_change_request_link(url, cx) => {}
+            None => self.open_link(url, event, window, cx),
+        }
     }
 
     /// The editor the details card's Open in launches.

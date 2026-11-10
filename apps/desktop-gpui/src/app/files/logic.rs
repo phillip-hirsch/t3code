@@ -385,16 +385,36 @@ pub(super) fn language_for_path(path: &str) -> &'static str {
     }
 }
 
-/// One crumb: its label and the folder (or file) path it names; `""` is the workspace root.
+/// `fileBreadcrumbs`: each crumb's label and the folder (or file) path it names. A workspace path
+/// starts at the project (`""`); a host path starts at its filesystem root.
 pub(super) fn breadcrumbs(path: &str, project_name: &str) -> Vec<(String, String)> {
-    let mut crumbs = vec![(project_name.to_owned(), String::new())];
-    let mut current = String::new();
-    for segment in path.split('/').filter(|s| !s.is_empty()) {
-        if !current.is_empty() {
-            current.push('/');
-        }
-        current.push_str(segment);
-        crumbs.push((segment.to_owned(), current.clone()));
+    let host = is_host_path(path);
+    let separator = if is_windows_absolute(path) { r"\" } else { "/" };
+    let parts: Vec<&str> = path.split(['/', '\\']).filter(|part| !part.is_empty()).collect();
+    let root = if path.starts_with(r"\\") {
+        r"\\"
+    } else if path.starts_with('/') {
+        "/"
+    } else {
+        ""
+    };
+    let mut crumbs = Vec::with_capacity(parts.len() + 1);
+    if !host {
+        crumbs.push((project_name.to_owned(), String::new()));
+    }
+    for (index, part) in parts.iter().enumerate() {
+        let joined = format!("{root}{}", parts[..=index].join(separator));
+        // A bare drive (`C:`) means the drive's current directory; its root is `C:\`. A bare `~`
+        // is not a host path; the home folder is `~/`.
+        let bare_drive = joined.len() == 2 && joined.as_bytes()[0].is_ascii_alphabetic() && joined.ends_with(':');
+        let crumb = if bare_drive {
+            format!(r"{joined}\")
+        } else if host && joined == "~" {
+            "~/".to_owned()
+        } else {
+            joined
+        };
+        crumbs.push(((*part).to_owned(), crumb));
     }
     crumbs
 }
@@ -538,9 +558,43 @@ pub(super) fn merge_search_entries(listed: &[Entry], hits: &[Entry]) -> Vec<Entr
     merged
 }
 
-/// `isHostPath`: an absolute path rather than one in the workspace.
+/// `isWindowsAbsolutePath`: a UNC share, or a drive (`C:`, `C:\`, `C:/`).
+pub(super) fn is_windows_absolute(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with(r"\\")
+        || (bytes.len() >= 2
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes.get(2).is_none_or(|c| matches!(c, b'/' | b'\\')))
+}
+
+/// `isHostPath`: an absolute or home-relative path rather than one in the workspace.
 pub(super) fn is_host_path(path: &str) -> bool {
-    path.starts_with('/') || path.starts_with('\\') || path.as_bytes().get(1) == Some(&b':')
+    path.starts_with('/') || is_windows_absolute(path) || path.starts_with("~/")
+}
+
+/// `isListableHostFolder`: UNC servers are not listable directories; their shares are.
+pub(super) fn is_listable_host_folder(path: &str) -> bool {
+    let unc_server = path.strip_prefix(r"\\").is_some_and(|rest| !rest.is_empty() && !rest.contains(['\\', '/']));
+    is_host_path(path) && !unc_server
+}
+
+/// `FileMarkdownPreview`'s `imageBaseDir`: the folder a rendered document's relative images and
+/// links start from.
+pub(super) fn markdown_base(cwd: &str, path: &str) -> String {
+    match path.rfind(['/', '\\']) {
+        // `/notes.md` sits in the root, not in `cwd`.
+        Some(at) => absolute_path(cwd, &path[..at.max(1)]),
+        None => cwd.to_owned(),
+    }
+}
+
+/// `resolveMarkdownFileLinkMeta` with the document's folder as the base: the file a rendered
+/// document's link names, with its `:line:column`, and the line.
+pub(super) fn markdown_file_link(base: &str, href: &str) -> Option<(String, Option<u32>)> {
+    let mut file = crate::file_links::parse_file_link(href)?;
+    file.path = crate::file_links::resolve_target(&file.path, Some(base))?;
+    Some((crate::file_links::with_position(&file), file.line))
 }
 
 /// `resolvePathLinkTarget` for a workspace path: joined onto `cwd` with its separator.
@@ -835,6 +889,52 @@ mod tests {
         assert_eq!(absolute_path("/home/me/repo", "src/a.rs"), "/home/me/repo/src/a.rs");
         assert_eq!(absolute_path("/repo", "/etc/hosts"), "/etc/hosts");
         assert_eq!(split_path("a/b/c.rs"), ("c.rs", "a/b"));
+    }
+
+    fn crumb_paths(path: &str) -> Vec<String> {
+        breadcrumbs(path, "t3code").into_iter().map(|(_, path)| path).collect()
+    }
+
+    #[test]
+    fn host_crumbs_start_at_the_filesystem_root() {
+        let crumbs = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs.iter().map(|(label, path)| ((*label).to_owned(), (*path).to_owned())).collect()
+        };
+        assert_eq!(
+            breadcrumbs("/tmp/t3-cleanup/report.md", "t3code"),
+            crumbs(&[("tmp", "/tmp"), ("t3-cleanup", "/tmp/t3-cleanup"), ("report.md", "/tmp/t3-cleanup/report.md")])
+        );
+        assert_eq!(
+            breadcrumbs(r"C:\Temp\report.md", "t3code"),
+            crumbs(&[("C:", r"C:\"), ("Temp", r"C:\Temp"), ("report.md", r"C:\Temp\report.md")])
+        );
+        assert_eq!(
+            crumb_paths(r"\\server\share\report.md"),
+            [r"\\server", r"\\server\share", r"\\server\share\report.md"]
+        );
+        assert_eq!(
+            breadcrumbs("~/.claude/CLAUDE.md", "t3code"),
+            crumbs(&[("~", "~/"), (".claude", "~/.claude"), ("CLAUDE.md", "~/.claude/CLAUDE.md")])
+        );
+        assert!(is_listable_host_folder("~/") && is_listable_host_folder("~/.claude"));
+        assert!(!is_listable_host_folder(r"\\server") && is_listable_host_folder(r"\\server\share"));
+        // A project folder named `~` stays inside the project.
+        assert_eq!(crumb_paths("~"), ["", "~"]);
+    }
+
+    #[test]
+    fn rendered_markdown_resolves_from_the_documents_folder() {
+        use crate::app::markdown_images::{Source, classify};
+        assert_eq!(markdown_base("/repo", "docs/guide/README.md"), "/repo/docs/guide");
+        assert_eq!(markdown_base(r"C:\repo", "docs/README.md"), r"C:\repo\docs");
+        assert_eq!(markdown_base("/repo", "README.md"), "/repo");
+        assert_eq!(markdown_base("/repo", "/tmp/notes/a.md"), "/tmp/notes");
+
+        let base = markdown_base("/repo", "docs/README.md");
+        assert_eq!(classify("img/logo.png", Some(&base)), Source::WorkspaceFile("/repo/docs/img/logo.png".into()));
+        assert_eq!(markdown_file_link(&base, "guide.md#L4"), Some(("/repo/docs/guide.md:4".into(), Some(4))));
+        assert_eq!(markdown_file_link(&base, "/etc/hosts"), Some(("/etc/hosts".into(), None)));
+        assert_eq!(markdown_file_link(&base, "https://example.com/a.md"), None);
     }
 
     #[test]

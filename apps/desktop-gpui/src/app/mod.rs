@@ -512,6 +512,7 @@ impl Workspace {
         let client_settings = crate::settings::ClientSettings::load();
         cx.set_global(crate::theme::Appearance::from_settings(&client_settings.values));
         crate::theme::set_preference(client_settings.theme_choice(), window, cx);
+        let files = files::FilesState::restored(&client_settings.values);
         let mut workspace = Self {
             connection: Connection::Starting,
             sessions: vec![sessions::EnvironmentSession::default()],
@@ -623,7 +624,7 @@ impl Workspace {
             palette: None,
             draft_picker: draft_picker::DraftPicker::new(cx),
             find: None,
-            files: files::FilesState::default(),
+            files,
             file_lookup: None,
             focus: cx.focus_handle(),
             areas: commands::WorkspaceAreas::new(cx),

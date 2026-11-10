@@ -97,7 +97,9 @@ pub(super) struct FilesState {
     reveal_requests: u64,
     /// `t3code.fileExplorerOpen`: the explorer beside a previewed file.
     explorer_hidden: bool,
+    /// `t3code.fileExplorerWidth`, stored once a resize settles.
     explorer_width: Option<f32>,
+    width_save: Option<gpui_kit::Task<()>>,
     /// `t3code.renderMarkdown`: Markdown files show rendered.
     render_markdown: bool,
     /// `t3code.renderBrowserFile`, `t3code.renderTable` and `t3code.renderMermaid`, which
@@ -245,9 +247,89 @@ impl Workspace {
     }
 }
 
+/// The web's `localStorage` keys for the file view, kept in this device's client settings.
+const EXPLORER_OPEN_KEY: &str = "t3code.fileExplorerOpen";
+const EXPLORER_WIDTH_KEY: &str = "t3code.fileExplorerWidth";
+const RENDER_MARKDOWN_KEY: &str = "t3code.renderMarkdown";
+const RENDER_BROWSER_FILE_KEY: &str = "t3code.renderBrowserFile";
+const RENDER_TABLE_KEY: &str = "t3code.renderTable";
+const RENDER_MERMAID_KEY: &str = "t3code.renderMermaid";
+
+impl FilesState {
+    /// The file view as the last session left it, else the web's defaults.
+    #[expect(clippy::cast_possible_truncation, reason = "a pixel width")]
+    pub(super) fn restored(stored: &crate::settings::Settings) -> Self {
+        let flag = |key: &str, default: bool| stored.get(key).as_bool().unwrap_or(default);
+        Self {
+            explorer_hidden: !flag(EXPLORER_OPEN_KEY, true),
+            explorer_width: stored.get(EXPLORER_WIDTH_KEY).as_f64().filter(|width| width.is_finite()).map(|w| w as f32),
+            render_markdown: flag(RENDER_MARKDOWN_KEY, false),
+            html_source: !flag(RENDER_BROWSER_FILE_KEY, true),
+            table_source: !flag(RENDER_TABLE_KEY, true),
+            mermaid_source: !flag(RENDER_MERMAID_KEY, true),
+            ..Self::default()
+        }
+    }
+
+    /// The preferences [`Self::restored`] reads back.
+    fn stored_prefs(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut prefs = serde_json::Map::from_iter(
+            [
+                (EXPLORER_OPEN_KEY, !self.explorer_hidden),
+                (RENDER_MARKDOWN_KEY, self.render_markdown),
+                (RENDER_BROWSER_FILE_KEY, !self.html_source),
+                (RENDER_TABLE_KEY, !self.table_source),
+                (RENDER_MERMAID_KEY, !self.mermaid_source),
+            ]
+            .map(|(key, value)| (key.to_owned(), value.into())),
+        );
+        if let Some(width) = self.explorer_width {
+            prefs.insert(EXPLORER_WIDTH_KEY.to_owned(), f64::from(width).into());
+        }
+        prefs
+    }
+}
+
+impl Workspace {
+    /// Stores the file view's preferences, as the web writes them to `localStorage`.
+    fn save_file_prefs(&mut self) {
+        let prefs = self.files.stored_prefs();
+        self.client_settings.apply(&prefs);
+    }
+
+    /// Stores the explorer's width once a resize has settled (`commitWidth` on pointer up).
+    fn save_explorer_width_later(&mut self, cx: &mut gpui_kit::Context<Self>) {
+        self.files.width_save = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_millis(300)).await;
+            let _ = this.update(cx, |this, _| this.save_file_prefs());
+        }));
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::opens_host_path_in_panel;
+    use super::{FilesState, opens_host_path_in_panel};
+
+    #[test]
+    fn file_view_preferences_load_from_the_web_keys() {
+        let defaults = FilesState::restored(&crate::settings::Settings::layered(&Default::default(), &().into()));
+        assert!(!defaults.explorer_hidden && defaults.explorer_width.is_none() && !defaults.render_markdown);
+        assert!(!defaults.html_source && !defaults.table_source && !defaults.mermaid_source);
+
+        let stored = serde_json::json!({
+            "t3code.fileExplorerOpen": false,
+            "t3code.fileExplorerWidth": 312.5,
+            "t3code.renderMarkdown": true,
+            "t3code.renderBrowserFile": false,
+            "t3code.renderTable": false,
+            "t3code.renderMermaid": false,
+        });
+        let restored = FilesState::restored(&crate::settings::Settings::layered(&Default::default(), &stored));
+        assert!(restored.explorer_hidden && restored.render_markdown);
+        assert!(restored.html_source && restored.table_source && restored.mermaid_source);
+        assert_eq!(restored.explorer_width, Some(312.5));
+        assert_eq!(serde_json::Value::Object(restored.stored_prefs()), stored);
+    }
 
     #[test]
     fn host_links_open_in_the_panel_except_media() {
