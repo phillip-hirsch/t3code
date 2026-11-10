@@ -1360,11 +1360,9 @@ impl<'a> WebViewBuilder<'a> {
   ///
   /// ## Platform-specific:
   ///
-  /// - **Windows**: WebView2's `NavigationCompleted` when it is not a success.
-  /// - **macOS / iOS**: `webView:didFailProvisionalNavigation:withError:` and
-  ///   `webView:didFailNavigation:withError:`.
   /// - **Linux**: WebKitGTK's `load-failed`.
-  /// - **Android:** Unsupported.
+  /// - **Windows / macOS / iOS / Android:** Unsupported: their failure callbacks are reachable
+  ///   only through `unsafe`, so the handler is never called.
   pub fn with_on_page_load_error_handler(mut self, handler: impl Fn(PageLoadError) + 'static) -> Self {
     self.attrs.on_page_load_error_handler = Some(Box::new(handler));
     self
@@ -2190,8 +2188,8 @@ impl WebView {
   ///
   /// ## Platform-specific:
   ///
-  /// - **Linux**: X11 only; `parent` must be an Xlib or XCB window.
-  #[cfg(any(target_os = "windows", target_os = "macos", gtk))]
+  /// Windows only: moving a WKWebView or an X11 child needs `unsafe`.
+  #[cfg(target_os = "windows")]
   pub fn reparent_as_child<W: HasWindowHandle>(&self, parent: &W) -> Result<()> {
     self.webview.reparent_as_child(parent)
   }
@@ -2500,15 +2498,12 @@ pub enum PageLoadEvent {
 pub struct PageLoadError {
   /// The URL the navigation was for.
   pub url: String,
-  /// The error's domain: `COREWEBVIEW2_WEB_ERROR_STATUS` on Windows (whose values `code` holds),
-  /// the `NSError` domain on Apple platforms, the `GError` domain on Linux.
+  /// The error's `GError` domain.
   pub domain: String,
   /// The error's code within `domain`.
   pub code: i64,
   /// The platform's description of the error.
   pub description: String,
-  /// Windows only: the response's HTTP status, when a server answered.
-  pub http_status: Option<i32>,
 }
 
 /// Background throttling policy

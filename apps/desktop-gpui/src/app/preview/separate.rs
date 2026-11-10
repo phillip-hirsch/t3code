@@ -2,8 +2,12 @@
 //! More menu and the mini player): a tab's own page moves into a small window that floats above
 //! the app, and back into the panel when that window closes.
 //!
-//! Electron mirrors the page into its window as frames; here the native view itself moves, so
-//! the page stays live and interactive there, and the panel and mini player show where it went.
+//! Electron mirrors the page into its window as frames. On Windows the native view itself moves,
+//! so the page stays live and interactive there. `WKWebView` and `WebKitGTK` views can't move
+//! without `unsafe`, so on macOS and Linux the page is built again in the other window at its URL,
+//! on the same profile, so cookies and logins stay (not an incognito tab's), losing its scroll
+//! position, in-page state and back/forward history.
+//! The panel and mini player show where it went.
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::Button;
@@ -16,7 +20,7 @@ use gpui_kit::{
 };
 use gpui_webview::WebView;
 
-use super::Workspace;
+use super::{PageEvents, PageSource, Workspace};
 use crate::preview::{self, Appearance, TabRef};
 use crate::theme::Tokens;
 
@@ -88,6 +92,28 @@ fn keep_on_top(hwnd: isize) {
     });
     if let Err(error) = placed {
         log::warn!("could not keep the separate preview window on top: {error}");
+    }
+}
+
+/// Puts `view`'s page in `window`: the view itself where it can move (WebView2), else a new view
+/// built from `source`, which `None` means nothing needs (the tab closed).
+fn place_page(
+    view: &Entity<WebView>,
+    source: Option<&PageSource>,
+    window: &mut Window,
+    cx: &mut gpui_kit::App,
+) -> wry::Result<Option<(Entity<WebView>, PageEvents)>> {
+    #[cfg(windows)]
+    {
+        let _ = source;
+        view.read(cx).raw().reparent_as_child(window).map(|()| None)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = view;
+        let Some(source) = source else { return Ok(None) };
+        let (webview, events) = source.build(window, cx)?;
+        Ok(Some((cx.new(|_| webview), events)))
     }
 }
 
@@ -178,6 +204,7 @@ impl Workspace {
     fn open_separate_window(&mut self, tab: TabRef, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(look), Some(hosted)) = (self.separate_look(&tab), self.preview.tabs.get(&tab)) else { return };
         let view = hosted.view.clone();
+        let page = self.page_source(&tab, cx);
         let panel = self.preview.panel_area.as_ref().filter(|(shown, _)| *shown == tab).map(|(_, area)| *area);
         let source = look.viewport.or(panel).unwrap_or(INITIAL_SIZE);
         let (width, height) = fit_content_size(INITIAL_SIZE, source.0 / source.1.max(1.));
@@ -201,11 +228,15 @@ impl Workspace {
         };
         let workspace = cx.entity();
         let main = window.window_handle();
-        let mut moved = Ok(());
+        let mut placed = Ok(None);
         #[cfg(windows)]
         let mut hwnd = None;
         let opened = cx.open_window(options, |separate, cx| {
-            moved = view.read(cx).move_to_window(separate);
+            placed = place_page(&view, page.as_ref(), separate, cx);
+            let shown = match &placed {
+                Ok(Some((rebuilt, _))) => rebuilt.clone(),
+                _ => view.clone(),
+            };
             #[cfg(windows)]
             {
                 use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
@@ -229,10 +260,17 @@ impl Workspace {
                 });
                 false
             });
-            cx.new(|cx| SeparatePreview::new(&workspace, tab.clone(), view.clone(), look, separate, cx))
+            cx.new(|cx| SeparatePreview::new(&workspace, tab.clone(), shown, look, separate, cx))
         });
-        let failure = match (opened, moved) {
-            (Ok(handle), Ok(())) => {
+        let failure = match (opened, placed) {
+            (Ok(handle), Ok(rebuilt)) => {
+                let view = match rebuilt {
+                    Some((rebuilt, events)) => {
+                        self.replace_view(&tab, rebuilt.clone(), events, window, cx);
+                        rebuilt
+                    }
+                    None => view,
+                };
                 self.preview.separate.insert(tab.clone(), Separate { window: handle, view });
                 if let Some(hosted) = self.preview.tabs.get_mut(&tab) {
                     // The separate window owns the view's look and visibility until it closes.
@@ -260,11 +298,13 @@ impl Workspace {
     /// Moves `tab`'s page back into the main window, `window`, and closes its separate window.
     pub(super) fn close_separate_window(&mut self, tab: &TabRef, window: &mut Window, cx: &mut Context<Self>) {
         let Some(separate) = self.preview.separate.remove(tab) else { return };
-        let view = separate.view.read(cx);
         // Hidden until the panel or the mini player lays it out again.
-        let _ = view.set_visible(false);
-        if let Err(error) = view.move_to_window(window) {
-            log::warn!("could not move the page back from its separate window: {error}");
+        let _ = separate.view.read(cx).set_visible(false);
+        let source = self.page_source(tab, cx);
+        match place_page(&separate.view, source.as_ref(), window, cx) {
+            Ok(Some((rebuilt, events))) => self.replace_view(tab, rebuilt, events, window, cx),
+            Ok(None) => {}
+            Err(error) => log::warn!("could not move the page back from its separate window: {error}"),
         }
         if let Some(hosted) = self.preview.tabs.get_mut(tab) {
             hosted.shown = false;

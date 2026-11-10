@@ -110,7 +110,33 @@ struct HostedTab {
     shown: bool,
     /// The chords the view's script starts each new document with.
     chords: Rc<str>,
+    /// The view's own page events, which WebView2's failure probe reports on.
+    page_events: async_channel::Sender<PageEvent>,
     _events: Task<()>,
+}
+
+/// A tab view's page events: what reports them, and what the panel reads them from.
+type PageEvents = (async_channel::Sender<PageEvent>, async_channel::Receiver<PageEvent>);
+
+/// What a tab's view is built from. The separate window builds a tab's page again from it where
+/// the live view can't move ([`separate`]).
+struct PageSource {
+    storage: profiles::Storage,
+    url: String,
+    chords: Rc<str>,
+}
+
+impl PageSource {
+    /// Builds the view, hidden until a frame lays it out so it never flashes at the window's
+    /// origin. See [`build_view`] for where this may run.
+    fn build(&self, window: &mut Window, cx: &mut App) -> wry::Result<(WebView, PageEvents)> {
+        let (sender, events) = async_channel::unbounded();
+        let mut context = self.storage.context();
+        let builder = page_builder(self.storage.builder(context.as_mut()), &self.url, &self.chords, sender.clone());
+        let webview = build_view(builder, window, cx)?;
+        let _ = webview.set_visible(false);
+        Ok((webview, (sender, events)))
+    }
 }
 
 impl HostedTab {
@@ -867,12 +893,9 @@ impl Workspace {
                 if this.preview.threads.session(&tab).is_none() {
                     return;
                 }
-                let (sender, events) = async_channel::unbounded();
-                let mut context = partition.context();
-                let chords = this.preview.chords.json.clone();
-                let builder = page_builder(partition.builder(context.as_mut()), &url, &chords, sender);
-                match build_view(builder, window, cx) {
-                    Ok(webview) => this.adopt_view(tab, url, webview, events, window, cx),
+                let source = PageSource { storage: partition, url, chords: this.preview.chords.json.clone() };
+                match source.build(window, cx) {
+                    Ok((webview, events)) => this.adopt_view(tab, source.url, webview, events, window, cx),
                     Err(error) => {
                         this.error = Some(format!("Unable to start the browser: {error}").into());
                         cx.notify();
@@ -888,21 +911,12 @@ impl Workspace {
         tab: TabRef,
         url: String,
         webview: WebView,
-        events: async_channel::Receiver<PageEvent>,
+        (page_events, events): PageEvents,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Hidden until a frame lays it out, so it never flashes at the window's origin.
-        let _ = webview.set_visible(false);
         let view = cx.new(|_| webview);
-        let events_tab = tab.clone();
-        let pump = cx.spawn_in(window, async move |this, cx| {
-            while let Ok(event) = events.recv().await {
-                if this.update_in(cx, |this, window, cx| this.on_page_event(&events_tab, event, window, cx)).is_err() {
-                    break;
-                }
-            }
-        });
+        let pump = Self::pump_page_events(tab.clone(), events, window, cx);
         self.preview.tabs.insert(
             tab,
             HostedTab {
@@ -918,10 +932,57 @@ impl Workspace {
                 shown: false,
                 // The same set `host_tab` just built the view with.
                 chords: self.preview.chords.json.clone(),
+                page_events,
                 _events: pump,
             },
         );
         cx.notify();
+    }
+
+    fn pump_page_events(
+        tab: TabRef,
+        events: async_channel::Receiver<PageEvent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        cx.spawn_in(window, async move |this, cx| {
+            while let Ok(event) = events.recv().await {
+                if this.update_in(cx, |this, window, cx| this.on_page_event(&tab, event, window, cx)).is_err() {
+                    break;
+                }
+            }
+        })
+    }
+
+    /// What `tab`'s view would be built from now: its profile and the page it is on.
+    fn page_source(&self, tab: &TabRef, cx: &App) -> Option<PageSource> {
+        let hosted = self.preview.tabs.get(tab)?;
+        let url = hosted.status.url().map(str::to_owned).or_else(|| hosted.view.read(cx).raw().url().ok())?;
+        let session = self.preview.threads.session(tab);
+        Some(PageSource {
+            storage: profiles::Storage::of(session.and_then(|s| s.profile_id.as_deref())),
+            url,
+            chords: self.preview.chords.json.clone(),
+        })
+    }
+
+    /// Puts `view`, built from [`Self::page_source`] in another window, in place of `tab`'s view.
+    fn replace_view(
+        &mut self,
+        tab: &TabRef,
+        view: Entity<WebView>,
+        (page_events, events): PageEvents,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pump = Self::pump_page_events(tab.clone(), events, window, cx);
+        let chords = self.preview.chords.json.clone();
+        if let Some(hosted) = self.preview.tabs.get_mut(tab) {
+            hosted.view = view;
+            hosted.chords = chords;
+            hosted.page_events = page_events;
+            hosted._events = pump;
+        }
     }
 
     fn on_page_event(&mut self, key: &TabRef, event: PageEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -939,6 +1000,10 @@ impl Workspace {
             // A failed load also finishes (WebView2, WebKitGTK); only a new load clears the failure.
             PageEvent::Finished(url) => {
                 if !matches!(tab.status, NavStatus::LoadFailed { .. }) {
+                    // WebView2 shows a failure only as its error page: lb-wry has no safe callback for it.
+                    if cfg!(windows) {
+                        probe_failure(tab.view.read(cx).raw(), &url, &tab.page_events);
+                    }
                     tab.status = NavStatus::Success { url, title };
                 }
                 // The new document started with the chords the view was built with.
@@ -966,8 +1031,6 @@ impl Workspace {
                 }
             }
             PageEvent::Failed { url, code, description } => {
-                // A first load that fails can leave WKWebView without the URL it tried.
-                let url = if url.is_empty() { tab.status.url().unwrap_or_default().to_owned() } else { url };
                 tab.status = NavStatus::LoadFailed { url, title, code, description, download: None };
             }
             PageEvent::OpenLink(url) => {
@@ -1620,6 +1683,20 @@ fn clear_cookies(view: &wry::WebView) {
     }
 }
 
+/// Asks a page that finished loading whether it is WebView2's error page, and if so reports the
+/// load as failed with the error it names.
+fn probe_failure(view: &wry::WebView, url: &str, events: &async_channel::Sender<PageEvent>) {
+    let (url, events) = (url.to_owned(), events.clone());
+    let probed = view.evaluate_script_with_callback(preview::FAILURE_PROBE, move |result| {
+        if let Some((code, description)) = preview::failed_load(&result) {
+            let _ = events.try_send(PageEvent::Failed { url: url.clone(), code, description: description.into() });
+        }
+    });
+    if let Err(error) = probed {
+        log::warn!("could not check the page for a failed load: {error}");
+    }
+}
+
 /// Builds a native view in `window` (gpui-webview's safe constructor). Call it from inside a task's
 /// update, never from an event handler or `defer`: WebView2's constructor runs the window's message
 /// loop, and only while a task runs does GPUI post no other task to that loop, so no task re-enters
@@ -1668,7 +1745,7 @@ fn page_builder<'a>(
                 });
             }
         })
-        // Electron's `did-fail-load`, from each platform's own navigation failure callback.
+        // Electron's `did-fail-load`, from WebKitGTK's failure callback (lb-wry calls it on Linux only).
         .with_on_page_load_error_handler({
             let sender = sender.clone();
             move |error| {

@@ -226,57 +226,6 @@ const NET_ERRORS: [(i64, &str); 26] = [
     (-324, "ERR_EMPTY_RESPONSE"),
 ];
 
-/// WebView2's `COREWEBVIEW2_WEB_ERROR_STATUS` as a Chromium net error; `None` for a cancelled load.
-fn webview2_net_error(status: i64) -> Option<i64> {
-    Some(match status {
-        1 => -200,
-        2 => -201,
-        3 => -117,
-        4 => -206,
-        // `CERTIFICATE_IS_INVALID`: what a self-signed development certificate reports.
-        5 => -202,
-        6 => -109,
-        7 => -118,
-        8 => -320,
-        9 => -103,
-        10 => -101,
-        11 => -106,
-        12 => -102,
-        13 => -105,
-        14 => return None,
-        15 => -310,
-        18 => -127,
-        _ => -2,
-    })
-}
-
-/// `WKWebView`'s `NSURLErrorDomain` and `WebKitErrorDomain` errors as a Chromium net error.
-fn webkit_cocoa_net_error(domain: &str, code: i64) -> Option<i64> {
-    Some(match (domain, code) {
-        ("NSURLErrorDomain", -999) => return None,
-        ("NSURLErrorDomain", -1000) => -300,
-        ("NSURLErrorDomain", -1001) => -118,
-        ("NSURLErrorDomain", -1002) => -302,
-        ("NSURLErrorDomain", -1003 | -1006) => -105,
-        ("NSURLErrorDomain", -1004) => -102,
-        ("NSURLErrorDomain", -1005) => -100,
-        ("NSURLErrorDomain", -1007) => -310,
-        ("NSURLErrorDomain", -1009 | -1020) => -106,
-        ("NSURLErrorDomain", -1011) => -320,
-        ("NSURLErrorDomain", -1014) => -324,
-        ("NSURLErrorDomain", -1200) => -107,
-        ("NSURLErrorDomain", -1201 | -1204) => -201,
-        ("NSURLErrorDomain", -1202 | -1203) => -202,
-        ("NSURLErrorDomain", -1205) => -117,
-        ("NSURLErrorDomain", -1206) => -110,
-        // A response WebKit hands off (a download) or a plug-in takes, which Chromium aborts.
-        ("WebKitErrorDomain", 100 | 102 | 204) => return None,
-        ("WebKitErrorDomain", 101) => -302,
-        ("WebKitErrorDomain", 103) => -312,
-        _ => -2,
-    })
-}
-
 /// `WebKitGTK`'s `GError` domains as a Chromium net error.
 fn webkit_gtk_net_error(domain: &str, code: i64) -> Option<i64> {
     Some(match (domain, code) {
@@ -299,22 +248,31 @@ fn webkit_gtk_net_error(domain: &str, code: i64) -> Option<i64> {
     })
 }
 
-/// The net error Electron's `did-fail-load` reports for a main-frame navigation the platform's web
-/// view failed (WebView2, `WKWebView` or `WebKitGTK`), so `LoadFailed` reads the same to agents, other
-/// clients and the error page. `None` for what Electron leaves alone: an aborted load (superseded,
-/// stopped or a download, `ERR_ABORTED`), and an HTTP error, whose page the server sent and shows.
+/// The net error Electron's `did-fail-load` reports for a main-frame navigation `WebKitGTK` failed
+/// (lb-wry's only safe failure callback), so `LoadFailed` reads the same to agents, other clients
+/// and the error page. `None` for what Electron leaves alone: an aborted load (cancelled or a
+/// download, `ERR_ABORTED`).
 pub fn net_error(error: &wry::PageLoadError) -> Option<(i64, &'static str)> {
-    if error.http_status.is_some_and(|status| !(300..400).contains(&status)) {
-        return None;
-    }
-    let domain = error.domain.as_str();
-    let code = match domain {
-        "COREWEBVIEW2_WEB_ERROR_STATUS" => webview2_net_error(error.code),
-        "NSURLErrorDomain" | "WebKitErrorDomain" => webkit_cocoa_net_error(domain, error.code),
-        _ => webkit_gtk_net_error(domain, error.code),
-    }?;
+    let code = webkit_gtk_net_error(&error.domain, error.code)?;
     let name = NET_ERRORS.iter().find(|(known, _)| *known == code).map_or("ERR_FAILED", |(_, name)| name);
     Some((code, name))
+}
+
+/// Run in a page after its load: on WebView2's error page, the net error it names (in Chromium's
+/// `loadTimeData` or the page text), else `null`. WebView2's own failure callback needs `unsafe`.
+pub const FAILURE_PROBE: &str = r#"(() => {
+  if (location.protocol !== "chrome-error:") return null;
+  const data = window.loadTimeData && window.loadTimeData.data_;
+  const text = (data ? JSON.stringify(data) : "") + " " + (document.body ? document.body.innerText : "");
+  const code = /\bERR_[A-Z_]+\b/.exec(text);
+  return code ? code[0] : "";
+})()"#;
+
+/// [`FAILURE_PROBE`]'s JSON result as the failed load's net error, or `None` for a page that loaded.
+/// An error page whose error isn't listed reads as `ERR_FAILED`.
+pub fn failed_load(result: &str) -> Option<(i64, &'static str)> {
+    let name = serde_json::from_str::<Option<String>>(result).ok()??;
+    Some(NET_ERRORS.into_iter().find(|(_, known)| *known == name).unwrap_or((-2, "ERR_FAILED")))
 }
 
 /// Reports the top page's URL and back/forward state over wry's IPC on load and on each history
@@ -1537,41 +1495,30 @@ mod tests {
 
     #[test]
     fn native_load_failures_read_as_chromium_net_errors() {
-        let failure = |domain: &str, code: i64, http_status: Option<i32>| {
+        let failure = |domain: &str, code: i64| {
             net_error(&wry::PageLoadError {
                 url: "https://a.test/".into(),
                 domain: domain.into(),
                 code,
                 description: String::new(),
-                http_status,
             })
         };
-        // WebView2.
-        let webview2 = |status, http| failure("COREWEBVIEW2_WEB_ERROR_STATUS", status, http);
-        assert_eq!(webview2(13, None), Some((-105, "ERR_NAME_NOT_RESOLVED")));
-        assert_eq!(webview2(12, None), Some((-102, "ERR_CONNECTION_REFUSED")));
-        assert_eq!(webview2(5, None), Some((-202, "ERR_CERT_AUTHORITY_INVALID")));
-        assert_eq!(webview2(15, Some(302)), Some((-310, "ERR_TOO_MANY_REDIRECTS")), "a redirect loop still failed");
-        assert_eq!(webview2(0, None), Some((-2, "ERR_FAILED")));
-        assert_eq!(webview2(14, None), None, "a cancelled load is ERR_ABORTED, which Electron ignores");
-        assert_eq!(webview2(0, Some(404)), None, "the server's own error page shows");
-        // WKWebView.
-        assert_eq!(failure("NSURLErrorDomain", -1004, None), Some((-102, "ERR_CONNECTION_REFUSED")));
-        assert_eq!(failure("NSURLErrorDomain", -1003, None), Some((-105, "ERR_NAME_NOT_RESOLVED")));
-        assert_eq!(failure("NSURLErrorDomain", -1202, None), Some((-202, "ERR_CERT_AUTHORITY_INVALID")));
-        assert_eq!(failure("NSURLErrorDomain", -1009, None), Some((-106, "ERR_INTERNET_DISCONNECTED")));
-        assert_eq!(failure("NSURLErrorDomain", -999, None), None, "superseded");
-        assert_eq!(failure("WebKitErrorDomain", 102, None), None, "handed off as a download");
-        assert_eq!(failure("NSPOSIXErrorDomain", 61, None), Some((-2, "ERR_FAILED")));
         // WebKitGTK.
-        assert_eq!(failure("g-io-error-quark", 39, None), Some((-102, "ERR_CONNECTION_REFUSED")));
-        assert_eq!(failure("g-resolver-error-quark", 0, None), Some((-105, "ERR_NAME_NOT_RESOLVED")));
-        assert_eq!(failure("g-io-error-quark", 24, None), Some((-118, "ERR_CONNECTION_TIMED_OUT")));
-        assert_eq!(failure("g-tls-error-quark", 2, None), Some((-202, "ERR_CERT_AUTHORITY_INVALID")));
-        assert_eq!(failure("WebKitPolicyError", 103, None), Some((-312, "ERR_UNSAFE_PORT")));
-        assert_eq!(failure("WebKitNetworkError", 302, None), None, "cancelled");
-        assert_eq!(failure("WebKitPolicyError", 102, None), None, "interrupted by a download");
-        assert_eq!(failure("g-io-error-quark", 19, None), None, "cancelled");
+        assert_eq!(failure("g-io-error-quark", 39), Some((-102, "ERR_CONNECTION_REFUSED")));
+        assert_eq!(failure("g-resolver-error-quark", 0), Some((-105, "ERR_NAME_NOT_RESOLVED")));
+        assert_eq!(failure("g-io-error-quark", 24), Some((-118, "ERR_CONNECTION_TIMED_OUT")));
+        assert_eq!(failure("g-tls-error-quark", 2), Some((-202, "ERR_CERT_AUTHORITY_INVALID")));
+        assert_eq!(failure("WebKitPolicyError", 103), Some((-312, "ERR_UNSAFE_PORT")));
+        assert_eq!(failure("WebKitNetworkError", 302), None, "cancelled");
+        assert_eq!(failure("WebKitPolicyError", 102), None, "interrupted by a download");
+        assert_eq!(failure("g-io-error-quark", 19), None, "cancelled");
+        // WebView2, from its error page.
+        assert_eq!(failed_load(r#""ERR_NAME_NOT_RESOLVED""#), Some((-105, "ERR_NAME_NOT_RESOLVED")));
+        assert_eq!(failed_load(r#""ERR_CONNECTION_REFUSED""#), Some((-102, "ERR_CONNECTION_REFUSED")));
+        assert_eq!(failed_load(r#""ERR_SOMETHING_NEW""#), Some((-2, "ERR_FAILED")));
+        assert_eq!(failed_load(r#""""#), Some((-2, "ERR_FAILED")), "an error page without its code still failed");
+        assert_eq!(failed_load("null"), None, "a page that loaded");
+        assert_eq!(failed_load(""), None, "a page that couldn't run the probe");
     }
 
     #[test]

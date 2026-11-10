@@ -374,8 +374,6 @@ features = [
     "NSValue",
     "NSRange",
     "NSRunLoop",
-    "NSError",
-    "NSURLError",
 ]
 default-features = false
 

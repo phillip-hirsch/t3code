@@ -504,7 +504,6 @@ impl InnerWebView {
           domain: error.domain().as_str().to_string(),
           code: load_error_code(error),
           description: error.message().to_string(),
-          http_status: None,
         });
         // Handled: WebKit's own error page would load as a page of its own.
         true
@@ -1158,33 +1157,6 @@ impl InnerWebView {
     }
 
     Ok(())
-  }
-
-  /// Moves the X11 window a child webview lives in under `parent`'s window.
-  pub fn reparent_as_child<W: HasWindowHandle>(&self, parent: &W) -> Result<()> {
-    #[cfg(feature = "x11")]
-    {
-      let parent = match parent.window_handle()?.as_raw() {
-        RawWindowHandle::Xlib(w) => w.window,
-        RawWindowHandle::Xcb(w) => c_ulong::from(w.window.get()),
-        _ => return Err(Error::UnsupportedWindowHandle),
-      };
-      let x11 = self
-        .x11
-        .as_ref()
-        .filter(|x11| x11.is_child)
-        .ok_or(Error::UnsupportedWindowHandle)?;
-      unsafe {
-        (x11.xlib.XReparentWindow)(x11.x11_display as _, x11.x11_window, parent, 0, 0);
-        (x11.xlib.XFlush)(x11.x11_display as _);
-      }
-      Ok(())
-    }
-    #[cfg(not(feature = "x11"))]
-    {
-      let _ = parent;
-      Err(Error::UnsupportedWindowHandle)
-    }
   }
 }
 

@@ -6,8 +6,8 @@
 use std::{cell::Cell, rc::Rc, time::Duration};
 
 use gpui::{
-    AnyWindowHandle, App, Bounds, Global, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent,
-    Pixels, PlatformInput, Point, Window, point, px,
+    App, Bounds, Global, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, Pixels,
+    PlatformInput, Point, Window, point, px,
 };
 use wry::dpi::{PhysicalPosition, PhysicalSize};
 use wry::raw_window_handle::{
@@ -98,17 +98,17 @@ pub(crate) fn device_bounds(bounds: Bounds<Pixels>, scale_factor: f32) -> wry::R
 }
 
 /// Forward presses on the page to GPUI, which does not otherwise see them, so overlays that
-/// close on an outside click (popovers, menus) close when the page is clicked. They go to the
-/// window the view is in now, `window`.
+/// close on an outside click (popovers, menus) close when the page is clicked.
 pub(crate) fn forward_mouse_down(
     webview: &wry::WebView,
     origin: Rc<Cell<Point<Pixels>>>,
-    window: Rc<Cell<AnyWindowHandle>>,
+    window: &Window,
     cx: &App,
 ) {
     use gtk::{gdk::EventType, glib::Propagation, prelude::WidgetExt as _};
     use wry::WebViewExtUnix as _;
 
+    let handle = window.window_handle();
     let cx = cx.to_async();
     webview
         .webview()
@@ -125,7 +125,6 @@ pub(crate) fn forward_mouse_down(
             let (x, y) = event.position();
             let gdk_scale = widget.scale_factor() as f32;
             let origin = origin.get();
-            let handle = window.get();
             // GTK dispatches this from the GTK main loop; update GPUI once it is done.
             cx.spawn(async move |cx| {
                 handle.update(cx, |_, window, cx| {

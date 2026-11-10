@@ -558,7 +558,6 @@ impl InnerWebView {
         attributes.navigation_handler,
         download_delegate.clone(),
         attributes.on_page_load_handler,
-        attributes.on_page_load_error_handler,
         mtm,
       );
 
@@ -1188,18 +1187,6 @@ r#"Object.defineProperty(window, 'ipc', {
       let content_view = (*window).contentView().unwrap();
       content_view.addSubview(&self.webview);
     }
-
-    Ok(())
-  }
-
-  #[cfg(target_os = "macos")]
-  pub(crate) fn reparent_as_child(&self, parent: &impl HasWindowHandle) -> crate::Result<()> {
-    let ns_view = match parent.window_handle()?.as_raw() {
-      RawWindowHandle::AppKit(w) => w.ns_view.as_ptr(),
-      _ => return Err(Error::UnsupportedWindowHandle),
-    };
-    // `addSubview` takes the view out of its current superview, as `new_as_child` put it in one.
-    unsafe { (*(ns_view as *mut NSView)).addSubview(&self.webview) };
 
     Ok(())
   }
