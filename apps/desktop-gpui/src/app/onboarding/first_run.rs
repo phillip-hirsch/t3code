@@ -150,6 +150,19 @@ pub(in crate::app) fn resolve(input: &Evidence) -> (Decision, bool) {
     if input.workspace_fresh { (Decision::Wizard, false) } else { (Decision::App, input.workspace_authoritative) }
 }
 
+/// The gate's decision for this launch, or `None` while it waits, without the timeout, for the
+/// local server. With the local environment off there is no primary to wait for, so the web's
+/// hosted gate applies (`resolveHostedFirstRunDecision`).
+pub(in crate::app) fn decide(local_off: bool, input: &Evidence) -> Option<(Decision, bool)> {
+    if local_off {
+        return Some((if input.hydrated { Decision::App } else { Decision::Pending }, false));
+    }
+    if !input.enabled && !input.completed {
+        return None;
+    }
+    Some(resolve(input))
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -217,6 +230,19 @@ mod tests {
         assert_eq!(resolve(&input), (Decision::App, false));
         assert_eq!(GateState::initial(true).decision, Decision::App);
         assert_eq!(GateState::initial(false).decision, Decision::Pending);
+    }
+
+    #[test]
+    fn with_the_local_environment_off_the_app_opens_without_a_primary() {
+        let no_primary = Evidence { hydrated: true, ..Evidence::default() };
+        // `resolveHostedFirstRunDecision`: nothing to wait for, and setup is not recorded.
+        assert_eq!(decide(true, &no_primary), Some((Decision::App, false)));
+        assert_eq!(decide(true, &Evidence { completed: true, ..no_primary }), Some((Decision::App, false)));
+        assert_eq!(decide(true, &Evidence::default()), Some((Decision::Pending, false)));
+        // An enabled local server that has not answered yet is waited on.
+        assert_eq!(decide(false, &no_primary), None);
+        assert_eq!(decide(false, &Evidence { completed: true, ..no_primary }), Some((Decision::App, false)));
+        assert_eq!(decide(false, &fresh()), Some((Decision::Wizard, false)));
     }
 
     #[test]

@@ -997,6 +997,8 @@ impl Workspace {
             {
                 self.start_draft_in(env, project_id, window, cx);
             }
+            // With no environment to send a snapshot, nothing else opens the links that waited.
+            self.open_pending_links(window, cx);
         }
         if self.welcome_owns_home() {
             self.show_welcome(cx);

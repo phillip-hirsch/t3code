@@ -171,12 +171,22 @@ impl Workspace {
     pub(super) fn open_pending_links(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.process_activations(window, cx);
         self.resume_link_clone(window, cx);
-        if !self.landed || self.client().is_none() {
+        if !self.landed || !self.links_ready() {
             return;
         }
         for link in std::mem::take(&mut self.desktop.pending_links) {
             self.open_app_link(link, window, cx);
         }
+    }
+
+    /// `DesktopWebLinkCoordinator`'s `ready`: the primary is connected with its config, or the
+    /// local environment is off and links run against the saved environments. Each link then
+    /// asks for its own environment's client.
+    fn links_ready(&self) -> bool {
+        matches!(self.connection, super::Connection::Off)
+            || self.primary_environment().is_some_and(|primary| {
+                self.env_client(primary).is_some() && self.env_info(primary).is_some_and(|i| !i.config.is_null())
+            })
     }
 
     fn open_app_link(&mut self, link: AppLink, window: &mut Window, cx: &mut Context<Self>) {
