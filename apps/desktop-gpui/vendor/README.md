@@ -567,8 +567,10 @@ expansion count, the count expanding both ends), the first expansion reads the f
 shows its revealed ends (`GapReveal`) around a separator that hides the rest. A failed read leaves
 the patch as it was, and so do contents that no longer fit it: `with_contents` refuses a hunk line
 whose text differs from the patch's, or a gap line that differs between the sides, so a file edited
-since the patch never shows its new lines as unchanged. (Pierre's `hydratePartialDiff` does not
-check; this is stricter.) `DiffFile::is_same` also matches a hydrated file to the patch-only file it
+since the patch never shows its new lines as unchanged. A patch made ignoring whitespace
+(`DiffFileContents::ignore_whitespace`) is checked by `with_contents_ignoring_whitespace`, which
+compares those lines with whitespace removed. (Pierre's `hydratePartialDiff` does not check; this
+is stricter.) `DiffFile::is_same` also matches a hydrated file to the patch-only file it
 came from, so `update_files` keeps it. Files:
 
 - `src/diff/document.rs`: `with_contents`, `can_load_contents`, `is_hydrated`, `gap_pairs`,

@@ -1409,6 +1409,7 @@ impl Workspace {
                         move |this| this.env_client(&env),
                         "review.getDiffFileContents",
                         source,
+                        ignore_whitespace,
                     )
                 });
                 diff.update(cx, |state, cx| state.set_contents_loader(loader, cx));

@@ -509,6 +509,29 @@ impl DiffFile {
         original: &str,
         modified: &str,
     ) -> Result<Self, DiffContentsMismatch> {
+        self.hydrate_with(original, modified, |a, b| a == b)
+    }
+
+    /// [`Self::with_contents`] for a patch made ignoring whitespace (`git diff
+    /// -w`): its unchanged lines may differ from the contents, and from each
+    /// other, in whitespace only.
+    pub fn with_contents_ignoring_whitespace(
+        &self,
+        original: &str,
+        modified: &str,
+    ) -> Result<Self, DiffContentsMismatch> {
+        let visible = |c: &char| !c.is_whitespace();
+        self.hydrate_with(original, modified, |a, b| {
+            a.chars().filter(visible).eq(b.chars().filter(visible))
+        })
+    }
+
+    fn hydrate_with(
+        &self,
+        original: &str,
+        modified: &str,
+        same: impl Fn(&str, &str) -> bool,
+    ) -> Result<Self, DiffContentsMismatch> {
         if !self.can_load_contents() {
             return Err(DiffContentsMismatch);
         }
@@ -527,8 +550,10 @@ impl DiffFile {
             let len = end[0].checked_sub(next[0]).ok_or(DiffContentsMismatch)?;
             if end[1].checked_sub(next[1]) != Some(len)
                 || (0..len).any(|ix| {
-                    text(DiffSide::Original, next[0] - 1 + ix)
-                        != text(DiffSide::Modified, next[1] - 1 + ix)
+                    !same(
+                        text(DiffSide::Original, next[0] - 1 + ix),
+                        text(DiffSide::Modified, next[1] - 1 + ix),
+                    )
                 })
             {
                 return Err(DiffContentsMismatch);
@@ -555,7 +580,10 @@ impl DiffFile {
                 |side: DiffSide, ix: Option<usize>| ix.map(|ix| self.line_number(side, ix) - 1);
             let differs = |side: DiffSide, ix: Option<usize>| {
                 ix.is_some_and(|ix| {
-                    self.lines(side)[ix].text.as_ref() != text(side, self.line_number(side, ix) - 1)
+                    !same(
+                        self.lines(side)[ix].text.as_ref(),
+                        text(side, self.line_number(side, ix) - 1),
+                    )
                 })
             };
             if self.inner.pairs[hunk.pairs()].iter().any(|pair| {

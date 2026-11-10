@@ -456,6 +456,7 @@ impl Workspace {
             move |this| this.pull_request_client_of(&key),
             "pullRequests.diffFileContents",
             source,
+            code.ignore_whitespace,
         );
         let mut text = String::new();
         let mut files = Vec::new();
