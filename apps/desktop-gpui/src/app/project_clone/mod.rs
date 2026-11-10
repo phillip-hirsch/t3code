@@ -407,14 +407,15 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.env_grants(&key.env, super::git::SOURCE_CONTROL_WRITE) {
+        let input = json!({"projectId": key.id});
+        if !self.env_permits(&key.env, method, &input) {
             return toast_error(window, cx, title, NEEDS_SOURCE_CONTROL);
         }
         let Some(client) = self.env_client(&key.env) else {
             return toast_error(window, cx, title, "This environment is not connected.");
         };
         cx.spawn_in(window, async move |this, cx| {
-            if let Err(error) = client.request(method, json!({"projectId": key.id})).await {
+            if let Err(error) = client.request(method, input).await {
                 let _ = this.update_in(cx, |_, window, cx| toast_error(window, cx, title, error.message()));
             }
         })
