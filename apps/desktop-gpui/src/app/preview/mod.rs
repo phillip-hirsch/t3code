@@ -1627,6 +1627,7 @@ impl Workspace {
         let view = cx.entity();
         trigger
             .dropdown_menu_with_anchor(Anchor::TopRight, move |menu: PopupMenu, window, cx| {
+                crate::app::files::clear_on_release(&view, cx, |this| &mut this.preview.menu_open);
                 let adjust = |method: &'static str, change: Value| {
                     window.listener_for(&view, move |this: &mut Self, _: &ClickEvent, _, cx| {
                         this.adjust_preview(method, change.clone(), cx);

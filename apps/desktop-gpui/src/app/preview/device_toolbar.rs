@@ -300,7 +300,8 @@ impl Workspace {
                     .child(div().min_w_0().truncate().child(label))
                     .child(Icon::new(IconName::ChevronDown).size(px(14.)).text_color(t.muted_foreground.opacity(0.7))),
             )
-            .dropdown_menu_with_anchor(gpui_kit::Anchor::TopLeft, move |menu: PopupMenu, window, _| {
+            .dropdown_menu_with_anchor(gpui_kit::Anchor::TopLeft, move |menu: PopupMenu, window, cx| {
+                crate::app::files::clear_on_release(&view, cx, |this| &mut this.preview.toolbar.menu_open);
                 let pick = |choice: &'static str| {
                     let (setting, tab) = (picked.clone(), pick_tab.clone());
                     window.listener_for(&view, move |this: &mut Workspace, _: &ClickEvent, _, cx| {
