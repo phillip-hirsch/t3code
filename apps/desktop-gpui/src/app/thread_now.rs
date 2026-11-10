@@ -93,7 +93,7 @@ impl Workspace {
         let child_input = (!children.is_empty() && !parent_awaiting).then(|| NowLine::ChildInput {
             title: thread_now::child_inputs_title(&children).into(),
             approvals: thread_now::has_pending_approval(children[0]),
-            children: children.iter().map(|c| (c.id.clone().into(), c.title.clone().into())).collect(),
+            children: children.iter().map(|c| (ScopedId::of_thread(c), c.title.clone().into())).collect(),
         });
         let background = thread_now::background_work(tasks, &projection.turn_items).map(NowLine::Background);
         let (attention, work) = match stop {
@@ -475,13 +475,11 @@ pub(super) fn now_row(
             let _ = this.update(cx, |workspace, cx| f(workspace, pane, window, cx));
         }
     };
-    let open = |id: SharedString| {
+    let open = |child: ScopedId| {
         let this = this.clone();
         move |window: &mut Window, cx: &mut App| {
             let _ = this.update(cx, |workspace, cx| {
-                // Child threads live on their parent's environment.
-                let Some((env, _)) = workspace.pane_thread(pane) else { return };
-                workspace.select_thread_in(env, id.to_string(), window, cx);
+                workspace.select_thread_in(child.env.clone(), child.id.clone(), window, cx);
             });
         }
     };
@@ -499,7 +497,7 @@ pub(super) fn now_row(
                 h_flex().flex_wrap().gap(px(4.)).children(children.iter().enumerate().map(|(index, (id, name))| {
                     let label = if index + 1 < children.len() { format!("{name},") } else { name.to_string() };
                     inline_button(
-                        ElementId::Name(format!("now-child:{id}").into()),
+                        ElementId::Name(format!("now-child:{}:{}", id.env, id.id).into()),
                         label,
                         muted,
                         fg,
@@ -543,9 +541,11 @@ pub(super) fn now_row(
             if let Some(start_ms) = work.started_at_ms {
                 actions.push(clock(start_ms, &mut texts));
             }
+            // A provider's background subagent lives on its parent's environment.
             if let Some(child) = &work.open_thread {
                 texts.push(("Open".into(), FontWeight::MEDIUM));
-                actions.push(inline_button("now-open-background", "Open", muted, fg, false, open(child.clone())));
+                let child = ScopedId::new(key.0.clone(), child.as_ref());
+                actions.push(inline_button("now-open-background", "Open", muted, fg, false, open(child)));
             }
             let stopping = workspace.background_stop_pending(&key);
             let label = if stopping { "Stopping..." } else { "Stop" };

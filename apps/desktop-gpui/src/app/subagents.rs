@@ -41,7 +41,7 @@ pub(super) struct SubagentUi {
 }
 
 struct ChildApproval {
-    /// The child, on its parent's environment.
+    /// The child, on its own environment: a delegated task runs on a linked one.
     thread: ScopedId,
     title: SharedString,
     /// The child's environment, id and `updatedAt` the approvals were read at; a newer one reads them again.
