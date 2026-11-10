@@ -333,6 +333,10 @@ their own width with `min-w-(--anchor-width) max-w-(--available-width)`; 0.9.0's
 `menu_width` used that width alone, so a wide trigger had a narrower popup. In `src/select.rs` a
 set width is at least the trigger's and at most the window's less the 8px margins.
 
+**A select says whether its menu is open.** The scheduled task editor's Destination picker
+replaces its rows in recency order only while the menu is closed, since replacing them clears a
+search being typed. 0.9.0 keeps the open state private; `src/select.rs` adds `SelectState::is_open`.
+
 **Switches can be mixed.** gpui-base's `Switch` reports only on or off; `src/switch.rs` (in
 gpui-base) adds `mixed`, exposed as `aria-checked="mixed"` like the web's mixed `Switch`.
 

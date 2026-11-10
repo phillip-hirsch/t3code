@@ -395,6 +395,11 @@ where
         self.state.list.read(cx).selected_index()
     }
 
+    /// Whether the menu is open.
+    pub fn is_open(&self) -> bool {
+        self.state.is_open()
+    }
+
     /// Get the current selected value.
     pub fn selected_value(&self) -> Option<&<D::Item as SearchableListItem>::Value> {
         self.state.selection.first().map(|(_, i)| i.value())

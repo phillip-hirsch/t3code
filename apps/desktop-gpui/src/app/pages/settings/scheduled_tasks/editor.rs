@@ -87,10 +87,10 @@ type DestinationSelect = SelectState<SearchableVec<DestinationChoice>>;
 
 /// The searchable destination thread picker (`ScheduledTaskDestination`'s combobox).
 struct DestinationPicker {
-    /// What the rows were last derived from, so a render reads the shell only when it changed.
-    key: (u64, SharedString, String, String, ThreadMode),
-    /// The rows by value: only a new, removed or renamed row replaces the items, since that
-    /// clears a search the reader is typing; a reorder alone waits for the next one.
+    /// What the rows were last derived from, and whether the menu was open, so a render reads the
+    /// shell only when one changed.
+    key: (u64, SharedString, String, String, ThreadMode, bool),
+    /// The rows the select shows, in order ([`logic::destination_rows_stale`]).
     rows: Vec<DestinationChoice>,
     state: Entity<DestinationSelect>,
     _subscription: Subscription,
@@ -342,12 +342,14 @@ impl TaskEditor {
             self.destination = None;
             return;
         };
+        let open = self.destination.as_ref().is_some_and(|picker| picker.state.read(cx).is_open());
         let key = (
             workspace.read(cx).shell.revision,
             self.environment.clone(),
             project_id.to_owned(),
             self.draft.thread_id.clone(),
             self.draft.thread_mode,
+            open,
         );
         if self.destination.as_ref().is_some_and(|picker| picker.key == key) {
             return;
@@ -357,13 +359,11 @@ impl TaskEditor {
             let choices = logic::destination_choices(threads, &self.environment, project_id, &self.draft);
             (choices, logic::destination_current(threads, &self.environment, &self.draft).1)
         };
-        let mut rows = choices.clone();
-        rows.sort_by(|a, b| a.value.cmp(&b.value));
         if let Some(picker) = &mut self.destination {
             picker.key = key;
             let state = picker.state.clone();
-            if picker.rows != rows {
-                picker.rows = rows;
+            if logic::destination_rows_stale(&picker.rows, &choices, open) {
+                picker.rows = choices.clone();
                 state.update(cx, |state, cx| state.set_items(SearchableVec::new(choices), window, cx));
             }
             if state.read(cx).selected_value() != selected.as_ref() {
@@ -378,6 +378,7 @@ impl TaskEditor {
             .iter()
             .position(|choice| Some(&choice.value) == selected.as_ref())
             .map(gpui_kit::component::IndexPath::new);
+        let rows = choices.clone();
         let state = cx.new(|cx| SelectState::new(SearchableVec::new(choices), index, window, cx).searchable(true));
         let subscription = cx.subscribe_in(&state, window, |this, _, event: &SelectEvent<_>, window, cx| {
             if let SelectEvent::Confirm(Some(value)) = event {

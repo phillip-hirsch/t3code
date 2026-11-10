@@ -384,6 +384,18 @@ pub(super) fn destination_choices(
     std::iter::once(new_thread).chain(current).chain(others).collect()
 }
 
+/// Whether the destination picker must show `choices` in place of its `shown` rows. While its
+/// menu is open only a new, removed or renamed row counts, since replacing the items drops the
+/// search being typed; a reorder waits for the menu to close, so it reopens newest first.
+pub(super) fn destination_rows_stale(shown: &[DestinationChoice], choices: &[DestinationChoice], open: bool) -> bool {
+    fn by_value(rows: &[DestinationChoice]) -> Vec<&DestinationChoice> {
+        let mut rows: Vec<&DestinationChoice> = rows.iter().collect();
+        rows.sort_by(|a, b| a.value.cmp(&b.value));
+        rows
+    }
+    if open { by_value(shown) != by_value(choices) } else { shown != choices }
+}
+
 /// Formats an instant as a `datetime-local` value in `tz`.
 pub(super) fn to_datetime_local_value<Tz: TimeZone>(instant: &DateTime<Tz>) -> String {
     instant.naive_local().format(DATETIME_LOCAL).to_string()
@@ -922,6 +934,13 @@ mod tests {
         assert_eq!(matching(" RUN "), ["new", "old"], "a search hides New thread each run");
         assert_eq!(matching("nightly"), ["bound"]);
         assert!(matching("untitled").is_empty(), "an untitled thread matches on its own title");
+
+        let mut reordered = choices.clone();
+        reordered.swap(2, 3);
+        assert!(!destination_rows_stale(&choices, &reordered, true), "a reorder waits while the menu is open");
+        assert!(destination_rows_stale(&choices, &reordered, false), "a closed menu reopens newest first");
+        assert!(destination_rows_stale(&choices, &choices[..4], true), "a removed row shows at once");
+        assert!(!destination_rows_stale(&choices, &choices, false));
 
         assert_eq!(destination_current(&threads, "laptop", &draft), ("Nightly".into(), Some("bound".into())));
         let gone = DraftState { thread_id: "gone".into(), ..draft.clone() };
