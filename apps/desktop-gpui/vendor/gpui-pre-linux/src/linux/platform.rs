@@ -1662,6 +1662,7 @@ pub(super) fn capslock_from_xkb(keymap_state: &State) -> gpui::Capslock {
     gpui::Capslock { on }
 }
 
+#[cfg(any(feature = "wayland", feature = "x11"))]
 pub(super) fn num_lock_from_xkb(keymap_state: &State) -> bool {
     keymap_state.mod_name_is_active(xkb::MOD_NAME_NUM, xkb::STATE_MODS_EFFECTIVE)
 }
