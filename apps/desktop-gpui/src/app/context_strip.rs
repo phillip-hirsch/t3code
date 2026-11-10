@@ -20,7 +20,6 @@ use serde_json::{Value, json};
 
 use super::banners::{Variant, composer_banner, corner_action};
 use super::composer::{control_button, runtime_modes};
-use super::git::SOURCE_CONTROL_WRITE;
 use super::{Target, Workspace};
 use crate::model::ScopedId;
 use crate::new_thread::{self, DraftWorkspace, EnvMode, WorkspaceChoice};
@@ -402,13 +401,11 @@ impl Workspace {
 
     /// [`BranchGrants`] on the environment of the picker's thread or draft.
     fn branch_grants(&self) -> BranchGrants {
+        // `permissionAtom` for the `vcs.switchRef` a ref row sends; `vcs.createRef` needs the same.
+        let write = |env: &str| self.env_permits(env, "vcs.switchRef", &json!({"cwd": self.composer_cwd()}));
         match &self.target {
-            Some(Target::Thread { env, .. }) => {
-                BranchGrants { write: self.env_grants(env, SOURCE_CONTROL_WRITE), update: self.can_operate(env) }
-            }
-            Some(Target::Draft { env, .. }) => {
-                BranchGrants { write: self.env_grants(env, SOURCE_CONTROL_WRITE), update: true }
-            }
+            Some(Target::Thread { env, .. }) => BranchGrants { write: write(env), update: self.can_operate(env) },
+            Some(Target::Draft { env, .. }) => BranchGrants { write: write(env), update: true },
             None => BranchGrants { write: false, update: false },
         }
     }
@@ -723,7 +720,11 @@ impl Workspace {
         failure: &'static str,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.client() else { return };
+        let Some(env) = self.target.as_ref().map(Target::environment) else { return };
+        if !self.env_permits(env, method, &input) {
+            return;
+        }
+        let Some(client) = self.env_client(env) else { return };
         self.draft_workspace.choice.branch = Some(name.clone());
         let origin = self.target.clone();
         cx.notify();
@@ -815,6 +816,9 @@ impl Workspace {
         worktree: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        if !self.env_permits(&thread.env, method, &input) {
+            return;
+        }
         let (Some(client), Some(checkout)) = (self.env_client(&thread.env), self.thread_checkout(&thread)) else {
             return;
         };
