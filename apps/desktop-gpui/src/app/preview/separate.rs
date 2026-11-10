@@ -14,9 +14,9 @@ use gpui_kit::component::button::Button;
 use gpui_kit::component::{Icon, Sizable as _, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, AppContext as _, Bounds, Context, Entity, IntoElement, ParentElement as _, Render, SharedString,
-    Styled as _, Subscription, TitlebarOptions, Window, WindowBounds, WindowHandle, WindowKind, WindowOptions, div, px,
-    rgb, size,
+    AnyElement, AnyWindowHandle, AppContext as _, Bounds, Context, Entity, IntoElement, ParentElement as _, Render,
+    SharedString, Styled as _, Subscription, TitlebarOptions, Window, WindowBounds, WindowHandle, WindowKind,
+    WindowOptions, div, px, rgb, size,
 };
 use gpui_webview::WebView;
 
@@ -177,6 +177,11 @@ impl Workspace {
     /// Whether `tab`'s page is in its separate window.
     pub(super) fn separated(&self, tab: &TabRef) -> bool {
         self.preview.separate.contains_key(tab)
+    }
+
+    /// The separate window holding `tab`'s page.
+    pub(super) fn separate_window(&self, tab: &TabRef) -> Option<AnyWindowHandle> {
+        self.preview.separate.get(tab).map(|separate| separate.window.into())
     }
 
     fn separate_look(&self, tab: &TabRef) -> Option<Look> {

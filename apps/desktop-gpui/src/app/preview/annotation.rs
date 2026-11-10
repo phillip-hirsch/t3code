@@ -556,9 +556,10 @@ impl Workspace {
         area: Rect,
         (width, _): (f64, f64),
         window: &Window,
-        cx: &App,
+        cx: &mut App,
     ) -> Option<ScreenRect> {
         let bounds = self.preview.tabs.get(tab).filter(|hosted| hosted.shown)?.view.read(cx).bounds();
+        let page = self.page_window(tab, window, cx)?;
         // The page's CSS pixels to the view's, through its zoom.
         #[expect(clippy::cast_possible_truncation, reason = "on-screen sizes fit in an f32")]
         let scale = (f64::from(f32::from(bounds.size.width)) / width) as f32;
@@ -566,7 +567,7 @@ impl Workspace {
         let pixels = |value: f64| px(value as f32 * scale);
         let origin = point(bounds.origin.x + pixels(area.x), bounds.origin.y + pixels(area.y));
         let area = Bounds { origin, size: size(pixels(area.width), pixels(area.height)) };
-        capture::screen_rect(capture::content_origin(window), area, capture::screen_units(window))
+        page.screen_rect(area)
     }
 
     /// The screenshot was read (or not): the overlay goes, and the annotation joins the draft.

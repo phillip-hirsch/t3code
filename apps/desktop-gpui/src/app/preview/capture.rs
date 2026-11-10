@@ -209,6 +209,25 @@ pub(super) fn content_origin(window: &Window) -> Point<Pixels> {
     gpui_kit::point(px(f32::from(origin.x) / scale), px(f32::from(origin.y) / scale))
 }
 
+/// The window a page is drawn in, as capture reads it.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PageWindow {
+    origin: Point<Pixels>,
+    units: f32,
+    active: bool,
+}
+
+impl PageWindow {
+    fn of(window: &Window) -> Self {
+        Self { origin: content_origin(window), units: screen_units(window), active: window.is_window_active() }
+    }
+
+    /// Where `view`, in this window's pixels, is on screen.
+    pub(super) fn screen_rect(self, view: Bounds<Pixels>) -> Option<ScreenRect> {
+        screen_rect(self.origin, view, self.units)
+    }
+}
+
 /// `captureScreenshot`: `browser-screenshot-<site>-<time>-<id>.png`.
 fn save_screenshot(rect: ScreenRect, url: &str) -> Result<Screenshot, String> {
     let png = grab_png(rect)?;
@@ -436,14 +455,24 @@ impl Workspace {
         self.preview.tabs.get(tab)
     }
 
-    /// Where a shown tab's page is on screen.
-    fn capture_rect(&self, tab: &TabRef, window: &Window, cx: &App) -> Option<ScreenRect> {
-        let hosted = self.capture_tab(tab).filter(|hosted| hosted.shown)?;
-        screen_rect(content_origin(window), hosted.view.read(cx).bounds(), screen_units(window))
+    /// The window `tab`'s page is drawn in: its separate window once it popped out, else the
+    /// main window, `window`.
+    pub(super) fn page_window(&self, tab: &TabRef, window: &Window, cx: &mut App) -> Option<PageWindow> {
+        match self.separate_window(tab) {
+            Some(separate) => separate.update(cx, |_, window, _| PageWindow::of(window)).ok(),
+            None => Some(PageWindow::of(window)),
+        }
+    }
+
+    /// Where a shown tab's page is on screen, and whether its window is active.
+    fn capture_rect(&self, tab: &TabRef, window: &Window, cx: &mut App) -> Option<(ScreenRect, bool)> {
+        let bounds = self.capture_tab(tab).filter(|hosted| hosted.shown)?.view.read(cx).bounds();
+        let page = self.page_window(tab, window, cx)?;
+        Some((page.screen_rect(bounds)?, page.active))
     }
 
     fn take_screenshot(&mut self, tab: &TabRef, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(rect) = self.capture_rect(tab, window, cx) else {
+        let Some((rect, _)) = self.capture_rect(tab, window, cx) else {
             return error_toast(window, cx, "Unable to capture screenshot", "Show the browser tab to capture it.");
         };
         let url = self.capture_tab(tab).and_then(|hosted| hosted.status.url()).unwrap_or_default().to_owned();
@@ -522,8 +551,7 @@ impl Workspace {
         }
         // A hidden or covered tab skips frames, and so does an inactive window, whose page other
         // windows may cover on screen; the video holds its last frame.
-        if window.is_window_active()
-            && let Some(rect) = self.capture_rect(&tab, window, cx)
+        if let Some((rect, true)) = self.capture_rect(&tab, window, cx)
             && let Err(TrySendError::Disconnected(_)) = frames.try_send(FrameRequest { rect, at: started.elapsed() })
         {
             return false;
