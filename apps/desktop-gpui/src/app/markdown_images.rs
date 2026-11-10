@@ -411,9 +411,7 @@ impl Workspace {
         if !cache.same(&self.markdown_images) {
             return;
         }
-        if let Some(index) = self.rows.iter().rposition(|row| super::chat::shows_markdown(row, key)) {
-            self.scroller.update(cx, |scroller, cx| scroller.remeasure_items(index..index + 1, cx));
-        }
+        self.remeasure_item_rows(key, cx);
         cx.notify();
     }
 }

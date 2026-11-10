@@ -241,6 +241,15 @@ impl Workspace {
         }
     }
 
+    /// Remeasures the rows showing the view key `key`'s item in either pane: an image one pane
+    /// loaded draws in the other's copy of the item too, which found it already claimed.
+    pub(super) fn remeasure_item_rows(&self, key: &str, cx: &mut Context<Self>) {
+        let item = view_pane(key).1;
+        for pane in [ChatPane::Main, ChatPane::Side] {
+            self.remeasure_markdown_row(&view_key(pane, item), cx);
+        }
+    }
+
     fn toggle_code_wrap(&mut self, key: &str, cx: &mut Context<Self>) {
         if let Some(state) = self.markdown.0.get_mut(key) {
             state.nowrap = !state.nowrap;
