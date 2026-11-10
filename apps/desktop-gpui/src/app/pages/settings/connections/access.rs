@@ -566,6 +566,7 @@ impl Workspace {
         t: &Tokens,
     ) -> AnyElement {
         let environment = self.settings_environment();
+        let host = LinkIssuer { workspace: workspace.clone(), environment: environment.clone() };
         let use_in_another_app = WebButton::new("use-in-another-app", "Use in another app (MCP)")
             .icon(IconName::Plug)
             .on_click(move |_, window, cx| {
@@ -584,7 +585,7 @@ impl Workspace {
         .variant(Variant::DestructiveOutline)
         .disabled(s.revoking_others || !others)
         .on_click({
-            let (state, endpoint) = (state.clone(), endpoint.clone());
+            let state = state.clone();
             move |_, window, cx| revoke(&state, endpoint.clone(), Revoke::Others, window, cx)
         });
         let denial = logic::remote_clients_denial(&self.settings_info().managed_policy);
@@ -605,7 +606,7 @@ impl Workspace {
                 let state = state.downgrade();
                 create
                     .on_click(move |_, window, cx| {
-                        open_create_link_dialog(state.clone(), endpoint.clone(), delegatable.clone(), window, cx);
+                        open_create_link_dialog(state.clone(), host.clone(), delegatable.clone(), window, cx);
                     })
                     .into_any_element()
             }
@@ -1074,7 +1075,28 @@ struct CreateLinkForm {
     delegatable: Vec<String>,
     busy: bool,
     access: WeakEntity<AccessState>,
-    endpoint: Option<Endpoint>,
+    host: LinkIssuer,
+}
+
+/// The environment a "Create pairing link" dialog opened on, read again when it creates: the
+/// dialog can stay open through a reconnect.
+#[derive(Clone)]
+struct LinkIssuer {
+    workspace: WeakEntity<Workspace>,
+    environment: Option<SharedString>,
+}
+
+impl LinkIssuer {
+    /// The environment's address now, while this session may issue `scopes` there.
+    fn endpoint(&self, scopes: &[String], cx: &App) -> Option<Endpoint> {
+        let workspace = self.workspace.upgrade()?;
+        let workspace = workspace.read(cx);
+        let environment = self.environment.as_deref()?;
+        let grants = |scope: &str| workspace.env_grants(environment, scope);
+        (grants(ACCESS_WRITE) && scopes.iter().all(|scope| grants(scope)))
+            .then(|| workspace.env_endpoint(environment).cloned())
+            .flatten()
+    }
 }
 
 impl CreateLinkForm {
@@ -1093,6 +1115,7 @@ impl CreateLinkForm {
         if self.busy || scopes.is_empty() || !scopes.iter().all(|s| self.delegatable.contains(s)) {
             return;
         }
+        let Some(endpoint) = self.host.endpoint(&scopes, cx) else { return };
         self.busy = true;
         cx.notify();
         let label = self.label.read(cx).value().trim().to_owned();
@@ -1100,9 +1123,8 @@ impl CreateLinkForm {
         if !label.is_empty() {
             body["label"] = label.into();
         }
-        let endpoint = self.endpoint.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let result = auth_request(endpoint, "/api/auth/pairing-token", Some(body)).await;
+            let result = auth_request(Some(endpoint), "/api/auth/pairing-token", Some(body)).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.busy = false;
                 cx.notify();
@@ -1238,7 +1260,7 @@ impl Render for CreateLinkForm {
 
 fn open_create_link_dialog(
     access: WeakEntity<AccessState>,
-    endpoint: Option<Endpoint>,
+    host: LinkIssuer,
     delegatable: Vec<String>,
     window: &mut Window,
     cx: &mut App,
@@ -1246,6 +1268,6 @@ fn open_create_link_dialog(
     let label = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. Living room iPad"));
     label.update(cx, |input, cx| input.focus(window, cx));
     let scopes = logic::STANDARD_SCOPES.iter().map(std::string::ToString::to_string).collect();
-    let form = cx.new(|_| CreateLinkForm { label, scopes, delegatable, busy: false, access, endpoint });
+    let form = cx.new(|_| CreateLinkForm { label, scopes, delegatable, busy: false, access, host });
     window.open_dialog(cx, move |dialog, _, _| dialog.title("Create pairing link").w(px(448.)).child(form.clone()));
 }

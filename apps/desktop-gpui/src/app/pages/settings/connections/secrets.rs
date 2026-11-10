@@ -5,22 +5,22 @@ use std::collections::HashSet;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, ElementId, Entity, FontWeight, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window,
-    div, px,
+    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task,
+    WeakEntity, Window, div, px,
 };
 use serde_json::{Value, json};
 
 use super::super::widgets::{RowFrame, section_with_action, settings_section};
-use super::logic::{self, PROVIDERS_MANAGE, SecretProviderDraft};
+use super::logic::{self, PROVIDERS_MANAGE, SETTINGS_WRITE, SecretProviderDraft};
 use super::ui::{self, Size, Variant, WebButton, text_sm, text_xs};
 use super::{SessionLoad, check_session, error_toast, update_settings};
 use crate::app::Workspace;
 use crate::app::pages::settings::widgets::SettingsView;
-use crate::rpc::RpcClient;
 use crate::settings::scope::ScopeKind;
 use crate::theme::{self, Tokens};
 
@@ -57,7 +57,9 @@ impl Workspace {
             message_section(format!("Update T3 Code on {label} to manage its secret providers."), &t)
         } else if connected {
             let project_scoped = matches!(view.scope.kind, ScopeKind::Project { .. });
-            self.secret_providers(&state, label, project_scoped, cx, &t)
+            let host =
+                SecretsHost { workspace: cx.entity().downgrade(), environment: self.settings_environment(), label };
+            self.secret_providers(&state, host, project_scoped, cx, &t)
         } else {
             message_section(
                 "Connect an environment to manage the secret providers its provider variables read from.".into(),
@@ -70,7 +72,7 @@ impl Workspace {
     fn secret_providers(
         &self,
         state: &Entity<SecretsState>,
-        environment: String,
+        host: SecretsHost,
         project_scoped: bool,
         cx: &App,
         t: &Tokens,
@@ -81,13 +83,12 @@ impl Workspace {
         let empty = serde_json::Map::new();
         let providers = self.server_settings()["secretProviders"].as_object().unwrap_or(&empty);
         let ids: Vec<String> = providers.keys().cloned().collect();
-        let client = self.settings_client();
         let add = (!read_only).then(|| {
-            let (client, environment, ids) = (client.clone(), environment.clone(), ids.clone());
+            let (host, ids) = (host.clone(), ids.clone());
             WebButton::new("add-secret-provider", "Add provider")
                 .icon(IconName::Plus)
                 .on_click(move |_, window, cx| {
-                    open_provider_dialog(client.clone(), environment.clone(), ids.clone(), None, window, cx);
+                    open_provider_dialog(host.clone(), ids.clone(), None, window, cx);
                 })
                 .into_any_element()
         });
@@ -131,24 +132,17 @@ impl Workspace {
                     };
                     let controls = (!read_only).then(|| {
                         let edit = account.is_some().then(|| {
-                            let (client, environment, ids) = (client.clone(), environment.clone(), ids.clone());
+                            let (host, ids) = (host.clone(), ids.clone());
                             let editing = (id.clone(), provider.clone());
                             WebButton::new(ElementId::Name(format!("secret-provider-edit-{id}").into()), "Edit")
                                 .variant(Variant::Ghost)
                                 .on_click(move |_, window, cx| {
                                     let editing = Some(editing.clone());
-                                    open_provider_dialog(
-                                        client.clone(),
-                                        environment.clone(),
-                                        ids.clone(),
-                                        editing,
-                                        window,
-                                        cx,
-                                    );
+                                    open_provider_dialog(host.clone(), ids.clone(), editing, window, cx);
                                 })
                         });
                         let remove = {
-                            let (client, id, label) = (client.clone(), id.clone(), label.clone());
+                            let (host, id, label) = (host.clone(), id.clone(), label.clone());
                             let uses: Vec<String> = logic::secret_provider_uses(self.server_settings(), &id)
                                 .into_iter()
                                 .map(|u| u.label)
@@ -156,7 +150,7 @@ impl Workspace {
                             WebButton::new(ElementId::Name(format!("secret-provider-remove-{id}").into()), "Remove")
                                 .variant(Variant::Ghost)
                                 .on_click(move |_, window, cx| {
-                                    confirm_remove(client.clone(), id.clone(), label.clone(), uses.clone(), window, cx);
+                                    confirm_remove(host.clone(), id.clone(), label.clone(), uses.clone(), window, cx);
                                 })
                         };
                         h_flex().gap(px(4.)).children(edit).child(remove).into_any_element()
@@ -209,16 +203,9 @@ fn redacted_account(state: &Entity<SecretsState>, id: &str, account: &str, revea
 }
 
 /// `RemoveSecretProviderButton`; `uses` are what reads from the provider and will be unset.
-fn confirm_remove(
-    client: Option<RpcClient>,
-    id: String,
-    label: String,
-    uses: Vec<String>,
-    window: &mut Window,
-    cx: &mut App,
-) {
+fn confirm_remove(host: SecretsHost, id: String, label: String, uses: Vec<String>, window: &mut Window, cx: &mut App) {
     window.open_alert_dialog(cx, move |dialog, _, cx| {
-        let (client, id) = (client.clone(), id.clone());
+        let (host, id) = (host.clone(), id.clone());
         let t = theme::tokens(cx);
         let description = if uses.is_empty() {
             format!("Nothing reads from {label}. The secrets themselves are untouched.").into_any_element()
@@ -249,20 +236,41 @@ fn confirm_remove(
             .ok_variant(gpui_kit::component::button::ButtonVariant::Danger)
             .on_ok(move |_, window, cx| {
                 let patch = json!({ "secretProviders": { id.clone(): null } });
-                save(client.clone(), patch, window, cx);
+                // Removing also unsets what reads from it (`requiredScopesForServerSettingsPatch`).
+                host.save(patch, &[SETTINGS_WRITE, PROVIDERS_MANAGE], window, cx);
                 true
             })
     });
 }
 
-fn save(client: Option<RpcClient>, patch: Value, window: &mut Window, cx: &mut App) {
-    window
-        .spawn(cx, async move |cx| {
-            if let Err(error) = update_settings(client, patch).await {
-                let _ = cx.update(|window, cx| error_toast(window, cx, "Could not update settings", error));
-            }
-        })
-        .detach();
+/// The environment a secrets dialog opened on, whose socket and grants are read when it saves:
+/// a dialog can stay open through a reconnect.
+#[derive(Clone)]
+struct SecretsHost {
+    workspace: WeakEntity<Workspace>,
+    environment: Option<SharedString>,
+    label: String,
+}
+
+impl SecretsHost {
+    /// `useUpdateEnvironmentSettings`: a session without `scopes` there saves nothing.
+    fn save(&self, patch: Value, scopes: &[&str], window: &mut Window, cx: &mut App) {
+        let Some(workspace) = self.workspace.upgrade() else { return };
+        let workspace = workspace.read(cx);
+        let environment = self.environment.as_deref().unwrap_or_default();
+        if !scopes.iter().all(|scope| workspace.env_grants(environment, scope)) {
+            let reason = format!("This connection lacks permission to change settings on {}.", self.label);
+            return window.push_notification(Notification::warning(reason).title("Setting not saved"), cx);
+        }
+        let client = workspace.env_client(environment);
+        window
+            .spawn(cx, async move |cx| {
+                if let Err(error) = update_settings(client, patch).await {
+                    let _ = cx.update(|window, cx| error_toast(window, cx, "Could not update settings", error));
+                }
+            })
+            .detach();
+    }
 }
 
 /// The add/edit dialog's form (`SecretProviderDialog`); one per open, so each starts fresh.
@@ -273,7 +281,7 @@ struct ProviderForm {
     /// The provider being edited: its id and stored config.
     editing: Option<(String, Value)>,
     submitted: bool,
-    client: Option<RpcClient>,
+    host: SecretsHost,
     _subscriptions: [Subscription; 2],
 }
 
@@ -293,7 +301,7 @@ impl ProviderForm {
         let patch = json!({ "secretProviders": { entry.id: {
             "kind": "one_password", "label": entry.label, "config": { "account": entry.account },
         } } });
-        save(self.client.clone(), patch, window, cx);
+        self.host.save(patch, &[PROVIDERS_MANAGE], window, cx);
         window.close_dialog(cx);
     }
 }
@@ -347,8 +355,7 @@ impl Render for ProviderForm {
 }
 
 fn open_provider_dialog(
-    client: Option<RpcClient>,
-    environment: String,
+    host: SecretsHost,
     existing_ids: Vec<String>,
     editing: Option<(String, Value)>,
     window: &mut Window,
@@ -367,7 +374,8 @@ fn open_provider_dialog(
         None => "Add a 1Password provider".into(),
     };
     let description: SharedString = format!(
-        "Provider variables on {environment} can read values from it by name. Values are read with the op CLI on that server when a provider starts."
+        "Provider variables on {} can read values from it by name. Values are read with the op CLI on that server when a provider starts.",
+        host.label
     )
     .into();
     let form = cx.new(|cx| {
@@ -389,7 +397,7 @@ fn open_provider_dialog(
             existing_ids,
             editing,
             submitted: false,
-            client,
+            host,
         }
     });
     window.open_dialog(cx, move |dialog, _, cx| {
