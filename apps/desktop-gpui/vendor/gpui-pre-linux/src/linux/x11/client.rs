@@ -51,7 +51,8 @@ use super::{
 use crate::linux::{
     DEFAULT_CURSOR_ICON_NAME, capslock_from_xkb, cursor_style_to_icon_names, get_xkb_compose_state,
     is_within_click_distance, keystroke_from_xkb, keystroke_underlying_dead_key,
-    log_cursor_icon_warning, modifiers_from_xkb, new_xkb_context, open_uri_internal,
+    log_cursor_icon_warning, modifiers_from_xkb, new_xkb_context, num_lock_from_xkb,
+    open_uri_internal,
     platform::{DOUBLE_CLICK_INTERVAL, SCROLL_LINES},
     reveal_path_internal,
     xdg_desktop_portal::{Event as XDPEvent, XDPEventSource},
@@ -1164,6 +1165,7 @@ impl X11Client {
                     }
                     state.native_key = NativeKey {
                         code: Some(NativeKeyCode::Xkb(u32::from(event.detail))),
+                        num_lock: Some(num_lock_from_xkb(&key_event_state)),
                     };
 
                     if let Some(mut compose_state) = state.compose_state.take() {
@@ -1230,6 +1232,7 @@ impl X11Client {
                     }
                     state.native_key = NativeKey {
                         code: Some(NativeKeyCode::Xkb(u32::from(event.detail))),
+                        num_lock: Some(num_lock_from_xkb(&key_event_state)),
                     };
 
                     keystroke

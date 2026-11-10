@@ -3665,7 +3665,7 @@ impl Window {
     }
 
     /// What the platform knows about the key event being dispatched beyond its keystroke (its
-    /// physical key), for terminals that encode keys the way browsers report `KeyboardEvent.code`.
+    /// physical key and Num Lock), for terminals that encode keys the way browsers report `KeyboardEvent.code`.
     /// Read it from a key down or key up listener; outside one it describes the last key event.
     pub fn native_key(&self) -> crate::NativeKey {
         self.platform_window.native_key()

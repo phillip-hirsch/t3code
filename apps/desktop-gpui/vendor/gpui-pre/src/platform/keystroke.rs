@@ -720,6 +720,8 @@ pub enum NativeKeyCode {
 pub struct NativeKey {
     /// The key's physical code, when the platform reports one.
     pub code: Option<NativeKeyCode>,
+    /// Whether Num Lock was on, when the platform reports it.
+    pub num_lock: Option<bool>,
 }
 
 impl AsKeystroke for Keystroke {

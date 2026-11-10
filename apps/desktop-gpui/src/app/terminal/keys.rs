@@ -8,7 +8,7 @@ use std::borrow::Cow;
 use gpui_kit::{Keystroke, NativeKeyCode};
 use libghostty_vt::key::Key;
 
-use super::core::{Core, KeyAction as Press, KeyInput, Modifiers};
+use super::core::{Core, KeyAction as Press, KeyInput, Locks, Modifiers};
 use super::key_codes;
 
 /// A key's identity across its press and release (`event.code`): the platform's code for the
@@ -128,12 +128,19 @@ impl Keyboard {
     }
 
     /// Kitty sessions that asked for releases hear them, for the keys whose press they heard.
-    pub fn release(&mut self, core: &mut Core, keystroke: &Keystroke, key: &PhysicalKey, mac: bool) -> Option<String> {
+    pub fn release(
+        &mut self,
+        core: &mut Core,
+        keystroke: &Keystroke,
+        key: &PhysicalKey,
+        locks: Locks,
+        mac: bool,
+    ) -> Option<String> {
         let code = self.forget(&key.id)?;
         if self.preedit > 0 {
             return None;
         }
-        let data = core.encode_key(&KeyInput { code, ..key_input(keystroke, Press::Release, mac) });
+        let data = core.encode_key(&KeyInput { code, locks, ..key_input(keystroke, Press::Release, mac) });
         (!data.is_empty()).then_some(data)
     }
 }
@@ -310,6 +317,7 @@ pub(super) fn key_input(keystroke: &Keystroke, action: Press, mac: bool) -> KeyI
         action,
         code: key_codes::from_name(&keystroke.key),
         mods,
+        locks: Locks::default(),
         consumed,
         text,
         unshifted: base.and_then(|c| unshifted(c, m.shift)),
@@ -375,6 +383,8 @@ mod tests {
         character_input: bool,
         /// `Window::native_key`.
         native: Option<NativeKeyCode>,
+        /// `Window::capslock` and `NativeKey::num_lock`.
+        locks: Locks,
     }
 
     impl Platform {
@@ -397,7 +407,7 @@ mod tests {
         }
         match key_action_on(keystroke, false, core.alt_screen(), false, platform.mac)? {
             KeyAction::Send(data) => Some(data.to_owned()),
-            KeyAction::Encode(input) => keyboard.press(core, &key, input),
+            KeyAction::Encode(input) => keyboard.press(core, &key, KeyInput { locks: platform.locks, ..input }),
             _ => None,
         }
     }
@@ -409,7 +419,7 @@ mod tests {
         keystroke: &Keystroke,
         platform: Platform,
     ) -> Option<String> {
-        keyboard.release(core, keystroke, &PhysicalKey::of(keystroke, platform.native), platform.mac)
+        keyboard.release(core, keystroke, &PhysicalKey::of(keystroke, platform.native), platform.locks, platform.mac)
     }
 
     fn released(keyboard: &mut Keyboard, core: &mut Core, keystroke: &Keystroke) -> Option<String> {
@@ -683,6 +693,21 @@ mod tests {
         assert_eq!(pressed_as(&mut keyboard, &mut core, &quote, dead), None);
         keyboard.cancel_composition();
         assert_eq!(pressed_as(&mut keyboard, &mut core, &e, e_key).as_deref(), Some("\x1b[101u"));
+    }
+
+    #[test]
+    fn lock_keys_reach_kitty_programs_that_ask_for_every_key() {
+        use NativeKeyCode::{Windows, Xkb};
+        let mut core = core(80, 24);
+        let caps = Platform { locks: Locks { caps: true, num: false }, ..Platform::key(Xkb(38)) };
+        let a = typed("a", Some("A"));
+        assert_eq!(sent_as(&mut core, &a, caps), None, "legacy sessions get the typed A");
+        core.write(b"\x1b[>11u");
+        let mut keyboard = Keyboard::default();
+        assert_eq!(pressed_as(&mut keyboard, &mut core, &a, caps).as_deref(), Some("\x1b[97;65u"));
+        assert_eq!(released_as(&mut keyboard, &mut core, &a, caps).as_deref(), Some("\x1b[97;65:3u"));
+        let num = Platform { locks: Locks { caps: false, num: true }, ..Platform::key(Windows(0x4f)) };
+        assert_eq!(sent_as(&mut core, &typed("1", Some("1")), num).as_deref(), Some("\x1b[57400;129u"));
     }
 
     #[test]

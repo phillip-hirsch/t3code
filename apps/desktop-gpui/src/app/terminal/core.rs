@@ -51,6 +51,13 @@ impl Modifiers {
     }
 }
 
+/// The lock keys that are on (`getModifierState("CapsLock")` and `"NumLock"`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Locks {
+    pub caps: bool,
+    pub num: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum KeyAction {
     Press,
@@ -65,6 +72,7 @@ pub(super) struct KeyInput<'a> {
     /// The key's physical code (`event.code`).
     pub code: key::Key,
     pub mods: Modifiers,
+    pub locks: Locks,
     /// Modifiers the layout used to produce `text` (`ghosttyConsumedMods`).
     pub consumed: Modifiers,
     /// The character the key types, without Ctrl applied.
@@ -383,10 +391,13 @@ impl Core {
             KeyAction::Repeat => key::Action::Repeat,
             KeyAction::Release => key::Action::Release,
         };
+        let mut mods = input.mods.mods();
+        mods.set(Mods::CAPS_LOCK, input.locks.caps);
+        mods.set(Mods::NUM_LOCK, input.locks.num);
         self.key_event
             .set_action(action)
             .set_key(input.code)
-            .set_mods(input.mods.mods())
+            .set_mods(mods)
             .set_consumed_mods(input.consumed.mods())
             .set_composing(false)
             .set_unshifted_codepoint(input.unshifted.unwrap_or('\0'))

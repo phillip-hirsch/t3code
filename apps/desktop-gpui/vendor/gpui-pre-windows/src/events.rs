@@ -1563,9 +1563,11 @@ where
             }))
         }
         vkey => {
-            let keystroke = parse_normal_key(vkey, lparam, modifiers)?;
+            let mut num_lock = None;
+            let keystroke = parse_normal_key(vkey, lparam, modifiers, &mut num_lock)?;
             state.last_native_key.set(NativeKey {
                 code: native_key_code(lparam),
+                num_lock,
             });
             Some(f(keystroke.0, keystroke.1))
         }
@@ -1636,8 +1638,9 @@ fn parse_normal_key(
     vkey: VIRTUAL_KEY,
     lparam: LPARAM,
     mut modifiers: Modifiers,
+    num_lock: &mut Option<bool>,
 ) -> Option<(Keystroke, bool)> {
-    let (key_char, prefer_character_input) = process_key(vkey, lparam.hiword());
+    let (key_char, prefer_character_input) = process_key(vkey, lparam.hiword(), num_lock);
 
     let key = parse_immutable(vkey).or_else(|| {
         let scan_code = lparam.hiword() & 0xFF;
@@ -1654,13 +1657,19 @@ fn parse_normal_key(
     ))
 }
 
-fn process_key(vkey: VIRTUAL_KEY, scan_code: u16) -> (Option<String>, bool) {
+/// Also reports Num Lock (bit 0 of `VK_NUMLOCK` in the keyboard state it reads) in `num_lock`.
+fn process_key(
+    vkey: VIRTUAL_KEY,
+    scan_code: u16,
+    num_lock: &mut Option<bool>,
+) -> (Option<String>, bool) {
     let mut keyboard_state = [0u8; 256];
     unsafe {
         if GetKeyboardState(&mut keyboard_state).is_err() {
             return (None, false);
         }
     }
+    *num_lock = Some(std::hint::black_box(keyboard_state)[VK_NUMLOCK.0 as usize] & 1 != 0);
 
     let mut buffer_c = [0u16; 8];
     let result_c = unsafe {

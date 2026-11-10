@@ -1662,6 +1662,10 @@ pub(super) fn capslock_from_xkb(keymap_state: &State) -> gpui::Capslock {
     gpui::Capslock { on }
 }
 
+pub(super) fn num_lock_from_xkb(keymap_state: &State) -> bool {
+    keymap_state.mod_name_is_active(xkb::MOD_NAME_NUM, xkb::STATE_MODS_EFFECTIVE)
+}
+
 /// Resolve a Linux `dev_t` to PCI vendor/device IDs via sysfs, returning a
 /// [`CompositorGpuHint`] that the GPU adapter selection code can use to
 /// prioritize the compositor's rendering device.

@@ -2718,8 +2718,10 @@ extern "C" fn handle_key_event(
     let Some((event, key_code)) = event else {
         return Bool::NO;
     };
+    // Mac keyboards have no Num Lock (Clear sits in its place), so the platform reports none.
     lock.native_key = NativeKey {
         code: key_code.map(NativeKeyCode::Mac),
+        num_lock: None,
     };
 
     let run_callback = |event: PlatformInput| -> Bool {
