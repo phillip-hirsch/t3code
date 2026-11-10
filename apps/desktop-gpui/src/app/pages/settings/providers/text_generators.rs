@@ -76,7 +76,7 @@ pub(in crate::app::pages::settings) fn text_generators_allowed(policy: &Value) -
 
 /// `TextGeneratorBaseUrl`: an http(s) URL without credentials, query or fragment.
 fn valid_base_url(url: &str) -> bool {
-    if url.is_empty() || url.len() > 2048 || url.trim() != url {
+    if url.is_empty() || url.encode_utf16().count() > 2048 || url.trim() != url {
         return false;
     }
     Url::parse(url).is_ok_and(|url| {
@@ -1602,6 +1602,10 @@ mod tests {
         for url in ["https://api.openai.com/v1", "http://localhost:11434/v1", "http://192.168.1.4:1234"] {
             assert!(valid_base_url(url), "{url}");
         }
+        // The contract counts UTF-16 units: 721 here, though 2121 UTF-8 bytes.
+        let unicode = format!("https://example.test/{}", "界".repeat(700));
+        assert!(valid_base_url(&unicode));
+        assert!(!valid_base_url(&format!("https://example.test/{}", "a".repeat(2028))), "over 2048");
         for url in [
             "",
             "ftp://host/v1",
