@@ -93,8 +93,12 @@ fn not_connected(window: &mut Window, cx: &mut App) {
 impl Workspace {
     /// The socket and HTTP origin of the environment `pane`'s thread lives on.
     fn pane_connection(&self, pane: ChatPane) -> Option<(RpcClient, String)> {
-        let (env, _) = self.pane_thread(pane)?;
-        Some((self.env_client(&env)?, self.env_endpoint(&env)?.http_base.clone()))
+        self.env_origin(&self.pane_thread(pane)?.0)
+    }
+
+    /// The socket and HTTP origin `env` has now.
+    fn env_origin(&self, env: &str) -> Option<(RpcClient, String)> {
+        Some((self.env_client(env)?, self.env_endpoint(env)?.http_base.clone()))
     }
 
     /// `onFileOpen` and `onImageExpand`: a sent file opens in its right panel tab, an image in the
@@ -173,30 +177,35 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((client, base)) = self.pane_connection(pane) else {
+        let Some(env) = self.pane_thread(pane).map(|(env, _)| env).filter(|env| self.env_origin(env).is_some()) else {
             return not_connected(window, cx);
         };
         let picked = cx.prompt_for_new_path(&super::attachment_preview::downloads_dir(), Some(&attachment.name));
         let resource = attachment_resource(attachment, "attachment");
         let label = attachment.label().to_owned();
-        window
-            .spawn(cx, async move |cx| {
-                let Ok(Ok(Some(path))) = picked.await else { return };
-                let saved = match fetch_bytes(&client, &base, resource).await {
-                    Ok(bytes) => {
-                        let write = async move { std::fs::write(path, bytes).map_err(|error| error.to_string()) };
-                        cx.background_executor().spawn(write).await
-                    }
-                    Err(error) => Err(error),
-                };
-                if let Err(error) = saved {
-                    let _ = cx.update(|window, cx| {
-                        let toast = Notification::error(error).title(format!("Could not download {label}"));
-                        window.push_notification(toast, cx);
-                    });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(path))) = picked.await else { return };
+            // Looked up after the dialog: a reconnect while it was open replaced the socket.
+            let connection = this.read_with(cx, |this, _| this.env_origin(&env)).ok().flatten();
+            let fetched = match &connection {
+                Some((client, base)) => fetch_bytes(client, base, resource).await,
+                None => Err("The environment is not connected.".to_owned()),
+            };
+            let saved = match fetched {
+                Ok(bytes) => {
+                    let write = async move { std::fs::write(path, bytes).map_err(|error| error.to_string()) };
+                    cx.background_executor().spawn(write).await
                 }
-            })
-            .detach();
+                Err(error) => Err(error),
+            };
+            if let Err(error) = saved {
+                let _ = cx.update(|window, cx| {
+                    let toast = Notification::error(error).title(format!("Could not download {label}"));
+                    window.push_notification(toast, cx);
+                });
+            }
+        })
+        .detach();
     }
 }
 

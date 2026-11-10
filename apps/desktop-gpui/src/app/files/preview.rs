@@ -431,8 +431,12 @@ impl Workspace {
 
     /// The socket and address of the environment `key`'s checkout is on.
     pub(super) fn file_connection(&self, key: &FileKey) -> Option<(crate::rpc::RpcClient, crate::backend::Endpoint)> {
-        let env = self.file_environment(key)?;
-        Some((self.env_client(&env)?, self.env_endpoint(&env)?.clone()))
+        self.env_connection(&self.file_environment(key)?)
+    }
+
+    /// The socket and address `env` has now.
+    pub(super) fn env_connection(&self, env: &str) -> Option<(crate::rpc::RpcClient, crate::backend::Endpoint)> {
+        Some((self.env_client(env)?, self.env_endpoint(env)?.clone()))
     }
 
     fn load_full_file(&mut self, key: FileKey, window: &mut Window, cx: &mut Context<Self>) {
@@ -491,14 +495,21 @@ impl Workspace {
 
     /// Save file: fetches the file again and writes it where the user picks.
     fn save_full_file(&mut self, key: &FileKey, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some((client, endpoint)), Some(resource)) = (self.file_connection(key), self.media_resource(key)) else {
+        let env = self.file_environment(key).filter(|env| self.env_connection(env).is_some());
+        let (Some(env), Some(resource)) = (env, self.media_resource(key)) else {
             return;
         };
         let directory = std::env::home_dir().map(|home| home.join("Downloads")).unwrap_or_default();
         let picked = cx.prompt_for_new_path(&directory, Some(logic::file_name(&key.path)));
-        cx.spawn_in(window, async move |_, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(path))) = picked.await else { return };
-            let written = match fetch_asset(client, endpoint, resource).await {
+            // Looked up after the dialog: a reconnect while it was open replaced the socket.
+            let connection = this.read_with(cx, |this, _| this.env_connection(&env)).ok().flatten();
+            let fetched = match connection {
+                Some((client, endpoint)) => fetch_asset(client, endpoint, resource).await,
+                None => Err(anyhow::anyhow!("Reconnect to the environment and try again.")),
+            };
+            let written = match fetched {
                 Ok(bytes) => {
                     cx.background_spawn(async move {
                         std::fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))
