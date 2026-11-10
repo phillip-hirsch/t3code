@@ -1062,6 +1062,11 @@ fn toggle(
     }
 }
 
+/// A response's fork source, which a side chat never offers: a fork would promote it.
+fn main_fork(pane: ChatPane, fork: Option<&(SharedString, SharedString)>) -> Option<&(SharedString, SharedString)> {
+    fork.filter(|_| pane == ChatPane::Main)
+}
+
 pub(super) fn render_row(
     row: &Row,
     pane: ChatPane,
@@ -1144,7 +1149,7 @@ pub(super) fn render_row(
                 false,
                 updated_at,
                 status,
-                fork.as_ref(),
+                main_fork(pane, fork.as_ref()),
                 Some("timeline-meta"),
                 &t,
                 cx,
@@ -1174,7 +1179,7 @@ pub(super) fn render_row(
                     *streaming,
                     updated_at,
                     status,
-                    fork.as_ref(),
+                    main_fork(pane, fork.as_ref()),
                     Some("timeline-row"),
                     &t,
                     cx,
