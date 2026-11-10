@@ -1235,14 +1235,13 @@ impl Render for Workspace {
         self.sync_servers(window, cx);
         self.sync_load_balancing(cx);
         self.sync_automations(window, cx);
-        self.sync_lineage_tick(window, cx);
         let right_panel = self.render_right_panel(window, cx);
         let mini_player = self.render_preview_mini_player(window, cx);
         self.sync_preview_views(window, cx);
         self.sync_document_views(window, cx);
         let terminal_drawer = self.render_terminal_drawer(window, cx);
         let theme = cx.theme();
-        div()
+        let view = div()
             .size_full()
             .relative()
             .track_focus(&self.focus)
@@ -1385,6 +1384,9 @@ impl Render for Workspace {
             .children(self.render_quit_hint(cx))
             .child(self.render_caption_overlay(window, cx))
             .children(titlebar::render_resize_edges(window, cx))
-            .into_any_element()
+            .into_any_element();
+        // Only the built view knows whether the card rendered Lineage.
+        self.sync_lineage_tick(cx);
+        view
     }
 }

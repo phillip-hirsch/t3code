@@ -116,6 +116,11 @@ fn fitting_height(sections: &[Option<Section>], density: Density) -> f32 {
         + 2.
 }
 
+/// Whether the card at `density` renders its Lineage section.
+fn lineage_renders(sections: &[Option<Section>], density: Density) -> bool {
+    sections[LINEAGE_SLOT].as_ref().is_some_and(|section| section.min_density <= density)
+}
+
 /// One label | bar | value row of the usage grid (`ThreadDetailsUsage.tsx` `UsageRow`).
 struct Meter {
     id: SharedString,
@@ -304,7 +309,7 @@ impl Workspace {
         }
     }
 
-    pub(super) fn render_details_card(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(super) fn render_details_card(&mut self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.details_shown(window) {
             return None;
         }
@@ -341,6 +346,8 @@ impl Workspace {
             sections[0] = self.workspace_section_at(density, &tokens, &colors, cx);
             sections[1] = self.version_control_section_at(density, &tokens, &colors, cx);
         }
+        self.lineage.card_ticks =
+            lineage_renders(&sections, density) && relationships.ticks(&self.lineage.open_workflows);
         let sections: Vec<AnyElement> = sections
             .into_iter()
             .flatten()
@@ -2558,6 +2565,17 @@ mod tests {
         let full = fitting_height(&sections, Density::Full);
         assert_eq!(full, 100. + SECTION_PADDING + 2.);
         assert_eq!(resolve_density(200., full, fitting_height(&sections, Density::Compact)), Density::Full);
+    }
+
+    #[test]
+    fn lineage_renders_only_at_full_density() {
+        let mut sections: [Option<Section>; 8] = Default::default();
+        assert!(!lineage_renders(&sections, Density::Full));
+        sections[LINEAGE_SLOT] =
+            Some(Section { element: div().into_any_element(), height: 0., min_density: Density::Full });
+        assert!(lineage_renders(&sections, Density::Full));
+        assert!(!lineage_renders(&sections, Density::Compact));
+        assert!(!lineage_renders(&sections, Density::Essential));
     }
 
     #[test]

@@ -29,6 +29,8 @@ pub(in crate::app) struct LineageUi {
     pub(super) phase_open: HashMap<(String, i64), bool>,
     /// Repaints an open workflow's running elapsed times once a second.
     _tick: Option<Task<()>>,
+    /// Whether the card this frame rendered such a time; taken by `sync_lineage_tick`.
+    pub(super) card_ticks: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -109,6 +111,17 @@ pub(super) struct Relationships {
     pub active: Vec<Relative>,
     pub previous: Vec<Relative>,
     pub side_chats: Vec<Relative>,
+}
+
+impl Relationships {
+    /// Whether one of the `open` workflow rows shows a time that runs.
+    pub fn ticks(&self, open: &HashSet<String>) -> bool {
+        self.active
+            .iter()
+            .chain(&self.previous)
+            .filter_map(|row| row.workflow.as_ref())
+            .any(|group| open.contains(&group.subagent_id) && group.ticks())
+    }
 }
 
 fn is_work_active(status: &str) -> bool {
@@ -299,22 +312,10 @@ impl Workspace {
         }))
     }
 
-    /// Keeps a once-a-second repaint alive while the shown card's open workflow row shows a
-    /// running time; called each render.
-    pub(in crate::app) fn sync_lineage_tick(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let open = &self.lineage.open_workflows;
-        let ticks = !open.is_empty()
-            && self.details_shown(window)
-            && self.details_item_shown("lineage")
-            && self.open_relationships().is_some_and(|relationships| {
-                relationships
-                    .active
-                    .iter()
-                    .chain(&relationships.previous)
-                    .filter_map(|row| row.workflow.as_ref())
-                    .any(|group| open.contains(&group.subagent_id) && group.ticks())
-            });
-        if !ticks {
+    /// Keeps a once-a-second repaint alive while the card's rendered Lineage shows an open
+    /// workflow's running time; called after each render builds the view.
+    pub(in crate::app) fn sync_lineage_tick(&mut self, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.lineage.card_ticks) {
             self.lineage._tick = None;
         } else if self.lineage._tick.is_none() {
             self.lineage._tick = Some(cx.spawn(async move |this, cx| {
@@ -556,6 +557,7 @@ mod tests {
         assert_eq!(group.phases[0].members[0].child_thread_id.as_deref(), Some("perf-thread"));
         assert_eq!((group.phases[0].elapsed_ms(4000), group.phases[1].elapsed_ms(9000)), (Some(3000), Some(2000)));
         assert!(group.ticks());
+        assert!(found.ticks(&HashSet::from(["w1".to_owned()])) && !found.ticks(&HashSet::new()), "only open rows tick");
 
         // A settled workflow moves to previous agents, and its queued agents read as it ended.
         let done = relationships("current", None, &threads, &[coordinator("cancelled")], |_| None);
