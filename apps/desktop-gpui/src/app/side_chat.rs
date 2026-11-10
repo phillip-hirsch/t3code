@@ -814,17 +814,19 @@ This permanently clears its conversation history."
             })
             .collect();
         let running = projection.is_some_and(ThreadProjection::is_running);
+        let operate = self.pane_can_operate(ChatPane::Side);
         let stop = |cx: &mut Context<Self>| {
             Button::new("side-chat-stop")
                 .xsmall()
                 .icon(Icon::new(IconName::Square))
                 .tooltip("Stop")
+                .disabled(!operate)
                 .on_click(cx.listener(|this, _, _, cx| this.stop_side_chat(cx)))
         };
         let question = self.render_question(ChatPane::Side, false, t, cx);
         let button = match self.side_chat_question() {
-            Some(draft) => self.render_side_question_actions(draft, running, stop(cx), cx),
-            None => self.render_side_primary_action(view, running, stop(cx), cx),
+            Some(draft) => self.render_side_question_actions(draft, running, operate, stop(cx), cx),
+            None => self.render_side_primary_action(view, running, operate, stop(cx), cx),
         };
         let composer = h_flex()
             .mx_2()
@@ -862,6 +864,7 @@ This permanently clears its conversation history."
         &self,
         draft: &QuestionDraft,
         running: bool,
+        operate: bool,
         stop: Button,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -891,7 +894,7 @@ This permanently clears its conversation history."
                     .primary()
                     .xsmall()
                     .label(label)
-                    .disabled(!enabled)
+                    .disabled(!enabled || !operate)
                     .on_click(cx.listener(|this, _, window, cx| this.advance_question(ChatPane::Side, window, cx))),
             )
             .into_any_element()
@@ -901,6 +904,7 @@ This permanently clears its conversation history."
         &self,
         view: &SideChatView,
         running: bool,
+        operate: bool,
         stop: Button,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -909,16 +913,20 @@ This permanently clears its conversation history."
                 .primary()
                 .xsmall()
                 .icon(Icon::new(IconName::Check))
-                .tooltip(if saving { "Updating queued message" } else { "Update queued message" })
-                .disabled(saving)
+                .tooltip(match (operate, saving) {
+                    (false, _) => NOT_OPERATE,
+                    (true, true) => "Updating queued message",
+                    (true, false) => "Update queued message",
+                })
+                .disabled(saving || !operate)
                 .on_click(cx.listener(|this, _, window, cx| this.send_side_chat(window, cx))),
             PrimaryAction::Stop => stop,
             PrimaryAction::Send => Button::new("side-chat-send")
                 .primary()
                 .xsmall()
                 .icon(Icon::new(IconName::ArrowUp))
-                .tooltip("Send")
-                .disabled(view.sending)
+                .tooltip(if operate { "Send" } else { NOT_OPERATE })
+                .disabled(view.sending || !operate)
                 .on_click(cx.listener(|this, _, window, cx| this.send_side_chat(window, cx))),
         }
         .into_any_element()
@@ -978,6 +986,11 @@ impl Workspace {
             return None;
         }
         Some((self.env_client(&env)?, env, thread_id))
+    }
+
+    /// `canOperateThread` for the pane's thread, on the environment it lives on.
+    pub(super) fn pane_can_operate(&self, pane: ChatPane) -> bool {
+        self.pane_thread(pane).is_some_and(|(env, _)| self.can_operate(&env))
     }
 
     /// Whether this connection may change side chats on the parent thread's environment

@@ -801,6 +801,7 @@ impl Workspace {
         let pane = if self.question.is_some() { ChatPane::Main } else { ChatPane::Side };
         let Some(draft) = self.question(pane) else { return false };
         if draft.collapsed
+            || !self.pane_can_operate(pane)
             || self.pending_question_request(pane).is_none_or(|(r, _)| r.capability() == Some("not_resumable"))
         {
             return false;
@@ -981,7 +982,7 @@ impl Workspace {
         let attached = |id: &str| self.question_attached(pane, id);
         let Some(answers) = requests::answers(&draft.questions, &draft.drafts, attached) else { return };
         let request_id = draft.request_id.clone();
-        if self.responding.is_some() || !self.target_can_operate() {
+        if self.responding.is_some() || !self.pane_can_operate(pane) {
             return;
         }
         let mut response = json!({"answers": answers});
@@ -1009,6 +1010,10 @@ impl Workspace {
     }
 
     fn pick_option(&mut self, pane: ChatPane, value: String, window: &mut Window, cx: &mut Context<Self>) {
+        let responding = self.question(pane).is_some_and(|q| self.responding.as_ref() == Some(&q.request_id));
+        if responding || !self.pane_can_operate(pane) {
+            return;
+        }
         let Some(draft) = self.question_mut(pane) else { return };
         let question = &draft.questions[draft.index];
         let next = requests::toggle(question, draft.drafts.get(&question.id), &value);
@@ -1677,7 +1682,7 @@ impl Workspace {
                         .collect()
                 },
             );
-        let enabled = request.is_live() && self.responding.as_ref() != Some(&request.id);
+        let enabled = request.is_live() && self.responding.as_ref() != Some(&request.id) && self.pane_can_operate(pane);
         let inline =
             |decision: &str, label: &str, warning: Option<SharedString>, tone: Hsla, cx: &mut Context<Self>| {
                 let request_id = request.id.clone();
@@ -1955,7 +1960,9 @@ impl Workspace {
         let draft = self.question(pane)?;
         let (request, item) = self.pending_question_request(pane)?;
         let question = &draft.questions[draft.index];
-        let disabled = request.capability() == Some("not_resumable") || self.responding.as_ref() == Some(&request.id);
+        let disabled = request.capability() == Some("not_resumable")
+            || self.responding.as_ref() == Some(&request.id)
+            || !self.pane_can_operate(pane);
         let dismissible = item.str("responseMode") == Some("message") || request.capability() == Some("message");
         let collapsed = draft.collapsed;
         let count = draft.questions.len();
