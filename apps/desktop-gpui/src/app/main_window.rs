@@ -84,11 +84,15 @@ pub fn ensure(cx: &mut App) -> Option<(AnyWindowHandle, Entity<Workspace>)> {
     Some((window, workspace))
 }
 
-/// Later launches' command lines ([`desktop::activation`]) and, on macOS, URLs the OS opens
-/// with the app: each brings the main window forward, reopening it if needed, and opens its
-/// app links there.
+/// Later launches' command lines ([`desktop::activation`]): each brings the main window
+/// forward, reopening it if needed, and opens its app links there.
 pub fn receive_launches(launches: async_channel::Receiver<Vec<String>>, cx: &mut App) {
     deliver(launches, Workspace::receive_launch, cx);
+}
+
+/// URLs macOS opens with the app, which may also be ordinary web pages and HTML files.
+pub fn receive_opened_urls(urls: async_channel::Receiver<Vec<String>>, cx: &mut App) {
+    deliver(urls, Workspace::receive_opened_urls, cx);
 }
 
 /// `t3 app` requests ([`desktop::app_control`]): each brings the main window forward, reopening

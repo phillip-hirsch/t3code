@@ -137,6 +137,13 @@ impl Workspace {
         self.open_pending_links(window, cx);
     }
 
+    /// URLs macOS opened with the app (`open-url`, and `open-file` for web pages): app links,
+    /// and ordinary pages for the browser or the Pull requests page.
+    pub(super) fn receive_opened_urls(&mut self, urls: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+        self.desktop.pending_links.extend(urls.iter().filter_map(|url| links::parse_opened_url(url)));
+        self.open_pending_links(window, cx);
+    }
+
     /// Opens queued links and `t3 app` requests once the server has listed its projects; the
     /// shell's snapshots call this again.
     pub(super) fn open_pending_links(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -152,6 +159,7 @@ impl Workspace {
     fn open_app_link(&mut self, link: AppLink, window: &mut Window, cx: &mut Context<Self>) {
         match link {
             AppLink::Pair { pairing_url } => self.pair_from_link(pairing_url, window, cx),
+            AppLink::Web { url } => self.open_web_link(url, window, cx),
             AppLink::Thread { environment_id, thread_id, query } => {
                 let listed = self.shell.threads.iter().any(|t| t.id == thread_id && t.environment_id == environment_id);
                 if listed {
@@ -184,6 +192,26 @@ impl Workspace {
                 ),
                 Ok(link) => self.launch_new_thread_link(link, window, cx),
             },
+        }
+    }
+
+    /// `DesktopWebLinkCoordinator.openLink` for a page: a pull request link opens in the Pull
+    /// requests page when that setting is on (`openChangeRequest`), anything else in the open
+    /// thread's browser. Only this machine serves files, so an HTML file needs a thread on it.
+    fn open_web_link(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.open_change_request_link(&url, cx) {
+            return;
+        }
+        let file = url::Url::parse(&url).ok().filter(|u| u.scheme() == "file").and_then(|u| u.to_file_path().ok());
+        let primary = self.primary_environment().cloned();
+        let thread =
+            self.preview_thread().filter(|thread| file.is_none() || primary.as_ref() == Some(&thread.environment));
+        let Some(thread) = thread else {
+            return toast_error(window, cx, "Could not open the link", url);
+        };
+        match file {
+            Some(path) => self.open_host_file_in_browser(&path.to_string_lossy(), window, cx),
+            None => self.request_preview_tab(thread, Some(url), false, window, cx),
         }
     }
 
