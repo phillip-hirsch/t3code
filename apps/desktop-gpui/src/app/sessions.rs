@@ -175,6 +175,11 @@ impl Workspace {
         self.settings_session()?.device_state.as_ref()
     }
 
+    /// One environment's device state, `None` until its stream's first state arrives.
+    pub(super) fn env_device_state(&self, environment_id: &str) -> Option<&DeviceState> {
+        self.session(environment_id)?.device_state.as_ref()
+    }
+
     pub(super) fn set_device_state(&mut self, environment_id: &str, state: DeviceState) {
         if let Some(session) = self.session_mut(environment_id) {
             session.device_state = Some(state);

@@ -5,8 +5,8 @@
 //! `SshDeviceHostConfig`, `EasDeviceHostConfig` and `SimlockDeviceHostConfig` schemas
 //! in `packages/contracts/src/device.ts`.
 //!
-//! GPUI talks to one environment, so the web's per-environment plans reduce to one host
-//! list, and `groupDeviceHosts` (which only merges lists across environments) has no port.
+//! Each function works on one environment's host list; `sources.rs` runs them once per
+//! selected environment.
 
 use crate::device::{DeviceState, HostStatus};
 
@@ -146,6 +146,48 @@ pub(super) fn ssh_connection_key(host: &SshHost) -> (String, Option<i64>, Option
 
 fn same_destination(a: &SshHost, b: &SshHost) -> bool {
     a.target == b.target && a.port == b.port && a.identity_file == b.identity_file
+}
+
+/// One SSH host as several environments hold it (`DeviceHostGroup`): the first one seen, and
+/// each holder's environment and own entry.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct HostGroup {
+    pub host: SshHost,
+    pub members: Vec<(String, SshHost)>,
+}
+
+/// `groupDeviceHosts`: combines matching configurations across environments, or `None` when an
+/// id or target means different hosts on different environments, which then keep their own rows.
+pub(super) fn group_device_hosts(environments: &[(&str, Vec<SshHost>)]) -> Option<Vec<HostGroup>> {
+    type Destination<'a> = (&'a str, Option<i64>, Option<&'a str>);
+    let mut groups: Vec<(Destination, HostGroup)> = Vec::new();
+    let mut identities: Vec<(&str, (&str, Destination))> = Vec::new();
+    let mut configurations: Vec<(&str, (&str, Destination))> = Vec::new();
+    for (environment, hosts) in environments {
+        let mut destinations: Vec<Destination> = Vec::new();
+        for host in hosts {
+            let destination = (host.target.as_str(), host.port, host.identity_file.as_deref());
+            let configuration = (host.label.as_str(), destination);
+            let differs = |seen: &[(&str, (&str, Destination))], key: &str| {
+                seen.iter().any(|(seen_key, seen)| *seen_key == key && *seen != configuration)
+            };
+            if destinations.contains(&destination)
+                || differs(&identities, &host.id)
+                || differs(&configurations, &host.target)
+            {
+                return None;
+            }
+            destinations.push(destination);
+            identities.push((&host.id, configuration));
+            configurations.push((&host.target, configuration));
+            let member = ((*environment).to_owned(), host.clone());
+            match groups.iter_mut().find(|(seen, _)| *seen == destination) {
+                Some((_, group)) => group.members.push(member),
+                None => groups.push((destination, HostGroup { host: host.clone(), members: vec![member] })),
+            }
+        }
+    }
+    Some(groups.into_iter().map(|(_, group)| group).collect())
 }
 
 /// `updateDeviceHosts`: adds, replaces or removes `host`, finding the saved entry by
@@ -321,31 +363,47 @@ pub(super) fn update_simlock_hosts(hosts: &[SimlockHost], host: &SimlockHost, re
     }
 }
 
-/// A secret field: the saved (redacted) value, a replacement, or none.
+/// A secret field: the saved (redacted) value, a replacement (a literal or a secret reference),
+/// or none.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum TokenEntry {
     Saved,
-    New(String),
+    New(Value),
     Cleared,
 }
 
-/// `planSimlockDeviceHostSave` for one environment: its host list with the shared
-/// fields and its own token.
-pub(super) fn plan_simlock_save(
-    hosts: &[SimlockHost],
+impl TokenEntry {
+    /// The value it saves over `saved`: a typed literal is trimmed.
+    pub(super) fn resolve(&self, saved: &Value) -> Value {
+        match self {
+            Self::Saved => saved.clone(),
+            Self::New(Value::String(value)) => value.trim().into(),
+            Self::New(reference) => reference.clone(),
+            Self::Cleared => empty_token(),
+        }
+    }
+}
+
+/// `planSimlockDeviceHostSave`: each environment's host list with the shared fields and its
+/// own token (a missing entry is a cleared one).
+pub(super) fn plan_simlock_saves(
+    environments: &[(String, Vec<SimlockHost>)],
     draft: &SimlockHost,
-    token: &TokenEntry,
-) -> Result<Vec<SimlockHost>, &'static str> {
+    tokens: &[(String, TokenEntry)],
+) -> Result<Vec<(String, Vec<SimlockHost>)>, &'static str> {
     if let Some(problem) = simlock_problem(draft) {
         return Err(problem);
     }
-    let saved = hosts.iter().find(|host| host.id == draft.id).map_or_else(empty_token, |host| host.agent_token.clone());
-    let agent_token = match token {
-        TokenEntry::Saved => saved,
-        TokenEntry::New(value) => value.trim().into(),
-        TokenEntry::Cleared => empty_token(),
-    };
-    Ok(update_simlock_hosts(hosts, &SimlockHost { agent_token, ..draft.clone() }, false))
+    Ok(environments
+        .iter()
+        .map(|(environment, hosts)| {
+            let saved =
+                hosts.iter().find(|host| host.id == draft.id).map_or_else(empty_token, |host| host.agent_token.clone());
+            let entry = tokens.iter().find(|(id, _)| id == environment).map_or(&TokenEntry::Cleared, |(_, e)| e);
+            let host = SimlockHost { agent_token: entry.resolve(&saved), ..draft.clone() };
+            (environment.clone(), update_simlock_hosts(hosts, &host, false))
+        })
+        .collect())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -564,22 +622,58 @@ mod tests {
     }
 
     #[test]
-    fn saves_the_shared_simlock_fields_and_the_environments_own_token() {
+    fn saves_the_shared_simlock_fields_and_each_environments_own_token() {
         let host = simlock();
         let draft = SimlockHost { label: "Pool".into(), agent_token: empty_token(), ..host.clone() };
-        let saved = [SimlockHost { agent_token: "<redacted>".into(), ..host }];
-        assert_eq!(
-            plan_simlock_save(&saved, &draft, &TokenEntry::Saved).unwrap(),
-            [SimlockHost { agent_token: "<redacted>".into(), ..draft.clone() }]
-        );
-        assert_eq!(
-            plan_simlock_save(&[], &draft, &TokenEntry::New(" cups-token ".into())).unwrap(),
-            [SimlockHost { agent_token: "cups-token".into(), ..draft.clone() }]
-        );
-        assert_eq!(plan_simlock_save(&[], &draft, &TokenEntry::Cleared).unwrap(), std::slice::from_ref(&draft));
         let reference = serde_json::json!({"provider": "homelab", "reference": "simlock#token"});
-        let referenced = [SimlockHost { agent_token: reference, ..draft.clone() }];
-        assert_eq!(plan_simlock_save(&referenced, &draft, &TokenEntry::Saved).unwrap(), referenced);
+        let environments = [
+            ("laptop".to_owned(), vec![SimlockHost { agent_token: "<redacted>".into(), ..host.clone() }]),
+            ("server".to_owned(), vec![]),
+            ("studio".to_owned(), vec![SimlockHost { agent_token: reference.clone(), ..host }]),
+            ("guest".to_owned(), vec![]),
+        ];
+        let tokens = [
+            ("laptop".to_owned(), TokenEntry::Saved),
+            ("server".to_owned(), TokenEntry::New(" cups-token ".into())),
+            ("studio".to_owned(), TokenEntry::Saved),
+        ];
+        let token = |agent_token: Value| vec![SimlockHost { agent_token, ..draft.clone() }];
+        assert_eq!(
+            plan_simlock_saves(&environments, &draft, &tokens).unwrap(),
+            [
+                ("laptop".to_owned(), token("<redacted>".into())),
+                ("server".to_owned(), token("cups-token".into())),
+                ("studio".to_owned(), token(reference.clone())),
+                ("guest".to_owned(), token(empty_token())),
+            ]
+        );
+        let new_reference = [("server".to_owned(), TokenEntry::New(reference.clone()))];
+        assert_eq!(plan_simlock_saves(&environments[1..2], &draft, &new_reference).unwrap()[0].1, token(reference));
+        let unlabeled = SimlockHost { label: " ".into(), ..draft };
+        assert_eq!(plan_simlock_saves(&environments, &unlabeled, &tokens), Err("Give the host a label."));
+    }
+
+    #[test]
+    fn groups_matching_hosts_across_environments_and_refuses_ambiguous_ones() {
+        let mac = ssh("mac", "Mac mini", "me@mac");
+        let pi = ssh("pi", "Pi", "me@pi");
+        let elsewhere = SshHost { id: "mac-2".into(), ..mac.clone() };
+        let groups = group_device_hosts(&[("laptop", vec![mac.clone(), pi]), ("server", vec![elsewhere])])
+            .expect("the same destination and label group even under another id");
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].host, mac);
+        let holders: Vec<&str> = groups[0].members.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(holders, ["laptop", "server"]);
+        assert_eq!(groups[0].members[1].1.id, "mac-2", "each holder keeps its own entry");
+        assert_eq!(groups[1].members.len(), 1);
+
+        let renamed = SshHost { label: "Studio".into(), ..mac.clone() };
+        assert_eq!(group_device_hosts(&[("laptop", vec![mac.clone()]), ("server", vec![renamed])]), None);
+        let reused_id = SshHost { target: "me@other".into(), ..mac.clone() };
+        assert_eq!(group_device_hosts(&[("laptop", vec![mac.clone()]), ("server", vec![reused_id])]), None);
+        let twice = SshHost { id: "again".into(), ..mac.clone() };
+        assert_eq!(group_device_hosts(&[("laptop", vec![mac, twice])]), None);
+        assert_eq!(group_device_hosts(&[]), Some(Vec::new()));
     }
 
     #[test]
