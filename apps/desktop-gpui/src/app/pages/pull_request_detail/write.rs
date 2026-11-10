@@ -151,7 +151,8 @@ pub(super) struct WriteState {
     replies: HashMap<String, Entity<TextareaState>>,
     editing: Option<Editing>,
     saving: bool,
-    thread_pending: bool,
+    /// Conversations whose resolve or reply is in flight, each on its own like the web's cards.
+    thread_pending: HashSet<String>,
     /// Reactions pressed and not yet read back, by subject and content.
     pub(super) reactions: HashMap<(String, String), bool>,
     reaction_picker: Option<String>,
@@ -229,6 +230,11 @@ fn summary_shortcut_verdict(
 /// Forgejo needs a summary to request changes (`reviewSummaryRequired`).
 fn summary_required(provider: &str) -> bool {
     provider == "forgejo"
+}
+
+/// A conversation's Fix waits while that conversation's resolve or reply is in flight.
+fn finding_pending(write: &WriteState, finding: &logic::Finding) -> bool {
+    matches!(finding, logic::Finding::Thread(thread) if write.thread_pending.contains(&thread.id))
 }
 
 /// Where a line draft opens: path, old path, anchor, range start, picked lines and excerpt.
@@ -1099,7 +1105,7 @@ impl Workspace {
         resolve.then(|| {
             let (id, resolved) = (thread.id.clone(), thread.is_resolved);
             ghost_button(ElementId::Name(format!("pr-thread-resolve:{id}").into()), t)
-                .disabled(panel.write.thread_pending)
+                .disabled(panel.write.thread_pending.contains(&thread.id))
                 .child(if resolved { "Unresolve" } else { "Resolve" })
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.set_pr_thread_resolved(id.clone(), !resolved, window, cx);
@@ -1123,7 +1129,7 @@ impl Workspace {
         Some(
             ghost_button(ElementId::Name(format!("pr-fix:{key}").into()), t)
                 .flex_none()
-                .disabled(panel.write.thread_pending || panel.handoff.is_some())
+                .disabled(finding_pending(&panel.write, &finding) || panel.handoff.is_some())
                 .child(Icon::new(Lucide::Hammer).with_size(px(12.)))
                 .child(if preparing { "Preparing..." } else { label })
                 .on_click(cx.listener(move |this, _, window, cx| this.fix_pr_finding(&finding, window, cx))),
@@ -1159,8 +1165,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(mut input) = self.pr_ref_json() else { return };
-        let Some(write) = self.pr_write().filter(|w| !w.thread_pending) else { return };
-        write.thread_pending = true;
+        let Some(write) = self.pr_write().filter(|w| !w.thread_pending.contains(&thread_id)) else { return };
+        write.thread_pending.insert(thread_id.clone());
         input["threadId"] = json!(thread_id);
         input["resolved"] = json!(resolved);
         self.run_pr_write(
@@ -1170,9 +1176,9 @@ impl Workspace {
             None,
             window,
             cx,
-            |this, key, _, _, _| {
+            move |this, key, _, _, _| {
                 if let Some(write) = this.pr_write_of(key) {
-                    write.thread_pending = false;
+                    write.thread_pending.remove(&thread_id);
                 }
             },
         );
@@ -1194,7 +1200,7 @@ impl Workspace {
         match panel.write.replies.get(&thread.id) {
             Some(input) => {
                 let empty = text_of(input, cx).trim().is_empty();
-                let pending = panel.write.thread_pending;
+                let pending = panel.write.thread_pending.contains(&thread.id);
                 let (cancel, send) = (id.clone(), id.clone());
                 Some(
                     v_flex()
@@ -1261,13 +1267,13 @@ impl Workspace {
     /// Posts one conversation's reply; only that conversation's box closes once it lands.
     fn send_pr_reply(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(mut payload) = self.pr_ref_json() else { return };
-        let Some(write) = self.pr_write().filter(|w| !w.thread_pending) else { return };
+        let Some(write) = self.pr_write().filter(|w| !w.thread_pending.contains(thread_id)) else { return };
         let Some(input) = write.replies.get(thread_id).cloned() else { return };
         let body = text_of(&input, cx).trim().to_owned();
         if body.is_empty() {
             return;
         }
-        write.thread_pending = true;
+        write.thread_pending.insert(thread_id.to_owned());
         payload["threadId"] = json!(thread_id);
         payload["body"] = json!(body);
         let thread_id = thread_id.to_owned();
@@ -1280,7 +1286,7 @@ impl Workspace {
             cx,
             move |this, key, ok, _, _| {
                 if let Some(write) = this.pr_write_of(key) {
-                    write.thread_pending = false;
+                    write.thread_pending.remove(&thread_id);
                     if ok && write.replies.get(&thread_id) == Some(&input) {
                         write.replies.remove(&thread_id);
                     }
