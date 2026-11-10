@@ -246,11 +246,9 @@ impl Workspace {
         let recents: Vec<crate::browser_history::Entry> = project
             .as_ref()
             .map(|p| {
-                let history = &self.preview.history;
-                // Entries still under the bare id show until a visit moves them.
-                let entries = history.recent(&p.key, 8);
-                let entries = if entries.is_empty() { history.recent(&p.legacy, 8) } else { entries };
-                entries.iter().filter(|e| url::Url::parse(&e.url).is_ok()).cloned().collect()
+                // Entries still under the bare id show as a visit, title or removal will merge them.
+                let entries = self.preview.history.merged(&p.key, &p.legacy);
+                entries.into_iter().take(8).filter(|e| url::Url::parse(&e.url).is_ok()).collect()
             })
             .unwrap_or_default();
         let servers = &self.preview.discovery.servers;

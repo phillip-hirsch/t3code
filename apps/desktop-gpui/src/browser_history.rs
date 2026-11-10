@@ -115,6 +115,7 @@ impl BrowserHistory {
         }
     }
 
+    #[cfg(test)]
     pub fn recent(&self, project_key: &str, limit: usize) -> &[Entry] {
         self.by_project_key.get(project_key).map_or(&[], |entries| &entries[..entries.len().min(limit)])
     }
@@ -159,12 +160,25 @@ impl BrowserHistory {
         changed
     }
 
-    /// Moves the entries kept under `legacy` to `key` when `key` has none.
+    /// `key`'s entries with those still kept under `legacy` merged in, newest first; `key`'s
+    /// own entry wins for a page both have.
+    pub fn merged(&self, key: &str, legacy: &str) -> Vec<Entry> {
+        let mut entries = self.by_project_key.get(key).cloned().unwrap_or_default();
+        let Some(old) = self.by_project_key.get(legacy).filter(|_| legacy != key) else { return entries };
+        let seen: std::collections::HashSet<String> = entries.iter().map(|e| visit_key(&e.url)).collect();
+        entries.extend(old.iter().filter(|e| !seen.contains(&visit_key(&e.url))).cloned());
+        entries.sort_by_key(|e| std::cmp::Reverse(e.last_visited_at));
+        entries.truncate(MAX_ENTRIES_PER_PROJECT);
+        entries
+    }
+
+    /// Merges the entries kept under `legacy` into `key` and forgets `legacy`.
     pub fn adopt(&mut self, legacy: &str, key: &str) -> bool {
-        if legacy == key || self.by_project_key.contains_key(key) {
+        if legacy == key || !self.by_project_key.contains_key(legacy) {
             return false;
         }
-        let Some(entries) = self.by_project_key.remove(legacy) else { return false };
+        let entries = self.merged(key, legacy);
+        self.by_project_key.remove(legacy);
         self.by_project_key.insert(key.to_owned(), entries);
         true
     }
@@ -221,17 +235,29 @@ mod tests {
     }
 
     #[test]
-    fn entries_under_a_bare_id_move_to_the_new_key_once() {
+    fn entries_under_bare_ids_merge_into_the_new_key() {
+        let urls =
+            |history: &BrowserHistory| history.recent("group", 8).iter().map(|e| e.url.clone()).collect::<Vec<_>>();
         let mut history = BrowserHistory::default();
         history.record_visit("p1", "https://example.com/", 1);
-        assert!(history.adopt("p1", "env:/src/app"));
-        assert_eq!(history.recent("env:/src/app", 8).len(), 1);
+        assert!(history.adopt("p1", "group"));
+        assert_eq!(urls(&history), ["https://example.com/"]);
         assert!(history.recent("p1", 8).is_empty());
-        // A key with its own entries keeps them.
-        history.record_visit("p1", "https://other.test/", 2);
-        assert!(!history.adopt("p1", "env:/src/app"));
-        assert_eq!(history.recent("env:/src/app", 8)[0].url, "https://example.com/");
-        assert!(!history.adopt("env:/src/app", "env:/src/app"));
+        // A second project id now in the same group joins it: newest first, one entry per page.
+        history.record_visit("p2", "https://other.test/", 3);
+        history.record_visit("p2", "https://example.com/", 0);
+        let shown = history.merged("group", "p2");
+        assert!(history.adopt("p2", "group"));
+        assert_eq!(history.recent("group", 8), shown, "the list shows what removal acts on");
+        assert_eq!(urls(&history), ["https://other.test/", "https://example.com/"]);
+        assert_eq!(history.recent("group", 8)[1].last_visited_at, 1, "the group's own visit stays");
+        assert!(history.recent("p2", 8).is_empty());
+        // Removed entries don't come back from an old key.
+        history.remove("group", "https://other.test/");
+        history.remove("group", "https://example.com/");
+        assert!(!history.adopt("p2", "group"));
+        assert!(urls(&history).is_empty());
+        assert!(!history.adopt("group", "group"));
     }
 
     #[test]
