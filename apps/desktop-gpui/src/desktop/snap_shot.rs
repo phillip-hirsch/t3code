@@ -862,6 +862,7 @@ function run() {
     }
 
     /// `currentMacPermissions`.
+    #[expect(clippy::unnecessary_wraps, reason = "matches the other platforms, which return None")]
     pub fn mac_permissions() -> Option<MacPermissions> {
         Some(MacPermissions {
             screen_recording: objc2_core_graphics::CGPreflightScreenCaptureAccess(),

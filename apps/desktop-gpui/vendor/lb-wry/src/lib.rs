@@ -341,6 +341,8 @@
 #![allow(clippy::new_without_default)]
 #![allow(clippy::default_constructed_unit_structs)]
 #![allow(clippy::type_complexity)]
+// Upstream wry 0.53.3's own macOS warnings (deprecated AppKit statics, redundant unsafe blocks).
+#![cfg_attr(target_os = "macos", allow(deprecated, unused_unsafe, mismatched_lifetime_syntaxes))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 // #[cfg(any(target_os = "macos", target_os = "ios"))]

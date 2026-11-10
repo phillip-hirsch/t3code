@@ -192,6 +192,7 @@ struct CopyDir(PathBuf);
 impl CopyDir {
     fn new() -> Result<Self, String> {
         let dir = std::env::temp_dir().join(format!("t3code-sqlite-{}", uuid::Uuid::new_v4()));
+        #[cfg_attr(not(unix), expect(unused_mut, reason = "only Unix sets a mode"))]
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
