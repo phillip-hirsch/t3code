@@ -147,7 +147,6 @@ pub(in crate::app) struct Panel {
     maintainer_saving: bool,
     /// A maintainer-edits choice saved and not yet read back.
     maintainer_choice: Option<bool>,
-    _picker_search: Option<Subscription>,
     /// The handoff being prepared, as the web keys it ("ask", "checkout:worktree", ...).
     handoff: Option<String>,
     /// The project a handoff runs in, picked from another environment's copy (`actingScope`).
@@ -220,7 +219,6 @@ impl Panel {
             checks_all: false,
             maintainer_saving: false,
             maintainer_choice: None,
-            _picker_search: None,
             handoff: None,
             acting: None,
             condensed: false,
@@ -1502,6 +1500,7 @@ impl Workspace {
         let tip: SharedString =
             if refreshing { format!("Refreshing {term}") } else { format!("More {term} actions") }.into();
         Button::new("pr-actions")
+            .track_focus(&self.pull_requests.actions_focus)
             .ghost()
             .xsmall()
             .size(px(24.))

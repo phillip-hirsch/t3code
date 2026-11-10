@@ -171,6 +171,8 @@ pub(in crate::app) struct PullRequestsState {
     /// Each tab's close button and title, as the web's two buttons: Tab reaches them, Enter or Space presses.
     pub(super) tab_focus: std::collections::HashMap<String, [FocusHandle; 2]>,
     /// The right-click menu on one of the panel's tabs, where it opened.
+    /// The detail's actions trigger, which focus returns to from the dialogs it opens.
+    pub(super) actions_focus: FocusHandle,
     pub(super) tab_menu:
         Option<(Entity<gpui_kit::component::menu::PopupMenu>, gpui_kit::Point<gpui_kit::Pixels>, Subscription)>,
     /// Shift's quick actions on rows and the close sweep.
@@ -243,6 +245,7 @@ impl PullRequestsState {
             avatars_unread: false,
             row_popover: None,
             tab_menu: None,
+            actions_focus: cx.focus_handle(),
             tab_focus: std::collections::HashMap::new(),
             speed: speed_actions::SpeedActions::default(),
             linked_focus: std::collections::HashMap::new(),
