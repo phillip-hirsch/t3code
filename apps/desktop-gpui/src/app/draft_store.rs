@@ -483,13 +483,11 @@ impl Workspace {
                 runtime_mode: self.runtime_mode_override.clone(),
             });
         let editor;
+        let set_aside = self.target.as_ref().and_then(|target| self.set_aside_prompt_ref(target));
         let (live_prompt, live_attachments, live_records): (&str, &[Attachment], Option<&ContextRecords>) =
-            match (&self.question, self.queue_edit_draft()) {
-                (Some(question), _) => {
-                    (question.prompt.as_str(), question.prompt_attachments.as_slice(), Some(&question.prompt_records))
-                }
-                (None, Some((prompt, attachments, records))) => (prompt, attachments, Some(records)),
-                (None, None) => {
+            match set_aside {
+                Some((prompt, attachments, records)) => (prompt, attachments, Some(records)),
+                None => {
                     editor = self.composer.read(cx).value();
                     (&*editor, self.attachments.as_slice(), Some(&self.context.records))
                 }
@@ -510,13 +508,8 @@ impl Workspace {
             if !seen.insert(target) {
                 continue;
             }
-            let (prompt, attachments, records) = match self.composer_drafts.get(target) {
-                Some(ComposerDraft::Prompt(prompt, attachments, records)) => {
-                    (prompt.as_str(), attachments.as_slice(), Some(records))
-                }
-                Some(ComposerDraft::Question(question)) => {
-                    (question.prompt.as_str(), question.prompt_attachments.as_slice(), Some(&question.prompt_records))
-                }
+            let (prompt, attachments, records) = match self.set_aside_prompt_ref(target) {
+                Some((prompt, attachments, records)) => (prompt, attachments, Some(records)),
                 None => ("", &[][..], None),
             };
             let selection = self.composer_selections.get(target);

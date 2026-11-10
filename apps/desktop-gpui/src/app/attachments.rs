@@ -24,9 +24,11 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use super::composer::ComposerDraft;
+use super::draft_holder::EditorDraft;
 use super::side_chat::ChatPane;
 use super::snap_shot::SnapShotSource;
 use super::{Target, Workspace, new_id};
+use crate::composer_context::ContextRecords;
 use crate::composer_text;
 use crate::image_attachment;
 use crate::requests::Attached;
@@ -41,11 +43,11 @@ const QUESTION_REFUSES: &str = "This question cannot accept attachments.";
 /// keeps its in the composer's list.
 pub(super) type QuestionDraft = crate::requests::QuestionDraft<Attachment>;
 
-/// The composer list an intake fills: a target's prompt, or one question (request id,
-/// question id) of its open card.
+/// The composer list an intake fills: the editor's draft (a target's prompt or a queued
+/// message's edit), or one question (request id, question id) of its open card.
 #[derive(Clone, PartialEq)]
 pub(super) struct Origin {
-    target: Target,
+    draft: EditorDraft,
     question: Option<(String, String)>,
 }
 
@@ -126,7 +128,17 @@ impl QuestionDraft {
         }
     }
 
-    fn lists(&mut self) -> impl Iterator<Item = &mut [Attachment]> {
+    /// What it parked when it took the editor: the pane's prompt, or a queued message's edit.
+    pub(super) fn prompt_mut(&mut self) -> (&mut String, &mut Vec<Attachment>, &mut ContextRecords) {
+        (&mut self.prompt, &mut self.prompt_attachments, &mut self.prompt_records)
+    }
+
+    /// Parks `draft` in place of what it parked.
+    pub(super) fn set_parked(&mut self, (prompt, attachments, records): super::draft_holder::Draft) {
+        (self.prompt, self.prompt_attachments, self.prompt_records) = (prompt, attachments, records);
+    }
+
+    pub(super) fn lists(&mut self) -> impl Iterator<Item = &mut [Attachment]> {
         std::iter::once(self.prompt_attachments.as_mut_slice())
             .chain(self.attachments.values_mut().map(Vec::as_mut_slice))
     }
@@ -329,28 +341,6 @@ It is referenced in your text; removing it also removes every reference.",
     }
 }
 
-/// An attachment in the composer on screen or set aside by its open question card (no
-/// target: the open one's), or in the draft it was stashed with, beside that draft's target.
-fn find_attachment<'a>(
-    active: &'a mut [Attachment],
-    question: Option<&'a mut QuestionDraft>,
-    drafts: &'a mut HashMap<Target, ComposerDraft>,
-    local_id: &str,
-) -> Option<(Option<&'a Target>, &'a mut Attachment)> {
-    let mut lists: Vec<(Option<&'a Target>, &'a mut [Attachment])> = vec![(None, active)];
-    lists.extend(question.into_iter().flat_map(QuestionDraft::lists).map(|list| (None, list)));
-    for (target, draft) in drafts.iter_mut() {
-        match draft {
-            ComposerDraft::Prompt(_, kept, _) => lists.push((Some(target), kept.as_mut_slice())),
-            ComposerDraft::Question(question) => lists.extend(question.lists().map(|list| (Some(target), list))),
-        }
-    }
-    lists
-        .into_iter()
-        .flat_map(|(target, attachments)| attachments.iter_mut().map(move |attachment| (target, attachment)))
-        .find(|(_, attachment)| attachment.local_id == local_id)
-}
-
 /// Moves attachments whose reference left the text (it was in `previous`, not in `live`) into
 /// `retained`, and retained ones whose reference is back into `attachments`; `None` when nothing
 /// moved, else the restored attachments that need their upload taken again.
@@ -481,9 +471,9 @@ impl Workspace {
 
     /// The list on screen: the prompt's, or the open question's.
     pub(super) fn attachment_origin(&self) -> Option<Origin> {
-        let target = self.target.clone()?;
+        let draft = self.editor_draft()?;
         let question = self.question.as_ref().map(|q| (q.request_id.clone(), q.active().id.clone()));
-        Some(Origin { target, question })
+        Some(Origin { draft, question })
     }
 
     pub(super) fn attachments_busy(&self) -> bool {
@@ -503,9 +493,8 @@ impl Workspace {
         let list = self.question_list(question, question_id);
         let here = self.active_environment();
         let origin = self
-            .target
-            .clone()
-            .map(|target| Origin { target, question: Some((question.request_id.clone(), question_id.to_owned())) });
+            .editor_draft()
+            .map(|draft| Origin { draft, question: Some((question.request_id.clone(), question_id.to_owned())) });
         let preparing = origin.is_some_and(|origin| self.reading_attachments.contains(&origin));
         let blocked =
             preparing || list.iter().any(|a| !matches!(a.upload, Upload::Ready(_)) || a.upload_env.as_ref() != here);
@@ -695,7 +684,7 @@ impl Workspace {
                 if let Some(at) = this.reading_attachments.iter().position(|reading| reading == &origin) {
                     this.reading_attachments.swap_remove(at);
                 }
-                let shown = this.target.as_ref() == Some(&origin.target);
+                let shown = this.target.as_ref() == Some(&origin.draft.target);
                 for taken in taken {
                     let placed = taken.and_then(|(name, kind, mime, bytes)| {
                         this.place_attachment(&origin, name, kind, mime, bytes, window, cx)
@@ -849,14 +838,11 @@ impl Workspace {
         if let Some(error) = self.attachment_error(&name, Kind::Image, bytes.len() as u64) {
             return Err(error);
         }
-        let origin = Origin { target, question: None };
+        let origin = Origin { draft: EditorDraft { target, edit: None }, question: None };
         let local_id = self
             .park_attachment(&origin, name, Kind::Image, mime, bytes, cx)
             .map_err(|_| "Remove an attachment, then try this capture again.".to_owned())?;
-        let question = self.question.as_mut();
-        if let Some((_, attachment)) =
-            find_attachment(&mut self.attachments, question, &mut self.composer_drafts, &local_id)
-        {
+        if let Some((_, attachment)) = self.attachment_lists().find(&local_id) {
             attachment.source = Some(source);
         }
         Ok(())
@@ -878,19 +864,18 @@ impl Workspace {
             return Err(error);
         }
         let full = || format!("You can attach up to {MAX_ATTACHMENTS} files per message.");
-        let here = self.target.as_ref() == Some(&origin.target);
-        if !here && origin.question.is_none() {
-            self.composer_drafts.entry(origin.target.clone()).or_insert_with(ComposerDraft::empty);
+        let target = &origin.draft.target;
+        let here = self.target.as_ref() == Some(target);
+        if !here && origin.question.is_none() && origin.draft.edit.is_none() {
+            self.composer_drafts.entry(target.clone()).or_insert_with(ComposerDraft::empty);
         }
-        let parked = if here {
-            self.question.as_mut().and_then(|question| question.parked(origin.question.as_ref()))
-        } else {
-            self.composer_drafts.get_mut(&origin.target).and_then(|draft| match draft {
-                ComposerDraft::Prompt(prompt, kept, _) => {
-                    origin.question.is_none().then_some(Parked::Prompt(prompt, kept))
-                }
-                ComposerDraft::Question(question) => question.parked(origin.question.as_ref()),
-            })
+        let parked = match &origin.question {
+            None => self.left_draft_mut(&origin.draft).map(|(prompt, kept, _)| Parked::Prompt(prompt, kept)),
+            Some(_) if here => self.question.as_mut().and_then(|question| question.parked(origin.question.as_ref())),
+            Some(_) => match self.composer_drafts.get_mut(target) {
+                Some(ComposerDraft::Question(question)) => question.parked(origin.question.as_ref()),
+                _ => None,
+            },
         };
         let attachment = Attachment::restored(kind.as_str(), name, mime.to_owned(), bytes);
         let local_id = attachment.local_id.clone();
@@ -949,20 +934,12 @@ impl Workspace {
 
     /// Mints a signed upload URL on the environment of the attachment's draft, then POSTs the bytes to it.
     pub(super) fn upload(&mut self, local_id: String, cx: &mut Context<Self>) {
-        let Some((draft, _)) =
-            find_attachment(&mut self.attachments, self.question.as_mut(), &mut self.composer_drafts, &local_id)
-        else {
-            return;
-        };
+        let Some((draft, _)) = self.attachment_lists().find(&local_id) else { return };
         let environment = draft.map(Target::environment).cloned();
         let environment = environment.or_else(|| self.active_environment().cloned());
         let client = environment.as_deref().and_then(|id| self.env_client(id));
         let http_base = environment.as_deref().and_then(|id| self.env_endpoint(id)).map(|e| e.http_base.clone());
-        let Some((_, attachment)) =
-            find_attachment(&mut self.attachments, self.question.as_mut(), &mut self.composer_drafts, &local_id)
-        else {
-            return;
-        };
+        let Some((_, attachment)) = self.attachment_lists().find(&local_id) else { return };
         let released = attachment.begin_upload(environment.clone());
         let mut input =
             json!({"name": attachment.name, "mimeType": attachment.mime, "sizeBytes": attachment.bytes.len()});
@@ -1016,14 +993,8 @@ impl Workspace {
             }
             .await;
             let _ = this.update(cx, |this, cx| {
-                let waiting = find_attachment(
-                    &mut this.attachments,
-                    this.question.as_mut(),
-                    &mut this.composer_drafts,
-                    &local_id,
-                )
-                .map(|(_, attachment)| attachment)
-                .filter(|attachment| attachment.awaits_upload_on(&environment));
+                let waiting = (this.attachment_lists().find(&local_id).map(|(_, attachment)| attachment))
+                    .filter(|attachment| attachment.awaits_upload_on(&environment));
                 if let Some(attachment) = waiting {
                     attachment.upload = match result {
                         Ok(id) => Upload::Ready(id),
@@ -1431,6 +1402,7 @@ fn bind_screenshots(records: &mut Vec<Value>, unlinked: &[Value]) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::draft_holder::AttachmentLists;
     use super::*;
 
     #[test]
@@ -1538,27 +1510,39 @@ It is referenced in your text; removing it also removes every reference."
         let mut open = card();
         open.prompt_attachments.push(attachment("prompt-set-aside"));
         open.attachments.insert("b".into(), vec![attachment("other-question")]);
+        let mut edited_over = vec![attachment("set-aside-by-queued-edit")];
         let mut asked = card();
         asked.attachments.insert("a".into(), vec![attachment("stashed-answer")]);
         let mut drafts = HashMap::from([
             (stashed_in.clone(), ComposerDraft::Prompt("hi".into(), vec![attachment("stashed")], Default::default())),
             (asked_in.clone(), ComposerDraft::Question(asked)),
         ]);
-        let (target, found) = find_attachment(&mut active, Some(&mut open), &mut drafts, "stashed").unwrap();
+        macro_rules! lists {
+            () => {
+                AttachmentLists {
+                    editor: &mut active,
+                    question: Some(&mut open),
+                    queue_edit: Some(&mut edited_over),
+                    drafts: &mut drafts,
+                }
+            };
+        }
+        let (target, found) = lists!().find("stashed").unwrap();
         assert_eq!(target, Some(&stashed_in), "a stashed attachment uploads to its draft's environment");
         found.upload = Upload::Ready("srv".into());
-        let Some(ComposerDraft::Prompt(_, kept, _)) = drafts.get(&stashed_in) else { panic!() };
-        assert_eq!(kept[0].upload, Upload::Ready("srv".into()));
         for (id, target) in [
             ("on-screen", None),
             ("prompt-set-aside", None),
             ("other-question", None),
+            ("set-aside-by-queued-edit", None),
             ("stashed-answer", Some(&asked_in)),
         ] {
-            let found = find_attachment(&mut active, Some(&mut open), &mut drafts, id).map(|(target, _)| target);
-            assert_eq!(found, Some(target), "{id}");
+            let found = lists!().find(id).map(|(target, _)| target.cloned());
+            assert_eq!(found, Some(target.cloned()), "{id}");
         }
-        assert!(find_attachment(&mut active, Some(&mut open), &mut drafts, "removed").is_none());
+        assert!(lists!().find("removed").is_none());
+        let Some(ComposerDraft::Prompt(_, kept, _)) = drafts.get(&stashed_in) else { panic!() };
+        assert_eq!(kept[0].upload, Upload::Ready("srv".into()));
     }
 
     /// A card asking questions `a` and `b`, on `a`.

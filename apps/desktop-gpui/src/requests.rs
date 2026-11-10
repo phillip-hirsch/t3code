@@ -93,7 +93,7 @@ pub struct QuestionDraft<A> {
     pub index: usize,
     pub drafts: HashMap<String, Draft>,
     pub collapsed: bool,
-    /// The thread's prompt, set aside while the card holds the editor.
+    /// What the editor held when the card took it: the thread's prompt, or a queued message's edit.
     pub prompt: String,
     /// The prompt's attachments, set aside with it.
     pub prompt_attachments: Vec<A>,

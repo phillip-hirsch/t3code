@@ -81,9 +81,18 @@ impl QueueUi {
         self.edit.as_mut().filter(|edit| edit.id == id)
     }
 
-    /// The draft an open edit set aside, which a failed send rejoins.
+    /// The draft an open edit set aside; see `draft_holder`.
     pub(super) fn edit_draft_mut(&mut self) -> Option<&mut (String, Vec<Attachment>, ContextRecords)> {
         self.edit.as_mut().map(|edit| &mut edit.saved)
+    }
+
+    pub(super) fn edit_draft(&self) -> Option<&(String, Vec<Attachment>, ContextRecords)> {
+        self.edit.as_ref().map(|edit| &edit.saved)
+    }
+
+    /// The open edit's own id, which changes with each begin.
+    pub(super) fn edit_id(&self) -> Option<&str> {
+        self.edit.as_ref().map(|edit| edit.id.as_str())
     }
 }
 
@@ -127,11 +136,6 @@ impl Workspace {
 
     pub(super) fn saving_queue_edit(&self) -> bool {
         self.queue.edit.as_ref().is_some_and(|edit| edit.saving)
-    }
-
-    /// The thread's own draft while a queued message holds the composer, left in place.
-    pub(super) fn queue_edit_draft(&self) -> Option<(&str, &[Attachment], &ContextRecords)> {
-        self.queue.edit.as_ref().map(|edit| (edit.saved.0.as_str(), edit.saved.1.as_slice(), &edit.saved.2))
     }
 
     /// The thread's draft, while a queued message holds the composer; see `stash_composer`.
@@ -280,12 +284,8 @@ impl Workspace {
     }
 
     fn cancel_queue_edit(&mut self, pane: ChatPane, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some((text, attachments, records)) = self.queue_ui_mut(pane).and_then(QueueUi::take_edit_draft) {
-            if pane == ChatPane::Main {
-                self.attachments = attachments;
-                self.context.records = records;
-            }
-            self.set_pane_text(pane, text, window, cx);
+        if let Some(saved) = self.queue_ui_mut(pane).and_then(QueueUi::take_edit_draft) {
+            self.put_editor_content(pane, saved, window, cx);
             self.focus_pane_composer(pane, window, cx);
         }
         cx.notify();
@@ -449,23 +449,15 @@ impl Workspace {
         if ui.state.queued.iter().any(|q| q.run_id == edit.run_id) || self.pane_projection(pane).is_none() {
             return;
         }
-        let text = self.pane_text(pane, cx);
-        let attached = pane == ChatPane::Main && self.has_attachments();
+        // Under a question card the edit's text waits parked; the editor shows the answer.
+        let (text, attached) = self.editor_content(pane, cx);
         let thread_draft_empty = edit.saved.0.trim().is_empty() && edit.saved.1.is_empty();
         let exit = edit_exit(&text, &edit.original, edit.removed_attachment, attached, thread_draft_empty);
         let (changed, keep) = (exit != EditExit::Clean, exit == EditExit::Kept);
         let title = self.pane_projection(pane).map(|p| p.thread.title.clone());
-        let Some((saved_text, saved_attachments, saved_records)) =
-            self.queue_ui_mut(pane).and_then(QueueUi::take_edit_draft)
-        else {
-            return;
-        };
+        let Some(saved) = self.queue_ui_mut(pane).and_then(QueueUi::take_edit_draft) else { return };
         if !keep {
-            if pane == ChatPane::Main {
-                self.attachments = saved_attachments;
-                self.context.records = saved_records;
-            }
-            self.set_pane_text(pane, saved_text, window, cx);
+            self.put_editor_content(pane, saved, window, cx);
         }
         if changed {
             let place = title.map(|title| format!(" in “{title}”")).unwrap_or_default();

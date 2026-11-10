@@ -24,9 +24,11 @@ use serde_json::{Value, json};
 
 use super::attachments::QuestionDraft;
 use super::composer::merge_prompt;
+use super::draft_holder::PromptHolder;
 use super::right_panel::Surface;
 use super::titlebar::icon;
 use super::{Target, Workspace, new_id};
+use crate::composer_context::ContextRecords;
 use crate::model::{ModelSelection, Run, ScopedId, ThreadProjection, ThreadShell, ThreadState};
 use crate::rpc::RpcClient;
 use crate::theme::{self, Tokens};
@@ -114,11 +116,21 @@ enum SideDraft {
 }
 
 impl SideDraft {
-    /// What a released view keeps: its open question, else its composer's text.
-    fn kept(question: Option<QuestionDraft>, text: String) -> Option<Self> {
+    /// What a released view keeps: its open question, else its composer's text. A queued
+    /// message's edit that `ended` gives back the side chat's own text it set aside, in place of
+    /// the edit's text in the composer or parked under the question.
+    fn kept(question: Option<QuestionDraft>, text: String, ended: Option<String>) -> Option<Self> {
         match question {
-            Some(question) => Some(Self::Question(Box::new(question))),
-            None => (!text.is_empty()).then_some(Self::Prompt(text)),
+            Some(mut question) => {
+                if let Some(own) = ended {
+                    question.set_parked((own, Vec::new(), ContextRecords::default()));
+                }
+                Some(Self::Question(Box::new(question)))
+            }
+            None => {
+                let text = ended.unwrap_or(text);
+                (!text.is_empty()).then_some(Self::Prompt(text))
+            }
         }
     }
 
@@ -177,13 +189,13 @@ impl SideChats {
     fn release_view(&mut self, cx: &App) -> Option<Key> {
         let mut view = self.view.take()?;
         let question = view.question.take();
-        let text = match (&question, view.queue.take_edit_draft()) {
-            (Some(_), _) => String::new(),
-            (None, Some((text, ..))) => text,
-            (None, None) => view.composer.read(cx).value().to_string(),
+        let text = match &question {
+            Some(_) => String::new(),
+            None => view.composer.read(cx).value().to_string(),
         };
+        let ended = view.queue.take_edit_draft().map(|(own, ..)| own);
         let key = (view.env, view.thread_id);
-        match SideDraft::kept(question, text) {
+        match SideDraft::kept(question, text, ended) {
             Some(draft) => self.drafts.insert(key.clone(), draft),
             None => self.drafts.remove(&key),
         };
@@ -660,11 +672,13 @@ impl Workspace {
             self.side_chat.give_back(key, text);
             return;
         };
-        if let Some(question) = &mut view.question {
-            question.prompt = merge_prompt(text, &question.prompt);
-            return;
-        }
-        if let Some((prompt, ..)) = view.queue.edit_draft_mut() {
+        let saved = view.queue.edit_draft_mut();
+        let prompt = match PromptHolder::of(true, saved.is_some(), view.question.is_some()) {
+            PromptHolder::QueueEdit => saved.map(|(prompt, ..)| prompt),
+            PromptHolder::Question => view.question.as_mut().map(|question| &mut question.prompt),
+            PromptHolder::Editor | PromptHolder::OffScreen => None,
+        };
+        if let Some(prompt) = prompt {
             *prompt = merge_prompt(text, prompt);
             return;
         }
@@ -1467,12 +1481,23 @@ mod tests {
     }
 
     #[test]
+    fn a_side_chat_left_mid_edit_keeps_its_own_text_not_the_edits() {
+        // A question asked during the edit parked the edit's text.
+        let mut card = answered_card();
+        card.prompt = "edit".into();
+        let (text, card) = SideDraft::kept(Some(card), String::new(), Some("own".into())).expect("kept").restore();
+        assert_eq!((text.as_str(), card.expect("the card comes back").prompt.as_str()), ("typed", "own"));
+        let kept = SideDraft::kept(None, "edit".into(), Some("own".into())).map(|draft| draft.restore().0);
+        assert_eq!(kept.as_deref(), Some("own"));
+    }
+
+    #[test]
     fn a_released_side_chat_keeps_its_question_answers_and_progress() {
-        let (text, card) = SideDraft::kept(Some(answered_card()), String::new()).expect("kept").restore();
+        let (text, card) = SideDraft::kept(Some(answered_card()), String::new(), None).expect("kept").restore();
         assert_eq!(text, "typed", "the editor shows the question on screen's typed answer");
         let card = card.expect("the card comes back");
         assert_eq!((card.index, card.prompt.as_str()), (1, "parked prompt"));
         assert_eq!(card.drafts["a"].selected, ["Red"]);
-        assert_eq!(SideDraft::kept(None, String::new()).map(|draft| draft.restore().0), None);
+        assert_eq!(SideDraft::kept(None, String::new(), None).map(|draft| draft.restore().0), None);
     }
 }
