@@ -18,6 +18,7 @@ mod file_icons;
 mod file_links;
 mod handoff;
 mod hex;
+mod image_attachment;
 mod inbox;
 mod keybindings;
 mod load_balancing;

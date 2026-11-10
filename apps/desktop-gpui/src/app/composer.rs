@@ -21,7 +21,7 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
-use super::attachments::Attachment;
+use super::attachments::{Attachment, QuestionDraft};
 use super::composer_fit::{ControlsWidths, ModeFit, resolve_mode_fit};
 use super::context_strip::PermissionsForm;
 use super::send::Intent;
@@ -30,7 +30,7 @@ use super::{Target, Workspace, new_id};
 use crate::composer_text::{self, Chip};
 use crate::model::{ModelSelection, RuntimeRequest, TurnItem};
 use crate::new_thread::UsageFallback;
-use crate::requests::{self, Question, QuestionDraft};
+use crate::requests::{self, Attached, Question};
 use crate::theme::{Tokens, tokens};
 
 /// `max-h-52` (208px) over the 22.75px line.
@@ -252,7 +252,10 @@ impl Workspace {
         }
         let attachments = std::mem::take(&mut self.attachments);
         let draft = match (self.question.take(), self.take_queue_edit_draft()) {
-            (Some(question), _) => ComposerDraft::Question(question),
+            (Some(mut question), _) => {
+                question.park(attachments);
+                ComposerDraft::Question(question)
+            }
             // A queued message's edit ends here; the thread keeps its own draft.
             (None, Some((prompt, attachments))) => ComposerDraft::Prompt(prompt, attachments),
             (None, None) => ComposerDraft::Prompt(self.composer.read(cx).value().to_string(), attachments),
@@ -307,7 +310,8 @@ impl Workspace {
         self._typing_idle = None;
         self.sync_typing_guard(window, cx);
         match self.target.as_ref().and_then(|target| self.composer_drafts.remove(target)) {
-            Some(ComposerDraft::Question(question)) => {
+            Some(ComposerDraft::Question(mut question)) => {
+                self.attachments = question.unpark();
                 self.question = Some(question);
                 self.load_custom_answer(ChatPane::Main, window, cx);
             }
@@ -660,20 +664,50 @@ impl Workspace {
         }
         let next = first.and_then(|(request, item)| QuestionDraft::new(request.id.clone(), requests::questions(item)));
         let Some(previous) = self.question_slot(pane).map(Option::take) else { return };
+        // The open thread's composer lists the question on screen's attachments; side chats take none.
+        let main = pane == ChatPane::Main;
         match (previous, next) {
             (None, None) => {}
-            (Some(previous), None) => self.set_pane_text(pane, previous.prompt, window, cx),
+            (Some(previous), None) => {
+                if main {
+                    self.close_question_attachments(previous.attachments, previous.prompt_attachments, cx);
+                }
+                self.set_pane_text(pane, previous.prompt, window, cx);
+            }
             (previous, Some(draft)) => {
-                let prompt = match previous {
-                    Some(previous) => previous.prompt,
-                    None => self.pane_text(pane, cx),
+                let (prompt, prompt_attachments) = match previous {
+                    Some(previous) if main => {
+                        self.close_question_attachments(previous.attachments, Vec::new(), cx);
+                        (previous.prompt, previous.prompt_attachments)
+                    }
+                    Some(previous) => (previous.prompt, previous.prompt_attachments),
+                    None if main => (self.pane_text(pane, cx), std::mem::take(&mut self.attachments)),
+                    None => (self.pane_text(pane, cx), Vec::new()),
                 };
                 if let Some(slot) = self.question_slot(pane) {
-                    *slot = Some(QuestionDraft { prompt, ..draft });
+                    *slot = Some(QuestionDraft { prompt, prompt_attachments, ..draft });
                 }
                 self.load_custom_answer(pane, window, cx);
             }
         }
+    }
+
+    /// Shows question `index` of the pane's card, with its attachments in the composer.
+    fn show_question(&mut self, pane: ChatPane, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        match pane {
+            ChatPane::Main => {
+                let Some(question) = self.question.as_mut() else { return };
+                question.park(std::mem::take(&mut self.attachments));
+                question.index = index;
+                self.attachments = question.unpark();
+            }
+            ChatPane::Side => {
+                let Some(draft) = self.question_mut(pane) else { return };
+                draft.index = index;
+            }
+        }
+        self.load_custom_answer(pane, window, cx);
+        cx.notify();
     }
 
     pub(super) fn pending_question_request(&self, pane: ChatPane) -> Option<(&RuntimeRequest, &TurnItem)> {
@@ -705,30 +739,45 @@ impl Workspace {
 
     /// Next question, or submit on the last; a no-op while the active one is unanswered.
     pub(super) fn advance_question(&mut self, pane: ChatPane, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(draft) = self.question_mut(pane) else { return };
-        let question = &draft.questions[draft.index];
-        if requests::answer(question, draft.drafts.get(&question.id)).is_none() {
+        let Some(draft) = self.question(pane) else { return };
+        let question = draft.active();
+        let attached = self.question_attached(pane, &question.id);
+        if requests::answer(question, draft.drafts.get(&question.id), attached).is_none() {
             return;
         }
         if draft.index + 1 < draft.questions.len() {
-            draft.index += 1;
-            self.load_custom_answer(pane, window, cx);
-            cx.notify();
+            let next = draft.index + 1;
+            self.show_question(pane, next, window, cx);
             return;
         }
-        let Some(answers) = requests::answers(&draft.questions, &draft.drafts) else { return };
+        let attached = |id: &str| self.question_attached(pane, id);
+        let Some(answers) = requests::answers(&draft.questions, &draft.drafts, attached) else { return };
         let request_id = draft.request_id.clone();
         if self.responding.is_some() {
             return;
         }
-        self.respond(pane, request_id, json!({"answers": answers}), cx);
+        let mut response = json!({"answers": answers});
+        if pane == ChatPane::Main {
+            match self.question_attachments_payload() {
+                Ok(by_question) => {
+                    if let Some(by_question) = by_question {
+                        response["attachmentsByQuestionId"] = by_question;
+                    }
+                }
+                Err(error) => {
+                    self.error = Some(error.into());
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+        self.respond(pane, request_id, response, cx);
     }
 
     pub(super) fn previous_question(&mut self, pane: ChatPane, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(draft) = self.question_mut(pane) else { return };
-        draft.index = draft.index.saturating_sub(1);
-        self.load_custom_answer(pane, window, cx);
-        cx.notify();
+        let Some(draft) = self.question(pane) else { return };
+        let previous = draft.index.saturating_sub(1);
+        self.show_question(pane, previous, window, cx);
     }
 
     fn pick_option(&mut self, pane: ChatPane, value: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -1148,7 +1197,8 @@ impl Workspace {
             let can_respond = self
                 .pending_question_request(ChatPane::Main)
                 .is_some_and(|(r, _)| r.capability() != Some("not_resumable"));
-            let (label, enabled) = question_submit(draft, responding, can_respond);
+            let attached = |id: &str| self.question_attached(ChatPane::Main, id);
+            let (label, enabled) = question_submit(draft, attached, responding, can_respond);
             let submit = div().id("submit-answer");
             let submit = if enabled { action_control(submit, &self.composer_action_focus[PRIMARY], t) } else { submit };
             return h_flex()
@@ -1772,11 +1822,16 @@ pub(super) fn question_placeholder(draft: &QuestionDraft) -> &'static str {
 
 /// The question card's submit (`ComposerPrimaryActions`): its label, and whether it can go. The
 /// last question submits once every question has an answer; an earlier one moves on once it has.
-pub(super) fn question_submit(draft: &QuestionDraft, responding: bool, can_respond: bool) -> (&'static str, bool) {
+pub(super) fn question_submit(
+    draft: &QuestionDraft,
+    attached: impl Fn(&str) -> Attached,
+    responding: bool,
+    can_respond: bool,
+) -> (&'static str, bool) {
     let last = draft.index + 1 == draft.questions.len();
     let answered = |index: usize| {
         let question = &draft.questions[index];
-        requests::answer(question, draft.drafts.get(&question.id)).is_some()
+        requests::answer(question, draft.drafts.get(&question.id), attached(&question.id)).is_some()
     };
     let ready = if last { (0..draft.questions.len()).all(answered) } else { answered(draft.index) };
     let label = match (responding, last) {
@@ -2131,16 +2186,21 @@ mod tests {
             serde_json::from_value(json!({"id": id, "header": "H", "question": "?", "options": [{"label": "Red"}]}))
                 .unwrap()
         };
+        let none = |_: &str| Attached::default();
         let mut draft = QuestionDraft::new("r".into(), vec![question("a"), question("b")]).unwrap();
-        assert_eq!(question_submit(&draft, false, true), ("Next question", false), "unanswered");
+        assert_eq!(question_submit(&draft, none, false, true), ("Next question", false), "unanswered");
+        let ready = |id: &str| Attached { count: usize::from(id == "a"), blocked: false };
+        assert_eq!(question_submit(&draft, ready, false, true), ("Next question", true), "attachments answer it");
+        let uploading = |id: &str| Attached { count: usize::from(id == "a"), blocked: id == "a" };
+        assert_eq!(question_submit(&draft, uploading, false, true), ("Next question", false), "until they upload");
         draft.drafts.insert("a".into(), requests::toggle(&draft.questions[0], None, "Red"));
-        assert_eq!(question_submit(&draft, false, true), ("Next question", true));
+        assert_eq!(question_submit(&draft, none, false, true), ("Next question", true));
         draft.index = 1;
-        assert_eq!(question_submit(&draft, false, true), ("Submit answers", false), "the last needs its answer");
+        assert_eq!(question_submit(&draft, none, false, true), ("Submit answers", false), "the last needs its answer");
         draft.drafts.insert("b".into(), requests::toggle(&draft.questions[1], None, "Red"));
-        assert_eq!(question_submit(&draft, false, true), ("Submit answers", true));
-        assert_eq!(question_submit(&draft, true, true), ("Submitting...", false));
-        assert_eq!(question_submit(&draft, false, false), ("Submit answers", false), "not resumable");
+        assert_eq!(question_submit(&draft, none, false, true), ("Submit answers", true));
+        assert_eq!(question_submit(&draft, none, true, true), ("Submitting...", false));
+        assert_eq!(question_submit(&draft, none, false, false), ("Submit answers", false), "not resumable");
     }
 
     #[test]

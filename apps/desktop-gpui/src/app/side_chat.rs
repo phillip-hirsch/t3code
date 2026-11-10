@@ -22,11 +22,11 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
+use super::attachments::QuestionDraft;
 use super::right_panel::Surface;
 use super::titlebar::icon;
 use super::{Target, Workspace, new_id};
 use crate::model::{ModelSelection, Run, ThreadProjection, ThreadShell, ThreadState};
-use crate::requests::QuestionDraft;
 use crate::rpc::RpcClient;
 use crate::theme::{self, Tokens};
 use crate::timeline::{self, Row};
@@ -826,7 +826,8 @@ This permanently clears its conversation history."
         let can_respond = self
             .pending_question_request(ChatPane::Side)
             .is_some_and(|(request, _)| request.capability() != Some("not_resumable"));
-        let (label, enabled) = super::composer::question_submit(draft, responding, can_respond);
+        let attached = |_: &str| crate::requests::Attached::default();
+        let (label, enabled) = super::composer::question_submit(draft, attached, responding, can_respond);
         h_flex()
             .gap_1()
             .when(running, |el| el.child(stop))

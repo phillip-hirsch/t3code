@@ -24,14 +24,136 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use super::composer::ComposerDraft;
+use super::side_chat::ChatPane;
 use super::snap_shot::SnapShotSource;
 use super::{Target, Workspace, new_id};
 use crate::composer_text::{self, Chip};
+use crate::image_attachment;
+use crate::requests::Attached;
 use crate::theme::Tokens;
 
 pub(super) const MAX_ATTACHMENTS: usize = 100;
-const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_IMAGE_BYTES: u64 = image_attachment::MAX_IMAGE_BYTES as u64;
 const MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
+const QUESTION_REFUSES: &str = "This question cannot accept attachments.";
+
+/// An open question card, whose questions keep their own attachments; the one on screen
+/// keeps its in the composer's list.
+pub(super) type QuestionDraft = crate::requests::QuestionDraft<Attachment>;
+
+/// The composer list an intake fills: a target's prompt, or one question (request id,
+/// question id) of its open card.
+#[derive(Clone, PartialEq)]
+pub(super) struct Origin {
+    target: Target,
+    question: Option<(String, String)>,
+}
+
+/// A file the composer takes in: from disk, or a pasted image already in memory.
+enum Incoming {
+    Path(PathBuf),
+    Image { name: String, mime: &'static str, bytes: Vec<u8> },
+}
+
+/// A read and prepared file (name, kind, type, bytes), or why it can't join.
+type Taken = Result<(String, Kind, &'static str, Vec<u8>), String>;
+
+/// Reads `incoming` and fits an image to the provider's limits; background work.
+fn take_in(incoming: Incoming, file_limit: u64) -> Taken {
+    let (name, kind, mime, bytes) = match incoming {
+        Incoming::Image { name, mime, bytes } => (name, Kind::Image, mime, bytes),
+        Incoming::Path(path) => {
+            let name = path.file_name().map_or_else(|| "file".into(), |n| n.to_string_lossy().into_owned());
+            let (kind, mime) = classify(&name)?;
+            match read_at_most(&path, MAX_FILE_BYTES) {
+                Ok(Read::Bytes(bytes)) => (name, kind, mime, bytes),
+                Ok(Read::TooLarge(_)) if kind == Kind::Image => {
+                    return Err(image_attachment::Failure::TooLarge.message(&name));
+                }
+                Ok(Read::TooLarge(_)) => return Err(file_too_large(&name, file_limit)),
+                Err(error) => {
+                    log::warn!("could not read {name:?}: {error}");
+                    return Err(format!("'{name}' is empty or could not be read."));
+                }
+            }
+        }
+    };
+    if bytes.is_empty() {
+        return Err(format!("'{name}' is empty or could not be read."));
+    }
+    if kind == Kind::File {
+        return Ok((name, kind, mime, bytes));
+    }
+    let prepared = image_attachment::prepare(&name, mime, bytes, image_attachment::MAX_IMAGE_BYTES)
+        .map_err(|failure| failure.message(&name))?;
+    Ok((prepared.name, Kind::Image, prepared.mime, prepared.bytes))
+}
+
+fn file_too_large(name: &str, limit: u64) -> String {
+    format!("'{name}' exceeds the {} MB attachment limit.", limit / 1024 / 1024)
+}
+
+/// Where an attachment that isn't for the list on screen waits: a prompt (its text carries
+/// a file's chip) or a question's list.
+enum Parked<'a> {
+    Prompt(&'a mut String, &'a mut Vec<Attachment>),
+    Question(&'a mut Vec<Attachment>),
+}
+
+impl QuestionDraft {
+    /// Sets the composer's attachments aside under the question on screen.
+    pub(super) fn park(&mut self, attachments: Vec<Attachment>) {
+        if !attachments.is_empty() {
+            let id = self.active().id.clone();
+            self.attachments.insert(id, attachments);
+        }
+    }
+
+    /// The attachments of the question on screen, for the composer.
+    pub(super) fn unpark(&mut self) -> Vec<Attachment> {
+        let id = self.active().id.clone();
+        self.attachments.remove(&id).unwrap_or_default()
+    }
+
+    /// The list `question` names (`None`: the prompt's), unless it is another request's.
+    fn parked(&mut self, question: Option<&(String, String)>) -> Option<Parked<'_>> {
+        match question {
+            None => Some(Parked::Prompt(&mut self.prompt, &mut self.prompt_attachments)),
+            Some((request, id)) if *request == self.request_id => {
+                Some(Parked::Question(self.attachments.entry(id.clone()).or_default()))
+            }
+            Some(_) => None,
+        }
+    }
+
+    fn lists(&mut self) -> impl Iterator<Item = &mut [Attachment]> {
+        std::iter::once(self.prompt_attachments.as_mut_slice())
+            .chain(self.attachments.values_mut().map(Vec::as_mut_slice))
+    }
+}
+
+/// `attachmentsByQuestionId`: each question's uploads, once all are ready on `here`; `None`
+/// when no question has any.
+fn attachments_by_question<'a>(
+    lists: impl IntoIterator<Item = (&'a str, &'a [Attachment])>,
+    here: Option<&SharedString>,
+) -> Result<Option<Value>, String> {
+    let mut by_question = serde_json::Map::new();
+    for (id, list) in lists {
+        if list.is_empty() {
+            continue;
+        }
+        let sent = list.iter().map(|attachment| match &attachment.upload {
+            Upload::Ready(upload) if attachment.upload_env.as_ref() == here => Some(attachment.sent(upload)),
+            _ => None,
+        });
+        let sent = sent
+            .collect::<Option<Vec<_>>>()
+            .ok_or("Wait for attachments to finish uploading, or remove failed uploads.")?;
+        by_question.insert(id.to_owned(), Value::Array(sent));
+    }
+    Ok((!by_question.is_empty()).then_some(Value::Object(by_question)))
+}
 /// How long one upload POST may take before the attachment shows as failed.
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -165,10 +287,7 @@ It is referenced in your text; removing it also removes every reference.",
     /// when `text` links its chip.
     fn wire(&self, id: &str, text: &str) -> (Value, Option<Value>) {
         let (kind, context_id, size) = (self.kind.as_str(), self.context_id(), self.bytes.len());
-        let mut sent = json!({"type": kind, "id": id, "name": self.name, "mimeType": self.mime, "sizeBytes": size});
-        if let Some(source) = &self.source {
-            sent["source"] = source.value.clone();
-        }
+        let sent = self.sent(id);
         let record = text.contains(&format!("/{kind}/{context_id})")).then(|| {
             json!({
                 "version": 1, "kind": kind, "contextId": context_id, "label": self.name, "attachmentId": id,
@@ -177,21 +296,36 @@ It is referenced in your text; removing it also removes every reference.",
         });
         (sent, record)
     }
+
+    /// The message's or answer's attachment entry for the upload `id`.
+    fn sent(&self, id: &str) -> Value {
+        let (kind, size) = (self.kind.as_str(), self.bytes.len());
+        let mut sent = json!({"type": kind, "id": id, "name": self.name, "mimeType": self.mime, "sizeBytes": size});
+        if let Some(source) = &self.source {
+            sent["source"] = source.value.clone();
+        }
+        sent
+    }
 }
 
-/// An attachment in the composer on screen (no target: the open one's) or in the draft it was
-/// stashed with, beside that draft's target.
+/// An attachment in the composer on screen or set aside by its open question card (no
+/// target: the open one's), or in the draft it was stashed with, beside that draft's target.
 fn find_attachment<'a>(
     active: &'a mut [Attachment],
+    question: Option<&'a mut QuestionDraft>,
     drafts: &'a mut HashMap<Target, ComposerDraft>,
     local_id: &str,
 ) -> Option<(Option<&'a Target>, &'a mut Attachment)> {
-    let stashed = drafts.iter_mut().filter_map(|(target, draft)| match draft {
-        ComposerDraft::Prompt(_, kept) => Some((Some(target), kept.as_mut_slice())),
-        ComposerDraft::Question(_) => None,
-    });
-    std::iter::once((None, active))
-        .chain(stashed)
+    let mut lists: Vec<(Option<&'a Target>, &'a mut [Attachment])> = vec![(None, active)];
+    lists.extend(question.into_iter().flat_map(QuestionDraft::lists).map(|list| (None, list)));
+    for (target, draft) in drafts.iter_mut() {
+        match draft {
+            ComposerDraft::Prompt(_, kept) => lists.push((Some(target), kept.as_mut_slice())),
+            ComposerDraft::Question(question) => lists.extend(question.lists().map(|list| (Some(target), list))),
+        }
+    }
+    lists
+        .into_iter()
         .flat_map(|(target, attachments)| attachments.iter_mut().map(move |attachment| (target, attachment)))
         .find(|(_, attachment)| attachment.local_id == local_id)
 }
@@ -305,18 +439,86 @@ fn image_format(mime: &str) -> Option<ImageFormat> {
 }
 
 impl Workspace {
-    /// The paperclip shows while the server takes file uploads.
+    /// The paperclip shows while the server takes file uploads and no open question is
+    /// choice-only (`showComposerAttachAction`).
     pub(super) fn can_attach(&self) -> bool {
-        self.server_info().file_upload_limit().is_some() && self.question.is_none()
+        self.server_info().file_upload_limit().is_some()
+            && self.question.as_ref().is_none_or(|question| question.active().allows_custom())
+    }
+
+    /// An open question that can't take attachments now: choice-only, being answered, or
+    /// not resumable (`addComposerAttachments`).
+    fn question_refuses_attachments(&self) -> bool {
+        self.question.as_ref().is_some_and(|question| {
+            !question.active().allows_custom()
+                || self.responding.as_ref() == Some(&question.request_id)
+                || self
+                    .pending_question_request(ChatPane::Main)
+                    .is_none_or(|(request, _)| request.capability() == Some("not_resumable"))
+        })
+    }
+
+    /// The list on screen: the prompt's, or the open question's.
+    fn attachment_origin(&self) -> Option<Origin> {
+        let target = self.target.clone()?;
+        let question = self.question.as_ref().map(|q| (q.request_id.clone(), q.active().id.clone()));
+        Some(Origin { target, question })
     }
 
     pub(super) fn attachments_busy(&self) -> bool {
         self.attachments.iter().any(|a| a.upload == Upload::Uploading)
-            || self.target.as_ref().is_some_and(|target| self.reading_attachments.contains(target))
+            || self.attachment_origin().is_some_and(|origin| self.reading_attachments.contains(&origin))
     }
 
     pub(super) fn has_attachments(&self) -> bool {
         !self.attachments.is_empty()
+    }
+
+    /// What the open card's question `question_id` carries beside its text; nothing in a side chat.
+    pub(super) fn question_attached(&self, pane: ChatPane, question_id: &str) -> Attached {
+        let Some(question) = self.question.as_ref().filter(|_| pane == ChatPane::Main) else {
+            return Attached::default();
+        };
+        let list = self.question_list(question, question_id);
+        let here = self.active_environment();
+        let origin = self
+            .target
+            .clone()
+            .map(|target| Origin { target, question: Some((question.request_id.clone(), question_id.to_owned())) });
+        let preparing = origin.is_some_and(|origin| self.reading_attachments.contains(&origin));
+        let blocked =
+            preparing || list.iter().any(|a| !matches!(a.upload, Upload::Ready(_)) || a.upload_env.as_ref() != here);
+        Attached { count: list.len(), blocked }
+    }
+
+    /// The open card's `attachmentsByQuestionId`, or why its answer can't go yet.
+    pub(super) fn question_attachments_payload(&self) -> Result<Option<Value>, String> {
+        let Some(question) = &self.question else { return Ok(None) };
+        let lists = question.questions.iter().map(|q| (q.id.as_str(), self.question_list(question, &q.id)));
+        attachments_by_question(lists, self.active_environment())
+    }
+
+    /// The attachments of the open card's question `id`: the composer's while it is on screen.
+    fn question_list<'a>(&'a self, question: &'a QuestionDraft, id: &str) -> &'a [Attachment] {
+        if question.active().id == id {
+            &self.attachments
+        } else {
+            question.attachments.get(id).map(Vec::as_slice).unwrap_or_default()
+        }
+    }
+
+    /// The open question's card closed: its questions' attachments go, and the prompt's
+    /// come back to the composer.
+    pub(super) fn close_question_attachments(
+        &mut self,
+        questions: HashMap<String, Vec<Attachment>>,
+        prompt: Vec<Attachment>,
+        cx: &mut Context<Self>,
+    ) {
+        let shown = mem::replace(&mut self.attachments, prompt);
+        for attachment in shown.iter().chain(questions.values().flatten()) {
+            self.release_upload(attachment, cx);
+        }
     }
 
     pub(super) fn pick_attachments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -361,6 +563,7 @@ impl Workspace {
             return item.text().is_some_and(|text| self.paste_chips(&text, window, cx));
         }
         let mut handled = false;
+        let mut incoming = Vec::new();
         for entry in item.entries() {
             match entry {
                 gpui_kit::ClipboardEntry::Image(image) => {
@@ -371,18 +574,12 @@ impl Workspace {
                         ImageFormat::Webp => ("image/webp", "webp"),
                         _ => continue,
                     };
-                    self.add_attachment(
-                        format!("image.{extension}"),
-                        Kind::Image,
-                        mime,
-                        image.bytes().to_vec(),
-                        window,
-                        cx,
-                    );
+                    let name = format!("image.{extension}");
+                    incoming.push(Incoming::Image { name, mime, bytes: image.bytes().to_vec() });
                     handled = true;
                 }
                 gpui_kit::ClipboardEntry::ExternalPaths(paths) => {
-                    self.add_paths(paths.paths().to_vec(), window, cx);
+                    incoming.extend(paths.paths().iter().filter(|p| !p.is_dir()).cloned().map(Incoming::Path));
                     handled = true;
                 }
                 gpui_kit::ClipboardEntry::String(text) if !handled => {
@@ -392,12 +589,17 @@ impl Workspace {
                 gpui_kit::ClipboardEntry::String(_) => {}
             }
         }
+        self.intake(incoming, window, cx);
         handled
     }
 
     /// `foldPastedText`: a large paste, or one past the input limit, attaches as a text
-    /// file; one that can neither fit nor attach is refused.
+    /// file; one that can neither fit nor attach is refused. A question's literal answer
+    /// (one with a suggested answer) always pastes inline.
     pub(super) fn fold_pasted_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.question.as_ref().is_some_and(|question| question.active().initial_answer.is_some()) {
+            return false;
+        }
         let state = self.composer.read(cx);
         let selected = state.selected_range();
         let value = state.value();
@@ -407,7 +609,10 @@ impl Workspace {
             return false;
         }
         let limit = self.server_info().file_upload_limit().map(|l| l.min(MAX_FILE_BYTES));
-        let can_stage = self.target.is_some() && self.can_attach() && self.attachments.len() < MAX_ATTACHMENTS;
+        let can_stage = self.target.is_some()
+            && self.can_attach()
+            && !self.question_refuses_attachments()
+            && self.reserved_attachments() < MAX_ATTACHMENTS;
         let refuse = |title: &'static str, description: &'static str, window: &mut Window, cx: &mut Context<Self>| {
             let toast = gpui_kit::component::notification::Notification::error(description).title(title);
             gpui_kit::component::WindowExt::push_notification(window, toast, cx);
@@ -437,52 +642,41 @@ impl Workspace {
     }
 
     fn add_paths(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
-        let files: Vec<PathBuf> = paths.into_iter().filter(|p| !p.is_dir()).collect();
-        if files.is_empty() {
+        let files = paths.into_iter().filter(|p| !p.is_dir()).map(Incoming::Path).collect();
+        self.intake(files, window, cx);
+    }
+
+    /// `addComposerAttachments`: reads the files and prepares the images off the UI thread,
+    /// for the list on screen now, even if the user leaves it meanwhile.
+    fn intake(&mut self, incoming: Vec<Incoming>, window: &mut Window, cx: &mut Context<Self>) {
+        if incoming.is_empty() {
             return;
         }
-        // The files belong to the composer they were added to, even if the user leaves it meanwhile.
-        let Some(origin) = self.target.clone() else { return };
+        let Some(origin) = self.attachment_origin() else { return };
+        if self.question_refuses_attachments() {
+            let toast = gpui_kit::component::notification::Notification::error(QUESTION_REFUSES);
+            gpui_kit::component::WindowExt::push_notification(window, toast, cx);
+            return;
+        }
+        let file_limit = self.file_limit();
         self.reading_attachments.push(origin.clone());
-        let read = cx.background_executor().spawn(async move {
-            files
-                .into_iter()
-                .map(|path| {
-                    let name = path.file_name().map_or_else(|| "file".into(), |n| n.to_string_lossy().into_owned());
-                    let read = read_at_most(&path, MAX_FILE_BYTES);
-                    (name, read)
-                })
-                .collect::<Vec<_>>()
+        cx.notify();
+        let taken = cx.background_executor().spawn(async move {
+            incoming.into_iter().map(|incoming| take_in(incoming, file_limit)).collect::<Vec<_>>()
         });
         cx.spawn_in(window, async move |this, cx| {
-            let files = read.await;
+            let taken = taken.await;
             let _ = this.update_in(cx, |this, window, cx| {
-                if let Some(at) = this.reading_attachments.iter().position(|target| target == &origin) {
+                if let Some(at) = this.reading_attachments.iter().position(|reading| reading == &origin) {
                     this.reading_attachments.swap_remove(at);
                 }
-                let here = this.target.as_ref() == Some(&origin);
-                for (name, read) in files {
-                    let added = classify(&name).and_then(|(kind, mime)| match read {
-                        Ok(Read::Bytes(bytes)) if !bytes.is_empty() => Ok((kind, mime, bytes)),
-                        Ok(Read::TooLarge(size)) => Err(this.attachment_error(&name, kind, size).unwrap_or_default()),
-                        Ok(Read::Bytes(_)) => Err(format!("'{name}' is empty or could not be read.")),
-                        Err(error) => {
-                            log::warn!("could not read {name:?}: {error}");
-                            Err(format!("'{name}' is empty or could not be read."))
-                        }
+                let shown = this.target.as_ref() == Some(&origin.target);
+                for taken in taken {
+                    let placed = taken.and_then(|(name, kind, mime, bytes)| {
+                        this.place_attachment(&origin, name, kind, mime, bytes, window, cx)
                     });
-                    let result = match added {
-                        Ok((kind, mime, bytes)) if here => {
-                            this.add_attachment(name, kind, mime, bytes, window, cx);
-                            Ok(())
-                        }
-                        Ok((kind, mime, bytes)) => {
-                            this.stash_attachment(origin.clone(), name, kind, mime, bytes, cx).map(|_| ())
-                        }
-                        Err(error) => Err(error),
-                    };
-                    match result {
-                        Err(error) if here && !error.is_empty() => this.error = Some(error.into()),
+                    match placed {
+                        Err(error) if shown && !error.is_empty() => this.error = Some(error.into()),
                         Err(error) if !error.is_empty() => log::warn!("an attachment for a left draft failed: {error}"),
                         _ => {}
                     }
@@ -493,16 +687,47 @@ impl Workspace {
         .detach();
     }
 
+    /// Puts a taken file in `origin`'s list: the composer's when it is on screen, else the
+    /// list it waits in. A question answered or dismissed meanwhile drops it silently.
+    fn place_attachment(
+        &mut self,
+        origin: &Origin,
+        name: String,
+        kind: Kind,
+        mime: &'static str,
+        bytes: Vec<u8>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if self.attachment_origin().as_ref() == Some(origin) {
+            self.add_attachment(name, kind, mime, bytes, window, cx);
+            return Ok(());
+        }
+        self.park_attachment(origin, name, kind, mime, bytes, cx).map(|_| ())
+    }
+
+    /// The server's file limit, at most the provider's.
+    fn file_limit(&self) -> u64 {
+        self.server_info().file_upload_limit().unwrap_or(MAX_FILE_BYTES).min(MAX_FILE_BYTES)
+    }
+
     /// Why an attachment of `size` bytes can't join the composer, or `None` when it can.
     fn attachment_error(&self, name: &str, kind: Kind, size: u64) -> Option<String> {
-        let file_limit = self.server_info().file_upload_limit().unwrap_or(MAX_FILE_BYTES).min(MAX_FILE_BYTES);
+        let file_limit = self.file_limit();
         if kind == Kind::Image && size > MAX_IMAGE_BYTES {
-            Some(format!("'{name}' is too large to attach, even after compression."))
+            Some(image_attachment::Failure::TooLarge.message(name))
         } else if size > file_limit {
-            Some(format!("'{name}' exceeds the {} MB attachment limit.", file_limit / 1024 / 1024))
+            Some(file_too_large(name, file_limit))
         } else {
             None
         }
+    }
+
+    /// The attachments that count against the limit: the composer's, and while a question
+    /// is open its other questions' too, since one answer carries them all.
+    fn reserved_attachments(&self) -> usize {
+        let questions = self.question.as_ref().map_or(0, |q| q.attachments.values().map(Vec::len).sum());
+        self.attachments.len() + questions
     }
 
     fn add_attachment(
@@ -514,7 +739,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let error = if self.attachments.len() >= MAX_ATTACHMENTS {
+        let error = if self.reserved_attachments() >= MAX_ATTACHMENTS {
             Some(format!("You can attach up to {MAX_ATTACHMENTS} files per message."))
         } else {
             self.attachment_error(&name, kind, bytes.len() as u64)
@@ -538,8 +763,9 @@ impl Workspace {
             upload_env: None,
             source: None,
         };
-        // Files always get an inline chip; images only once the prompt has text.
-        if kind == Kind::File || !self.composer_empty {
+        // Files always get an inline chip; images only once the prompt has text. A question's
+        // answer carries its attachments beside the text, never as chips.
+        if self.question.is_none() && (kind == Kind::File || !self.composer_empty) {
             let link = composer_text::context_link(kind.as_str(), &attachment.context_id(), &attachment.name);
             let chip = composer_text::Chip::Context {
                 kind: kind.as_str().into(),
@@ -597,20 +823,25 @@ impl Workspace {
         if let Some(error) = self.attachment_error(&name, Kind::Image, bytes.len() as u64) {
             return Err(error);
         }
+        let origin = Origin { target, question: None };
         let local_id = self
-            .stash_attachment(target, name, Kind::Image, mime, bytes, cx)
+            .park_attachment(&origin, name, Kind::Image, mime, bytes, cx)
             .map_err(|_| "Remove an attachment, then try this capture again.".to_owned())?;
-        if let Some((_, attachment)) = find_attachment(&mut self.attachments, &mut self.composer_drafts, &local_id) {
+        let question = self.question.as_mut();
+        if let Some((_, attachment)) =
+            find_attachment(&mut self.attachments, question, &mut self.composer_drafts, &local_id)
+        {
             attachment.source = Some(source);
         }
         Ok(())
     }
 
-    /// An attachment for `target`'s set-aside draft, with a file's chip at the end of its
-    /// prompt as the composer would add it; its local id, or why the draft can't take it.
-    fn stash_attachment(
+    /// An attachment for a list off screen (a set-aside draft, the prompt an open question set
+    /// aside, or a question not on screen), with a file's chip at the end of a prompt as the
+    /// composer would add it; its local id, or why it can't join (empty: its question is gone).
+    fn park_attachment(
         &mut self,
-        target: Target,
+        origin: &Origin,
         name: String,
         kind: Kind,
         mime: &str,
@@ -621,37 +852,59 @@ impl Workspace {
             return Err(error);
         }
         let full = || format!("You can attach up to {MAX_ATTACHMENTS} files per message.");
-        let draft =
-            self.composer_drafts.entry(target).or_insert_with(|| ComposerDraft::Prompt(String::new(), Vec::new()));
-        let ComposerDraft::Prompt(prompt, kept) = draft else { return Err(full()) };
-        if kept.len() >= MAX_ATTACHMENTS {
-            return Err(full());
+        let here = self.target.as_ref() == Some(&origin.target);
+        if !here && origin.question.is_none() {
+            let draft = || ComposerDraft::Prompt(String::new(), Vec::new());
+            self.composer_drafts.entry(origin.target.clone()).or_insert_with(draft);
         }
+        let parked = if here {
+            self.question.as_mut().and_then(|question| question.parked(origin.question.as_ref()))
+        } else {
+            self.composer_drafts.get_mut(&origin.target).and_then(|draft| match draft {
+                ComposerDraft::Prompt(prompt, kept) => {
+                    origin.question.is_none().then_some(Parked::Prompt(prompt, kept))
+                }
+                ComposerDraft::Question(question) => question.parked(origin.question.as_ref()),
+            })
+        };
         let attachment = Attachment::restored(kind.as_str(), name, mime.to_owned(), bytes);
-        if kind == Kind::File {
-            let link = composer_text::context_link(kind.as_str(), &attachment.context_id(), &attachment.name);
-            if !prompt.is_empty() && !prompt.ends_with(char::is_whitespace) {
-                prompt.push(' ');
-            }
-            prompt.push_str(&link);
-            prompt.push(' ');
-        }
         let local_id = attachment.local_id.clone();
-        kept.push(attachment);
+        match parked {
+            None => return Err(String::new()),
+            Some(Parked::Prompt(_, kept) | Parked::Question(kept)) if kept.len() >= MAX_ATTACHMENTS => {
+                return Err(full());
+            }
+            Some(Parked::Prompt(prompt, kept)) => {
+                if kind == Kind::File {
+                    let link = composer_text::context_link(kind.as_str(), &attachment.context_id(), &attachment.name);
+                    if !prompt.is_empty() && !prompt.ends_with(char::is_whitespace) {
+                        prompt.push(' ');
+                    }
+                    prompt.push_str(&link);
+                    prompt.push(' ');
+                }
+                kept.push(attachment);
+            }
+            Some(Parked::Question(kept)) => kept.push(attachment),
+        }
         self.upload(local_id.clone(), cx);
         Ok(local_id)
     }
 
     /// Mints a signed upload URL on the environment of the attachment's draft, then POSTs the bytes to it.
     pub(super) fn upload(&mut self, local_id: String, cx: &mut Context<Self>) {
-        let Some((draft, _)) = find_attachment(&mut self.attachments, &mut self.composer_drafts, &local_id) else {
+        let Some((draft, _)) =
+            find_attachment(&mut self.attachments, self.question.as_mut(), &mut self.composer_drafts, &local_id)
+        else {
             return;
         };
         let environment = draft.map(Target::environment).cloned();
         let environment = environment.or_else(|| self.active_environment().cloned());
         let client = environment.as_deref().and_then(|id| self.env_client(id));
         let http_base = environment.as_deref().and_then(|id| self.env_endpoint(id)).map(|e| e.http_base.clone());
-        let Some((_, attachment)) = find_attachment(&mut self.attachments, &mut self.composer_drafts, &local_id) else {
+        let Some((_, attachment)) =
+            find_attachment(&mut self.attachments, self.question.as_mut(), &mut self.composer_drafts, &local_id)
+        else {
             return;
         };
         let released = attachment.begin_upload(environment.clone());
@@ -707,9 +960,14 @@ impl Workspace {
             }
             .await;
             let _ = this.update(cx, |this, cx| {
-                let waiting = find_attachment(&mut this.attachments, &mut this.composer_drafts, &local_id)
-                    .map(|(_, attachment)| attachment)
-                    .filter(|attachment| attachment.awaits_upload_on(&environment));
+                let waiting = find_attachment(
+                    &mut this.attachments,
+                    this.question.as_mut(),
+                    &mut this.composer_drafts,
+                    &local_id,
+                )
+                .map(|(_, attachment)| attachment)
+                .filter(|attachment| attachment.awaits_upload_on(&environment));
                 if let Some(attachment) = waiting {
                     attachment.upload = match result {
                         Ok(id) => Upload::Ready(id),
@@ -767,6 +1025,10 @@ impl Workspace {
     }
 
     pub(super) fn remove_attachment(&mut self, local_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // An answer being sent keeps what it carries.
+        if self.question.as_ref().is_some_and(|question| self.responding.as_ref() == Some(&question.request_id)) {
+            return;
+        }
         let Some(index) = self.attachments.iter().position(|a| a.local_id == local_id) else { return };
         let attachment = self.attachments.remove(index);
         self.release_upload(&attachment, cx);
@@ -1186,16 +1448,75 @@ It is referenced in your text; removing it also removes every reference."
             source: None,
         };
         let stashed_in = Target::Thread { env: "e".into(), id: "t1".into() };
+        let asked_in = Target::Thread { env: "e".into(), id: "t2".into() };
         let mut active = vec![attachment("on-screen")];
-        let mut drafts =
-            HashMap::from([(stashed_in.clone(), ComposerDraft::Prompt("hi".into(), vec![attachment("stashed")]))]);
-        let (target, found) = find_attachment(&mut active, &mut drafts, "stashed").unwrap();
+        let mut open = card();
+        open.prompt_attachments.push(attachment("prompt-set-aside"));
+        open.attachments.insert("b".into(), vec![attachment("other-question")]);
+        let mut asked = card();
+        asked.attachments.insert("a".into(), vec![attachment("stashed-answer")]);
+        let mut drafts = HashMap::from([
+            (stashed_in.clone(), ComposerDraft::Prompt("hi".into(), vec![attachment("stashed")])),
+            (asked_in.clone(), ComposerDraft::Question(asked)),
+        ]);
+        let (target, found) = find_attachment(&mut active, Some(&mut open), &mut drafts, "stashed").unwrap();
         assert_eq!(target, Some(&stashed_in), "a stashed attachment uploads to its draft's environment");
         found.upload = Upload::Ready("srv".into());
         let Some(ComposerDraft::Prompt(_, kept)) = drafts.get(&stashed_in) else { panic!() };
         assert_eq!(kept[0].upload, Upload::Ready("srv".into()));
-        assert!(find_attachment(&mut active, &mut drafts, "on-screen").is_some_and(|(target, _)| target.is_none()));
-        assert!(find_attachment(&mut active, &mut drafts, "removed").is_none());
+        for (id, target) in [
+            ("on-screen", None),
+            ("prompt-set-aside", None),
+            ("other-question", None),
+            ("stashed-answer", Some(&asked_in)),
+        ] {
+            let found = find_attachment(&mut active, Some(&mut open), &mut drafts, id).map(|(target, _)| target);
+            assert_eq!(found, Some(target), "{id}");
+        }
+        assert!(find_attachment(&mut active, Some(&mut open), &mut drafts, "removed").is_none());
+    }
+
+    /// A card asking questions `a` and `b`, on `a`.
+    fn card() -> QuestionDraft {
+        let question = |id: &str| -> crate::requests::Question {
+            serde_json::from_value(json!({"id": id, "header": "H", "question": "?", "options": []})).unwrap()
+        };
+        QuestionDraft::new("r".into(), vec![question("a"), question("b")]).unwrap()
+    }
+
+    #[test]
+    fn each_question_keeps_its_own_attachments_and_answers_with_them_once_uploaded() {
+        let ready = |name: &str, id: &str| {
+            let mut attachment = Attachment::restored("image", name.into(), "image/png".into(), vec![1, 2]);
+            attachment.upload = Upload::Ready(id.into());
+            attachment.upload_env = Some("e".into());
+            attachment
+        };
+        let mut open = card();
+        open.park(vec![ready("a.png", "up-a")]);
+        open.index = 1;
+        assert!(open.unpark().is_empty(), "b has none of its own");
+        open.index = 0;
+        let on_screen = open.unpark();
+        assert_eq!(on_screen.len(), 1, "a's come back when it is on screen again");
+        assert!(open.parked(Some(&("other".into(), "a".into()))).is_none(), "another request's question is gone");
+
+        let here = SharedString::from("e");
+        let lists = [("a", on_screen.as_slice()), ("b", &[][..])];
+        assert_eq!(
+            attachments_by_question(lists, Some(&here)).unwrap(),
+            Some(
+                json!({"a": [{"type": "image", "id": "up-a", "name": "a.png", "mimeType": "image/png", "sizeBytes": 2}]})
+            ),
+            "questions without attachments are left out"
+        );
+        assert_eq!(attachments_by_question([("b", &[][..])], Some(&here)).unwrap(), None);
+        let elsewhere = SharedString::from("other");
+        let error = attachments_by_question([("a", on_screen.as_slice())], Some(&elsewhere)).unwrap_err();
+        assert_eq!(error, "Wait for attachments to finish uploading, or remove failed uploads.");
+        let mut uploading = ready("c.png", "up-c");
+        uploading.upload = Upload::Uploading;
+        assert!(attachments_by_question([("a", std::slice::from_ref(&uploading))], Some(&here)).is_err());
     }
 
     #[test]

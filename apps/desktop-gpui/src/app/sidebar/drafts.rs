@@ -27,7 +27,7 @@ pub(super) struct Discarded {
 fn content(draft: &ComposerDraft) -> (&str, usize) {
     match draft {
         ComposerDraft::Prompt(prompt, attachments) => (prompt, attachments.len()),
-        ComposerDraft::Question(question) => (&question.prompt, 0),
+        ComposerDraft::Question(question) => (&question.prompt, question.prompt_attachments.len()),
     }
 }
 
@@ -145,8 +145,9 @@ impl Workspace {
                 Some(ComposerDraft::Prompt(prompt, attachments)) => (prompt, attachments),
                 Some(ComposerDraft::Question(mut question)) => {
                     let prompt = std::mem::take(&mut question.prompt);
+                    let attachments = std::mem::take(&mut question.prompt_attachments);
                     self.composer_drafts.insert(target.clone(), ComposerDraft::Question(question));
-                    (prompt, Vec::new())
+                    (prompt, attachments)
                 }
                 None => return,
             }
@@ -179,7 +180,10 @@ impl Workspace {
             }
         } else {
             match self.composer_drafts.get_mut(&target) {
-                Some(ComposerDraft::Question(question)) => question.prompt = prompt,
+                Some(ComposerDraft::Question(question)) => {
+                    question.prompt = prompt;
+                    question.prompt_attachments = attachments;
+                }
                 _ => {
                     self.composer_drafts.insert(target, ComposerDraft::Prompt(prompt, attachments));
                 }

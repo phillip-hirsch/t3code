@@ -21,7 +21,6 @@ use serde_json::{Value, json};
 use crate::backend;
 use crate::environments::{BackendStatus, PrimaryBackend};
 use crate::model::{ModelSelection, ProjectShell, ServerInfo, ShellState, ThreadState};
-use crate::requests::QuestionDraft;
 use crate::rpc::{self, ConnectOptions, RpcClient, RpcError, RpcStream, StreamEvent};
 use crate::runtime;
 use crate::timeline::{self, Row};
@@ -213,7 +212,7 @@ pub struct Workspace {
     /// The transcript lane's width last frame; a change reflows its rows (see `render_body`).
     timeline_lane_width: std::cell::Cell<f32>,
     /// The question card's drafts, for the first pending question.
-    question: Option<QuestionDraft>,
+    question: Option<attachments::QuestionDraft>,
     /// Requests that arrived mid-typing, kept out of sight for now.
     typing_guard: crate::composer_guard::TypingGuard,
     _typing_idle: Option<Task<()>>,
@@ -249,7 +248,7 @@ pub struct Workspace {
     /// Files from the OS are being dragged over the chat canvas.
     dragging_files: bool,
     /// Targets whose dropped or picked files are still being read, one entry per read.
-    reading_attachments: Vec<Target>,
+    reading_attachments: Vec<attachments::Origin>,
     /// Attachments whose chip was deleted, kept until the editor's undo history ends.
     retained_attachments: Vec<attachments::Attachment>,
     /// Sent messages their thread doesn't show yet.

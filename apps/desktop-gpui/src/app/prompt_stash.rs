@@ -546,14 +546,19 @@ impl Workspace {
                 unreadable.push(attachment.name);
                 continue;
             };
-            if self.attachments.len() >= MAX_ATTACHMENTS {
+            // An open question holds the composer; the prompt's attachments wait with the prompt.
+            let list = match &mut self.question {
+                Some(question) => &mut question.prompt_attachments,
+                None => &mut self.attachments,
+            };
+            if list.len() >= MAX_ATTACHMENTS {
                 over_limit.push(attachment.name);
                 continue;
             }
             let restored =
                 Attachment::restored_as(attachment.local_id, &attachment.kind, attachment.name, attachment.mime, bytes);
             let local_id = restored.local_id().to_owned();
-            self.attachments.push(restored);
+            list.push(restored);
             self.upload(local_id, cx);
         }
         match &mut self.question {
