@@ -1320,8 +1320,25 @@ impl Workspace {
 
     /// Answers a runtime request in the pane's thread; `response` holds `decision`, `feedback` or `answers`.
     fn respond(&mut self, pane: side_chat::ChatPane, request_id: String, response: Value, cx: &mut Context<Self>) {
+        self.dispatch_response(
+            pane,
+            request_id,
+            |thread_id, request_id| respond_value(thread_id, request_id, response),
+            cx,
+        );
+    }
+
+    /// Sends `command(thread_id, request_id)` for a request in the pane's thread, holding the
+    /// request's controls (`respondingRequestIds`) until it lands.
+    fn dispatch_response(
+        &mut self,
+        pane: side_chat::ChatPane,
+        request_id: String,
+        command: impl FnOnce(&str, &str) -> Value,
+        cx: &mut Context<Self>,
+    ) {
         let Some((client, env, thread_id)) = self.pane_client(pane, cx) else { return };
-        let command = respond_value(&thread_id, &request_id, response);
+        let command = command(&thread_id, &request_id);
         let key = (env.clone(), thread_id.clone(), request_id);
         if !self.responding.insert(key.clone()) {
             return;

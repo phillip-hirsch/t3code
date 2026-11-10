@@ -1054,9 +1054,14 @@ impl Workspace {
     }
 
     fn dismiss_question(&mut self, pane: ChatPane, request_id: String, cx: &mut Context<Self>) {
-        let Some((client, _, thread_id)) = self.pane_client(pane, cx) else { return };
-        let command = json!({"type": "thread.user-input.dismiss", "commandId": new_id(), "threadId": thread_id, "requestId": request_id});
-        self.dispatch_on(client, vec![command], cx);
+        self.dispatch_response(
+            pane,
+            request_id,
+            |thread_id, request_id| {
+                json!({"type": "thread.user-input.dismiss", "commandId": new_id(), "threadId": thread_id, "requestId": request_id})
+            },
+            cx,
+        );
     }
 
     /// Sending while an approval waits declines it: with the text as its
@@ -2044,18 +2049,20 @@ impl Workspace {
                     ))
                     .when(dismissible, |el| {
                         let request_id = request.id.clone();
+                        // Off while an answer or dismissal is on its way, as the web's `isResponding`.
+                        let responding = self.pane_responding(pane, &request.id);
                         el.child(
                             super::chat::focusable(icon_box(t).id("question-dismiss"), t)
-                                .cursor_pointer()
-                                .hover(|s| s.bg(t.accent))
                                 .child(Icon::new(Lucide::X).with_size(px(14.)))
                                 .tooltip(|window, cx| {
                                     Tooltip::new("Dismiss question without answering").build(window, cx)
                                 })
+                                .when(responding, |el| el.opacity(0.64))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
                                     this.dismiss_question(pane, request_id.clone(), cx);
-                                })),
+                                }))
+                                .when(!responding, |el| el.cursor_pointer().hover(|s| s.bg(t.accent))),
                         )
                     }),
             );
