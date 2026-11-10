@@ -87,8 +87,8 @@ pub(super) struct SideChats {
     starting: bool,
     bringing_back: bool,
     deleting: bool,
-    /// Unsent composer text of side chats not on screen. Ids repeat across environments.
-    drafts: HashMap<Key, String>,
+    /// What side chats not on screen keep of their composer. Ids repeat across environments.
+    drafts: HashMap<Key, SideDraft>,
     /// The parent composer's model pick for a side chat that started without a question; its
     /// first message runs on it (`setModelSelection` on the side chat's draft).
     models: HashMap<Key, ModelSelection>,
@@ -96,6 +96,36 @@ pub(super) struct SideChats {
 
 /// A side chat: its environment and thread id.
 type Key = (SharedString, String);
+
+/// What a side chat not on screen keeps of its composer.
+enum SideDraft {
+    Prompt(String),
+    /// An open question card's answers and progress; its prompt is the one it set aside.
+    Question(QuestionDraft),
+}
+
+impl SideDraft {
+    /// What a released view keeps: its open question, else its composer's text.
+    fn kept(question: Option<QuestionDraft>, text: String) -> Option<Self> {
+        match question {
+            Some(question) => Some(Self::Question(question)),
+            None => (!text.is_empty()).then_some(Self::Prompt(text)),
+        }
+    }
+
+    /// The composer's text and question card once the side chat shows again: a card brings
+    /// back the typed answer of the question it was on.
+    fn restore(self) -> (String, Option<QuestionDraft>) {
+        match self {
+            Self::Prompt(text) => (text, None),
+            Self::Question(question) => {
+                let active = &question.active().id;
+                let text = question.drafts.get(active).and_then(|draft| draft.custom.clone()).unwrap_or_default();
+                (text, Some(question))
+            }
+        }
+    }
+}
 
 impl SideChats {
     /// Drops the side chat's stream with the socket it ran on; it subscribes again on reconnect.
@@ -120,17 +150,17 @@ impl SideChats {
     /// message's edit ends here; the side chat keeps its own draft.
     fn release_view(&mut self, cx: &App) {
         let Some(mut view) = self.view.take() else { return };
-        let text = match (view.question.take(), view.queue.take_edit_draft()) {
-            (Some(question), _) => question.prompt,
+        let question = view.question.take();
+        let text = match (&question, view.queue.take_edit_draft()) {
+            (Some(_), _) => String::new(),
             (None, Some((text, ..))) => text,
             (None, None) => view.composer.read(cx).value().to_string(),
         };
         let key = (view.env, view.thread_id);
-        if text.is_empty() {
-            self.drafts.remove(&key);
-        } else {
-            self.drafts.insert(key, text);
-        }
+        match SideDraft::kept(question, text) {
+            Some(draft) => self.drafts.insert(key, draft),
+            None => self.drafts.remove(&key),
+        };
     }
 }
 
@@ -408,7 +438,8 @@ impl Workspace {
         }
         self.side_chat.release_view(cx);
         let (Some(thread_id), Some(client), Some(env)) = (shown, client, env) else { return };
-        let draft = self.side_chat.drafts.remove(&(env.clone(), thread_id.to_owned())).unwrap_or_default();
+        let kept = self.side_chat.drafts.remove(&(env.clone(), thread_id.to_owned()));
+        let (draft, question) = kept.map(SideDraft::restore).unwrap_or_default();
         let empty = draft.trim().is_empty();
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
@@ -467,7 +498,7 @@ impl Workspace {
             sending: false,
             queue: Default::default(),
             now: Default::default(),
-            question: None,
+            question,
             question_advance: None,
             _tick: None,
             _subscription: Some(subscription),
@@ -1272,14 +1303,38 @@ mod tests {
         let model = ModelSelection { instance_id: "codex".into(), model: "gpt".into(), options: None };
         let mut side_chats = SideChats::default();
         for env in [&a, &b] {
-            side_chats.drafts.insert((env.clone(), "side".to_owned()), format!("{env} text"));
+            side_chats.drafts.insert((env.clone(), "side".to_owned()), SideDraft::Prompt(format!("{env} text")));
             side_chats.models.insert((env.clone(), "side".to_owned()), model.clone());
         }
         side_chats.forget(&a, "side");
-        assert_eq!(
-            side_chats.drafts.into_iter().collect::<Vec<_>>(),
-            [((b.clone(), "side".to_owned()), "b text".to_owned())]
-        );
+        let drafts: Vec<_> = side_chats.drafts.into_iter().map(|(key, draft)| (key, draft.restore().0)).collect();
+        assert_eq!(drafts, [((b.clone(), "side".to_owned()), "b text".to_owned())]);
         assert_eq!(side_chats.models.into_keys().collect::<Vec<_>>(), [(b, "side".to_owned())]);
+    }
+
+    /// A card on question `b` of `a` and `b`, with `a` answered by option and `b` typed.
+    fn answered_card() -> QuestionDraft {
+        let question = |id: &str| -> crate::requests::Question {
+            let options = json!([{"label": "Red", "description": "r"}]);
+            serde_json::from_value(json!({"id": id, "header": "H", "question": "?", "options": options})).unwrap()
+        };
+        let mut card = QuestionDraft::new("r".into(), vec![question("a"), question("b")]).unwrap();
+        card.prompt = "parked prompt".into();
+        let picked = crate::requests::toggle(&card.questions[0], None, "Red");
+        card.drafts.insert("a".into(), picked);
+        let typed = crate::requests::set_custom(&card.questions[1], None, "typed".into());
+        card.drafts.insert("b".into(), typed);
+        card.index = 1;
+        card
+    }
+
+    #[test]
+    fn a_released_side_chat_keeps_its_question_answers_and_progress() {
+        let (text, card) = SideDraft::kept(Some(answered_card()), String::new()).expect("kept").restore();
+        assert_eq!(text, "typed", "the editor shows the question on screen's typed answer");
+        let card = card.expect("the card comes back");
+        assert_eq!((card.index, card.prompt.as_str()), (1, "parked prompt"));
+        assert_eq!(card.drafts["a"].selected, ["Red"]);
+        assert_eq!(SideDraft::kept(None, String::new()).map(|draft| draft.restore().0), None);
     }
 }
