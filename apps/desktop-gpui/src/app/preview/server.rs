@@ -18,11 +18,11 @@ use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{Disableable as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Bounds, ClickEvent, Context, ElementInputHandler, Entity, EntityInputHandler,
-    FocusHandle, InteractiveElement as _, IntoElement, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement as _, PathPromptOptions, Pixels, Point,
-    RenderImage, ScrollDelta, ScrollEvent, SharedString, Styled as _, StyledImage as _, Task, UTF16Selection, Window,
-    canvas, div, img, px, size,
+    AnyElement, App, AppContext as _, Bounds, ClickEvent, Context, DispatchPhase, ElementInputHandler, Entity,
+    EntityInputHandler, FocusHandle, InteractiveElement as _, IntoElement, KeyDownEvent, KeyUpEvent, Keystroke,
+    Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement as _,
+    PathPromptOptions, Pixels, Point, RenderImage, ScrollDelta, ScrollEvent, SharedString, Styled as _,
+    StyledImage as _, Task, UTF16Selection, Window, canvas, div, img, px, size,
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -145,6 +145,8 @@ impl ChooserMessage {
 #[derive(Debug, Default)]
 struct Composition {
     marked: String,
+    /// A Windows dead key went to the platform, which composes it with the next key that types.
+    dead_key: bool,
 }
 
 impl Composition {
@@ -152,9 +154,11 @@ impl Composition {
         text.clone_into(&mut self.marked);
     }
 
-    /// Committed text replaces the composition; the page types it unless it is empty.
+    /// Committed text replaces the composition; the page types it unless it is empty. Typed
+    /// text means no dead key waits: Windows sends a dead key no character.
     fn commit(&mut self, text: &str) -> Option<String> {
         self.marked.clear();
+        self.dead_key = false;
         (!text.is_empty()).then(|| text.to_owned())
     }
 
@@ -167,6 +171,21 @@ impl Composition {
 
     fn marked_range(&self) -> Option<Range<usize>> {
         (!self.marked.is_empty()).then(|| 0..self.marked.encode_utf16().count())
+    }
+
+    /// Whether a key down belongs to the platform's composition, so it types through the input
+    /// handler instead of reaching the page as a key (the terminal's `composing`). A Windows dead
+    /// key, the key that completes it, and text a modifier types (`AltGr`) need the
+    /// `TranslateMessage` a handled key skips. Until that text commits, the key may be a dead key.
+    fn composing(&mut self, keystroke: &Keystroke, prefer_character_input: bool) -> bool {
+        let m = &keystroke.modifiers;
+        let plain = !(m.control || m.alt || m.platform || m.function);
+        let completes_dead_key = keystroke.key_char.is_some() && std::mem::take(&mut self.dead_key);
+        if prefer_character_input {
+            self.dead_key = !completes_dead_key;
+            return true;
+        }
+        !self.marked.is_empty() || (plain && completes_dead_key)
     }
 }
 
@@ -255,6 +274,15 @@ impl EntityInputHandler for PageInput {
     fn accepts_text_input(&self, _: &mut Window, _: &mut Context<Self>) -> bool {
         self.live
     }
+}
+
+/// A key event for the page: a release, or a press that may ask for character input
+/// (`KeyDownEvent::prefer_character_input`, a Windows dead key).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyAction {
+    Down,
+    DownComposing,
+    Up,
 }
 
 /// Shift+Escape takes the keyboard back from the page (`aria-description` on the web's textarea).
@@ -788,6 +816,10 @@ impl Workspace {
             stream.sent_size = Some(size);
             stream.send(json!({"type": "resize", "width": size.0, "height": size.1}));
         }
+        // A press the window stopped seeing ends like the web's `pointercancel`.
+        if stream.buttons != 0 && !window.is_window_active() {
+            self.cancel_server_buttons(key, window.mouse_position());
+        }
         let stream = &self.preview.server.streams[key];
         let control = stream.control.clone();
         let mine = control.as_ref().is_some_and(Control::mine);
@@ -839,8 +871,9 @@ impl Workspace {
         // The web disables its textarea over a PDF.
         let text_input = pdf.is_none().then(|| (stream.focus.clone(), stream.input.clone()));
         let tab = key.clone();
-        let (down_tab, up_tab, move_tab, wheel_tab, key_tab, key_up_tab) =
-            (tab.clone(), tab.clone(), tab.clone(), tab.clone(), tab.clone(), tab.clone());
+        let (down_tab, move_tab, wheel_tab, key_tab, key_up_tab) =
+            (tab.clone(), tab.clone(), tab.clone(), tab.clone(), tab.clone());
+        let (drag_view, drag_tab) = (cx.weak_entity(), tab.clone());
         let body = div()
             .id("server-browser-page")
             .relative()
@@ -855,6 +888,18 @@ impl Workspace {
                         if let Some((focus, input)) = text_input {
                             window.handle_input(&focus, ElementInputHandler::new(bounds, input), cx);
                         }
+                        // A press on the page follows the pointer and its release anywhere in the window.
+                        let (up_view, up_tab) = (drag_view.clone(), drag_tab.clone());
+                        window.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
+                            if phase == DispatchPhase::Capture {
+                                let _ = drag_view.update(cx, |this, _| this.server_mouse_move(&drag_tab, e, true));
+                            }
+                        });
+                        window.on_mouse_event(move |e: &MouseUpEvent, phase, _, cx| {
+                            if phase == DispatchPhase::Capture {
+                                let _ = up_view.update(cx, |this, cx| this.server_mouse_up(&up_tab, e, cx));
+                            }
+                        });
                     },
                 )
                 .absolute()
@@ -871,35 +916,26 @@ impl Workspace {
                 let tab = tab.clone();
                 cx.listener(move |this, e: &MouseDownEvent, w, cx| this.server_mouse_down(&tab, e, w, cx))
             })
-            .on_mouse_down(MouseButton::Middle, {
-                let tab = tab.clone();
-                cx.listener(move |this, e: &MouseDownEvent, w, cx| this.server_mouse_down(&tab, e, w, cx))
-            })
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(move |this, e: &MouseUpEvent, _, cx| this.server_mouse_up(&up_tab, e, cx)),
-            )
-            .on_mouse_up(MouseButton::Right, {
-                let tab = tab.clone();
-                cx.listener(move |this, e: &MouseUpEvent, _, cx| this.server_mouse_up(&tab, e, cx))
-            })
-            .on_mouse_up(
+            .on_mouse_down(
                 MouseButton::Middle,
-                cx.listener(move |this, e: &MouseUpEvent, _, cx| this.server_mouse_up(&tab, e, cx)),
+                cx.listener(move |this, e: &MouseDownEvent, w, cx| this.server_mouse_down(&tab, e, w, cx)),
             )
-            .on_mouse_move(cx.listener(move |this, e: &MouseMoveEvent, _, _| this.server_mouse_move(&move_tab, e)))
+            .on_mouse_move(
+                cx.listener(move |this, e: &MouseMoveEvent, _, _| this.server_mouse_move(&move_tab, e, false)),
+            )
             .on_scroll(cx.listener(move |this, e: &ScrollEvent, _, cx| {
                 if this.server_wheel(&wheel_tab, e) {
                     cx.stop_propagation();
                 }
             }))
             .on_key_down(cx.listener(move |this, e: &KeyDownEvent, window, cx| {
-                if this.server_key(&key_tab, "down", &e.keystroke, window, cx) {
+                let action = if e.prefer_character_input { KeyAction::DownComposing } else { KeyAction::Down };
+                if this.server_key(&key_tab, action, &e.keystroke, window, cx) {
                     cx.stop_propagation();
                 }
             }))
             .on_key_up(cx.listener(move |this, e: &KeyUpEvent, window, cx| {
-                if this.server_key(&key_up_tab, "up", &e.keystroke, window, cx) {
+                if this.server_key(&key_up_tab, KeyAction::Up, &e.keystroke, window, cx) {
                     cx.stop_propagation();
                 }
             }));
@@ -1099,9 +1135,10 @@ impl Workspace {
         cx.stop_propagation();
     }
 
-    fn server_mouse_move(&mut self, tab: &TabRef, event: &MouseMoveEvent) {
+    /// A hover over the page, or (`dragging`) a held press moving anywhere in the window.
+    fn server_mouse_move(&mut self, tab: &TabRef, event: &MouseMoveEvent, dragging: bool) {
         let Some(stream) = self.preview.server.streams.get(tab) else { return };
-        if !stream.control.as_ref().is_some_and(Control::mine) {
+        if !stream.control.as_ref().is_some_and(Control::mine) || (stream.buttons != 0) != dragging {
             return;
         }
         let held = stream.buttons;
@@ -1116,6 +1153,21 @@ impl Workspace {
             "type": "mouse", "action": "move", "x": x, "y": y, "button": button, "buttons": held,
             "clickCount": 0, "modifiers": modifier_bits(event.modifiers),
         }));
+    }
+
+    /// Releases every held button at `position`, clamped to the page.
+    fn cancel_server_buttons(&mut self, tab: &TabRef, position: Point<Pixels>) {
+        let point = self.server_point(tab, position, true);
+        let Some(stream) = self.preview.server.streams.get_mut(tab) else { return };
+        if let Some((x, y)) = point {
+            for (button, buttons) in released_buttons(stream.buttons) {
+                stream.send(json!({
+                    "type": "mouse", "action": "up", "x": x, "y": y, "button": button, "buttons": buttons,
+                    "clickCount": 0, "modifiers": 0,
+                }));
+            }
+        }
+        stream.buttons = 0;
     }
 
     fn server_wheel(&self, tab: &TabRef, event: &ScrollEvent) -> bool {
@@ -1134,11 +1186,12 @@ impl Workspace {
     fn server_key(
         &mut self,
         tab: &TabRef,
-        action: &str,
+        key_action: KeyAction,
         keystroke: &Keystroke,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        let action = if key_action == KeyAction::Up { "up" } else { "down" };
         let Some(stream) = self.preview.server.streams.get(tab) else { return false };
         // Keys typed into the page's own overlays, such as a prompt's response, stay there.
         if !stream.focus.is_focused(window) {
@@ -1152,6 +1205,12 @@ impl Workspace {
         }
         if !stream.mine() {
             return false;
+        }
+        if key_action != KeyAction::Up {
+            let prefer_character_input = key_action == KeyAction::DownComposing;
+            if stream.input.update(cx, |input, _| input.composition.composing(keystroke, prefer_character_input)) {
+                return false;
+            }
         }
         let m = &keystroke.modifiers;
         // Paste types the clipboard's text, as the page's own paste would.
@@ -1262,6 +1321,19 @@ fn mouse_button(button: MouseButton) -> Option<(&'static str, u8)> {
         MouseButton::Middle => Some(("middle", 4)),
         MouseButton::Navigate(_) => None,
     }
+}
+
+/// Cancellation releases every held button, one `up` each, with the buttons still held after it.
+fn released_buttons(held: u8) -> Vec<(&'static str, u8)> {
+    let mut buttons = held;
+    [("left", 1), ("right", 2), ("middle", 4)]
+        .into_iter()
+        .filter(|(_, bit)| held & bit != 0)
+        .map(|(button, bit)| {
+            buttons &= !bit;
+            (button, buttons)
+        })
+        .collect()
 }
 
 /// How the frame sits in its area: `object-fit: contain`, mapped to page CSS px.
@@ -1514,6 +1586,13 @@ mod tests {
     }
 
     #[test]
+    fn a_cancelled_press_releases_each_held_button() {
+        assert_eq!(released_buttons(0b101), vec![("left", 0b100), ("middle", 0)]);
+        assert_eq!(released_buttons(0b010), vec![("right", 0)]);
+        assert!(released_buttons(0).is_empty());
+    }
+
+    #[test]
     fn points_map_through_the_contained_frame() {
         // A 1000x500 frame of a 500x250 page in a 400x400 area at (100, 0): 400x200, centered.
         let area = Bounds { origin: point(px(100.), px(0.)), size: size(px(400.), px(400.)) };
@@ -1589,6 +1668,36 @@ mod tests {
         assert_eq!(composition.marked_range(), Some(0..2), "ranges count UTF-16 units");
         assert_eq!(composition.unmark(), Some("😀".into()), "an ended composition keeps its text");
         assert_eq!(composition.unmark(), None);
+    }
+
+    #[test]
+    fn dead_keys_and_compositions_type_through_the_input_handler() {
+        let key = |text: &'static str, key_char: Option<&str>| Keystroke {
+            key_char: key_char.map(str::to_owned),
+            ..Keystroke::parse(text).ok().unwrap()
+        };
+        let mut composition = Composition::default();
+        // Windows: the dead key asks for character input; the key that completes it does not.
+        assert!(composition.composing(&key("´", Some("´")), true), "the dead key");
+        assert!(composition.composing(&key("e", Some("é")), false), "the key it composes with");
+        assert!(!composition.composing(&key("e", Some("e")), false), "the dead key is spent");
+        // A dead key pressed twice types it, and a shortcut never composes.
+        assert!(composition.composing(&key("´", Some("´")), true));
+        assert!(composition.composing(&key("´", Some("´")), true));
+        assert!(!composition.composing(&key("e", Some("e")), false));
+        assert!(!composition.composing(&key("ctrl-c", Some("c")), false));
+        // AltGr is Ctrl+Alt on Windows: the text it types asks for character input too.
+        assert!(composition.composing(&key("ctrl-alt-q", Some("@")), true), "German AltGr+Q types @");
+        composition.commit("@");
+        assert!(!composition.composing(&key("e", Some("e")), false), "typed text leaves no dead key");
+        // An AltGr dead key composes with the next key that types.
+        assert!(composition.composing(&key("ctrl-alt-]", Some("~")), true));
+        assert!(composition.composing(&key("a", Some("ã")), false));
+        // Keys while an IME shows marked text belong to it.
+        composition.mark("に");
+        assert!(composition.composing(&key("enter", None), false));
+        composition.commit("に");
+        assert!(!composition.composing(&key("enter", None), false));
     }
 
     #[test]

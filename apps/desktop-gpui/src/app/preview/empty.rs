@@ -14,7 +14,9 @@ use serde_json::{Value, json};
 
 use super::super::Workspace;
 use super::super::right_panel::Surface;
+use crate::model::ProjectShell;
 use crate::preview::{self, FileDownload, NavStatus, Session, TabRef, ThreadRef};
+use crate::project_groups::{self, ProjectGroup};
 use crate::theme::Tokens;
 
 /// `PREVIEW_ERROR_CODE_MESSAGES`.
@@ -96,16 +98,48 @@ impl Discovery {
     }
 }
 
+/// `deriveHistoryProjectKey`: the key of the sidebar group listing `project`'s checkout, so equal
+/// ids on two environments keep their own history. Scratch projects keep their own too
+/// (`groupScratchProjects` is off there).
+fn history_key(groups: &[ProjectGroup], project: &ProjectShell) -> String {
+    let physical = project_groups::physical_key(&project.environment_id, &project.workspace_root);
+    groups
+        .iter()
+        .find(|group| group.members.iter().any(|member| member.physical_key == physical))
+        .filter(|group| !group.members.iter().any(|member| member.is_scratch))
+        .map_or(physical, |group| group.key.clone())
+}
+
+/// A thread's project's history key, and the bare project id history was once kept under.
+struct HistoryProject {
+    key: String,
+    legacy: String,
+}
+
 impl Workspace {
-    fn history_project(&self, thread: &ThreadRef) -> Option<String> {
+    fn history_project(&self, thread: &ThreadRef) -> Option<HistoryProject> {
         let thread =
-            self.shell.threads.iter().find(|t| t.id == thread.thread_id && t.environment_id == thread.environment);
-        thread.map(|t| t.project_id.clone())
+            self.shell.threads.iter().find(|t| t.id == thread.thread_id && t.environment_id == thread.environment)?;
+        let project = self
+            .shell
+            .projects
+            .iter()
+            .find(|p| p.id == thread.project_id && p.environment_id == thread.environment_id)?;
+        Some(HistoryProject { key: history_key(&self.project_groups(), project), legacy: project.id.clone() })
+    }
+
+    /// The history's key for `thread`'s project, with entries under its bare id moved there.
+    fn history_key_adopting(&mut self, thread: &ThreadRef) -> Option<String> {
+        let project = self.history_project(thread)?;
+        if self.preview.history.adopt(&project.legacy, &project.key) {
+            self.preview.history.save_in_background();
+        }
+        Some(project.key)
     }
 
     /// `recordVisitForThread`.
     pub(super) fn record_visit(&mut self, thread: &ThreadRef, url: &str) {
-        let Some(project) = self.history_project(thread) else { return };
+        let Some(project) = self.history_key_adopting(thread) else { return };
         if self.preview.history.record_visit(&project, url, crate::timestamp::now_ms()) {
             self.preview.history.save_in_background();
         }
@@ -113,9 +147,8 @@ impl Workspace {
 
     /// A settled page names its history entry (`recordPreviewTitles`).
     pub(super) fn record_title(&mut self, thread: &ThreadRef, status: &NavStatus) {
-        let (NavStatus::Success { url, title }, Some(project)) = (status, self.history_project(thread)) else {
-            return;
-        };
+        let NavStatus::Success { url, title } = status else { return };
+        let Some(project) = self.history_key_adopting(thread) else { return };
         if self.preview.history.set_title(&project, url, title) {
             self.preview.history.save_in_background();
         }
@@ -211,9 +244,11 @@ impl Workspace {
         let project = self.history_project(thread);
         let now = crate::timestamp::now_ms();
         let recents: Vec<crate::browser_history::Entry> = project
-            .as_deref()
+            .as_ref()
             .map(|p| {
-                self.preview.history.recent(p, 8).iter().filter(|e| url::Url::parse(&e.url).is_ok()).cloned().collect()
+                // Entries still under the bare id show as a visit, title or removal will merge them.
+                let entries = self.preview.history.merged(&p.key, &p.legacy);
+                entries.into_iter().take(8).filter(|e| url::Url::parse(&e.url).is_ok()).collect()
             })
             .unwrap_or_default();
         let servers = &self.preview.discovery.servers;
@@ -290,9 +325,9 @@ impl Workspace {
                 };
                 let group: SharedString = format!("preview-recent-{}", entry.url).into();
                 let (open, remove) = (entry.url.clone(), entry.url.clone());
-                let project = project.clone();
-                h_flex()
-                    .id(ElementId::Name(group.clone()))
+                let history_thread = thread.clone();
+                let ring = focus_ring(tokens);
+                focusable(h_flex().id(ElementId::Name(group.clone())), tokens)
                     .group(group.clone())
                     .relative()
                     .w_full()
@@ -306,14 +341,17 @@ impl Workspace {
                     .child(favicon())
                     .child(text_block(title.into(), detail.into()))
                     .child(
+                        // Faded, not hidden: GPUI skips a hidden element's focus, so Tab could never reveal it.
                         div()
                             .id(ElementId::Name(format!("{group}-remove").into()))
+                            .tab_index(0)
+                            .focus_visible(move |s| s.opacity(1.).shadow(vec![ring]))
                             .absolute()
                             .right(px(12.))
                             .p_1()
                             .rounded(px(4.))
-                            .invisible()
-                            .group_hover(group, gpui_kit::Styled::visible)
+                            .opacity(0.)
+                            .group_hover(group, |s| s.opacity(1.))
                             .text_color(tokens.muted_foreground)
                             .hover(|s| s.bg(tokens.accent).text_color(tokens.foreground))
                             .tooltip(move |window, cx| {
@@ -322,8 +360,8 @@ impl Workspace {
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
-                                if let Some(project) = &project {
-                                    this.preview.history.remove(project, &remove);
+                                if let Some(project) = this.history_key_adopting(&history_thread) {
+                                    this.preview.history.remove(&project, &remove);
                                     this.preview.history.save_in_background();
                                     cx.notify();
                                 }
@@ -337,21 +375,23 @@ impl Workspace {
             .iter()
             .map(|server| {
                 let url = server.url.clone();
-                h_flex()
-                    .id(ElementId::Name(format!("preview-server-{}:{}", server.host, server.port).into()))
-                    .w_full()
-                    .gap_3()
-                    .px_3()
-                    .py_3()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(tokens.accent.opacity(0.4)))
-                    .on_click(cx.listener(move |this, _, window, cx| this.open_in_blank_tab(url.clone(), window, cx)))
-                    .child(favicon())
-                    .child(text_block(
-                        server.process_name.clone().unwrap_or_else(|| "Listening".into()).into(),
-                        format!("{}:{}", server.host, server.port).into(),
-                    ))
-                    .into_any_element()
+                focusable(
+                    h_flex().id(ElementId::Name(format!("preview-server-{}:{}", server.host, server.port).into())),
+                    tokens,
+                )
+                .w_full()
+                .gap_3()
+                .px_3()
+                .py_3()
+                .cursor_pointer()
+                .hover(|s| s.bg(tokens.accent.opacity(0.4)))
+                .on_click(cx.listener(move |this, _, window, cx| this.open_in_blank_tab(url.clone(), window, cx)))
+                .child(favicon())
+                .child(text_block(
+                    server.process_name.clone().unwrap_or_else(|| "Listening".into()).into(),
+                    format!("{}:{}", server.host, server.port).into(),
+                ))
+                .into_any_element()
             })
             .collect();
         div()
@@ -655,6 +695,16 @@ impl Workspace {
     }
 }
 
+/// A `<button>` row: a Tab stop that Enter and Space click, with `focus-visible:ring-2 ring-inset ring-ring`.
+fn focusable(element: gpui_kit::Stateful<gpui_kit::Div>, tokens: &Tokens) -> gpui_kit::Stateful<gpui_kit::Div> {
+    let ring = focus_ring(tokens);
+    element.tab_index(0).focus_visible(move |s| s.shadow(vec![ring]))
+}
+
+fn focus_ring(tokens: &Tokens) -> gpui_kit::BoxShadow {
+    gpui_kit::BoxShadow::new(px(0.), px(0.), tokens.ring).spread_radius(px(2.)).inset()
+}
+
 /// `formatRelativeElapsed`.
 fn relative_time(elapsed_ms: i64) -> String {
     match elapsed_ms.max(0) / 60_000 {
@@ -694,6 +744,33 @@ fn no_preview(tokens: &Tokens) -> impl IntoElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_follows_the_sidebar_group_on_each_environment() {
+        let project = |env: &str, id: &str, root: &str| {
+            let mut project: ProjectShell =
+                serde_json::from_value(json!({"id": id, "title": id, "workspaceRoot": root})).unwrap();
+            project.environment_id = env.to_owned().into();
+            project
+        };
+        let projects = [project("laptop", "p1", "/src/app"), project("server", "p1", "/srv/app")];
+        let groups = project_groups::build_groups(&projects, &Default::default(), &[], true);
+        let keys: Vec<String> = projects.iter().map(|p| history_key(&groups, p)).collect();
+        assert_ne!(keys[0], keys[1], "one id on two environments");
+        assert_eq!(keys[0], groups[0].key);
+        // The sidebar's shared scratch group doesn't share its history.
+        let scratch = [project("laptop", "s1", "/tmp/a"), project("laptop", "s2", "/tmp/b")];
+        let roots: Vec<project_groups::ScratchRoot> = scratch
+            .iter()
+            .map(|p| project_groups::ScratchRoot {
+                environment_id: p.environment_id.clone(),
+                root: p.workspace_root.clone(),
+            })
+            .collect();
+        let groups = project_groups::build_groups(&scratch, &Default::default(), &roots, true);
+        assert_eq!(groups.len(), 1);
+        assert_ne!(history_key(&groups, &scratch[0]), history_key(&groups, &scratch[1]));
+    }
 
     #[test]
     fn configured_servers_come_first_then_ports_ascend() {

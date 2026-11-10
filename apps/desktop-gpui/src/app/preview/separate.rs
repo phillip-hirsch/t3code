@@ -148,10 +148,10 @@ impl Render for SeparatePreview {
             self.titled = Some(title);
         }
         let available = window.viewport_size();
-        let fit = self
-            .look
-            .viewport
-            .map(|viewport| preview::fit_viewport(viewport, (f32::from(available.width), f32::from(available.height))));
+        let fit = self.look.viewport.map(|viewport| {
+            let available = (f32::from(available.width), f32::from(available.height));
+            preview::fit_viewport(viewport, available, self.look.zoom)
+        });
         let look = (self.look.zoom * f64::from(fit.map_or(1., |(_, scale)| scale)), self.look.appearance);
         if self.applied.is_none_or(|(zoom, appearance)| (zoom - look.0).abs() > 1e-6 || appearance != look.1) {
             let view = self.view.read(cx);
@@ -177,6 +177,12 @@ impl Workspace {
     /// Whether `tab`'s page is in its separate window.
     pub(super) fn separated(&self, tab: &TabRef) -> bool {
         self.preview.separate.contains_key(tab)
+    }
+
+    /// The separate window holding `tab`'s page.
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn separate_window(&self, tab: &TabRef) -> Option<gpui_kit::AnyWindowHandle> {
+        self.preview.separate.get(tab).map(|separate| separate.window.into())
     }
 
     fn separate_look(&self, tab: &TabRef) -> Option<Look> {
@@ -297,15 +303,23 @@ impl Workspace {
 
     /// Moves `tab`'s page back into the main window, `window`, and closes its separate window.
     pub(super) fn close_separate_window(&mut self, tab: &TabRef, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(separate) = self.preview.separate.remove(tab) else { return };
+        let Some(view) = self.preview.separate.get(tab).map(|separate| separate.view.clone()) else { return };
         // Hidden until the panel or the mini player lays it out again.
-        let _ = separate.view.read(cx).set_visible(false);
+        let _ = view.read(cx).set_visible(false);
         let source = self.page_source(tab, cx);
-        match place_page(&separate.view, source.as_ref(), window, cx) {
+        match place_page(&view, source.as_ref(), window, cx) {
             Ok(Some((rebuilt, events))) => self.replace_view(tab, rebuilt, events, window, cx),
             Ok(None) => {}
+            // The page stays in its window rather than going down with it; a closed tab's goes anyway.
+            Err(error) if self.preview.tabs.contains_key(tab) => {
+                let _ = view.read(cx).set_visible(true);
+                self.error = Some(format!("Unable to return the preview to the panel: {error}").into());
+                cx.notify();
+                return;
+            }
             Err(error) => log::warn!("could not move the page back from its separate window: {error}"),
         }
+        let Some(separate) = self.preview.separate.remove(tab) else { return };
         if let Some(hosted) = self.preview.tabs.get_mut(tab) {
             hosted.shown = false;
             hosted.zoom = 0.;

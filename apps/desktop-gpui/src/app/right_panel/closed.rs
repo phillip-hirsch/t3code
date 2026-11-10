@@ -331,6 +331,11 @@ impl Workspace {
         }
     }
 
+    /// Whether Reopen Closed Tab has anything to reopen (`hasHistory`).
+    pub(in crate::app) fn has_closed_views(&self) -> bool {
+        !self.right_panel.closed.history.entries().is_empty()
+    }
+
     /// `view.reopenClosed`: `false` with nothing to reopen, so the key goes on; a held key is
     /// claimed without reopening more.
     pub(in crate::app) fn reopen_closed_view(

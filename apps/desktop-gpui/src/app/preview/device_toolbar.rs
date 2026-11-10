@@ -67,6 +67,18 @@ impl DeviceToolbar {
     }
 }
 
+impl DeviceToolbar {
+    /// The ratio `tab`'s lock holds its `size` to (`lockedAspectRatio`).
+    pub(super) fn locked_ratio(&self, tab: &TabRef, size: (f32, f32)) -> Option<f64> {
+        self.locked.contains(tab).then(|| f64::from(size.0) / f64::from(size.1.max(1.)))
+    }
+
+    /// Whether `tab` has a `preview.resize` in flight.
+    pub(super) fn resizing(&self, tab: &TabRef) -> bool {
+        self.pending.contains(tab)
+    }
+}
+
 #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "viewport sizes are whole pixels")]
 fn whole(size: (f32, f32)) -> (u32, u32) {
     (size.0 as u32, size.1 as u32)
@@ -140,6 +152,7 @@ impl Workspace {
             let result = client.request("preview.resize", input).await;
             let _ = this.update(cx, |this, cx| {
                 this.preview.toolbar.pending.remove(&tab);
+                this.settle_viewport_resize(&tab);
                 let session = result.map_err(|e| e.to_string()).and_then(|value| {
                     serde_json::from_value::<Session>(value)
                         .map_err(|e| format!("Unexpected preview.resize result: {e}"))

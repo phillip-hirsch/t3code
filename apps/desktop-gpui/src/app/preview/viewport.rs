@@ -45,14 +45,50 @@ fn resize_at_aspect(desired: f64, ratio: f64, axis: Axis) -> (f64, f64) {
     }
 }
 
-/// `resizeFreeformViewport` at zoom 1 for a change along one `axis` (an east or south edge).
-fn resize_freeform(start: (f64, f64), delta: f64, axis: Axis, ratio: Option<f64>) -> (f64, f64) {
-    let (horizontal, vertical) = match axis {
-        Axis::Width => (delta, 0.),
-        Axis::Height => (0., delta),
-    };
-    let desired = (start.0 + horizontal, start.1 + vertical);
+/// The edge or corner a resize handle drags (`BrowserViewportResizeDirection`); the toolbar
+/// sits above the viewport, so there is no north handle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Direction {
+    West,
+    East,
+    South,
+    SouthWest,
+    SouthEast,
+}
+
+impl Direction {
+    /// How a pointer's x and y move this direction's edges: +1 grows the viewport, -1 shrinks it.
+    fn signs(self) -> (f64, f64) {
+        match self {
+            Self::West => (-1., 0.),
+            Self::East => (1., 0.),
+            Self::South => (0., 1.),
+            Self::SouthWest => (-1., 1.),
+            Self::SouthEast => (1., 1.),
+        }
+    }
+}
+
+fn normal_zoom(zoom: f64) -> f64 {
+    if zoom.is_finite() && zoom > 0. { zoom } else { 1. }
+}
+
+/// `resizeFreeformViewport`: `start` moved by a pointer `delta` (host px at `zoom`) on `direction`,
+/// a locked `ratio` resolving from the axis that changed most.
+fn resize(start: (f64, f64), delta: (f64, f64), zoom: f64, direction: Direction, ratio: Option<f64>) -> (f64, f64) {
+    let zoom = normal_zoom(zoom);
+    let (sx, sy) = direction.signs();
+    let (horizontal, vertical) = (sx * delta.0, sy * delta.1);
+    let desired = (start.0 + horizontal / zoom, start.1 + vertical / zoom);
     if let Some(ratio) = ratio.filter(|ratio| ratio.is_finite() && *ratio > 0.) {
+        let controls_width = horizontal != 0. || matches!(direction, Direction::West | Direction::East);
+        let controls_height = vertical != 0. || direction == Direction::South;
+        let axis = match (controls_width, controls_height) {
+            (true, false) => Axis::Width,
+            (false, true) => Axis::Height,
+            _ if (desired.0 - start.0).abs() / start.0 >= (desired.1 - start.1).abs() / start.1 => Axis::Width,
+            _ => Axis::Height,
+        };
         return resize_at_aspect(if axis == Axis::Width { desired.0 } else { desired.1 }, ratio, axis);
     }
     let clamp = |value: f64| value.round().clamp(MIN, MAX);
@@ -66,6 +102,85 @@ fn resize_freeform(start: (f64, f64), delta: f64, axis: Axis, ratio: Option<f64>
         height = MIN.max((AREA / width).floor());
     }
     (width, height)
+}
+
+/// `resizeFreeformViewport` for a change along one `axis` (an east or south edge) at zoom 1.
+fn resize_freeform(start: (f64, f64), delta: f64, axis: Axis, ratio: Option<f64>) -> (f64, f64) {
+    match axis {
+        Axis::Width => resize(start, (delta, 0.), 1., Direction::East, ratio),
+        Axis::Height => resize(start, (0., delta), 1., Direction::South, ratio),
+    }
+}
+
+/// The new length of a centered viewport whose far edge moved `pointer` px (`resizeFromEndRail`):
+/// while it fits, both edges move, so the grabbed one stays under the pointer.
+fn from_end_rail(start: f64, pointer: f64, available: f64) -> f64 {
+    let start_edge = if start < available { f64::midpoint(available, start) } else { start };
+    let target = start_edge + pointer;
+    if target <= available { target * 2. - available } else { target }
+}
+
+/// `resizeFromStartRail`, for the near (left) edge.
+fn from_start_rail(start: f64, pointer: f64, available: f64) -> f64 {
+    if start > available {
+        let to_fit = start - available;
+        return if pointer <= to_fit { start - pointer } else { available - (pointer - to_fit) * 2. };
+    }
+    let target = (available - start) / 2. + pointer;
+    if target >= 0. { available - target * 2. } else { available - target }
+}
+
+/// `resizeBrowserViewportFromRail`: the size a handle dragged `pointer` px from `start` asks for,
+/// in a centered `available` area, with `zoom` host px per CSS px.
+pub(super) fn resize_from_rail(
+    start: (u32, u32),
+    pointer: (f32, f32),
+    available: (f32, f32),
+    zoom: f64,
+    direction: Direction,
+    ratio: Option<f64>,
+) -> (u32, u32) {
+    let zoom = normal_zoom(zoom);
+    let start = (f64::from(start.0), f64::from(start.1));
+    let scaled = (start.0 * zoom, start.1 * zoom);
+    let (sx, sy) = direction.signs();
+    let along = |sign: f64, start: f64, pointer: f32, available: f32| {
+        let (pointer, available) = (f64::from(pointer), f64::from(available));
+        if sign > 0. {
+            from_end_rail(start, pointer, available)
+        } else if sign < 0. {
+            from_start_rail(start, pointer, available)
+        } else {
+            start
+        }
+    };
+    let desired = (along(sx, scaled.0, pointer.0, available.0), along(sy, scaled.1, pointer.1, available.1));
+    // `resize` reads a west pointer delta as shrinking, so it gets the width change negated.
+    let delta = ((desired.0 - scaled.0) * if sx < 0. { -1. } else { 1. }, desired.1 - scaled.1);
+    whole_size(resize(start, delta, zoom, direction, ratio))
+}
+
+/// `handleResizeKeyDown`: an arrow key on `direction`'s handle steps 10 CSS px (50 with Shift)
+/// along the axes it controls; other keys pass.
+pub(super) fn key_resize(
+    size: (u32, u32),
+    direction: Direction,
+    key: &str,
+    shift: bool,
+    zoom: f64,
+    ratio: Option<f64>,
+) -> Option<(u32, u32)> {
+    let zoom = normal_zoom(zoom);
+    let step = if shift { 50. } else { 10. } * zoom;
+    let (sx, sy) = direction.signs();
+    let delta = match key {
+        "left" if sx != 0. => (-step, 0.),
+        "right" if sx != 0. => (step, 0.),
+        "up" if sy != 0. => (0., -step),
+        "down" if sy != 0. => (0., step),
+        _ => return None,
+    };
+    Some(whole_size(resize((f64::from(size.0), f64::from(size.1)), delta, zoom, direction, ratio)))
 }
 
 #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "sizes are whole and in range")]
@@ -265,6 +380,45 @@ mod tests {
             Some(Viewport::Preset { width: 412, height: 915, preset_id: "pixel-7".into() }),
         );
         assert_eq!(picked(&preset, "nope"), None);
+    }
+
+    #[test]
+    fn a_dragged_rail_stays_under_the_pointer() {
+        let available = (1120., 818.);
+        let rail = resize_from_rail;
+        assert_eq!(rail((1120, 818), (-100., -50.), available, 1., Direction::SouthEast, None), (920, 718));
+        assert_eq!(rail((800, 600), (300., 0.), (1200., 800.), 1., Direction::East, None), (1300, 600));
+        assert_eq!(rail((560, 409), (-100., 0.), available, 2., Direction::East, None), (460, 409));
+        // The left rail grows the viewport as it moves left, both edges moving while centered.
+        assert_eq!(rail((800, 600), (-100., 0.), (1200., 800.), 1., Direction::West, None), (1000, 600));
+        assert_eq!(rail((800, 600), (0., 50.), (1200., 800.), 1., Direction::SouthWest, None), (800, 700));
+        assert_eq!(rail((800, 600), (500., 0.), (1200., 800.), 1., Direction::West, None), (240, 600), "min width");
+    }
+
+    #[test]
+    fn a_resize_keeps_a_locked_ratio_and_the_size_caps() {
+        let ratio = Some(4. / 3.);
+        assert_eq!(whole_size(resize((400., 300.), (100., 0.), 1., Direction::SouthEast, ratio)), (500, 375));
+        assert_eq!(whole_size(resize((400., 300.), (0., 30.), 1., Direction::South, ratio)), (440, 330));
+        assert_eq!(whole_size(resize((400., 300.), (100., 0.), 2., Direction::East, None)), (450, 300), "at 200%");
+        assert_eq!(
+            whole_size(resize((3800., 2100.), (100., 100.), 1., Direction::SouthEast, None)),
+            (3770, 2200),
+            "the area cap trims the axis that moved most",
+        );
+    }
+
+    #[test]
+    fn arrow_keys_step_the_axes_a_handle_controls() {
+        let size = (400, 300);
+        assert_eq!(key_resize(size, Direction::East, "right", false, 1., None), Some((410, 300)));
+        assert_eq!(key_resize(size, Direction::East, "right", true, 1., None), Some((450, 300)), "Shift steps 50");
+        assert_eq!(key_resize(size, Direction::East, "up", false, 1., None), None, "east controls only the width");
+        assert_eq!(key_resize(size, Direction::West, "left", false, 1., None), Some((410, 300)), "left grows it");
+        assert_eq!(key_resize(size, Direction::SouthWest, "down", false, 1., None), Some((400, 310)));
+        assert_eq!(key_resize(size, Direction::South, "up", false, 2., None), Some((400, 290)), "CSS px at 200%");
+        assert_eq!(key_resize(size, Direction::South, "enter", false, 1., None), None);
+        assert_eq!(key_resize((240, 240), Direction::East, "left", false, 1., None), Some((240, 240)), "clamped");
     }
 
     #[test]

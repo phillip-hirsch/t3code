@@ -42,6 +42,7 @@ mod empty;
 mod mini_layout;
 mod mini_player;
 mod profiles;
+mod resize_handles;
 mod separate;
 mod server;
 mod viewport;
@@ -82,7 +83,8 @@ pub(super) enum PageEvent {
 
 /// The chords a focused page forwards (`setForwardedShortcuts`), and what they were resolved from.
 struct PageChords {
-    source: Option<(Rc<[crate::keybindings::Rule]>, bool)>,
+    /// The keymap, whether the terminal is open, and whether there are closed views to reopen.
+    source: Option<(Rc<[crate::keybindings::Rule]>, bool, bool)>,
     list: Vec<keymap::PageChord>,
     /// `list` as JSON, for the pages' script.
     json: Rc<str>,
@@ -139,6 +141,16 @@ impl PageSource {
     }
 }
 
+/// The URL a tab's page is rebuilt at: the live page's own (WebKit without the Navigation API
+/// never reports a pushState), else the one the status names (a failed or unfinished load).
+fn rebuild_url(status: &NavStatus, native: Option<String>) -> Option<String> {
+    let native = native.filter(|url| !url.is_empty() && url != "about:blank");
+    match status {
+        NavStatus::Success { .. } => native.or_else(|| status.url().map(str::to_owned)),
+        _ => status.url().map(str::to_owned).or(native),
+    }
+}
+
 impl HostedTab {
     fn loading(&self) -> bool {
         matches!(self.status, NavStatus::Loading { .. })
@@ -157,6 +169,7 @@ pub(super) struct PreviewState {
     /// Tabs whose page is in its separate window.
     separate: HashMap<TabRef, separate::Separate>,
     toolbar: device_toolbar::DeviceToolbar,
+    resize: resize_handles::ViewportResize,
     /// The page area the panel last drew a tab in: "Show device toolbar" sizes to it, and a
     /// fill tab floated from it keeps its layout.
     panel_area: Option<(TabRef, (f32, f32))>,
@@ -217,6 +230,7 @@ impl PreviewState {
             mini: mini_player::MiniPlayerUi::new(cx),
             separate: HashMap::new(),
             toolbar: device_toolbar::DeviceToolbar::new(window, cx),
+            resize: resize_handles::ViewportResize::new(cx),
             panel_area: None,
             reveals: Vec::new(),
             panel_view: None,
@@ -811,7 +825,12 @@ impl Workspace {
                 let result = client.request("preview.close", input).await;
                 let Err(error) = result else {
                     if let Some(snapshot) = snapshot {
-                        let _ = this.update_in(cx, |this, _, _| this.remember_closed_browser(&tab.thread, &snapshot));
+                        let _ = this.update_in(cx, |this, _, cx| {
+                            this.remember_closed_browser(&tab.thread, &snapshot);
+                            // The first closed view adds Reopen Closed Tab to what a focused page forwards.
+                            this.sync_page_chords(cx);
+                            cx.notify();
+                        });
                     }
                     return;
                 };
@@ -950,7 +969,7 @@ impl Workspace {
     /// What `tab`'s view would be built from now: its profile and the page it is on.
     fn page_source(&self, tab: &TabRef, cx: &App) -> Option<PageSource> {
         let hosted = self.preview.tabs.get(tab)?;
-        let url = hosted.status.url().map(str::to_owned).or_else(|| hosted.view.read(cx).raw().url().ok())?;
+        let url = rebuild_url(&hosted.status, hosted.view.read(cx).raw().url().ok())?;
         let session = self.preview.threads.session(tab);
         Some(PageSource {
             storage: profiles::Storage::of(session.and_then(|s| s.profile_id.as_deref())),
@@ -1079,17 +1098,18 @@ impl Workspace {
         self.run_command(command, false, &context, window, cx);
     }
 
-    /// Resolves the chords pages forward again when the keymap or the terminal changed, and swaps
-    /// a changed set into every hosted page.
+    /// Resolves the chords pages forward again when the keymap, the terminal or the closed views
+    /// changed, and swaps a changed set into every hosted page.
     fn sync_page_chords(&mut self, cx: &App) {
-        let terminal_open = self.terminal_open();
+        let (terminal_open, closed_views) = (self.terminal_open(), self.has_closed_views());
         let chords = &mut self.preview.chords;
-        if chords.source.as_ref().is_some_and(|(rules, open)| Rc::ptr_eq(rules, &self.keymap) && *open == terminal_open)
-        {
+        if chords.source.as_ref().is_some_and(|(rules, open, closed)| {
+            Rc::ptr_eq(rules, &self.keymap) && *open == terminal_open && *closed == closed_views
+        }) {
             return;
         }
-        chords.source = Some((self.keymap.clone(), terminal_open));
-        let list = keymap::page_chords(&self.keymap, terminal_open);
+        chords.source = Some((self.keymap.clone(), terminal_open, closed_views));
+        let list = keymap::page_chords(&self.keymap, terminal_open, closed_views);
         if list == chords.list {
             return;
         }
@@ -1293,7 +1313,8 @@ impl Workspace {
             return v_flex().flex_1().min_h_0().child(toolbar).child(page).into_any_element();
         }
         self.preview.panel_area = Some((tab.clone(), available));
-        let setting = session.as_ref().map(|s| s.viewport.clone()).unwrap_or_default();
+        let source = session.as_ref().map(|s| s.viewport.clone()).unwrap_or_default();
+        let setting = self.resized_viewport(tab, &source);
         let view = self.preview.tabs.get(tab).map(|hosted| hosted.view.clone());
         // `resolveBrowserDeviceViewportLayout`: under the toolbar, inside the resize rails' margin.
         let toolbar = view.is_some() && setting.size().is_some();
@@ -1302,11 +1323,12 @@ impl Workspace {
         } else {
             available
         };
-        let fixed = setting.size().map(|size| preview::fit_viewport(size, area));
+        // The page draws at its zoom over the interface's (`resolveBrowserLayoutZoomFactor`).
+        let zoom = session.as_ref().map_or(1., |s| self.tab_look(tab, s).0) / f64::from(window.ui_scale());
+        let fixed = setting.size().map(|size| preview::fit_viewport(size, area, zoom));
         let separated = self.separated(tab);
-        if !separated {
-            self.preview.panel_view = Some((tab.clone(), fixed.map_or(1., |(_, scale)| scale)));
-        }
+        // A separated tab counts as shown, so a pick in it lasts; its window draws the page.
+        self.preview.panel_view = Some((tab.clone(), fixed.map_or(1., |(_, scale)| scale)));
         let Some(view) = view else {
             let blank = session.as_ref().is_none_or(|s| matches!(s.nav_status, NavStatus::Idle));
             return div()
@@ -1317,6 +1339,9 @@ impl Workspace {
         };
         // A menu open over the page hides it, since the native view would cover the menu.
         let hidden = self.preview.menu_open || self.preview.toolbar.menu_open;
+        let handles = fixed
+            .filter(|_| toolbar && !separated)
+            .map(|(size, scale)| self.render_resize_handles(tab, &source, size, scale, zoom, area, window, cx));
         let page = match fixed {
             _ if separated => div().flex_1().min_h_0().child(self.render_separated(tab, false, &tokens, cx)),
             Some(((width, height), _)) => div()
@@ -1328,7 +1353,14 @@ impl Workspace {
                 .px(px(viewport::RAIL))
                 .pb(px(viewport::RAIL))
                 .bg(tokens.muted.opacity(0.35))
-                .when(!hidden, |el| el.child(div().w(px(width)).h(px(height)).child(view))),
+                .child(
+                    div()
+                        .relative()
+                        .w(px(width))
+                        .h(px(height))
+                        .when(!hidden, |el| el.child(view))
+                        .children(handles.into_iter().flatten()),
+                ),
             None => div().flex_1().min_h_0().when(!hidden, |el| el.child(view)),
         };
         if !toolbar {
@@ -1758,4 +1790,31 @@ fn page_builder<'a>(
             let _ = sender.try_send(PageEvent::OpenLink(url));
             wry::NewWindowResponse::Deny
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_page_is_rebuilt_where_it_is() {
+        let (old, pushed) = ("https://app.test/a".to_owned(), "https://app.test/b".to_owned());
+        let success = NavStatus::Success { url: old.clone(), title: String::new() };
+        // A pushState the status never heard of.
+        assert_eq!(rebuild_url(&success, Some(pushed.clone())), Some(pushed.clone()));
+        assert_eq!(rebuild_url(&success, None), Some(old.clone()));
+        assert_eq!(rebuild_url(&success, Some("about:blank".to_owned())), Some(old.clone()));
+        // A failed load retries its own URL, not the page it failed from.
+        let failed = NavStatus::LoadFailed {
+            url: old.clone(),
+            title: String::new(),
+            code: -105,
+            description: String::new(),
+            download: None,
+        };
+        assert_eq!(rebuild_url(&failed, Some(pushed.clone())), Some(old.clone()));
+        let loading = NavStatus::Loading { url: old.clone(), title: String::new() };
+        assert_eq!(rebuild_url(&loading, Some(pushed.clone())), Some(old));
+        assert_eq!(rebuild_url(&NavStatus::Idle, Some(pushed.clone())), Some(pushed));
+    }
 }
