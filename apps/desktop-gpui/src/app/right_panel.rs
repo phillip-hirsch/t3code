@@ -1061,14 +1061,7 @@ impl Workspace {
 
     /// The workspace mutation the open thread last saw, so file surfaces refetch after agent edits.
     pub(super) fn current_workspace_mutation(&self) -> (Option<String>, Option<String>) {
-        let Some(projection) = self.open_projection() else { return (None, None) };
-        // The newest turn as `turn_summaries` orders them, without sorting every frame.
-        let latest = projection
-            .checkpoints
-            .iter()
-            .filter(|c| c.run_id.is_some() && c.app_run_ordinal.is_some_and(|n| u32::try_from(n).is_ok()))
-            .max_by(|a, b| a.app_run_ordinal.cmp(&b.app_run_ordinal).then_with(|| a.captured_at.cmp(&b.captured_at)));
-        workspace_mutation_id(projection, latest.map(|c| c.captured_at.as_str()))
+        self.open_projection().map_or((None, None), projection_workspace_mutation)
     }
 
     /// `diffAvailable`: a server thread in a git repository.
@@ -3305,6 +3298,17 @@ fn collapsed_files(
         None if collapse_by_default => paths.iter().cloned().collect(),
         None => HashSet::new(),
     }
+}
+
+/// The workspace mutation `projection`'s thread last saw.
+pub(super) fn projection_workspace_mutation(projection: &ThreadProjection) -> (Option<String>, Option<String>) {
+    // The newest turn as `turn_summaries` orders them, without sorting every frame.
+    let latest = projection
+        .checkpoints
+        .iter()
+        .filter(|c| c.run_id.is_some() && c.app_run_ordinal.is_some_and(|n| u32::try_from(n).is_ok()))
+        .max_by(|a, b| a.app_run_ordinal.cmp(&b.app_run_ordinal).then_with(|| a.captured_at.cmp(&b.captured_at)));
+    workspace_mutation_id(projection, latest.map(|c| c.captured_at.as_str()))
 }
 
 /// `deriveWorkspaceMutationId`: the last settled item that may have written files, and the

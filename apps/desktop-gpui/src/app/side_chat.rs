@@ -590,6 +590,7 @@ impl Workspace {
             move |this, window, cx| {
                 if this.side_chat.view.as_ref().is_some_and(|v| v.is(&batch.0, &batch.1)) {
                     this.refresh_side_chat_rows(cx);
+                    this.refresh_workspace_images(cx);
                     this.sync_question(ChatPane::Side, window, cx);
                     this.sync_queue_edit(ChatPane::Side, window, cx);
                 }
