@@ -466,6 +466,19 @@ fn full_contents_fill_the_gaps_between_hunks() {
     }
     let original = contents.original.replacen("line 5\n", "edited\n", 1);
     assert!(file.with_contents(&original, &contents.modified).is_err());
+    // A line ending changed since, in a gap or a hunk, or a final newline dropped, is a change
+    // `git diff` would have shown.
+    for (edited, with) in [
+        ("line 10\n", "line 10\r\n"),
+        ("line 24\n", "line 24\r\n"),
+        ("line 30\n", "line 30"),
+    ] {
+        let modified = contents.modified.replacen(edited, with, 1);
+        assert!(
+            file.with_contents(&contents.original, &modified).is_err(),
+            "{with:?}"
+        );
+    }
     assert!(
         hydrated
             .with_contents(&contents.original, &contents.modified)
@@ -480,10 +493,13 @@ fn contents_of_a_whitespace_ignoring_patch_match_it_up_to_whitespace() {
     // `git diff -w` leaves out the reindented line 10 and keeps the reindented line 4 as context.
     let file = DiffFile::parse(PARTIAL).unwrap().remove(0);
     let contents = partial_contents();
+    // `-w` ignores a CR and a dropped final newline too.
     let modified = contents
         .modified
         .replacen("line 10\n", "    line 10\n", 1)
-        .replacen("line 4\n", "line\t4 \n", 1);
+        .replacen("line 4\n", "line\t4 \n", 1)
+        .replacen("line 12\n", "line 12\r\n", 1)
+        .replacen("line 30\n", "line 30", 1);
     assert!(file.with_contents(&contents.original, &modified).is_err());
     let hydrated = file
         .with_contents_ignoring_whitespace(&contents.original, &modified)

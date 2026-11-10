@@ -538,9 +538,9 @@ impl DiffFile {
         let contents = [original, modified];
         let sides = contents.map(line_ranges);
         let count = |side: DiffSide| sides[side as usize].len();
-        // The zero-based `line`'s text on `side`, without its ending.
+        // The zero-based `line` on `side` with its ending, which `git diff` compares too.
         let text = |side: DiffSide, line: usize| {
-            line_content(&contents[side as usize][sides[side as usize][line].clone()])
+            &contents[side as usize][sides[side as usize][line].clone()]
         };
         let mut pairs = Vec::with_capacity(count(DiffSide::Modified) + self.deletions());
         let mut hunks = Vec::with_capacity(self.inner.hunks.len());
@@ -581,7 +581,7 @@ impl DiffFile {
             let differs = |side: DiffSide, ix: Option<usize>| {
                 ix.is_some_and(|ix| {
                     !same(
-                        self.lines(side)[ix].text.as_ref(),
+                        &self.source(side)[self.lines(side)[ix].source.clone()],
                         text(side, self.line_number(side, ix) - 1),
                     )
                 })
