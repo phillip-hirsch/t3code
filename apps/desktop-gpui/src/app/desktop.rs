@@ -519,17 +519,6 @@ impl Workspace {
             let page = LinkPage::Failed { title: "Could not open the link".into(), message: CANNOT_CLONE.into() };
             return self.show_link_page(page, cx);
         };
-        if self.env_grant(&environment, super::git::SOURCE_CONTROL_WRITE) == Some(false) {
-            return toast_error(
-                window,
-                cx,
-                "Clone unavailable",
-                "This connection needs permission to write source control.",
-            );
-        }
-        let Some(client) = self.env_client(&environment) else {
-            return toast_error(window, cx, "Clone failed", "This environment is not connected.");
-        };
         let remote_url = format!("https://github.com/{}/{}.git", repository.owner, repository.name);
         let directory = if ghq { paths::add_project_initial_query(base.as_deref()) } else { root };
         let destination =
@@ -542,6 +531,17 @@ impl Workspace {
             "remoteUrl": remote_url,
             "destinationPath": destination,
         });
+        if !self.env_permits(&project.env, "projectClone.start", &input) {
+            return toast_error(
+                window,
+                cx,
+                "Clone unavailable",
+                "This connection needs permission to write source control.",
+            );
+        }
+        let Some(client) = self.env_client(&project.env) else {
+            return toast_error(window, cx, "Clone failed", "This environment is not connected.");
+        };
         let page = LinkPage::Cloning { link, repository, project: project.clone(), started: false };
         self.show_link_page(page, cx);
         self.desktop._link_task = Some(cx.spawn_in(window, async move |this, cx| {
@@ -748,18 +748,13 @@ impl Workspace {
             LinkPage::Failed { title, message } => (title, Some(message), Vec::new()),
             LinkPage::MissingRepository { link, repository } => {
                 let name = format!("{}/{}", repository.owner, repository.name);
-                let denied = self
-                    .last_active_environment()
-                    .is_some_and(|env| self.env_grant(&env, super::git::SOURCE_CONTROL_WRITE) == Some(false));
+                // Not gated, as the web's isn't: the handler answers a refused clone.
                 let clone_link = link.clone();
-                let clone = Button::new("link-clone")
-                    .primary()
-                    .small()
-                    .disabled(denied)
-                    .label(format!("Clone {name}"))
-                    .on_click(cx.listener(move |this, _, window, cx| {
+                let clone = Button::new("link-clone").primary().small().label(format!("Clone {name}")).on_click(
+                    cx.listener(move |this, _, window, cx| {
                         this.clone_link_repository(clone_link.clone(), repository.clone(), window, cx);
-                    }));
+                    }),
+                );
                 let without =
                     Button::new("link-without-project").outline().small().label("Use without project").on_click(
                         cx.listener(move |this, _, window, cx| this.open_scratch_draft(link.clone(), window, cx)),

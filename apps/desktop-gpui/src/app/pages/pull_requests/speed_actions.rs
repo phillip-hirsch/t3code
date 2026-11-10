@@ -19,12 +19,13 @@ use serde_json::{Value, json};
 
 use super::super::pull_request_detail::{toast_error, toast_success};
 use super::{Row, reference_of};
-use crate::app::git::SOURCE_CONTROL_WRITE;
+
 use crate::app::{Workspace, keymap};
 use crate::pull_request_detail::{self as detail_logic, Detail};
 use crate::pull_requests::{self as logic, Entry, State};
 use crate::theme::Tokens;
 
+const RUN_ACTION: &str = "pullRequests.runAction";
 /// The pointer travel that turns a press on Close into a sweep (`distance: 6`).
 const SWEEP_DISTANCE: f32 = 6.;
 
@@ -126,7 +127,7 @@ impl Workspace {
             actions: actions.clone(),
             shown: !actions.is_empty() && (speed.shift || busy || focused_inside),
             busy,
-            writable: self.env_grant(&entry.environment_id, SOURCE_CONTROL_WRITE) == Some(true),
+            writable: self.permits_pr_action(entry, None),
             sweeps: true,
         }
     }
@@ -143,9 +144,18 @@ impl Workspace {
             shown: !actions.is_empty() && (speed.shift || busy),
             actions,
             busy,
-            writable: self.env_grant(&entry.environment_id, SOURCE_CONTROL_WRITE) == Some(true),
+            writable: self.permits_pr_action(entry, None),
             sweeps: false,
         }
+    }
+
+    /// `runAction.permissionAtom` on the row's environment, for `action` when it is known.
+    fn permits_pr_action(&self, entry: &Entry, action: Option<&str>) -> bool {
+        let mut input = entry.reference();
+        if let Some(action) = action {
+            input["action"] = json!(action);
+        }
+        self.env_permits(&entry.environment_id, RUN_ACTION, &input)
     }
 
     fn listed_entry(&self, key: &str) -> Option<Rc<Entry>> {
@@ -177,7 +187,7 @@ impl Workspace {
                 *row_group == group
                     && *closes
                     && entry.state == State::Open
-                    && self.env_grant(&entry.environment_id, SOURCE_CONTROL_WRITE) == Some(true)
+                    && self.permits_pr_action(entry, Some("close"))
                     && !speed.closing.contains(key)
                     && !speed.acting.contains_key(key)
             })
@@ -285,7 +295,7 @@ impl Workspace {
         if speed.acting.contains_key(&key) || speed.closing.contains(&key) {
             return;
         }
-        if self.env_grant(&entry.environment_id, SOURCE_CONTROL_WRITE) != Some(true) {
+        if !self.permits_pr_action(entry, Some(action)) {
             return;
         }
         let Some(client) = self.env_client(&entry.environment_id) else { return };
@@ -318,7 +328,7 @@ impl Workspace {
                 }
                 input["action"] = json!(action);
                 input["replyWithSummary"] = json!(true);
-                client.request("pullRequests.runAction", input).await.map_err(|e| logic::error_message(&e))
+                client.request(RUN_ACTION, input).await.map_err(|e| logic::error_message(&e))
             }
             .await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -347,11 +357,11 @@ impl Workspace {
         let sends: Vec<_> = batch
             .iter()
             .map(|entry| {
-                let writable = self.env_grant(&entry.environment_id, SOURCE_CONTROL_WRITE) == Some(true);
-                let client = self.env_client(&entry.environment_id).filter(|_| writable);
                 let mut input = entry.reference();
                 input["action"] = json!("close");
                 input["replyWithSummary"] = json!(true);
+                let writable = self.env_permits(&entry.environment_id, RUN_ACTION, &input);
+                let client = self.env_client(&entry.environment_id).filter(|_| writable);
                 (entry.clone(), client, input)
             })
             .collect();
@@ -362,9 +372,7 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let replies = futures::future::join_all(sends.into_iter().map(|(entry, client, input)| async move {
                 let result = match client {
-                    Some(client) => {
-                        client.request("pullRequests.runAction", input).await.map_err(|e| logic::error_message(&e))
-                    }
+                    Some(client) => client.request(RUN_ACTION, input).await.map_err(|e| logic::error_message(&e)),
                     None => Err("This connection cannot change source control.".to_owned()),
                 };
                 (entry, result)

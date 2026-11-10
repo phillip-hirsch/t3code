@@ -10,7 +10,7 @@ use gpui_kit::{
 };
 use serde_json::{Map, Value, json};
 
-use super::super::connections::logic::{SETTINGS_WRITE, machine_icon};
+use super::super::connections::logic::machine_icon;
 use super::super::connections::ui::{Variant, WebButton, tooltip};
 use super::super::widgets::{SettingsView, section_with_action};
 use super::{DiagnosticsState, success};
@@ -171,7 +171,10 @@ impl Workspace {
         let values: [String; 3] = std::array::from_fn(|i| fields[i].read(cx).value().trim().to_owned());
 
         let s = state.read(cx);
-        let can_edit = s.grants(SETTINGS_WRITE);
+        // `checkOtlpEndpoint.permissionAtom`, which the web's form also edits under.
+        let can_edit = self
+            .settings_environment()
+            .is_some_and(|env| self.env_permits(&env, "server.checkOtlpEndpoint", &Value::Null));
         let can_check = can_edit && self.settings_info().capability("otlpEndpointCheck");
         if can_check && !s.export.checks_started {
             let initial: Vec<(usize, String)> = (0..3)

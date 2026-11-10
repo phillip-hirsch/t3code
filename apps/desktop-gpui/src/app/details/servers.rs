@@ -156,13 +156,13 @@ impl Workspace {
 
     /// `preview.stopLocalServer`.
     fn stop_server(&mut self, server: &LocalServer, window: &mut Window, cx: &mut Context<Self>) {
-        let client = self.servers.environment.as_deref().and_then(|environment| self.env_client(environment));
-        let (Some(pid), Some(client)) = (server.pid, client) else { return };
-        if self.servers.stopping.is_some() {
+        let Some(environment) = self.servers.environment.clone() else { return };
+        let (Some(pid), Some(client)) = (server.pid, self.env_client(&environment)) else { return };
+        let input = json!({"pid": pid, "port": server.port});
+        if self.servers.stopping.is_some() || !self.env_permits(&environment, STOP, &input) {
             return;
         }
         self.servers.stopping = Some(server.key());
-        let input = json!({"pid": pid, "port": server.port});
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request(STOP, input).await;
             let _ = this.update_in(cx, |this, window, cx| {

@@ -586,7 +586,7 @@ impl Workspace {
     ) {
         let Some(client) = self.pull_request_client() else { return };
         // `setFilesViewed` is guarded by source-control write on the pull request's environment.
-        if !self.shown_pr_key().is_some_and(|key| self.pr_panel_writable(&key)) {
+        if !self.shown_pr_key().is_some_and(|key| self.pr_panel_permits(&key, "pullRequests.setFilesViewed", None)) {
             return;
         }
         let Some(panel) = self.pull_requests.panel.as_mut() else { return };

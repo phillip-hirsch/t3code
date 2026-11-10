@@ -32,7 +32,6 @@ use serde_json::{Value, json};
 use super::codex_callback;
 
 mod antigravity;
-use super::super::connections::logic::PROVIDERS_MANAGE;
 use super::super::scoped_client;
 use super::super::widgets::RowFrame;
 use crate::app::Workspace;
@@ -1148,7 +1147,7 @@ impl AccountSection {
     /// `removeProviderAuthMethod.permissionAtom`: removal needs `providers:manage` on this environment.
     fn can_remove_auth_method(&self, cx: &App) -> bool {
         let (Some(workspace), Some(scope)) = (self.workspace.upgrade(), self.scope.as_ref()) else { return false };
-        workspace.read(cx).environment_grants(scope, PROVIDERS_MANAGE)
+        workspace.read(cx).env_permits(scope, "provider.auth.removeMethod", &self.input())
     }
 
     /// Forgets an incomplete ChatGPT connection; the picker stays open on the updated list.

@@ -646,8 +646,12 @@ impl Workspace {
         let siblings: Vec<_> = (self.shell.threads.iter())
             .filter(|t| t.environment_id == environment && !deleted.iter().any(|d| d.is_thread(t)))
             .collect();
-        let orphan = orphaned_worktree(&siblings, &key.id)
-            .filter(|_| removable.is_some() && self.env_grants(&environment, "source-control:write"));
+        let orphan = orphaned_worktree(&siblings, &key.id).filter(|path| {
+            removable.is_some_and(|p| {
+                let input = json!({"cwd": p.workspace_root, "path": path, "force": true});
+                self.env_permits(&environment, "vcs.removeWorktree", &input)
+            })
+        });
         let automatic = removable.is_some_and(|p| {
             crate::settings::scope::worktree_cleanup_rules(&info.settings, Some(&p.scope_project()))
                 .get("worktreeOnDelete")
@@ -1119,9 +1123,13 @@ pub(super) async fn run_delete(
             this.land_after_delete(&key, fallback, window, cx);
         }
         this.forget_deleted_thread(&environment, &thread_id, &side_chats, cx);
-        remove && this.env_grants(&environment, "source-control:write")
+        // The socket the environment has now, which the question above may have outlived.
+        let input = json!({"cwd": project_root, "path": orphan, "force": true});
+        (remove && this.env_permits(&environment, "vcs.removeWorktree", &input))
+            .then(|| this.env_client(&environment))
+            .flatten()
     });
-    let (Some(path), Some(root), Ok(true)) = (orphan.filter(|_| remove), project_root, removing) else {
+    let (Some(path), Some(root), Ok(Some(client))) = (orphan.filter(|_| remove), project_root, removing) else {
         return Ok(true);
     };
     let removed =

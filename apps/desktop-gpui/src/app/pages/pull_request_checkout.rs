@@ -18,7 +18,6 @@ use gpui_kit::{
 };
 use serde_json::json;
 
-use super::super::git::SOURCE_CONTROL_WRITE;
 use super::super::{Target, Workspace};
 use super::pull_requests::{host_mark, tone};
 use crate::new_thread::{EnvMode, WorkspaceChoice};
@@ -74,7 +73,10 @@ fn state_color(state: &str, t: &Tokens) -> Hsla {
 impl Workspace {
     /// `canCheckoutPullRequestIntoThread`: a draft whose environment allows source control writes.
     pub(in crate::app) fn can_checkout_pull_request(&self) -> bool {
-        matches!(&self.target, Some(Target::Draft { env, .. }) if self.env_grants(env, SOURCE_CONTROL_WRITE))
+        // The dialog checks out in place at least, which needs only source-control write.
+        let local = json!({"mode": "local"});
+        matches!(&self.target, Some(Target::Draft { env, .. })
+            if self.env_permits(env, "git.preparePullRequestThread", &local))
     }
 
     /// The open checkout's host, else the project's remote's.
@@ -250,11 +252,15 @@ impl CheckoutForm {
     fn access(&self, cx: &gpui_kit::App) -> Access {
         let Some(workspace) = self.workspace.upgrade() else { return Access::default() };
         let workspace = workspace.read(cx);
-        let environment = &self.origin.environment_id;
-        Access {
-            write: workspace.env_grants(environment, SOURCE_CONTROL_WRITE),
-            operate: workspace.can_operate(environment),
-        }
+        // `permissionAtom` for the `git.preparePullRequestThread` each mode sends.
+        let permits = |mode: &str| {
+            let mut input = json!({"cwd": self.origin.cwd, "mode": mode});
+            if mode == "worktree" {
+                input["threadId"] = json!(self.origin.thread_id);
+            }
+            workspace.env_permits(&self.origin.environment_id, "git.preparePullRequestThread", &input)
+        };
+        Access { write: permits("local"), operate: permits("worktree") }
     }
 
     fn schedule_settle(&mut self, cx: &mut Context<Self>) {

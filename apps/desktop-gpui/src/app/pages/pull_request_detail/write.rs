@@ -341,7 +341,7 @@ impl Workspace {
             return;
         };
         // The write grant can be lost while an editor or form stays open (`permissionAtom`).
-        if !self.pr_panel_writable(&key) {
+        if !self.pr_panel_permits(&key, method, Some(&input)) {
             done(self, &key, false, window, cx);
             cx.notify();
             return;
@@ -1375,8 +1375,9 @@ impl Workspace {
 
     /// `PullRequestMarkdownEditor`: Write and Preview, then Cancel and Save.
     pub(super) fn render_pr_editor(&mut self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let writable = self.shown_pr_key().is_some_and(|key| self.pr_panel_writable(&key));
         let editing = self.pull_requests.panel.as_ref()?.write.editing.as_ref()?;
+        let method = if editing.kind == "description" { "pullRequests.update" } else { "pullRequests.updateComment" };
+        let writable = self.shown_pr_key().is_some_and(|key| self.pr_panel_permits(&key, method, None));
         let (input, preview, description, saving) = (
             editing.input.clone(),
             editing.preview,
@@ -1514,7 +1515,7 @@ impl Workspace {
     /// The title being renamed, with Cancel and Save under it; Escape cancels.
     pub(super) fn render_pr_title_input(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
         let panel = self.pull_requests.panel.as_ref()?;
-        let writable = self.pr_panel_writable(&panel.reference.key());
+        let writable = self.pr_panel_permits(&panel.reference.key(), "pullRequests.update", None);
         let write = &panel.write;
         let input = write.title.as_ref()?;
         let saving = write.title_saving;

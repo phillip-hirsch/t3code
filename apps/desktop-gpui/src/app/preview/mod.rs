@@ -844,9 +844,9 @@ impl Workspace {
             let _ = hosted.view.read(cx).set_visible(false);
         }
         // Without preview access the server keeps the session until an authorized close.
-        let granted = self.can_operate_preview(&tab.thread.environment);
+        let input = json!({"threadId": tab.thread.thread_id, "tabId": tab.tab_id});
+        let granted = self.env_permits(&tab.thread.environment, "preview.close", &input);
         if let Some(client) = self.env_client(&tab.thread.environment).filter(|_| granted) {
-            let input = json!({"threadId": tab.thread.thread_id, "tabId": tab.tab_id});
             cx.spawn_in(window, async move |this, cx| {
                 let result = client.request("preview.close", input).await;
                 let Err(error) = result else {

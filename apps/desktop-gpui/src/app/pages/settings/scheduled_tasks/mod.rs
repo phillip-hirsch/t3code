@@ -28,14 +28,14 @@ use gpui_kit::{
     ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task,
     WeakEntity, Window, div, px, svg,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
 use self::logic::{
     ListState, ScheduledTask, decode_tasks, list_summaries, matches_scope, relative_label, schedule_label,
 };
 use super::super::widgets::{RowFrame, card, section_frame, section_with_action};
 use crate::app::Workspace;
-use crate::app::pages::settings::connections::logic::{ORCHESTRATION_OPERATE, machine_icon};
+use crate::app::pages::settings::connections::logic::machine_icon;
 use crate::app::pages::settings::connections::{empty_media, ui as connection_ui};
 use crate::app::pages::settings::widgets::SettingsView;
 use crate::rpc::{RpcClient, RpcError, StreamEvent};
@@ -228,9 +228,9 @@ impl ScheduledTasksView {
         self.lists.insert(environment, EnvironmentTasks { client, tasks: Load::Loading, ended: false, _stream: task });
     }
 
-    /// `upsertScheduledTask.permissionAtom`: this connection may operate on `environment`.
-    fn can_operate(&self, environment: &str, cx: &App) -> bool {
-        self.workspace.upgrade().is_some_and(|w| w.read(cx).environment_grants(environment, ORCHESTRATION_OPERATE))
+    /// `permissionAtom` for `method` with `payload` on `environment`.
+    fn permits(&self, environment: &str, method: &str, payload: &Value, cx: &App) -> bool {
+        self.workspace.upgrade().is_some_and(|w| w.read(cx).env_permits(environment, method, payload))
     }
 
     fn client_on(&self, environment: &str) -> Option<RpcClient> {
@@ -245,17 +245,17 @@ impl ScheduledTasksView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.client_on(environment) else { return };
-        let key = (environment.clone(), task.id.clone());
-        if !self.can_operate(environment, cx) || !self.busy.insert(key.clone()) {
-            return;
-        }
         let id = task.id.clone();
         let (method, payload) = match action {
             Action::SetEnabled(enabled) => ("scheduledTasks.setEnabled", json!({"id": id, "enabled": enabled})),
             Action::RunNow => ("scheduledTasks.runNow", json!({"id": id})),
             Action::Delete => ("scheduledTasks.delete", json!({"id": id})),
         };
+        let Some(client) = self.workspace.upgrade().and_then(|w| w.read(cx).env_client(environment)) else { return };
+        let key = (environment.clone(), task.id.clone());
+        if !self.permits(environment, method, &payload, cx) || !self.busy.insert(key.clone()) {
+            return;
+        }
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request(method, payload).await;
@@ -381,7 +381,10 @@ impl ScheduledTasksView {
         t: &Tokens,
         cx: &mut Context<Self>,
     ) -> RowFrame {
-        let can_operate = self.can_operate(environment, cx);
+        // `upsertScheduledTask.permissionAtom` gates the row's menu, as the web's does.
+        let can_edit = self.permits(environment, "scheduledTasks.upsert", &json!({"id": task.id}), cx);
+        let set_enabled = json!({"id": task.id, "enabled": !task.enabled});
+        let can_toggle = self.permits(environment, "scheduledTasks.setEnabled", &set_enabled, cx);
         let busy = self.busy.contains(&(environment.clone(), task.id.clone()));
         let schedule = task.schedule();
         let webhook = schedule == logic::Schedule::Webhook;
@@ -419,7 +422,7 @@ impl ScheduledTasksView {
             .ghost()
             .small()
             .icon(Icon::new(Lucide::Ellipsis))
-            .disabled(busy || !can_operate)
+            .disabled(busy || !can_edit)
             .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |menu, _, _| {
                 let task = menu_task.clone();
                 let edit = {
@@ -463,7 +466,7 @@ impl ScheduledTasksView {
             .child(
                 Switch::new(SharedString::from(format!("scheduled-task-enabled-{id}")))
                     .checked(enabled)
-                    .disabled(busy || !can_operate)
+                    .disabled(busy || !can_toggle)
                     .accessibility_label(format!("Enable {}", task.title))
                     .on_change(cx.listener(move |this, _: &bool, window, cx| {
                         this.act(&toggle_environment, &toggle_task, Action::SetEnabled(!enabled), window, cx);
@@ -640,7 +643,7 @@ impl Render for ScheduledTasksView {
             let permitted: Vec<SharedString> = view
                 .connected_environment_ids()
                 .into_iter()
-                .filter(|id| workspace.environment_grants(id, ORCHESTRATION_OPERATE))
+                .filter(|id| workspace.env_permits(id, "scheduledTasks.upsert", &json!({})))
                 .collect();
             let creation = permitted
                 .iter()

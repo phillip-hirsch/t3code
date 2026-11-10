@@ -6,7 +6,6 @@
 
 use super::*;
 use crate::app::Target;
-use crate::app::git::SOURCE_CONTROL_WRITE;
 use crate::model::ProjectShell;
 use crate::pull_request_checkout::Prepared;
 use crate::pull_request_detail::{CheckoutMode, CheckoutRequest};
@@ -168,8 +167,14 @@ impl Workspace {
 
     /// [`HandoffAccess`] on the acting project's environment.
     pub(super) fn pr_handoff_access(&self, project: &ProjectScope) -> HandoffAccess {
-        let grants = |scope| self.env_grants(&project.environment_id, scope);
-        HandoffAccess::new(grants(SOURCE_CONTROL_WRITE), grants("orchestration:operate"))
+        let permits = |mode| self.permits_draft_checkout(&project.environment_id, mode);
+        HandoffAccess::new(permits(CheckoutMode::Local), permits(CheckoutMode::Worktree))
+    }
+
+    /// `permissionAtom` for a handoff's checkout in `mode`, always made for the draft thread it starts.
+    pub(in crate::app) fn permits_draft_checkout(&self, environment_id: &str, mode: CheckoutMode) -> bool {
+        let input = json!({"mode": mode.as_str(), "threadId": "draft"});
+        self.env_permits(environment_id, "git.preparePullRequestThread", &input)
     }
 
     /// `canFixFindings`: into the composer beside the panel, or a worktree checkout of the pull request.
@@ -335,6 +340,10 @@ impl Workspace {
             return;
         };
         let input = request.input(&root, &thread_id);
+        if !self.env_permits(&request.environment_id, "git.preparePullRequestThread", &input) {
+            settled(self);
+            return;
+        }
         let CheckoutRequest { environment_id, project_id, task, .. } = request;
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("git.preparePullRequestThread", input).await;

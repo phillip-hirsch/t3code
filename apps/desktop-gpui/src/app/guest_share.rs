@@ -57,7 +57,7 @@ impl Workspace {
     /// links beta is on, and no policy turns T3 Connect off.
     pub(super) fn can_share_with_guest(&self, environment_id: &str) -> bool {
         let Some(info) = self.env_info(environment_id) else { return false };
-        self.env_grants(environment_id, "access:write")
+        self.env_permits(environment_id, "guestShare.create", &Value::Null)
             && info.settings.bool("guestSharingEnabled")
             && info.managed_policy.pointer("/limits/connect") != Some(&Value::Bool(false))
     }
@@ -69,8 +69,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.env_client(&key.env) else { return };
         let Some(environment) = self.shell.thread(key).map(|t| t.environment_id.clone()) else { return };
+        if self.env_client(&environment).is_none() {
+            return;
+        }
         let thread_id = key.id.as_str();
         let open = self.is_open_thread(key);
         let shared = open && self.open_projection().is_some_and(|p| p.thread.guest_share.is_some());
@@ -127,7 +129,8 @@ impl Workspace {
                         .on_click(|_, window, cx| window.close_dialog(cx)),
                 )
             } else {
-                let (state, client, thread_id) = (state.clone(), client.clone(), thread_id.clone());
+                let (state, view, environment, thread_id) =
+                    (state.clone(), view.clone(), environment.clone(), thread_id.clone());
                 DialogFooter::new()
                     .child(
                         Button::new("guest-share-cancel")
@@ -144,10 +147,19 @@ impl Workspace {
                             .label(if creating { "Creating..." } else { "Create link" })
                             .disabled(!can_create || creating)
                             .on_click(move |_, window, cx| {
+                                // The environment's socket now: a reconnect while the dialog was open replaced it.
+                                let input = json!({"threadId": thread_id});
+                                let Some(client) = view.upgrade().and_then(|w| {
+                                    let w = w.read(cx);
+                                    w.env_permits(&environment, "guestShare.create", &input)
+                                        .then(|| w.env_client(&environment))
+                                        .flatten()
+                                }) else {
+                                    return;
+                                };
                                 *state.borrow_mut() = Create::Creating;
                                 window.refresh();
-                                let (state, client) = (state.clone(), client.clone());
-                                let input = json!({"threadId": thread_id});
+                                let state = state.clone();
                                 window
                                     .spawn(cx, async move |cx| {
                                         let result = client.request("guestShare.create", input).await;

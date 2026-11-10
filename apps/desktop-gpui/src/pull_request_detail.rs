@@ -1618,6 +1618,16 @@ pub enum CheckoutMode {
     Local,
 }
 
+impl CheckoutMode {
+    /// The `mode` `git.preparePullRequestThread` takes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CheckoutMode::Worktree => "worktree",
+            CheckoutMode::Local => "local",
+        }
+    }
+}
+
 /// A checkout `startHandoff` prepares: the pull request, the project it goes in, and the task
 /// the thread opened on it gets in its composer.
 #[derive(Clone, Debug)]
@@ -1634,11 +1644,7 @@ pub struct CheckoutRequest {
 impl CheckoutRequest {
     /// The `git.preparePullRequestThread` input, run from the project checkout `root` for `thread_id`.
     pub fn input(&self, root: &str, thread_id: &str) -> Value {
-        let mode = match self.mode {
-            CheckoutMode::Worktree => "worktree",
-            CheckoutMode::Local => "local",
-        };
-        json!({"cwd": root, "reference": self.url, "mode": mode, "threadId": thread_id})
+        json!({"cwd": root, "reference": self.url, "mode": self.mode.as_str(), "threadId": thread_id})
     }
 }
 

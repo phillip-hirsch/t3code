@@ -411,7 +411,7 @@ impl Workspace {
             }
             let (can_write, can_branch) = {
                 let this = workspace.read(cx);
-                (this.can_write_source_control(), this.can_change_thread_branch())
+                (this.permits_git_action(&GitRequest::new("commit")), this.can_change_thread_branch())
             };
             let none_selected = body.read(cx).none_selected(cx);
             let submit = |feature_branch: bool| {

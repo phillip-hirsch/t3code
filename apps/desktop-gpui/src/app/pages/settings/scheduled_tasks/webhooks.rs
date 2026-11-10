@@ -52,10 +52,15 @@ impl WebhookContext {
         Self { client, environment: environment.to_owned().into(), endpoint, workspace: workspace.downgrade() }
     }
 
-    /// `permissionAtom`: this connection may send `method` to the task's environment.
-    fn permits(&self, method: &str, cx: &App) -> bool {
+    /// `permissionAtom`: this connection may send `method` with `payload` to the task's environment.
+    fn permits(&self, method: &str, payload: &Value, cx: &App) -> bool {
         let workspace = self.workspace.upgrade();
-        workspace.is_some_and(|w| w.read(cx).environment_permits(&self.environment, method, &json!({})))
+        workspace.is_some_and(|w| w.read(cx).env_permits(&self.environment, method, payload))
+    }
+
+    /// The task environment's socket now, which a reconnect replaces.
+    fn live_client(&self, cx: &App) -> Option<RpcClient> {
+        self.workspace.upgrade()?.read(cx).env_client(&self.environment)
     }
 }
 
@@ -292,10 +297,14 @@ impl WebhookFields {
 
     fn rotate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.task.as_ref().and_then(|task| task["id"].as_str()).map(str::to_owned) else { return };
-        let client = self.context.client.clone();
+        let input = json!({"id": id});
+        if !self.context.permits(ROTATE, &input, cx) {
+            return;
+        }
+        let Some(client) = self.context.live_client(cx) else { return };
         self.rotating = true;
         cx.spawn_in(window, async move |this, cx| {
-            let result = client.request(ROTATE, json!({"id": id})).await;
+            let result = client.request(ROTATE, input).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.rotating = false;
                 match result {
@@ -314,6 +323,7 @@ impl WebhookFields {
             return text_sm(div(), t.muted_foreground).child("The URL appears after you save.").into_any_element();
         };
         let relay = self.task.as_ref().is_some_and(|task| task["webhook"]["url"].is_string());
+        let rotate_input = json!({"id": self.task.as_ref().map(|task| task["id"].clone())});
         v_flex()
             .gap(px(6.))
             .child(
@@ -330,7 +340,9 @@ impl WebhookFields {
                     .child(
                         outline_button("webhook-url-rotate")
                             .label("Rotate")
-                            .disabled(self.rotating || self.disabled || !self.context.permits(ROTATE, cx))
+                            .disabled(
+                                self.rotating || self.disabled || !self.context.permits(ROTATE, &rotate_input, cx),
+                            )
                             .on_click(cx.listener(|this, _, window, cx| this.confirm_rotate(window, cx))),
                     ),
             )

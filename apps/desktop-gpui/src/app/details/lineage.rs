@@ -682,7 +682,8 @@ impl Workspace {
     /// `stopWorkflow`: ends a running workflow coordinator and every agent in it.
     pub(super) fn stop_workflow(&mut self, subagent_id: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(Target::Thread { env, id }) = self.target.clone() else { return };
-        if self.lineage.stopping.is_some() || !self.can_operate(&env) {
+        let input = json!({"threadId": id, "subagentId": subagent_id});
+        if self.lineage.stopping.is_some() || !self.env_permits(&env, "orchestration.stopWorkflow", &input) {
             return;
         }
         let stoppable = self.open_relationships().is_some_and(|relationships| {
@@ -693,7 +694,6 @@ impl Workspace {
                 .any(|row| row.workflow.as_ref().is_some_and(|w| w.subagent_id == subagent_id && w.stoppable))
         });
         let Some(client) = self.env_client(&env).filter(|_| stoppable) else { return };
-        let input = json!({"threadId": id, "subagentId": subagent_id});
         self.lineage.stopping = Some(subagent_id);
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {

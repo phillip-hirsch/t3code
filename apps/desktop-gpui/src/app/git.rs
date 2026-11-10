@@ -692,6 +692,45 @@ impl Workspace {
         self.vcs.env.as_deref().is_some_and(|env| self.env_grants(env, SOURCE_CONTROL_WRITE))
     }
 
+    /// `permissionAtom` for the `git.runStackedAction` `request` would send from the open target.
+    pub(super) fn permits_git_action(&self, request: &GitRequest) -> bool {
+        let (Some(env), Some(cwd)) = (self.vcs.env.as_deref(), self.vcs.cwd.as_deref()) else { return false };
+        self.env_permits(env, "git.runStackedAction", &self.git_action_input(request, String::new(), cwd))
+    }
+
+    /// `permissionAtom` for a one-shot git RPC on the watched checkout.
+    pub(super) fn permits_vcs_request(&self, method: &str) -> bool {
+        let (Some(env), Some(cwd)) = (self.vcs.env.as_deref(), self.vcs.cwd.as_deref()) else { return false };
+        self.env_permits(env, method, &json!({"cwd": cwd}))
+    }
+
+    /// `permissionAtom` for `sourceControl.publishRepository` on the watched checkout.
+    pub(super) fn permits_publish(&self) -> bool {
+        self.permits_vcs_request("sourceControl.publishRepository")
+    }
+
+    /// `permissionAtom` for what the quick action sends; a hint sends nothing but still needs write.
+    pub(super) fn permits_quick_action(&self, kind: &QuickKind) -> bool {
+        match kind {
+            QuickKind::Run(action) => self.permits_git_action(&GitRequest::new(action)),
+            QuickKind::Pull => self.permits_vcs_request("vcs.pull"),
+            QuickKind::Publish => self.permits_publish(),
+            QuickKind::Hint(_) => self.can_write_source_control(),
+        }
+    }
+
+    /// The `git.runStackedAction` input for `request` on `cwd`, for the open thread and project.
+    fn git_action_input(&self, request: &GitRequest, action_id: String, cwd: &str) -> Value {
+        let mut input = request.input(action_id, cwd);
+        if let Some(Target::Thread { id, .. }) = &self.target {
+            input["threadId"] = id.clone().into();
+        }
+        if let Some(project) = self.target_project() {
+            input["projectId"] = project.id.clone().into();
+        }
+        input
+    }
+
     /// `canChangeThreadBranch`: a feature branch also moves a server thread to it.
     pub(super) fn can_change_thread_branch(&self) -> bool {
         self.can_write_source_control()
@@ -703,7 +742,7 @@ impl Workspace {
 
     /// `runGitActionWithToast`: a push or PR from the default ref asks first.
     pub(super) fn request_git_action(&mut self, request: GitRequest, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.can_write_source_control() {
+        if !self.permits_git_action(&request) {
             return;
         }
         let status = self.vcs.status.as_ref();
@@ -718,18 +757,12 @@ impl Workspace {
     /// `git.runStackedAction` on the watched checkout, past the default-ref prompt. The grants are
     /// checked again, since they can change while a dialog is open.
     pub(super) fn run_git_action(&mut self, request: GitRequest, cx: &mut Context<Self>) {
-        if !self.can_write_source_control() || (request.feature_branch && !self.can_change_thread_branch()) {
+        if !self.permits_git_action(&request) || (request.feature_branch && !self.can_change_thread_branch()) {
             return;
         }
         let Some(client) = self.vcs_client() else { return };
         let Some(checkout) = self.vcs.start("Starting source control action...") else { return };
-        let mut input = request.input(new_id(), &checkout.1);
-        if let Some(Target::Thread { id, .. }) = &self.target {
-            input["threadId"] = id.clone().into();
-        }
-        if let Some(project) = self.target_project() {
-            input["projectId"] = project.id.clone().into();
-        }
+        let input = self.git_action_input(&request, new_id(), &checkout.1);
         let owner = self.branch_owner();
         let origin = self.target.clone();
         let stream = client.stream("git.runStackedAction", input);
@@ -798,7 +831,7 @@ impl Workspace {
 
     /// A one-shot git RPC (`vcs.init`, `vcs.pull`) on the current cwd.
     pub(super) fn run_vcs_request(&mut self, method: &'static str, label: &'static str, cx: &mut Context<Self>) {
-        if !self.can_write_source_control() {
+        if !self.permits_vcs_request(method) {
             return;
         }
         let Some(client) = self.vcs_client() else { return };
