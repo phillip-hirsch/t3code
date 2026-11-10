@@ -118,6 +118,7 @@ impl Workspace {
         let name: SharedString = match (label, provider.zip(model), selection) {
             (Some(label), ..) => label.to_owned().into(),
             (None, Some((provider, model)), _) => model_label::trigger_model_name(model, &provider.driver).into(),
+            (None, None, Some(selection)) if selection.model.is_empty() => "Choose model".into(),
             (None, None, Some(selection)) => selection.model.clone().into(),
             (None, None, None) => "Select a model".into(),
         };
@@ -255,7 +256,8 @@ fn default_text_generation_model(driver: &str) -> Option<&'static str> {
 
 /// `resolveAppModelSelectionState`: the stored text-generation model while its provider can
 /// generate text, else the first such provider's cheap default. Options carry over only when
-/// the stored provider is kept.
+/// the stored provider is kept. A provider without models resolves with an empty model, so the
+/// picker still offers the others.
 pub(in crate::app) fn resolve_text_generation(
     selection: Option<&ModelSelection>,
     providers: &[&Provider],
@@ -266,9 +268,8 @@ pub(in crate::app) fn resolve_text_generation(
     let provider = selected.or_else(|| providers.iter().find(usable).copied())?;
     let has = |slug: &&str| provider.models.iter().any(|m| m.slug == *slug);
     let kept = selected.and(selection).map(|s| s.model.as_str()).filter(has);
-    let model = kept
-        .or_else(|| default_text_generation_model(&provider.driver).filter(has))
-        .or_else(|| provider.default_model())?;
+    let cheap = default_text_generation_model(&provider.driver);
+    let model = kept.or_else(|| cheap.filter(has)).or_else(|| provider.default_model()).or(cheap).unwrap_or_default();
     Some(ModelSelection {
         instance_id: provider.instance_id.clone(),
         model: model.to_owned(),
@@ -317,5 +318,15 @@ mod tests {
         );
         let kept = ModelSelection { instance_id: "claude".into(), model: "claude-opus-5-5".into(), options: None };
         assert_eq!(resolve_text_generation(Some(&kept), &providers).unwrap(), kept);
+
+        // A generator whose models failed to load still resolves, so the picker can reach the next.
+        let generators: Vec<Provider> = serde_json::from_value(json!([
+            {"instanceId": "a", "driver": "openaiCompatible", "enabled": true, "status": "error", "models": []},
+            {"instanceId": "b", "driver": "openaiCompatible", "enabled": true, "models": [{"slug": "m"}]}
+        ]))
+        .unwrap();
+        let generators: Vec<&Provider> = generators.iter().collect();
+        let empty = ModelSelection { instance_id: "a".into(), model: String::new(), options: None };
+        assert_eq!(resolve_text_generation(None, &generators), Some(empty));
     }
 }
