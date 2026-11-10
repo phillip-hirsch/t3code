@@ -565,7 +565,10 @@ hunk. 0.9.0 keeps only the patch's lines. The patch adds `DiffState::set_content
 expansion count, the count expanding both ends), the first expansion reads the file and
 `DiffFile::with_contents` rebuilds it with every line of both sides, and each gap between hunks
 shows its revealed ends (`GapReveal`) around a separator that hides the rest. A failed read leaves
-the patch as it was. `DiffFile::is_same` also matches a hydrated file to the patch-only file it
+the patch as it was, and so do contents that no longer fit it: `with_contents` refuses a hunk line
+whose text differs from the patch's, or a gap line that differs between the sides, so a file edited
+since the patch never shows its new lines as unchanged. (Pierre's `hydratePartialDiff` does not
+check; this is stricter.) `DiffFile::is_same` also matches a hydrated file to the patch-only file it
 came from, so `update_files` keeps it. Files:
 
 - `src/diff/document.rs`: `with_contents`, `can_load_contents`, `is_hydrated`, `gap_pairs`,

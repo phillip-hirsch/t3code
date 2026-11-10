@@ -451,6 +451,17 @@ fn full_contents_fill_the_gaps_between_hunks() {
     assert!(file.with_contents(&short, &short).is_err());
     let longer = format!("{}extra\n", contents.modified);
     assert!(file.with_contents(&contents.original, &longer).is_err());
+    // So are files edited since the patch with the same line count: in a gap, and in a hunk's
+    // changed and unchanged lines.
+    for edited in ["line 10\n", "changed 5\n", "line 24\n"] {
+        let modified = contents.modified.replacen(edited, "edited\n", 1);
+        assert!(
+            file.with_contents(&contents.original, &modified).is_err(),
+            "{edited:?}"
+        );
+    }
+    let original = contents.original.replacen("line 5\n", "edited\n", 1);
+    assert!(file.with_contents(&original, &contents.modified).is_err());
     assert!(
         hydrated
             .with_contents(&contents.original, &contents.modified)
