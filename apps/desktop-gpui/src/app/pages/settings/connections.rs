@@ -35,6 +35,7 @@ use crate::app::Workspace;
 use crate::app::pages::settings::widgets::SettingsView;
 use crate::backend::Endpoint;
 use crate::rpc::RpcClient;
+use crate::rpc_permissions::Grants;
 
 use self::logic::Session;
 
@@ -62,6 +63,20 @@ impl SessionLoad {
     /// A failed or pending check grants nothing, like `resolveRemoteOperateAccess`.
     pub(in crate::app) fn grants(&self, scope: &str) -> bool {
         self.session().is_some_and(|session| session.grants(scope))
+    }
+
+    /// `permissionAtom`: whether a control that sends `method` with `payload` may be used.
+    pub(in crate::app) fn permits(&self, method: &str, payload: &Value) -> bool {
+        crate::rpc_permissions::permits(method, payload, |scope| self.grants(scope))
+    }
+
+    /// What the environment's socket checks guarded requests against.
+    pub(in crate::app) fn rpc_grants(&self) -> Grants {
+        match self {
+            Self::Pending => Grants::Pending,
+            Self::Ready(session) => Grants::ready(|scope| session.grants(scope)),
+            Self::Failed => Grants::Failed,
+        }
     }
 }
 
@@ -261,5 +276,23 @@ mod tests {
         assert!(!operates_terminals(&session(json!(["terminal:read"]))));
         assert!(operates_terminals(&SessionLoad::Pending), "the server still checks every write");
         assert!(operates_terminals(&SessionLoad::Failed));
+    }
+
+    #[test]
+    fn exact_empty_permissions_grant_nothing_and_legacy_parents_still_grant() {
+        let load = |session: Value| SessionLoad::Ready(Session::from_json(&session));
+        let exact = load(json!({"authenticated": true, "scopes": ["orchestration:operate"], "permissions": []}));
+        let legacy = load(json!({"authenticated": true, "scopes": ["orchestration:operate"]}));
+        let signed_out = load(json!({"authenticated": false, "scopes": ["orchestration:operate"]}));
+        for (load, allowed) in [(&exact, false), (&legacy, true), (&signed_out, false), (&SessionLoad::Pending, false)]
+        {
+            assert_eq!(load.permits("vcs.init", &json!({"cwd": "/repo"})), allowed);
+            let answer = load.rpc_grants().authorize("vcs.init", &Value::Null);
+            match load {
+                SessionLoad::Pending => assert_eq!(answer, None, "a guarded request waits for the first answer"),
+                _ => assert_eq!(answer, Some(if allowed { Ok(()) } else { Err("source-control:write") })),
+            }
+        }
+        assert!(SessionLoad::Failed.rpc_grants().authorize("vcs.init", &Value::Null).is_some_and(|r| r.is_err()));
     }
 }

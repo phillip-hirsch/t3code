@@ -52,6 +52,7 @@ mod remote_open;
 mod requests;
 mod review_comment;
 mod rpc;
+mod rpc_permissions;
 mod search;
 mod secure_storage;
 mod settings;

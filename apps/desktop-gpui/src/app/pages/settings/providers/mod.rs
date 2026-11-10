@@ -107,6 +107,7 @@ const IDLE_COMPACTION_MODES: &[(&str, &str)] =
 
 /// `PROVIDER_HEALTH_INTERVAL_STEP_SECONDS`.
 const HEALTH_STEP_SECONDS: i64 = 30;
+const REFRESH_PROVIDERS: &str = "server.refreshProviders";
 const HEALTH_KEY: &str = "providerHealthRefreshInterval";
 /// Its index in [`background::DURATION_KEYS`].
 const HEALTH: usize = 1;
@@ -428,6 +429,7 @@ impl Workspace {
         };
         let refresh_page = page.clone();
         let update_page = page.clone();
+        let can_refresh = self.can_refresh_providers();
         h_flex()
             .gap_2()
             .mr(px(-8.))
@@ -445,7 +447,7 @@ impl Workspace {
                 ghost_text_button("providers-refresh", "", t)
                     .icon(Icon::new(gpui_kit::assets::IconName::RefreshCw).size(px(14.)))
                     .when_some(label, gpui_kit::component::button::Button::label)
-                    .disabled(refreshing)
+                    .disabled(refreshing || !can_refresh)
                     .tooltip("Refresh provider status")
                     .on_click(
                         cx.listener(move |this, _, window, cx| this.refresh_providers(&refresh_page, window, cx)),
@@ -591,9 +593,14 @@ impl Workspace {
         self.save_settings(payload, "Could not update provider instance", window, cx);
     }
 
+    /// `refreshProviders.permissionAtom` on the Settings environment.
+    fn can_refresh_providers(&self) -> bool {
+        self.settings_environment().is_some_and(|env| self.environment_permits(&env, REFRESH_PROVIDERS, &Value::Null))
+    }
+
     /// `server.refreshProviders` with models and secrets reloaded, as the refresh button does.
     fn refresh_providers(&mut self, page: &Entity<ProvidersPage>, window: &mut Window, cx: &mut Context<Self>) {
-        if page.read(cx).refreshing {
+        if page.read(cx).refreshing || !self.can_refresh_providers() {
             return;
         }
         page.update(cx, |page, cx| {
@@ -603,7 +610,7 @@ impl Workspace {
         let page = page.clone();
         let payload = json!({"refreshModels": true, "reloadSecrets": true});
         self.providers_request_then(
-            "server.refreshProviders",
+            REFRESH_PROVIDERS,
             payload,
             None,
             window,
@@ -760,6 +767,11 @@ impl Workspace {
     /// Whether this connection's session on `environment` grants `scope` (`readEnvironmentScope`).
     pub(super) fn environment_grants(&self, environment: &str, scope: &str) -> bool {
         self.settings_ui.grants.get(environment).is_some_and(|(_, load)| load.grants(scope))
+    }
+
+    /// `permissionAtom` for a Settings control that sends `method` to `environment`.
+    pub(super) fn environment_permits(&self, environment: &str, method: &str, payload: &serde_json::Value) -> bool {
+        self.settings_ui.grants.get(environment).is_some_and(|(_, load)| load.permits(method, payload))
     }
 
     /// Provider mutations wait for `providers:manage` (`readOnly` across the panel).

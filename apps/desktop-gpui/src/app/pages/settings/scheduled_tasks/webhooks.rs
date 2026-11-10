@@ -32,10 +32,14 @@ use crate::theme::{Tokens, tokens};
 
 pub(super) use webhook_logic::DEFAULT_WEBHOOK_PROMPT;
 
+const ROTATE: &str = "scheduledTasks.rotateWebhookToken";
+
 /// What webhook controls need from the window's connection.
 #[derive(Clone)]
 pub(super) struct WebhookContext {
     client: RpcClient,
+    /// The environment the task lives on.
+    environment: SharedString,
     /// `useEnvironmentHttpBaseUrl`, and the session that reads `/api/connect/link-state`.
     endpoint: Option<crate::backend::Endpoint>,
     workspace: WeakEntity<Workspace>,
@@ -45,7 +49,13 @@ impl WebhookContext {
     /// `environment` is the one the task lives on, whose address the webhook URL uses.
     pub(super) fn new(client: RpcClient, environment: &str, workspace: &Entity<Workspace>, cx: &App) -> Self {
         let endpoint = workspace.read(cx).env_endpoint(environment).cloned();
-        Self { client, endpoint, workspace: workspace.downgrade() }
+        Self { client, environment: environment.to_owned().into(), endpoint, workspace: workspace.downgrade() }
+    }
+
+    /// `permissionAtom`: this connection may send `method` to the task's environment.
+    fn permits(&self, method: &str, cx: &App) -> bool {
+        let workspace = self.workspace.upgrade();
+        workspace.is_some_and(|w| w.read(cx).environment_permits(&self.environment, method, &json!({})))
     }
 }
 
@@ -285,7 +295,7 @@ impl WebhookFields {
         let client = self.context.client.clone();
         self.rotating = true;
         cx.spawn_in(window, async move |this, cx| {
-            let result = client.request("scheduledTasks.rotateWebhookToken", json!({"id": id})).await;
+            let result = client.request(ROTATE, json!({"id": id})).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.rotating = false;
                 match result {
@@ -320,7 +330,7 @@ impl WebhookFields {
                     .child(
                         outline_button("webhook-url-rotate")
                             .label("Rotate")
-                            .disabled(self.rotating || self.disabled)
+                            .disabled(self.rotating || self.disabled || !self.context.permits(ROTATE, cx))
                             .on_click(cx.listener(|this, _, window, cx| this.confirm_rotate(window, cx))),
                     ),
             )

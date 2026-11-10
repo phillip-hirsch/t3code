@@ -5,7 +5,7 @@
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::{ClipboardItem, Context, SharedString, Window};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::{Target, Workspace, new_id};
 use crate::model::RepositoryIdentity;
@@ -13,6 +13,7 @@ use crate::thread_pull_requests::ReferenceCopy;
 
 /// `TRIAGE_CLI_COMMAND`: triage from a terminal on the machine.
 pub(super) const TRIAGE_CLI: &str = "npx t3 triage";
+const PREPARE_TRIAGE: &str = "server.prepareTriage";
 
 /// `isTriagePrompt`: a draft is a triage draft while its message still links the playbook file
 /// (`TRIAGE_PROMPT_FILE_NAME`).
@@ -101,6 +102,12 @@ impl Workspace {
         .detach();
     }
 
+    /// `canTriage`: the environment supports triage and this connection may operate there.
+    pub(super) fn can_triage(&self) -> bool {
+        self.server_info().capability("triage")
+            && self.active_environment().is_some_and(|env| self.env_permits(env, PREPARE_TRIAGE, &Value::Null))
+    }
+
     /// `useStartTriage`: the server prepares a triage session, then a No project draft opens
     /// with its playbook linked.
     pub(super) fn start_triage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -127,13 +134,13 @@ impl Workspace {
             "appVersion": env!("CARGO_PKG_VERSION"),
         }});
         cx.spawn_in(window, async move |this, cx| {
-            let result = client.request("server.prepareTriage", input).await;
+            let result = client.request(PREPARE_TRIAGE, input).await;
             let _ = this.update_in(cx, |this, window, cx| match result {
                 Ok(value) => {
                     let prompt = value["prompt"].as_str().map(str::to_owned);
                     this.start_scratch_thread(environment, prompt, window, cx);
                 }
-                Err(error) => toast_error("Could not start triage", fail(&error.to_string()), window, cx),
+                Err(error) => toast_error("Could not start triage", fail(&error.message()), window, cx),
             });
         })
         .detach();

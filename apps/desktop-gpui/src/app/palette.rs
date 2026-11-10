@@ -1232,7 +1232,7 @@ impl Workspace {
             self.bind_shortcut(&mut row, "chat.newWithoutProject");
             rows.push(row);
         }
-        if self.server_info().capability("triage") {
+        if self.can_triage() {
             let mut row = lucide("triage", IconName::Bug, "Triage an issue", Run::Triage);
             row.description =
                 Some(Description::Text("An agent investigates a T3 Code problem and helps file an issue".into()));

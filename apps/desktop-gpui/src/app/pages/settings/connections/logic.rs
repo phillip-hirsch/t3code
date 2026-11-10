@@ -4,6 +4,7 @@
 
 use serde_json::Value;
 
+use crate::rpc_permissions::legacy_parent;
 use crate::timestamp::parse_ms;
 
 pub(in crate::app::pages::settings) const ORCHESTRATION_READ: &str = "orchestration:read";
@@ -69,17 +70,6 @@ pub(in crate::app) const STANDARD_SCOPES: &[&str] = &[
 
 /// The "Read only" preset of the create-link dialog.
 pub(super) const READ_ONLY_SCOPES: &[&str] = &[ORCHESTRATION_READ, FILESYSTEM_READ, DIAGNOSTICS_READ, TERMINAL_READ];
-
-/// Older servers grant these through a broader parent scope (`legacyParents` in `auth.ts`).
-fn legacy_parent(scope: &str) -> Option<&'static str> {
-    Some(match scope {
-        FILESYSTEM_READ | DIAGNOSTICS_READ => ORCHESTRATION_READ,
-        SETTINGS_WRITE | PROVIDERS_MANAGE | ENVIRONMENT_MAINTAIN | PREVIEW_OPERATE | SOURCE_CONTROL_WRITE
-        | FILESYSTEM_WRITE => ORCHESTRATION_OPERATE,
-        TERMINAL_READ => TERMINAL_OPERATE,
-        _ => return None,
-    })
-}
 
 /// `GET /api/auth/session` (`AuthSessionState`).
 #[derive(Clone, Debug, Default, PartialEq)]
