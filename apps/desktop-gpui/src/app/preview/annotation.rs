@@ -3,19 +3,19 @@
 //! draft (`PreviewChromeRow`'s pick button, `handlePickElement` in `PreviewView.tsx`).
 //!
 //! The overlay is `PickPreload.ts` as a page script (`annotation/picker.js`) without its voice
-//! input; it reports over wry's IPC with a session nonce. The screenshot is read off the screen
-//! like the camera's (`capture.rs`) once the overlay has hidden its own chrome.
+//! input; it reports over wry's IPC with a session nonce. The screenshot is read like the
+//! camera's (`capture.rs`) once the overlay has hidden its own chrome.
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{ButtonCustomVariant, ButtonVariants as _};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::prelude::FluentBuilder as _;
-use gpui_kit::{AnyElement, App, Bounds, Context, FocusHandle, IntoElement as _, Window, point, px, size};
+use gpui_kit::{AnyElement, App, Bounds, Context, FocusHandle, IntoElement as _, Pixels, Window, point, px, size};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::capture::{self, ScreenRect};
+use super::capture;
 use super::icon_button;
 use crate::app::send::Intent;
 use crate::app::{Target, Workspace};
@@ -537,37 +537,39 @@ impl Workspace {
             PickMessage::Submit(submission) => submission,
         };
         pick.capturing = true;
-        let rect = crop_area(submission.crop, submission.viewport, &submission.annotation.target_rects())
-            .and_then(|area| self.annotation_screen_rect(tab, area, submission.viewport, window, cx));
+        let crop = crop_area(submission.crop, submission.viewport, &submission.annotation.target_rects())
+            .and_then(|area| self.annotation_view_area(tab, area, submission.viewport, cx));
         let session = session.to_owned();
-        let shot = cx.background_executor().spawn(async move { rect.map(capture::grab_png) });
+        let shot = crop.and_then(|crop| self.read_page(tab, Some(crop), window, cx, |image| capture::png(&image)));
         cx.spawn_in(window, async move |this, cx| {
-            let shot = shot.await;
+            let shot = match shot {
+                Some(shot) => Some(shot.await),
+                None => None,
+            };
             let _ = this
                 .update_in(cx, |this, window, cx| this.annotation_captured(&session, *submission, shot, window, cx));
         })
         .detach();
     }
 
-    /// Where `area` of the tab's viewport is on screen.
-    fn annotation_screen_rect(
+    /// Where `area` of the tab's viewport is in its view, in the view's pixels.
+    fn annotation_view_area(
         &self,
         tab: &TabRef,
         area: Rect,
         (width, _): (f64, f64),
-        window: &Window,
-        cx: &mut App,
-    ) -> Option<ScreenRect> {
+        cx: &App,
+    ) -> Option<Bounds<Pixels>> {
         let bounds = self.preview.tabs.get(tab).filter(|hosted| hosted.shown)?.view.read(cx).bounds();
-        let page = self.page_window(tab, window, cx)?;
         // The page's CSS pixels to the view's, through its zoom.
         #[expect(clippy::cast_possible_truncation, reason = "on-screen sizes fit in an f32")]
         let scale = (f64::from(f32::from(bounds.size.width)) / width) as f32;
         #[expect(clippy::cast_possible_truncation, reason = "on-screen sizes fit in an f32")]
         let pixels = |value: f64| px(value as f32 * scale);
-        let origin = point(bounds.origin.x + pixels(area.x), bounds.origin.y + pixels(area.y));
-        let area = Bounds { origin, size: size(pixels(area.width), pixels(area.height)) };
-        page.screen_rect(area)
+        Some(Bounds {
+            origin: point(pixels(area.x), pixels(area.y)),
+            size: size(pixels(area.width), pixels(area.height)),
+        })
     }
 
     /// The screenshot was read (or not): the overlay goes, and the annotation joins the draft.

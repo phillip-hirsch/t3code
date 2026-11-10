@@ -2,22 +2,29 @@
 //! recording (`PreviewChromeRow`'s capture button, `handleCapture` in `PreviewView.tsx` and
 //! `browserRecording.ts`).
 //!
-//! Native WebViews have no DevTools protocol and wry has no snapshot API, so both read the tab's
-//! pixels off the screen with xcap. Recordings are encoded to AV1 `WebM` on their own thread
-//! (`encode.rs`); the page draws the cursor and the key and mouse press overlays itself
-//! (`recording.js`, after `RecordingCursor.ts`), since a screen capture has neither. Files land in
-//! `<T3 home>/userdata/browser-artifacts`, as Electron's do.
+//! Native WebViews have no DevTools protocol and wry has no snapshot API, so on Windows and macOS
+//! both read the tab's pixels off the screen with xcap; Linux reads `WebKitGTK`'s own snapshot of
+//! the page (`snapshot.rs`), which windows over it don't spoil. Recordings are encoded to AV1
+//! `WebM` on their own thread (`encode.rs`); the page draws the cursor and the key and mouse press
+//! overlays itself (`recording.js`, after `RecordingCursor.ts`), since a capture has neither. Files
+//! land in `<T3 home>/userdata/browser-artifacts`, as Electron's do.
 
 mod encode;
+#[cfg(target_os = "linux")]
+mod snapshot;
 mod webm;
 
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+#[cfg(not(target_os = "linux"))]
+use std::sync::mpsc::TrySendError;
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(not(target_os = "linux"))]
+use gpui_kit::Point;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_kit::component::notification::{Notification, NotificationType};
@@ -25,7 +32,7 @@ use gpui_kit::component::{Disableable as _, Sizable as _, WindowExt as _, h_flex
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, Image, ImageFormat, IntoElement as _,
-    ParentElement as _, Pixels, Point, SharedString, Styled as _, Task, Window, div, px,
+    ParentElement as _, Pixels, SharedString, Styled as _, Task, Window, div, px,
 };
 use image::RgbaImage;
 use serde_json::json;
@@ -68,6 +75,9 @@ struct Recording {
     /// Frame requests to the recording thread; dropping it stops the recording.
     frames: Option<SyncSender<FrameRequest>>,
     started: Instant,
+    /// A frame's snapshot is being taken; the next waits for it.
+    #[cfg(target_os = "linux")]
+    snapshotting: Rc<Cell<bool>>,
     _pump: Task<()>,
 }
 
@@ -81,6 +91,7 @@ impl Captures {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 /// A rectangle on screen in xcap's units: physical pixels on Windows and X11, points on macOS.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ScreenRect {
@@ -90,6 +101,7 @@ pub(super) struct ScreenRect {
     height: u32,
 }
 
+#[cfg(not(target_os = "linux"))]
 /// The screen rectangle of a view at `view` in a window whose content starts at `origin`, both
 /// in GPUI pixels, at `units` screen units per pixel.
 pub(super) fn screen_rect(origin: Point<Pixels>, view: Bounds<Pixels>, units: f32) -> Option<ScreenRect> {
@@ -103,6 +115,7 @@ pub(super) fn screen_rect(origin: Point<Pixels>, view: Bounds<Pixels>, units: f3
     (width > 0 && height > 0).then_some(ScreenRect { x, y, width, height })
 }
 
+#[cfg(not(target_os = "linux"))]
 /// The screen's pixels under `rect`, opaque, from the display under its center and clipped to it.
 fn grab(rect: ScreenRect) -> Result<RgbaImage, String> {
     let center_x = rect.x.saturating_add_unsigned(rect.width / 2);
@@ -186,9 +199,8 @@ struct Screenshot {
     png: Arc<[u8]>,
 }
 
-/// The screen's pixels under `rect` as a PNG.
-pub(super) fn grab_png(rect: ScreenRect) -> Result<Vec<u8>, String> {
-    let image = grab(rect)?;
+/// `image` as a PNG.
+pub(super) fn png(image: &RgbaImage) -> Result<Vec<u8>, String> {
     let mut png = Vec::new();
     image
         .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
@@ -196,12 +208,14 @@ pub(super) fn grab_png(rect: ScreenRect) -> Result<Vec<u8>, String> {
     Ok(png)
 }
 
+#[cfg(not(target_os = "linux"))]
 /// Screen units per GPUI pixel in `window`, as xcap counts them.
 pub(super) fn screen_units(window: &Window) -> f32 {
     // A GPUI pixel is `ui_scale` points; the scale factor already includes it.
     if cfg!(target_os = "macos") { window.ui_scale() } else { window.scale_factor() }
 }
 
+#[cfg(not(target_os = "linux"))]
 /// Where the window's content starts, in GPUI pixels: its bounds stay in the platform's logical
 /// pixels while the interface zoom (`Window::ui_scale`) shrinks GPUI's.
 pub(super) fn content_origin(window: &Window) -> Point<Pixels> {
@@ -209,6 +223,7 @@ pub(super) fn content_origin(window: &Window) -> Point<Pixels> {
     gpui_kit::point(px(f32::from(origin.x) / scale), px(f32::from(origin.y) / scale))
 }
 
+#[cfg(not(target_os = "linux"))]
 /// The window a page is drawn in, as capture reads it.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct PageWindow {
@@ -217,6 +232,7 @@ pub(super) struct PageWindow {
     active: bool,
 }
 
+#[cfg(not(target_os = "linux"))]
 impl PageWindow {
     fn of(window: &Window) -> Self {
         Self { origin: content_origin(window), units: screen_units(window), active: window.is_window_active() }
@@ -229,8 +245,8 @@ impl PageWindow {
 }
 
 /// `captureScreenshot`: `browser-screenshot-<site>-<time>-<id>.png`.
-fn save_screenshot(rect: ScreenRect, url: &str) -> Result<Screenshot, String> {
-    let png = grab_png(rect)?;
+fn save_screenshot(image: &RgbaImage, url: &str) -> Result<Screenshot, String> {
+    let png = png(image)?;
     let id = uuid::Uuid::new_v4().simple().to_string();
     let name = format!("browser-screenshot-{}-{}-{}.png", site_slug(url), base36(now_millis()), &id[..8]);
     let path = save_artifact(&name, &png)?;
@@ -239,8 +255,34 @@ fn save_screenshot(rect: ScreenRect, url: &str) -> Result<Screenshot, String> {
 
 /// What the recording thread is asked to capture, and when, from the recording's start.
 struct FrameRequest {
-    rect: ScreenRect,
+    pixels: FramePixels,
     at: Duration,
+}
+
+/// The screen area the recording thread reads.
+#[cfg(not(target_os = "linux"))]
+type FramePixels = ScreenRect;
+/// The page's snapshot, taken on the main thread.
+#[cfg(target_os = "linux")]
+type FramePixels = Result<RgbaImage, String>;
+
+/// Marks a recording frame's snapshot in flight until it lands or is dropped.
+#[cfg(target_os = "linux")]
+struct InFlight(Rc<Cell<bool>>);
+
+#[cfg(target_os = "linux")]
+impl InFlight {
+    fn start(flag: &Rc<Cell<bool>>) -> Self {
+        flag.set(true);
+        Self(flag.clone())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
 }
 
 enum RecorderEvent {
@@ -277,7 +319,11 @@ fn record(
     let mut encoder: Option<Encoder> = None;
     let mut last = Duration::ZERO;
     while let Ok(request) = requests.recv() {
-        let image = match grab(request.rect) {
+        #[cfg(not(target_os = "linux"))]
+        let pixels = grab(request.pixels);
+        #[cfg(target_os = "linux")]
+        let pixels = request.pixels;
+        let image = match pixels {
             Ok(image) => image,
             Err(error) if encoder.is_none() => return RecorderEvent::Started(Err(error)),
             Err(error) => {
@@ -457,7 +503,8 @@ impl Workspace {
 
     /// The window `tab`'s page is drawn in: its separate window once it popped out, else the
     /// main window, `window`.
-    pub(super) fn page_window(&self, tab: &TabRef, window: &Window, cx: &mut App) -> Option<PageWindow> {
+    #[cfg(not(target_os = "linux"))]
+    fn page_window(&self, tab: &TabRef, window: &Window, cx: &mut App) -> Option<PageWindow> {
         match self.separate_window(tab) {
             Some(separate) => separate.update(cx, |_, window, _| PageWindow::of(window)).ok(),
             None => Some(PageWindow::of(window)),
@@ -465,18 +512,62 @@ impl Workspace {
     }
 
     /// Where a shown tab's page is on screen, and whether its window is active.
+    #[cfg(not(target_os = "linux"))]
     fn capture_rect(&self, tab: &TabRef, window: &Window, cx: &mut App) -> Option<(ScreenRect, bool)> {
         let bounds = self.capture_tab(tab).filter(|hosted| hosted.shown)?.view.read(cx).bounds();
         let page = self.page_window(tab, window, cx)?;
         Some((page.screen_rect(bounds)?, page.active))
     }
 
+    /// Reads `crop` of a shown tab's page (in its view's pixels; all of it without one), then
+    /// runs `then` on the pixels off the main thread. `None` when the tab isn't shown.
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn read_page<T: Send + 'static>(
+        &self,
+        tab: &TabRef,
+        crop: Option<Bounds<Pixels>>,
+        window: &Window,
+        cx: &mut App,
+        then: impl FnOnce(RgbaImage) -> Result<T, String> + Send + 'static,
+    ) -> Option<Task<Result<T, String>>> {
+        let bounds = self.capture_tab(tab).filter(|hosted| hosted.shown)?.view.read(cx).bounds();
+        let area = crop.map_or(bounds, |crop| Bounds { origin: bounds.origin + crop.origin, size: crop.size });
+        let rect = self.page_window(tab, window, cx)?.screen_rect(area)?;
+        Some(cx.background_executor().spawn(async move { grab(rect).and_then(then) }))
+    }
+
+    /// Reads `crop` of a shown tab's page (in its view's pixels; all of it without one), then
+    /// runs `then` on the pixels off the main thread. `None` when the tab isn't shown.
+    #[cfg(target_os = "linux")]
+    pub(super) fn read_page<T: Send + 'static>(
+        &self,
+        tab: &TabRef,
+        crop: Option<Bounds<Pixels>>,
+        _window: &Window,
+        cx: &mut App,
+        then: impl FnOnce(RgbaImage) -> Result<T, String> + Send + 'static,
+    ) -> Option<Task<Result<T, String>>> {
+        let view = self.capture_tab(tab).filter(|hosted| hosted.shown)?.view.read(cx);
+        let width = f32::from(view.bounds().size.width);
+        let (sender, received) = async_channel::bounded(1);
+        snapshot::snapshot(view.raw(), move |image| {
+            let _ = sender.try_send(image);
+        });
+        Some(cx.background_executor().spawn(async move {
+            let image = received.recv().await.map_err(|_| "The page closed before its snapshot.".to_owned())??;
+            match crop {
+                Some(area) => snapshot::crop(&image, width, area),
+                None => Ok(image),
+            }
+            .and_then(then)
+        }))
+    }
+
     fn take_screenshot(&mut self, tab: &TabRef, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((rect, _)) = self.capture_rect(tab, window, cx) else {
+        let url = self.capture_tab(tab).and_then(|hosted| hosted.status.url()).unwrap_or_default().to_owned();
+        let Some(saved) = self.read_page(tab, None, window, cx, move |image| save_screenshot(&image, &url)) else {
             return error_toast(window, cx, "Unable to capture screenshot", "Show the browser tab to capture it.");
         };
-        let url = self.capture_tab(tab).and_then(|hosted| hosted.status.url()).unwrap_or_default().to_owned();
-        let saved = cx.background_executor().spawn(async move { save_screenshot(rect, &url) });
         cx.spawn_in(window, async move |_, cx| {
             let saved = saved.await;
             let _ = cx.update(|window, cx| match saved {
@@ -493,7 +584,7 @@ impl Workspace {
             let description = "Another browser tab is being recorded. Stop that recording first.";
             return error_toast(window, cx, "Unable to start recording", description);
         }
-        if self.capture_rect(tab, window, cx).is_none() {
+        if self.capture_tab(tab).is_none_or(|hosted| !hosted.shown) {
             return error_toast(window, cx, "Unable to start recording", "Show the browser tab to record it.");
         }
         let settings = &self.client_settings.values;
@@ -534,6 +625,8 @@ impl Workspace {
             overlay,
             frames: Some(frames),
             started: Instant::now(),
+            #[cfg(target_os = "linux")]
+            snapshotting: Rc::default(),
             _pump: pump,
         });
         self.recording_page_loaded(tab, cx);
@@ -549,13 +642,45 @@ impl Workspace {
             self.stop_recording(cx);
             return false;
         }
-        // A hidden or covered tab skips frames, and so does an inactive window, whose page other
-        // windows may cover on screen; the video holds its last frame.
-        if let Some((rect, true)) = self.capture_rect(&tab, window, cx)
-            && let Err(TrySendError::Disconnected(_)) = frames.try_send(FrameRequest { rect, at: started.elapsed() })
-        {
-            return false;
-        }
+        self.request_frame(&tab, &frames, started.elapsed(), window, cx)
+    }
+
+    /// Asks the recording thread to read the tab's screen area; `false` once it stopped. A hidden
+    /// or covered tab skips frames, and so does an inactive window, whose page other windows may
+    /// cover on screen; the video holds its last frame.
+    #[cfg(not(target_os = "linux"))]
+    fn request_frame(
+        &self,
+        tab: &TabRef,
+        frames: &SyncSender<FrameRequest>,
+        at: Duration,
+        window: &Window,
+        cx: &mut App,
+    ) -> bool {
+        let Some((rect, true)) = self.capture_rect(tab, window, cx) else { return true };
+        !matches!(frames.try_send(FrameRequest { pixels: rect, at }), Err(TrySendError::Disconnected(_)))
+    }
+
+    /// Snapshots the tab's page for the recording thread, one frame at a time; a hidden tab skips
+    /// frames and the video holds its last one.
+    #[cfg(target_os = "linux")]
+    fn request_frame(
+        &self,
+        tab: &TabRef,
+        frames: &SyncSender<FrameRequest>,
+        at: Duration,
+        _window: &Window,
+        cx: &mut App,
+    ) -> bool {
+        let Some(recording) = self.preview.capture.recording.as_ref() else { return false };
+        let Some(hosted) = self.capture_tab(tab).filter(|hosted| hosted.shown && !recording.snapshotting.get()) else {
+            return true;
+        };
+        let (in_flight, frames) = (InFlight::start(&recording.snapshotting), frames.clone());
+        snapshot::snapshot(hosted.view.read(cx).raw(), move |pixels| {
+            drop(in_flight);
+            let _ = frames.try_send(FrameRequest { pixels, at });
+        });
         true
     }
 
@@ -619,10 +744,11 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui_kit::{point, size};
 
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn screen_rects_scale_the_window_and_view_offsets() {
+        use gpui_kit::{point, size};
         let view = Bounds { origin: point(px(10.), px(40.5)), size: size(px(300.), px(200.)) };
         let rect = screen_rect(point(px(100.), px(50.)), view, 2.).expect("on screen");
         assert_eq!(rect, ScreenRect { x: 220, y: 181, width: 600, height: 400 });
