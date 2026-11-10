@@ -672,10 +672,13 @@ impl MarkdownPlugin for CitationChips {
         node: &gpui_kit::component::text::markdown_ast::Node,
         cx: &MarkdownParseContext<'_>,
     ) -> Option<MarkdownNode> {
-        let gpui_kit::component::text::markdown_ast::Node::Link(link) = node else { return None };
-        let citation = crate::assistant_citations::parse_href(&link.url)?;
+        let (url, _) = link_destination(node, cx)?;
+        let citation = crate::assistant_citations::parse_href(url)?;
         let label = citation.label();
-        let markdown = cx.node_source(node).map_or_else(|| citation.markdown(), str::to_owned);
+        let source = matches!(node, gpui_kit::component::text::markdown_ast::Node::Link(_))
+            .then(|| cx.node_source(node))
+            .flatten();
+        let markdown = source.map_or_else(|| citation.markdown(), str::to_owned);
         Some(MarkdownNode::new("t3-citation", citation).text(label).markdown(markdown))
     }
 
@@ -852,6 +855,34 @@ pub(super) fn link_text(nodes: &[gpui_kit::component::text::markdown_ast::Node])
         .collect()
 }
 
+/// A link's destination and text: an inline link's own, or a reference's (`[text][ref]`) from
+/// its definition, as the web's `a` gets the resolved `href`.
+pub(super) fn link_destination<'a>(
+    node: &'a gpui_kit::component::text::markdown_ast::Node,
+    cx: &MarkdownParseContext<'a>,
+) -> Option<(&'a str, &'a [gpui_kit::component::text::markdown_ast::Node])> {
+    use gpui_kit::component::text::markdown_ast::Node;
+    match node {
+        Node::Link(link) => Some((&link.url, &link.children)),
+        Node::LinkReference(link) => Some((cx.definition(&link.identifier)?, &link.children)),
+        _ => None,
+    }
+}
+
+/// What copying a link keeps: its source, or for a reference, which reads as nothing without
+/// its definition, an inline link to where it points.
+fn link_markdown(
+    node: &gpui_kit::component::text::markdown_ast::Node,
+    cx: &MarkdownParseContext<'_>,
+    url: &str,
+    children: &[gpui_kit::component::text::markdown_ast::Node],
+) -> String {
+    match node {
+        gpui_kit::component::text::markdown_ast::Node::Link(_) => cx.node_source(node).unwrap_or_default().to_owned(),
+        _ => format!("[{}](<{}>)", escape_link_text(&link_text(children)), url.replace('<', "\\<").replace('>', "\\>")),
+    }
+}
+
 /// A Markdown link to a file: its destination, and its text unless that text is the path.
 fn file_link(text: &str, url: &str) -> Option<(file_links::FilePosition, Option<String>)> {
     let file = file_links::parse_file_link(url)?;
@@ -987,24 +1018,23 @@ impl MarkdownPlugin for FileChips {
         cx: &MarkdownParseContext<'_>,
     ) -> Option<MarkdownNode> {
         use gpui_kit::component::text::markdown_ast::Node;
-        let (path, file, after_text) = match node {
+        let (path, file, after_text, markdown) = match node {
             Node::InlineCode(code) => {
                 let candidate = file_links::inline_code_candidate(&code.value)?;
                 let file = file_links::split_position(&candidate, "");
-                (candidate, file, false)
+                (candidate, file, false, cx.node_source(node).unwrap_or_default().to_owned())
             }
-            Node::Link(link)
-                if !link.url.starts_with(SKILL_SCHEME)
-                    && !link.url.starts_with(MODEL_SCHEME)
-                    && !link.url.starts_with("t3-thread:") =>
-            {
-                let (file, description) = file_link(&link_text(&link.children), &link.url)?;
-                (file_links::with_position(&file), file, description.is_some())
+            _ => {
+                let (url, children) = link_destination(node, cx)?;
+                if [SKILL_SCHEME, MODEL_SCHEME, "t3-thread:"].iter().any(|scheme| url.starts_with(scheme)) {
+                    return None;
+                }
+                let (file, description) = file_link(&link_text(children), url)?;
+                let markdown = link_markdown(node, cx, url, children);
+                (file_links::with_position(&file), file, description.is_some(), markdown)
             }
-            _ => return None,
         };
         let label = file_links::chip_label(&file, &self.suffixes.of(cx.source()));
-        let markdown = cx.node_source(node).unwrap_or_default().to_owned();
         // The space the web puts between a link's text and its chip.
         let text = if after_text { format!(" {label}") } else { label.clone() };
         let node =
@@ -1155,13 +1185,13 @@ impl MarkdownPlugin for ThreadChips {
         node: &gpui_kit::component::text::markdown_ast::Node,
         cx: &MarkdownParseContext<'_>,
     ) -> Option<MarkdownNode> {
-        let gpui_kit::component::text::markdown_ast::Node::Link(link) = node else { return None };
-        let parsed = crate::thread_links::parse(&link.url)?;
-        let written = link_text(&link.children);
+        let (url, children) = link_destination(node, cx)?;
+        let parsed = crate::thread_links::parse(url)?;
+        let written = link_text(children);
         // An autolink's text is its own URL, which is no label.
         let label = (!written.is_empty() && crate::thread_links::parse(&written).is_none()).then_some(written);
         let text = label.clone().unwrap_or_else(|| "Thread".to_owned());
-        let markdown = cx.node_source(node).unwrap_or_default().to_owned();
+        let markdown = link_markdown(node, cx, url, children);
         Some(MarkdownNode::new("t3-thread", ThreadChip { link: parsed, label }).text(text).markdown(markdown))
     }
 
@@ -1859,6 +1889,45 @@ mod tests {
         assert_eq!(workspace_relative("/repo/src/../x.rs", Some("/repo")).as_deref(), Some("src/../x.rs"));
         // Lowercasing the Kelvin sign changes its byte length; this sliced inside it.
         assert_eq!(workspace_relative("/repo/\u{212A}/a.rs", Some("/repo/k")), None);
+    }
+
+    #[test]
+    fn reference_links_draw_the_chip_their_definition_names() {
+        use gpui_base::text::editor_host::{BlockNode, parse_markdown};
+        use gpui_kit::component::text::MarkdownExtensions;
+        let workspace = WeakEntity::new_invalid();
+        let files = FileChips {
+            workspace: workspace.clone(),
+            pane: ChatPane::Main,
+            dark: false,
+            folder_color: Hsla::default(),
+            cwd: Some("/repo".into()),
+            kinds: Arc::default(),
+            suffixes: ParentSuffixes::default(),
+        };
+        let extensions = MarkdownExtensions::default()
+            .plugin(CitationChips { workspace: workspace.clone(), pane: ChatPane::Main })
+            .plugin(ThreadChips { workspace: workspace.clone() })
+            .plugin(files)
+            .plugin(super::super::external_links::LinkMarks { workspace });
+        let citation = "t3-citation://v1/a/b/c?text=quote&start=0&end=5&prefix=&suffix=";
+        let source = format!(
+            "[quote][C] [impl][f] [chat][t] [docs][w]\n\n[c]: {citation}\n[f]: src/main.rs:12\n\
+             [t]: t3-thread://v1/abc\n[w]: https://example.com"
+        );
+        let blocks = parse_markdown(&source, std::sync::Arc::new(extensions)).unwrap();
+        let BlockNode::Paragraph(paragraph) = &blocks[0] else { panic!("a paragraph") };
+        let custom: Vec<_> = paragraph.children().iter().filter_map(|node| node.as_custom()).collect();
+        assert_eq!(
+            custom.iter().map(|node| node.name()).collect::<Vec<_>>(),
+            ["t3-citation", "t3-file", "t3-thread", "t3-link-mark"]
+        );
+        let quote = custom[0].data::<crate::assistant_citations::AssistantCitation>().unwrap();
+        assert_eq!(quote.text, "quote");
+        let file = custom[1].data::<FileChip>().unwrap();
+        assert_eq!((file.path.as_str(), file.line, file.after_text), ("src/main.rs:12", Some(12), true));
+        let thread = custom[2].data::<ThreadChip>().unwrap();
+        assert_eq!((thread.link.thread_id.as_str(), thread.label.as_deref()), ("abc", Some("chat")));
     }
 
     #[test]
