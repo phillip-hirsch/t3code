@@ -247,6 +247,7 @@ impl Workspace {
         let config_known = !session.server_info.config.is_null();
         session.shell_waits_for_config = !config_known;
         self.resume_file_saves(&environment_id, cx);
+        self.retry_failed_embeds(&environment_id, window, cx);
         let config = client
             .stream("subscribeServerConfig", json!({"workspaceSnapshotsOnDemand": true, "environmentThemes": true}));
         let id = environment_id.clone();
