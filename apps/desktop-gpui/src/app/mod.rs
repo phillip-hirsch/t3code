@@ -1235,6 +1235,7 @@ impl Render for Workspace {
         self.sync_servers(window, cx);
         self.sync_load_balancing(cx);
         self.sync_automations(window, cx);
+        self.sync_lineage_tick(window, cx);
         let right_panel = self.render_right_panel(window, cx);
         let mini_player = self.render_preview_mini_player(window, cx);
         self.sync_preview_views(window, cx);

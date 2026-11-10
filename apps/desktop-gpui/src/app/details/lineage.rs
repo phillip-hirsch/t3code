@@ -299,10 +299,13 @@ impl Workspace {
         }))
     }
 
-    /// Keeps a once-a-second repaint alive while an open workflow row shows a running time.
-    pub(super) fn sync_lineage_tick(&mut self, cx: &mut Context<Self>) {
+    /// Keeps a once-a-second repaint alive while the shown card's open workflow row shows a
+    /// running time; called each render.
+    pub(in crate::app) fn sync_lineage_tick(&mut self, window: &Window, cx: &mut Context<Self>) {
         let open = &self.lineage.open_workflows;
         let ticks = !open.is_empty()
+            && self.details_shown(window)
+            && self.details_item_shown("lineage")
             && self.open_relationships().is_some_and(|relationships| {
                 relationships
                     .active
@@ -327,7 +330,6 @@ impl Workspace {
 
     /// Reads the titles of related threads the shell leaves out, once each.
     pub(in crate::app) fn sync_lineage_titles(&mut self, cx: &mut Context<Self>) {
-        self.sync_lineage_tick(cx);
         let Some(Target::Thread { env, id }) = &self.target else { return };
         let Some(thread) = self.shell.threads.iter().find(|thread| &thread.id == id) else { return };
         let parent = thread.lineage.parent_thread_id.as_deref();

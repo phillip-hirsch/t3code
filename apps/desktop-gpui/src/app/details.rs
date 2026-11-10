@@ -1568,7 +1568,6 @@ impl Workspace {
             if !this.lineage.open_workflows.remove(&toggle_id) {
                 this.lineage.open_workflows.insert(toggle_id.clone());
             }
-            this.sync_lineage_tick(cx);
             cx.notify();
         }));
         let line = colors.divider;
@@ -1978,7 +1977,6 @@ fn phase_header(
     )
     .on_click(cx.listener(move |this, _, _, cx| {
         this.lineage.phase_open.insert(key.clone(), !open);
-        this.sync_lineage_tick(cx);
         cx.notify();
     }))
 }
