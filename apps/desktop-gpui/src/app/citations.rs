@@ -1012,8 +1012,8 @@ mod tests {
         let markdown = citation.markdown();
         let text = format!("see {markdown} and [a](https://example.com)");
         let content = citation_content(&text);
-        let ranges: Vec<_> = content.tokens().iter().map(|span| span.range()).collect();
-        assert_eq!(ranges, [4..4 + markdown.len()], "only the citation is a chip");
+        let ranges: Vec<_> = content.tokens().iter().map(gpui_kit::base::input::InlineTokenSpan::range).collect();
+        assert_eq!(ranges, vec![4..4 + markdown.len()], "only the citation is a chip");
     }
 
     #[test]
