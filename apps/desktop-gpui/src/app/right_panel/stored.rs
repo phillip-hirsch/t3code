@@ -199,6 +199,7 @@ mod tests {
             size: 12,
         };
         let reference = crate::pull_request_detail::Reference {
+            environment_id: "env".into(),
             project_id: "p".into(),
             host: Some("github.com".into()),
             repository: "o/r".into(),

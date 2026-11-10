@@ -368,10 +368,10 @@ impl Workspace {
 
     /// Reads one page of the diff; the first page replaces what was loaded.
     fn read_pr_diff(&mut self, cursor: Option<String>, cx: &mut Context<Self>) {
-        let Some(project_id) = self.pull_requests.panel.as_ref().map(|p| p.reference.project_id.clone()) else {
+        let Some(environment) = self.pull_requests.panel.as_ref().map(|p| p.reference.environment_id.clone()) else {
             return;
         };
-        let endpoint = self.project_endpoint(&project_id).cloned();
+        let endpoint = self.env_endpoint(&environment).cloned();
         let Some(panel) = self.pull_requests.panel.as_mut() else { return };
         let key = panel.reference.key();
         let mut input = panel.reference.to_json();

@@ -162,8 +162,10 @@ impl RefSearch {
     }
 }
 
-/// One row of the branch picker: a ref, or "Create new ref".
+/// One row of the branch picker: "Checkout pull request" for the reference the search names, a
+/// ref, or "Create new ref".
 enum BranchItem {
+    Checkout(String),
     Ref(Value),
     Create(String),
 }
@@ -242,6 +244,7 @@ impl Workspace {
                         self.select_branch(name, window, cx);
                     }
                     Some(BranchItem::Create(name)) => self.create_branch(name, cx),
+                    Some(BranchItem::Checkout(reference)) => self.pick_checkout_item(reference, window, cx),
                     None => return false,
                 }
             }
@@ -251,8 +254,9 @@ impl Workspace {
         true
     }
 
-    /// The picker's rows: its loaded refs that match the search, then "Create new ref" when no
-    /// ref has that exact name (`branchPickerItems`, `shouldIncludeBranchPickerItem`).
+    /// The picker's rows: "Checkout pull request" when the search names one and the draft can
+    /// check it out, its loaded refs that match the search, then "Create new ref" when no ref has
+    /// that exact name (`branchPickerItems`, `shouldIncludeBranchPickerItem`).
     fn branch_items(&self) -> Vec<BranchItem> {
         let state = &self.draft_workspace;
         let (_, worktree_base, _) = self.branch_trigger();
@@ -262,14 +266,31 @@ impl Workspace {
         let exact = refs.iter().any(|r| r["name"].as_str() == Some(state.branch_pages.query.as_str()));
         let create =
             (!query.is_empty() && !exact && !worktree_base).then(|| BranchItem::Create(state.branch_query.clone()));
-        refs.into_iter()
-            .filter(|r| {
-                let name = r["name"].as_str().unwrap_or_default().to_lowercase();
-                query.is_empty() || name.contains(&query) || name.contains(&sanitized)
-            })
-            .map(|r| BranchItem::Ref(r.clone()))
+        let checkout = self
+            .can_checkout_pull_request()
+            .then(|| crate::pull_request_checkout::parse_reference(&state.branch_query))
+            .flatten()
+            .map(BranchItem::Checkout);
+        checkout
+            .into_iter()
+            .chain(
+                refs.into_iter()
+                    .filter(|r| {
+                        let name = r["name"].as_str().unwrap_or_default().to_lowercase();
+                        query.is_empty() || name.contains(&query) || name.contains(&sanitized)
+                    })
+                    .map(|r| BranchItem::Ref(r.clone())),
+            )
             .chain(create)
             .collect()
+    }
+
+    /// "Checkout pull request" picked: the picker closes, the composer takes focus, and the
+    /// checkout dialog opens on the reference.
+    fn pick_checkout_item(&mut self, reference: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.draft_workspace.branch_open = false;
+        self.focus_composer(window, cx);
+        self.open_pull_request_checkout(Some(reference), window, cx);
     }
 
     /// Fetches the picker's first page for its current search, or the next page after the last.
@@ -939,7 +960,11 @@ impl Workspace {
             .child(div().max_w(px(240.)).truncate().child(label));
         let popover = self.branch_popover("branch-popover", trigger, false, t, cx);
         let wrap = div().id("branch-selector-wrap").min_w_0().child(popover);
-        with_copy_menu(wrap, branch.map(str::to_owned), "Copy branch name", "Branch name copied")
+        let selector = with_copy_menu(wrap, branch.map(str::to_owned), "Copy branch name", "Branch name copied");
+        match self.render_composer_pull_request_badge(branch, cx) {
+            Some(badge) => h_flex().min_w_0().gap(px(4.)).child(badge).child(selector).into_any_element(),
+            None => selector,
+        }
     }
 
     fn render_branch_popover(
@@ -962,6 +987,15 @@ impl Workspace {
             });
             let r = match item {
                 BranchItem::Ref(r) => r,
+                BranchItem::Checkout(reference) => {
+                    let row = self.render_checkout_branch_item(&reference, highlighted, t);
+                    return row
+                        .on_mouse_move(hover)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.pick_checkout_item(reference.clone(), window, cx);
+                        }))
+                        .into_any_element();
+                }
                 BranchItem::Create(name) => {
                     let label = format!("Create new ref \"{name}\"");
                     return div()

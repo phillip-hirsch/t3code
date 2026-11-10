@@ -1,16 +1,20 @@
 //! Where the window is: a chat target, a page beside the chat (Pull requests,
 //! Usage), or the Settings modal on top, plus back/forward history over them.
 
+mod pull_request_checkout;
 mod pull_request_detail;
 pub(super) use pull_request_detail::{avatar as pr_avatar, state_glyph as pr_state_glyph};
 mod pull_request_surface;
 mod pull_requests;
 pub(super) mod settings;
+mod thread_card_pull_requests;
+mod thread_pull_request_badge;
 mod usage;
 
 use gpui_kit::{AnyElement, Context, SharedString, Window};
 
 pub(super) use pull_requests::PullRequestsState;
+pub(super) use thread_pull_request_badge::terminal_running_color;
 pub(super) use usage::{UsageLimitsPanel, UsageState};
 
 use super::{Target, Workspace};

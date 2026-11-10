@@ -743,7 +743,7 @@ impl Workspace {
             return;
         }
         if !matches!(connection, Connection::Connected) {
-            self.set_primary_connection(None, None);
+            self.set_primary_connection(None, None, cx);
             if self.target_on_primary() {
                 self.end_target_streams();
             }
@@ -762,7 +762,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.connection = Connection::Connected;
-        self.set_primary_connection(Some(client), Some(endpoint));
+        self.set_primary_connection(Some(client), Some(endpoint), cx);
         // Read per connection: the files may have changed, or never loaded while down.
         self.t3_project_files.clear();
         // A page opened while the socket was down reads now.
@@ -1390,9 +1390,10 @@ impl Render for Workspace {
                 this.held_key = None;
                 this.quit_key_up(event, cx);
             }))
-            .on_modifiers_changed(cx.listener(|this, event: &gpui_kit::ModifiersChangedEvent, _, cx| {
+            .on_modifiers_changed(cx.listener(|this, event: &gpui_kit::ModifiersChangedEvent, window, cx| {
                 this.snap_shot_record_modifiers(event, cx);
                 this.quit_modifiers_changed(event, cx);
+                this.pull_request_modifiers_changed(event, window, cx);
             }))
             .when(!cfg!(target_os = "macos"), |el| el.child(menu::wheel_zoom_listener(self.image_viewer_open())))
             .child(

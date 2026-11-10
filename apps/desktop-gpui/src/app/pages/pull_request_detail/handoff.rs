@@ -8,13 +8,30 @@ use super::*;
 use crate::app::Target;
 use crate::app::git::SOURCE_CONTROL_WRITE;
 use crate::model::ProjectShell;
-use crate::new_thread::{EnvMode, WorkspaceChoice};
+use crate::pull_request_checkout::Prepared;
 use crate::pull_request_detail::{CheckoutMode, CheckoutRequest};
+
+/// A project on one environment (`scopeProjectRef`): project ids repeat across environments.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ProjectScope {
+    pub(super) environment_id: SharedString,
+    pub(super) project_id: String,
+}
+
+impl ProjectScope {
+    fn of(project: &ProjectShell) -> Self {
+        Self { environment_id: project.environment_id.clone(), project_id: project.id.clone() }
+    }
+
+    pub(super) fn names(&self, project: &ProjectShell) -> bool {
+        project.id == self.project_id && project.environment_id == self.environment_id
+    }
+}
 
 /// `PickableEnvironment`: a connected environment holding its own copy of the repository.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct Pickable {
-    pub(super) project_id: String,
+    pub(super) project: ProjectScope,
     pub(super) label: SharedString,
     pub(super) machine: String,
 }
@@ -22,14 +39,14 @@ pub(super) struct Pickable {
 /// `resolvePickableEnvironments`: the pull request's own project first, then the first project
 /// of the same repository on each other environment; none when no other environment has one.
 pub(super) fn pickable_environments(
-    own_project: &str,
+    own_project: &ProjectScope,
     projects: &[ProjectShell],
     environments: &[(SharedString, SharedString, String)],
 ) -> Vec<Pickable> {
     let key = |project: &ProjectShell| {
         project.repository_identity.as_ref().and_then(|i| i.canonical_key.as_deref()).map(str::to_lowercase)
     };
-    let Some(own) = projects.iter().find(|p| p.id == own_project) else { return Vec::new() };
+    let Some(own) = projects.iter().find(|p| own_project.names(p)) else { return Vec::new() };
     let Some(repository) = key(own).filter(|k| !k.is_empty()) else { return Vec::new() };
     let Some((_, own_label, own_machine)) = environments.iter().find(|(id, _, _)| *id == own.environment_id) else {
         return Vec::new();
@@ -39,13 +56,13 @@ pub(super) fn pickable_environments(
         .filter(|(id, _, _)| *id != own.environment_id)
         .filter_map(|(id, label, machine)| {
             let copy = projects.iter().find(|p| p.environment_id == *id && key(p).as_ref() == Some(&repository))?;
-            Some(Pickable { project_id: copy.id.clone(), label: label.clone(), machine: machine.clone() })
+            Some(Pickable { project: ProjectScope::of(copy), label: label.clone(), machine: machine.clone() })
         })
         .collect();
     if others.is_empty() {
         return Vec::new();
     }
-    let own = Pickable { project_id: own.id.clone(), label: own_label.clone(), machine: own_machine.clone() };
+    let own = Pickable { project: ProjectScope::of(own), label: own_label.clone(), machine: own_machine.clone() };
     std::iter::once(own).chain(others).collect()
 }
 
@@ -53,7 +70,7 @@ pub(super) fn pickable_environments(
 pub(super) fn environment_items(
     mut menu: PopupMenu,
     pickable: &[Pickable],
-    acting: &str,
+    acting: &ProjectScope,
     disabled: bool,
     view: &Entity<Workspace>,
     window: &mut Window,
@@ -63,14 +80,14 @@ pub(super) fn environment_items(
     }
     menu = menu.separator();
     for environment in pickable {
-        let project_id = environment.project_id.clone();
+        let project = environment.project.clone();
         menu = menu.item(
             PopupMenuItem::new(environment.label.clone())
                 .icon(crate::app::host_picker::machine_icon(&environment.machine))
-                .checked(environment.project_id == acting)
+                .checked(environment.project == *acting)
                 .disabled(disabled)
                 .on_click(window.listener_for(view, move |this: &mut Workspace, _, _, cx| {
-                    this.pick_pr_acting_project(project_id.clone(), cx);
+                    this.pick_pr_acting_project(project.clone(), cx);
                 })),
         );
     }
@@ -128,35 +145,44 @@ impl Workspace {
         if self.page != Some(super::super::Page::PullRequests) {
             return Vec::new();
         }
-        pickable_environments(&detail.project_id, &self.shell.projects, &self.pull_request_servers())
+        pickable_environments(&self.pr_own_project(detail), &self.shell.projects, &self.pull_request_servers())
+    }
+
+    /// The pull request's own project, on the environment that read it.
+    fn pr_own_project(&self, detail: &Detail) -> ProjectScope {
+        let environment_id = self.pull_requests.panel.as_ref().map(|p| p.reference.environment_id.clone());
+        ProjectScope {
+            environment_id: environment_id.unwrap_or_default().into(),
+            project_id: detail.project_id.clone(),
+        }
     }
 
     /// `acting`: the picked project while it is still pickable, else the pull request's own.
-    pub(super) fn pr_acting_project(&self, detail: &Detail) -> String {
-        let chosen = self.pull_requests.panel.as_ref().and_then(|p| p.acting.as_deref());
+    pub(super) fn pr_acting_project(&self, detail: &Detail) -> ProjectScope {
+        let chosen = self.pull_requests.panel.as_ref().and_then(|p| p.acting.as_ref());
         self.pr_pickable_environments(detail)
             .into_iter()
-            .find(|p| Some(p.project_id.as_str()) == chosen)
-            .map_or_else(|| detail.project_id.clone(), |p| p.project_id)
+            .find(|p| Some(&p.project) == chosen)
+            .map_or_else(|| self.pr_own_project(detail), |p| p.project)
     }
 
-    /// [`HandoffAccess`] on the environment `project_id` lives on.
-    pub(super) fn pr_handoff_access(&self, project_id: &str) -> HandoffAccess {
-        let environment = self.project_environment(project_id);
-        let grants = |scope| environment.as_deref().is_some_and(|env| self.env_grants(env, scope));
+    /// [`HandoffAccess`] on the acting project's environment.
+    pub(super) fn pr_handoff_access(&self, project: &ProjectScope) -> HandoffAccess {
+        let grants = |scope| self.env_grants(&project.environment_id, scope);
         HandoffAccess::new(grants(SOURCE_CONTROL_WRITE), grants("orchestration:operate"))
     }
 
     /// `canFixFindings`: into the composer beside the panel, or a worktree checkout of the pull request.
     pub(super) fn pr_can_fix(&self, detail: &Detail) -> bool {
+        let own = self.pr_own_project(detail);
         self.pr_attaches_to_composer()
-            || (self.shell.projects.iter().any(|p| p.id == detail.project_id)
+            || (self.shell.projects.iter().any(|p| own.names(p))
                 && self.pr_handoff_access(&self.pr_acting_project(detail)).allows(CheckoutMode::Worktree))
     }
 
-    fn pick_pr_acting_project(&mut self, project_id: String, cx: &mut Context<Self>) {
+    fn pick_pr_acting_project(&mut self, project: ProjectScope, cx: &mut Context<Self>) {
         if let Some(panel) = self.pull_requests.panel.as_mut() {
-            panel.acting = Some(project_id);
+            panel.acting = Some(project);
         }
         cx.notify();
     }
@@ -218,14 +244,15 @@ impl Workspace {
             }
             return;
         }
-        let project_id = self.pr_acting_project(&detail);
-        if !self.shell.projects.iter().any(|p| p.id == project_id) {
+        let project = self.pr_acting_project(&detail);
+        if !self.shell.projects.iter().any(|p| project.names(p)) {
             toast_error(window, cx, "Could not open a thread", "Try again from the project, or open a thread first.");
             return;
         }
-        self.start_draft(project_id.clone(), window, cx);
-        let opened = matches!(&self.target, Some(Target::Draft { project_id: p, .. }) if *p == project_id);
-        if !opened || !self.write_pr_task(&task, window, cx) {
+        let env = project.environment_id.clone();
+        self.start_draft_in(env.clone(), project.project_id.clone(), window, cx);
+        let draft = Target::Draft { env, project_id: project.project_id };
+        if self.target.as_ref() != Some(&draft) || !self.write_pr_task(&task, window, cx) {
             toast_error(window, cx, "Could not open a thread", "Try again from the project, or open a thread first.");
             return;
         }
@@ -258,12 +285,13 @@ impl Workspace {
             }
             return;
         }
-        let project_id = self.pr_acting_project(&detail);
-        if !self.pr_handoff_access(&project_id).allows(mode) {
+        let project = self.pr_acting_project(&detail);
+        if !self.pr_handoff_access(&project).allows(mode) {
             return;
         }
         let request = CheckoutRequest {
-            project_id,
+            environment_id: project.environment_id.to_string(),
+            project_id: project.project_id,
             url: detail.url.clone(),
             term: logic::terminology(&detail.provider).0,
             task,
@@ -282,21 +310,26 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let root = self.shell.projects.iter().find(|p| p.id == request.project_id).map(|p| p.workspace_root.clone());
-        let (Some(client), Some(root)) = (self.project_client(&request.project_id), root) else {
+        let root = self
+            .shell
+            .projects
+            .iter()
+            .find(|p| p.id == request.project_id && p.environment_id == request.environment_id)
+            .map(|p| p.workspace_root.clone());
+        let (Some(client), Some(root)) = (self.env_client(&request.environment_id), root) else {
             settled(self);
             return;
         };
         let term = request.term;
         window.push_notification(Notification::info("").title(format!("Preparing the {term} checkout...")), cx);
         // The checkout is made for the thread, so the draft's thread id exists first.
-        self.start_draft(request.project_id.clone(), window, cx);
+        self.start_draft_in(request.environment_id.clone().into(), request.project_id.clone(), window, cx);
         let Some(thread_id) = self.terminal_thread(true) else {
             settled(self);
             return;
         };
         let input = request.input(&root, &thread_id);
-        let CheckoutRequest { project_id, task, .. } = request;
+        let CheckoutRequest { environment_id, project_id, task, .. } = request;
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("git.preparePullRequestThread", input).await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -326,10 +359,13 @@ impl Workspace {
                         return;
                     }
                 };
-                let branch = value["branch"].as_str().unwrap_or_default().to_owned();
-                let worktree = value["worktreePath"].as_str().map(str::to_owned);
-                let on_head = value["isOnPullRequestHead"].as_bool() != Some(false);
-                if !matches!(&this.target, Some(Target::Draft { project_id: p, .. }) if *p == project_id) {
+                let prepared = Prepared {
+                    branch: value["branch"].as_str().unwrap_or_default().to_owned(),
+                    worktree_path: value["worktreePath"].as_str().map(str::to_owned),
+                    on_head: value["isOnPullRequestHead"].as_bool() != Some(false),
+                };
+                let (branch, worktree, on_head) = (&prepared.branch, &prepared.worktree_path, prepared.on_head);
+                if !matches!(&this.target, Some(Target::Draft { env, project_id: p }) if *p == project_id && *env == environment_id) {
                     toast_error(
                         window,
                         cx,
@@ -338,20 +374,7 @@ impl Workspace {
                     );
                     return;
                 }
-                this.draft_workspace.choice = match &worktree {
-                    Some(path) => WorkspaceChoice {
-                        mode: Some(EnvMode::Worktree),
-                        branch: Some(branch),
-                        existing_worktree: Some(path.clone()),
-                        start_from_origin: None,
-                    },
-                    None => WorkspaceChoice {
-                        mode: Some(EnvMode::Local),
-                        branch: Some(branch),
-                        existing_worktree: None,
-                        start_from_origin: None,
-                    },
-                };
+                this.point_draft_at_checkout(&prepared);
                 if let Some(task) = &task {
                     this.write_pr_task(task, window, cx);
                 }
@@ -378,8 +401,8 @@ impl Workspace {
 
     /// The project checkout a handoff prepares from (`checkoutRoot`), on the acting environment.
     fn pr_checkout_root(&self, detail: &Detail) -> Option<String> {
-        let project_id = self.pr_acting_project(detail);
-        self.shell.projects.iter().find(|p| p.id == project_id).map(|p| p.workspace_root.clone())
+        let project = self.pr_acting_project(detail);
+        self.shell.projects.iter().find(|p| project.names(p)).map(|p| p.workspace_root.clone())
     }
 
     pub(super) fn ask_about_pr(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -561,14 +584,30 @@ mod tests {
             project("c", "p4", Some("github.com/other/repo")),
         ];
         let environments = [environment("a"), environment("b"), environment("c")];
-        let picked: Vec<String> =
-            pickable_environments("p1", &projects, &environments).into_iter().map(|p| p.project_id).collect();
-        assert_eq!(picked, ["p1", "p2"], "its own first, then one copy per other environment");
-        assert!(
-            pickable_environments("p1", &projects[..1], &environments).is_empty(),
-            "no picker while no other environment has the repository"
+        let own = |environment: &str, id: &str| ProjectScope {
+            environment_id: environment.to_owned().into(),
+            project_id: id.into(),
+        };
+        let picked = |own: &ProjectScope, projects: &[ProjectShell]| -> Vec<String> {
+            pickable_environments(own, projects, &environments)
+                .into_iter()
+                .map(|p| format!("{}/{}", p.project.environment_id, p.project.project_id))
+                .collect()
+        };
+        assert_eq!(
+            picked(&own("a", "p1"), &projects),
+            ["a/p1", "b/p2"],
+            "its own first, then one per other environment"
         );
+        assert!(picked(&own("a", "p1"), &projects[..1]).is_empty(), "no picker while no other environment has it");
         let unkeyed = [project("a", "p1", None), project("b", "p2", None)];
-        assert!(pickable_environments("p1", &unkeyed, &environments).is_empty());
+        assert!(picked(&own("a", "p1"), &unkeyed).is_empty());
+        // Project ids repeat across environments: the pull request's own is the one on its environment.
+        let repeated = [
+            project("a", "p", Some("github.com/other/repo")),
+            project("b", "p", Some("github.com/t3/code")),
+            project("c", "q", Some("github.com/t3/code")),
+        ];
+        assert_eq!(picked(&own("b", "p"), &repeated), ["b/p", "c/q"]);
     }
 }

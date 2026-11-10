@@ -271,7 +271,7 @@ impl Workspace {
                     project.repository_identity.as_ref().and_then(|identity| identity.canonical_key.as_deref()),
                 )
             });
-        let reference = logic::preview_target(url, loaded, projects)?;
+        let reference = logic::preview_target(&environment, url, loaded, projects)?;
         Some((environment, reference))
     }
 

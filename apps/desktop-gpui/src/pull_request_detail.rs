@@ -516,10 +516,12 @@ impl Activity {
     }
 }
 
-/// `PullRequestRef`: where a pull request is read from.
+/// `PullRequestRef`: where a pull request is read from, and the environment that reads it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Reference {
+    /// The environment that reads it: project ids repeat across environments.
+    pub environment_id: String,
     pub project_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
@@ -528,6 +530,7 @@ pub struct Reference {
 }
 
 impl Reference {
+    /// The wire `PullRequestRef`, which the environment it is sent to scopes.
     pub fn to_json(&self) -> Value {
         let mut value = json!({"projectId": self.project_id, "repository": self.repository, "number": self.number});
         if let Some(host) = &self.host {
@@ -536,9 +539,16 @@ impl Reference {
         value
     }
 
-    /// `pullRequestRefKey`.
+    /// `pullRequestRefKey`, scoped to its environment as `pullRequestSurfaceId` is.
     pub fn key(&self) -> String {
-        format!("{}:{}:{}#{}", self.project_id, self.host.as_deref().unwrap_or(""), self.repository, self.number)
+        format!(
+            "{}:{}:{}:{}#{}",
+            self.environment_id,
+            self.project_id,
+            self.host.as_deref().unwrap_or(""),
+            self.repository,
+            self.number
+        )
     }
 }
 
@@ -814,6 +824,78 @@ pub fn primary_control(detail: &Detail, checks_state: Option<&str>, stack: Stack
         return Some(Primary::EnableAutoMerge);
     }
     (!stack.owns && can(detail, "merge")).then_some(Primary::Merge)
+}
+
+/// `isPullRequestConflicting`: open and conflicting with its base, draft or not.
+pub fn is_conflicting(detail: &Detail) -> bool {
+    detail.state == State::Open && detail.mergeability == "conflicting"
+}
+
+/// `classifyPullRequestChecks`: unlike [`checks_state`], checks that only skipped still pass.
+pub fn classify_checks(checks: &[Check]) -> &'static str {
+    let any = |statuses: &[&str]| checks.iter().any(|c| statuses.contains(&c.status.as_str()));
+    if checks.is_empty() {
+        "none"
+    } else if any(&["failure", "cancelled"]) {
+        "failing"
+    } else if any(&["pending", "action-required"]) {
+        "pending"
+    } else {
+        "passing"
+    }
+}
+
+/// `describePullRequestChecks`.
+pub fn describe_checks(checks: &[Check]) -> String {
+    let total = checks.len();
+    if total == 0 {
+        return "No checks reported".into();
+    }
+    let count = |statuses: &[&str]| checks.iter().filter(|c| statuses.contains(&c.status.as_str())).count();
+    let (failed, pending, awaiting, passed) =
+        (count(&["failure", "cancelled"]), count(&["pending"]), count(&["action-required"]), count(&["success"]));
+    let mut parts = Vec::new();
+    if pending > 0 {
+        parts.push(format!("{pending} of {total} running"));
+    }
+    if awaiting > 0 {
+        parts.push(format!("{awaiting} of {total} awaiting action"));
+    }
+    if failed > 0 {
+        parts.push(if parts.is_empty() { format!("{failed} of {total} failing") } else { format!("{failed} failed") });
+    }
+    if parts.is_empty() {
+        return if passed == total { "All checks passed".into() } else { format!("{passed} of {total} passing") };
+    }
+    parts.join(" · ")
+}
+
+/// The thread card's one action on a pull request (`ThreadPanelPullRequestAction`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CardAction {
+    Resolve,
+    Ready,
+    Fix,
+    Merge,
+}
+
+/// `resolveThreadPanelPullRequestAction`: conflicts first, then a draft's Ready, failing checks'
+/// Fix, and Merge once the checks have settled.
+pub fn card_action(detail: &Detail) -> Option<CardAction> {
+    if detail.state != State::Open {
+        return None;
+    }
+    if is_conflicting(detail) {
+        return Some(CardAction::Resolve);
+    }
+    if detail.is_draft {
+        return can(detail, "ready").then_some(CardAction::Ready);
+    }
+    match classify_checks(&detail.checks) {
+        "failing" => Some(CardAction::Fix),
+        "pending" => None,
+        _ => (can(detail, "merge") && !allowed_merge_methods(detail).is_empty()).then_some(CardAction::Merge),
+    }
 }
 
 /// The overflow menu's state actions (`showsDraftToggle`, `showsMergeNow`, ...).
@@ -1540,6 +1622,7 @@ pub enum CheckoutMode {
 /// the thread opened on it gets in its composer.
 #[derive(Clone, Debug)]
 pub struct CheckoutRequest {
+    pub environment_id: String,
     pub project_id: String,
     pub url: String,
     /// The host's word for it, from [`terminology`].
@@ -1591,6 +1674,37 @@ pub fn readable_failure(message: &str, hint: &str) -> String {
     } else {
         format!("{}…", detail.chars().take(319).collect::<String>())
     }
+}
+
+/// The success toast's title for an action (`actionSuccessLabels`).
+pub fn action_success(action: &str, term: &str) -> String {
+    match action {
+        "merge" => "Merge requested".into(),
+        "ready" => "Marked ready for review".into(),
+        "draft" => "Converted to draft".into(),
+        "close" => format!("{} closed", capitalize(term)),
+        "reopen" => format!("{} reopened", capitalize(term)),
+        "update-branch" => "Branch updated with the base branch".into(),
+        "enable-auto-merge" => "Auto-merge enabled".into(),
+        "disable-auto-merge" => "Auto-merge disabled".into(),
+        "revert" => format!("Revert {term} opened"),
+        "delete-branch" => "Branch deleted".into(),
+        "approve-workflows" => "Workflows approved".into(),
+        _ => "Done".into(),
+    }
+}
+
+/// A list row's quick merge (`runAction` with `resolveMergeMethod`): the method to send, from the
+/// detail read just before it, or why it cannot merge. A stack merges from its panel instead.
+pub fn quick_merge_method(detail: &Detail, project_default: Option<&str>, last: &str) -> Result<&'static str, String> {
+    if detail.state != State::Open || detail.is_draft || !can(detail, "merge") {
+        return Err("This pull request cannot be merged.".into());
+    }
+    let allowed = allowed_merge_methods(detail);
+    if allowed.is_empty() {
+        return Err("No merge method is available for this repository.".into());
+    }
+    Ok(resolve_merge_method(&allowed, None, project_default, last))
 }
 
 /// The failure toast's title and hint for an action (`actionFailureLabels`, `actionFailureHints`).
@@ -2347,11 +2461,11 @@ pub fn parse_change_request_url(url: &str) -> Option<(String, String, u64)> {
 }
 
 /// The project whose repository holds the change request: its repository key is `host/repository`.
-pub fn project_for_link<'a>(
-    projects: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+pub fn project_for_link<'a, P>(
+    projects: impl IntoIterator<Item = (P, Option<&'a str>)>,
     host: &str,
     repository: &str,
-) -> Option<&'a str> {
+) -> Option<P> {
     let wanted = format!("{host}/{repository}").to_lowercase();
     projects.into_iter().find(|(_, key)| key.is_some_and(|k| k.to_lowercase() == wanted)).map(|(id, _)| id)
 }
@@ -2394,6 +2508,22 @@ mod tests {
         assert_eq!(resolve_merge_method(&allowed, Some("rebase"), Some("rebase"), "squash"), "squash");
         assert_eq!(resolve_merge_method(&allowed, None, None, "rebase"), "merge", "falls back to the first allowed");
         assert_eq!(resolve_merge_method(&[], None, None, "squash"), "merge");
+    }
+
+    #[test]
+    fn a_quick_merge_checks_the_fresh_detail_before_choosing_a_method() {
+        assert_eq!(quick_merge_method(&detail(json!({})), Some("squash"), "merge"), Ok("squash"));
+        assert_eq!(quick_merge_method(&detail(json!({})), Some("rebase"), "squash"), Ok("squash"), "rebase is off");
+        let refused = Err("This pull request cannot be merged.".to_owned());
+        assert_eq!(quick_merge_method(&detail(json!({"isDraft": true})), None, "merge"), refused);
+        assert_eq!(quick_merge_method(&detail(json!({"state": "closed"})), None, "merge"), refused);
+        let viewer = json!({"viewerPermissions": {"actions": ["close"]}});
+        assert_eq!(quick_merge_method(&detail(viewer), None, "merge"), refused, "the viewer may not merge");
+        let none = json!({"mergeCapabilities": {"merge": false, "squash": false, "rebase": false}});
+        assert_eq!(
+            quick_merge_method(&detail(none), None, "merge"),
+            Err("No merge method is available for this repository.".to_owned())
+        );
     }
 
     #[test]
@@ -2868,6 +2998,42 @@ mod tests {
         );
         assert_eq!(check_status_label(&checks(&[("action-required", run)])[0]), "Awaiting approval");
         assert_eq!(summarize_checks(&checks(&[("success", None), ("skipped", None)])), "1 of 2 passing");
+
+        // The thread card reads them its own way: skipped-only passes, and each kind is counted.
+        assert_eq!(classify_checks(&[]), "none");
+        assert_eq!(classify_checks(&checks(&[("skipped", None)])), "passing");
+        assert_eq!(classify_checks(&checks(&[("pending", None), ("cancelled", None)])), "failing");
+        assert_eq!(classify_checks(&checks(&[("success", None), ("action-required", None)])), "pending");
+        assert_eq!(describe_checks(&[]), "No checks reported");
+        assert_eq!(describe_checks(&checks(&[("success", None), ("success", None)])), "All checks passed");
+        assert_eq!(describe_checks(&checks(&[("success", None), ("skipped", None)])), "1 of 2 passing");
+        assert_eq!(describe_checks(&checks(&[("failure", None), ("success", None)])), "1 of 2 failing");
+        assert_eq!(
+            describe_checks(&checks(&[("pending", None), ("action-required", None), ("failure", None)])),
+            "1 of 3 running · 1 of 3 awaiting action · 1 failed"
+        );
+    }
+
+    #[test]
+    fn the_thread_card_offers_one_action_by_what_the_pull_request_needs_next() {
+        let check = |status: &str| json!([{"name": "ci", "status": status}]);
+        let action = |patch: Value| card_action(&detail(patch));
+        assert_eq!(action(json!({"checks": check("success")})), Some(CardAction::Merge));
+        assert_eq!(action(json!({})), Some(CardAction::Merge), "no checks reported");
+        assert_eq!(action(json!({"checks": check("pending")})), None, "checks still running");
+        assert_eq!(action(json!({"checks": check("failure")})), Some(CardAction::Fix));
+        assert_eq!(action(json!({"isDraft": true, "checks": check("failure")})), Some(CardAction::Ready));
+        assert_eq!(
+            action(json!({"isDraft": true, "mergeability": "conflicting"})),
+            Some(CardAction::Resolve),
+            "conflicts first, even on a draft"
+        );
+        assert_eq!(action(json!({"state": "merged"})), None);
+        assert_eq!(action(json!({"state": "closed", "mergeability": "conflicting"})), None);
+        let no_ready = json!({"isDraft": true, "viewerPermissions": {"actions": ["merge"]}});
+        assert_eq!(action(no_ready), None, "the viewer may not mark it ready");
+        let no_method = json!({"mergeCapabilities": {"merge": false, "squash": false, "rebase": false}});
+        assert_eq!(action(no_method), None, "the repository allows no offered method");
     }
 
     #[test]
@@ -3040,6 +3206,7 @@ mod tests {
     #[test]
     fn a_checkout_asks_for_the_pull_request_in_the_chosen_place() {
         let request = CheckoutRequest {
+            environment_id: "e1".into(),
             project_id: "p1".into(),
             url: "https://github.com/acme/app/pull/7".into(),
             term: "pull request",

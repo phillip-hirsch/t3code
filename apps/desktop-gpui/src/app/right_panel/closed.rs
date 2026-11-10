@@ -479,8 +479,13 @@ mod tests {
     #[test]
     fn the_history_is_stored_without_incognito_tabs() {
         let mut history = History::default();
-        let reference =
-            Reference { project_id: "p".into(), host: Some("github.com".into()), repository: "o/r".into(), number: 3 };
+        let reference = Reference {
+            environment_id: "e".into(),
+            project_id: "p".into(),
+            host: Some("github.com".into()),
+            repository: "o/r".into(),
+            number: 3,
+        };
         history.remember(browser("a", "private", Some(preview::INCOGNITO_PROFILE_ID)));
         history.remember(browser("a", "public", Some("default")));
         history.remember(ClosedView::PullRequestTab { reference: reference.clone() });

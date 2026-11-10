@@ -21,6 +21,7 @@ use tokio::sync::{Notify, watch};
 use url::Url;
 
 use crate::backend::{self, Endpoint, LocalServer};
+use crate::pull_request_routing as routing;
 use crate::secure_storage as secure;
 
 /// `ORCHESTRATION_PROTOCOL_VERSION` in `packages/contracts`.
@@ -29,6 +30,7 @@ const ORCHESTRATION_PROTOCOL_VERSION: u64 = 2;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const RETRY_BASE_DELAY_MS: f64 = 1_000.;
 const RETRY_MAX_DELAY_MS: f64 = 300_000.;
+const ROUTING_KEY: &str = "githubRoutingPermissions";
 
 // ---------------------------------------------------------------------------------------------
 // Pairing input
@@ -462,6 +464,9 @@ impl SavedEnvironment {
 pub struct Catalog {
     pub local_environment_enabled: bool,
     pub environments: Vec<SavedEnvironment>,
+    /// This device's pull request routing grants (`githubRoutingPermissions`, the web catalog's
+    /// field name), including the primary environment's.
+    pub pull_request_routing: Vec<routing::Stored>,
     /// The document as read. Saving writes back its fields this build does not know and the
     /// entries it could not decode, so an older or newer build loses nothing.
     stored: Map<String, Value>,
@@ -469,7 +474,12 @@ pub struct Catalog {
 
 impl Default for Catalog {
     fn default() -> Self {
-        Self { local_environment_enabled: true, environments: Vec::new(), stored: Map::new() }
+        Self {
+            local_environment_enabled: true,
+            environments: Vec::new(),
+            pull_request_routing: Vec::new(),
+            stored: Map::new(),
+        }
     }
 }
 
@@ -560,7 +570,14 @@ impl Catalog {
             })
             .collect();
         let local_environment_enabled = stored.get("localEnvironmentEnabled") != Some(&Value::Bool(false));
-        Ok(Self { local_environment_enabled, environments, stored })
+        let pull_request_routing = stored
+            .get(ROUTING_KEY)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|grant| routing::Stored::deserialize(grant).ok())
+            .collect();
+        Ok(Self { local_environment_enabled, environments, pull_request_routing, stored })
     }
 
     /// `protect` encrypts a token ([`secure::protect`] outside tests).
@@ -610,6 +627,11 @@ impl Catalog {
         document.entry("version").or_insert(json!(1));
         document.insert("localEnvironmentEnabled".into(), json!(self.local_environment_enabled));
         document.insert("environments".into(), Value::Array(environments));
+        if self.pull_request_routing.is_empty() {
+            document.remove(ROUTING_KEY);
+        } else {
+            document.insert(ROUTING_KEY.into(), serde_json::to_value(&self.pull_request_routing)?);
+        }
         Ok(Value::Object(document))
     }
 
@@ -626,6 +648,12 @@ impl Catalog {
 
     pub fn get_mut(&mut self, environment_id: &str) -> Option<&mut SavedEnvironment> {
         self.environments.iter_mut().find(|environment| environment.environment_id == environment_id)
+    }
+
+    /// `removeConnectionFromCatalog`: forgets the environment and the grants it was given.
+    pub fn remove(&mut self, environment_id: &str) {
+        self.environments.retain(|environment| environment.environment_id != environment_id);
+        self.pull_request_routing.retain(|grant| grant.environment_id != environment_id);
     }
 
     /// `EnvironmentRegistry.register` for one bearer route: replaces a saved entry with the same id.
@@ -1463,6 +1491,31 @@ mod tests {
         let ids: Vec<_> =
             written["environments"].as_array().unwrap().iter().map(|e| e["environmentId"].clone()).collect();
         assert_eq!(ids, [json!("c"), json!("b"), Value::Null]);
+    }
+
+    #[test]
+    fn pull_request_routing_grants_round_trip_and_drop_with_their_environment() {
+        let grant = |id: &str| routing::Stored {
+            environment_id: id.into(),
+            connection_key: format!("key-{id}"),
+            permission: routing::Permission::ReadWrite,
+        };
+        let document = json!({ "githubRoutingPermissions": [
+            { "environmentId": "a", "connectionKey": "key-a", "permission": "read-write" },
+            { "environmentId": "b", "connectionKey": "key-b", "permission": "sideways" },
+        ] });
+        let mut catalog = read(&document, seal);
+        assert_eq!(catalog.pull_request_routing, [grant("a")]);
+        assert_eq!(
+            catalog.document(seal).unwrap()["githubRoutingPermissions"],
+            json!([
+                { "environmentId": "a", "connectionKey": "key-a", "permission": "read-write" },
+            ])
+        );
+        catalog.upsert(saved("a", Credential::Missing));
+        catalog.remove("a");
+        assert!(catalog.environments.is_empty());
+        assert!(catalog.document(seal).unwrap().get("githubRoutingPermissions").is_none());
     }
 
     #[test]

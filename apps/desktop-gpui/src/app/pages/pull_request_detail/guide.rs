@@ -177,8 +177,8 @@ impl Workspace {
         if let Some(cursor) = &cursor {
             input["cursor"] = json!(cursor);
         }
-        let project_id = panel.reference.project_id.clone();
-        let endpoint = self.project_endpoint(&project_id).cloned();
+        let reference = panel.reference.clone();
+        let endpoint = self.env_endpoint(&reference.environment_id).cloned();
         let Some(panel) = self.pull_requests.panel.as_mut() else { return };
         let head = head.to_owned();
         panel.guide_diff.loading = true;
@@ -769,7 +769,7 @@ impl Workspace {
         self.pr_attaches_to_composer()
             || self.pull_requests.panel.as_ref().and_then(|p| p.detail.as_ref()).is_some_and(|detail| {
                 let acting = self.pr_acting_project(detail);
-                self.shell.projects.iter().any(|p| p.id == acting)
+                self.shell.projects.iter().any(|p| acting.names(p))
             })
     }
 

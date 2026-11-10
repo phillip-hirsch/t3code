@@ -35,6 +35,9 @@ pub struct BranchChanges {
 pub struct SourceControlProvider {
     #[serde(default)]
     pub kind: String,
+    /// The host's display name ("GitHub Self-Hosted"), when the server names it.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// `VcsStatusLocalResult`.
@@ -64,6 +67,10 @@ pub struct ChangeRequest {
     pub number: u64,
     pub url: String,
     pub state: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub is_draft: bool,
 }
 
 /// `VcsStatusRemoteResult`; a missing remote part reads as all zeros (`mergeGitStatusParts`).

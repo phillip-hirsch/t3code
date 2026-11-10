@@ -16,6 +16,7 @@ mod environments;
 mod exposure;
 mod load_balancing;
 pub(super) mod logic;
+mod pull_request_routing;
 mod saved;
 pub(super) use saved::empty_media;
 mod secrets;

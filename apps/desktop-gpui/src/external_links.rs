@@ -127,9 +127,10 @@ pub fn is_public_favicon_host(host: &str) -> bool {
 }
 
 /// `resolvePullRequestPreviewTarget`: the pull request a link names, read through the project of
-/// the message's environment checked out from its repository. `projects` are that environment's
+/// the message's `environment` checked out from its repository. `projects` are that environment's
 /// (id, repository key) pairs; `None` while its config has not loaded (`pullRequestsEnabled`).
 pub fn preview_target<'a>(
+    environment: &str,
     url: &str,
     config_loaded: bool,
     projects: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
@@ -139,7 +140,7 @@ pub fn preview_target<'a>(
     }
     let (host, repository, number) = crate::pull_request_detail::parse_change_request_url(url)?;
     let project_id = crate::pull_request_detail::project_for_link(projects, &host, &repository)?.to_owned();
-    Some(Reference { project_id, host: Some(host), repository, number })
+    Some(Reference { environment_id: environment.to_owned(), project_id, host: Some(host), repository, number })
 }
 
 /// `PullRequestPreview`, what `pullRequests.preview` answers.
@@ -251,14 +252,26 @@ mod tests {
     #[test]
     fn a_pull_request_link_previews_through_its_repositorys_project() {
         let projects = [("p1", Some("github.com/acme/app")), ("p2", Some("github.com/acme/other")), ("p3", None)];
-        let target = preview_target("https://github.com/Acme/App/pull/7/files", true, projects).expect("a target");
+        let target =
+            preview_target("e1", "https://github.com/Acme/App/pull/7/files", true, projects).expect("a target");
         assert_eq!(
-            (target.project_id.as_str(), target.host.as_deref(), target.repository.as_str(), target.number),
-            ("p1", Some("github.com"), "acme/app", 7)
+            (
+                target.environment_id.as_str(),
+                target.project_id.as_str(),
+                target.host.as_deref(),
+                target.repository.as_str(),
+                target.number
+            ),
+            ("e1", "p1", Some("github.com"), "acme/app", 7)
         );
-        assert_eq!(preview_target("https://github.com/acme/app/pull/7", false, projects), None, "config not loaded");
-        assert_eq!(preview_target("https://github.com/acme/elsewhere/pull/7", true, projects), None);
-        assert_eq!(preview_target("https://github.com/acme/app/issues/7", true, projects), None);
+        let none = |url| preview_target("e1", url, true, projects);
+        assert_eq!(
+            preview_target("e1", "https://github.com/acme/app/pull/7", false, projects),
+            None,
+            "config not loaded"
+        );
+        assert_eq!(none("https://github.com/acme/elsewhere/pull/7"), None);
+        assert_eq!(none("https://github.com/acme/app/issues/7"), None);
     }
 
     #[test]

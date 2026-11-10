@@ -224,7 +224,7 @@ fn set_badge(window: &Window, count: usize) {
 }
 
 /// Plays an alert's sound off the UI thread; while one plays, the same sound again is dropped.
-fn play_sound(kind: Kind) {
+pub(super) fn play_sound(kind: Kind) {
     // Two independent timestamps, so a poisoned lock holds nothing half-updated.
     static PLAYING_UNTIL: Mutex<[Option<Instant>; 2]> = Mutex::new([None, None]);
     let playing_until = || PLAYING_UNTIL.lock().unwrap_or_else(PoisonError::into_inner);
