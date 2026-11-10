@@ -16,7 +16,6 @@ use gpui_kit::{
 use serde_json::{Value, json};
 use std::collections::HashSet;
 
-use super::super::connections::logic::{ENVIRONMENT_MAINTAIN, SETTINGS_WRITE};
 use super::super::widgets::{RowFrame, card, loose_section, note, settings_section};
 use super::{format_bytes, notify_error, now_ms, relative_label, text};
 use crate::app::Workspace;
@@ -25,6 +24,7 @@ use crate::app::sessions::EnvironmentSession;
 use crate::rpc::{RpcClient, RpcError, StreamEvent};
 use crate::theme::{self, Tokens};
 
+const RECLAIM: &str = "server.reclaimDatabaseSpace";
 /// `DATABASE_COMPACTION_RECOMMENDED_BYTES`.
 const COMPACTION_RECOMMENDED_BYTES: f64 = 1024. * 1024. * 1024.;
 const RETENTION_MAX_DAYS: i64 = 3650;
@@ -379,7 +379,7 @@ impl Workspace {
             supported.iter().any(|m| self.session(&m.id).is_some_and(|s| has_rules(&s.server_info.settings)));
         let allowed: Vec<(SharedString, RpcClient)> = supported
             .iter()
-            .filter(|m| self.environment_grants(&m.id, SETTINGS_WRITE))
+            .filter(|m| self.env_permits(&m.id, "server.runStorageCleanup", &json!({})))
             .map(|m| (m.label.clone(), m.client.clone()))
             .collect();
         let now = now_ms();
@@ -454,8 +454,7 @@ impl Workspace {
                 let status = machine.database.as_ref()?;
                 let recommended = status["incrementalVacuumEnabled"] != true
                     && status["reclaimableBytes"].as_f64().unwrap_or(0.) >= COMPACTION_RECOMMENDED_BYTES;
-                let reclaimable =
-                    status["canReclaim"] == true && self.environment_grants(&machine.id, ENVIRONMENT_MAINTAIN);
+                let reclaimable = status["canReclaim"] == true && self.env_permits(&machine.id, RECLAIM, &json!({}));
                 recommended.then_some((index, machine, status, reclaimable))
             })
             .collect();
@@ -499,7 +498,6 @@ impl Workspace {
                     state: state.downgrade(),
                     id: machine.id.clone(),
                     label: machine.label.clone(),
-                    client: machine.client.clone(),
                     amount,
                     minutes,
                 };
@@ -557,7 +555,6 @@ struct Reclaim {
     state: WeakEntity<StorageState>,
     id: String,
     label: SharedString,
-    client: RpcClient,
     amount: String,
     minutes: u64,
 }
@@ -584,9 +581,11 @@ fn confirm_reclaim(request: Reclaim, window: &mut Window, cx: &mut App) {
 
 /// Sends the reclaim once per machine; the row waits for the restart unless it is refused.
 fn start_reclaim(request: Reclaim, window: &mut Window, cx: &mut App) {
-    let Reclaim { workspace, state, id, label, client, amount, minutes } = request;
-    // The grant can change on a reconnect while the dialog is open.
-    let allowed = workspace.upgrade().is_some_and(|w| w.read(cx).environment_grants(&id, ENVIRONMENT_MAINTAIN));
+    let Reclaim { workspace, state, id, label, amount, minutes, .. } = request;
+    // The grant and the socket can change on a reconnect while the dialog is open.
+    let Some(workspace) = workspace.upgrade() else { return };
+    let allowed = workspace.read(cx).env_permits(&id, RECLAIM, &json!({}));
+    let Some(client) = workspace.read(cx).env_client(&id) else { return };
     let started = state.update(cx, |state, cx| {
         let Some(machine) = state.machines.iter().find(|m| m.id == id && m.client.same_socket(&client)) else {
             return false;
@@ -603,7 +602,7 @@ fn start_reclaim(request: Reclaim, window: &mut Window, cx: &mut App) {
     }
     window
         .spawn(cx, async move |cx| {
-            let result = client.request("server.reclaimDatabaseSpace", json!({})).await;
+            let result = client.request(RECLAIM, json!({})).await;
             let _ = cx.update(|window, cx| match result {
                 Ok(_) => window.push_notification(
                     Notification::success(format!("T3 Code there restarts and is back in about {minutes} min."))

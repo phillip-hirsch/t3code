@@ -25,8 +25,8 @@ use crate::pull_request_detail::{self as detail_logic, Detail};
 use crate::pull_requests::{self as logic, Entry, State};
 use crate::theme::Tokens;
 
-/// The pointer travel that turns a press on Close into a sweep (`distance: 6`).
 const RUN_ACTION: &str = "pullRequests.runAction";
+/// The pointer travel that turns a press on Close into a sweep (`distance: 6`).
 const SWEEP_DISTANCE: f32 = 6.;
 
 /// The quick actions' state on the Pull requests page.

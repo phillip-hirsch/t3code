@@ -35,12 +35,13 @@ use super::super::widgets::{
     ROW_SELECT_MIN_WIDTH, SelectWidth, SettingRow, SettingsView, section_with_action, settings_section, switch,
 };
 use crate::app::Workspace;
-use crate::app::pages::settings::connections::logic::SETTINGS_WRITE;
+
 use crate::model::{ModelSelection, Provider};
 use crate::rpc::RpcClient;
 use crate::settings::scope;
 use crate::theme::{Tokens, tokens};
 
+const SIGN_IN_START: &str = "sourceControl.signInStart";
 const MERGE_METHODS: &[(&str, &str)] =
     &[("last", "Last selected"), ("merge", "Merge"), ("squash", "Squash and merge"), ("rebase", "Rebase and merge")];
 
@@ -1112,15 +1113,14 @@ impl Workspace {
         card.into_any_element()
     }
 
-    /// `sourceControl.signInStart`'s permission (`settings:write`) on the settings environment,
-    /// which sign-out shares.
+    /// `startSignIn.permissionAtom` on the settings environment, which sign-out shares.
     fn can_sign_in(&self) -> bool {
-        self.settings_environment().is_some_and(|environment| self.environment_grants(&environment, SETTINGS_WRITE))
+        self.settings_environment().is_some_and(|env| self.env_permits(&env, SIGN_IN_START, &Value::Null))
     }
 
     /// `signIn`: start the device flow, show its code, then wait for the user to approve it.
     fn start_sign_in(&mut self, state: &Entity<SourceControlState>, input: Value, cx: &mut Context<Self>) {
-        if !self.can_sign_in() {
+        if !self.settings_environment().is_some_and(|env| self.env_permits(&env, SIGN_IN_START, &input)) {
             return;
         }
         let Some(client) = self.settings_client() else { return };
@@ -1130,7 +1130,7 @@ impl Workspace {
         });
         let state = state.clone();
         cx.spawn(async move |this, cx| {
-            let started = client.request("sourceControl.signInStart", input.clone()).await;
+            let started = client.request(SIGN_IN_START, input.clone()).await;
             let prompt = match started {
                 Ok(prompt) => prompt,
                 Err(error) => {

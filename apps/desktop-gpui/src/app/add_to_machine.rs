@@ -30,8 +30,8 @@ use super::{Target, Workspace, new_id};
 use crate::model::{ProjectShell, ScopedId};
 use crate::theme::Tokens;
 
-/// `COPYABLE_FILE_MAX_BYTES`: the server's read cap; a larger file would arrive truncated.
 const CLONE_START: &str = "projectClone.start";
+/// `COPYABLE_FILE_MAX_BYTES`: the server's read cap; a larger file would arrive truncated.
 const COPYABLE_FILE_MAX_BYTES: u64 = 1024 * 1024;
 
 /// A machine the project can be cloned to (`AddProjectTarget`).

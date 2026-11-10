@@ -21,8 +21,8 @@ use super::super::{Workspace, keymap};
 use super::{Description, Group, Row, RowIcon, Run, View, environment_row};
 use crate::theme::Tokens;
 
-/// The publish toggle's row (`newProjectPublishToggleValue`).
 const PUBLISH: &str = "sourceControl.publishRepository";
+/// The publish toggle's row (`newProjectPublishToggleValue`).
 const PUBLISH_KEY: &str = "new-project:publish";
 
 /// `newProjectFlow` and the state beside it.

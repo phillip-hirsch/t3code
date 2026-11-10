@@ -11,12 +11,11 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{Icon, WindowExt as _};
-use gpui_kit::{Context, Styled as _, Window};
+use gpui_kit::{Context, SharedString, Styled as _, WeakEntity, Window};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::app::Workspace;
-use crate::rpc::RpcClient;
 
 const REPOSITORY: &str = "pingdotgg/t3code";
 const PROMPTS_BEFORE_ASKING: u32 = 5;
@@ -88,13 +87,14 @@ impl Workspace {
         if write(&stored).is_none() || !ask {
             return;
         }
-        let Some(client) = self.settings_client() else { return };
+        let Some(environment) = self.settings_environment() else { return };
+        let Some(client) = self.env_client(&environment) else { return };
         self.settings_ui.star_prompt_shown = true;
         // Input resets the idle clock; only keystrokes are observable app-wide here.
         let last_input = Rc::new(Cell::new(Instant::now()));
         let input_clock = last_input.clone();
         let keystrokes = cx.observe_keystrokes(move |_, _, _, _| input_clock.set(Instant::now()));
-        cx.spawn_in(window, async move |_, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let _keystrokes = keystrokes;
             let Ok(starred) = client.request("sourceControl.starred", star_input()).await else { return };
             if starred.as_bool() == Some(true) {
@@ -116,13 +116,13 @@ impl Workspace {
             if read().is_none_or(|stored| stored.dismissed) {
                 return;
             }
-            let _ = cx.update(|window, cx| show(client, window, cx));
+            let _ = cx.update(|window, cx| show(this, environment, window, cx));
         })
         .detach();
     }
 }
 
-fn show(client: RpcClient, window: &mut Window, cx: &mut gpui_kit::App) {
+fn show(workspace: WeakEntity<Workspace>, environment: SharedString, window: &mut Window, cx: &mut gpui_kit::App) {
     let t = *crate::theme::tokens(cx);
     let toast = Notification::new()
         .id::<StarPrompt>()
@@ -132,15 +132,19 @@ fn show(client: RpcClient, window: &mut Window, cx: &mut gpui_kit::App) {
         .autohide(false)
         .on_close(|_, _| dismiss())
         .action(move |_, _, cx| {
-            let client = client.clone();
+            let (workspace, environment) = (workspace.clone(), environment.clone());
             Button::new("star-on-github").primary().label("Star on GitHub").on_click(cx.listener(
                 move |toast, _, window, cx| {
                     dismiss();
                     toast.dismiss(window, cx);
-                    let client = client.clone();
+                    // The environment's socket now: the toast can outlive the one it was asked on.
+                    let client = workspace.upgrade().and_then(|w| w.read(cx).env_client(&environment));
                     window
                         .spawn(cx, async move |cx| {
-                            let starred = client.request("sourceControl.star", star_input()).await;
+                            let starred = match client {
+                                Some(client) => client.request("sourceControl.star", star_input()).await,
+                                None => Ok(Value::Null),
+                            };
                             let _ = cx.update(|window, cx| {
                                 if matches!(starred, Ok(Value::Bool(true))) {
                                     let thanks = Notification::success("It really helps T3 Code grow.")

@@ -593,9 +593,10 @@ impl Workspace {
         self.save_settings(payload, "Could not update provider instance", window, cx);
     }
 
-    /// `refreshProviders.permissionAtom` on the Settings environment.
+    /// `refreshProviders.permissionAtom` on the Settings environment, for what the button sends.
     fn can_refresh_providers(&self) -> bool {
-        self.settings_environment().is_some_and(|env| self.environment_permits(&env, REFRESH_PROVIDERS, &Value::Null))
+        let payload = json!({"refreshModels": true, "reloadSecrets": true});
+        self.settings_environment().is_some_and(|env| self.env_permits(&env, REFRESH_PROVIDERS, &payload))
     }
 
     /// `server.refreshProviders` with models and secrets reloaded, as the refresh button does.
@@ -767,11 +768,6 @@ impl Workspace {
     /// Whether this connection's session on `environment` grants `scope` (`readEnvironmentScope`).
     pub(super) fn environment_grants(&self, environment: &str, scope: &str) -> bool {
         self.settings_ui.grants.get(environment).is_some_and(|(_, load)| load.grants(scope))
-    }
-
-    /// `permissionAtom` for a Settings control that sends `method` to `environment`.
-    pub(super) fn environment_permits(&self, environment: &str, method: &str, payload: &serde_json::Value) -> bool {
-        self.settings_ui.grants.get(environment).is_some_and(|(_, load)| load.permits(method, payload))
     }
 
     /// Provider mutations wait for `providers:manage` (`readOnly` across the panel).
