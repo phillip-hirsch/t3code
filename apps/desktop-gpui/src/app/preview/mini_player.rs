@@ -15,6 +15,7 @@ use gpui_kit::{
 };
 
 use super::mini_layout::{self, Composer, Direction, Frame, GAP, Obstacles, Position, Size};
+use super::viewport;
 use super::{Surface, Workspace, icon_button};
 use crate::preview::{self, ThreadRef};
 use crate::theme;
@@ -146,13 +147,13 @@ impl Workspace {
     }
 
     /// The aspect the frame keeps: an agent tab's streamed viewport, else the tab's own size.
-    fn mini_source(&self, thread: &ThreadRef, mini: &MiniPlayer, session: &preview::Session) -> Size {
+    fn mini_source(&self, thread: &ThreadRef, mini: &MiniPlayer, session: &preview::Session, ui_scale: f32) -> Size {
         let tab = thread.tab(&mini.tab_id);
         let streamed = session.server_hosted().then(|| self.stream_viewport(&tab)).flatten();
         if let Some((width, height)) = streamed.filter(|(w, h)| *w > 0. && *h > 0.) {
             return Size { width: f64::from(width), height: f64::from(height) };
         }
-        let (zoom, _) = self.tab_look(&tab, session);
+        let zoom = viewport::layout_zoom(self.tab_look(&tab, session).0, ui_scale);
         mini_layout::source_size(session.viewport.size(), mini.fitted, zoom)
     }
 
@@ -259,7 +260,7 @@ impl Workspace {
         }
         let session = self.preview.threads.session(&tab)?.clone();
         let tokens = *theme::tokens(cx);
-        let source = self.mini_source(&thread, &mini, &session);
+        let source = self.mini_source(&thread, &mini, &session, window.ui_scale());
         let obstacles = self.mini_obstacles(window);
         let frame = self.preview.mini.canvas.map(|canvas| {
             let container = Size {

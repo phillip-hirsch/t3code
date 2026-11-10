@@ -183,7 +183,7 @@ impl Workspace {
     }
 
     /// The More menu's "Show device toolbar" / "Hide device toolbar" (`handleToggleDeviceToolbar`).
-    pub(super) fn toggle_device_toolbar(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn toggle_device_toolbar(&mut self, window: &Window, cx: &mut Context<Self>) {
         let Some(tab) = self.active_tab() else { return };
         let Some(session) = self.preview.threads.session(&tab) else { return };
         let next = if session.viewport == Viewport::Fill {
@@ -191,7 +191,8 @@ impl Workspace {
                 serde::Deserialize::deserialize(self.client_settings.values.get("browserDefaultViewport"))
                     .unwrap_or_default();
             let panel = self.preview.panel_area.as_ref().filter(|(shown, _)| *shown == tab).map(|(_, size)| *size);
-            viewport::toolbar_viewport(&default, panel, self.tab_look(&tab, session).0)
+            let zoom = viewport::layout_zoom(self.tab_look(&tab, session).0, window.ui_scale());
+            viewport::toolbar_viewport(&default, panel, zoom)
         } else {
             Viewport::Fill
         };

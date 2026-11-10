@@ -148,11 +148,12 @@ impl Render for SeparatePreview {
             self.titled = Some(title);
         }
         let available = window.viewport_size();
+        let zoom = super::viewport::layout_zoom(self.look.zoom, window.ui_scale());
         let fit = self.look.viewport.map(|viewport| {
             let available = (f32::from(available.width), f32::from(available.height));
-            preview::fit_viewport(viewport, available, self.look.zoom)
+            preview::fit_viewport(viewport, available, zoom)
         });
-        let look = (self.look.zoom * f64::from(fit.map_or(1., |(_, scale)| scale)), self.look.appearance);
+        let look = (zoom * f64::from(fit.map_or(1., |(_, scale)| scale)), self.look.appearance);
         if self.applied.is_none_or(|(zoom, appearance)| (zoom - look.0).abs() > 1e-6 || appearance != look.1) {
             let view = self.view.read(cx);
             let _ = view.set_zoom(look.0);
