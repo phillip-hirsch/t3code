@@ -35,6 +35,26 @@ impl ImageCache {
         self.0.lock().ok()?.get(destination).cloned().flatten()
     }
 
+    /// Marks `destination` loading; false when the cache has already seen it.
+    pub(super) fn claim(&self, destination: &str) -> bool {
+        let Ok(mut cache) = self.0.lock() else { return false };
+        if cache.contains_key(destination) {
+            return false;
+        }
+        cache.insert(destination.to_owned(), None);
+        true
+    }
+
+    pub(super) fn store(&self, destination: String, image: Arc<Image>) {
+        if let Ok(mut cache) = self.0.lock() {
+            cache.insert(destination, Some(image));
+        }
+    }
+
+    pub(super) fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     /// `TextView`'s `image_source`: the loaded image, else a blank one.
     pub(super) fn resolver(&self) -> impl Fn(&SharedUri) -> ImageSource + Send + Sync + 'static {
         let cache = self.0.clone();
@@ -358,33 +378,42 @@ impl Workspace {
     /// images of `markdown`, less those linking somewhere other than an image, and where `url`
     /// is among them.
     pub(super) fn markdown_gallery(&self, markdown: &str, url: &str) -> Option<(Vec<ViewerImage>, usize)> {
-        let root = self.git_cwd();
-        let mut items = Vec::new();
-        let mut index = None;
-        for image in markdown_images(markdown) {
-            if image.link.as_deref().is_some_and(|link| !links_to_image(link)) {
-                continue;
-            }
-            let Some(loaded) = self.markdown_images.get(&image.destination) else { continue };
-            if index.is_none() && image.link.is_none() && image.destination == url {
-                index = Some(items.len());
-            }
-            // An image linking to a web image names that image, as its menu copies it.
-            let web_link = image.link.filter(|link| link.starts_with("https://") || link.starts_with("http://"));
-            let reference = match web_link {
-                Some(link) => Some(Reference::Url(link)),
-                None => match classify(&image.destination, root.as_deref()) {
-                    Source::Direct(url) => Some(Reference::Url(url)),
-                    Source::WorkspaceFile(path) => Some(file_reference(&path, root.as_deref())),
-                    Source::Data(..) | Source::Asset(_) | Source::Blocked => None,
-                },
-            };
-            let name = image.alt.trim();
-            let name = if name.is_empty() { "image" } else { name };
-            items.push(ViewerImage { image: loaded, name: name.to_owned().into(), reference });
-        }
-        Some((items, index?))
+        gallery(&self.markdown_images, self.git_cwd().as_deref(), markdown, url)
     }
+}
+
+/// [`Workspace::markdown_gallery`] over the images `cache` holds, with relative files under `root`.
+pub(super) fn gallery(
+    cache: &ImageCache,
+    root: Option<&str>,
+    markdown: &str,
+    url: &str,
+) -> Option<(Vec<ViewerImage>, usize)> {
+    let mut items = Vec::new();
+    let mut index = None;
+    for image in markdown_images(markdown) {
+        if image.link.as_deref().is_some_and(|link| !links_to_image(link)) {
+            continue;
+        }
+        let Some(loaded) = cache.get(&image.destination) else { continue };
+        if index.is_none() && image.link.is_none() && image.destination == url {
+            index = Some(items.len());
+        }
+        // An image linking to a web image names that image, as its menu copies it.
+        let web_link = image.link.filter(|link| link.starts_with("https://") || link.starts_with("http://"));
+        let reference = match web_link {
+            Some(link) => Some(Reference::Url(link)),
+            None => match classify(&image.destination, root) {
+                Source::Direct(url) => Some(Reference::Url(url)),
+                Source::WorkspaceFile(path) => Some(file_reference(&path, root)),
+                Source::Data(..) | Source::Asset(_) | Source::Blocked => None,
+            },
+        };
+        let name = image.alt.trim();
+        let name = if name.is_empty() { "image" } else { name };
+        items.push(ViewerImage { image: loaded, name: name.to_owned().into(), reference });
+    }
+    Some((items, index?))
 }
 
 /// `mediaKindFromPath(href) === "image"`: the link's path ends in an image extension.

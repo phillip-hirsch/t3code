@@ -440,7 +440,7 @@ impl super::Workspace {
         self.embeds.begin_frame([over_layout, over_everything]);
         self.sync_html_pages(window, cx);
         self.sync_mcp_apps(window, cx);
-        self.sync_chat_media(cx);
+        self.sync_chat_media(window, cx);
     }
 }
 

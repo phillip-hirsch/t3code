@@ -13,6 +13,7 @@ use gpui_kit::component::text::{
     InlineElement, InlineRenderContext, MarkdownNode, MarkdownParseContext, MarkdownPlugin,
 };
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, Context, Font, FontWeight, Hsla, IntoElement, ParentElement as _, SharedString, Styled as _, Task,
     TextRun, WeakEntity, Window, div, px, rgb,
@@ -272,14 +273,36 @@ type MediaKey = (SharedString, SharedString, usize);
 
 /// What a media plays: a web URL as written, or a host file through a signed URL.
 #[derive(Clone, Debug, PartialEq)]
-enum Playable {
+pub(super) enum Playable {
     Url(String),
-    File { thread_id: String, path: String },
+    File {
+        thread_id: String,
+        path: String,
+    },
+    /// An `assets.createUrl` resource such as a change request's host media (`github-media`),
+    /// played from `fallback` when the URL can't be signed; `fragment` is the link's `#...`.
+    Asset {
+        resource: Value,
+        fallback: String,
+        fragment: String,
+    },
+}
+
+/// What a media's size change re-lays out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Owner {
+    /// A chat message's markdown.
+    Chat,
+    /// The open pull request's panel.
+    PullRequest,
 }
 
 struct ChatMedia {
     kind: MediaKind,
     playable: Playable,
+    owner: Owner,
+    /// The page's name and look until it starts loading (see [`Workspace::sync_chat_media`]).
+    pending: Option<(String, ChipLook)>,
     embed: Option<EmbedView>,
     failed: bool,
     /// A video's natural size, once it reports one.
@@ -419,7 +442,7 @@ impl Workspace {
         let frame = self.embeds.frame();
         let path = match &playable {
             Playable::File { path, .. } => Some(path.clone()),
-            Playable::Url(_) => None,
+            Playable::Url(_) | Playable::Asset { .. } => None,
         };
         let name = media_name(&media.destination, path.as_deref(), &media.alt, media.kind);
         let style = context.text_style();
@@ -449,9 +472,10 @@ impl Workspace {
                 if state.failed {
                     let url = match &state.playable {
                         Playable::Url(url) => Some(url.clone()),
-                        Playable::File { .. } => None,
+                        Playable::File { .. } | Playable::Asset { .. } => None,
                     };
-                    return InlineElement::new(self.video_failure(&key, &media.alt, url, max_width, &t, cx));
+                    let failure = self.video_failure(&key, Owner::Chat, &media.alt, url, Some(max_width), &t, cx);
+                    return InlineElement::new(failure);
                 }
                 let (width, height) = video_box(state.natural, max_width, MEDIA_MAX_REM * rem);
                 let body = state.embed.as_ref().map(|embed| embed.frame().into_any_element());
@@ -477,13 +501,16 @@ impl Workspace {
         }
     }
 
-    /// `MediaVideoPlayer`'s failed state: Retry video, and Open in browser for a web video.
+    /// `MediaVideoPlayer`'s failed state: Retry video, and Open in browser for a web video. It is
+    /// `width` wide at 16:9, or fills its column without one.
+    #[expect(clippy::too_many_arguments, reason = "the failed video and where it sits")]
     fn video_failure(
         &self,
         key: &MediaKey,
+        owner: Owner,
         alt: &str,
         url: Option<String>,
-        width: f32,
+        width: Option<f32>,
         t: &crate::theme::Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -500,8 +527,10 @@ impl Workspace {
         });
         v_flex()
             .flex_none()
-            .w(px(width))
-            .h(px(width * 9. / 16.))
+            .map(|el| match width {
+                Some(width) => el.w(px(width)).h(px(width * 9. / 16.)),
+                None => el.w_full().aspect_ratio(16. / 9.),
+            })
             .items_center()
             .justify_center()
             .gap(px(12.))
@@ -529,7 +558,7 @@ impl Workspace {
                             .label("Retry video")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.chat_media.media.remove(&retry);
-                                this.relayout_markdown(&retry.1, cx);
+                                this.relayout_media(&retry, owner, cx);
                             })),
                     )
                     .children(open),
@@ -548,45 +577,75 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.insert_chat_media(key.clone(), kind, playable, Owner::Chat, name, look);
+        self.load_chat_media(&key, window, cx);
+    }
+
+    fn insert_chat_media(
+        &mut self,
+        key: MediaKey,
+        kind: MediaKind,
+        playable: Playable,
+        owner: Owner,
+        name: String,
+        look: ChipLook,
+    ) {
         let state = ChatMedia {
             kind,
-            playable: playable.clone(),
+            playable,
+            owner,
+            dark: look.dark,
+            pending: Some((name, look)),
             embed: None,
             failed: false,
             natural: None,
-            dark: look.dark,
             used: self.embeds.frame(),
             _task: None,
             _messages: None,
         };
-        self.chat_media.media.insert(key.clone(), state);
-        let border = css_color(crate::theme::tokens(cx).border.opacity(0.4));
-        let connection = (self.client(), self.http_base().map(str::to_owned));
+        self.chat_media.media.insert(key, state);
+    }
+
+    /// The socket and HTTP origin of the environment `key` plays on.
+    fn media_connection(&self, key: &MediaKey) -> (Option<crate::rpc::RpcClient>, Option<String>) {
+        (self.env_client(&key.0), self.env_endpoint(&key.0).map(|endpoint| endpoint.http_base.clone()))
+    }
+
+    /// Starts building `key`'s page, once.
+    fn load_chat_media(&mut self, key: &MediaKey, window: &mut Window, cx: &mut Context<Self>) {
+        let connection = self.media_connection(key);
+        let t = *crate::theme::tokens(cx);
+        let Some(state) = self.chat_media.media.get_mut(key) else { return };
+        let Some((name, look)) = state.pending.take() else { return };
+        let (kind, playable, owner) = (state.kind, state.playable.clone(), state.owner);
+        // `MediaVideoPlayer`'s pull request look: a black letterbox inside `border-border/60`.
+        let (border, fill) = match owner {
+            Owner::Chat => (css_color(t.border.opacity(0.4)), "transparent"),
+            Owner::PullRequest => (css_color(t.border.opacity(0.6)), "#000"),
+        };
         let request = key.clone();
         let task = cx.spawn_in(window, async move |this, cx| {
-            let url = match &playable {
-                Playable::Url(url) => Some(url.clone()),
-                Playable::File { thread_id, path } => match connection {
-                    (Some(client), Some(base)) => mint_media_url(client, base, thread_id.clone(), path.clone()).await,
-                    _ => None,
-                },
-            };
+            let can_open = matches!(playable, Playable::File { .. });
+            let url = resolve_playable(playable, connection).await;
             let page = match kind {
                 MediaKind::Video => {
-                    url.map(|url| super::files::inline_video_page(&url, &look.background, &border, look.dark))
+                    url.map(|url| super::files::inline_video_page(&url, &look.background, &border, fill, look.dark))
                 }
-                MediaKind::Audio => {
-                    let can_open = matches!(playable, Playable::File { .. });
-                    Some(audio_chip_page(url.as_deref(), &name, can_open, &look))
-                }
+                MediaKind::Audio => Some(audio_chip_page(url.as_deref(), &name, can_open, &look)),
             };
             let _ = this.update_in(cx, |this, window, cx| match page {
                 Some(page) => this.build_media_view(request, page, look.dark, window, cx),
                 None => this.chat_media_failed(&request, cx),
             });
         });
-        if let Some(state) = self.chat_media.media.get_mut(&key) {
-            state._task = Some(task);
+        state._task = Some(task);
+    }
+
+    /// Re-lays out what shows `key`, as its size or state changed.
+    fn relayout_media(&mut self, key: &MediaKey, owner: Owner, cx: &mut Context<Self>) {
+        match owner {
+            Owner::Chat => self.relayout_markdown(&key.1, cx),
+            Owner::PullRequest => self.remeasure_pr_panel(cx),
         }
     }
 
@@ -595,7 +654,8 @@ impl Workspace {
         state.failed = true;
         state.embed = None;
         state._task = None;
-        self.relayout_markdown(&key.1, cx);
+        let owner = state.owner;
+        self.relayout_media(key, owner, cx);
     }
 
     fn build_media_view(
@@ -636,11 +696,11 @@ impl Workspace {
                     Ok(view) => {
                         let _ = view.set_theme(if dark { wry::Theme::Dark } else { wry::Theme::Light });
                         let embed = this.embeds.adopt(view, Layer::Page, cx);
-                        if let Some(state) = this.chat_media.media.get_mut(&built_key) {
-                            state.embed = Some(embed);
-                            state._task = None;
-                        }
-                        this.relayout_markdown(&built_key.1, cx);
+                        let Some(state) = this.chat_media.media.get_mut(&built_key) else { return };
+                        state.embed = Some(embed);
+                        state._task = None;
+                        let owner = state.owner;
+                        this.relayout_media(&built_key, owner, cx);
                     }
                     Err(error) => {
                         log::warn!("chat media: {error}");
@@ -671,7 +731,8 @@ impl Workspace {
                 cx.notify();
             }
             MediaMessage::Size(width, height) => {
-                if state.natural != Some((width, height)) {
+                // A pull request's video keeps its 16:9 box, whatever the video's own size.
+                if state.natural != Some((width, height)) && state.owner == Owner::Chat {
                     state.natural = Some((width, height));
                     self.relayout_markdown(&key.1, cx);
                 }
@@ -689,16 +750,10 @@ impl Workspace {
             }
             MediaMessage::Retry => {
                 let playable = state.playable.clone();
-                let connection = (self.client(), self.http_base().map(str::to_owned));
+                let connection = self.media_connection(&key);
                 let request = key.clone();
                 let task = cx.spawn(async move |this, cx| {
-                    let url = match playable {
-                        Playable::Url(url) => Some(url),
-                        Playable::File { thread_id, path } => match connection {
-                            (Some(client), Some(base)) => mint_media_url(client, base, thread_id, path).await,
-                            _ => None,
-                        },
-                    };
+                    let url = resolve_playable(playable, connection).await;
                     let _ = this.update(cx, |this, cx| {
                         let Some(embed) = this.chat_media.media.get(&request).and_then(|state| state.embed.as_ref())
                         else {
@@ -715,12 +770,16 @@ impl Workspace {
         }
     }
 
-    /// Before the frame draws: media long off screen close, and a theme change repaints the pages.
-    pub(super) fn sync_chat_media(&mut self, cx: &mut Context<Self>) {
+    /// Before the frame draws: media long off screen close, a theme change repaints the pages,
+    /// and media a view asked for without a window start loading.
+    pub(super) fn sync_chat_media(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let dark = crate::theme::tokens(cx).dark;
         let media = &mut self.chat_media.media;
-        let stale: Vec<SharedString> =
-            media.iter().filter(|(_, state)| state.dark != dark).map(|(key, _)| key.1.clone()).collect();
+        let stale: Vec<(MediaKey, Owner)> = media
+            .iter()
+            .filter(|(_, state)| state.dark != dark)
+            .map(|(key, state)| (key.clone(), state.owner))
+            .collect();
         media.retain(|_, state| state.dark == dark);
         if media.len() > KEPT_MEDIA {
             let last = self.embeds.frame();
@@ -729,20 +788,90 @@ impl Workspace {
             let oldest_kept = used[KEPT_MEDIA - 1];
             media.retain(|_, state| state.used >= oldest_kept || state.used + 1 >= last);
         }
-        for key in stale {
-            self.relayout_markdown(&key, cx);
+        let pending: Vec<MediaKey> =
+            media.iter().filter(|(_, state)| state.pending.is_some()).map(|(key, _)| key.clone()).collect();
+        for key in pending {
+            self.load_chat_media(&key, window, cx);
+        }
+        for (key, owner) in stale {
+            self.relayout_media(&key, owner, cx);
+        }
+    }
+
+    /// `MediaVideoPlayer` filling its column at 16:9 (`PullRequestHostVideo`), in the open pull
+    /// request's panel. It loads from the next frame, which starts it with the window.
+    pub(super) fn render_pull_request_video(
+        &mut self,
+        environment: SharedString,
+        message: SharedString,
+        playable: Playable,
+        original_url: &str,
+        t: &crate::theme::Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        const LABEL: &str = "Pull request video";
+        let key = (environment, message, 0);
+        if self.chat_media.media.get(&key).is_none_or(|existing| existing.playable != playable) {
+            let look = ChipLook {
+                dark: t.dark,
+                background: css_color(t.background),
+                accent: String::new(),
+                invalid: String::new(),
+                font: String::new(),
+                font_size: 0.,
+                line_height: 0.,
+            };
+            self.insert_chat_media(key.clone(), MediaKind::Video, playable, Owner::PullRequest, LABEL.into(), look);
+            cx.notify();
+        }
+        // A page over the layout holds the panel, so only what covers everything covers its video.
+        let layer = if self.page.is_some() { Layer::Dialog } else { Layer::Page };
+        let frame = self.embeds.frame();
+        let Some(state) = self.chat_media.media.get_mut(&key) else { return div().into_any_element() };
+        state.used = frame;
+        if state.failed {
+            let url = Some(original_url.to_owned());
+            return self.video_failure(&key, Owner::PullRequest, LABEL, url, None, t, cx);
+        }
+        let body = state.embed.as_ref().map(|embed| {
+            embed.set_layer(layer);
+            embed.frame().into_any_element()
+        });
+        div()
+            .w_full()
+            .aspect_ratio(16. / 9.)
+            .rounded(px(8.))
+            .when(body.is_none(), |el| el.bg(t.muted.opacity(0.6)))
+            .children(body)
+            .into_any_element()
+    }
+}
+
+/// The URL a media page plays: a signed one for a host file or asset.
+async fn resolve_playable(
+    playable: Playable,
+    (client, base): (Option<crate::rpc::RpcClient>, Option<String>),
+) -> Option<String> {
+    let connection = client.zip(base);
+    match playable {
+        Playable::Url(url) => Some(url),
+        Playable::File { thread_id, path } => {
+            let (client, base) = connection?;
+            let resource = json!({"_tag": "media-file", "threadId": thread_id, "path": path});
+            mint_url(client, base, resource).await
+        }
+        Playable::Asset { resource, fallback, fragment } => {
+            let minted = match connection {
+                Some((client, base)) => mint_url(client, base, resource).await,
+                None => None,
+            };
+            Some(format!("{}{fragment}", minted.unwrap_or(fallback)))
         }
     }
 }
 
-/// `assets.createUrl` for a host file the thread can play (`media-file`).
-async fn mint_media_url(
-    client: crate::rpc::RpcClient,
-    base: String,
-    thread_id: String,
-    path: String,
-) -> Option<String> {
-    let resource = json!({"_tag": "media-file", "threadId": thread_id, "path": path});
+/// `assets.createUrl` for what a media plays.
+async fn mint_url(client: crate::rpc::RpcClient, base: String, resource: Value) -> Option<String> {
     match client.request("assets.createUrl", json!({"resource": resource})).await {
         Ok(minted) => Some(format!("{base}{}", minted["relativeUrl"].as_str()?)),
         Err(error) => {

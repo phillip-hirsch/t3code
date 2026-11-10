@@ -38,6 +38,7 @@ use crate::theme::{self, FONT_MONO, Tokens};
 use crate::timestamp::parse_ms;
 
 pub(super) mod avatars;
+mod body;
 pub(super) mod breakdown;
 mod code;
 mod completions;
@@ -110,6 +111,10 @@ pub(in crate::app) struct Panel {
     copied: Option<&'static str>,
     _copied: Option<Task<()>>,
     markdown: HashMap<String, (String, Entity<TextViewState>, Subscription)>,
+    /// Bodies by their key, as split into prose and media (`splitPullRequestBody`).
+    bodies: HashMap<String, Rc<body::Body>>,
+    /// The bodies' images, loaded through the pull request's environment.
+    images: super::super::markdown_images::ImageCache,
     /// Markdown bodies whose code blocks scroll instead of wrapping (`MarkdownCodeBlock`'s wrap).
     code_nowrap: HashSet<gpui_kit::EntityId>,
     /// The description as last written from here (`DescriptionDraft`).
@@ -186,6 +191,8 @@ impl Panel {
             copied: None,
             _copied: None,
             markdown: HashMap::new(),
+            bodies: HashMap::new(),
+            images: Default::default(),
             code_nowrap: HashSet::new(),
             description_draft: None,
             summary_scroll: ScrollHandle::new(),
@@ -874,7 +881,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// One markdown body, parsed once and kept while the panel shows this pull request.
     /// What a markdown body's view parses: HTML comments out, media links resolved on the host.
     fn pr_markdown_source(&self, text: &str) -> String {
         let panel = self.pull_requests.panel.as_ref();
@@ -887,19 +893,18 @@ impl Workspace {
         }
     }
 
+    /// One prose run of a body (see [`Self::pr_body`]), parsed once and kept while the panel
+    /// shows this pull request.
     fn pr_markdown(&mut self, key: &str, text: &str, cx: &mut Context<Self>) -> Option<Entity<TextViewState>> {
-        let shown = self.pr_markdown_source(text);
         let panel = self.pull_requests.panel.as_mut()?;
         if let Some((held, view, _)) = panel.markdown.get_mut(key) {
             if held != text {
-                let source = shown;
-                view.update(cx, |view, cx| view.set_text(&source, cx));
+                view.update(cx, |view, cx| view.set_text(text, cx));
                 text.clone_into(held);
             }
             return Some(view.clone());
         }
-        let source = shown;
-        let view = cx.new(|cx| TextViewState::markdown(&source, cx));
+        let view = cx.new(|cx| TextViewState::markdown(text, cx));
         let changed = cx.observe(&view, |this, _, cx| {
             if let Some(panel) = this.pull_requests.panel.as_mut() {
                 panel.timeline.remeasure();
@@ -908,6 +913,14 @@ impl Workspace {
         });
         panel.markdown.insert(key.to_owned(), (text.to_owned(), view.clone(), changed));
         Some(view)
+    }
+
+    /// Re-lays out the open pull request, as something in its bodies changed size.
+    pub(in crate::app) fn remeasure_pr_panel(&mut self, cx: &mut Context<Self>) {
+        if let Some(panel) = self.pull_requests.panel.as_mut() {
+            panel.timeline.remeasure();
+        }
+        cx.notify();
     }
 
     /// Whether the code blocks of the markdown body `state` wrap; they do until toggled.
@@ -1966,17 +1979,7 @@ impl Workspace {
             }
             let text = if body.trim().is_empty() { "_No description provided._" } else { body.as_str() };
             let editable = logic::can_edit_change_request(detail);
-            let view = cx.entity();
-            let state = self.pr_markdown("description", text, cx);
-            let markdown = state.map(|state| {
-                let markdown = pr_markdown_view(&state, t, view.clone(), self.pr_code_wraps(&state));
-                if !editable {
-                    return markdown;
-                }
-                markdown.on_task_toggle(move |item_start, checked, window, cx| {
-                    view.update(cx, |this, cx| this.toggle_pr_task(item_start, checked, window, cx));
-                })
-            });
+            let markdown = self.pr_body("description", text, editable, t, cx);
             let edit = editable.then(|| self.pr_edit_button("description".into(), "description", body.clone(), t, cx));
             let reactions = activity.as_ref().and_then(|a| self.render_pr_reactions(None, &a.reactions, t, cx));
             Some(
@@ -2209,8 +2212,11 @@ impl Workspace {
         let reply_count = replies.len() + more;
         let body = logic::visible_body(&root.body);
         let preview = (!open).then(|| body.as_deref().map(preview_line)).flatten();
-        let opened_body =
-            if open { body.as_ref().and_then(|b| self.pr_markdown(&format!("c:{}", root.id), b, cx)) } else { None };
+        let opened_body = if open {
+            body.as_ref().and_then(|b| self.pr_body(&format!("c:{}", root.id), b, false, t, cx))
+        } else {
+            None
+        };
         let chat = self.render_pr_add_to_chat(&root.id, logic::chat_subject(root, thread), false, t, cx);
         let toggle_key = key;
         v_flex()
@@ -2263,17 +2269,7 @@ impl Workspace {
                     ),
             )
             .when(open, |el| {
-                el.child(
-                    v_flex()
-                        .px(px(12.))
-                        .pb(px(12.))
-                        .gap(px(12.))
-                        .children(
-                            opened_body
-                                .map(|state| pr_markdown_view(&state, t, cx.entity(), self.pr_code_wraps(&state))),
-                        )
-                        .children(replies_column),
-                )
+                el.child(v_flex().px(px(12.)).pb(px(12.)).gap(px(12.)).children(opened_body).children(replies_column))
             })
             .children(more_replies.map(|line| div().px(px(12.)).pb(px(12.)).child(line)))
             .into_any_element()
@@ -2288,7 +2284,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let body = logic::visible_body(&comment.body);
-        let markdown = body.as_ref().and_then(|b| self.pr_markdown(&format!("c:{}", comment.id), b, cx));
+        let markdown = body.as_ref().and_then(|b| self.pr_body(&format!("c:{}", comment.id), b, false, t, cx));
         let can_edit = self
             .pull_requests
             .panel
@@ -2350,9 +2346,7 @@ impl Workspace {
                         .gap(px(4.))
                         .px(px(12.))
                         .py(px(12.))
-                        .child(div().flex_1().min_w_0().children(
-                            markdown.map(|state| pr_markdown_view(&state, t, cx.entity(), self.pr_code_wraps(&state))),
-                        ))
+                        .child(div().flex_1().min_w_0().children(markdown))
                         .children(edit),
                 ),
                 None => el,
@@ -3247,9 +3241,8 @@ fn open_on_host_button(id: String, url: Option<String>, t: &Tokens) -> Option<im
 
 fn timeline_body(event: &Event, view: &Entity<Workspace>, t: &Tokens, cx: &mut App) -> Option<AnyElement> {
     let body = event.body.as_ref()?;
-    let state = view.update(cx, |this, cx| this.pr_markdown(&format!("c:{}", event.id), body, cx))?;
-    let wrap = view.read(cx).pr_code_wraps(&state);
-    Some(div().mt(px(12.)).child(pr_markdown_view(&state, t, view.clone(), wrap)).into_any_element())
+    let markdown = view.update(cx, |this, cx| this.pr_body(&format!("c:{}", event.id), body, false, t, cx))?;
+    Some(div().mt(px(12.)).child(markdown).into_any_element())
 }
 
 /// `ConversationCard`.

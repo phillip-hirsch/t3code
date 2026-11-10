@@ -29,6 +29,7 @@ mod open_vsx;
 mod preview;
 mod project_groups;
 mod proposed_plan;
+mod pull_request_body;
 mod pull_request_completions;
 mod pull_request_detail;
 mod pull_request_diff;

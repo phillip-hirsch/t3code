@@ -335,6 +335,9 @@ pub struct Detail {
     #[serde(default)]
     pub viewer_permissions: Permissions,
     pub project_id: String,
+    /// The checkout the server reads the change request from, which host media is fetched for.
+    #[serde(default)]
+    pub workspace_root: String,
     pub repository: String,
     pub number: u64,
     pub title: String,

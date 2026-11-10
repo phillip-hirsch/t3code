@@ -1275,7 +1275,7 @@ impl Workspace {
             },
         );
         let body = if preview {
-            let rendered = (!empty).then(|| self.pr_markdown("editor-preview", &text, cx)).flatten();
+            let rendered = (!empty).then(|| self.pr_body("editor-preview", &text, false, t, cx)).flatten();
             div()
                 .rounded(px(8.))
                 .border_1()
@@ -1283,9 +1283,7 @@ impl Workspace {
                 .px(px(12.))
                 .py(px(8.))
                 .child(match rendered {
-                    Some(state) => {
-                        pr_markdown_view(&state, t, cx.entity(), self.pr_code_wraps(&state)).into_any_element()
-                    }
+                    Some(markdown) => markdown,
                     None => {
                         div().text_xs().text_color(t.muted_foreground).child("Nothing to preview.").into_any_element()
                     }

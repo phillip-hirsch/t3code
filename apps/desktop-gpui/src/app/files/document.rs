@@ -173,15 +173,16 @@ fn document_page(kind: FileKind, url: &str, background: &str, dark: bool) -> Pag
 
 /// A chat video's page (`ChatMarkdownVideo`): the same element and bridge as the file panel's,
 /// filling an embed sized to the video (see [`crate::app::embed`]), rounded with a faint border on
-/// `background`. It reports the video's natural size and pauses when its row unmounts.
-pub(in crate::app) fn inline_video_page(url: &str, background: &str, border: &str, dark: bool) -> String {
+/// `background`, letterboxed in `fill`. It reports the video's natural size and pauses when its
+/// row unmounts.
+pub(in crate::app) fn inline_video_page(url: &str, background: &str, border: &str, fill: &str, dark: bool) -> String {
     use crate::app::embed::{FRAME_CSS, FRAME_SCRIPT};
     let src = escape_attribute(url);
     let scheme = if dark { "dark" } else { "light" };
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"color-scheme\" content=\"{scheme}\">\
          <style>{FRAME_CSS}html{{background:{background}}}video{{display:block;width:100%;height:100%;\
-         box-sizing:border-box;border:1px solid {border};border-radius:8px;object-fit:contain}}</style></head>\
+         box-sizing:border-box;border:1px solid {border};border-radius:8px;background:{fill};object-fit:contain}}</style></head>\
          <body><div id=\"t3-embed\"><video id=\"m\" controls playsinline preload=\"metadata\" src=\"{src}\"></video></div>\
          <script>{FRAME_SCRIPT}{MEDIA_SCRIPT}m.addEventListener('loadedmetadata',()=>\
          post({{type:'size',w:m.videoWidth,h:m.videoHeight}}));window.t3Hidden=()=>m.pause();</script></body></html>"
@@ -775,9 +776,10 @@ mod tests {
         assert!(video.contains("window.t3Media") && video.contains("'contextmenu'"));
         assert_eq!(media_adopt_script("http://h/a\"b"), r#"window.t3Media&&window.t3Media.adopt("http://h/a\"b")"#);
         assert!(audio.contains("content=\"dark\""));
-        let chat = inline_video_page("http://h/a\"b.mp4", "#fff", "#eee", false);
+        let chat = inline_video_page("http://h/a\"b.mp4", "#fff", "#eee", "#000", false);
         assert!(chat.contains("src=\"http://h/a&quot;b.mp4\"") && chat.contains("id=\"t3-embed\""));
         assert!(chat.contains("window.t3Media") && chat.contains("type:'size'") && chat.contains("window.t3Hidden"));
+        assert!(chat.contains("background:#000;object-fit:contain"), "the letterbox fill");
         assert_eq!(resolve_asset_url("http://h:1/", "/api/assets/t/a.pdf"), "http://h:1/api/assets/t/a.pdf");
         assert_eq!(resolve_asset_url("http://h:1", "https://x/y"), "https://x/y");
         assert_eq!(resolve_asset_url("http://h:1", "httpx/y"), "http://h:1/httpx/y", "a path, not a URL");
