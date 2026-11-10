@@ -921,16 +921,16 @@ pub(super) fn render_row(
         Row::SubagentGroup { key, cards, expanded } => {
             lane(0., subagent_group(key, cards, *expanded, this, &t, cx)).into_any_element()
         }
-        // `HtmlRenderTimelineRow`: a rendered page draws inline; an MCP app keeps its card.
-        Row::Embed(embed) => match &embed.page {
-            Some(size) => {
-                let page = this
-                    .update(cx, |workspace, cx| workspace.render_html_page(embed, size, lane_width - 8., window, cx))
-                    .unwrap_or_else(|_| div().into_any_element());
-                lane(8., div().px(px(4.)).child(page)).into_any_element()
-            }
-            None => lane(8., embed_card(embed, this, &t)).into_any_element(),
-        },
+        // `HtmlRenderTimelineRow` and `McpAppTimelineRow`: the page or the app, inline.
+        Row::Embed(embed) => {
+            let body = this
+                .update(cx, |workspace, cx| match &embed.page {
+                    Some(size) => workspace.render_html_page(embed, size, lane_width - 8., window, cx),
+                    None => workspace.render_mcp_app(embed, lane_width - 8., window, cx),
+                })
+                .unwrap_or_else(|_| div().into_any_element());
+            lane(8., div().px(px(4.)).child(body)).into_any_element()
+        }
         Row::CreatedThread { id, title, thread_id, .. } => {
             lane(8., created_thread_card(id, title.as_ref(), thread_id.as_ref(), this, &t)).into_any_element()
         }
@@ -1434,59 +1434,6 @@ fn created_thread_card(
         .into_any_element()
 }
 
-/// An MCP app (`McpAppFrame`): the web runs its bridge in a frame; here it opens in the browser.
-fn embed_card(embed: &Rc<timeline::Embed>, this: &WeakEntity<Workspace>, t: &Tokens) -> AnyElement {
-    let open = {
-        let (this, embed) = (this.clone(), embed.clone());
-        move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-            let _ = this.update(cx, |workspace, cx| workspace.open_embed(&embed, cx));
-        }
-    };
-    h_flex()
-        .w_full()
-        .min_w_0()
-        .gap(px(10.))
-        .px(px(12.))
-        .py(px(10.))
-        .rounded(px(8.))
-        .border_1()
-        .border_color(alpha(t.border, 0.6))
-        .bg(alpha(t.card, 0.3))
-        .child(
-            Icon::new(if embed.app_server.is_some() { IconName::AppWindow } else { IconName::Globe })
-                .size(px(16.))
-                .text_color(icon_color(t)),
-        )
-        .child(
-            v_flex()
-                .flex_1()
-                .min_w_0()
-                .child(div().truncate().text_size(px(TEXT)).font_weight(FontWeight::MEDIUM).child(embed.title.clone()))
-                .child(div().text_xs().text_color(t.muted_foreground).child(match &embed.app_server {
-                    Some(_) => "MCP app",
-                    None => "HTML page",
-                })),
-        )
-        .child(
-            h_flex()
-                .id(ElementId::Name(format!("embed-open:{}", embed.id).into()))
-                .flex_none()
-                .h(px(24.))
-                .px(px(7.))
-                .gap(px(4.))
-                .rounded(px(8.))
-                .border_1()
-                .border_color(t.input)
-                .cursor_pointer()
-                .text_xs()
-                .hover(|style| style.bg(t.accent))
-                .child(Icon::new(IconName::ExternalLink).size(px(12.)))
-                .child("Open in browser")
-                .on_click(open),
-        )
-        .into_any_element()
-}
-
 impl Workspace {
     /// Opens a file sent with an answer through a signed URL, as its link does on the web.
     fn open_answer_attachment(&mut self, attachment_id: &str, cx: &mut Context<Self>) {
@@ -1500,32 +1447,6 @@ impl Workspace {
                 },
                 Err(error) => log::debug!("assets.createUrl for an answer attachment: {error}"),
             }
-        })
-        .detach();
-    }
-
-    /// Mints a signed URL for the page (`assets.createUrl`) and opens it.
-    fn open_embed(&mut self, embed: &timeline::Embed, cx: &mut Context<Self>) {
-        let (Some(client), Some(base)) = (self.client(), self.http_base().map(str::to_owned)) else { return };
-        let mut resource = serde_json::json!({
-            "_tag": "attachment",
-            "attachmentId": embed.attachment_id,
-            "mimeType": "text/html",
-            "disposition": "inline",
-        });
-        match &embed.app_server {
-            Some(_) => resource["renderIntent"] = "mcp-app".into(),
-            None => resource["fileName"] = embed.file_name().into(),
-        }
-        cx.spawn(async move |this, cx| {
-            let result = client.request("assets.createUrl", serde_json::json!({"resource": resource})).await;
-            let _ = this.update(cx, |this, cx| {
-                match result.as_ref().ok().and_then(|r| r.get("relativeUrl")).and_then(|u| u.as_str()) {
-                    Some(url) => cx.open_url(&format!("{base}{url}")),
-                    None => this.error = Some("Page unavailable. Reconnect to the environment and try again.".into()),
-                }
-                cx.notify();
-            });
         })
         .detach();
     }

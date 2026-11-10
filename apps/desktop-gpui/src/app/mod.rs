@@ -63,6 +63,7 @@ mod markdown_images;
 mod markdown_media;
 mod markdown_ui;
 mod math;
+mod mcp_app;
 pub mod menu;
 mod mermaid;
 mod message_actions;
@@ -348,6 +349,7 @@ pub struct Workspace {
     /// Native pages laid into the layout: rendered HTML pages and chat media.
     embeds: embed::Embeds,
     html_pages: html_page::HtmlPages,
+    mcp_apps: mcp_app::McpApps,
     chat_media: markdown_media::ChatMediaUi,
     diagrams: mermaid::Diagrams,
     formulas: math::Formulas,
@@ -545,6 +547,7 @@ impl Workspace {
             image_viewer: Default::default(),
             embeds: Default::default(),
             html_pages: Default::default(),
+            mcp_apps: Default::default(),
             chat_media: Default::default(),
             diagrams: Default::default(),
             formulas: Default::default(),
@@ -1400,6 +1403,7 @@ impl Render for Workspace {
             // The panel toggles stay above the sheet, as the web's `z-50` titlebar controls do.
             .children(self.render_sidebar_sheet(window, cx))
             .child(self.render_titlebar_overlay(window, cx))
+            .children(self.render_mcp_app_fullscreen(cx))
             .children(self.render_page_modal(window, cx))
             .children(self.render_settings(window, cx))
             .children(self.theme_editor.clone())

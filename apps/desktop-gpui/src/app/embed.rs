@@ -63,7 +63,7 @@ struct Shared {
 
 struct Placement {
     view: WeakEntity<WebView>,
-    layer: Layer,
+    layer: Cell<Layer>,
     /// The frame an [`EmbedFrame`] last laid this embed out in.
     drawn: Cell<u64>,
     /// Laid out by the last sweep's frame, so the next one that misses it pauses it once.
@@ -136,6 +136,11 @@ impl EmbedView {
     pub(super) fn retell(&self) {
         self.placement.told.set(None);
     }
+
+    /// Moves the page under another layer's overlays, as a full screen app leaves the layout.
+    pub(super) fn set_layer(&self, layer: Layer) {
+        self.placement.layer.set(layer);
+    }
 }
 
 impl Embeds {
@@ -145,7 +150,7 @@ impl Embeds {
         let view = cx.new(|_| webview);
         let placement = Rc::new(Placement {
             view: view.downgrade(),
-            layer,
+            layer: Cell::new(layer),
             drawn: Cell::new(0),
             was_drawn: Cell::new(false),
             shown: Cell::new(false),
@@ -241,12 +246,13 @@ impl Element for EmbedFrame {
         placement.drawn.set(self.shared.frame.get());
         let Some(view) = placement.view.upgrade() else { return };
         let mut clip = window.content_mask().bounds;
-        if placement.layer == Layer::Page
+        let layer = placement.layer.get();
+        if layer == Layer::Page
             && let Some(scope) = self.shared.clip.get()
         {
             clip = clip.intersect(&scope);
         }
-        let covered = self.shared.covered.get()[placement.layer as usize];
+        let covered = self.shared.covered.get()[layer as usize];
         let Some((visible, offset)) = visible_part(bounds, clip).filter(|_| !covered) else {
             placement.hide(view.read(cx), false);
             return;
@@ -424,6 +430,7 @@ impl super::Workspace {
         let over_layout = over_everything
             || self.browser_covered(window, cx)
             || self.html_dialog_open()
+            || self.mcp_app_fullscreen()
             || self.chat_menu.is_some()
             || self.composer_menu_open()
             || self.model_picker_open()
@@ -432,6 +439,7 @@ impl super::Workspace {
             || (self.details_visibility().popover_open && !self.details_inline(window));
         self.embeds.begin_frame([over_layout, over_everything]);
         self.sync_html_pages(window, cx);
+        self.sync_mcp_apps(window, cx);
         self.sync_chat_media(cx);
     }
 }

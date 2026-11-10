@@ -147,7 +147,7 @@ fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\
 <polyline points=\"15 3 21 3 21 9\"/><polyline points=\"9 21 3 21 3 15\"/><line x1=\"21\" x2=\"14\" y1=\"3\" y2=\"10\"/>\
 <line x1=\"3\" x2=\"10\" y1=\"21\" y2=\"14\"/></svg>";
 
-fn escape_attribute(value: &str) -> String {
+pub(super) fn escape_attribute(value: &str) -> String {
     value.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;")
 }
 
@@ -519,7 +519,7 @@ impl Workspace {
     }
 
     /// Re-lays out the timeline row of the page `attachment_id`, whose height changed.
-    fn remeasure_page_row(&mut self, attachment_id: &SharedString, cx: &mut Context<Self>) {
+    pub(super) fn remeasure_page_row(&mut self, attachment_id: &SharedString, cx: &mut Context<Self>) {
         let is_page =
             |row: &timeline::Row| matches!(row, timeline::Row::Embed(embed) if embed.attachment_id == *attachment_id);
         if let Some(index) = self.rows.iter().position(is_page) {

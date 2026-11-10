@@ -20,6 +20,7 @@ mod hex;
 mod inbox;
 mod keybindings;
 mod load_balancing;
+mod mcp_apps;
 mod model;
 mod model_label;
 mod new_thread;

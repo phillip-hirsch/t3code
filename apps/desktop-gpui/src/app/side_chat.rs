@@ -429,6 +429,11 @@ impl Workspace {
         self.side_chat.view.as_ref()?.state.projection.as_ref()
     }
 
+    /// The side chat on screen.
+    pub(super) fn side_chat_thread_id(&self) -> Option<&str> {
+        Some(self.side_chat.view.as_ref()?.thread_id.as_str())
+    }
+
     fn send_side_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(view) = self.side_chat.view.as_ref() else { return };
         let text = view.composer.read(cx).value().trim().to_owned();

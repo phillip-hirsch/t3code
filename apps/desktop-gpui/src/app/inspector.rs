@@ -300,7 +300,7 @@ impl Workspace {
     }
 
     /// The thread and item an item was projected from, for the item RPCs.
-    fn source_of(&self, item_id: &str) -> Option<(String, String)> {
+    pub(super) fn source_of(&self, item_id: &str) -> Option<(String, String)> {
         let main = self.thread.as_ref().and_then(|thread| thread.state.projection.as_ref());
         let rows = main.into_iter().chain(self.side_chat_projection()).flat_map(|p| &p.visible_turn_items);
         let row = rows.into_iter().find(|row| row.item.id == item_id)?;
