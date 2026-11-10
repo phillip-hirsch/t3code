@@ -93,10 +93,11 @@ impl Workspace {
                 }
                 _ => {}
             }
+            // Marked only once a read starts: offline, the next shell batch after a reconnect asks.
+            let Some(client) = self.env_client(&thread.env) else { continue };
             if !self.subagents.fetching.insert(key.clone()) {
                 continue;
             }
-            let Some(client) = self.env_client(&thread.env) else { return };
             let input = json!({"threadId": thread.id});
             let origin = origin.clone();
             self.subagents._fetches.push(cx.spawn(async move |this, cx| {
