@@ -15,6 +15,7 @@ use super::super::Workspace;
 use super::super::git::{self, DiffColorScheme};
 use super::super::markdown_ui::workspace_relative;
 use super::diff_load::FileStat;
+use crate::model::ScopedId;
 use crate::theme::Tokens;
 
 /// The header the copy button shows on hover of.
@@ -81,8 +82,8 @@ impl Workspace {
     /// A diff's file in the open checkout: its workspace root and the path inside it.
     fn diff_file_in_workspace(&self, file_path: &str) -> Option<(String, String)> {
         let worktree = match &self.target {
-            Some(super::super::Target::Thread { id, .. }) => {
-                self.shell.threads.iter().find(|thread| &thread.id == id).and_then(|t| t.worktree_path.clone())
+            Some(super::super::Target::Thread { env, id }) => {
+                self.shell.thread(&ScopedId::new(env.clone(), id.as_str())).and_then(|t| t.worktree_path.clone())
             }
             _ => None,
         };
