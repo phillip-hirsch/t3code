@@ -766,6 +766,9 @@ struct ThreadPicker {
     highlight: Option<String>,
     scroll: ScrollHandle,
     _search: Option<Task<()>>,
+    /// What `_search` asked, on which socket, under which shell snapshot: a reconnect or a new
+    /// snapshot asks again, as `useThreadSearch`'s query reruns when its session changes.
+    asked: Option<(Value, crate::rpc::SocketId, u64)>,
     /// The shell revision last drawn.
     revision: Option<u64>,
     _subscriptions: Vec<Subscription>,
@@ -795,6 +798,7 @@ impl ThreadPicker {
                 if this.revision.replace(revision) != Some(revision) {
                     cx.notify();
                 }
+                this.search_older(cx);
             })
         });
         Self {
@@ -805,6 +809,7 @@ impl ThreadPicker {
             highlight: None,
             scroll: ScrollHandle::new(),
             _search: None,
+            asked: None,
             revision: None,
             _subscriptions: [Some(typed), shell].into_iter().flatten().collect(),
         }
@@ -825,17 +830,23 @@ impl ThreadPicker {
 
     /// The query's older settled threads, after the search's debounce, join the shell.
     fn search_older(&mut self, cx: &mut Context<Self>) {
-        self._search = None;
         let Some(workspace) = self.workspace.upgrade() else { return };
         let workspace = workspace.read(cx);
         let before = workspace.shell.older_settled(&self.environment).map(|cut| cut.before.as_str());
         let query = self.search.read(cx).value().to_string();
-        let Some(input) = picker_search_input(&query, before) else { return };
-        let (Some(client), generation) =
-            (workspace.env_client(&self.environment), workspace.shell.generation(&self.environment))
-        else {
+        let (Some(input), Some(client), generation) = (
+            picker_search_input(&query, before),
+            workspace.env_client(&self.environment),
+            workspace.shell.generation(&self.environment),
+        ) else {
+            (self._search, self.asked) = (None, None);
             return;
         };
+        let asked = (input.clone(), client.socket_id(), generation);
+        if self.asked.as_ref() == Some(&asked) {
+            return;
+        }
+        self.asked = Some(asked);
         let environment = self.environment.clone();
         self._search = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_millis(120)).await;

@@ -114,6 +114,8 @@ pub(in crate::app) struct PullRequestsState {
     typed: String,
     sent: String,
     list: Option<ListResult>,
+    /// The question `list` last answered from the top (`pull_request_list_scope`).
+    list_scope: Option<Value>,
     /// The dedicated authored and review-requested reads, and the scope they answer.
     partitions: Option<Partitions>,
     partition_generation: u64,
@@ -212,6 +214,7 @@ impl PullRequestsState {
             typed: String::new(),
             sent: String::new(),
             list: None,
+            list_scope: None,
             partitions: None,
             partition_generation: 0,
             stale: false,
@@ -402,6 +405,15 @@ impl Workspace {
         input
     }
 
+    /// The question a list read asks, apart from its page length and cursors.
+    fn pull_request_list_scope(&self) -> Value {
+        let mut input = self.pull_request_input(None);
+        if let Some(input) = input.as_object_mut() {
+            input.remove("limit");
+        }
+        json!([input, self.pull_requests.environment.as_deref()])
+    }
+
     /// The machines the list asks and, where a repository lives on several, the projects each
     /// asks about (`usePullRequestScope`'s `environmentQueries`).
     pub(super) fn pull_request_targets(&self) -> Vec<(SharedString, RpcClient, Option<Vec<String>>)> {
@@ -468,6 +480,7 @@ impl Workspace {
         state.loading = true;
         state.loading_more = more;
         let continuing = cursors.is_some();
+        let scope = self.pull_request_list_scope();
         let requests: Vec<(String, RpcClient, Value)> = targets
             .into_iter()
             .filter_map(|(environment, client, project_ids)| {
@@ -496,27 +509,36 @@ impl Workspace {
                 }
                 state.loading = false;
                 state.loading_more = false;
-                // An unreachable machine must not hide the others' rows.
+                // An unreachable machine must not hide the others' rows, and keeps its own last
+                // answer to this question beside them while its error shows.
                 let mut answers = Vec::new();
                 let mut failure = None;
+                let held = state.list.as_ref().filter(|_| !continuing && state.list_scope.as_ref() == Some(&scope));
                 for (environment, result) in results {
-                    match result.map(serde_json::from_value::<ListResult>) {
-                        Ok(Ok(answer)) => answers.push((environment, answer)),
-                        Ok(Err(error)) => {
-                            failure.get_or_insert_with(|| format!("Unreadable pull request list: {error}"));
+                    let error = match result.map(serde_json::from_value::<ListResult>) {
+                        Ok(Ok(answer)) => {
+                            answers.push((environment, answer));
+                            continue;
                         }
-                        Err(error) => {
-                            failure.get_or_insert_with(|| logic::error_message(&error));
-                        }
+                        Ok(Err(error)) => format!("Unreadable pull request list: {error}"),
+                        Err(error) => logic::error_message(&error),
+                    };
+                    failure.get_or_insert(error);
+                    if let Some(held) = held {
+                        let kept = logic::held_answer(held, &environment);
+                        answers.push((environment, kept));
                     }
                 }
                 let result = match (answers.is_empty(), failure) {
                     (true, Some(failure)) => Err(failure),
-                    _ => Ok(logic::merge_lists(answers)),
+                    (_, failure) => Ok((logic::merge_lists(answers), failure)),
                 };
                 match result {
-                    Ok(mut answer) => {
-                        state.error = None;
+                    Ok((mut answer, failure)) => {
+                        state.error = failure.map(Into::into);
+                        if !continuing {
+                            state.list_scope = Some(scope);
+                        }
                         let (text, _) = logic::parse_query(&state.sent);
                         match (continuing, state.list.as_mut()) {
                             (true, Some(held)) => logic::append_page(held, answer, &text),

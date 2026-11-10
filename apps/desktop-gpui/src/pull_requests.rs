@@ -989,6 +989,23 @@ pub fn merge_lists(answers: Vec<(String, ListResult)>) -> ListResult {
     merged
 }
 
+/// One machine's part of a merged list, as it last answered: a machine whose read fails keeps
+/// showing it, as the web's per-environment query keeps its previous success.
+pub fn held_answer(held: &ListResult, environment_id: &str) -> ListResult {
+    let prefix = format!("{environment_id} ");
+    let next_cursors = held.next_cursors.get(environment_id).and_then(Value::as_object).cloned().unwrap_or_default();
+    ListResult {
+        viewers: (held.viewers.iter())
+            .filter_map(|(key, login)| Some((key.strip_prefix(&prefix)?.to_owned(), login.clone())))
+            .collect(),
+        providers: held.providers.clone(),
+        entries: held.entries.iter().filter(|e| e.environment_id == environment_id).cloned().collect(),
+        errors: Vec::new(),
+        truncated: !next_cursors.is_empty(),
+        next_cursors,
+    }
+}
+
 /// The error text the web shows for a failed read (`formatEnvironmentQueryError`, which reads
 /// each tagged error's `message` getter).
 pub fn error_message(error: &RpcError) -> String {
@@ -1186,6 +1203,24 @@ mod tests {
         // An unmerged answer still names its viewers by bare host.
         let single = HashMap::from([("github.com".to_owned(), "carol".to_owned())]);
         assert_eq!(viewer_for(on("a"), &single), Some("carol"));
+    }
+
+    #[test]
+    fn a_failed_machine_keeps_its_last_answer_beside_fresh_ones() {
+        let answer = |environment: &str, number: u64, cursors: Value| {
+            let viewers = HashMap::from([("github.com".to_owned(), format!("{environment}-login"))]);
+            let next_cursors = cursors.as_object().cloned().unwrap_or_default();
+            let entries = vec![entry(number, json!({}))];
+            (environment.to_owned(), ListResult { viewers, entries, next_cursors, ..Default::default() })
+        };
+        let held = merge_lists(vec![answer("a", 1, json!({})), answer("b", 2, json!({"github.com": "c2"}))]);
+        let merged = merge_lists(vec![answer("a", 3, json!({})), ("b".into(), held_answer(&held, "b"))]);
+        let rows: Vec<(&str, u64)> = merged.entries.iter().map(|e| (e.environment_id.as_str(), e.number)).collect();
+        assert_eq!(rows, [("a", 3), ("b", 2)], "a's fresh rows replace its old ones; b keeps its own");
+        assert_eq!(merged.next_cursors, *json!({"b": {"github.com": "c2"}}).as_object().unwrap());
+        assert!(merged.truncated, "b can still continue");
+        let on_b = merged.entries.iter().find(|e| e.environment_id == "b").unwrap();
+        assert_eq!(viewer_for(on_b, &merged.viewers), Some("b-login"));
     }
 
     #[test]
