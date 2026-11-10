@@ -71,9 +71,14 @@ struct DatabaseMarks {
 }
 
 impl DatabaseMarks {
-    /// Starts one reclaim per machine; `false` while one is waiting.
-    fn begin_reclaim(&mut self, id: &str) -> bool {
-        self.reclaiming.insert(id.to_owned())
+    /// Starts one reclaim per machine; `false` while one waits for its restart. A failure the
+    /// restarted server reports ends that wait, so Reclaim can try again.
+    fn begin_reclaim(&mut self, id: &str, failure: Option<&str>) -> bool {
+        if self.restarting(id, failure) {
+            return false;
+        }
+        self.reclaiming.insert(id.to_owned());
+        true
     }
 
     /// The row shows "Restarting…" until the restarted server reports a failure.
@@ -583,8 +588,11 @@ fn start_reclaim(request: Reclaim, window: &mut Window, cx: &mut App) {
     // The grant can change on a reconnect while the dialog is open.
     let allowed = workspace.upgrade().is_some_and(|w| w.read(cx).environment_grants(&id, ENVIRONMENT_MAINTAIN));
     let started = state.update(cx, |state, cx| {
-        let connected = state.machines.iter().any(|m| m.id == id && m.client.same_socket(&client));
-        if !allowed || !connected || !state.marks.begin_reclaim(&id) {
+        let Some(machine) = state.machines.iter().find(|m| m.id == id && m.client.same_socket(&client)) else {
+            return false;
+        };
+        let failure = machine.database.as_ref().and_then(|status| status["reclaimFailure"].as_str());
+        if !allowed || !state.marks.begin_reclaim(&id, failure) {
             return false;
         }
         cx.notify();
@@ -773,12 +781,15 @@ mod tests {
     #[test]
     fn a_reclaim_waits_once_per_machine_until_its_restarted_server_reports_a_failure() {
         let mut marks = DatabaseMarks::default();
-        assert!(marks.begin_reclaim("a"));
-        assert!(!marks.begin_reclaim("a"), "one reclaim per machine while it restarts");
-        assert!(marks.begin_reclaim("b"), "another machine reclaims on its own");
+        assert!(marks.begin_reclaim("a", None));
+        assert!(!marks.begin_reclaim("a", None), "one reclaim per machine while it restarts");
+        assert!(marks.begin_reclaim("b", None), "another machine reclaims on its own");
         assert!(marks.restarting("a", None));
         assert!(!marks.restarting("a", Some("disk full")), "a reported failure ends the wait");
         assert!(!marks.restarting("c", None));
+        assert!(marks.begin_reclaim("a", Some("disk full")), "the restarted server's failure allows a retry");
+        assert!(marks.restarting("a", None), "the retry waits for the next restart");
+        assert!(!marks.begin_reclaim("a", None));
     }
 
     #[test]
