@@ -89,14 +89,23 @@ fn not_connected(window: &mut Window, cx: &mut App) {
 }
 
 impl Workspace {
-    /// `onFileOpen` and `onImageExpand`: a sent image or file opens in the preview; a video or
-    /// a recording plays in the system's player.
+    /// `onFileOpen` and `onImageExpand`: a sent file opens in its right panel tab, an image in the
+    /// image viewer; a video or a recording plays in the system's player.
     pub(super) fn open_message_attachment(
         &mut self,
         attachment: &Attachment,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if matches!(attachment.media, Media::File | Media::Unknown) {
+            let file = super::files::AttachmentFile {
+                id: attachment.id.clone(),
+                name: attachment.name.clone(),
+                mime: attachment.mime.clone(),
+                size: attachment.size,
+            };
+            return self.open_attachment(file, window, cx);
+        }
         let (Some(client), Some(base)) = (self.client(), self.http_base().map(str::to_owned)) else {
             return not_connected(window, cx);
         };
@@ -124,20 +133,19 @@ impl Workspace {
                     return;
                 }
                 match fetched {
-                    Ok(bytes) => {
-                        let image = (attachment.media == Media::Image)
-                            .then(|| super::markdown_images::sniff(&bytes))
-                            .flatten()
-                            .map(|format| Arc::new(Image::from_bytes(format, bytes.to_vec())));
-                        let preview = super::attachment_preview::Preview {
-                            origin: "Attachment",
-                            name: attachment.name.clone(),
-                            bytes,
-                            image,
-                            removable: None,
-                        };
-                        this.open_preview_dialog(preview, window, cx);
-                    }
+                    Ok(bytes) => match super::markdown_images::sniff(&bytes) {
+                        Some(format) => {
+                            let image = Arc::new(Image::from_bytes(format, bytes.to_vec()));
+                            let name = SharedString::from(attachment.name.clone());
+                            let item = super::image_viewer::ViewerImage { image, name, reference: None };
+                            this.open_image_viewer(vec![item], 0, window, cx);
+                        }
+                        None => {
+                            let title = format!("Could not open {}", attachment.label());
+                            let note = Notification::error("The image could not be read.").title(title);
+                            window.push_notification(note, cx);
+                        }
+                    },
                     Err(error) => {
                         let title = format!("Could not open {}", attachment.label());
                         window.push_notification(Notification::error(error).title(title), cx);

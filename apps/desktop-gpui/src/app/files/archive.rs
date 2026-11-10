@@ -335,7 +335,7 @@ impl Archive {
     }
 }
 
-fn image_format(path: &str) -> Option<ImageFormat> {
+pub(super) fn image_format(path: &str) -> Option<ImageFormat> {
     match logic::file_name(path).rsplit_once('.')?.1.to_lowercase().as_str() {
         "png" => Some(ImageFormat::Png),
         "jpg" | "jpeg" => Some(ImageFormat::Jpeg),

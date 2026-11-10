@@ -651,6 +651,7 @@ impl Workspace {
             }
             let removing = this.update_in(cx, |this, window, cx| {
                 this.expire_undo(&thread_id);
+                this.forget_thread_panel(&environment, &thread_id);
                 if was_open {
                     this.land_after_delete(&thread_id, fallback, window, cx);
                 }

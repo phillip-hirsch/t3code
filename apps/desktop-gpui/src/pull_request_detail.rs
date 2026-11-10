@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::pull_requests::State;
@@ -517,9 +517,11 @@ impl Activity {
 }
 
 /// `PullRequestRef`: where a pull request is read from.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Reference {
     pub project_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
     pub repository: String,
     pub number: u64,

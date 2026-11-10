@@ -1,15 +1,20 @@
 //! The right panel (`RightPanelTabs.tsx` inside `PreviewPanelShell`, state as `rightPanelStore.ts`)
 //! with its Diff (`DiffPanel.tsx`) and Browser (`preview/`) surfaces. The panel owns the titlebar
-//! row above it, keeps per-thread open state and tabs, and resizes from its left edge.
+//! row above it, keeps per-thread open state, tabs and width across launches (`stored`) with the
+//! tabs it closed (`closed`), and resizes from its left edge.
 //! Other surfaces render in their own modules (files, terminal, pull requests, side chats); the
 //! device surface is not native, so the launcher leaves it out.
 
+mod closed;
 mod commit_link;
 mod diff_base;
 mod diff_comments;
 mod diff_load;
 mod diff_open;
 mod diff_tree;
+mod sheet;
+mod stored;
+mod writer;
 
 use std::collections::{HashMap, HashSet};
 
@@ -29,6 +34,7 @@ use gpui_kit::{
     KeyDownEvent, LayoutId, MouseButton, ParentElement as _, Pixels, Point, ScrollHandle, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, deferred, div, px,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::git::{self, DiffColorScheme};
@@ -95,12 +101,15 @@ pub(super) fn turn_summaries(projection: &ThreadProjection) -> Vec<TurnSummary> 
 
 /// One tab of the panel (`RightPanelSurface`): the Diff, one browser tab by its preview tab id,
 /// the Files tree, or a file (or folder) by its workspace path.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "kebab-case")]
 pub(super) enum Surface {
     Diff,
     Browser(String),
     Files,
     File(String),
+    /// A file sent with a message (`attachment:<id>`), which needs no workspace.
+    Attachment(super::files::AttachmentFile),
     /// A side chat's tab, by its thread id.
     SideChat(String),
     /// A pull request in the detail panel.
@@ -127,6 +136,8 @@ struct PanelState {
     proactive_diff_run: Option<String>,
     /// The panel fills the row and the chat column steps aside (`maximized`), kept per thread.
     maximized: bool,
+    /// The width the user dragged it to (`t3code:preview-panel-width:<thread>`); none is the default.
+    width: Option<f32>,
 }
 
 impl PanelState {
@@ -198,6 +209,12 @@ impl PanelState {
         self.active = Some(surface);
     }
 
+    /// `openAttachment`: like a file, an attachment's tab replaces the standalone Files tree.
+    fn open_attachment(&mut self, file: super::files::AttachmentFile) {
+        self.surfaces.retain(|s| *s != Surface::Files);
+        self.upsert(Surface::Attachment(file));
+    }
+
     /// `navigateFolder`: `source` turns into the folder (the root is the Files tree), or with
     /// `keep_source` the folder opens beside it. A folder already open is focused instead.
     fn navigate_folder(&mut self, source: &Surface, folder: &str, keep_source: bool) {
@@ -223,24 +240,30 @@ impl PanelState {
     }
 
     /// `reconcileBrowserSurfaces`: a tab per preview session, dropping closed ones. Closing the
-    /// last session hides the panel rather than leave it on the launcher.
-    fn reconcile_browsers(&mut self, tab_ids: &[&str]) {
+    /// last session hides the panel rather than leave it on the launcher. Returns whether
+    /// anything changed.
+    fn reconcile_browsers(&mut self, tab_ids: &[&str]) -> bool {
+        let (count, open) = (self.surfaces.len(), self.open);
         let had_browser = self.surfaces.iter().any(|s| matches!(s, Surface::Browser(_)));
         self.surfaces.retain(|s| !matches!(s, Surface::Browser(tab) if !tab_ids.contains(&tab.as_str())));
+        let mut changed = self.surfaces.len() != count;
         for tab in tab_ids {
-            let surface = Surface::Browser((*tab).to_owned());
-            if !self.surfaces.contains(&surface) {
-                self.surfaces.push(surface);
+            if !self.surfaces.iter().any(|s| matches!(s, Surface::Browser(id) if id == tab)) {
+                self.surfaces.push(Surface::Browser((*tab).to_owned()));
+                changed = true;
             }
         }
         // Nothing active, as after a restart, also falls back to a browser tab.
         if self.active.as_ref().is_none_or(|active| !self.surfaces.contains(active)) {
             let browser = self.surfaces.iter().find(|s| matches!(s, Surface::Browser(_)));
-            self.active = browser.or(self.surfaces.first()).cloned();
+            let active = browser.or(self.surfaces.first()).cloned();
+            changed |= active != self.active;
+            self.active = active;
         }
         if self.surfaces.is_empty() && had_browser {
             self.open = false;
         }
+        changed || open != self.open
     }
 }
 
@@ -352,7 +375,10 @@ impl FilePatches {
 
 pub(super) struct RightPanel {
     panels: HashMap<Target, PanelState>,
-    width: f32,
+    /// Saves `panels` across launches; see [`RightPanel::panels_mut`].
+    layout: stored::LayoutStore,
+    /// Closed tabs for Reopen Closed Tab.
+    closed: closed::ClosedViews,
     /// The "+" menu is open; a native browser view must not cover it. It also opens the menu,
     /// as `rightPanel.new` does.
     pub(super) add_menu_open: bool,
@@ -420,6 +446,13 @@ pub(super) struct RightPanel {
     tree_pane: diff_tree::TreePane,
     /// The line comment being written (`AnnotatableCodeView`'s draft).
     comment: Option<diff_comments::DiffComment>,
+    /// The window width at the last render, for work that runs outside one.
+    viewport_width: f32,
+    /// The narrow-window sheet's focus: what had it when the sheet opened, the sheet's trap, and
+    /// an opening whose focus move waits for the sheet's first frame.
+    sheet_focus: super::sidebar_sheet::SheetFocus<FocusHandle>,
+    sheet_trap: FocusHandle,
+    sheet_entering: bool,
     _diff_events: Subscription,
 }
 
@@ -434,9 +467,11 @@ impl RightPanel {
             DiffEvent::FileExpanded(_) | DiffEvent::FileCollapsed(_) => this.remember_collapsed(cx),
             _ => {}
         });
+        let (layout, panels) = stored::LayoutStore::restored();
         Self {
-            panels: HashMap::new(),
-            width: DEFAULT_WIDTH,
+            panels,
+            layout,
+            closed: closed::ClosedViews::restored(),
             add_menu_open: false,
             profiles_menu_open: false,
             launcher_focus: cx.focus_handle().tab_stop(true),
@@ -478,8 +513,18 @@ impl RightPanel {
             toolbar_focus: DiffToolbarFocus::new(cx),
             tree_pane: diff_tree::TreePane::new(cx),
             comment: None,
+            viewport_width: f32::INFINITY,
+            sheet_focus: Default::default(),
+            sheet_trap: cx.focus_handle(),
+            sheet_entering: false,
             _diff_events: diff_events,
         }
+    }
+
+    /// The panels for a change, which the layout then saves.
+    fn panels_mut(&mut self) -> &mut HashMap<Target, PanelState> {
+        self.layout.changed = true;
+        &mut self.panels
     }
 }
 
@@ -548,7 +593,7 @@ impl Workspace {
 
     fn panel_state_mut(&mut self) -> Option<&mut PanelState> {
         let target = self.target.clone()?;
-        Some(self.right_panel.panels.entry(target).or_default())
+        Some(self.right_panel.panels_mut().entry(target).or_default())
     }
 
     /// The panel state for a change the user made, which proactive opens then defer to.
@@ -573,11 +618,20 @@ impl Workspace {
             return None;
         }
         let viewport = f32::from(window.viewport_size().width);
+        if self.right_panel_sheet(window) {
+            return Some(sheet::sheet_width(viewport));
+        }
         let sidebar = if self.sidebar_open.docked() { f32::from(self.sidebar_width()) } else { 0. };
         if self.right_panel_maximized() {
             return Some(panel_row(viewport, sidebar));
         }
-        Some(clamp_width(self.right_panel.width, viewport, panel_row(viewport, sidebar)))
+        let width = self.panel_state().and_then(|panel| panel.width).unwrap_or(DEFAULT_WIDTH);
+        Some(clamp_width(width, viewport, panel_row(viewport, sidebar)))
+    }
+
+    /// The width the open panel takes from the row beside the chat; a sheet takes none.
+    pub(super) fn right_panel_docked_width(&self, window: &Window) -> Option<f32> {
+        self.right_panel_width(window).filter(|_| !self.right_panel_sheet(window))
     }
 
     /// `rightPanelMaximized`: only an open panel counts as maximized.
@@ -643,7 +697,7 @@ impl Workspace {
         if self.target.as_ref() == Some(target) {
             return self.open_surface(surface, window, cx);
         }
-        let panel = self.right_panel.panels.entry(target.clone()).or_default();
+        let panel = self.right_panel.panels_mut().entry(target.clone()).or_default();
         panel.user_revision += 1;
         panel.upsert(surface);
     }
@@ -659,7 +713,7 @@ impl Workspace {
 
     /// Removes a tab without the side effects of closing it (its terminals already closed).
     pub(super) fn drop_surface(&mut self, target: &Target, surface: &Surface) {
-        if let Some(panel) = self.right_panel.panels.get_mut(target) {
+        if let Some(panel) = self.right_panel.panels_mut().get_mut(target) {
             panel.close(surface);
         }
     }
@@ -669,8 +723,13 @@ impl Workspace {
         if let Surface::Terminal(id) = surface {
             return self.request_close_terminal_surface(id, window, cx);
         }
-        if let Some(panel) = self.user_panel_state() {
+        let closed = self.user_panel_state().is_some_and(|panel| {
+            let shown = panel.surfaces.contains(&surface);
             panel.close(&surface);
+            shown
+        });
+        if closed {
+            self.remember_closed_surface(&surface);
         }
         if let Surface::SideChat(thread_id) = &surface {
             self.release_side_chat(thread_id, cx);
@@ -712,7 +771,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let active = self.panel_state().and_then(|panel| panel.active.clone());
-        for surface in close {
+        for surface in closed::closed_in_order(close, active.as_ref()) {
             self.close_surface(surface, window, cx);
         }
         if let Some(panel) = self.panel_state_mut().filter(|panel| !panel.surfaces.is_empty()) {
@@ -818,7 +877,10 @@ impl Workspace {
     /// Follows a thread's preview sessions: a panel tab per drawable session.
     pub(super) fn reconcile_browser_surfaces(&mut self, thread_id: &str, tab_ids: &[&str]) {
         let Some(target) = self.thread_target(thread_id) else { return };
-        self.right_panel.panels.entry(target).or_default().reconcile_browsers(tab_ids);
+        // Preview events reconcile often; only a real change is saved.
+        if self.right_panel.panels.entry(target).or_default().reconcile_browsers(tab_ids) {
+            self.right_panel.layout.changed = true;
+        }
     }
 
     /// Whether the thread's panel has a tab for `tab_id`; `focus` shows it (`revealSurface`).
@@ -832,6 +894,7 @@ impl Workspace {
         if focus {
             panel.open = true;
             panel.active = Some(surface);
+            self.right_panel.layout.changed = true;
         }
         true
     }
@@ -874,6 +937,21 @@ impl Workspace {
         self.page = None;
         if let Some(panel) = self.user_panel_state() {
             panel.open_file(path);
+        }
+        self.sync_active_browser(window, cx);
+        cx.notify();
+    }
+
+    /// `openAttachment`: an uploaded attachment's tab on the open target's panel.
+    pub(super) fn open_attachment(
+        &mut self,
+        file: super::files::AttachmentFile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.page = None;
+        if let Some(panel) = self.user_panel_state() {
+            panel.open_attachment(file);
         }
         self.sync_active_browser(window, cx);
         cx.notify();
@@ -1051,7 +1129,7 @@ impl Workspace {
         });
         let offer = match &newly {
             // A thread with pull requests offers those instead of its turn diffs.
-            Some(run) if self.client_settings.values.bool("proactivePanelsEnabled") && !pull_requests => {
+            Some(run) if self.proactive_panels_enabled() && !pull_requests => {
                 let checkpoint = projection.checkpoints.iter().rev().find(|c| c.run_id.as_ref() == Some(run));
                 turn_diff_offer(checkpoint, self.vcs.status.as_ref().map(|status| status.local.is_repo))
             }
@@ -1063,7 +1141,7 @@ impl Workspace {
         let revision = observation.revision;
         self.right_panel.observation = Some(observation);
         let (DiffOffer::Open, Some(run)) = (offer, newly) else { return };
-        if self.right_panel.panels.entry(target).or_default().open_proactive_diff(&run, revision) {
+        if self.right_panel.panels_mut().entry(target).or_default().open_proactive_diff(&run, revision) {
             cx.notify();
         }
     }
@@ -1090,12 +1168,12 @@ impl Workspace {
             0 => linked.as_ref().map(|r| format!("{}:{}#{}", r.project_id, r.repository.to_lowercase(), r.number)),
             _ => Some(visible.join("\n")),
         };
-        let eligible = self.client_settings.values.bool("proactivePanelsEnabled")
-            && key.is_some()
-            && observation.target_key.as_ref() != Some(&key);
+        let eligible =
+            self.proactive_panels_enabled() && key.is_some() && observation.target_key.as_ref() != Some(&key);
         observation.target_key = Some(key.clone());
         let revision = observation.revision;
         let Some(target) = self.thread_target(thread_id) else { return false };
+        // This runs on every thread update; only a tab it opens is saved.
         let panel = self.right_panel.panels.entry(target).or_default();
         let mut changed = false;
         if let (true, Some(linked)) = (follow, &linked) {
@@ -1109,6 +1187,7 @@ impl Workspace {
             }
         }
         if changed {
+            self.right_panel.layout.changed = true;
             cx.notify();
         }
         key.is_some()
@@ -1540,6 +1619,9 @@ impl Workspace {
     }
 
     pub(super) fn render_right_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.persist_panel_layout(cx);
+        self.right_panel.viewport_width = f32::from(window.viewport_size().width);
+        self.sync_right_panel_sheet_focus(window, cx);
         let git_diff_shown = self.git_diff_shown();
         if git_diff_shown && !self.right_panel.git_diff_shown {
             self.revalidate_diff();
@@ -1566,6 +1648,7 @@ impl Workspace {
             self.request_visible_patches(cx);
         }
         let tokens = *theme::tokens(cx);
+        let sheet = self.right_panel_sheet(window);
         let panel = self.panel_state().cloned().unwrap_or_default();
         // A newly active tab, or a new tab, can sit outside the scrolled strip.
         let active_index = panel.active.as_ref().and_then(|active| panel.surfaces.iter().position(|s| s == active));
@@ -1588,6 +1671,7 @@ impl Workspace {
             }
             (Some(Surface::Files), _) => self.render_files_surface(None, width, window, cx),
             (Some(Surface::File(path)), _) => self.render_files_surface(Some(path.clone()), width, window, cx),
+            (Some(Surface::Attachment(file)), _) => self.render_attachment_surface(file, width, window, cx),
             (Some(Surface::SideChat(thread_id)), _) => self.render_side_chat_surface(thread_id, width, window, cx),
             (Some(Surface::PullRequest(reference)), _) => self.render_pull_request_surface(reference, window, cx),
             (Some(Surface::PullRequests), _) => self.render_linked_pull_requests(cx),
@@ -1605,8 +1689,10 @@ impl Workspace {
             .cursor_col_resize()
             .on_drag(RightPanelResize, |_, _, _, cx| cx.new(|_| Empty))
             .on_click(cx.listener(|this, event: &gpui_kit::ClickEvent, _, cx| {
-                if event.click_count() == 2 {
-                    this.right_panel.width = DEFAULT_WIDTH;
+                if event.click_count() == 2
+                    && let Some(panel) = this.panel_state_mut()
+                {
+                    panel.width = None;
                     cx.notify();
                 }
             }))
@@ -1635,20 +1721,23 @@ impl Workspace {
                 .on_drag_move(cx.listener(|this, event: &DragMoveEvent<RightPanelResize>, window, cx| {
                     let viewport = f32::from(window.viewport_size().width);
                     let right = f32::from(event.bounds.right());
-                    this.right_panel.width = (right - f32::from(event.event.position.x)).max(MIN_WIDTH);
+                    let width = (right - f32::from(event.event.position.x)).max(MIN_WIDTH);
                     let sidebar = if this.sidebar_open.docked() { f32::from(this.sidebar_width()) } else { 0. };
-                    this.right_panel.width =
-                        clamp_width(this.right_panel.width, viewport, panel_row(viewport, sidebar));
+                    let width = clamp_width(width, viewport, panel_row(viewport, sidebar));
+                    if let Some(panel) = this.panel_state_mut() {
+                        panel.width = Some(width);
+                    }
                     cx.notify();
                 }))
                 .child({
                     // `COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS`: maximized past a hidden sidebar, clear its toggle.
                     let inset = (panel.maximized && !self.sidebar_open.docked())
                         .then(|| super::titlebar::collapsed_content_left(window));
-                    self.render_tab_bar(&panel, inset, &tokens, window, cx)
+                    self.render_tab_bar(&panel, inset, sheet, &tokens, window, cx)
                 })
                 .child(div().flex_1().min_h_0().flex().flex_col().child(content))
-                .child(deferred(handle).with_priority(1))
+                // The sheet keeps its fixed width (`mode="sheet"` has no resize handle).
+                .when(!sheet, |el| el.child(deferred(handle).with_priority(1)))
                 .children(self.right_panel.tab_menu.as_ref().map(|(menu, position, _)| {
                     deferred(
                         gpui_kit::anchored().position(*position).snap_to_window_with_margin(px(8.)).child(menu.clone()),
@@ -1791,6 +1880,7 @@ impl Workspace {
         &self,
         panel: &PanelState,
         left_inset: Option<Pixels>,
+        sheet: bool,
         tokens: &Tokens,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1815,11 +1905,18 @@ impl Workspace {
             .flex_none()
             .min_w_0()
             .pl(left_inset.unwrap_or(px(8.)))
-            .pr(reserve)
+            .pr(if sheet { px(12.) } else { reserve })
             .gap_1();
+        // Only the inline panel owns the titlebar row (`ownsDesktopTitleBar`); the sheet carries
+        // the layout controls at its right end (`layoutControls`).
+        let (tab_bar, layout_controls) = if sheet {
+            (tab_bar, Some(self.render_sheet_layout_controls(window, cx)))
+        } else {
+            (super::titlebar::drag_region(tab_bar), None)
+        };
         // The open "+" menu has focus; its letters bubble up here (gpui-kit menus bind only arrows,
         // Enter and Escape).
-        super::titlebar::drag_region(tab_bar)
+        tab_bar
             .when(add_menu_open, |el| el.on_key_down(cx.listener(Self::add_surface_for_key)))
             .child(
                 h_flex()
@@ -1922,6 +2019,7 @@ impl Workspace {
                         cx.notify();
                     })),
             )
+            .when_some(layout_controls, |el, controls| el.child(div().flex_1()).child(controls))
     }
 
     /// A tab (`h-6 rounded-md pl-1.5 pr-2 text-xs`), its icon turning into a close button on hover
@@ -1953,6 +2051,14 @@ impl Workspace {
                     Icon::empty().path(asset).size(px(12.)).text_color(color).into_any_element()
                 })
             }
+            Surface::Attachment(file) => (
+                format!("attachment:{}", file.id).into(),
+                { file.name.rsplit(['/', '\\']).next().unwrap_or(&file.name).to_owned().into() },
+                {
+                    let (asset, color) = crate::file_icons::file_icon(&file.name, self.dark_theme(cx));
+                    Icon::empty().path(asset).size(px(12.)).text_color(color).into_any_element()
+                },
+            ),
             Surface::SideChat(thread_id) => {
                 let (title, state) = self.side_chat_tab(thread_id);
                 // Static dots: a side chat tab can stay open for a whole run.
@@ -3393,18 +3499,41 @@ mod tests {
     }
 
     #[test]
+    fn attachments_open_as_their_own_tabs_without_a_workspace() {
+        use crate::app::files::AttachmentFile;
+        let file = || AttachmentFile { id: "a1".into(), name: "notes.txt".into(), mime: "text/plain".into(), size: 3 };
+        let mut panel = PanelState::default();
+        panel.upsert(Surface::Files);
+        panel.open_file("notes.txt".into());
+        panel.upsert(Surface::Files);
+        panel.open_attachment(file());
+        assert_eq!(
+            panel.surfaces,
+            [Surface::File("notes.txt".into()), Surface::Attachment(file())],
+            "an attachment is not the workspace file of its name, and replaces the standalone tree"
+        );
+        panel.upsert(Surface::Diff);
+        panel.open_attachment(file());
+        assert_eq!(panel.surfaces.len(), 3, "reopening an attachment focuses its tab");
+        assert_eq!(panel.active, Some(Surface::Attachment(file())));
+        panel.close(&Surface::Attachment(file()));
+        assert_eq!(panel.surfaces, [Surface::File("notes.txt".into()), Surface::Diff]);
+    }
+
+    #[test]
     fn browser_tabs_follow_the_preview_sessions() {
         let browser = |tab: &str| Surface::Browser(tab.into());
         let mut panel = PanelState::default();
         panel.upsert(Surface::Diff);
         panel.upsert(browser("gone"));
-        panel.reconcile_browsers(&["kept", "new"]);
+        assert!(panel.reconcile_browsers(&["kept", "new"]));
         assert_eq!(panel.surfaces, [Surface::Diff, browser("kept"), browser("new")]);
         assert_eq!(panel.active, Some(browser("kept")), "a closed active tab falls back to a browser");
         assert!(panel.open);
+        assert!(!panel.reconcile_browsers(&["kept", "new"]), "the same sessions change nothing to save");
         let mut only_browser = PanelState::default();
         only_browser.upsert(browser("a"));
-        only_browser.reconcile_browsers(&[]);
+        assert!(only_browser.reconcile_browsers(&[]));
         assert!(!only_browser.open, "losing the last session hides the panel");
         let mut restarted = PanelState::default();
         restarted.reconcile_browsers(&["left"]);

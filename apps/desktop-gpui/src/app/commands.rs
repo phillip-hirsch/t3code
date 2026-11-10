@@ -124,6 +124,7 @@ impl Workspace {
             {
                 self.preview_command(command, window, cx);
             }
+            "view.reopenClosed" if chat_route && !palette_open => return self.reopen_closed_view(held, window, cx),
             "rightPanel.toggle" if chat => self.toggle_right_panel(window, cx),
             "rightPanel.new" if chat => return self.open_add_surface_menu(context.layer_open, held, cx),
             "rightPanel.toggleMaximized" if chat => return self.toggle_right_panel_maximized(cx),
@@ -488,7 +489,11 @@ impl Workspace {
 
     /// `moveWorkspaceFocus`: F6 moves focus to the next shown area; dialogs keep it.
     pub(super) fn move_workspace_focus(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.palette.is_some() || self.sidebar_open.sheet() || window.has_active_dialog(cx) {
+        if self.palette.is_some()
+            || self.sidebar_open.sheet()
+            || self.right_panel_sheet(window)
+            || window.has_active_dialog(cx)
+        {
             return;
         }
         let shown = self.shown_areas(window);

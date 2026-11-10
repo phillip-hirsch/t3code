@@ -251,13 +251,6 @@ pub(super) struct McpApps {
     theme: Option<(ThemeKey, ThemeVariables)>,
 }
 
-fn downloads_dir() -> std::path::PathBuf {
-    std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(|home| std::path::PathBuf::from(home).join("Downloads"))
-        .unwrap_or_default()
-}
-
 /// Asks the reader in the confirm dialog, with the app back inline so it stays in view.
 async fn ask(
     this: &WeakEntity<Workspace>,
@@ -1120,7 +1113,7 @@ async fn run_request(
                 }
                 saved.push((name, bytes));
             }
-            let directory = downloads_dir();
+            let directory = super::attachment_preview::downloads_dir();
             for (name, bytes) in saved {
                 let Ok(picked) = cx.update(|_, cx| cx.prompt_for_new_path(&directory, Some(&name))) else {
                     return Outcome::Failed("Request failed.".into());

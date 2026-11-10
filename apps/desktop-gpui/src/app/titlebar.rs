@@ -216,7 +216,10 @@ impl Workspace {
                 if self.page == Some(super::pages::Page::PullRequests) && self.settings.is_none() {
                     el.child(self.render_pull_request_page_toggles(cx))
                 } else {
-                    el.when(self.target.is_some(), |el| el.child(self.render_panel_toggles(window, cx)))
+                    // An open sheet carries the panel toggles in its tab bar (`rightPanelControlsInPanel`).
+                    el.when(self.target.is_some() && !self.right_panel_sheet(window), |el| {
+                        el.child(self.render_panel_toggles(window, cx))
+                    })
                 }
             })
     }
@@ -328,13 +331,11 @@ impl Workspace {
             .child(panel)
     }
 
-    /// `WorkspaceTitlebarControls` + `PanelLayoutControls`: thread details, terminal, right panel.
-    /// With the panel open, maximize takes the details toggle's place and the details toggle
-    /// moves to the chat header's right edge (`ThreadPanelHeaderControl`).
-    fn render_panel_toggles(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    /// `RightPanelMaximizeControl` and `PanelLayoutControls`' thread details, terminal and right
+    /// panel toggles, for the titlebar or the sheet's tab bar.
+    fn panel_toggles(&self, window: &Window, cx: &mut Context<Self>) -> PanelToggles {
         let tokens = theme::tokens(cx);
         let details = self.details_shown(window);
-        let panel_width = self.right_panel_width(window);
         let maximized = self.right_panel_maximized();
         let focus = &self.titlebar_focus;
         // These act on press; Enter and Space reach them as keyboard clicks.
@@ -364,12 +365,7 @@ impl Workspace {
                     this.toggle_details(window, cx);
                 }
             }));
-        let (header_details, bar_details) = match panel_width {
-            Some(_) if maximized => (None, None),
-            Some(_) => (Some(details_toggle), None),
-            None => (None, Some(details_toggle)),
-        };
-        let maximize = panel_width.map(|_| {
+        let maximize = {
             let label = if maximized { "Restore panel size" } else { "Maximize panel" };
             let path = if maximized { "icons/minimize-2.svg" } else { "icons/maximize-2.svg" };
             toggle("toggle-right-panel-maximized", path, maximized, true, &focus.maximize)
@@ -385,46 +381,30 @@ impl Workspace {
                         this.toggle_right_panel_maximized(cx);
                     }
                 }))
-        });
-        let bar = div()
-            .absolute()
-            .top_0()
-            .right(CONTROLS_RIGHT)
-            .h(TITLEBAR_HEIGHT)
-            .flex()
-            .items_center()
-            .gap_1()
-            .children(maximize)
-            .children(bar_details)
-            .child({
-                let available = self.terminal_available();
-                toggle("toggle-terminal", "icons/panel-bottom.svg", self.terminal_open(), available, &focus.terminal)
-                    .tooltip(tooltip(if available {
-                        self.with_shortcut("Toggle terminal drawer", "terminal.toggle")
-                    } else {
-                        "Terminal drawer is unavailable".into()
+        };
+        let terminal = {
+            let available = self.terminal_available();
+            toggle("toggle-terminal", "icons/panel-bottom.svg", self.terminal_open(), available, &focus.terminal)
+                .tooltip(tooltip(if available {
+                    self.with_shortcut("Toggle terminal drawer", "terminal.toggle")
+                } else {
+                    "Terminal drawer is unavailable".into()
+                }))
+                // On press, like the details toggle beside it.
+                .when(available, |el| {
+                    el.on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx)),
+                    )
+                    .on_click(cx.listener(|this, event, window, cx| {
+                        if is_keyboard(event) {
+                            this.toggle_terminal(window, cx);
+                        }
                     }))
-                    // On press, like the details toggle beside it.
-                    .when(available, |el| {
-                        el.on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx)),
-                        )
-                        .on_click(cx.listener(|this, event, window, cx| {
-                            if is_keyboard(event) {
-                                this.toggle_terminal(window, cx);
-                            }
-                        }))
-                    })
-            })
-            .child(
-                toggle(
-                    "toggle-right-panel",
-                    "icons/panel-right.svg",
-                    self.right_panel_open(),
-                    true,
-                    &focus.right_panel,
-                )
+                })
+        };
+        let right_panel =
+            toggle("toggle-right-panel", "icons/panel-right.svg", self.right_panel_open(), true, &focus.right_panel)
                 .tooltip(tooltip(self.with_shortcut("Toggle right panel", "rightPanel.toggle")))
                 .on_mouse_down(MouseButton::Left, |_, window, cx| {
                     window.dispatch_action(Box::new(ToggleRightPanel), cx);
@@ -433,8 +413,35 @@ impl Workspace {
                     if is_keyboard(event) {
                         window.dispatch_action(Box::new(ToggleRightPanel), cx);
                     }
-                }),
-            );
+                });
+        PanelToggles { maximize, details: details_toggle, terminal, right_panel }
+    }
+
+    /// `WorkspaceTitlebarControls` + `PanelLayoutControls`: thread details, terminal, right panel.
+    /// With the panel open, maximize takes the details toggle's place and the details toggle
+    /// moves to the chat header's right edge (`ThreadPanelHeaderControl`). An open sheet carries
+    /// them in its tab bar instead.
+    fn render_panel_toggles(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let panel_width = self.right_panel_docked_width(window);
+        let maximized = self.right_panel_maximized();
+        let PanelToggles { maximize, details, terminal, right_panel } = self.panel_toggles(window, cx);
+        let (header_details, bar_details) = match panel_width {
+            Some(_) if maximized => (None, None),
+            Some(_) => (Some(details), None),
+            None => (None, Some(details)),
+        };
+        let bar = div()
+            .absolute()
+            .top_0()
+            .right(CONTROLS_RIGHT)
+            .h(TITLEBAR_HEIGHT)
+            .flex()
+            .items_center()
+            .gap_1()
+            .children(panel_width.map(|_| maximize))
+            .children(bar_details)
+            .child(terminal)
+            .child(right_panel);
         // `right-[calc(env(safe-area-inset-right)+0.75rem)]` of the chat header, left of the panel.
         let header = header_details.zip(panel_width).map(|(toggle, width)| {
             div()
@@ -448,6 +455,30 @@ impl Workspace {
         });
         div().children(header).child(bar)
     }
+
+    /// The sheet's `layoutControls`: maximize, then every `PanelLayoutControls` toggle (`mr-px gap-1`).
+    pub(super) fn render_sheet_layout_controls(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let PanelToggles { maximize, details, terminal, right_panel } = self.panel_toggles(window, cx);
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .mr(px(1.))
+            .child(maximize)
+            .child(details)
+            .child(terminal)
+            .child(right_panel)
+            .into_any_element()
+    }
+}
+
+/// The panel layout toggles, built once for the titlebar or the sheet.
+struct PanelToggles {
+    maximize: Stateful<Div>,
+    details: Stateful<Div>,
+    terminal: Stateful<Div>,
+    right_panel: Stateful<Div>,
 }
 
 /// Minimize, maximize/restore and close, drawn like Windows 11's own caption

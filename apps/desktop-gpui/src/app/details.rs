@@ -376,7 +376,7 @@ impl Workspace {
         // `PopoverPopup variant="panel"` under the header, `align="end"`: 4px align
         // offset plus its 8px padding put the card where the inline one sits, 8px
         // below the header, capped at `100dvh - 6.5rem`.
-        let right = self.right_panel_width(window).map_or(px(0.), px) + RIGHT_RESIZE_INSET;
+        let right = self.right_panel_docked_width(window).map_or(px(0.), px) + RIGHT_RESIZE_INSET;
         let corner = point(viewport.width - right - px(CARD_INSET), TITLEBAR_HEIGHT + px(8.));
         Some(
             deferred(

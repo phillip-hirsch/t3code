@@ -530,7 +530,7 @@ impl Workspace {
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.refresh_tree(&refresh_key, cx);
                     if let Some(path) = &refresh_selected {
-                        let key = super::FileKey { checkout: refresh_key.clone(), path: path.clone() };
+                        let key = super::FileKey::new(refresh_key.clone(), path.clone());
                         this.refresh_selected_file(&key, window, cx);
                     }
                 })),

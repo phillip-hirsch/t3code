@@ -19,8 +19,9 @@ impl Workspace {
         let tokens = *theme::tokens(cx);
         // Clears the caption buttons plus 12px, like `--workspace-native-controls-inset`.
         let controls_inset = CAPTION_BUTTONS_WIDTH + px(12.) - RIGHT_RESIZE_INSET;
-        // An open right panel owns the titlebar controls, so the header keeps only its `px-5`.
-        let panel_open = self.right_panel_open()
+        // An open inline right panel owns the titlebar controls, so the header keeps only its `px-5`;
+        // a sheet leaves them to the header (`inlineRightPanelOwnsTitleBar`).
+        let panel_open = self.right_panel_docked_width(window).is_some()
             || (self.page == Some(super::pages::Page::PullRequests) && self.pull_request_panel_shown());
         let header = h_flex()
             .id("chat-header")
