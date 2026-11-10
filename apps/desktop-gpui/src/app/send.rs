@@ -218,6 +218,13 @@ impl Workspace {
             return;
         }
         let text = self.composer.read(cx).value().trim().to_owned();
+        // `/usage-limits` alone opens the panel rather than reaching the provider.
+        if crate::usage::is_usage_limits_command(&text) && self.usage_limits_offered() {
+            if self.open_usage_limits(window, cx) {
+                self.set_composer_text("", window, cx);
+            }
+            return;
+        }
         let fresh_session = self.fresh_session_command_available();
         if fresh_session && !self.has_attachments() && super::fresh_session::is_clear_command(&text) {
             self.arm_fresh_session(cx);
@@ -420,6 +427,9 @@ impl Workspace {
                 this.sending = false;
                 match result {
                     Ok(_) => {
+                        if !text_is_feedback {
+                            this.clear_usage_limits_for(&origin);
+                        }
                         if fresh_arm.is_some() {
                             this.disarm_fresh_session(&origin, fresh_arm);
                         }
@@ -537,8 +547,12 @@ impl Workspace {
             }
             let _ = this.update(cx, |this, cx| {
                 this.sending = false;
-                if let (Err(error), Some(origin)) = (result, &origin) {
-                    this.set_error_for(origin, format!("Could not resume thread. {error}").into());
+                match (result, &origin) {
+                    (Err(error), Some(origin)) => {
+                        this.set_error_for(origin, format!("Could not resume thread. {error}").into());
+                    }
+                    (Ok(_), Some(origin)) => this.clear_usage_limits_for(origin),
+                    (_, None) => {}
                 }
                 cx.notify();
             });

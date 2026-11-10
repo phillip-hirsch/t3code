@@ -10,7 +10,7 @@ mod usage;
 use gpui_kit::{AnyElement, Context, SharedString, Window};
 
 pub(super) use pull_requests::PullRequestsState;
-pub(super) use usage::UsageState;
+pub(super) use usage::{UsageLimitsPanel, UsageState};
 
 use super::{Target, Workspace};
 

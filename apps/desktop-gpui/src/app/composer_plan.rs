@@ -49,6 +49,8 @@ pub(super) struct ComposerUi {
     pub(super) fanout: super::fanout::FanoutState,
     /// Compacting an idle thread before its next send.
     pub(super) compact: super::compact_send::CompactState,
+    /// `/usage-limits`' panel in the banner dock.
+    pub(super) usage_limits: super::pages::UsageLimitsPanel,
 }
 
 /// `resolveComposerInteractionMode`: whether the toggle shows, and the mode sends use.

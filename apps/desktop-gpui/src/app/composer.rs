@@ -1553,6 +1553,7 @@ impl Workspace {
             .chain(self.render_fallback_banner(t, cx))
             .chain(self.render_recovery_banner(t, cx))
             .chain(self.render_extension_status_banner(t))
+            .chain(self.render_usage_limits_banner(t, cx))
             .chain(self.render_fresh_session_banner(t, cx))
             .chain(self.render_branch_banner(t, cx))
             .chain(self.render_runtime_mode_ceiling_banner(t, cx))

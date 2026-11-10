@@ -2,6 +2,7 @@
 //! over the last main view). Cost and Tokens read `server.getUsageSummary`; Limits shows the
 //! subscription windows providers report, refreshed through `server.refreshProviders`.
 
+mod composer_limits;
 mod prices;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -28,6 +29,8 @@ use super::super::Workspace;
 use super::super::sidebar::now_ms;
 use crate::theme::{self, Tokens};
 use crate::usage::{self as logic, Merged, PeriodKey, Pool, PoolWindow, Summary, Window as UsageWindow};
+
+pub(in crate::app) use composer_limits::UsageLimitsPanel;
 
 /// Limits re-probe on their own at most this often; the refresh button always does.
 const LIMITS_AUTO_REFRESH_MS: i64 = 5 * 60_000;
