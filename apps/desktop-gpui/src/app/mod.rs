@@ -1088,7 +1088,9 @@ impl Workspace {
         if let Some(thread) = self.preview_thread() {
             self.load_previews(thread, window, cx);
         }
-        self.open_visit(&thread_id, cx);
+        if let Some(thread) = self.target.as_ref().and_then(Target::thread_key) {
+            self.open_visit(thread, cx);
+        }
         self.focus_composer(window, cx);
         self.notify_sidebar(cx);
         cx.notify();

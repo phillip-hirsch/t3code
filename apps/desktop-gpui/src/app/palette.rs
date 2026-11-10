@@ -1492,7 +1492,7 @@ impl Workspace {
     }
 
     fn thread_use(&self, thread: &crate::model::ThreadShell) -> search::ThreadUse {
-        search::ThreadUse::of(thread, self.local_opened_at(&thread.id))
+        search::ThreadUse::of(thread, self.local_opened_at(thread))
     }
 
     /// Threads the palette lists.
