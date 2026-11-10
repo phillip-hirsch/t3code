@@ -89,23 +89,26 @@ impl Dimensions for GridSize {
 }
 
 /// Where the shell starts (`terminal.open` / `terminal.attach` launch fields).
-#[derive(Clone, Debug, PartialEq)]
-pub(super) struct Launch {
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(in crate::app) struct Launch {
     pub cwd: String,
     pub worktree_path: Option<String>,
-    pub project_root: String,
+    /// A project's root, passed to the shell as `projectScriptRuntimeEnv`; `None` sends no env.
+    pub project_root: Option<String>,
     /// Set by project script runs: the server closes the terminal when the thread settles.
     pub stop_on_settle: Option<bool>,
+    /// The provider whose environment the shell starts in (agent setup terminals).
+    pub provider_instance_id: Option<String>,
 }
 
 impl Launch {
     /// `projectScriptRuntimeEnv`.
-    fn env(&self) -> Value {
-        let mut env = json!({"T3CODE_PROJECT_ROOT": self.project_root});
+    fn env(&self) -> Option<Value> {
+        let mut env = json!({"T3CODE_PROJECT_ROOT": self.project_root.as_ref()?});
         if let Some(path) = &self.worktree_path {
             env["T3CODE_WORKTREE_PATH"] = path.clone().into();
         }
-        env
+        Some(env)
     }
 
     /// The output stream a pane subscribes to: `terminal.attach` (which starts the shell when
@@ -128,18 +131,24 @@ impl Launch {
     }
 
     pub fn payload(&self, thread_id: &str, terminal_id: &str) -> Value {
-        let mut input = json!({"threadId": thread_id, "terminalId": terminal_id, "cwd": self.cwd, "env": self.env()});
+        let mut input = json!({"threadId": thread_id, "terminalId": terminal_id, "cwd": self.cwd});
+        if let Some(env) = self.env() {
+            input["env"] = env;
+        }
         if let Some(path) = &self.worktree_path {
             input["worktreePath"] = path.clone().into();
         }
         if let Some(stop) = self.stop_on_settle {
             input["stopOnSettle"] = stop.into();
         }
+        if let Some(id) = &self.provider_instance_id {
+            input["providerInstanceId"] = id.clone().into();
+        }
         input
     }
 }
 
-pub(super) enum SessionEvent {
+pub(in crate::app) enum SessionEvent {
     /// The process exited or the server closed the terminal.
     Exited,
     /// Pressed: the drawer makes this pane active.
@@ -150,11 +159,15 @@ pub(super) enum SessionEvent {
     OpenUrl { url: String, force_browser: bool },
     /// A clicked path that exists, resolved and with its `:line:column`.
     OpenPath(String),
+    /// A [`TerminalSession::sink`]'s typed input and query replies.
+    Input(String),
+    /// A [`TerminalSession::sink`]'s grid once it fits its pane, and after each resize.
+    Resize { columns: usize, rows: usize },
 }
 
 /// A selection for the composer (`TerminalContextSelection` without the label).
 #[derive(Clone, Debug, PartialEq)]
-pub(super) struct Selected {
+pub(in crate::app) struct Selected {
     pub line_start: usize,
     pub line_end: usize,
     pub text: String,
@@ -187,7 +200,17 @@ impl DerefMut for Emulator {
     }
 }
 
-pub(super) struct TerminalSession {
+/// Where a session's input and grid size go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wire {
+    /// `terminal.write` and `terminal.resize` on the session's PTY.
+    Pty,
+    /// [`SessionEvent::Input`] and [`SessionEvent::Resize`], for a terminal the server runs
+    /// elsewhere (a provider sign-in); Tab moves focus instead of reaching the program.
+    Events,
+}
+
+pub(in crate::app) struct TerminalSession {
     pub thread_id: String,
     pub terminal_id: String,
     launch: Launch,
@@ -198,7 +221,7 @@ pub(super) struct TerminalSession {
     events: Listener,
     pub focus: FocusHandle,
     /// Written by the grid element each prepaint, read by mouse and IME handlers.
-    pub geometry: Cell<Geometry>,
+    pub(super) geometry: Cell<Geometry>,
     /// The grid that fits the pane; the PTY hears this one.
     size: Option<GridSize>,
     /// The PTY's grid as the server last reported it.
@@ -210,6 +233,9 @@ pub(super) struct TerminalSession {
     exited: bool,
     /// The attach stream replied once; later attaches resume instead of opening a shell.
     attached: bool,
+    wire: Wire,
+    /// Selections can go to the composer (Add to chat); off outside a thread.
+    chat: bool,
     client: Option<RpcClient>,
     outbox: String,
     writing: bool,
@@ -274,6 +300,33 @@ impl TerminalSession {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let mut session = Self::unattached(thread_id, terminal_id, launch, read_only, window, cx);
+        if let Some(client) = client {
+            session.attach(client, cx);
+        }
+        session
+    }
+
+    /// A surface its owner feeds with [`Self::write`] and [`Self::reset_and_write`]; typed input
+    /// and the grid's size come back as events (`GhosttyTerminalSurface`'s `onData` / `onResize`).
+    pub fn sink(id: String, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mut session = Self::unattached(String::new(), id, Launch::default(), false, window, cx);
+        session.wire = Wire::Events;
+        session.chat = false;
+        session.running = true;
+        // Tab reaches it and leaves it, like any other control on the page.
+        session.focus = session.focus.clone().tab_stop(true);
+        session
+    }
+
+    fn unattached(
+        thread_id: String,
+        terminal_id: String,
+        launch: Launch,
+        read_only: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let events = Listener::default();
         let focus = cx.focus_handle();
         let scrollbar = Scrollbar { focus: cx.focus_handle().tab_stop(true), track: Rc::default(), grab: None };
@@ -292,7 +345,7 @@ impl TerminalSession {
             cx.on_focus(&scrollbar.focus, window, |_, _, cx| cx.notify()),
             cx.on_blur(&scrollbar.focus, window, |_, _, cx| cx.notify()),
         ];
-        let mut session = Self {
+        Self {
             thread_id,
             terminal_id,
             launch,
@@ -309,6 +362,8 @@ impl TerminalSession {
             read_only,
             exited: false,
             attached: false,
+            wire: Wire::Pty,
+            chat: true,
             client: None,
             outbox: String::new(),
             writing: false,
@@ -323,19 +378,27 @@ impl TerminalSession {
             _attach: None,
             _resize: None,
             _focus,
-        };
-        if let Some(client) = client {
-            session.attach(client, cx);
         }
-        session
     }
 
-    pub fn term(&self) -> &Term<Listener> {
+    /// `surface.write`: more output for a [`Self::sink`]; its queries are answered.
+    pub fn write(&mut self, data: &str, cx: &mut Context<Self>) {
+        self.feed(data, true, cx);
+        cx.notify();
+    }
+
+    /// `surface.resetAndWrite`: the screen starts over from `data`.
+    pub fn reset_and_write(&mut self, data: &str, cx: &mut Context<Self>) {
+        self.reset();
+        self.write(data, cx);
+    }
+
+    pub(super) fn term(&self) -> &Term<Listener> {
         &self.term
     }
 
     /// The visible grid's runs and spans, rebatched only after the terminal or the theme changed.
-    pub fn batched(&mut self, theme: &TerminalTheme) -> Rc<Batched> {
+    pub(super) fn batched(&mut self, theme: &TerminalTheme) -> Rc<Batched> {
         if let Some((revision, cached_theme, batched)) = &self.batched
             && *revision == self.term.revision
             && cached_theme == theme
@@ -349,7 +412,7 @@ impl TerminalSession {
     }
 
     /// The link to underline, if the pointer is on one.
-    pub fn hovered_link(&self) -> Option<&pointer::HoveredLink> {
+    pub(super) fn hovered_link(&self) -> Option<&pointer::HoveredLink> {
         self.pointer.hovered.as_ref()
     }
 
@@ -529,6 +592,10 @@ impl TerminalSession {
     /// Queues `data` for the PTY; writes go out one at a time, in order.
     /// Without a connection the input is dropped: queued keystrokes would run on reconnect.
     fn send_input(&mut self, data: &str, cx: &mut Context<Self>) {
+        if self.wire == Wire::Events {
+            cx.emit(SessionEvent::Input(data.to_owned()));
+            return;
+        }
         let Some(client) = self.client.clone().filter(|_| !self.read_only) else { return };
         self.outbox.push_str(data);
         if self.writing {
@@ -591,6 +658,13 @@ impl TerminalSession {
     }
 
     fn send_size(&mut self, cx: &mut Context<Self>) {
+        if self.wire == Wire::Events {
+            if let Some(size) = self.size.filter(|size| self.sent_size != Some(*size)) {
+                self.sent_size = Some(size);
+                cx.emit(SessionEvent::Resize { columns: size.columns, rows: size.rows });
+            }
+            return;
+        }
         let (Some(size), Some(client)) = (self.size, self.client.clone()) else { return };
         if !self.running || self.read_only || self.sent_size == Some(size) {
             return;
@@ -669,6 +743,21 @@ impl TerminalSession {
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         // Keys on the focused scrollbar never reach the shell.
         if !self.focus.is_focused(window) {
+            return;
+        }
+        let keystroke = &event.keystroke;
+        let modifiers = &keystroke.modifiers;
+        // `beforeKey: (event) => event.key !== "Tab"`: Tab leaves a sign-in terminal.
+        if self.wire == Wire::Events
+            && keystroke.key == "tab"
+            && !(modifiers.control || modifiers.alt || modifiers.platform)
+        {
+            if modifiers.shift {
+                window.focus_prev(cx);
+            } else {
+                window.focus_next(cx);
+            }
+            cx.stop_propagation();
             return;
         }
         let mode = *self.term.mode();
@@ -930,14 +1019,20 @@ mod tests {
 
     #[test]
     fn read_only_panes_observe_instead_of_attaching() {
-        let launch =
-            Launch { cwd: "/repo".into(), worktree_path: None, project_root: "/repo".into(), stop_on_settle: None };
+        let launch = Launch { cwd: "/repo".into(), project_root: Some("/repo".into()), ..Launch::default() };
         let (method, input) = launch.stream_request("t", "default", true, true);
         assert_eq!((method, input), ("terminal.observe", json!({"threadId": "t", "terminalId": "default"})));
         let (method, input) = launch.stream_request("t", "default", false, false);
         assert_eq!(method, "terminal.attach");
         assert_eq!(input["cwd"], "/repo");
+        assert_eq!(input["env"], json!({"T3CODE_PROJECT_ROOT": "/repo"}));
         assert!(input.get("resume").is_none());
         assert_eq!(launch.stream_request("t", "default", false, true).1["resume"], true);
+        // An agent setup shell gets no project env and starts in its provider's environment.
+        let setup = Launch { cwd: "/home".into(), provider_instance_id: Some("codex".into()), ..Launch::default() };
+        assert_eq!(
+            setup.payload("t", "setup"),
+            json!({"threadId": "t", "terminalId": "setup", "cwd": "/home", "providerInstanceId": "codex"})
+        );
     }
 }

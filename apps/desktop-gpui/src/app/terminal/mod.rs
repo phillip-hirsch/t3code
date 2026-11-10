@@ -31,7 +31,7 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use self::layout::{DrawerLayout, Place, Split};
-use self::session::{Launch, SessionEvent, TerminalSession};
+pub(in crate::app) use self::session::{Launch, SessionEvent, TerminalSession};
 use super::titlebar::icon;
 use super::{Target, Workspace};
 use crate::composer_text::Chip;
@@ -362,8 +362,8 @@ impl Workspace {
         Some(Launch {
             cwd: worktree_path.clone().unwrap_or_else(|| project.workspace_root.clone()),
             worktree_path,
-            project_root: project.workspace_root.clone(),
-            stop_on_settle: None,
+            project_root: Some(project.workspace_root.clone()),
+            ..Launch::default()
         })
     }
 
@@ -817,6 +817,8 @@ impl Workspace {
                     cx.notify();
                 }
             },
+            // Only a sink session sends these, and drawer panes are never sinks.
+            SessionEvent::Input(_) | SessionEvent::Resize { .. } => {}
         }
     }
 

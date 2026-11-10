@@ -22,9 +22,9 @@ use gpui_kit::component::radio::Radio;
 use gpui_kit::component::{Disableable as _, Icon, IconName, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, FocusHandle, FontWeight, Global,
-    InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Task, WeakEntity, Window, div, px,
+    AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, FontWeight, Global, InteractiveElement as _,
+    IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
+    Task, WeakEntity, Window, div, px,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -36,6 +36,7 @@ use super::super::connections::logic::PROVIDERS_MANAGE;
 use super::super::scoped_client;
 use super::super::widgets::RowFrame;
 use crate::app::Workspace;
+use crate::app::terminal::{SessionEvent, TerminalSession};
 use crate::model::{Provider, ProviderAuth, ProviderSetup};
 use crate::rpc::{RpcClient, RpcError, StreamEvent};
 use crate::theme::{self, Tokens};
@@ -99,7 +100,11 @@ enum Interaction {
     },
     Terminal {
         id: String,
+        /// The tail of everything the flow printed, at most 16,384 UTF-16 units.
         output: String,
+        /// UTF-16 units printed so far, `output` included; older servers leave it out.
+        #[serde(default)]
+        output_offset: Option<u64>,
     },
     Credentials {
         id: String,
@@ -247,57 +252,60 @@ fn redacted_placeholder(value: &str) -> String {
         .collect()
 }
 
-/// Drops terminal control sequences so the sign-in output reads as text.
-fn strip_ansi(output: &str) -> String {
-    let mut text = String::with_capacity(output.len());
-    let mut chars = output.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\u{1b}' => match chars.next() {
-                Some('[') => while chars.next().is_some_and(|c| !('@'..='~').contains(&c)) {},
-                Some(']') => {
-                    while let Some(c) = chars.next() {
-                        if c == '\u{7}' || (c == '\u{1b}' && chars.next_if_eq(&'\\').is_some()) {
-                            break;
-                        }
-                    }
-                }
-                _ => {}
-            },
-            '\r' if chars.peek() == Some(&'\n') => {}
-            c if c.is_control() && c != '\n' && c != '\t' => {}
-            c => text.push(c),
+/// What new sign-in output does to the terminal (`ProviderAuthTerminal`'s effect).
+#[derive(Debug, PartialEq, Eq)]
+enum OutputStep<'a> {
+    Unchanged,
+    /// The units printed since the last write, all still in `output`.
+    Append(&'a str),
+    /// Output was dropped from the window or the flow started over: redraw from `output`.
+    Reset,
+}
+
+/// The step for `output` once `offset` UTF-16 units were printed, after `written` were shown.
+fn output_step(output: &str, offset: usize, written: usize) -> OutputStep<'_> {
+    let available = output.encode_utf16().count();
+    match offset.checked_sub(written) {
+        Some(0) => OutputStep::Unchanged,
+        Some(delta) if delta <= available => OutputStep::Append(utf16_tail(output, delta)),
+        _ => OutputStep::Reset,
+    }
+}
+
+/// `text.slice(-units)`, widened to keep a surrogate pair whole.
+fn utf16_tail(text: &str, units: usize) -> &str {
+    let mut taken = 0;
+    for (index, c) in text.char_indices().rev() {
+        if taken >= units {
+            return &text[index + c.len_utf8()..];
         }
+        taken += c.len_utf16();
     }
     text
 }
 
-/// What a key press sends to a terminal, as xterm encodes it.
-fn terminal_input(event: &KeyDownEvent) -> Option<String> {
-    let keystroke = &event.keystroke;
-    let modifiers = &keystroke.modifiers;
-    let named = match keystroke.key.as_str() {
-        "enter" => Some("\r"),
-        "backspace" => Some("\x7f"),
-        "tab" => Some("\t"),
-        "escape" => Some("\x1b"),
-        "up" => Some("\x1b[A"),
-        "down" => Some("\x1b[B"),
-        "right" => Some("\x1b[C"),
-        "left" => Some("\x1b[D"),
-        "home" => Some("\x1b[H"),
-        "end" => Some("\x1b[F"),
-        "delete" => Some("\x1b[3~"),
-        _ => None,
-    };
-    if let Some(named) = named {
-        return Some(named.to_owned());
+/// `data.slice(offset, offset + max)` for each chunk, and one empty chunk for empty data (a
+/// resize); a surrogate pair stays whole, so a chunk can be one unit short.
+fn utf16_chunks(data: &str, max: usize) -> Vec<&str> {
+    let mut chunks = Vec::new();
+    let (mut start, mut units) = (0, 0);
+    for (index, c) in data.char_indices() {
+        if units + c.len_utf16() > max {
+            chunks.push(&data[start..index]);
+            (start, units) = (index, 0);
+        }
+        units += c.len_utf16();
     }
-    if modifiers.control && !modifiers.alt {
-        let key = keystroke.key.chars().next().filter(|_| keystroke.key.len() == 1)?.to_ascii_lowercase();
-        return key.is_ascii_lowercase().then(|| ((key as u8 - b'a' + 1) as char).to_string());
+    if start < data.len() || chunks.is_empty() {
+        chunks.push(&data[start..]);
     }
-    keystroke.key_char.clone()
+    chunks
+}
+
+/// `onLinkActivate`: only web links leave the sign-in terminal.
+fn is_web_link(url: &str) -> bool {
+    let scheme = url.get(..8).unwrap_or(url).to_ascii_lowercase();
+    scheme.starts_with("https://") || scheme.starts_with("http://")
 }
 
 // ---------------------------------------------------------------------------
@@ -675,6 +683,16 @@ enum FollowUp {
     OpenPage { flow_id: String },
 }
 
+/// The sign-in terminal of one flow's terminal interaction (`ProviderAuthTerminal`, keyed
+/// `flowId:interactionId`).
+struct AuthTerminal {
+    key: String,
+    session: Entity<TerminalSession>,
+    /// The output offset already shown.
+    written: usize,
+    _events: Subscription,
+}
+
 /// Options of the managed setup shown inside the add-account wizard.
 struct WizardSetup {
     on_cancelled: Callback,
@@ -706,7 +724,7 @@ pub(in crate::app) struct AccountSection {
     receiving: Option<(String, AbortOnDrop)>,
     auto_start_handled: bool,
     email_revealed: bool,
-    terminal_focus: Option<FocusHandle>,
+    terminal: Option<AuthTerminal>,
     terminal_queue: VecDeque<Value>,
     terminal_sending: bool,
     // Antigravity setup.
@@ -752,7 +770,7 @@ impl AccountSection {
             receiving: None,
             auto_start_handled: false,
             email_revealed: false,
-            terminal_focus: None,
+            terminal: None,
             terminal_queue: VecDeque::new(),
             terminal_sending: false,
             antigravity: false,
@@ -1243,22 +1261,64 @@ impl AccountSection {
         input
     }
 
-    fn send_terminal(&mut self, data: String, cx: &mut Context<Self>) {
-        let Some(auth) = &self.auth.data else { return };
+    /// The flow's terminal, made when its interaction first shows and fed what was printed since.
+    fn sync_terminal(
+        &mut self,
+        key: String,
+        output: &str,
+        offset: Option<u64>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<TerminalSession> {
+        let terminal = match self.terminal.take().filter(|terminal| terminal.key == key) {
+            Some(terminal) => terminal,
+            None => {
+                let id = format!("provider-auth-{}", self.instance_id);
+                let session = cx.new(|cx| TerminalSession::sink(id, window, cx));
+                let _events = cx.subscribe(&session, |this, _, event: &SessionEvent, cx| match event {
+                    SessionEvent::Input(data) => this.send_terminal(data, None, cx),
+                    SessionEvent::Resize { columns, rows } => {
+                        this.send_terminal("", Some(((*columns).clamp(1, 500), (*rows).clamp(1, 200))), cx);
+                    }
+                    SessionEvent::OpenUrl { url, .. } if is_web_link(url) => cx.open_url(url),
+                    _ => {}
+                });
+                AuthTerminal { key, session, written: 0, _events }
+            }
+        };
+        let offset = offset.map_or_else(|| output.encode_utf16().count(), |o| usize::try_from(o).unwrap_or(usize::MAX));
+        match output_step(output, offset, terminal.written) {
+            OutputStep::Unchanged => {}
+            OutputStep::Append(data) => terminal.session.update(cx, |session, cx| session.write(data, cx)),
+            OutputStep::Reset => terminal.session.update(cx, |session, cx| session.reset_and_write(output, cx)),
+        }
+        let session = terminal.session.clone();
+        self.terminal = Some(AuthTerminal { written: offset, ..terminal });
+        session
+    }
+
+    /// `onResponse`: typed input and the grid's size, in order and in pieces the server takes.
+    fn send_terminal(&mut self, data: &str, size: Option<(usize, usize)>, cx: &mut Context<Self>) {
+        let read_only =
+            self.workspace.upgrade().is_none_or(|w| w.read(cx).providers_read_only_on(self.scope.as_deref()));
+        let Some(auth) = self.auth.data.as_ref().filter(|_| !read_only) else { return };
         let (Some(flow_id), Some(interaction)) = (&auth.flow_id, &auth.interaction) else { return };
-        let chars: Vec<char> = data.chars().collect();
-        for chunk in chars.chunks(TERMINAL_CHUNK) {
+        let Some(client) = self.client(cx) else { return };
+        for chunk in utf16_chunks(data, TERMINAL_CHUNK) {
+            let mut response = json!({ "type": "terminal", "data": chunk });
+            if let Some((cols, rows)) = size {
+                response["size"] = json!({ "cols": cols, "rows": rows });
+            }
             self.terminal_queue.push_back(json!({
                 "instanceId": self.instance_id,
                 "flowId": flow_id,
                 "interactionId": interaction.id(),
-                "response": { "type": "terminal", "data": chunk.iter().collect::<String>() },
+                "response": response,
             }));
         }
         if std::mem::replace(&mut self.terminal_sending, true) {
             return;
         }
-        let Some(client) = self.client(cx) else { return };
         cx.spawn(async move |this, cx| {
             loop {
                 let Ok(Some(input)) = this.update(cx, |this, _| this.terminal_queue.pop_front()) else { break };
@@ -1886,37 +1946,24 @@ impl AccountSection {
                     .child("in your browser."),
             );
         }
-        if let Some(Interaction::Terminal { output, .. }) = &interaction {
-            let focus = self.terminal_focus.get_or_insert_with(|| cx.focus_handle()).clone();
+        if let Some(Interaction::Terminal { id, output, output_offset }) = &interaction {
+            let key = format!("{}:{id}", auth.as_ref().and_then(|a| a.flow_id.as_deref()).unwrap_or_default());
+            let session = self.sync_terminal(key, output, *output_offset, window, cx);
             details = details.child(
                 div().py_2().child(
                     div()
                         .id("auth-terminal")
-                        .track_focus(&focus)
+                        .relative()
                         .h(px(256.))
-                        .overflow_y_scroll()
+                        .overflow_hidden()
                         .rounded_md()
                         .border_1()
-                        .border_color(if focus.is_focused(window) { t.ring } else { t.border })
-                        .bg(t.background)
-                        .p_2()
-                        .font_family(t.fonts.mono)
-                        .text_size(px(13.))
-                        .text_color(t.foreground)
-                        .child(strip_ansi(output))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            if let Some(focus) = &this.terminal_focus {
-                                window.focus(focus, cx);
-                            }
-                        }))
-                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                            if let Some(data) = terminal_input(event) {
-                                cx.stop_propagation();
-                                this.send_terminal(data, cx);
-                            }
-                        })),
+                        .border_color(t.border)
+                        .child(session),
                 ),
             );
+        } else {
+            self.terminal = None;
         }
         if let Some(Interaction::Credentials { fields, .. }) = &interaction {
             let mut form = v_flex().gap_2().py_2().text_sm();
@@ -2379,10 +2426,29 @@ mod tests {
     }
 
     #[test]
-    fn terminal_output_drops_control_sequences() {
-        assert_eq!(
-            strip_ansi("\x1b[1;32mSign in\x1b[0m\r\nCode: \x1b]8;;https://x\x07link\x1b]8;;\x07"),
-            "Sign in\nCode: link"
-        );
+    fn sign_in_output_appends_what_is_new_and_redraws_after_a_gap() {
+        assert_eq!(output_step("", 0, 0), OutputStep::Unchanged);
+        assert_eq!(output_step("Sign in", 7, 0), OutputStep::Append("Sign in"));
+        assert_eq!(output_step("Sign in: ok", 11, 7), OutputStep::Append(": ok"));
+        assert_eq!(output_step("Sign in: ok", 11, 11), OutputStep::Unchanged);
+        // The window kept only the tail: what was missed is no longer there.
+        assert_eq!(output_step("tail", 40, 10), OutputStep::Reset);
+        // A new flow's output restarts from zero.
+        assert_eq!(output_step("again", 5, 11), OutputStep::Reset);
+        // Offsets count UTF-16 units, and a surrogate pair is never split.
+        assert_eq!(output_step("a😀b", 4, 1), OutputStep::Append("😀b"));
+        assert_eq!(utf16_tail("a😀", 1), "😀");
+        assert_eq!(utf16_tail("abc", 0), "");
+    }
+
+    #[test]
+    fn terminal_responses_split_below_the_limit_and_a_resize_sends_one() {
+        assert_eq!(utf16_chunks("", 4), vec![""]);
+        assert_eq!(utf16_chunks("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
+        assert_eq!(utf16_chunks("abc😀", 4), vec!["abc", "😀"]);
+        assert_eq!(utf16_chunks("ab😀", 4), vec!["ab😀"]);
+        assert!(is_web_link("HTTPS://auth.example/device"));
+        assert!(is_web_link("http://localhost:1455"));
+        assert!(!is_web_link("file:///etc/passwd"));
     }
 }
