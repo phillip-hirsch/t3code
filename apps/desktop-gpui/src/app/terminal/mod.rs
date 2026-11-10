@@ -403,10 +403,35 @@ impl Terminals {
         let drawer_ids = self.drawer_ref(key).map(|d| d.terminal_ids.clone()).unwrap_or_default();
         let panel_ids = self.panel_ids(key);
         let known = self.summaries(key).iter().map(|s| s.terminal_id.as_str());
-        let listed = readable && key.env.as_deref().is_some_and(|env| self.listed_now.contains(env));
-        let suffix = (!listed).then(super::new_id);
+        let suffix = (!self.listed_readably(key, readable)).then(super::new_id);
         let taken = known.chain(drawer_ids.iter().map(String::as_str)).chain(panel_ids.iter().map(String::as_str));
         layout::next_terminal_id(taken, suffix.as_deref())
+    }
+
+    /// Whether `key`'s environment is readable and its current stream has listed its terminals.
+    fn listed_readably(&self, key: &DrawerKey, readable: bool) -> bool {
+        readable && key.env.as_deref().is_some_and(|env| self.listed_now.contains(env))
+    }
+
+    /// `findReusableProjectScriptTerminal`: an idle drawer or server terminal, the active one
+    /// first, never a panel tab's. Only a readable current list tells which are idle; without
+    /// one a script gets a new terminal.
+    fn script_reuse(&self, key: &DrawerKey, readable: bool) -> Option<String> {
+        if !self.listed_readably(key, readable) {
+            return None;
+        }
+        let drawer = self.drawer_ref(key);
+        let panel = self.panel_ids(key);
+        let running = self.running(key.env.as_deref(), &key.thread_id);
+        let drawer_ids = drawer.map(|d| d.terminal_ids.as_slice()).unwrap_or_default();
+        let known = self.summaries(key).iter().map(|s| &s.terminal_id);
+        let idle: Vec<&String> = drawer_ids
+            .iter()
+            .chain(known)
+            .filter(|id| !panel.contains(id) && !running.contains(&id.as_str()))
+            .collect();
+        let active = idle.iter().find(|id| drawer.is_some_and(|d| d.active_id == ***id));
+        active.or(idle.first()).map(|id| (*id).clone())
     }
 
     /// `environment`'s metadata stream (re)started: its old list may miss terminals made since.
@@ -521,14 +546,18 @@ impl Workspace {
         self.terminals.drawer_ref(&self.shown_drawer_key()?)
     }
 
-    /// Where new terminals start: the thread's worktree, else its project root.
+    /// Where new terminals start: the thread's worktree (a draft's picked existing worktree), else
+    /// its project root.
     fn terminal_launch(&self) -> Option<Launch> {
-        let (env, project_id, worktree_path) = match self.target.as_ref()? {
+        let target = self.target.as_ref()?;
+        let (env, project_id, worktree_path) = match target {
             Target::Thread { env, id } => {
                 let thread = self.shell.thread(&ScopedId::new(env.clone(), id.clone()))?;
                 (env, thread.project_id.as_str(), thread.worktree_path.clone())
             }
-            Target::Draft { env, project_id, .. } => (env, project_id.as_str(), None),
+            Target::Draft { env, project_id, .. } => {
+                (env, project_id.as_str(), self.draft_workspace.existing_worktree(Some(target)).map(str::to_owned))
+            }
         };
         let project = self.shell.project(&ScopedId::new(env.clone(), project_id))?;
         Some(Launch {
@@ -667,15 +696,11 @@ impl Workspace {
         launch.cwd.clone_from(&run.cwd);
         launch.stop_on_settle = Some(run.stop_on_settle);
         let input = format!(" {}\r", run.command);
-        let running: Vec<String> =
-            self.terminals.running(key.env.as_deref(), &key.thread_id).into_iter().map(str::to_owned).collect();
-        let drawer = self.terminals.drawer(&key);
-        let idle: Vec<&String> = drawer.terminal_ids.iter().filter(|id| !running.contains(id)).collect();
-        let reuse = idle.iter().find(|id| ***id == drawer.active_id).or(idle.first()).map(|id| (*id).clone());
-        let written = match reuse.filter(|_| !run.stop_on_settle) {
+        let reuse = (!run.stop_on_settle).then(|| self.terminals.script_reuse(&key, self.drawer_readable(&key)));
+        let written = match reuse.flatten() {
             // Reopening a live terminal only updates its launch flags, as the web's launch does.
             Some(terminal_id) => {
-                drawer.set_active(&terminal_id);
+                self.terminals.drawer(&key).ensure(&terminal_id);
                 self.open_terminal_session(key.clone(), terminal_id, launch, Some(input), cx)
             }
             None => self.launch_terminal_with(key.clone(), Place::New, launch, Some(input), cx),
@@ -715,8 +740,12 @@ impl Workspace {
     }
 
     fn next_terminal_id(&self, key: &DrawerKey) -> String {
-        let readable = key.env.as_deref().is_some_and(|env| self.env_grants(env, "terminal:read"));
-        self.terminals.next_id(key, readable)
+        self.terminals.next_id(key, self.drawer_readable(key))
+    }
+
+    /// The environment of `key`'s drawer grants `terminal:read`.
+    fn drawer_readable(&self, key: &DrawerKey) -> bool {
+        key.env.as_deref().is_some_and(|env| self.env_grants(env, "terminal:read"))
     }
 
     /// `terminal.open` (then an optional write) for a terminal already placed; resolves to
@@ -1815,6 +1844,26 @@ mod tests {
         assert_eq!(terminals.drawer_reuse(&key).as_deref(), Some("default"));
         terminals.panel.insert("surface".into(), panel_group("env", "t", &["term-2", "default", "term-3"]));
         assert_eq!(terminals.drawer_reuse(&key), None);
+    }
+
+    #[test]
+    fn scripts_reuse_an_idle_drawer_terminal_only_from_a_readable_current_list() {
+        let key = DrawerKey::new("env", "t");
+        let summary = |id: &str, running: bool| json!({"threadId": "t", "terminalId": id, "hasRunningSubprocess": running, "label": ""});
+        let mut terminals = Terminals::default();
+        terminals.drawer(&key).place("term-1", Place::New);
+        terminals.drawer(&key).place("term-2", Place::New);
+        assert_eq!(terminals.script_reuse(&key, true), None, "nothing listed yet: term-2 may run a program");
+
+        let snapshot = json!({"type": "snapshot", "terminals": [summary("term-1", false), summary("term-2", true), summary("setup", false)]});
+        terminals.apply_metadata(&"env".into(), &snapshot);
+        assert_eq!(terminals.script_reuse(&key, false), None, "without terminal:read");
+        assert_eq!(terminals.script_reuse(&key, true).as_deref(), Some("term-1"), "the active one runs a program");
+        terminals.panel.insert("tab".into(), panel_group("env", "t", &["term-1"]));
+        assert_eq!(terminals.script_reuse(&key, true).as_deref(), Some("setup"), "a server shell, never a panel tab");
+
+        terminals.metadata_restarted("env");
+        assert_eq!(terminals.script_reuse(&key, true), None, "a reconnect's list is not in yet");
     }
 
     fn panel_group(env: &str, thread_id: &str, ids: &[&str]) -> panel::PanelGroup {

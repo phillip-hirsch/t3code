@@ -622,7 +622,21 @@ impl gpui_kit::Render for TabDragPreview {
     }
 }
 
+/// `draft`'s panel becomes `thread`'s: the web keys it by the thread id a draft launches with.
+fn carry_panel(panels: &mut HashMap<Target, PanelState>, draft: &Target, thread: &Target) -> bool {
+    let Some(panel) = panels.remove(draft) else { return false };
+    panels.insert(thread.clone(), panel);
+    true
+}
+
 impl Workspace {
+    /// A launched draft's open panel (its tabs, terminal groups, width) goes on with its thread.
+    pub(super) fn carry_draft_panel(&mut self, draft: &Target, thread: &Target) {
+        if carry_panel(&mut self.right_panel.panels, draft, thread) {
+            self.right_panel.layout.changed = true;
+        }
+    }
+
     fn panel_state(&self) -> Option<&PanelState> {
         self.right_panel.panels.get(self.target.as_ref()?)
     }
@@ -3807,6 +3821,30 @@ mod tests {
         // The web's 1138px window beside a 256px sidebar leaves 516 once the resize inset is out.
         let expected = if cfg!(windows) { 516. } else { 522. };
         assert_eq!(clamp_width(540., 1138., panel_row(1138., 256.)), expected);
+    }
+
+    #[test]
+    fn a_launched_drafts_panel_becomes_its_threads() {
+        let draft = Target::Draft {
+            env: "a".into(),
+            project_id: "p".into(),
+            draft: super::super::draft_sessions::DraftId::for_test("d"),
+        };
+        let thread = Target::Thread { env: "a".into(), id: "t".into() };
+        let mut panel = PanelState::default();
+        panel.upsert(Surface::Terminal("tab".into()));
+        panel.upsert(Surface::Files);
+        panel.width = Some(480.);
+        let mut panels = HashMap::from([(draft.clone(), panel)]);
+
+        assert!(carry_panel(&mut panels, &draft, &thread));
+        assert!(!panels.contains_key(&draft), "no layout left behind under the draft");
+        let carried = &panels[&thread];
+        assert!(carried.open);
+        assert_eq!(carried.surfaces, [Surface::Terminal("tab".into()), Surface::Files]);
+        assert_eq!((carried.active.clone(), carried.width), (Some(Surface::Files), Some(480.)));
+        assert!(!carry_panel(&mut panels, &draft, &thread), "nothing left to carry");
+        assert_eq!(panels.len(), 1);
     }
 
     #[test]

@@ -437,6 +437,7 @@ impl Workspace {
                                 let thread =
                                     Target::Thread { env: origin.environment().clone(), id: thread_id.clone() };
                                 this.retarget_closed_views(&origin, &thread);
+                                this.carry_draft_panel(&origin, &thread);
                             }
                             this.drafts_changed(cx);
                         }
