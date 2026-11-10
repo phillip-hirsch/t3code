@@ -66,8 +66,18 @@ struct PathSearch {
     truncated: bool,
     pending: bool,
     error: Option<String>,
+    /// The socket the search last went out on; `None` while it waits for one.
+    on: Option<crate::rpc::SocketId>,
     generation: u64,
     _task: Option<Task<()>>,
+}
+
+impl PathSearch {
+    /// A search that is still waiting, or failed, runs again on a new socket, as the tree's
+    /// failed folders do ([`Failure::retries_on`]).
+    fn retries_on(&self, socket: &crate::rpc::SocketId) -> bool {
+        !self.query.is_empty() && (self.pending || self.error.is_some()) && self.on.as_ref() != Some(socket)
+    }
 }
 
 pub(super) struct TreeState {
@@ -402,6 +412,7 @@ impl Workspace {
         tree.search.query = query.clone();
         tree.search._task = None;
         tree.search.error = None;
+        tree.search.on = None;
         tree.rows_dirty = true;
         if query.is_empty() {
             tree.search.pending = false;
@@ -409,8 +420,11 @@ impl Workspace {
             cx.notify();
             return;
         }
+        // Offline, the search stays pending (as the web's waits on the connection) until
+        // `sync_tree` sees a socket.
         tree.search.pending = true;
         let Some(client) = client else { return };
+        tree.search.on = Some(client.socket_id());
         let root = root.clone();
         let payload = json!({"cwd": root.cwd, "query": query, "limit": SEARCH_LIMIT});
         tree.search._task = Some(cx.spawn(async move |this, cx| {
@@ -456,10 +470,16 @@ impl Workspace {
         let Some(tree) = self.tree(root) else { return };
         let previous = tree.mutation.replace(mutation.clone());
         let failed: Vec<String> = socket
-            .map(|socket| tree.errors.iter().filter(|(_, f)| f.retries_on(&socket)).map(|(p, _)| p.clone()).collect())
+            .as_ref()
+            .map(|socket| tree.errors.iter().filter(|(_, f)| f.retries_on(socket)).map(|(p, _)| p.clone()).collect())
             .unwrap_or_default();
+        let search_retries = socket.is_some_and(|socket| tree.search.retries_on(&socket));
         if previous.is_some_and(|p| p != mutation) {
             self.refresh_tree(root, cx);
+        } else if search_retries && let Some(tree) = self.tree(root) {
+            let value = tree.query.read(cx).value().to_string();
+            tree.search.query.clear();
+            self.search_tree(root, value, cx);
         }
         for folder in failed {
             self.load_folder(root, folder, true, cx);
@@ -952,7 +972,7 @@ impl Workspace {
 
 #[cfg(test)]
 mod tests {
-    use super::{Failure, Reveal};
+    use super::{Failure, PathSearch, Reveal};
 
     #[test]
     fn a_failed_folder_lists_again_on_a_new_socket() {
@@ -962,6 +982,22 @@ mod tests {
         let failed = Failure { message: "closed".into(), on: Some(first.socket_id()) };
         assert!(!failed.retries_on(&first.socket_id()), "the failure stands on that socket");
         assert!(failed.retries_on(&second.socket_id()), "a reconnect reads again");
+    }
+
+    #[test]
+    fn a_search_that_found_no_socket_or_failed_runs_again_on_a_new_one() {
+        let (first, second) = (crate::rpc::RpcClient::unopened(), crate::rpc::RpcClient::unopened());
+        let offline = PathSearch { query: "readme".into(), pending: true, ..PathSearch::default() };
+        assert!(offline.retries_on(&first.socket_id()), "typed offline: the first socket searches");
+        let sent = PathSearch { on: Some(first.socket_id()), ..offline };
+        assert!(!sent.retries_on(&first.socket_id()), "in flight on this socket");
+        assert!(sent.retries_on(&second.socket_id()), "its socket closed under it");
+        let failed = PathSearch { pending: false, error: Some("closed".into()), ..sent };
+        assert!(!failed.retries_on(&first.socket_id()), "the failure stands on that socket");
+        assert!(failed.retries_on(&second.socket_id()), "a reconnect searches again");
+        let answered = PathSearch { error: None, ..failed };
+        assert!(!answered.retries_on(&second.socket_id()), "answered searches stay");
+        assert!(!PathSearch::default().retries_on(&second.socket_id()), "no query, no search");
     }
 
     #[test]
