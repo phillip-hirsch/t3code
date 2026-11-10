@@ -414,9 +414,18 @@ impl Workspace {
             .find(|p| p.id == reference.project_id && p.environment_id == reference.environment_id)
     }
 
-    /// The pull request `key` names may be acted on.
+    /// The pull request `key` names shows writable: `canWriteSourceControl` on its environment.
     pub(super) fn pr_panel_writable(&self, key: &str) -> bool {
         self.pr_panel_ref(key).is_some_and(|p| self.pr_write_grant(&p.reference) == Some(true))
+    }
+
+    /// `permissionAtom` for `method` sent with `payload`, or with the pull request's reference
+    /// every request carries, to the environment of the pull request `key` names.
+    pub(super) fn pr_panel_permits(&self, key: &str, method: &str, payload: Option<&Value>) -> bool {
+        self.pr_panel_ref(key).is_some_and(|p| {
+            let reference = p.reference.to_json();
+            self.env_permits(&p.reference.environment_id, method, payload.unwrap_or(&reference))
+        })
     }
 
     /// An environment's session answered (`before` was its grant): a newly granted environment
@@ -471,7 +480,7 @@ impl Workspace {
     /// `generateReviewGuide.permissionAtom`: writing a guide runs an agent on the pull request's
     /// environment.
     pub(super) fn can_write_pr_guide(&self, reference: &Reference) -> bool {
-        self.env_grants(&reference.environment_id, "orchestration:operate")
+        self.env_permits(&reference.environment_id, "pullRequests.generateReviewGuide", &reference.to_json())
     }
 
     fn review_guides_enabled(&self, reference: &Reference) -> bool {
@@ -650,7 +659,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(client) = self.pull_request_client_of(key) else { return };
-        if !self.pr_panel_writable(key) {
+        if !self.pr_panel_permits(key, "pullRequests.runAction", None) {
             return;
         }
         let Some(panel) = self.pr_panel(key) else { return };

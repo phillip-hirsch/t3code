@@ -400,14 +400,23 @@ impl Workspace {
         let read = self.pull_requests.card.reads.get(key)?;
         let action = logic::card_action(read.shown.as_deref()?)?;
         let environment = &read.reference.environment_id;
-        let denied = if !self.env_grants(environment, SOURCE_CONTROL_WRITE) {
-            Some(NO_WRITE)
-        } else if matches!(action, CardAction::Resolve | CardAction::Fix) && !self.can_operate(environment) {
-            Some(NO_OPERATE)
-        } else {
-            None
+        // `permissionAtom` for what the action sends: a worktree checkout for a new thread, else `runAction`.
+        let permitted = match action {
+            CardAction::Resolve | CardAction::Fix => self.permits_card_handoff(environment),
+            _ => self.env_permits(environment, "pullRequests.runAction", &read.reference.to_json()),
+        };
+        let denied = match permitted {
+            true => None,
+            false if !self.env_grants(environment, SOURCE_CONTROL_WRITE) => Some(NO_WRITE),
+            false => Some(NO_OPERATE),
         };
         Some((action, denied))
+    }
+
+    /// `permissionAtom` for Resolve and Fix's worktree checkout, made for a new draft's thread.
+    fn permits_card_handoff(&self, environment: &str) -> bool {
+        let input = json!({"mode": "worktree", "threadId": "draft"});
+        self.env_permits(environment, "git.preparePullRequestThread", &input)
     }
 
     /// The Merge confirmation closes once the row can no longer merge (`confirmingMerge`).
@@ -490,8 +499,14 @@ impl Workspace {
         let Some(read) = self.pull_requests.card.reads.get(key) else { return };
         let reference = read.reference.clone();
         let term = logic::terminology(read.shown.as_ref().map_or("", |d| d.provider.as_str())).0;
+        let mut input = reference.to_json();
+        input["action"] = json!(action);
+        input["replyWithSummary"] = json!(true);
+        if let Some(method) = method {
+            input["mergeMethod"] = json!(method);
+        }
         if self.pull_requests.card.acting.contains(key)
-            || !self.env_grants(&reference.environment_id, SOURCE_CONTROL_WRITE)
+            || !self.env_permits(&reference.environment_id, "pullRequests.runAction", &input)
         {
             return;
         }
@@ -499,12 +514,6 @@ impl Workspace {
             toast_error(window, cx, logic::action_failure(action, term).0, "This environment is not connected.");
             return;
         };
-        let mut input = reference.to_json();
-        input["action"] = json!(action);
-        input["replyWithSummary"] = json!(true);
-        if let Some(method) = method {
-            input["mergeMethod"] = json!(method);
-        }
         let key = key.to_owned();
         self.pull_requests.card.acting.insert(key.clone());
         cx.notify();
@@ -538,10 +547,7 @@ impl Workspace {
         let Some(read) = self.pull_requests.card.reads.get(key) else { return };
         let Some(detail) = read.shown.clone() else { return };
         let environment_id = read.reference.environment_id.clone();
-        if self.pull_requests.card.handoff.is_some()
-            || !self.env_grants(&environment_id, SOURCE_CONTROL_WRITE)
-            || !self.can_operate(&environment_id)
-        {
+        if self.pull_requests.card.handoff.is_some() || !self.permits_card_handoff(&environment_id) {
             return;
         }
         let subject = HandoffSubject::of(&detail);

@@ -373,7 +373,7 @@ impl Workspace {
     /// "Allow edits from maintainers" (`pullRequests.update` with `maintainerCanModify`).
     pub(super) fn save_pr_maintainer_edits(&mut self, value: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(client) = self.pull_request_client() else { return };
-        if !self.shown_pr_key().is_some_and(|key| self.pr_panel_writable(&key)) {
+        if !self.shown_pr_key().is_some_and(|key| self.pr_panel_permits(&key, "pullRequests.update", None)) {
             return;
         }
         let Some(panel) = self.pull_requests.panel.as_mut() else { return };
@@ -626,7 +626,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(client) = self.pull_request_client() else { return };
-        if !self.shown_pr_key().is_some_and(|key| self.pr_panel_writable(&key)) {
+        if !self.shown_pr_key().is_some_and(|key| self.pr_panel_permits(&key, "pullRequests.runAction", None)) {
             return;
         }
         let Some(panel) = self.pull_requests.panel.as_mut() else { return };
