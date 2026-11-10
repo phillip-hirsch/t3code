@@ -123,6 +123,7 @@ impl Workspace {
             {
                 self.preview_command(command, window, cx);
             }
+            "view.reopenClosed" if chat_route && !palette_open => return self.reopen_closed_view(held, window, cx),
             "rightPanel.toggle" if chat => self.toggle_right_panel(window, cx),
             "rightPanel.new" if chat => return self.open_add_surface_menu(context.layer_open, held, cx),
             "rightPanel.toggleMaximized" if chat => return self.toggle_right_panel_maximized(cx),

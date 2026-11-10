@@ -309,7 +309,7 @@ fn repository_url(url: &str) -> Option<String> {
 
 impl Workspace {
     /// Opens a pull request in the panel, or shows the one already open.
-    pub(super) fn open_pull_request_panel(
+    pub(in crate::app) fn open_pull_request_panel(
         &mut self,
         reference: Reference,
         seed: Option<Rc<Entry>>,

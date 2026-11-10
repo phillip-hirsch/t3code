@@ -139,6 +139,11 @@ impl Workspace {
         self.pull_requests.panel.is_some()
     }
 
+    /// The page's panel shows `reference` among its tabs.
+    pub(in crate::app) fn pull_request_tab_shown(&self, reference: &Reference) -> bool {
+        self.pull_request_panel_shown() && self.pull_requests.tabs.contains(reference)
+    }
+
     pub(in crate::app) fn pull_request_panel_maximized(&self) -> bool {
         self.pull_requests.layout.maximized(self.pull_requests.panel.is_some())
     }
@@ -192,6 +197,7 @@ impl Workspace {
         let Some(index) = self.pull_requests.tabs.iter().position(|r| r == reference) else { return };
         self.pull_requests.tabs.remove(index);
         self.pull_requests.parked.remove(&reference.key());
+        self.remember_closed_pull_request_tabs(vec![reference.clone()], None);
         if self.pull_requests.panel.as_ref().is_some_and(|p| &p.reference == reference) {
             self.pull_requests.panel = None;
             let next = self.pull_requests.tabs.get(index).or_else(|| self.pull_requests.tabs.last()).cloned();
@@ -274,6 +280,10 @@ impl Workspace {
 
     /// Closes several tabs at once; when the shown one goes, `keep` shows instead.
     fn close_pr_tabs(&mut self, close: &[Reference], keep: Option<Reference>, cx: &mut Context<Self>) {
+        let closed: Vec<Reference> =
+            self.pull_requests.tabs.iter().filter(|tab| close.contains(tab)).cloned().collect();
+        let shown = self.pull_requests.panel.as_ref().map(|panel| panel.reference.clone());
+        self.remember_closed_pull_request_tabs(closed, shown.as_ref());
         self.pull_requests.tabs.retain(|tab| !close.contains(tab));
         for reference in close {
             self.pull_requests.parked.remove(&reference.key());

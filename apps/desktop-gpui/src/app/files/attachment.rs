@@ -30,7 +30,7 @@ const COPIED_FOR: Duration = Duration::from_millis(2000);
 
 /// A file sent with a message (`ChatFileAttachment`): what its panel tab opens. Tabs are the
 /// same attachment by id (`attachment:<id>`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(in crate::app) struct AttachmentFile {
     pub id: String,
     pub name: String,

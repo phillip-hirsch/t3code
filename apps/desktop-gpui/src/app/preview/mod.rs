@@ -655,6 +655,41 @@ impl Workspace {
         .detach();
     }
 
+    /// `openPreviewSession` with a ready `input`, for Reopen Closed Tab: the new session joins
+    /// `thread_id`'s tabs and `opened` gets its tab id, or the error.
+    pub(in crate::app) fn request_preview_open(
+        &mut self,
+        thread_id: String,
+        input: Value,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        opened: impl FnOnce(&mut Self, Result<String, String>, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        let Some(client) = self.thread_client(&thread_id) else {
+            return opened(self, Err("The environment is not connected.".into()), window, cx);
+        };
+        let url = input.get("url").and_then(Value::as_str).map(str::to_owned);
+        cx.spawn_in(window, async move |this, cx| {
+            let result = client.request("preview.open", input).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let session = result.map_err(|e| e.to_string()).and_then(|v| {
+                    serde_json::from_value::<Session>(v).map_err(|e| format!("Unexpected preview.open result: {e}"))
+                });
+                let tab = session.map(|session| {
+                    let tab = session.tab_id.clone();
+                    if let Some(url) = &url {
+                        this.record_visit(&thread_id, url);
+                    }
+                    this.preview.threads.entry(thread_id.clone()).or_default().apply_snapshot(session, true);
+                    tab
+                });
+                opened(this, tab, window, cx);
+                this.after_preview_change(window, cx);
+            });
+        })
+        .detach();
+    }
+
     /// `setActivePreviewTab`: the tab the address bar and the chrome act on.
     pub(super) fn focus_preview_tab(
         &mut self,
@@ -679,6 +714,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let snapshot = self.preview.threads.get(&thread_id).and_then(|previews| previews.get(&tab_id)).cloned();
         let closing = self.preview.threads.entry(thread_id.clone()).or_default().begin_close(&tab_id);
         // The page stays alive, hidden, until the server confirms the close.
         let mut hosted = self.preview.tabs.remove(&tab_id);
@@ -689,7 +725,12 @@ impl Workspace {
         if let Some(client) = self.thread_client(&thread_id) {
             cx.spawn_in(window, async move |this, cx| {
                 let result = client.request("preview.close", json!({"threadId": thread_id, "tabId": tab_id})).await;
-                let Err(error) = result else { return };
+                let Err(error) = result else {
+                    if let Some(snapshot) = snapshot {
+                        let _ = this.update_in(cx, |this, _, _| this.remember_closed_browser(&snapshot));
+                    }
+                    return;
+                };
                 let _ = this.update_in(cx, |this, window, cx| {
                     if let Some(previews) = this.preview.threads.get_mut(&thread_id) {
                         previews.cancel_close(closing);
