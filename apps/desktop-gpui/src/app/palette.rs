@@ -223,7 +223,7 @@ enum Run {
     /// `workspace.focusNext` (`true`) or `workspace.focusPrevious`, once the palette has closed.
     WorkspaceFocus(bool),
     /// "Link pull request to thread" for this thread.
-    LinkPullRequest(String),
+    LinkPullRequest(ScopedId),
     /// "Show linked pull requests": the right panel's Linked pull requests surface.
     LinkedPullRequests,
     /// "Use T3 Code in another app (MCP)" for this environment, else the one Sharing & access picks.
@@ -1277,8 +1277,8 @@ impl Workspace {
             rows.push(row);
         }
         if let Some(thread) = thread {
-            if self.pull_request_linking(&thread.id) {
-                let link = Run::LinkPullRequest(thread.id.clone());
+            if self.pull_request_linking(&ScopedId::of_thread(thread)) {
+                let link = Run::LinkPullRequest(ScopedId::of_thread(thread));
                 let mut row = lucide("link-pull-request", IconName::Link2, "Link pull request to thread", link);
                 row.terms = &["link", "pull request", "pr", "attach", "stack"];
                 rows.push(row);
@@ -2057,7 +2057,7 @@ impl Workspace {
             }
             Run::ThemeEditor => self.toggle_theme_editor(window, cx),
             Run::WorkspaceFocus(forward) => self.move_workspace_focus(forward, window, cx),
-            Run::LinkPullRequest(thread_id) => self.open_link_pull_request(thread_id, window, cx),
+            Run::LinkPullRequest(thread) => self.open_link_pull_request(thread, window, cx),
             Run::LinkedPullRequests => self.open_surface(super::right_panel::Surface::PullRequests, window, cx),
             Run::UseInAnotherApp(environment) => self.open_use_in_another_app(environment.as_deref(), window, cx),
             Run::FindIn { thread, query, message_id } => {

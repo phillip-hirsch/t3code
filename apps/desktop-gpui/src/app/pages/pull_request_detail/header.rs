@@ -305,7 +305,9 @@ impl Workspace {
 
     /// "Link to thread": a searchable list of active threads in this environment.
     pub(super) fn open_pr_thread_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(detail) = self.pull_requests.panel.as_ref().and_then(|p| p.detail.clone()) else { return };
+        let Some(panel) = self.pull_requests.panel.as_ref() else { return };
+        let Some(detail) = panel.detail.clone() else { return };
+        let environment = panel.reference.environment_id.clone();
         let term = logic::terminology(&detail.provider).0;
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search threads or projects..."));
         search.update(cx, |input, cx| input.focus(window, cx));
@@ -317,13 +319,18 @@ impl Workspace {
         if let Some(panel) = self.pull_requests.panel.as_mut() {
             panel._picker_search = Some(refresh);
         }
-        let projects: HashMap<String, String> =
-            self.shell.projects.iter().map(|p| (p.id.clone(), p.title.clone())).collect();
+        let projects: HashMap<String, String> = self
+            .shell
+            .projects
+            .iter()
+            .filter(|p| p.environment_id == environment)
+            .map(|p| (p.id.clone(), p.title.clone()))
+            .collect();
         let mut threads: Vec<(String, String, String, String)> = self
             .shell
             .threads
             .iter()
-            .filter(|t| t.archived_at.is_none())
+            .filter(|t| t.archived_at.is_none() && t.environment_id == environment)
             .map(|t| {
                 (
                     t.id.clone(),
@@ -402,7 +409,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.thread_client(&thread_id) else { return };
+        // Both entry points list only threads on the pull request's environment.
+        let Some(client) = self.pull_request_client() else { return };
         let Some(detail) = self.pull_requests.panel.as_ref().and_then(|p| p.detail.clone()) else { return };
         let Some((host, repository, number)) = thread_key(&detail) else { return };
         let term = logic::terminology(&detail.provider).0;
