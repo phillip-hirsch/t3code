@@ -1280,7 +1280,7 @@ impl Workspace {
     /// on every environment (`getSidebarProjectSettingsKey`, resolved as Settings groups them).
     pub(in crate::app) fn open_project_settings(&mut self, project_id: &str, cx: &mut Context<Self>) {
         let project = self.settings_project_groups().into_iter().find(|g| g.contains(project_id)).map(|g| g.key);
-        self.settings_ui.scope = crate::settings::scope::ScopeSearch { project, machine: None };
+        self.settings_ui.scope = crate::settings::scope::ScopeSearch { project, ..Default::default() };
         self.open_settings("projects", cx);
     }
 

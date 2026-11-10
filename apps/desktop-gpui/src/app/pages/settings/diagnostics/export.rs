@@ -387,7 +387,7 @@ impl Workspace {
             .map(|&((id, label, url), machine)| {
                 let secondary =
                     scope::environment_secondary(id, &labeled).unwrap_or_else(|| scope::environment_address(id, url));
-                let search = scope::ScopeSearch { project: None, machine: Some(id.to_owned()) };
+                let search = scope::ScopeSearch { machine: Some(id.to_owned()), ..scope::ScopeSearch::default() };
                 h_flex()
                     .id(ElementId::Name(format!("telemetry-export-environment-{id}").into()))
                     .px(px(16.))

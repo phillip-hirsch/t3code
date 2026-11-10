@@ -754,6 +754,7 @@ mod tests {
             kind,
             label: String::new(),
             environment_ids: environments.iter().map(|id| (*id).to_owned()).collect(),
+            checkout_environment: None,
         };
         let checkout = |id: &str, environment: &str| Project {
             id: id.into(),
