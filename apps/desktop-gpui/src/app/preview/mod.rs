@@ -641,6 +641,7 @@ impl Workspace {
         let zoom_to = |direction| json!({"zoomFactor": preview::step_zoom(zoom, direction)});
         match command {
             "preview.refresh" => self.refresh_preview_tab(&tab, cx),
+            "preview.focusUrl" if self.server_input_disabled(&tab) => {}
             "preview.focusUrl" => self.preview.address.update(cx, |input, cx| {
                 input.focus(window, cx);
                 input.select_all(window, cx);
@@ -1455,8 +1456,9 @@ impl Workspace {
         let hosted = tab.as_ref().and_then(|tab| self.preview.tabs.get(tab));
         // An agent tab navigates over its stream, from the server's own history.
         let server_tab = session.filter(|s| s.server_hosted());
+        let input_disabled = tab.as_ref().is_some_and(|tab| self.server_input_disabled(tab));
         let (can_back, can_forward) = match server_tab {
-            Some(s) => (s.can_go_back, s.can_go_forward),
+            Some(s) => (s.can_go_back && !input_disabled, s.can_go_forward && !input_disabled),
             None => hosted.map_or((false, false), |tab| (tab.can_go_back, tab.can_go_forward)),
         };
         let loading = match server_tab {
@@ -1465,6 +1467,7 @@ impl Workspace {
         };
         let url = self.active_url();
         let has_page = hosted.is_some() || server_tab.is_some_and(|s| !matches!(s.nav_status, NavStatus::Idle));
+        let can_reload = has_page && !input_disabled;
         let reload_tab = tab.clone();
         let unreachable = match server_tab {
             Some(s) => matches!(s.nav_status, NavStatus::LoadFailed { .. }),
@@ -1525,9 +1528,9 @@ impl Workspace {
                             }),
                     )
                     .child(
-                        icon_button("preview-reload", IconName::RotateCw, has_page, tokens, cx)
+                        icon_button("preview-reload", IconName::RotateCw, can_reload, tokens, cx)
                             .tooltip(if loading { "Loading…" } else { "Refresh" })
-                            .when(has_page, |el| {
+                            .when(can_reload, |el| {
                                 el.on_click(cx.listener(move |this, _, _, cx| {
                                     if let Some(tab) = &reload_tab {
                                         this.refresh_preview_tab(tab, cx);
@@ -1547,6 +1550,7 @@ impl Workspace {
                     .child(
                         Input::new(&self.preview.address)
                             .appearance(false)
+                            .disabled(input_disabled)
                             .flex_1()
                             .h(px(28.))
                             .px_2()
