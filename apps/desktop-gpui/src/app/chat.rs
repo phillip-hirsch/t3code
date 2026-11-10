@@ -272,7 +272,7 @@ pub(super) fn markdown(
     t: &Tokens,
     cx: &mut App,
 ) -> AnyElement {
-    markdown_with(this, key, text, MarkdownKind::Assistant { streaming }, None, t, cx)
+    markdown_with(this, key, text, MarkdownKind::Assistant { streaming }, None, None, t, cx)
 }
 
 fn markdown_with(
@@ -281,6 +281,7 @@ fn markdown_with(
     text: &SharedString,
     kind: MarkdownKind,
     width: Option<f32>,
+    content: Option<&Arc<timeline::UserContent>>,
     t: &Tokens,
     cx: &mut App,
 ) -> AnyElement {
@@ -292,7 +293,7 @@ fn markdown_with(
         (workspace.markdown_state(key, text, cx), wrap, workspace.markdown_images.clone(), math, chips)
     }) {
         Ok((state, wrap, images, math, chips)) => {
-            markdown_view(&state, kind, key_for_view, wrap, width, this, chips, t)
+            markdown_view(&state, kind, key_for_view, wrap, width, this, chips, content, t)
                 .image_source(images.resolver())
                 .when(math, |view| view.plugin(super::markdown_ui::InlineMath).plugin(super::markdown_ui::DisplayMath))
                 .into_any_element()
@@ -762,16 +763,35 @@ pub(super) fn render_row(
             created_at,
             revert,
             attribution,
+            content,
         } => {
+            use super::user_message as attachments;
             let expanded =
                 this.upgrade().is_some_and(|workspace| workspace.read(cx).expanded.contains(&timeline::entry_key(id)));
-            let fold = folded_message(attribution.as_ref(), text, this, cx);
+            let fold = folded_message(attribution.as_ref(), &crate::user_message::plain_text(text), this, cx);
             let actions = message_actions::user_actions(this, id, text, created_at, revert.as_ref(), &t, cx);
-            let body = markdown_with(this, id.clone(), text, MarkdownKind::User, None, &t, cx);
+            // A folded agent message and a guest's keep their attachments inside the bubble.
+            let guest = matches!(attribution, Some(timeline::Attribution::Guest { .. }));
+            let layout = crate::user_message::layout(content, text, fold.is_none() && !guest);
+            let corners = attachments::Corners {
+                top_right: *grouped_with_previous,
+                bottom_right: layout.media_above_text || *grouped_with_next,
+            };
+            let media = attachments::media_block(id, &layout, corners, this, &t, window, cx);
+            let (media_above, media_inside) = if layout.media_above_text { (media, None) } else { (None, media) };
+            let inside: Vec<AnyElement> = media_inside
+                .into_iter()
+                .chain(attachments::audio_block(id, &layout, this, &t))
+                .chain(layout.file_cards_only.then(|| attachments::file_cards(id, &layout, this, &t)))
+                .chain(attachments::file_list(id, &layout, this, &t).filter(|_| !layout.file_cards_only))
+                .collect();
+            let body = (!layout.file_cards_only && !layout.audio_only && !text.trim().is_empty())
+                .then(|| markdown_with(this, id.clone(), text, MarkdownKind::User, None, Some(content), &t, cx));
+            let bare = layout.media_only || layout.file_cards_only || layout.audio_only;
             user_row(
                 id,
                 text,
-                body,
+                UserBody { media_above, attachments: inside, body, bare },
                 actions,
                 steer.filter(|_| !*continues_steer),
                 UserRowLook {
@@ -805,6 +825,7 @@ pub(super) fn render_row(
                     text,
                     MarkdownKind::Assistant { streaming: *streaming },
                     Some(lane_width - 8.),
+                    None,
                     &t,
                     cx,
                 ));
@@ -1544,6 +1565,17 @@ fn working_duration(ms: i64) -> String {
 // ---------------------------------------------------------------------------
 // Messages
 
+/// What a user message bubble holds.
+struct UserBody {
+    /// Media sent with words, standing above the bubble as its own shape.
+    media_above: Option<AnyElement>,
+    /// Attachments inside the bubble, above the words.
+    attachments: Vec<AnyElement>,
+    body: Option<AnyElement>,
+    /// Only media, cards or a recording, each with its own shape: no surface around them.
+    bare: bool,
+}
+
 /// How a user message bubble sits among its neighbours, and how much of it shows.
 struct UserRowLook<'a> {
     grouped_with_previous: bool,
@@ -1628,7 +1660,7 @@ fn folded_message(
 fn user_row(
     id: &SharedString,
     text: &SharedString,
-    body: AnyElement,
+    contents: UserBody,
     actions: gpui_kit::Div,
     steer: Option<Steer>,
     look: UserRowLook,
@@ -1646,7 +1678,9 @@ fn user_row(
             .child(Icon::new(IconName::Redo2).size(px(12.)))
             .child("Steer")
     });
+    let UserBody { media_above, attachments, body, bare } = contents;
     if let Some(fold) = fold {
+        let body = v_flex().children(attachments).children(body).into_any_element();
         return folded_row(id, body, actions, steer_label, fold, expanded, this, t);
     }
     let guest = match attribution {
@@ -1656,20 +1690,21 @@ fn user_row(
     // `bg-guest-surface`: `color-mix(in srgb, var(--guest) 14%, var(--message-surface))`.
     let surface =
         if guest.is_some() { theme::mix_srgb(t.message_surface, rgb(GUEST).into(), 0.14) } else { t.message_surface };
-    let collapsible = should_collapse(text);
+    let collapsible = body.is_some() && should_collapse(text);
     let collapsed = collapsible && !expanded;
     let mut bubble = div()
         .relative()
+        .min_w_0()
         .max_w(relative(0.8))
-        .p(px(12.))
         .rounded(px(16.))
-        .bg(surface)
+        .when(!bare, |el| el.p(px(12.)).bg(surface))
         .text_color(t.foreground)
         .text_size(px(TEXT))
         .line_height(px(LINE))
-        .when(grouped_with_previous, |this| this.rounded_tr(px(6.)))
+        .when(grouped_with_previous || media_above.is_some(), |this| this.rounded_tr(px(6.)))
         .when(grouped_with_next, |this| this.rounded_br(px(6.)))
-        .child(div().when(collapsed, |this| this.max_h(px(176.)).overflow_hidden()).child(body));
+        .children(attachments)
+        .children(body.map(|body| div().when(collapsed, |this| this.max_h(px(176.)).overflow_hidden()).child(body)));
     if collapsed {
         bubble = bubble.child(div().absolute().left_0().right_0().bottom(px(12.)).h(px(28.)).bg(linear_gradient(
             180.,
@@ -1721,6 +1756,7 @@ fn user_row(
         .gap(px(4.))
         .children(attribution)
         .children(steer_label)
+        .children(media_above.map(|media| h_flex().max_w(relative(0.8)).justify_end().child(media)))
         .child(bubble)
         .children(toggle_button)
         .child(actions);
@@ -1831,13 +1867,14 @@ fn markdown_view(
     width: Option<f32>,
     this: &WeakEntity<Workspace>,
     (cwd, kinds): (Option<String>, Arc<super::markdown_ui::EntryKinds>),
+    content: Option<&Arc<timeline::UserContent>>,
     t: &Tokens,
 ) -> TextView {
     let streaming = matches!(kind, MarkdownKind::Assistant { streaming: true });
     let inline_code = inline_code_style(t);
     let t = *t;
     let (header_this, link_this, table_this, hover_this) = (this.clone(), this.clone(), this.clone(), this.clone());
-    let table_key = key.clone();
+    let (table_key, message_key) = (key.clone(), key.clone());
     let templates = super::markdown_ui::ArtifactTemplates {
         workspace: this.clone(),
         key: key.clone(),
@@ -1859,6 +1896,14 @@ fn markdown_view(
             })
         })
         .table_actions(move |table, _, cx| super::markdown_ui::table_actions(table, &table_this, &table_key, &t, cx))
+        // A sent message's context chips, ahead of the plugins that read other links.
+        .when_some(content, |view, content| {
+            view.plugin(super::user_message::ContextChips {
+                workspace: this.clone(),
+                content: content.clone(),
+                message: message_key,
+            })
+        })
         .plugin(super::markdown_ui::SkillChips { workspace: this.clone() })
         .plugin(super::markdown_ui::CitationChips { workspace: this.clone() })
         .plugin(super::markdown_ui::ThreadChips { workspace: this.clone() })
@@ -2230,6 +2275,7 @@ fn plan_card(
             body_text,
             MarkdownKind::Assistant { streaming: false },
             Some(lane_width - 42.),
+            None,
             t,
             cx,
         ));

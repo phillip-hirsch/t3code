@@ -383,6 +383,11 @@ impl Workspace {
     pub(super) fn attachment_image(&self, id: &str) -> Option<Arc<Image>> {
         self.markdown_images.0.lock().ok()?.get(&attachment_key(id)).cloned().flatten()
     }
+
+    /// The image attachment has loaded, is loading, or could not load.
+    pub(super) fn attachment_image_requested(&self, id: &str) -> bool {
+        self.markdown_images.0.lock().is_ok_and(|cache| cache.contains_key(&attachment_key(id)))
+    }
 }
 
 /// The bytes' format when the server named none.

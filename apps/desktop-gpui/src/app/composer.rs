@@ -1972,10 +1972,10 @@ const REVIEW_COMMENT: &str = "review-comment";
 /// `PullRequestContextMetadata`: the change request a review-comment chip names.
 #[derive(Clone, Debug, serde::Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-struct PullRequestContext {
-    number: u64,
+pub(super) struct PullRequestContext {
+    pub(super) number: u64,
     title: String,
-    url: String,
+    pub(super) url: String,
     head_branch: String,
     base_branch: String,
     state: String,
@@ -1984,7 +1984,7 @@ struct PullRequestContext {
 
 impl PullRequestContext {
     /// `resolvePullRequestState`: the glyph, the label, and the tone as light, dark and dark alpha.
-    fn state(&self) -> (Lucide, &'static str, u32, u32, f32) {
+    pub(super) fn state(&self) -> (Lucide, &'static str, u32, u32, f32) {
         match self.state.as_str() {
             "merged" => (Lucide::GitMerge, "Merged", 0x7f22fe, 0xc4b4ff, 0.9),
             "closed" => (Lucide::GitPullRequestClosed, "Closed", 0xe7000b, 0xffa2a2, 0.9),
@@ -2004,6 +2004,37 @@ impl PullRequestContext {
             "Change request"
         }
     }
+}
+
+/// `PullRequestContextDetails`: the change request's number, state, title and branches.
+pub(super) fn pull_request_details(pr: &PullRequestContext, t: &Tokens) -> gpui_kit::Div {
+    let (glyph, label, light, dark, alpha) = pr.state();
+    let tone: Hsla = if t.dark { Hsla::from(rgb(dark)).opacity(alpha) } else { rgb(light).into() };
+    let branch = |name: &str| div().min_w_0().truncate().font_family(t.fonts.mono).child(name.to_owned());
+    v_flex()
+        .max_w(px(320.))
+        .gap(px(4.))
+        .py(px(2.))
+        .overflow_hidden()
+        .child(
+            h_flex()
+                .gap(px(6.))
+                .font_weight(FontWeight::MEDIUM)
+                .child(Icon::new(glyph).with_size(px(14.)).flex_none().text_color(tone))
+                .child(div().text_color(t.foreground).child(format!("{} #{}", pr.noun(), pr.number)))
+                .child(div().text_color(tone).child(label)),
+        )
+        .child(div().text_color(t.foreground).child(pr.title.clone()))
+        .child(
+            h_flex()
+                .min_w_0()
+                .gap(px(4.))
+                .text_size(px(10.))
+                .text_color(t.muted_foreground)
+                .child(branch(&pr.head_branch))
+                .child(Icon::new(Lucide::ArrowRight).with_size(px(12.)).flex_none())
+                .child(branch(&pr.base_branch)),
+        )
 }
 
 /// The review-comment records' change requests, by the context id their chips carry.
@@ -2028,33 +2059,7 @@ impl Workspace {
         let (chip, bounds) = self.composer_ui.chip_hover.as_ref()?;
         let Some(Chip::Context { kind, id, .. }) = Chip::from_id(chip) else { return None };
         let pr = pull_requests.get(&id).filter(|_| kind == REVIEW_COMMENT)?;
-        let (glyph, label, light, dark, alpha) = pr.state();
-        let tone: Hsla = if t.dark { Hsla::from(rgb(dark)).opacity(alpha) } else { rgb(light).into() };
-        let branch = |name: &str| div().min_w_0().truncate().font_family(t.fonts.mono).child(name.to_owned());
-        let details = v_flex()
-            .max_w(px(320.))
-            .gap(px(4.))
-            .py(px(2.))
-            .overflow_hidden()
-            .child(
-                h_flex()
-                    .gap(px(6.))
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(Icon::new(glyph).with_size(px(14.)).flex_none().text_color(tone))
-                    .child(div().text_color(t.foreground).child(format!("{} #{}", pr.noun(), pr.number)))
-                    .child(div().text_color(tone).child(label)),
-            )
-            .child(div().text_color(t.foreground).child(pr.title.clone()))
-            .child(
-                h_flex()
-                    .min_w_0()
-                    .gap(px(4.))
-                    .text_size(px(10.))
-                    .text_color(t.muted_foreground)
-                    .child(branch(&pr.head_branch))
-                    .child(Icon::new(Lucide::ArrowRight).with_size(px(12.)).flex_none())
-                    .child(branch(&pr.base_branch)),
-            );
+        let details = pull_request_details(pr, t);
         // `TooltipPopup side="top"`, placed in window coordinates over the chip.
         let at = gpui_kit::point(bounds.left(), bounds.top() - px(4.));
         Some(

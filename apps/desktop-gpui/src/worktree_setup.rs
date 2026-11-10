@@ -181,6 +181,7 @@ mod tests {
             created_at: "".into(),
             revert: None,
             attribution: None,
+            content: Default::default(),
         };
         let running = snapshot("running", json!([stage("fetch", "running")]));
         let mut rows = vec![user.clone()];

@@ -25,6 +25,8 @@ pub(super) struct PendingSend {
     text: SharedString,
     created_at: SharedString,
     queued: bool,
+    /// The sent attachments and context records, which the row shows until the thread does.
+    content: std::sync::Arc<crate::timeline::UserContent>,
 }
 
 impl PendingSend {
@@ -52,7 +54,7 @@ impl PendingSend {
         }
         Row::User {
             id: format!("optimistic:{}", self.message_id).into(),
-            text: self.text.clone(),
+            text: crate::user_message::without_bootstrap_prompt(&self.text).to_owned().into(),
             steer: None,
             grouped_with_previous: false,
             grouped_with_next: false,
@@ -60,6 +62,7 @@ impl PendingSend {
             created_at: self.created_at.clone(),
             revert: None,
             attribution: None,
+            content: self.content.clone(),
         }
     }
 }
@@ -287,6 +290,7 @@ impl Workspace {
                     text: command["text"].as_str().unwrap_or_default().to_owned().into(),
                     created_at: crate::timestamp::iso(crate::timestamp::now_ms()).unwrap_or_default().into(),
                     queued: running && command.get("deliveryIntent").is_none(),
+                    content: std::sync::Arc::new(crate::timeline::UserContent::parse(&command)),
                 });
                 ("orchestration.dispatchCommand", command, None, None)
             }
@@ -590,6 +594,7 @@ mod tests {
             text: "hi".into(),
             created_at: "now".into(),
             queued,
+            content: Default::default(),
         };
         let mut pending = vec![send("t", "m1", false), send("t", "m2", true), send("other", "m3", false)];
         let empty = projection(json!([]), json!([]));

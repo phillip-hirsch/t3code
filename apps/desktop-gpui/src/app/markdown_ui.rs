@@ -799,15 +799,7 @@ impl MarkdownPlugin for FileChips {
         } else {
             Icon::empty().path(asset).text_color(icon_color)
         };
-        // `documentChipKindForFileName`: documents take their kind's ink, everything else `mention`.
-        let ink = match asset.rsplit('/').next().unwrap_or_default() {
-            "t3-file-icon-pdf.svg" => rgb(0xd55755),
-            "t3-file-icon-word.svg" => rgb(0x368bd3),
-            "t3-file-icon-spreadsheet.svg" => rgb(0x449c56),
-            "t3-file-icon-slides.svg" => rgb(0xc26e27),
-            "t3-file-icon-epub.svg" => rgb(0x8871de),
-            _ => rgb(0x0096af),
-        };
+        let ink = document_ink(asset).unwrap_or_else(|| rgb(0x0096af));
         let (path, line) = (chip.path.clone(), chip.line);
         let (open, menu) = (self.workspace.clone(), self.workspace.clone());
         let menu_path = path.clone();
@@ -844,10 +836,22 @@ impl MarkdownPlugin for FileChips {
     }
 }
 
+/// `documentChipKindForFileName`: a document's kind ink for its icon asset, `None` for others.
+pub(super) fn document_ink(asset: &str) -> Option<gpui_kit::Rgba> {
+    Some(match asset.rsplit('/').next().unwrap_or_default() {
+        "t3-file-icon-pdf.svg" => rgb(0xd55755),
+        "t3-file-icon-word.svg" => rgb(0x368bd3),
+        "t3-file-icon-spreadsheet.svg" => rgb(0x449c56),
+        "t3-file-icon-slides.svg" => rgb(0xc26e27),
+        "t3-file-icon-epub.svg" => rgb(0x8871de),
+        _ => return None,
+    })
+}
+
 impl Workspace {
     /// `handleOpenInFilePreview`: a file in the workspace, or a host file or folder outside it,
     /// opens in the thread's panel; the platform modifier, or host media, opens the preferred editor.
-    fn open_file_chip(
+    pub(super) fn open_file_chip(
         &mut self,
         path: &str,
         line: Option<u32>,
@@ -908,50 +912,62 @@ impl MarkdownPlugin for ThreadChips {
 
     fn render(&self, node: &MarkdownNode, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let Some(chip) = node.data::<ThreadChip>() else { return div().into_any_element() };
-        let Some(workspace) = self.workspace.upgrade() else { return div().into_any_element() };
-        let tokens = *crate::theme::tokens(cx);
-        let w = workspace.read(cx);
-        let message_environment = w.active_environment().cloned();
-        let thread = resolve_thread_link(&chip.link, message_environment.as_deref(), &w.shell.threads);
-        let id = SharedString::from(format!(
-            "thread-chip:{}:{}",
-            chip.link.environment_id.as_deref().unwrap_or_default(),
-            chip.link.thread_id
-        ));
-        let row = h_flex().id(id).max_w_full().gap(px(3.)).rounded(px(4.)).font_weight(FontWeight::MEDIUM);
-        let Some(thread) = thread else {
-            let unknown = crate::thread_links::unknown_label(&chip.link, message_environment.as_deref());
-            let label: SharedString = chip.label.clone().map_or_else(|| unknown.into(), Into::into);
-            return row
-                .child(Icon::new(IconName::CircleDashed).size(px(14.)).flex_none())
-                .child(div().min_w_0().truncate().child(label))
-                .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(unknown).build(window, cx))
-                .into_any_element();
-        };
-        let project =
-            w.shell.projects.iter().find(|p| p.id == thread.project_id && p.environment_id == thread.environment_id);
-        let icon = match project {
-            Some(project) => super::sidebar::project_icon(project, &tokens, false, 14., w.favicon(project)),
-            None => Icon::new(IconName::MessagesSquare).size(px(14.)).flex_none().into_any_element(),
-        };
-        let title = thread.title.trim();
-        let title: SharedString = if title.is_empty() {
-            chip.label.clone().unwrap_or_else(|| "Untitled thread".to_owned()).into()
-        } else {
-            title.to_owned().into()
-        };
-        let (environment, thread_id) = (thread.environment_id.clone(), thread.id.clone());
-        let open = self.workspace.clone();
-        row.text_color(rgb(0x009c96))
-            .cursor_pointer()
-            .child(div().flex_none().child(icon))
-            .child(div().min_w_0().truncate().hover(gpui_kit::Styled::underline).child(title))
-            .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Open thread").build(window, cx))
-            .on_click(move |_, window, cx| {
-                let _ = open.update(cx, |w, cx| w.select_thread_in(environment.clone(), thread_id.clone(), window, cx));
-            })
-            .into_any_element()
+        thread_chip(&chip.link, chip.label.clone(), &self.workspace, cx)
     }
+}
+
+/// `MarkdownThreadLink` and `ThreadContextChip`: the thread's project icon and title, which
+/// opens it; a thread not here draws dashed with why.
+pub(super) fn thread_chip(
+    link: &crate::thread_links::ThreadLink,
+    label: Option<String>,
+    workspace: &WeakEntity<Workspace>,
+    cx: &App,
+) -> AnyElement {
+    let chip = ThreadChip { link: link.clone(), label };
+    let Some(workspace) = workspace.upgrade() else { return div().into_any_element() };
+    let tokens = *crate::theme::tokens(cx);
+    let w = workspace.read(cx);
+    let message_environment = w.active_environment().cloned();
+    let thread = resolve_thread_link(&chip.link, message_environment.as_deref(), &w.shell.threads);
+    let id = SharedString::from(format!(
+        "thread-chip:{}:{}",
+        chip.link.environment_id.as_deref().unwrap_or_default(),
+        chip.link.thread_id
+    ));
+    let row = h_flex().id(id).max_w_full().gap(px(3.)).rounded(px(4.)).font_weight(FontWeight::MEDIUM);
+    let Some(thread) = thread else {
+        let unknown = crate::thread_links::unknown_label(&chip.link, message_environment.as_deref());
+        let label: SharedString = chip.label.clone().map_or_else(|| unknown.into(), Into::into);
+        return row
+            .child(Icon::new(IconName::CircleDashed).size(px(14.)).flex_none())
+            .child(div().min_w_0().truncate().child(label))
+            .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(unknown).build(window, cx))
+            .into_any_element();
+    };
+    let project =
+        w.shell.projects.iter().find(|p| p.id == thread.project_id && p.environment_id == thread.environment_id);
+    let icon = match project {
+        Some(project) => super::sidebar::project_icon(project, &tokens, false, 14., w.favicon(project)),
+        None => Icon::new(IconName::MessagesSquare).size(px(14.)).flex_none().into_any_element(),
+    };
+    let title = thread.title.trim();
+    let title: SharedString = if title.is_empty() {
+        chip.label.clone().unwrap_or_else(|| "Untitled thread".to_owned()).into()
+    } else {
+        title.to_owned().into()
+    };
+    let (environment, thread_id) = (thread.environment_id.clone(), thread.id.clone());
+    let open = workspace.downgrade();
+    row.text_color(rgb(0x009c96))
+        .cursor_pointer()
+        .child(div().flex_none().child(icon))
+        .child(div().min_w_0().truncate().hover(gpui_kit::Styled::underline).child(title))
+        .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Open thread").build(window, cx))
+        .on_click(move |_, window, cx| {
+            let _ = open.update(cx, |w, cx| w.select_thread_in(environment.clone(), thread_id.clone(), window, cx));
+        })
+        .into_any_element()
 }
 
 /// Where a chat link to a thread opens: the thread's environment and id, as [`ThreadChips`]

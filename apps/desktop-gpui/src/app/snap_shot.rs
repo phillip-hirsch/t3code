@@ -385,6 +385,18 @@ impl SnapShotSource {
         }
     }
 
+    /// A sent capture's source, its app icon read from the `data:image/png;base64,` URL.
+    pub(super) fn from_value(value: Value) -> Self {
+        use base64::Engine as _;
+        let icon = value["appIconDataUrl"]
+            .as_str()
+            .and_then(|url| {
+                url.get(..22).filter(|head| head.eq_ignore_ascii_case("data:image/png;base64,")).map(|_| &url[22..])
+            })
+            .and_then(|data| base64::engine::general_purpose::STANDARD.decode(data).ok());
+        Self::new(value, icon)
+    }
+
     /// `SnapShotAttachmentDetails`: the app and window along the tile's bottom edge.
     pub(super) fn render_details(&self, id: &str, t: &Tokens) -> AnyElement {
         let white = gpui_kit::white();

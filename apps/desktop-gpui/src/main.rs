@@ -59,6 +59,7 @@ mod timeline;
 mod timestamp;
 mod turn_diff_tree;
 mod usage;
+mod user_message;
 mod vscode_theme;
 mod work_log;
 mod workflow;

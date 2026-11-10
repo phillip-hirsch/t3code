@@ -89,6 +89,7 @@ mod thread_menu;
 mod thread_menu_actions;
 mod thread_now;
 mod titlebar;
+mod user_message;
 mod visits;
 mod workflow;
 mod workspace_lookup;
