@@ -97,6 +97,8 @@ pub(super) struct PreviewState {
     wrap: Option<bool>,
     applied_wrap: Option<bool>,
     mutation: Option<(Option<String>, Option<String>)>,
+    /// The socket a workspace read was last sent on.
+    read_on: Option<crate::rpc::SocketId>,
     revealed: Option<u64>,
     /// The open request the rendered view was picked over (`handledReveal`).
     rendered_reveal: Option<u64>,
@@ -126,6 +128,7 @@ impl PreviewState {
             wrap: None,
             applied_wrap: None,
             mutation: None,
+            read_on: None,
             revealed: None,
             rendered_reveal: None,
             marks: Default::default(),
@@ -135,6 +138,14 @@ impl PreviewState {
             _save: None,
             _subscription: None,
         }
+    }
+
+    /// Whether to read the file on `socket`: no read landed and none runs, and a failure stands
+    /// until a new socket, so a file opened offline reads once its environment reconnects.
+    fn needs_read(&self, socket: &crate::rpc::SocketId) -> bool {
+        matches!(self.load, Load::Loading | Load::Failed { .. })
+            && self._read.is_none()
+            && self.read_on.as_ref() != Some(socket)
     }
 }
 
@@ -266,6 +277,7 @@ impl Workspace {
     /// applies the wrap toggle and a pending line reveal.
     pub(super) fn sync_preview(&mut self, key: &FileKey, window: &mut Window, cx: &mut Context<Self>) {
         let mutation = self.key_mutation(key);
+        let socket = key.in_workspace().then(|| self.env_client(&key.checkout.env)).flatten().map(|c| c.socket_id());
         let wrap_default = self.client_settings.values.bool("wordWrap");
         let reveal = self.files.reveals.get(key).copied();
         let state = self.files.previews.entry(key.clone()).or_insert_with(|| PreviewState::new(&key.path));
@@ -286,7 +298,7 @@ impl Workspace {
             }
         } else if state.kind.is_asset() {
             state.load = Load::Asset;
-        } else if fresh || (changed && !dirty) {
+        } else if fresh || (changed && !dirty) || socket.is_some_and(|socket| state.needs_read(&socket)) {
             self.read_file(key.clone(), window, cx);
         }
         let draft = !matches!(self.target, Some(Target::Thread { .. }));
@@ -355,6 +367,7 @@ impl Workspace {
         let Some(client) = self.env_client(&key.checkout.env) else { return };
         let Some(state) = self.files.previews.get_mut(&key) else { return };
         let revision = state.save.revision();
+        state.read_on = Some(client.socket_id());
         let payload = json!({"cwd": key.checkout.cwd, "relativePath": key.path});
         let request_key = key.clone();
         state._read = Some(cx.spawn_in(window, async move |this, cx| {
@@ -1610,7 +1623,23 @@ async fn fetch_asset(
 
 #[cfg(test)]
 mod tests {
-    use super::reveal_handled;
+    use super::{Load, PreviewState, reveal_handled};
+
+    #[test]
+    fn a_text_read_runs_again_on_a_new_socket_until_it_lands() {
+        let (first, second) = (crate::rpc::RpcClient::unopened(), crate::rpc::RpcClient::unopened());
+        let mut state = PreviewState::new("src/main.rs");
+        assert!(state.needs_read(&first.socket_id()), "opened offline: nothing read yet");
+        state.read_on = Some(first.socket_id());
+        state._read = Some(gpui_kit::Task::ready(()));
+        assert!(!state.needs_read(&first.socket_id()), "a read is running");
+        state._read = None;
+        state.load = Load::Failed { message: "closed".into(), attempted: None, cwd: None };
+        assert!(!state.needs_read(&first.socket_id()), "the failure stands on that socket");
+        assert!(state.needs_read(&second.socket_id()), "a reconnect reads again");
+        state.load = Load::Text { truncated: false, byte_length: 0 };
+        assert!(!state.needs_read(&second.socket_id()), "read");
+    }
 
     #[test]
     fn a_line_reveal_holds_the_source_until_the_rendered_view_is_picked() {
