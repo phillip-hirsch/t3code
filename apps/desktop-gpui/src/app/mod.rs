@@ -401,6 +401,7 @@ impl Workspace {
                     window.refresh();
                 }
             }),
+            cx.on_focus_lost(window, Self::recover_request_focus),
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
                     this.clear_system_alerts(window, cx);

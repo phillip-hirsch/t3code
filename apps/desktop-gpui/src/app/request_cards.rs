@@ -12,8 +12,9 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, FontWeight, IntoElement, ParentElement as _, Render,
-    SharedString, Styled as _, Subscription, WeakEntity, Window, div, prelude::FluentBuilder as _, px,
+    AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable as _, FontWeight, IntoElement,
+    ParentElement as _, Render, SharedString, Styled as _, Subscription, WeakEntity, Window, div,
+    prelude::FluentBuilder as _, px,
 };
 use serde_json::{Value, json};
 
@@ -39,6 +40,10 @@ pub(super) struct RequestUi {
     references: HashMap<SharedString, (Entity<InputState>, Subscription)>,
     busy: HashSet<SharedString>,
     errors: HashMap<SharedString, SharedString>,
+    /// The timeline card whose input has focus, and that input's focus.
+    focused: Option<(SharedString, FocusHandle)>,
+    /// A focused input whose card went away; focus it held returns to the composer.
+    lost: Option<FocusHandle>,
 }
 
 /// A configured secret provider a pending card can read its answer from (`SecretRequestSource`).
@@ -295,6 +300,34 @@ impl Workspace {
         ui.references.retain(|id, _| shown(id));
         ui.sources.retain(|id, _| shown(id));
         ui.errors.retain(|id, _| shown(id));
+        if ui.focused.as_ref().is_some_and(|(id, _)| !shown(id)) {
+            ui.lost = ui.focused.take().map(|(_, focus)| focus);
+        }
+    }
+
+    /// `workspaceFocus` recovery: focus that dropped with an answered or ended timeline card,
+    /// whoever answered it, goes on to the composer.
+    pub(super) fn recover_request_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.requests.lost.take().is_some_and(|focus| focus.is_focused(window)) {
+            self.focus_composer(window, cx);
+        }
+    }
+
+    /// Tracks which timeline card's input has focus; a side-chat card keeps its own.
+    fn request_input_focus(&mut self, card: &RequestCard, input: &Entity<InputState>, event: &InputEvent, cx: &App) {
+        match event {
+            InputEvent::Focus if self.in_timeline(card) => {
+                self.requests.focused = Some((card.item_id.clone(), input.read(cx).focus_handle(cx)));
+            }
+            InputEvent::Blur if self.requests.focused.as_ref().is_some_and(|(id, _)| *id == card.item_id) => {
+                self.requests.focused = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn in_timeline(&self, card: &RequestCard) -> bool {
+        self.rows.iter().any(|row| matches!(row, timeline::Row::Request(shown) if shown.item_id == card.item_id))
     }
 
     fn secret_input(&mut self, card: &RequestCard, window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
@@ -309,10 +342,10 @@ impl Workspace {
         let id = card.item_id.clone();
         let card = card.clone();
         let subscription =
-            cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, window, cx| match event {
+            cx.subscribe_in(&input, window, move |this, input, event: &InputEvent, window, cx| match event {
                 InputEvent::PressEnter { .. } => this.answer_secret(&card, true, window, cx),
                 InputEvent::Change => cx.notify(),
-                _ => {}
+                _ => this.request_input_focus(&card, input, event, cx),
             });
         self.requests.secrets.insert(id, (input.clone(), subscription));
         input
@@ -340,13 +373,13 @@ impl Workspace {
         let id = card.item_id.clone();
         let card = card.clone();
         let subscription =
-            cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, window, cx| match event {
+            cx.subscribe_in(&input, window, move |this, input, event: &InputEvent, window, cx| match event {
                 InputEvent::PressEnter { .. } => this.answer_secret(&card, true, window, cx),
                 InputEvent::Change => {
                     this.requests.errors.remove(&card.item_id);
                     cx.notify();
                 }
-                _ => {}
+                _ => this.request_input_focus(&card, input, event, cx),
             });
         self.requests.references.insert(id, (input.clone(), subscription));
         input
@@ -364,9 +397,7 @@ impl Workspace {
     /// A timeline card's controls disable once it is answered, so focus goes on to the composer
     /// (`workspaceFocus` recovering a finished conversation prompt). A side-chat card keeps its own.
     fn leave_answered_card(&mut self, card: &RequestCard, window: &mut Window, cx: &mut Context<Self>) {
-        let in_timeline =
-            self.rows.iter().any(|row| matches!(row, timeline::Row::Request(shown) if shown.item_id == card.item_id));
-        if in_timeline {
+        if self.in_timeline(card) {
             self.focus_composer(window, cx);
         }
     }
