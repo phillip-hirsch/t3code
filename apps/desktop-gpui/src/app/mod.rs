@@ -82,6 +82,7 @@ mod side_chat;
 mod sidebar;
 mod sidebar_sheet;
 mod snap_shot;
+mod source_control;
 mod subagents;
 mod terminal;
 mod theme_editor;

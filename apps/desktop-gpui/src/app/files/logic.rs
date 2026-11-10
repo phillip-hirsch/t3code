@@ -544,7 +544,7 @@ pub(super) fn is_host_path(path: &str) -> bool {
 }
 
 /// `resolvePathLinkTarget` for a workspace path: joined onto `cwd` with its separator.
-pub(super) fn absolute_path(cwd: &str, path: &str) -> String {
+pub(in crate::app) fn absolute_path(cwd: &str, path: &str) -> String {
     if is_host_path(path) {
         return path.to_owned();
     }
