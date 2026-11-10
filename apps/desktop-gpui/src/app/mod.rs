@@ -1301,18 +1301,15 @@ impl Workspace {
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
-        if !self.target_can_operate() {
-            return;
-        }
+        let Some((client, _, thread_id)) = self.pane_client(side_chat::ChatPane::Main, cx) else { return };
         let Some(projection) = self.thread.as_ref().and_then(|t| t.state.projection.as_ref()) else { return };
-        let thread_id = projection.thread.id.clone();
         let command = if self.server_info().capability("threadStop") {
             json!({"type": "thread.stop", "commandId": new_id(), "threadId": thread_id})
         } else {
             let Some(run) = projection.interruptible_run() else { return };
             json!({"type": "run.interrupt", "commandId": new_id(), "threadId": thread_id, "runId": run.id, "holdQueue": true})
         };
-        self.dispatch(command, cx);
+        self.dispatch_on(client, vec![command], cx);
     }
 
     /// `runtime-request.respond` for the open thread; `response` holds `decision`, `feedback` or `answers`.
@@ -1350,6 +1347,12 @@ impl Workspace {
     /// Dispatches dependent commands one after another, stopping at the first failure.
     fn dispatch_in_order(&mut self, commands: Vec<Value>, cx: &mut Context<Self>) {
         let Some(client) = commands.first().and_then(|command| self.command_client(command)) else { return };
+        self.dispatch_on(client, commands, cx);
+    }
+
+    /// [`Self::dispatch_in_order`] on `client`, the socket of the environment the commands' thread
+    /// lives on, for callers that know it: a bare thread id can name a thread on two environments.
+    fn dispatch_on(&mut self, client: RpcClient, commands: Vec<Value>, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             for command in commands {
                 if let Err(error) = client.request("orchestration.dispatchCommand", command).await {

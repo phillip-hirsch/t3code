@@ -1039,9 +1039,9 @@ impl Workspace {
     }
 
     fn dismiss_question(&mut self, pane: ChatPane, request_id: String, cx: &mut Context<Self>) {
-        let Some((_, _, thread_id)) = self.pane_client(pane, cx) else { return };
+        let Some((client, _, thread_id)) = self.pane_client(pane, cx) else { return };
         let command = json!({"type": "thread.user-input.dismiss", "commandId": new_id(), "threadId": thread_id, "requestId": request_id});
-        self.dispatch(command, cx);
+        self.dispatch_on(client, vec![command], cx);
     }
 
     /// Sending while an approval waits declines it: with the text as its
@@ -1085,9 +1085,11 @@ impl Workspace {
 
     pub(super) fn set_runtime_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
         match &self.target {
-            Some(Target::Thread { id: thread_id, .. }) => {
+            Some(Target::Thread { env, id: thread_id }) => {
                 let command = json!({"type": "thread.runtime-mode.set", "commandId": new_id(), "threadId": thread_id, "runtimeMode": mode});
-                self.dispatch(command, cx);
+                if let Some(client) = self.env_client(env) {
+                    self.dispatch_on(client, vec![command], cx);
+                }
             }
             _ => self.runtime_mode_override = Some(mode.to_owned()),
         }

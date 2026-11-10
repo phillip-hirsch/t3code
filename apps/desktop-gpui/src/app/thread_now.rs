@@ -316,10 +316,10 @@ impl Workspace {
 
     /// `useAcknowledgeThreadWoke`: marks the thread visited at the time it woke.
     fn acknowledge_pane_woke(&mut self, pane: ChatPane, woke_at: SharedString, cx: &mut Context<Self>) {
-        let Some((_, _, thread_id)) = self.pane_client(pane, cx) else { return };
+        let Some((client, _, thread_id)) = self.pane_client(pane, cx) else { return };
         let command =
             json!({"type": "thread.visit", "commandId": new_id(), "threadId": thread_id, "visitedAt": woke_at});
-        self.dispatch(command, cx);
+        self.dispatch_on(client, vec![command], cx);
     }
 }
 

@@ -26,7 +26,7 @@ use super::attachments::QuestionDraft;
 use super::right_panel::Surface;
 use super::titlebar::icon;
 use super::{Target, Workspace, new_id};
-use crate::model::{ModelSelection, Run, ThreadProjection, ThreadShell, ThreadState};
+use crate::model::{ModelSelection, Run, ScopedId, ThreadProjection, ThreadShell, ThreadState};
 use crate::rpc::RpcClient;
 use crate::theme::{self, Tokens};
 use crate::timeline::{self, Row};
@@ -221,11 +221,16 @@ impl Workspace {
         self.shell.threads.iter().find(|t| t.id == thread_id)
     }
 
+    /// A side chat or its parent: on the open thread's environment, as thread ids repeat across them.
+    fn side_shell(&self, thread_id: &str) -> Option<&ThreadShell> {
+        self.shell.thread(&ScopedId::new(self.active_environment()?.clone(), thread_id))
+    }
+
     /// The open thread as a side chat source, if any.
     fn side_chat_origin(&self) -> Option<Origin> {
         Some(match self.target.as_ref()? {
             Target::Draft { .. } => Origin::Draft,
-            Target::Thread { id, .. } => self.shell_thread(id).map_or(Origin::Thread, shell_origin),
+            Target::Thread { id, .. } => self.side_shell(id).map_or(Origin::Thread, shell_origin),
         })
     }
 
@@ -248,7 +253,7 @@ impl Workspace {
         let capability = self.client().map(|_| self.server_info().capability("sideChats"));
         let pending = match &self.target {
             Some(Target::Thread { id, .. }) => worktree_pending(
-                self.shell_thread(id).and_then(|t| t.worktree_path.as_deref()),
+                self.side_shell(id).and_then(|t| t.worktree_path.as_deref()),
                 self.open_projection().map_or(&[], |p| p.runs.as_slice()),
             ),
             _ => false,
@@ -371,7 +376,7 @@ impl Workspace {
 
     /// A side chat's tab: its shell title, and the dot for a run or a request.
     pub(super) fn side_chat_tab(&self, thread_id: &str) -> (SharedString, Option<&'static str>) {
-        let Some(shell) = self.shell_thread(thread_id) else { return ("Side chat".into(), None) };
+        let Some(shell) = self.side_shell(thread_id) else { return ("Side chat".into(), None) };
         let requests = crate::inbox::child_requests(&self.shell.threads);
         let state = tab_state(shell, crate::inbox::Facts::new(shell, &requests));
         (shell.title.clone().into(), state)
@@ -379,11 +384,12 @@ impl Workspace {
 
     /// `releaseSurfaceResources` for a side chat: the server keeps one that ran or got a message.
     pub(super) fn release_side_chat(&mut self, thread_id: &str, cx: &mut Context<Self>) {
-        if let Some(env) = self.active_environment() {
-            self.side_chat.models.remove(&(env.clone(), thread_id.to_owned()));
-        }
-        if self.shell_thread(thread_id).is_some() {
-            self.dispatch(delete_command(thread_id, true), cx);
+        let Some(env) = self.active_environment().cloned() else { return };
+        self.side_chat.models.remove(&(env.clone(), thread_id.to_owned()));
+        if self.side_shell(thread_id).is_some()
+            && let Some(client) = self.env_client(&env)
+        {
+            self.dispatch_on(client, vec![delete_command(thread_id, true)], cx);
         }
     }
 
@@ -571,18 +577,15 @@ impl Workspace {
     }
 
     fn stop_side_chat(&mut self, cx: &mut Context<Self>) {
-        if self.pane_client(ChatPane::Side, cx).is_none() {
-            return;
-        }
+        let Some((client, _, thread_id)) = self.pane_client(ChatPane::Side, cx) else { return };
         let Some(projection) = self.side_chat_projection() else { return };
-        let thread_id = projection.thread.id.clone();
         let command = if self.server_info().capability("threadStop") {
             json!({"type": "thread.stop", "commandId": new_id(), "threadId": thread_id})
         } else {
             let Some(run) = projection.interruptible_run() else { return };
             json!({"type": "run.interrupt", "commandId": new_id(), "threadId": thread_id, "runId": run.id, "holdQueue": true})
         };
-        self.dispatch(command, cx);
+        self.dispatch_on(client, vec![command], cx);
     }
 
     /// Why Bring back is unavailable (`bringBackBlockedReason`), else the run it merges.
@@ -590,7 +593,7 @@ impl Workspace {
         if !self.side_chat_operable() {
             return Err(NOT_OPERATE);
         }
-        let parent_active = self.shell_thread(parent_id).is_some_and(|shell| {
+        let parent_active = self.side_shell(parent_id).is_some_and(|shell| {
             let requests = crate::inbox::child_requests(&self.shell.threads);
             crate::inbox::Facts::new(shell, &requests).runtime_status().is_some_and(crate::model::is_active_run_status)
         });
@@ -636,7 +639,7 @@ impl Workspace {
     }
 
     fn delete_side_chat(&mut self, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(title) = self.shell_thread(&thread_id).map(|t| t.title.clone()) else { return };
+        let Some(title) = self.side_shell(&thread_id).map(|t| t.title.clone()) else { return };
         if self.side_chat.deleting || !self.side_chat_operable() {
             return;
         }
@@ -693,7 +696,7 @@ This permanently clears its conversation history."
     ) -> AnyElement {
         let t = *theme::tokens(cx);
         let Some(Target::Thread { id: parent_id, .. }) = self.target.clone() else { return div().into_any_element() };
-        let shell = self.shell_thread(thread_id);
+        let shell = self.side_shell(thread_id);
         let title: SharedString = shell.map_or_else(|| "Side chat".into(), |s| s.title.clone().into());
         let blocked = self.bring_back_blocked(&parent_id);
         let tooltip: SharedString =
