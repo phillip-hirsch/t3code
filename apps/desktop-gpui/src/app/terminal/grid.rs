@@ -139,6 +139,8 @@ pub(super) struct Batched {
     pub runs: Vec<Run>,
     pub backgrounds: Vec<Span>,
     pub selection: Vec<Span>,
+    /// Overlined cells, spaces included, in their text color: text runs cannot draw an overline.
+    pub overlines: Vec<Span>,
 }
 
 fn push_span(spans: &mut Vec<Span>, row: usize, column: usize, color: Hsla) {
@@ -168,6 +170,12 @@ pub(super) fn batch(snapshot: &Snapshot, theme: &TerminalTheme) -> Batched {
             }
             if matches!(cell.wide, Width::SpacerTail | Width::SpacerHead) {
                 continue;
+            }
+            if cell.overline {
+                push_span(&mut out.overlines, row, column, hsla(cell.fg));
+                if cell.wide == Width::Wide {
+                    push_span(&mut out.overlines, row, column + 1, hsla(cell.fg));
+                }
             }
             let style = RunStyle::new(cell);
             let blank = is_blank(cell);
@@ -340,6 +348,8 @@ pub(super) struct GridPrepaint {
     backgrounds: Vec<Bounds<Pixels>>,
     background_colors: Vec<Hsla>,
     lines: Vec<(Point<Pixels>, ShapedLine)>,
+    /// `renderGhosttySnapshot`'s overlines: 1px, a pixel below each cell's top.
+    overlines: Vec<(Bounds<Pixels>, Hsla)>,
     cursor: Option<Cursor>,
     link_hovered: bool,
     link_underlines: Vec<Bounds<Pixels>>,
@@ -441,6 +451,14 @@ impl Element for TerminalGrid {
             .iter()
             .map(|run| (cell_origin(run.row, run.column), shape(run.text.clone(), &run.style)))
             .collect();
+        let overlines = batched
+            .overlines
+            .iter()
+            .map(|span| {
+                let at = cell_origin(span.row, span.column) + point(px(0.), px(1.));
+                (Bounds::new(at, size(cell_width * span.len as f32, px(1.))), span.color)
+            })
+            .collect();
         let cursor = frame.cursor.filter(|_| self.cursor_on).map(|cursor| {
             let at = cell_origin(cursor.at.y, cursor.at.x);
             let width = if cursor.wide { cell_width * 2. } else { cell_width };
@@ -477,6 +495,7 @@ impl Element for TerminalGrid {
             backgrounds,
             background_colors,
             lines,
+            overlines,
             cursor,
             link_hovered: link.is_some(),
             link_underlines,
@@ -504,6 +523,9 @@ impl Element for TerminalGrid {
             }
             for (origin, line) in &prepaint.lines {
                 let _ = line.paint(*origin, line_height, TextAlign::Left, None, window, cx);
+            }
+            for (bounds, color) in &prepaint.overlines {
+                window.paint_quad(fill(*bounds, *color));
             }
             for bounds in &prepaint.link_underlines {
                 window.paint_quad(fill(*bounds, self.theme.foreground));
@@ -582,6 +604,16 @@ mod tests {
         assert_eq!(runs, [(0, 0, "ls"), (0, 3, "red"), (0, 8, "done")]);
         assert_eq!(to_rgb(batched.runs[1].style.color), to_rgb(theme().palette[1]));
         assert!(batched.backgrounds.is_empty());
+    }
+
+    #[test]
+    fn overlines_span_their_cells_including_spaces() {
+        let theme = theme();
+        let batched = batch(&snapshot("\x1b[53ma b\x1b[31m c\x1b[0m d \x1b[53m\u{4e2d}"), &theme);
+        let spans: Vec<_> = batched.overlines.iter().map(|span| (span.column, span.len, to_rgb(span.color))).collect();
+        // "a b" in the text color, " c" in red, then the wide glyph's two cells.
+        let (fg, red) = (to_rgb(theme.foreground), to_rgb(theme.palette[1]));
+        assert_eq!(spans, [(0, 3, fg), (3, 2, red), (8, 2, fg)]);
     }
 
     #[test]
