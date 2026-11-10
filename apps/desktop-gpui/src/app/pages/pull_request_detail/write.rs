@@ -321,6 +321,12 @@ impl Workspace {
         done: impl FnOnce(&mut Workspace, &str, bool, &mut Window, &mut Context<Workspace>) + 'static,
     ) {
         let (Some(client), Some(key)) = (self.pull_request_client(), self.shown_pr_key()) else { return };
+        // The write grant can be lost while an editor or form stays open (`permissionAtom`).
+        if !self.pr_panel_writable(&key) {
+            done(self, &key, false, window, cx);
+            cx.notify();
+            return;
+        }
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request(method, input).await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -1350,6 +1356,7 @@ impl Workspace {
 
     /// `PullRequestMarkdownEditor`: Write and Preview, then Cancel and Save.
     pub(super) fn render_pr_editor(&mut self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let writable = self.shown_pr_key().is_some_and(|key| self.pr_panel_writable(&key));
         let editing = self.pull_requests.panel.as_ref()?.write.editing.as_ref()?;
         let (input, preview, description, saving) = (
             editing.input.clone(),
@@ -1416,7 +1423,7 @@ impl Workspace {
                         ))
                         .child(
                             xs_outline("pr-editor-save", t)
-                                .disabled(saving || (empty && !description))
+                                .disabled(saving || !writable || (empty && !description))
                                 .child(if saving { "Saving..." } else { "Save" })
                                 .on_click(cx.listener(|this, _, window, cx| this.save_pr_edit(window, cx))),
                         ),
@@ -1487,7 +1494,9 @@ impl Workspace {
 
     /// The title being renamed, with Cancel and Save under it; Escape cancels.
     pub(super) fn render_pr_title_input(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let write = &self.pull_requests.panel.as_ref()?.write;
+        let panel = self.pull_requests.panel.as_ref()?;
+        let writable = self.pr_panel_writable(&panel.reference.key());
+        let write = &panel.write;
         let input = write.title.as_ref()?;
         let saving = write.saving;
         let empty = input.read(cx).value().trim().is_empty();
@@ -1515,7 +1524,7 @@ impl Workspace {
                         )
                         .child(
                             xs_outline("pr-title-save", t)
-                                .disabled(saving || empty)
+                                .disabled(saving || !writable || empty)
                                 .child(if saving { "Saving..." } else { "Save" })
                                 .on_click(cx.listener(|this, _, window, cx| this.save_pr_title(window, cx))),
                         ),

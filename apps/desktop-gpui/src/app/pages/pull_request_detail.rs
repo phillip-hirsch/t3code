@@ -415,7 +415,7 @@ impl Workspace {
     }
 
     /// The pull request `key` names may be acted on.
-    fn pr_panel_writable(&self, key: &str) -> bool {
+    pub(super) fn pr_panel_writable(&self, key: &str) -> bool {
         self.pr_panel_ref(key).is_some_and(|p| self.pr_write_grant(&p.reference) == Some(true))
     }
 
