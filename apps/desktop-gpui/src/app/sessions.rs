@@ -270,6 +270,8 @@ impl Workspace {
                 }
             },
             move |this, window, cx| {
+                // Whether it answers checks may have changed.
+                this.publish_pull_request_routing(cx);
                 if primary {
                     this.sync_keymap(cx);
                     this.show_reload_toast(window, cx);
@@ -444,6 +446,8 @@ impl Workspace {
             self.retract_hidden_alerts(window, cx);
             self.notify_sidebar(cx);
         }
+        // Connections and grants both change here.
+        self.publish_pull_request_routing(cx);
         cx.notify();
     }
 
@@ -459,10 +463,11 @@ impl Workspace {
         }
         self.saved_environments.update(cx, |saved, cx| saved.set_primary(&environment_id, cx));
         self.sessions[PRIMARY].id = Some(environment_id);
+        self.publish_pull_request_routing(cx);
     }
 
     /// The primary session's socket opened or closed.
-    pub(super) fn set_primary_connection(&mut self, client: Option<RpcClient>, endpoint: Option<Endpoint>) {
+    pub(super) fn set_primary_connection(&mut self, client: Option<RpcClient>, endpoint: Option<Endpoint>, cx: &App) {
         let session = &mut self.sessions[PRIMARY];
         match client {
             Some(client) => {
@@ -471,6 +476,7 @@ impl Workspace {
             }
             None => session.disconnect(),
         }
+        self.publish_pull_request_routing(cx);
     }
 
     /// Each connected environment's "No project" workspace, for project grouping.

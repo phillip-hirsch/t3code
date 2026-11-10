@@ -10,6 +10,7 @@ use futures::channel::oneshot;
 use gpui_kit::{Context, Subscription, Task};
 
 use crate::environments::{self, Catalog, ConnectionState, Credential, Failure, Phase, SavedEnvironment};
+use crate::pull_request_routing as routing;
 use crate::rpc::{self, ConnectOptions, RpcClient};
 use crate::runtime;
 
@@ -326,7 +327,26 @@ impl SavedEnvironments {
     /// Forgets the pairing and credential here; the session on that machine stays until revoked there.
     pub fn remove(&mut self, environment_id: &str, cx: &mut Context<Self>) -> Saving {
         self.edit(cx, |catalog| {
-            catalog.environments.retain(|environment| environment.environment_id != environment_id);
+            catalog.remove(environment_id);
+            Ok(())
+        })
+    }
+
+    /// This device's pull request routing grants; empty until the catalog is read.
+    pub fn pull_request_routing(&self) -> &[routing::Stored] {
+        self.catalog.as_ref().map_or(&[], |catalog| &catalog.pull_request_routing)
+    }
+
+    /// `setPullRequestRoutingPermission`: trusts the machine at `connection_key`, or stops.
+    pub fn set_pull_request_routing(
+        &mut self,
+        environment_id: &str,
+        connection_key: String,
+        permission: routing::Permission,
+        cx: &mut Context<Self>,
+    ) -> Saving {
+        self.edit(cx, |catalog| {
+            routing::set(&mut catalog.pull_request_routing, environment_id, connection_key, permission);
             Ok(())
         })
     }

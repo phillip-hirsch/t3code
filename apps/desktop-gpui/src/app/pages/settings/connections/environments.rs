@@ -1,8 +1,7 @@
 //! Environments (`ConnectionsSettings view="environments"`): this app's local
 //! environment switch and saved remote environments (`saved.rs`), then each connected
-//! host's linked environments (`LinkedEnvironmentsSettings.tsx`). Load
-//! balancing and pull request sharing route work across environments, which this
-//! client does not do yet, so it never shows them.
+//! host's linked environments (`LinkedEnvironmentsSettings.tsx`), then load balancing and
+//! pull request sharing, which route work across them.
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::Button;
@@ -105,6 +104,7 @@ impl Workspace {
             sections.push(self.linked_environments(&state, client, section_id, title, cx, &t));
         }
         sections.extend(self.load_balancing_section(cx));
+        sections.extend(self.pull_request_routing_section(cx));
         self.settings_page("connections", view, sections, cx)
     }
 

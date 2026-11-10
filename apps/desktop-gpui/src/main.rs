@@ -34,6 +34,7 @@ mod pull_request_detail;
 mod pull_request_diff;
 mod pull_request_reply;
 mod pull_request_reviewers;
+mod pull_request_routing;
 mod pull_requests;
 mod queue;
 mod quit_shortcut;

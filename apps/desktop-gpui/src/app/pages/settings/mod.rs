@@ -260,6 +260,8 @@ pub(in crate::app) struct SettingsUi {
     open_marker: Option<SharedString>,
     /// Open "Advanced" folds, by section id.
     advanced_open: HashSet<&'static str>,
+    /// A pull request routing grant is being saved; the pickers wait for it.
+    pull_request_routing_saving: bool,
     /// The Typography rows' family pickers, by setting key.
     font_pickers: HashMap<&'static str, typography::FontPicker>,
     project_picker: Option<widgets::ScopeProjectPicker>,
@@ -327,6 +329,7 @@ impl SettingsUi {
             sliders: HashMap::new(),
             open_marker: None,
             advanced_open: HashSet::new(),
+            pull_request_routing_saving: false,
             font_pickers: HashMap::new(),
             star_prompt_shown: false,
             project_picker: None,

@@ -684,7 +684,7 @@ impl Workspace {
             return;
         }
         if !matches!(connection, Connection::Connected) {
-            self.set_primary_connection(None, None);
+            self.set_primary_connection(None, None, cx);
             if self.target_on_primary() {
                 self.end_target_streams();
             }
@@ -703,7 +703,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.connection = Connection::Connected;
-        self.set_primary_connection(Some(client), Some(endpoint));
+        self.set_primary_connection(Some(client), Some(endpoint), cx);
         // Read per connection: the files may have changed, or never loaded while down.
         self.t3_project_files.clear();
         // A page opened while the socket was down reads now.

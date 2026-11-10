@@ -16,6 +16,7 @@ mod environments;
 mod exposure;
 mod load_balancing;
 pub(super) mod logic;
+mod pull_request_routing;
 mod saved;
 mod secrets;
 pub(super) mod ui;
