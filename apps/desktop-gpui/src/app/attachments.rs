@@ -872,7 +872,7 @@ impl Workspace {
         let parked = match &origin.question {
             None => self.left_draft_mut(&origin.draft).map(|(prompt, kept, _)| Parked::Prompt(prompt, kept)),
             Some(_) if here => self.question.as_mut().and_then(|question| question.parked(origin.question.as_ref())),
-            Some(_) => match self.composer_drafts.get_mut(target) {
+            Some(_) => match self.composer_drafts.get_mut(target).map(ComposerDraft::editor_mut) {
                 Some(ComposerDraft::Question(question)) => question.parked(origin.question.as_ref()),
                 _ => None,
             },
@@ -918,9 +918,9 @@ impl Workspace {
         let attachments = if self.target.as_ref() == Some(target) {
             &mut self.attachments
         } else {
-            match self.composer_drafts.entry(target.clone()).or_insert_with(ComposerDraft::empty) {
+            match self.composer_drafts.entry(target.clone()).or_insert_with(ComposerDraft::empty).editor_mut() {
                 ComposerDraft::Prompt(_, kept, _) => kept,
-                ComposerDraft::Question(_) => return false,
+                ComposerDraft::Question(_) | ComposerDraft::QueueEdit(..) => return false,
             }
         };
         if attachments.len() >= MAX_ATTACHMENTS || attachments.iter().any(|a| a.local_id == local_id) {
@@ -1513,9 +1513,17 @@ It is referenced in your text; removing it also removes every reference."
         let mut edited_over = vec![attachment("set-aside-by-queued-edit")];
         let mut asked = card();
         asked.attachments.insert("a".into(), vec![attachment("stashed-answer")]);
+        let edited_in = Target::Thread { env: "e".into(), id: "t3".into() };
+        let edit = super::super::queue::QueueEdit::test(
+            "edit",
+            "e",
+            ("own".into(), vec![attachment("left-own")], Default::default()),
+        );
+        let left_mid_edit = ComposerDraft::Prompt("edited".into(), vec![attachment("left-edit")], Default::default());
         let mut drafts = HashMap::from([
             (stashed_in.clone(), ComposerDraft::Prompt("hi".into(), vec![attachment("stashed")], Default::default())),
             (asked_in.clone(), ComposerDraft::Question(asked)),
+            (edited_in.clone(), ComposerDraft::QueueEdit(Box::new(edit), Box::new(left_mid_edit))),
         ]);
         macro_rules! lists {
             () => {
@@ -1536,6 +1544,8 @@ It is referenced in your text; removing it also removes every reference."
             ("other-question", None),
             ("set-aside-by-queued-edit", None),
             ("stashed-answer", Some(&asked_in)),
+            ("left-own", Some(&edited_in)),
+            ("left-edit", Some(&edited_in)),
         ] {
             let found = lists!().find(id).map(|(target, _)| target.cloned());
             assert_eq!(found, Some(target.cloned()), "{id}");

@@ -44,13 +44,10 @@ fn preview(prompt: &str, attachments: usize) -> String {
     format!("{attachments} attachment{}", if attachments == 1 { "" } else { "s" })
 }
 
-/// The prompt, attachments and records a question card set aside, leaving it an empty prompt.
-fn take_parked(
-    question: &mut crate::app::attachments::QuestionDraft,
-) -> (String, Vec<crate::app::attachments::Attachment>, crate::composer_context::ContextRecords) {
-    let prompt = std::mem::take(&mut question.prompt);
-    let attachments = std::mem::take(&mut question.prompt_attachments);
-    (prompt, attachments, std::mem::take(&mut question.prompt_records))
+/// The draft's own prompt, attachments and records (see `draft_holder`), leaving them empty.
+fn take_own(draft: &mut ComposerDraft) -> crate::app::draft_holder::Draft {
+    let (prompt, attachments, records) = draft.own_prompt_mut();
+    (std::mem::take(prompt), std::mem::take(attachments), std::mem::take(records))
 }
 
 /// One draft row: the draft, its project on its environment, and its preview.
@@ -120,9 +117,10 @@ impl Workspace {
         } else {
             match self.composer_drafts.remove(&target) {
                 Some(ComposerDraft::Prompt(prompt, attachments, records)) => (prompt, attachments, records),
-                Some(ComposerDraft::Question(mut question)) => {
-                    let taken = take_parked(&mut question);
-                    self.composer_drafts.insert(target.clone(), ComposerDraft::Question(question));
+                // A question card or queued message's edit keeps the editor; the prompt waits beside it.
+                Some(mut draft) => {
+                    let taken = take_own(&mut draft);
+                    self.composer_drafts.insert(target.clone(), draft);
                     taken
                 }
                 None => return,
@@ -165,12 +163,11 @@ impl Workspace {
             }
         } else {
             match self.composer_drafts.get_mut(&target) {
-                Some(ComposerDraft::Question(question)) => {
-                    question.prompt = prompt;
-                    question.prompt_attachments = attachments;
-                    question.prompt_records = records;
+                Some(draft) => {
+                    let (held_prompt, held_attachments, held_records) = draft.own_prompt_mut();
+                    (*held_prompt, *held_attachments, *held_records) = (prompt, attachments, records);
                 }
-                _ => {
+                None => {
                     self.composer_drafts.insert(target, ComposerDraft::Prompt(prompt, attachments, records));
                 }
             }
