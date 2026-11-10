@@ -1275,6 +1275,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn mouse_position(&self) -> Point<Pixels>;
     fn modifiers(&self) -> Modifiers;
     fn capslock(&self) -> Capslock;
+    /// What the platform knows about the key event being dispatched beyond its keystroke.
+    /// Platforms that do not track it report nothing.
+    fn native_key(&self) -> NativeKey {
+        NativeKey::default()
+    }
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler);
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler>;
     /// Apply the focused text region's [`TextInputConfiguration`] to the

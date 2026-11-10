@@ -3701,6 +3701,13 @@ impl Window {
         self.capslock
     }
 
+    /// What the platform knows about the key event being dispatched beyond its keystroke (its
+    /// physical key and Num Lock), for terminals that encode keys the way browsers report `KeyboardEvent.code`.
+    /// Read it from a key down or key up listener; outside one it describes the last key event.
+    pub fn native_key(&self) -> crate::NativeKey {
+        self.platform_window.native_key()
+    }
+
     /// Produces a new frame and assigns it to `rendered_frame`. To actually show
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]

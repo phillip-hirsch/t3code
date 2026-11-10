@@ -2,19 +2,16 @@
 //! runs (consecutive cells of one style) and merged background rects, so a
 //! frame costs a handful of draw calls per row rather than one per cell.
 
-use alacritty_terminal::grid::Dimensions as _;
-use alacritty_terminal::index::{Column, Line, Point as GridPoint};
-use alacritty_terminal::term::cell::{Cell, Flags};
-use alacritty_terminal::term::{RenderableContent, TermMode};
-use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 use gpui_kit::{
     App, BorderStyle, Bounds, ContentMask, CursorStyle, Element, ElementId, ElementInputHandler, Entity, Font,
     FontFallbacks, FontStyle, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId,
-    IntoElement, LayoutId, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollEvent, ShapedLine,
-    SharedString, StrikethroughStyle, Style, TextAlign, TextRun, UnderlineStyle, Window, fill, font, hsla, outline,
-    point, px, relative, rgb, size,
+    IntoElement, LayoutId, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, ScrollEvent, ShapedLine,
+    SharedString, StrikethroughStyle, Style, TextAlign, TextRun, UnderlineStyle, Window, fill, font, outline, point,
+    px, relative, rgb, size,
 };
 
+use super::core;
+use super::model::{Cell, CursorShape, Rgb, Snapshot, ViewportPoint, Width};
 use super::session::TerminalSession;
 use crate::theme::{self, Fonts, Tokens};
 
@@ -53,45 +50,27 @@ impl TerminalTheme {
         }
     }
 
-    fn resolve(&self, color: Color, colors: &alacritty_terminal::term::color::Colors) -> Hsla {
-        match color {
-            Color::Spec(Rgb { r, g, b }) => rgb8(r, g, b, 1.),
-            Color::Indexed(index) => match colors[index as usize] {
-                Some(Rgb { r, g, b }) => rgb8(r, g, b, 1.),
-                None => self.indexed(index),
-            },
-            Color::Named(named) => {
-                if let Some(Rgb { r, g, b }) = colors[named] {
-                    return rgb8(r, g, b, 1.);
-                }
-                match named {
-                    NamedColor::Foreground | NamedColor::BrightForeground => self.foreground,
-                    NamedColor::Background => self.background,
-                    NamedColor::Cursor => self.cursor,
-                    NamedColor::DimForeground => dim(self.foreground),
-                    named if (named as usize) < 16 => self.palette[named as usize],
-                    // DimBlack..DimWhite follow DimForeground (index 259 onwards).
-                    named => dim(self.palette[(named as usize).saturating_sub(NamedColor::DimBlack as usize) % 8]),
-                }
-            }
+    /// The colors Ghostty resolves cells with (`setTheme`).
+    pub(super) fn core(&self) -> core::Theme {
+        core::Theme {
+            fg: to_rgb(self.foreground),
+            bg: to_rgb(self.background),
+            cursor: to_rgb(self.cursor),
+            palette: self.palette.map(to_rgb),
         }
     }
 
-    /// xterm's 256-color table above the 16 theme colors.
-    fn indexed(&self, index: u8) -> Hsla {
-        match index {
-            0..=15 => self.palette[index as usize],
-            16..=231 => {
-                let i = index - 16;
-                let level = |v: u8| if v == 0 { 0 } else { v * 40 + 55 };
-                rgb8(level(i / 36), level((i / 6) % 6), level(i % 6), 1.)
-            }
-            _ => {
-                let v = (index - 232) * 10 + 8;
-                rgb8(v, v, v, 1.)
-            }
-        }
+    /// Faint (SGR 2) default text: the foreground blended toward the background, as Ghostty draws it.
+    pub fn faint_foreground(&self) -> Hsla {
+        hsla(core::faint(to_rgb(self.foreground), to_rgb(self.background)))
     }
+}
+
+fn to_rgb(color: Hsla) -> Rgb {
+    let color = Rgba::from(color);
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a 0-255 channel; `as` saturates")]
+    let channel = |value: f32| (value.clamp(0., 1.) * 255.).round() as u8;
+    Rgb { r: channel(color.r), g: channel(color.g), b: channel(color.b) }
 }
 
 fn rgb8(r: u8, g: u8, b: u8, alpha: f32) -> Hsla {
@@ -100,8 +79,8 @@ fn rgb8(r: u8, g: u8, b: u8, alpha: f32) -> Hsla {
     color
 }
 
-fn dim(color: Hsla) -> Hsla {
-    hsla(color.h, color.s, color.l * 0.66, color.a)
+fn hsla(color: Rgb) -> Hsla {
+    rgb8(color.r, color.g, color.b, 1.)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -114,13 +93,13 @@ pub(super) struct RunStyle {
 }
 
 impl RunStyle {
-    fn new(color: Hsla, flags: Flags) -> Self {
+    fn new(cell: &Cell) -> Self {
         Self {
-            color,
-            bold: flags.contains(Flags::BOLD),
-            italic: flags.contains(Flags::ITALIC),
-            underline: flags.intersects(Flags::ALL_UNDERLINES),
-            strikethrough: flags.contains(Flags::STRIKEOUT),
+            color: hsla(cell.fg),
+            bold: cell.bold,
+            italic: cell.italic,
+            underline: cell.underline,
+            strikethrough: cell.strikethrough,
         }
     }
 }
@@ -153,83 +132,66 @@ pub(super) struct Span {
 
 #[derive(Default, Debug)]
 pub(super) struct Batched {
+    /// The terminal's background, painted under every span (`renderGhosttySnapshot`).
+    pub background: Hsla,
     pub runs: Vec<Run>,
     pub backgrounds: Vec<Span>,
     pub selection: Vec<Span>,
+    /// Overlined cells, spaces included, in their text color: text runs cannot draw an overline.
+    pub overlines: Vec<Span>,
 }
 
-/// Groups the visible cells into text runs and background spans.
-/// A wide glyph ends its run, so every glyph after it still starts on its own cell.
-pub(super) fn batch(content: RenderableContent<'_>, columns: usize, rows: usize, theme: &TerminalTheme) -> Batched {
-    let mut out = Batched::default();
-    let offset = super::line_count(content.display_offset);
-    let colors = content.colors;
-    let mut run: Option<PendingRun> = None;
-    let mut wide = false;
-    for indexed in content.display_iter {
-        let cell = indexed.cell;
-        let row = usize::try_from(indexed.point.line.0 + offset).unwrap_or(0);
-        let column = indexed.point.column.0;
-        if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
-            continue;
-        }
-        let mut fg = theme.resolve(cell.fg, colors);
-        let mut bg = theme.resolve(cell.bg, colors);
-        if cell.flags.contains(Flags::INVERSE) {
-            std::mem::swap(&mut fg, &mut bg);
-        }
-        if cell.flags.contains(Flags::DIM) {
-            fg = dim(fg);
-        }
-        if cell.flags.contains(Flags::HIDDEN) {
-            fg = bg;
-        }
-        let cells = if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
-        if bg != theme.background {
-            match out.backgrounds.last_mut() {
-                Some(span) if span.row == row && span.column + span.len == column && span.color == bg => {
-                    span.len += cells;
-                }
-                _ => out.backgrounds.push(Span { row, column, len: cells, color: bg }),
-            }
-        }
-        let style = RunStyle::new(fg, cell.flags);
-        let blank = cell.c == ' ' || cell.c == '\t';
-        let continues = !wide && run.as_ref().is_some_and(|run| run.row == row && run.style == style);
-        if !continues {
-            flush(&mut run, &mut out.runs);
-            if blank && !style.underline && !style.strikethrough {
-                wide = false;
-                continue;
-            }
-            run = Some(PendingRun { row, column, text: String::new(), style });
-        }
-        if let Some(run) = &mut run {
-            run.text.push(if blank { ' ' } else { cell.c });
-            if let Some(zero_width) = cell.zerowidth() {
-                run.text.extend(zero_width);
-            }
-        }
-        wide = cells == 2;
+fn push_span(spans: &mut Vec<Span>, row: usize, column: usize, color: Hsla) {
+    match spans.last_mut() {
+        Some(span) if span.row == row && span.column + span.len == column && span.color == color => span.len += 1,
+        _ => spans.push(Span { row, column, len: 1, color }),
     }
-    flush(&mut run, &mut out.runs);
-    if let Some(range) = content.selection {
-        for row in 0..rows {
-            let line = Line(super::line_count(row) - offset);
-            if line < range.start.line || line > range.end.line {
+}
+
+fn is_blank(cell: &Cell) -> bool {
+    cell.invisible || matches!(cell.text.as_str(), "" | " " | "\t")
+}
+
+/// Groups the visible cells into text runs and background spans (`renderGhosttySnapshot`).
+/// A wide glyph ends its run, so every glyph after it still starts on its own cell.
+pub(super) fn batch(snapshot: &Snapshot, theme: &TerminalTheme) -> Batched {
+    let mut out = Batched { background: hsla(snapshot.bg), ..Batched::default() };
+    for (row, cells) in snapshot.rows.iter().enumerate() {
+        let mut run: Option<PendingRun> = None;
+        let mut wide = false;
+        for (column, cell) in cells.cells.iter().enumerate() {
+            if cell.bg != snapshot.bg {
+                push_span(&mut out.backgrounds, row, column, hsla(cell.bg));
+            }
+            if cell.selected {
+                push_span(&mut out.selection, row, column, theme.selection);
+            }
+            if matches!(cell.wide, Width::SpacerTail | Width::SpacerHead) {
                 continue;
             }
-            let (start, end) = if range.is_block {
-                (range.start.column.0, range.end.column.0)
-            } else {
-                let start = if line == range.start.line { range.start.column.0 } else { 0 };
-                let end = if line == range.end.line { range.end.column.0 } else { columns - 1 };
-                (start, end)
-            };
-            if end >= start {
-                out.selection.push(Span { row, column: start, len: end - start + 1, color: theme.selection });
+            if cell.overline {
+                push_span(&mut out.overlines, row, column, hsla(cell.fg));
+                if cell.wide == Width::Wide {
+                    push_span(&mut out.overlines, row, column + 1, hsla(cell.fg));
+                }
             }
+            let style = RunStyle::new(cell);
+            let blank = is_blank(cell);
+            let continues = !wide && run.as_ref().is_some_and(|run| run.style == style);
+            if !continues {
+                flush(&mut run, &mut out.runs);
+                if blank && !style.underline && !style.strikethrough {
+                    wide = false;
+                    continue;
+                }
+                run = Some(PendingRun { row, column, text: String::new(), style });
+            }
+            if let Some(run) = &mut run {
+                run.text.push_str(if blank { " " } else { &cell.text });
+            }
+            wide = cell.wide == Width::Wide;
         }
+        flush(&mut run, &mut out.runs);
     }
     out
 }
@@ -246,19 +208,49 @@ fn flush(run: &mut Option<PendingRun>, runs: &mut Vec<Run>) {
     }
 }
 
-/// What a filled block cursor redraws over `cell`: its character with any combining marks.
-fn cursor_glyph_text(cell: &Cell) -> Option<String> {
-    if matches!(cell.c, ' ' | '\t') {
-        return None;
+/// The cursor where the snapshot places it, with what a filled block redraws over its cell.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct CursorCell {
+    pub at: ViewportPoint,
+    pub shape: CursorShape,
+    pub color: Hsla,
+    pub wide: bool,
+    /// The cell's glyph in the background color, for a filled block.
+    pub glyph: Option<(SharedString, RunStyle)>,
+}
+
+impl CursorCell {
+    pub fn of(snapshot: &Snapshot) -> Option<Self> {
+        let at = snapshot.cursor?;
+        let cell = snapshot.rows.get(at.y)?.cells.get(at.x);
+        let glyph = cell.filter(|cell| !is_blank(cell)).map(|cell| {
+            (SharedString::from(cell.text.clone()), RunStyle { color: hsla(snapshot.bg), ..RunStyle::new(cell) })
+        });
+        Some(Self {
+            at,
+            shape: snapshot.cursor_shape,
+            color: hsla(snapshot.cursor_color),
+            wide: cell.is_some_and(|cell| cell.wide == Width::Wide),
+            glyph,
+        })
     }
-    let mut text = String::from(cell.c);
-    text.extend(cell.zerowidth().into_iter().flatten());
-    Some(text)
+}
+
+/// What the grid element draws this frame, read from the session in one update.
+pub(super) struct Frame {
+    pub batched: std::rc::Rc<Batched>,
+    pub cursor: Option<CursorCell>,
+    pub columns: usize,
+    pub rows: usize,
+    /// With scrollback, the last row sits on the bottom edge (`terminalContentOriginY`).
+    pub anchor_bottom: bool,
 }
 
 /// Cell size and where the grid starts, in window coordinates.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(super) struct Geometry {
+    /// The grid element; mouse reports measure from its corner.
+    pub bounds: Bounds<Pixels>,
     pub origin: Point<Pixels>,
     pub cell_width: Pixels,
     pub line_height: Pixels,
@@ -269,29 +261,27 @@ pub(super) struct Geometry {
 }
 
 impl Geometry {
-    /// The grid cell under `position` (clamped) and whether it is in the cell's right half.
-    pub fn cell_at(&self, position: Point<Pixels>, display_offset: usize) -> (GridPoint, bool) {
-        let x = ((position.x - self.origin.x) / self.cell_width).max(0.);
-        let y = ((position.y - self.origin.y) / self.line_height).max(0.);
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "non-negative cell coordinates; `as` saturates"
-        )]
-        let column = (x as usize).min(self.columns.saturating_sub(1));
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "non-negative cell coordinates; `as` saturates"
-        )]
-        let row = (y as usize).min(self.rows.saturating_sub(1));
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "non-negative cell coordinates; `as` saturates"
-        )]
-        let right = x.fract() >= 0.5 || x as usize >= self.columns;
-        (GridPoint::new(Line(super::line_count(row) - super::line_count(display_offset)), Column(column)), right)
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "non-negative cell coordinates; `as` saturates"
+    )]
+    fn cell(&self, position: Point<Pixels>) -> (f32, f32, usize, usize) {
+        let x = (position.x - self.origin.x) / self.cell_width;
+        let y = (position.y - self.origin.y) / self.line_height;
+        (x, y, x.max(0.).floor() as usize, y.max(0.).floor() as usize)
+    }
+
+    /// `cellAt`: the visible cell under `position`, clamped to the grid.
+    pub fn cell_at(&self, position: Point<Pixels>) -> ViewportPoint {
+        let (_, _, x, y) = self.cell(position);
+        ViewportPoint { x: x.min(self.columns.saturating_sub(1)), y: y.min(self.rows.saturating_sub(1)) }
+    }
+
+    /// `terminalGridCellAt`: the cell under `position`, or `None` off the grid.
+    pub fn grid_cell_at(&self, position: Point<Pixels>) -> Option<ViewportPoint> {
+        let (fx, fy, x, y) = self.cell(position);
+        (fx >= 0. && fy >= 0. && x < self.columns && y < self.rows).then_some(ViewportPoint { x, y })
     }
 }
 
@@ -344,16 +334,20 @@ impl IntoElement for TerminalGrid {
 
 struct Cursor {
     bounds: Bounds<Pixels>,
-    shape: CursorShape,
+    hollow: bool,
+    color: Hsla,
     glyph: Option<ShapedLine>,
 }
 
 pub(super) struct GridPrepaint {
     hitbox: Hitbox,
     geometry: Geometry,
+    background: Hsla,
     backgrounds: Vec<Bounds<Pixels>>,
     background_colors: Vec<Hsla>,
     lines: Vec<(Point<Pixels>, ShapedLine)>,
+    /// `renderGhosttySnapshot`'s overlines: 1px, a pixel below each cell's top.
+    overlines: Vec<(Bounds<Pixels>, Hsla)>,
     cursor: Option<Cursor>,
     link_hovered: bool,
     link_underlines: Vec<Bounds<Pixels>>,
@@ -410,28 +404,21 @@ impl Element for TerminalGrid {
         )]
         let rows = (((bounds.size.height - PADDING * 2.) / line_height).floor() as usize).max(1);
         let theme = self.theme;
-        let batched = self.session.update(cx, |session, cx| {
-            session.fit(columns, rows, cx);
-            session.batched(&theme)
+        let frame = self.session.update(cx, |session, cx| {
+            session.fit(columns, rows, (cell_width, line_height), cx);
+            session.frame(&theme)
         });
-        let session = self.session.read(cx);
-        let term = session.term();
         // The drawn grid: the shared PTY's, capped to this fit.
-        let (columns, rows) = (term.columns(), term.screen_lines());
-        // `terminalContentOriginY`: with scrollback, the last row sits on the bottom edge.
+        let (columns, rows) = (frame.columns, frame.rows);
         let slack = bounds.size.height - PADDING * 2. - line_height * rows as f32;
-        let top = if term.grid().history_size() > 0 { PADDING + slack.max(px(0.)) } else { PADDING };
+        let top = if frame.anchor_bottom { PADDING + slack.max(px(0.)) } else { PADDING };
         let origin = bounds.origin + point(PADDING, top);
         let scroll_edges =
             (bounds.top().max(px(0.)) + PADDING, bounds.bottom().min(window.viewport_size().height) - PADDING);
-        let geometry = Geometry { origin, cell_width, line_height, columns, rows, scroll_edges };
-        let content = term.renderable_content();
-        let cursor_point = content.cursor.point;
-        let cursor_shape = content.cursor.shape;
-        let display_offset = content.display_offset;
-        let show_cursor = self.cursor_on && display_offset == 0 && !content.mode.contains(TermMode::VI);
+        let geometry = Geometry { bounds, origin, cell_width, line_height, columns, rows, scroll_edges };
         let cell_origin =
             |row: usize, column: usize| origin + point(cell_width * column as f32, line_height * row as f32);
+        let batched = &frame.batched;
         let mut backgrounds = Vec::with_capacity(batched.backgrounds.len() + batched.selection.len());
         let mut background_colors = Vec::with_capacity(backgrounds.capacity());
         for span in batched.backgrounds.iter().chain(&batched.selection) {
@@ -462,43 +449,51 @@ impl Element for TerminalGrid {
             .iter()
             .map(|run| (cell_origin(run.row, run.column), shape(run.text.clone(), &run.style)))
             .collect();
-        let cursor_row = cursor_point.line.0 + super::line_count(display_offset);
-        // The glyph under a filled block cursor is redrawn in the background color.
-        let cursor_glyph = (self.focused && show_cursor && cursor_shape == CursorShape::Block)
-            .then(|| &term.grid()[cursor_point])
-            .and_then(|cell| {
-                let text = cursor_glyph_text(cell)?;
-                Some(shape(text.into(), &RunStyle::new(self.theme.background, cell.flags)))
-            });
-        let cursor = (show_cursor && cursor_shape != CursorShape::Hidden && cursor_row >= 0).then(|| {
-            let at = cell_origin(usize::try_from(cursor_row).unwrap_or(0), cursor_point.column.0);
-            let wide = term.grid()[cursor_point].flags.contains(Flags::WIDE_CHAR);
-            let width = if wide { cell_width * 2. } else { cell_width };
-            let bounds = match cursor_shape {
-                CursorShape::Beam => Bounds::new(at, size(px(2.), line_height)),
+        let overlines = batched
+            .overlines
+            .iter()
+            .map(|span| {
+                let at = cell_origin(span.row, span.column) + point(px(0.), px(1.));
+                (Bounds::new(at, size(cell_width * span.len as f32, px(1.))), span.color)
+            })
+            .collect();
+        let cursor = frame.cursor.filter(|_| self.cursor_on).map(|cursor| {
+            let at = cell_origin(cursor.at.y, cursor.at.x);
+            let width = if cursor.wide { cell_width * 2. } else { cell_width };
+            let hollow = !self.focused || cursor.shape == CursorShape::BlockHollow;
+            let bounds = match cursor.shape {
+                _ if hollow => Bounds::new(at, size(width, line_height)),
+                CursorShape::Bar => Bounds::new(at, size(px(2.), line_height)),
                 CursorShape::Underline => Bounds::new(at + point(px(0.), line_height - px(2.)), size(width, px(2.))),
                 _ => Bounds::new(at, size(width, line_height)),
             };
-            let shape = if self.focused { cursor_shape } else { CursorShape::HollowBlock };
-            Cursor { bounds, shape, glyph: cursor_glyph }
+            // The glyph under a filled block is redrawn in the background color.
+            let glyph = (!hollow && cursor.shape == CursorShape::Block)
+                .then_some(cursor.glyph)
+                .flatten()
+                .map(|(text, style)| shape(text, &style));
+            Cursor { bounds, hollow, color: cursor.color, glyph }
         });
+        let session = self.session.read(cx);
         let link = session.hovered_link();
         let link_underlines = link
             .into_iter()
-            .flat_map(|link| &link.cells)
-            .filter_map(|(line, start, end)| {
-                let row = usize::try_from(line.0 + super::line_count(display_offset)).ok().filter(|row| *row < rows)?;
-                let at = cell_origin(row, *start) + point(px(0.), line_height - px(1.));
-                Some(Bounds::new(at, size(cell_width * (end - start) as f32, px(1.))))
+            .flat_map(|link| link.spans(columns))
+            .filter(|(row, _, _)| *row < rows)
+            .map(|(row, start, end)| {
+                let at = cell_origin(row, start) + point(px(0.), line_height - px(1.));
+                Bounds::new(at, size(cell_width * end.saturating_sub(start) as f32, px(1.)))
             })
             .collect();
         session.geometry.set(geometry);
         GridPrepaint {
             hitbox,
             geometry,
+            background: frame.batched.background,
             backgrounds,
             background_colors,
             lines,
+            overlines,
             cursor,
             link_hovered: link.is_some(),
             link_underlines,
@@ -519,20 +514,25 @@ impl Element for TerminalGrid {
         window.set_cursor_style(cursor, &prepaint.hitbox);
         let line_height = prepaint.geometry.line_height;
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            // Cells in the terminal's own background paint no span; a program may have changed it.
+            window.paint_quad(fill(bounds, prepaint.background));
             for (bounds, color) in prepaint.backgrounds.iter().zip(&prepaint.background_colors) {
                 window.paint_quad(fill(*bounds, *color));
             }
             for (origin, line) in &prepaint.lines {
                 let _ = line.paint(*origin, line_height, TextAlign::Left, None, window, cx);
             }
+            for (bounds, color) in &prepaint.overlines {
+                window.paint_quad(fill(*bounds, *color));
+            }
             for bounds in &prepaint.link_underlines {
                 window.paint_quad(fill(*bounds, self.theme.foreground));
             }
             if let Some(cursor) = &prepaint.cursor {
-                if cursor.shape == CursorShape::HollowBlock {
-                    window.paint_quad(outline(cursor.bounds, self.theme.cursor, BorderStyle::Solid));
+                if cursor.hollow {
+                    window.paint_quad(outline(cursor.bounds, cursor.color, BorderStyle::Solid));
                 } else {
-                    window.paint_quad(fill(cursor.bounds, self.theme.cursor));
+                    window.paint_quad(fill(cursor.bounds, cursor.color));
                     if let Some(glyph) = &cursor.glyph {
                         let _ = glyph.paint(cursor.bounds.origin, line_height, TextAlign::Left, None, window, cx);
                     }
@@ -546,7 +546,7 @@ impl Element for TerminalGrid {
         let session = self.session.clone();
         window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
             if phase.bubble() && hitbox.is_hovered(window) {
-                // A tracking app's right click is its own, so the menu stays shut.
+                // A tracking program's right click is its own, so the menu stays shut.
                 if session.update(cx, |session, cx| session.mouse_down(event, window, cx)) {
                     cx.stop_propagation();
                 }
@@ -580,89 +580,124 @@ impl Element for TerminalGrid {
 
 #[cfg(test)]
 mod tests {
-    use alacritty_terminal::Term;
-    use alacritty_terminal::event::VoidListener;
-    use alacritty_terminal::grid::Dimensions;
-    use alacritty_terminal::term::Config;
-    use alacritty_terminal::vte::ansi::Processor;
-
+    use super::super::core::tests::core;
     use super::*;
-
-    struct Size(usize, usize);
-
-    impl Dimensions for Size {
-        fn total_lines(&self) -> usize {
-            self.1
-        }
-        fn screen_lines(&self) -> usize {
-            self.1
-        }
-        fn columns(&self) -> usize {
-            self.0
-        }
-    }
-
-    fn term(output: &str) -> Term<VoidListener> {
-        let mut term = Term::new(Config::default(), &Size(20, 3), VoidListener);
-        let mut parser: Processor = Processor::new();
-        parser.advance(&mut term, output.as_bytes());
-        term
-    }
 
     fn theme() -> TerminalTheme {
         TerminalTheme::new(&Tokens::dark())
     }
 
+    fn snapshot(output: &str) -> Snapshot {
+        let mut core = core(20, 3);
+        core.set_theme(&theme().core());
+        core.write(output.as_bytes());
+        core.snapshot().clone()
+    }
+
     #[test]
     fn one_run_per_style_and_no_runs_for_blank_cells() {
-        let term = term("ls \x1b[31mred\x1b[0m  done\r\n\r\n   ");
-        let batched = batch(term.renderable_content(), 20, 3, &theme());
+        let batched = batch(&snapshot("ls \x1b[31mred\x1b[0m  done\r\n\r\n   "), &theme());
         let runs: Vec<(usize, usize, &str)> =
             batched.runs.iter().map(|run| (run.row, run.column, run.text.as_ref())).collect();
         assert_eq!(runs, [(0, 0, "ls"), (0, 3, "red"), (0, 8, "done")]);
-        assert_eq!(batched.runs[1].style.color, theme().palette[1]);
+        assert_eq!(to_rgb(batched.runs[1].style.color), to_rgb(theme().palette[1]));
         assert!(batched.backgrounds.is_empty());
     }
 
     #[test]
-    fn backgrounds_merge_and_inverse_swaps_colors() {
-        let term = term("\x1b[44mab\x1b[7m c\x1b[0m");
-        let batched = batch(term.renderable_content(), 20, 3, &theme());
+    fn overlines_span_their_cells_including_spaces() {
         let theme = theme();
-        // Blue under "ab", then the inverse cells paint the foreground as their background.
-        assert_eq!(
-            batched.backgrounds,
-            [
-                Span { row: 0, column: 0, len: 2, color: theme.palette[4] },
-                Span { row: 0, column: 2, len: 2, color: theme.foreground },
-            ]
-        );
-        assert_eq!(batched.runs.last().map(|run| run.style.color), Some(theme.palette[4]));
+        let batched = batch(&snapshot("\x1b[53ma b\x1b[31m c\x1b[0m d \x1b[53m\u{4e2d}"), &theme);
+        let spans: Vec<_> = batched.overlines.iter().map(|span| (span.column, span.len, to_rgb(span.color))).collect();
+        // "a b" in the text color, " c" in red, then the wide glyph's two cells.
+        let (fg, red) = (to_rgb(theme.foreground), to_rgb(theme.palette[1]));
+        assert_eq!(spans, [(0, 3, fg), (3, 2, red), (8, 2, fg)]);
+    }
+
+    #[test]
+    fn backgrounds_merge_and_inverse_swaps_colors() {
+        let theme = theme();
+        let batched = batch(&snapshot("\x1b[44mab\x1b[7m c\x1b[0m"), &theme);
+        let spans: Vec<_> =
+            batched.backgrounds.iter().map(|span| (span.column, span.len, to_rgb(span.color))).collect();
+        // Blue under "ab", then the inverse cells paint the blue foreground's swap: the default text color.
+        assert_eq!(spans, [(0, 2, to_rgb(theme.palette[4])), (2, 2, to_rgb(theme.foreground))]);
+        assert_eq!(batched.runs.last().map(|run| to_rgb(run.style.color)), Some(to_rgb(theme.palette[4])));
+    }
+
+    #[test]
+    fn the_frame_fills_the_terminal_background() {
+        let theme = theme();
+        assert_eq!(to_rgb(batch(&snapshot("ab"), &theme).background), to_rgb(theme.background));
+        // A program's background (OSC 11) and DEC reverse video: default cells paint no span over it.
+        for (output, background) in [
+            ("\x1b]11;rgb:12/34/56\x07ab", Rgb { r: 0x12, g: 0x34, b: 0x56 }),
+            ("\x1b[?5hab", to_rgb(theme.foreground)),
+        ] {
+            let batched = batch(&snapshot(output), &theme);
+            assert_eq!(to_rgb(batched.background), background, "{output:?}");
+            assert!(batched.backgrounds.is_empty(), "{output:?}");
+        }
+        // A later change redraws the rows already shown.
+        let mut core = core(20, 3);
+        core.set_theme(&theme.core());
+        core.write(b"ab");
+        let before = core.snapshot().revision;
+        core.write(b"\x1b]11;rgb:12/34/56\x07");
+        let batched = batch(core.snapshot(), &theme);
+        assert!(core.snapshot().revision > before, "the cached batch is rebuilt");
+        assert_eq!(to_rgb(batched.background), Rgb { r: 0x12, g: 0x34, b: 0x56 });
+        assert!(batched.backgrounds.is_empty());
+        // So do palette (OSC 4) and default foreground (OSC 10) changes, for the text on them.
+        core.write(b"\x1b[31mr\x1b[0m");
+        for (output, color) in [
+            (&b"\x1b]4;1;rgb:aa/bb/cc\x07"[..], Rgb { r: 0xaa, g: 0xbb, b: 0xcc }),
+            (b"\x1b]10;rgb:11/22/33\x07", Rgb { r: 0x11, g: 0x22, b: 0x33 }),
+        ] {
+            let before = core.snapshot().revision;
+            core.write(output);
+            let batched = batch(core.snapshot(), &theme);
+            assert!(core.snapshot().revision > before, "{output:?}");
+            assert!(batched.runs.iter().any(|run| to_rgb(run.style.color) == color), "{output:?}");
+        }
     }
 
     #[test]
     fn wide_glyphs_end_their_run() {
-        let term = term("a漢b");
-        let batched = batch(term.renderable_content(), 20, 3, &theme());
+        let batched = batch(&snapshot("a漢b"), &theme());
         let runs: Vec<(usize, &str)> = batched.runs.iter().map(|run| (run.column, run.text.as_ref())).collect();
         assert_eq!(runs, [(0, "a漢"), (3, "b")]);
+    }
+
+    #[test]
+    fn invisible_text_and_selection_paint_no_glyphs_but_a_tint() {
+        let mut core = core(20, 3);
+        core.write(b"\x1b[8msecret\x1b[0m shown");
+        let start = core.viewport_to_screen(ViewportPoint { x: 7, y: 0 }).unwrap();
+        core.set_selection(start, super::super::model::ScreenPoint { x: 11, ..start });
+        let batched = batch(core.snapshot(), &theme());
+        let runs: Vec<(usize, &str)> = batched.runs.iter().map(|run| (run.column, run.text.as_ref())).collect();
+        assert_eq!(runs, [(7, "shown")]);
+        assert_eq!(batched.selection.iter().map(|span| (span.column, span.len)).collect::<Vec<_>>(), [(7, 5)]);
     }
 
     #[test]
     fn the_block_cursor_redraws_its_own_cell() {
         // "e" plus a combining acute accent, then "x"; the cursor goes back to each cell.
         for (output, glyph) in [("e\u{301}x\r", Some("e\u{301}")), ("e\u{301}x\r\x1b[C", Some("x")), ("ab ", None)] {
-            let term = term(output);
-            let cell = &term.grid()[term.grid().cursor.point];
-            assert_eq!(cursor_glyph_text(cell).as_deref(), glyph, "{output:?}");
+            let cursor = CursorCell::of(&snapshot(output)).unwrap();
+            assert_eq!(cursor.glyph.map(|(text, _)| text.to_string()).as_deref(), glyph, "{output:?}");
         }
+        let cursor = CursorCell::of(&snapshot("漢\x1b[D\x1b[D")).unwrap();
+        assert!(cursor.wide && cursor.at == ViewportPoint { x: 0, y: 0 }, "a wide glyph's cursor covers both cells");
+        assert_eq!(CursorCell::of(&snapshot("\x1b[?25l")), None, "a hidden cursor draws nothing");
     }
 
     #[test]
-    fn indexed_colors_follow_the_xterm_table() {
+    fn the_theme_round_trips_through_ghostty_colors() {
         let theme = theme();
-        assert_eq!(theme.indexed(16), rgb8(0, 0, 0, 1.));
-        assert_eq!(theme.indexed(196), rgb8(255, 0, 0, 1.));
-        assert_eq!(theme.indexed(244), rgb8(128, 128, 128, 1.));
+        let colors = theme.core();
+        assert_eq!(to_rgb(hsla(colors.palette[1])), colors.palette[1]);
+        assert_eq!(colors.palette[1], Rgb { r: 0xcd, g: 0x31, b: 0x31 });
     }
 }

@@ -15,7 +15,6 @@ aes-gcm = "0.10"
 # Chromium's macOS and Linux cookies are AES-128-CBC (`browser_import`); aes-gcm already builds both.
 aes = "0.8"
 cbc = "0.1"
-alacritty_terminal = "0.26"
 anyhow = "1"
 async-channel = "2"
 # Decodes the user PATH the `t3` command installer reads through PowerShell.
@@ -66,6 +65,8 @@ image = { version = "0.25", default-features = false, features = [
   "tiff",
   "webp",
 ] }
+# The terminal emulator (Ghostty's VT core, as the web uses it); its build script needs Zig 0.15.2.
+libghostty-vt = "0.2.2"
 log = "0.4"
 # Notebook Markdown is made inert on the tree the chat renderer parses; gpui-base already builds it.
 markdown = "1"
@@ -206,6 +207,8 @@ gpui-pre-linux = { path = "vendor/gpui-pre-linux" }
 gpui-webview = { path = "vendor/gpui-webview" }
 # lb-wry 0.53.3: a handler for failed navigations; a child webview can move to another window.
 lb-wry = { path = "vendor/lb-wry" }
+# gpui-pre-macos 0.3.11: key events carry their physical key code.
+gpui-pre-macos = { path = "vendor/gpui-pre-macos" }
 
 # BeautifulRust's lint set (github.com/morganlinton/BeautifulRust), trimmed for an application:
 # no library-API lints (missing_docs, missing_*_doc, exhaustive_enums, unreachable_pub, print_*).

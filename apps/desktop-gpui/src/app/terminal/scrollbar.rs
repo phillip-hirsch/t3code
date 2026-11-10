@@ -1,10 +1,6 @@
 //! The scrollback scrollbar over a terminal's right edge (`terminalScrollbarGeometry` and
 //! `onScrollbarKeyDown` in the web's Ghostty surface).
 
-use alacritty_terminal::Term;
-use alacritty_terminal::event::EventListener;
-use alacritty_terminal::grid::Dimensions as _;
-
 /// `MIN_SCROLLBAR_THUMB_HEIGHT`.
 const MIN_THUMB_HEIGHT: f32 = 18.;
 
@@ -17,12 +13,6 @@ pub(super) struct ScrollState {
 }
 
 impl ScrollState {
-    pub fn of<T: EventListener>(term: &Term<T>) -> Self {
-        let grid = term.grid();
-        let (history, len) = (grid.history_size(), grid.screen_lines());
-        Self { total: history + len, len, offset: history.saturating_sub(grid.display_offset()) }
-    }
-
     pub fn max_offset(self) -> usize {
         self.total.saturating_sub(self.len.min(self.total))
     }

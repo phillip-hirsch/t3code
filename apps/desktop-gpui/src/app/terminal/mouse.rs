@@ -1,100 +1,102 @@
-//! Mouse reports for full-screen apps that ask for them (xterm modes 1000/1002/1003, with
-//! the SGR 1006 and UTF-8 1005 encodings), as the web's Ghostty mouse encoder sends them.
+//! Mouse reports for programs that track the mouse. Ghostty's encoder picks the tracking mode
+//! and format (X10, UTF-8, SGR, urxvt, SGR pixels); this decides when to report and drops
+//! repeated motion, as the web's surface does.
 
-use alacritty_terminal::term::TermMode;
+use gpui_kit::{Modifiers, MouseButton as GpuiButton};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum MouseAction {
-    Press,
-    Release,
-    Motion,
+use super::core::{self, MouseAction};
+
+/// `shouldReportTerminalMouse`: Shift, Ctrl or ⌘ ask for local selection instead.
+pub(super) fn reports(tracking: bool, modifiers: Modifiers) -> bool {
+    tracking && !modifiers.shift && !modifiers.control && !modifiers.platform
 }
 
-/// xterm button codes: 0 left, 1 middle, 2 right, 3 none (motion), 64/65 wheel up/down.
-pub(super) const NO_BUTTON: u8 = 3;
-pub(super) const WHEEL_UP: u8 = 64;
-pub(super) const WHEEL_DOWN: u8 = 65;
-
-/// `shouldReportTerminalMouse`: tracking is on and no modifier asks for local selection.
-pub(super) fn reports(mode: TermMode, shift: bool, ctrl: bool) -> bool {
-    mode.intersects(TermMode::MOUSE_MODE) && !shift && !ctrl
+/// `ghosttyMouseButton`: the buttons a terminal can report.
+pub(super) fn button(button: GpuiButton) -> Option<core::MouseButton> {
+    match button {
+        GpuiButton::Left => Some(core::MouseButton::Left),
+        GpuiButton::Middle => Some(core::MouseButton::Middle),
+        GpuiButton::Right => Some(core::MouseButton::Right),
+        GpuiButton::Navigate(_) => None,
+    }
 }
 
-/// The bytes for one mouse event at a 0-based cell, or `None` when the mode doesn't report it.
-pub(super) fn encode(
-    mode: TermMode,
-    action: MouseAction,
-    button: u8,
-    alt: bool,
-    column: usize,
-    row: usize,
-) -> Option<String> {
-    if !mode.intersects(TermMode::MOUSE_MODE) {
-        return None;
-    }
-    if action == MouseAction::Motion
-        && !(mode.contains(TermMode::MOUSE_MOTION) || (mode.contains(TermMode::MOUSE_DRAG) && button != NO_BUTTON))
-    {
-        return None;
-    }
-    let mut code = button + if alt { 8 } else { 0 };
-    if action == MouseAction::Motion {
-        code += 32;
-    }
-    let (x, y) = (column + 1, row + 1);
-    if mode.contains(TermMode::SGR_MOUSE) {
-        let end = if action == MouseAction::Release { 'm' } else { 'M' };
-        return Some(format!("\x1b[<{code};{x};{y}{end}"));
-    }
-    if action == MouseAction::Release {
-        // The legacy encodings can't say which button went up.
-        code = NO_BUTTON + if alt { 8 } else { 0 };
-    }
-    let utf8 = mode.contains(TermMode::UTF8_MOUSE);
-    let limit = if utf8 { 2015 } else { 223 };
-    if x > limit || y > limit {
-        return None;
-    }
-    let coordinate = |v: usize| u32::try_from(v).ok().and_then(|v| v.checked_add(32)).and_then(char::from_u32);
-    let mut out = String::from("\x1b[M");
-    out.push(char::from(32 + code));
-    // Legacy coordinates above 127 go out as their Latin-1 code points.
-    out.push(coordinate(x)?);
-    out.push(coordinate(y)?);
-    Some(out)
+pub(super) fn modifiers(modifiers: Modifiers) -> core::Modifiers {
+    core::Modifiers { shift: modifiers.shift, ctrl: modifiers.control, alt: modifiers.alt, meta: modifiers.platform }
+}
+
+/// `resolveTerminalMouseData`: whether to send `data`, and the motion report to compare the
+/// next one with. Any other action starts over.
+pub(super) fn resolve(action: MouseAction, data: &str, last_motion: &str) -> (bool, String) {
+    let next = if action == MouseAction::Motion { data.to_owned() } else { String::new() };
+    (!data.is_empty() && (action != MouseAction::Motion || data != last_motion), next)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::core::tests::core;
+    use super::super::core::{Core, Modifiers, MouseButton, MouseInput};
     use super::*;
 
-    #[test]
-    fn sgr_reports_presses_releases_and_wheel() {
-        let mode = TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE;
-        assert_eq!(encode(mode, MouseAction::Press, 0, false, 4, 1).as_deref(), Some("\x1b[<0;5;2M"));
-        assert_eq!(encode(mode, MouseAction::Release, 0, false, 4, 1).as_deref(), Some("\x1b[<0;5;2m"));
-        assert_eq!(encode(mode, MouseAction::Press, WHEEL_DOWN, true, 0, 0).as_deref(), Some("\x1b[<73;1;1M"));
-        // Click tracking alone sends no motion.
-        assert_eq!(encode(mode, MouseAction::Motion, 0, false, 1, 1), None);
+    /// A report at cell (`column`, `row`) of an 8×16 grid with no padding.
+    fn report(core: &mut Core, action: MouseAction, button: Option<MouseButton>, column: f32, row: f32) -> String {
+        core.encode_mouse(&MouseInput {
+            action,
+            button,
+            mods: Modifiers::default(),
+            x: column * 8. + 1.,
+            y: row * 16. + 1.,
+            width: 800.,
+            height: 400.,
+            cell_width: 8.,
+            cell_height: 16.,
+            padding_left: 0.,
+            padding_top: 0.,
+            any_button_pressed: button.is_some() && action != MouseAction::Release,
+        })
     }
 
     #[test]
-    fn drag_and_motion_modes() {
-        let drag = TermMode::MOUSE_DRAG | TermMode::SGR_MOUSE;
-        assert_eq!(encode(drag, MouseAction::Motion, 0, false, 2, 3).as_deref(), Some("\x1b[<32;3;4M"));
-        assert_eq!(encode(drag, MouseAction::Motion, NO_BUTTON, false, 2, 3), None);
-        let motion = TermMode::MOUSE_MOTION | TermMode::SGR_MOUSE;
-        assert_eq!(encode(motion, MouseAction::Motion, NO_BUTTON, false, 0, 0).as_deref(), Some("\x1b[<35;1;1M"));
-        assert_eq!(encode(TermMode::empty(), MouseAction::Press, 0, false, 0, 0), None);
+    fn sgr_reports_presses_releases_and_the_wheel() {
+        let mut core = core(100, 25);
+        assert_eq!(report(&mut core, MouseAction::Press, Some(MouseButton::Left), 4., 1.), "", "nothing until asked");
+        core.write(b"\x1b[?1000h\x1b[?1006h");
+        assert!(core.mouse_tracking() && !core.any_event_mouse());
+        assert_eq!(report(&mut core, MouseAction::Press, Some(MouseButton::Left), 4., 1.), "\x1b[<0;5;2M");
+        assert_eq!(report(&mut core, MouseAction::Release, Some(MouseButton::Left), 4., 1.), "\x1b[<0;5;2m");
+        assert_eq!(report(&mut core, MouseAction::Press, Some(MouseButton::WheelDown), 0., 0.), "\x1b[<65;1;1M");
+        assert_eq!(report(&mut core, MouseAction::Motion, None, 1., 1.), "", "click tracking sends no motion");
     }
 
     #[test]
-    fn legacy_encoding_offsets_by_32_and_releases_as_button_3() {
-        let mode = TermMode::MOUSE_REPORT_CLICK;
-        assert_eq!(encode(mode, MouseAction::Press, 2, false, 0, 9).as_deref(), Some("\x1b[M\"!*"));
-        assert_eq!(encode(mode, MouseAction::Release, 2, false, 0, 9).as_deref(), Some("\x1b[M#!*"));
-        assert_eq!(encode(mode, MouseAction::Press, 0, false, 300, 0), None);
-        assert!(reports(mode, false, false));
-        assert!(!reports(mode, true, false) && !reports(mode, false, true));
+    fn drag_and_any_motion_modes() {
+        let mut core = core(100, 25);
+        core.write(b"\x1b[?1002h\x1b[?1006h");
+        assert_eq!(report(&mut core, MouseAction::Motion, Some(MouseButton::Left), 2., 3.), "\x1b[<32;3;4M");
+        assert_eq!(report(&mut core, MouseAction::Motion, None, 5., 3.), "", "drags only");
+        core.write(b"\x1b[?1003h");
+        assert!(core.any_event_mouse());
+        assert_eq!(report(&mut core, MouseAction::Motion, None, 0., 0.), "\x1b[<35;1;1M");
+    }
+
+    #[test]
+    fn legacy_reports_offset_by_32_and_release_as_button_3() {
+        let mut core = core(100, 25);
+        core.write(b"\x1b[?1000h");
+        assert_eq!(report(&mut core, MouseAction::Press, Some(MouseButton::Right), 0., 9.), "\x1b[M\"!*");
+        assert_eq!(report(&mut core, MouseAction::Release, Some(MouseButton::Right), 0., 9.), "\x1b[M#!*");
+        let shift = gpui_kit::Modifiers { shift: true, ..Default::default() };
+        assert!(reports(true, Default::default()) && !reports(true, shift) && !reports(false, Default::default()));
+    }
+
+    #[test]
+    fn repeated_motion_drops_until_another_action_resets_it() {
+        let (send, last) = resolve(MouseAction::Motion, "\x1b[<35;8;4M", "");
+        assert!(send);
+        let (send, last) = resolve(MouseAction::Motion, "\x1b[<35;8;4M", &last);
+        assert!(!send);
+        let (send, last) = resolve(MouseAction::Press, "\x1b[<0;8;4M", &last);
+        assert!(send && last.is_empty());
+        assert!(resolve(MouseAction::Motion, "\x1b[<35;8;4M", &last).0);
     }
 }

@@ -107,7 +107,7 @@ fn web_key(key: &str) -> &str {
 
 /// `US_SHIFTED_TO_UNSHIFTED_KEYS`: GPUI on Windows reports Shift+4 as `$` with Shift
 /// consumed, where the web still sees `Digit4` with Shift held.
-fn unshifted(key: &str) -> Option<&'static str> {
+pub(super) fn unshifted(key: &str) -> Option<&'static str> {
     const PAIRS: [(&str, &str); 21] = [
         ("!", "1"),
         ("@", "2"),

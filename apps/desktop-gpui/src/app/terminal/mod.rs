@@ -2,10 +2,13 @@
 //! per-thread terminals in split groups, the session sidebar, resizing, and
 //! the `subscribeTerminalMetadata` labels and running indicators.
 
+mod core;
 mod grid;
+mod key_codes;
 mod keys;
 mod layout;
 mod links;
+mod model;
 mod mouse;
 mod panel;
 mod scrollbar;
@@ -36,11 +39,6 @@ use super::titlebar::icon;
 use super::{Target, Workspace};
 use crate::rpc::RpcClient;
 use crate::theme::{self, Tokens};
-
-/// A row count as an alacritty `Line` offset; grids hold far fewer than `i32::MAX` rows.
-fn line_count(rows: usize) -> i32 {
-    i32::try_from(rows).unwrap_or(i32::MAX)
-}
 
 gpui_kit::actions!(terminal, [ToggleTerminal, SplitTerminal, SplitTerminalVertical, NewTerminal, CloseTerminal]);
 

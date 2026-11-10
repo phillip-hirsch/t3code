@@ -12,6 +12,14 @@ it once upstream has an equivalent), and update the versions here and in `../Car
 gpui-kit's `gpui-pre-platform` pins). Each patch was committed separately from its unmodified
 copy, so `git log -p -- vendor/<name>` shows it.
 
+## Not vendored: libghostty-vt needs Zig 0.15.2
+
+The terminal links the crates.io `libghostty-vt` crate. Its `libghostty-vt-sys` build script
+clones Ghostty at the crate's pinned commit and builds it with `zig build`, so every platform needs
+Zig 0.15.2 on `PATH`, and the first build of a target directory needs network (a few minutes; later
+builds reuse it). On macOS 27 or newer, install Zig with Homebrew (the formula that provides
+0.15.2, such as `brew install zig@0.15`): the ziglang.org 0.15.2 download fails to link there.
+
 ## gpui-pre 0.3.11
 
 GPUI's core (Zed's `gpui`), which gpui-kit re-exports.
@@ -112,6 +120,22 @@ bounds and sizes stay in the platform's units. Files:
 - `src/geometry.rs`: `Pixels::scale_down`.
 - Test in `window.rs`: `ui_scale_scales_the_interface_against_the_platform_window`.
 
+**Key events carry the platform's code for their physical key.** The terminal encodes keys from
+the physical key the way the web does from `KeyboardEvent.code`: a release matches its press on
+any layout, and keypad keys stay keypad keys. 0.3.11's keystrokes carry only a layout-dependent
+name and the typed character (a keypad `1` looks like the main row's). A field on `KeyDownEvent`
+would break every crate that builds one, so the patch adds `PlatformWindow::native_key` (default:
+nothing), which each platform answers for the key event it is dispatching, and
+`Window::native_key`, which reads it. `NativeKey` holds a `NativeKeyCode` (the Windows scan code
+with the extended bit, the XKB keycode, or the macOS `keyCode`), whether Num Lock was on, which
+the terminal reports to Kitty programs as the web does from `getModifierState("NumLock")`, and
+the character the key types without modifiers on the current layout, which Electron reads from
+its keyboard layout map (German Shift+7 is the key `7` typing `/`). Files:
+
+- `src/platform/keystroke.rs`: `NativeKeyCode` and `NativeKey`.
+- `src/platform.rs`: the trait method.
+- `src/window.rs`: `Window::native_key`.
+
 The crate's tests need `--features test-support`; run them from a scratch copy outside this
 repository (`cargo test --features test-support --lib`). The copy needs the published crate's
 missing pieces: put it two levels below a folder whose `assets/fonts/ibm-plex-sans` and
@@ -134,6 +158,18 @@ the environment variable still works. Files:
 - `src/platform.rs`: the `DIRECT_COMPOSITION_DISABLED` flag, its setter, and the check in `WindowsPlatform::new`.
 - `src/gpui_windows.rs`: exports the setter.
 
+**Key events carry the platform's code for their physical key** (see gpui-pre's patch of that
+name). `handle_key_event` records the scan code of every key message from its `lparam` (bits
+16-23, with `0xE000` for the extended bit 24), Num Lock from the keyboard state `process_key`
+already reads with `GetKeyboardState`, and the key's unmodified character from the
+`MapVirtualKeyW(MAPVK_VK_TO_CHAR)` lookup `get_key_from_vkey` already makes for key names, now run
+for every key message. No new `unsafe`. Files:
+
+- `src/events.rs`: `native_key_code`, called in `handle_key_event`; `parse_normal_key` and
+  `process_key` hand back Num Lock.
+- `src/keyboard.rs`: `layout_char`, which lowercases `get_key_from_vkey`'s character.
+- `src/window.rs`: `WindowsWindowState::last_native_key` and `native_key`.
+
 ## gpui-pre-linux 0.3.11
 
 GPUI's Linux platform (Zed's `gpui_linux`), which gpui-kit pulls in through `gpui-pre-platform`.
@@ -150,6 +186,33 @@ so saved bounds include no shadow. The app keeps its resize edges for that case
 (`render_resize_edges` in `src/app/titlebar.rs`). Files:
 
 - `src/linux/x11/window.rs`: `request_decorations`, `window_decorations` and `set_client_inset`.
+
+**Key events carry the platform's code for their physical key** (see gpui-pre's patch of that
+name). Each key press, repeat and release records its XKB keycode, Num Lock (the XKB state's
+`Mod2`, read like Caps Lock) and the character of the key's level-0 keysym in its active layout,
+through xkbcommon's safe keymap API; an IBus commit sent as a key has none of them. Files:
+
+- `src/linux/platform.rs`: `native_key_from_xkb`, beside `capslock_from_xkb`.
+- `src/linux/x11/client.rs`, `src/linux/x11/window.rs`: `X11ClientState::native_key`, set in
+  the `KeyPress` and `KeyRelease` arms, and `native_key`.
+- `src/linux/wayland/client.rs`, `src/linux/wayland/window.rs`: `WaylandClientState::native_key`,
+  set in the keyboard `Key` event, the repeat timer and `CommitString`, and `native_key`.
+
+## gpui-pre-macos 0.3.11
+
+GPUI's macOS platform (Zed's `gpui_macos`), which gpui-kit pulls in through `gpui-pre-platform`.
+
+**Key events carry the platform's code for their physical key** (see gpui-pre's patch of that
+name). `platform_input_from_native` already holds the `NSEvent`; for a key down or up it also
+returns its `keyCode` (a safe `objc2-app-kit` call `parse_keystroke` already makes) and the
+unmodified character `parse_keystroke` already translates with `chars_for_modified_key(_,
+NO_MOD)`, and `handle_key_event` stores them in the window state before dispatching. No new
+`unsafe`. Mac keyboards have no Num Lock, so none is reported. Files:
+
+- `src/events.rs`: `platform_input_from_native` returns the `NativeKey` beside the input;
+  `parse_keystroke` hands back the unmodified character.
+- `src/window.rs`: `MacWindowState::native_key`, set in `handle_key_event`; `native_key`; the
+  view-event caller drops the `NativeKey`.
 
 ## lb-wry 0.53.3
 
