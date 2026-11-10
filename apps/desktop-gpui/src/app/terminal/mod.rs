@@ -1677,7 +1677,7 @@ mod tests {
         assert_eq!(terminals.owner(&drafts, &key), drafts.target(&draft), "not the thread it will launch");
         let other = DrawerKey::new("a", "other");
         assert_eq!(terminals.owner(&drafts, &other), Some(Target::Thread { env: "a".into(), id: "other".into() }));
-        drafts.promote(&draft);
+        drafts.promote(&draft, Target::Thread { env: "a".into(), id: future.clone() });
         assert_eq!(terminals.owner(&drafts, &key), Some(Target::Thread { env: "a".into(), id: future }));
         assert_eq!(terminals.owner(&drafts, &key.legacy()), None, "an older build's drawer has no environment");
     }
