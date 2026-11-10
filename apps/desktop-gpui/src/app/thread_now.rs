@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 use super::side_chat::ChatPane;
 use super::{Workspace, new_id};
 use crate::inbox::{self, Facts};
+use crate::model::{ScopedId, ThreadShell};
 use crate::theme::Tokens;
 use crate::thread_now::{self, NowLine, StatusLine};
 use crate::timeline::Row;
@@ -26,16 +27,19 @@ use crate::timeline::Row;
 /// `BACKGROUND_WORK_STOP_RETRY_AFTER_MS`: the Claude adapter forces a stuck query closed after 10 s.
 const BACKGROUND_STOP_RETRY: Duration = Duration::from_secs(10);
 
+/// A thread's environment and id; ids repeat across environments.
+type Key = (SharedString, String);
+
 #[derive(Default)]
 pub(super) struct NowUi {
     /// The open thread's footer; a side chat's is on its view.
     main: NowFooter,
     /// Threads a Force stop is in flight for.
-    force_stopping: HashSet<String>,
+    force_stopping: HashSet<Key>,
     /// The background Stops sent, by thread; each stays pending while its tasks run.
-    background_stops: HashMap<String, BackgroundStop>,
+    background_stops: HashMap<Key, BackgroundStop>,
     /// Threads a wake or un-settle is in flight for.
-    status_busy: HashSet<String>,
+    status_busy: HashSet<Key>,
 }
 
 /// One chat's footer lines and the clock that moves their labels.
@@ -54,13 +58,17 @@ struct BackgroundStop {
 impl NowUi {
     /// `isBackgroundWorkStopPending` for one thread, given the tasks its shell still lists: an
     /// accepted Stop stays pending while its tasks run.
-    fn background_stop_pending<'a>(&self, thread_id: &str, listed: impl IntoIterator<Item = &'a str>) -> bool {
-        let Some(stop) = self.background_stops.get(thread_id) else { return false };
+    fn background_stop_pending<'a>(&self, key: &Key, listed: impl IntoIterator<Item = &'a str>) -> bool {
+        let Some(stop) = self.background_stops.get(key) else { return false };
         !stop.accepted || listed.into_iter().any(|task| stop.task_ids.iter().any(|id| id == task))
     }
 }
 
 impl Workspace {
+    fn now_shell(&self, (env, thread_id): &Key) -> Option<&ThreadShell> {
+        self.shell.thread(&ScopedId::new(env.clone(), thread_id))
+    }
+
     fn now_footer_mut(&mut self, pane: ChatPane) -> Option<&mut NowFooter> {
         match pane {
             ChatPane::Main => Some(&mut self.now.main),
@@ -70,17 +78,18 @@ impl Workspace {
 
     /// The pane's lines, in the web's order: what needs you, its work, its goal, its status.
     fn now_lines(&self, pane: ChatPane) -> Vec<Rc<NowLine>> {
-        let (Some((_, thread_id)), Some(projection)) = (self.pane_thread(pane), self.pane_projection(pane)) else {
+        let (Some(key), Some(projection)) = (self.pane_thread(pane), self.pane_projection(pane)) else {
             return Vec::new();
         };
-        let thread_id = &thread_id;
-        let Some(shell) = self.shell.threads.iter().find(|t| &t.id == thread_id) else { return Vec::new() };
+        let Some(shell) = self.now_shell(&key) else { return Vec::new() };
+        let (env, thread_id) = (&key.0, &key.1);
         let working = projection.is_running();
         let stop = thread_now::run_stop(&projection.runs, &projection.turn_items);
         // The interrupt path also accepts a completed run while its provider still has background work.
         let tasks = if working { &[][..] } else { &shell.pending_background_tasks[..] };
         let stop = stop.filter(|stop| !stop.background || !tasks.is_empty());
-        let children = inbox::child_thread_inputs(&self.shell.threads, thread_id);
+        let mut children = inbox::child_thread_inputs(&self.shell.threads, thread_id);
+        children.retain(|child| &child.environment_id == env);
         let parent_awaiting = shell.pending_runtime_request.is_some() || !projection.pending_approvals().is_empty();
         let child_input = (!children.is_empty() && !parent_awaiting).then(|| NowLine::ChildInput {
             title: thread_now::child_inputs_title(&children).into(),
@@ -161,8 +170,9 @@ impl Workspace {
         if !self.server_info().capability("threadForceStop") {
             return;
         }
-        let Some((client, _, thread_id)) = self.pane_client(pane, cx) else { return };
-        if !self.now.force_stopping.insert(thread_id.clone()) {
+        let Some((client, env, thread_id)) = self.pane_client(pane, cx) else { return };
+        let key = (env, thread_id.clone());
+        if !self.now.force_stopping.insert(key.clone()) {
             return;
         }
         cx.notify();
@@ -170,7 +180,7 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("orchestration.forceStopThread", input).await;
             let _ = this.update_in(cx, |this, window, cx| {
-                this.now.force_stopping.remove(&thread_id);
+                this.now.force_stopping.remove(&key);
                 match result {
                     Err(error) => window.push_notification(
                         Notification::error(error.to_string()).title("Could not force stop the agent"),
@@ -190,11 +200,12 @@ impl Workspace {
 
     /// Stops the background work a finished run left running (`handleStopBackgroundWork`).
     fn stop_background_work(&mut self, pane: ChatPane, cx: &mut Context<Self>) {
-        let Some((env, thread_id)) = self.pane_thread(pane) else { return };
-        if self.background_stop_pending(&thread_id) {
+        let Some(key) = self.pane_thread(pane) else { return };
+        if self.background_stop_pending(&key) {
             return;
         }
-        let Some(shell) = self.shell.threads.iter().find(|t| t.id == thread_id) else { return };
+        let Some(shell) = self.now_shell(&key) else { return };
+        let (env, thread_id) = key.clone();
         let task_ids = shell.pending_background_tasks.iter().map(|t| t.task_id.clone()).collect();
         let command = if self.server_info().capability("threadStop") {
             json!({"type": "thread.stop", "commandId": new_id(), "threadId": thread_id})
@@ -204,28 +215,28 @@ impl Workspace {
         };
         let Some((client, ..)) = self.pane_client(pane, cx) else { return };
         let stop = BackgroundStop { task_ids, accepted: false, _retry: None };
-        self.now.background_stops.insert(thread_id.clone(), stop);
+        self.now.background_stops.insert(key.clone(), stop);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = client.request("orchestration.dispatchCommand", command).await;
             let _ = this.update(cx, |this, cx| {
                 match result {
                     Err(error) => {
-                        this.now.background_stops.remove(&thread_id);
+                        this.now.background_stops.remove(&key);
                         if this.pane_shows(pane, &env, &thread_id) {
                             this.error = Some(error.to_string().into());
                         }
                     }
                     Ok(_) => {
-                        let retry_thread = thread_id.clone();
+                        let retry_key = key.clone();
                         let retry = cx.spawn(async move |this, cx| {
                             cx.background_executor().timer(BACKGROUND_STOP_RETRY).await;
                             let _ = this.update(cx, |this, cx| {
-                                this.now.background_stops.remove(&retry_thread);
+                                this.now.background_stops.remove(&retry_key);
                                 cx.notify();
                             });
                         });
-                        if let Some(stop) = this.now.background_stops.get_mut(&thread_id) {
+                        if let Some(stop) = this.now.background_stops.get_mut(&key) {
                             stop.accepted = true;
                             stop._retry = Some(retry);
                         }
@@ -237,9 +248,9 @@ impl Workspace {
         .detach();
     }
 
-    fn background_stop_pending(&self, thread_id: &str) -> bool {
-        let tasks = self.shell.threads.iter().find(|t| t.id == thread_id).map(|t| &t.pending_background_tasks[..]);
-        self.now.background_stop_pending(thread_id, tasks.unwrap_or_default().iter().map(|t| t.task_id.as_str()))
+    fn background_stop_pending(&self, key: &Key) -> bool {
+        let tasks = self.now_shell(key).map(|t| &t.pending_background_tasks[..]);
+        self.now.background_stop_pending(key, tasks.unwrap_or_default().iter().map(|t| t.task_id.as_str()))
     }
 
     /// `sendStandaloneCommand`: a `/goal` command sent as its own message.
@@ -279,11 +290,13 @@ impl Workspace {
 
     /// Wake now / Un-settle from the status line, with the web's failure toasts.
     fn change_status(&mut self, pane: ChatPane, kind: &'static str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((client, _, thread_id)) = self.pane_client(pane, cx) else { return };
-        if self.now.status_busy.contains(&thread_id) {
+        let Some((client, env, thread_id)) = self.pane_client(pane, cx) else { return };
+        let key = (env, thread_id);
+        if self.now.status_busy.contains(&key) {
             return;
         }
-        let Some(shell) = self.shell.threads.iter().find(|t| t.id == thread_id) else { return };
+        let Some(shell) = self.now_shell(&key) else { return };
+        let thread_id = &key.1;
         // A snooze the usage-limit recovery set is undone through the recovery itself.
         let recovery = shell.limit_recovery.as_ref();
         let recovery_snooze = kind == "thread.unsnooze"
@@ -299,12 +312,12 @@ impl Workspace {
             None => json!({"type": kind, "commandId": new_id(), "threadId": thread_id, "reason": "user"}),
         };
         let title = if kind == "thread.unsnooze" { "Failed to wake thread" } else { "Failed to un-settle thread" };
-        self.now.status_busy.insert(thread_id.clone());
+        self.now.status_busy.insert(key.clone());
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("orchestration.dispatchCommand", command).await;
             let _ = this.update_in(cx, |this, window, cx| {
-                this.now.status_busy.remove(&thread_id);
+                this.now.status_busy.remove(&key);
                 if let Err(error) = result {
                     window.push_notification(Notification::error(error.to_string()).title(title), cx);
                 }
@@ -316,10 +329,10 @@ impl Workspace {
 
     /// `useAcknowledgeThreadWoke`: marks the thread visited at the time it woke.
     fn acknowledge_pane_woke(&mut self, pane: ChatPane, woke_at: SharedString, cx: &mut Context<Self>) {
-        let Some((_, _, thread_id)) = self.pane_client(pane, cx) else { return };
+        let Some((client, _, thread_id)) = self.pane_client(pane, cx) else { return };
         let command =
             json!({"type": "thread.visit", "commandId": new_id(), "threadId": thread_id, "visitedAt": woke_at});
-        self.dispatch(command, cx);
+        self.dispatch_on(client, vec![command], cx);
     }
 }
 
@@ -449,7 +462,7 @@ pub(super) fn now_row(
 ) -> AnyElement {
     let Some(workspace) = this.upgrade() else { return div().into_any_element() };
     let workspace = workspace.read(cx);
-    let thread_id = workspace.pane_thread(pane).map(|(_, id)| id).unwrap_or_default();
+    let key = workspace.pane_thread(pane).unwrap_or_default();
     let (fg, muted) = (t.foreground, t.muted_foreground);
     let act = |f: fn(&mut Workspace, ChatPane, &mut Window, &mut Context<Workspace>)| {
         let this = this.clone();
@@ -460,7 +473,11 @@ pub(super) fn now_row(
     let open = |id: SharedString| {
         let this = this.clone();
         move |window: &mut Window, cx: &mut App| {
-            let _ = this.update(cx, |workspace, cx| workspace.select_thread(id.to_string(), window, cx));
+            let _ = this.update(cx, |workspace, cx| {
+                // Child threads live on their parent's environment.
+                let Some((env, _)) = workspace.pane_thread(pane) else { return };
+                workspace.select_thread_in(env, id.to_string(), window, cx);
+            });
         }
     };
     let mut actions: Vec<AnyElement> = Vec::new();
@@ -496,7 +513,7 @@ pub(super) fn now_row(
         NowLine::RunStop(stop) => {
             actions.push(clock(stop.requested_at_ms, &mut texts));
             if stop.unresponsive && workspace.server_info().capability("threadForceStop") {
-                let stopping = workspace.now.force_stopping.contains(&thread_id);
+                let stopping = workspace.now.force_stopping.contains(&key);
                 let run_id = stop.run_id.clone();
                 let this = this.clone();
                 let label = if stopping { "Force stopping..." } else { "Force stop" };
@@ -525,7 +542,7 @@ pub(super) fn now_row(
                 texts.push(("Open".into(), FontWeight::MEDIUM));
                 actions.push(inline_button("now-open-background", "Open", muted, fg, false, open(child.clone())));
             }
-            let stopping = workspace.background_stop_pending(&thread_id);
+            let stopping = workspace.background_stop_pending(&key);
             let label = if stopping { "Stopping..." } else { "Stop" };
             texts.push((label.into(), FontWeight::MEDIUM));
             actions.push(inline_button(
@@ -566,7 +583,7 @@ pub(super) fn now_row(
             (IconName::Target, muted, goal.title.clone(), Some(div().child(goal.objective.clone()).into_any_element()))
         }
         NowLine::Status(status) => {
-            let busy = workspace.now.status_busy.contains(&thread_id);
+            let busy = workspace.now.status_busy.contains(&key);
             let (label, _) = status.label(super::sidebar::now_ms());
             let (icon, action): (IconName, AnyElement) = match status {
                 StatusLine::Snoozed { .. } => (
@@ -665,12 +682,14 @@ mod tests {
     #[test]
     fn background_stops_are_pending_per_thread() {
         let mut ui = NowUi::default();
+        let key = |env: &str, id: &str| (SharedString::from(env.to_owned()), id.to_owned());
         let stop = |accepted| BackgroundStop { task_ids: vec!["t1".into()], accepted, _retry: None };
-        ui.background_stops.insert("main".into(), stop(true));
-        ui.background_stops.insert("side".into(), stop(false));
-        assert!(ui.background_stop_pending("main", ["t1"]), "its task still runs");
-        assert!(!ui.background_stop_pending("main", ["t2"]), "its tasks ended");
-        assert!(ui.background_stop_pending("side", []), "not accepted yet");
-        assert!(!ui.background_stop_pending("other", ["t1"]), "another thread's Stop is not this one's");
+        ui.background_stops.insert(key("a", "main"), stop(true));
+        ui.background_stops.insert(key("a", "side"), stop(false));
+        assert!(ui.background_stop_pending(&key("a", "main"), ["t1"]), "its task still runs");
+        assert!(!ui.background_stop_pending(&key("a", "main"), ["t2"]), "its tasks ended");
+        assert!(ui.background_stop_pending(&key("a", "side"), []), "not accepted yet");
+        assert!(!ui.background_stop_pending(&key("a", "other"), ["t1"]), "another thread's Stop is not this one's");
+        assert!(!ui.background_stop_pending(&key("b", "side"), []), "nor is the same id's on another environment");
     }
 }

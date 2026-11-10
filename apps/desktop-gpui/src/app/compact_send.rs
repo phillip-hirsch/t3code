@@ -111,7 +111,7 @@ impl Workspace {
         !compactable
             || self.client().is_none()
             || projection.is_running()
-            || self.sending
+            || self.target_sending()
             || self.target_rewinding()
             || !projection.pending_approvals().is_empty()
             || !projection.pending_user_inputs().is_empty()

@@ -23,10 +23,11 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use super::attachments::QuestionDraft;
+use super::composer::merge_prompt;
 use super::right_panel::Surface;
 use super::titlebar::icon;
 use super::{Target, Workspace, new_id};
-use crate::model::{ModelSelection, Run, ThreadProjection, ThreadShell, ThreadState};
+use crate::model::{ModelSelection, Run, ScopedId, ThreadProjection, ThreadShell, ThreadState};
 use crate::rpc::RpcClient;
 use crate::theme::{self, Tokens};
 use crate::timeline::{self, Row};
@@ -34,7 +35,7 @@ use crate::timeline::{self, Row};
 const PLACEHOLDER: &str = "Ask a side question";
 
 /// `threadOperationFailure`: the connection lacks `orchestration:operate`.
-const NOT_OPERATE: &str = "This connection cannot change threads.";
+pub(super) const NOT_OPERATE: &str = "This connection cannot change threads.";
 
 /// Which chat a footer row and its controls act on: the open thread's, or the side chat tab's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -66,12 +67,13 @@ pub(super) struct SideChatView {
     composer: Entity<TextareaState>,
     /// Tracked so typing only re-renders when Send and Stop trade places.
     empty: bool,
-    sending: bool,
     pub(super) queue: super::queue::QueueUi,
     pub(super) now: super::thread_now::NowFooter,
     /// The question card's drafts for the side chat's first pending question; the editor holds
     /// its custom answer meanwhile.
     question: Option<QuestionDraft>,
+    /// The question's pending auto-advance after an option pick; dropping it cancels it.
+    question_advance: Option<Task<()>>,
     /// Repaints the footer's and timeline's clocks once a second while one runs.
     _tick: Option<Task<()>>,
     _subscription: Option<Task<()>>,
@@ -82,11 +84,6 @@ impl SideChatView {
     fn is(&self, env: &str, thread_id: &str) -> bool {
         self.env == env && self.thread_id == thread_id
     }
-
-    /// The composer, unless a message is being sent from it.
-    pub(super) fn ready_composer(&self) -> Option<&Entity<TextareaState>> {
-        (!self.sending).then_some(&self.composer)
-    }
 }
 
 #[derive(Default)]
@@ -94,10 +91,13 @@ pub(super) struct SideChats {
     pub(super) view: Option<SideChatView>,
     /// A side chat is being forked; another start waits for it (`pendingRef`).
     starting: bool,
-    bringing_back: bool,
-    deleting: bool,
-    /// Unsent composer text of side chats not on screen. Ids repeat across environments.
-    drafts: HashMap<Key, String>,
+    /// Side chats with a message on its way, which outlive their tab's view.
+    sending: HashSet<Key>,
+    /// Side chats being brought back or deleted, each pane's own (`bringingBack`, `deleting`).
+    bringing_back: HashSet<Key>,
+    deleting: HashSet<Key>,
+    /// What side chats not on screen keep of their composer. Ids repeat across environments.
+    drafts: HashMap<Key, SideDraft>,
     /// The parent composer's model pick for a side chat that started without a question; its
     /// first message runs on it (`setModelSelection` on the side chat's draft).
     models: HashMap<Key, ModelSelection>,
@@ -106,7 +106,46 @@ pub(super) struct SideChats {
 /// A side chat: its environment and thread id.
 type Key = (SharedString, String);
 
+/// What a side chat not on screen keeps of its composer.
+enum SideDraft {
+    Prompt(String),
+    /// An open question card's answers and progress; its prompt is the one it set aside.
+    Question(Box<QuestionDraft>),
+}
+
+impl SideDraft {
+    /// What a released view keeps: its open question, else its composer's text.
+    fn kept(question: Option<QuestionDraft>, text: String) -> Option<Self> {
+        match question {
+            Some(question) => Some(Self::Question(Box::new(question))),
+            None => (!text.is_empty()).then_some(Self::Prompt(text)),
+        }
+    }
+
+    /// The composer's text and question card once the side chat shows again: a card brings
+    /// back the typed answer of the question it was on.
+    fn restore(self) -> (String, Option<QuestionDraft>) {
+        match self {
+            Self::Prompt(text) => (text, None),
+            Self::Question(question) => {
+                let active = &question.active().id;
+                let text = question.drafts.get(active).and_then(|draft| draft.custom.clone()).unwrap_or_default();
+                (text, Some(*question))
+            }
+        }
+    }
+}
+
 impl SideChats {
+    fn sending(&self, env: &str, thread_id: &str) -> bool {
+        self.sending.iter().any(|(e, id)| e == env && id == thread_id)
+    }
+
+    /// The composer on screen, unless a message is being sent from it.
+    pub(super) fn ready_composer(&self) -> Option<&Entity<TextareaState>> {
+        self.view.as_ref().filter(|view| !self.sending(&view.env, &view.thread_id)).map(|view| &view.composer)
+    }
+
     /// Drops the side chat's stream with the socket it ran on; it subscribes again on reconnect.
     pub(super) fn disconnect(&mut self) {
         if let Some(view) = &mut self.view {
@@ -125,21 +164,29 @@ impl SideChats {
         }
     }
 
+    /// A failed send's text, back with the side chat's saved draft ahead of anything kept since.
+    fn give_back(&mut self, key: Key, text: String) {
+        match self.drafts.entry(key).or_insert_with(|| SideDraft::Prompt(String::new())) {
+            SideDraft::Prompt(prompt) => *prompt = merge_prompt(text, prompt),
+            SideDraft::Question(question) => question.prompt = merge_prompt(text, &question.prompt),
+        }
+    }
+
     /// Releases the view on screen, keeping its unsent text for when it shows again. A queued
     /// message's edit ends here; the side chat keeps its own draft.
     fn release_view(&mut self, cx: &App) {
         let Some(mut view) = self.view.take() else { return };
-        let text = match (view.question.take(), view.queue.take_edit_draft()) {
-            (Some(question), _) => question.prompt,
+        let question = view.question.take();
+        let text = match (&question, view.queue.take_edit_draft()) {
+            (Some(_), _) => String::new(),
             (None, Some((text, ..))) => text,
             (None, None) => view.composer.read(cx).value().to_string(),
         };
         let key = (view.env, view.thread_id);
-        if text.is_empty() {
-            self.drafts.remove(&key);
-        } else {
-            self.drafts.insert(key, text);
-        }
+        match SideDraft::kept(question, text) {
+            Some(draft) => self.drafts.insert(key, draft),
+            None => self.drafts.remove(&key),
+        };
     }
 }
 
@@ -232,18 +279,29 @@ impl Workspace {
         self.shell.threads.iter().find(|t| t.id == thread_id)
     }
 
+    /// A side chat's key: it lives on the open thread's environment.
+    fn side_key(&self, thread_id: &str) -> Option<Key> {
+        Some((self.active_environment()?.clone(), thread_id.to_owned()))
+    }
+
+    /// A side chat or its parent: on the open thread's environment, as thread ids repeat across them.
+    fn side_shell(&self, thread_id: &str) -> Option<&ThreadShell> {
+        self.shell.thread(&ScopedId::new(self.active_environment()?.clone(), thread_id))
+    }
+
     /// The open thread as a side chat source, if any.
     fn side_chat_origin(&self) -> Option<Origin> {
         Some(match self.target.as_ref()? {
             Target::Draft { .. } => Origin::Draft,
-            Target::Thread { id, .. } => self.shell_thread(id).map_or(Origin::Thread, shell_origin),
+            Target::Thread { id, .. } => self.side_shell(id).map_or(Origin::Thread, shell_origin),
         })
     }
 
     /// `sideChatsOffered`: the launcher lists Side chat; whether it can start is
-    /// [`Self::side_chat_disabled_reason`].
+    /// [`Self::side_chat_disabled_reason`]. Forking needs `orchestration:operate` (`canOperateThread`).
     pub(super) fn side_chats_offered(&self) -> bool {
         matches!(self.side_chat_origin(), Some(Origin::Thread | Origin::Draft))
+            && self.target.as_ref().is_some_and(|target| self.can_operate(target.environment()))
             && self.server_info().capability("sideChats")
     }
 
@@ -259,7 +317,7 @@ impl Workspace {
         let capability = self.client().map(|_| self.server_info().capability("sideChats"));
         let pending = match &self.target {
             Some(Target::Thread { id, .. }) => worktree_pending(
-                self.shell_thread(id).and_then(|t| t.worktree_path.as_deref()),
+                self.side_shell(id).and_then(|t| t.worktree_path.as_deref()),
                 self.open_projection().map_or(&[], |p| p.runs.as_slice()),
             ),
             _ => false,
@@ -279,9 +337,13 @@ impl Workspace {
         if self.side_chat_disabled_reason().is_some() || self.side_chat.starting {
             return;
         }
-        let (Some(client), Some(Target::Thread { env, id: source })) = (self.client(), self.target.clone()) else {
+        let Some(Target::Thread { env, id: source }) = self.target.clone() else { return };
+        if !self.can_operate(&env) {
+            self.error = Some(NOT_OPERATE.into());
+            cx.notify();
             return;
-        };
+        }
+        let Some(client) = self.env_client(&env) else { return };
         let origin = Target::Thread { env, id: source.clone() };
         self.side_chat.starting = true;
         let target = new_id();
@@ -361,6 +423,10 @@ impl Workspace {
             warn("Side chat not started", reason, window, cx);
             return true;
         }
+        // Where side chats aren't offered, the text goes out as a message (`onSideChat` unset).
+        if !self.side_chats_offered() {
+            return false;
+        }
         if self.has_attachments() {
             warn("Side chats take text only", "Remove the attachments and context, then send it again.", window, cx);
             return true;
@@ -382,7 +448,7 @@ impl Workspace {
 
     /// A side chat's tab: its shell title, and the dot for a run or a request.
     pub(super) fn side_chat_tab(&self, thread_id: &str) -> (SharedString, Option<&'static str>) {
-        let Some(shell) = self.shell_thread(thread_id) else { return ("Side chat".into(), None) };
+        let Some(shell) = self.side_shell(thread_id) else { return ("Side chat".into(), None) };
         let requests = crate::inbox::child_requests(&self.shell.threads);
         let state = tab_state(shell, crate::inbox::Facts::new(shell, &requests));
         (shell.title.clone().into(), state)
@@ -390,11 +456,14 @@ impl Workspace {
 
     /// `releaseSurfaceResources` for a side chat: the server keeps one that ran or got a message.
     pub(super) fn release_side_chat(&mut self, thread_id: &str, cx: &mut Context<Self>) {
-        if let Some(env) = self.active_environment() {
-            self.side_chat.models.remove(&(env.clone(), thread_id.to_owned()));
-        }
-        if self.shell_thread(thread_id).is_some() {
-            self.dispatch(delete_command(thread_id, true), cx);
+        let Some(env) = self.active_environment().cloned() else { return };
+        self.side_chat.models.remove(&(env.clone(), thread_id.to_owned()));
+        // Without `orchestration:operate` the server keeps it, as the web leaves it.
+        if self.side_shell(thread_id).is_some()
+            && self.can_operate(&env)
+            && let Some(client) = self.env_client(&env)
+        {
+            self.dispatch_on(client, vec![delete_command(thread_id, true)], cx);
         }
     }
 
@@ -415,7 +484,8 @@ impl Workspace {
         self.diagrams.forget_sources(ChatPane::Side);
         self.sync_side_markdown();
         let (Some(thread_id), Some(client), Some(env)) = (shown, client, env) else { return };
-        let draft = self.side_chat.drafts.remove(&(env.clone(), thread_id.to_owned())).unwrap_or_default();
+        let kept = self.side_chat.drafts.remove(&(env.clone(), thread_id.to_owned()));
+        let (draft, question) = kept.map(SideDraft::restore).unwrap_or_default();
         let empty = draft.trim().is_empty();
         let composer = cx.new(|cx| {
             let mut state =
@@ -472,10 +542,10 @@ impl Workspace {
             scroller,
             composer,
             empty,
-            sending: false,
             queue: Default::default(),
             now: Default::default(),
-            question: None,
+            question,
+            question_advance: None,
             _tick: None,
             _subscription: Some(subscription),
             _events: events,
@@ -538,7 +608,7 @@ impl Workspace {
         }
         let Some(view) = self.side_chat.view.as_ref() else { return };
         let text = view.composer.read(cx).value().trim().to_owned();
-        if text.is_empty() || view.sending {
+        if text.is_empty() || self.side_chat.sending(&view.env, &view.thread_id) {
             return;
         }
         let projection = view.state.projection.as_ref();
@@ -554,9 +624,7 @@ impl Workspace {
         let command = turn_command(&view.thread_id, &text, running, follow_up, model);
         let Some((client, ..)) = self.pane_client(ChatPane::Side, cx) else { return };
         let origin = self.target.clone();
-        if let Some(view) = self.side_chat.view.as_mut() {
-            view.sending = true;
-        }
+        self.side_chat.sending.insert(key.clone());
         self.set_pane_text(ChatPane::Side, String::new(), window, cx);
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("orchestration.dispatchCommand", command).await;
@@ -564,12 +632,9 @@ impl Workspace {
                 if result.is_ok() {
                     this.side_chat.models.remove(&key);
                 }
-                if let Some(view) = this.side_chat.view.as_mut().filter(|v| v.is(&key.0, &key.1)) {
-                    view.sending = false;
-                    // Gives the text back rather than lose it.
-                    if result.is_err() && view.composer.read(cx).value().is_empty() {
-                        this.set_pane_text(ChatPane::Side, text.clone(), window, cx);
-                    }
+                this.side_chat.sending.remove(&key);
+                if result.is_err() {
+                    this.give_back_side_chat(key.clone(), text.clone(), window, cx);
                 }
                 if let Err(error) = result {
                     this.set_error_from(origin.as_ref(), error.to_string().into());
@@ -581,19 +646,36 @@ impl Workspace {
         cx.notify();
     }
 
-    fn stop_side_chat(&mut self, cx: &mut Context<Self>) {
-        if self.pane_client(ChatPane::Side, cx).is_none() {
+    /// A failed send's text back in its side chat, ahead of anything typed there since: in the
+    /// composer, set aside under an open question or queued message's edit, or kept until its tab
+    /// shows again.
+    fn give_back_side_chat(&mut self, key: Key, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.side_chat.view.as_mut().filter(|view| view.is(&key.0, &key.1)) else {
+            self.side_chat.give_back(key, text);
+            return;
+        };
+        if let Some(question) = &mut view.question {
+            question.prompt = merge_prompt(text, &question.prompt);
             return;
         }
+        if let Some((prompt, ..)) = view.queue.edit_draft_mut() {
+            *prompt = merge_prompt(text, prompt);
+            return;
+        }
+        let merged = merge_prompt(text, &view.composer.read(cx).value());
+        self.set_pane_text(ChatPane::Side, merged, window, cx);
+    }
+
+    fn stop_side_chat(&mut self, cx: &mut Context<Self>) {
+        let Some((client, _, thread_id)) = self.pane_client(ChatPane::Side, cx) else { return };
         let Some(projection) = self.side_chat_projection() else { return };
-        let thread_id = projection.thread.id.clone();
         let command = if self.server_info().capability("threadStop") {
             json!({"type": "thread.stop", "commandId": new_id(), "threadId": thread_id})
         } else {
             let Some(run) = projection.interruptible_run() else { return };
             json!({"type": "run.interrupt", "commandId": new_id(), "threadId": thread_id, "runId": run.id, "holdQueue": true})
         };
-        self.dispatch(command, cx);
+        self.dispatch_on(client, vec![command], cx);
     }
 
     /// Why Bring back is unavailable (`bringBackBlockedReason`), else the run it merges.
@@ -601,7 +683,7 @@ impl Workspace {
         if !self.side_chat_operable() {
             return Err(NOT_OPERATE);
         }
-        let parent_active = self.shell_thread(parent_id).is_some_and(|shell| {
+        let parent_active = self.side_shell(parent_id).is_some_and(|shell| {
             let requests = crate::inbox::child_requests(&self.shell.threads);
             crate::inbox::Facts::new(shell, &requests).runtime_status().is_some_and(crate::model::is_active_run_status)
         });
@@ -616,10 +698,10 @@ impl Workspace {
 
     fn bring_back(&mut self, parent_id: String, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
         let (Ok(run_id), Some(client)) = (self.bring_back_blocked(&parent_id), self.client()) else { return };
-        if self.side_chat.bringing_back {
+        let Some(key) = self.side_key(&thread_id) else { return };
+        if !self.side_chat.bringing_back.insert(key.clone()) {
             return;
         }
-        self.side_chat.bringing_back = true;
         let command = json!({
             "type": "thread.merge_back",
             "commandId": new_id(),
@@ -632,7 +714,7 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("orchestration.dispatchCommand", command).await;
             let _ = this.update_in(cx, |this, window, cx| {
-                this.side_chat.bringing_back = false;
+                this.side_chat.bringing_back.remove(&key);
                 let notification = match result {
                     Ok(_) => Notification::success("The main thread gets this side chat with your next message there.")
                         .title("Brought back"),
@@ -647,8 +729,9 @@ impl Workspace {
     }
 
     fn delete_side_chat(&mut self, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(title) = self.shell_thread(&thread_id).map(|t| t.title.clone()) else { return };
-        if self.side_chat.deleting || !self.side_chat_operable() {
+        let Some(title) = self.side_shell(&thread_id).map(|t| t.title.clone()) else { return };
+        let Some(key) = self.side_key(&thread_id) else { return };
+        if self.side_chat.deleting.contains(&key) || !self.side_chat_operable() {
             return;
         }
         let (Some(client), Some(origin)) = (self.client(), self.target.clone()) else { return };
@@ -666,13 +749,16 @@ This permanently clears its conversation history."
             {
                 return;
             }
-            let _ = this.update(cx, |this, cx| {
-                this.side_chat.deleting = true;
+            let started = this.update(cx, |this, cx| {
                 cx.notify();
+                this.side_chat.deleting.insert(key.clone())
             });
+            if !matches!(started, Ok(true)) {
+                return;
+            }
             let result = client.request("orchestration.dispatchCommand", delete_command(&thread_id, false)).await;
             let _ = this.update_in(cx, |this, window, cx| {
-                this.side_chat.deleting = false;
+                this.side_chat.deleting.remove(&key);
                 match result {
                     // Closing the tab keeps its unsent text, so the deleted chat's state goes after.
                     Ok(_) => {
@@ -704,12 +790,14 @@ This permanently clears its conversation history."
     ) -> AnyElement {
         let t = *theme::tokens(cx);
         let Some(Target::Thread { id: parent_id, .. }) = self.target.clone() else { return div().into_any_element() };
-        let shell = self.shell_thread(thread_id);
+        let shell = self.side_shell(thread_id);
         let title: SharedString = shell.map_or_else(|| "Side chat".into(), |s| s.title.clone().into());
         let blocked = self.bring_back_blocked(&parent_id);
         let tooltip: SharedString =
             blocked.as_ref().err().copied().unwrap_or("Adds this side chat to the main thread's next message.").into();
-        let can_bring_back = blocked.is_ok() && !self.side_chat.bringing_back;
+        let key = self.side_key(thread_id);
+        let busy = |set: &HashSet<Key>| key.as_ref().is_some_and(|key| set.contains(key));
+        let can_bring_back = blocked.is_ok() && !busy(&self.side_chat.bringing_back);
         let (bring_parent, bring_thread, delete_thread, close_thread) =
             (parent_id.clone(), thread_id.to_owned(), thread_id.to_owned(), thread_id.to_owned());
         let header = h_flex()
@@ -741,7 +829,7 @@ This permanently clears its conversation history."
                     .ghost()
                     .xsmall()
                     .icon(icon("icons/trash-2.svg"))
-                    .disabled(shell.is_none() || self.side_chat.deleting || !self.side_chat_operable())
+                    .disabled(shell.is_none() || busy(&self.side_chat.deleting) || !self.side_chat_operable())
                     .tooltip("Delete side chat")
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.delete_side_chat(delete_thread.clone(), window, cx);
@@ -837,17 +925,19 @@ This permanently clears its conversation history."
             })
             .collect();
         let running = projection.is_some_and(ThreadProjection::is_running);
+        let operate = self.pane_can_operate(ChatPane::Side);
         let stop = |cx: &mut Context<Self>| {
             Button::new("side-chat-stop")
                 .xsmall()
                 .icon(Icon::new(IconName::Square))
                 .tooltip("Stop")
+                .disabled(!operate)
                 .on_click(cx.listener(|this, _, _, cx| this.stop_side_chat(cx)))
         };
         let question = self.render_question(ChatPane::Side, false, t, cx);
         let button = match self.side_chat_question() {
-            Some(draft) => self.render_side_question_actions(draft, running, stop(cx), cx),
-            None => self.render_side_primary_action(view, running, stop(cx), cx),
+            Some(draft) => self.render_side_question_actions(draft, running, operate, stop(cx), cx),
+            None => self.render_side_primary_action(view, running, operate, stop(cx), cx),
         };
         let (t_chip, chip_view) = (*t, cx.weak_entity());
         let composer = h_flex()
@@ -894,10 +984,11 @@ This permanently clears its conversation history."
         &self,
         draft: &QuestionDraft,
         running: bool,
+        operate: bool,
         stop: Button,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let responding = self.responding.as_ref() == Some(&draft.request_id);
+        let responding = self.pane_responding(ChatPane::Side, &draft.request_id);
         let can_respond = self
             .pending_question_request(ChatPane::Side)
             .is_some_and(|(request, _)| request.capability() != Some("not_resumable"));
@@ -923,7 +1014,7 @@ This permanently clears its conversation history."
                     .primary()
                     .xsmall()
                     .label(label)
-                    .disabled(!enabled)
+                    .disabled(!enabled || !operate)
                     .on_click(cx.listener(|this, _, window, cx| this.advance_question(ChatPane::Side, window, cx))),
             )
             .into_any_element()
@@ -933,6 +1024,7 @@ This permanently clears its conversation history."
         &self,
         view: &SideChatView,
         running: bool,
+        operate: bool,
         stop: Button,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -941,16 +1033,20 @@ This permanently clears its conversation history."
                 .primary()
                 .xsmall()
                 .icon(Icon::new(IconName::Check))
-                .tooltip(if saving { "Updating queued message" } else { "Update queued message" })
-                .disabled(saving)
+                .tooltip(match (operate, saving) {
+                    (false, _) => NOT_OPERATE,
+                    (true, true) => "Updating queued message",
+                    (true, false) => "Update queued message",
+                })
+                .disabled(saving || !operate)
                 .on_click(cx.listener(|this, _, window, cx| this.send_side_chat(window, cx))),
             PrimaryAction::Stop => stop,
             PrimaryAction::Send => Button::new("side-chat-send")
                 .primary()
                 .xsmall()
                 .icon(Icon::new(IconName::ArrowUp))
-                .tooltip("Send")
-                .disabled(view.sending)
+                .tooltip(if operate { "Send" } else { NOT_OPERATE })
+                .disabled(self.side_chat.sending(&view.env, &view.thread_id) || !operate)
                 .on_click(cx.listener(|this, _, window, cx| this.send_side_chat(window, cx))),
         }
         .into_any_element()
@@ -987,6 +1083,10 @@ impl Workspace {
         self.side_chat.view.as_mut().map(|view| &mut view.question)
     }
 
+    pub(super) fn side_chat_advance_slot(&mut self) -> Option<&mut Option<Task<()>>> {
+        self.side_chat.view.as_mut().map(|view| &mut view.question_advance)
+    }
+
     /// Whether the pane still shows `env`'s `thread_id`, for a result that arrives later. Thread
     /// ids can repeat across environments (an imported thread).
     pub(super) fn pane_shows(&self, pane: ChatPane, env: &str, thread_id: &str) -> bool {
@@ -1021,6 +1121,22 @@ impl Workspace {
         Some((self.env_client(&env)?, env, thread_id))
     }
 
+    /// An answer to `request_id` in the pane's thread is on its way (`respondingRequestIds`).
+    pub(super) fn pane_responding(&self, pane: ChatPane, request_id: &str) -> bool {
+        self.pane_thread(pane)
+            .is_some_and(|(env, thread_id)| self.responding.contains(&(env, thread_id, request_id.to_owned())))
+    }
+
+    /// The pane's open question is being answered.
+    pub(super) fn question_responding(&self, pane: ChatPane) -> bool {
+        self.question(pane).is_some_and(|question| self.pane_responding(pane, &question.request_id))
+    }
+
+    /// `canOperateThread` for the pane's thread, on the environment it lives on.
+    pub(super) fn pane_can_operate(&self, pane: ChatPane) -> bool {
+        self.pane_thread(pane).is_some_and(|(env, _)| self.can_operate(&env))
+    }
+
     /// Whether this connection may change side chats on the parent thread's environment
     /// (`canOperate`).
     fn side_chat_operable(&self) -> bool {
@@ -1036,8 +1152,10 @@ impl Workspace {
     /// A message from the pane's composer is in flight.
     pub(super) fn pane_sending(&self, pane: ChatPane) -> bool {
         match pane {
-            ChatPane::Main => self.sending,
-            ChatPane::Side => self.side_chat.view.as_ref().is_some_and(|view| view.sending),
+            ChatPane::Main => self.target_sending(),
+            ChatPane::Side => {
+                self.side_chat.view.as_ref().is_some_and(|view| self.side_chat.sending(&view.env, &view.thread_id))
+            }
         }
     }
 
@@ -1300,14 +1418,55 @@ mod tests {
         let model = ModelSelection { instance_id: "codex".into(), model: "gpt".into(), options: None };
         let mut side_chats = SideChats::default();
         for env in [&a, &b] {
-            side_chats.drafts.insert((env.clone(), "side".to_owned()), format!("{env} text"));
+            side_chats.drafts.insert((env.clone(), "side".to_owned()), SideDraft::Prompt(format!("{env} text")));
             side_chats.models.insert((env.clone(), "side".to_owned()), model.clone());
         }
         side_chats.forget(&a, "side");
-        assert_eq!(
-            side_chats.drafts.into_iter().collect::<Vec<_>>(),
-            [((b.clone(), "side".to_owned()), "b text".to_owned())]
-        );
+        let drafts: Vec<_> = side_chats.drafts.into_iter().map(|(key, draft)| (key, draft.restore().0)).collect();
+        assert_eq!(drafts, [((b.clone(), "side".to_owned()), "b text".to_owned())]);
         assert_eq!(side_chats.models.into_keys().collect::<Vec<_>>(), [(b, "side".to_owned())]);
+    }
+
+    /// A card on question `b` of `a` and `b`, with `a` answered by option and `b` typed.
+    fn answered_card() -> QuestionDraft {
+        let question = |id: &str| -> crate::requests::Question {
+            let options = json!([{"label": "Red", "description": "r"}]);
+            serde_json::from_value(json!({"id": id, "header": "H", "question": "?", "options": options})).unwrap()
+        };
+        let mut card = QuestionDraft::new("r".into(), vec![question("a"), question("b")]).unwrap();
+        card.prompt = "parked prompt".into();
+        let picked = crate::requests::toggle(&card.questions[0], None, "Red");
+        card.drafts.insert("a".into(), picked);
+        let typed = crate::requests::set_custom(&card.questions[1], None, "typed".into());
+        card.drafts.insert("b".into(), typed);
+        card.index = 1;
+        card
+    }
+
+    #[test]
+    fn a_failed_send_returns_to_its_side_chat_off_screen() {
+        let key = |id: &str| (SharedString::from("e"), id.to_owned());
+        let mut side_chats = SideChats::default();
+        side_chats.drafts.insert(key("typed"), SideDraft::Prompt("newer".into()));
+        side_chats.drafts.insert(key("asking"), SideDraft::Question(Box::new(answered_card())));
+        for id in ["typed", "asking", "empty"] {
+            side_chats.give_back(key(id), "failed".into());
+        }
+        let mut restored = |id: &str| side_chats.drafts.remove(&key(id)).expect(id).restore();
+        assert_eq!(restored("typed").0, "failed\n\nnewer");
+        assert_eq!(restored("empty").0, "failed");
+        let (text, card) = restored("asking");
+        let card = card.expect("the question keeps the editor");
+        assert_eq!((text.as_str(), card.prompt.as_str()), ("typed", "failed\n\nparked prompt"));
+    }
+
+    #[test]
+    fn a_released_side_chat_keeps_its_question_answers_and_progress() {
+        let (text, card) = SideDraft::kept(Some(answered_card()), String::new()).expect("kept").restore();
+        assert_eq!(text, "typed", "the editor shows the question on screen's typed answer");
+        let card = card.expect("the card comes back");
+        assert_eq!((card.index, card.prompt.as_str()), (1, "parked prompt"));
+        assert_eq!(card.drafts["a"].selected, ["Red"]);
+        assert_eq!(SideDraft::kept(None, String::new()).map(|draft| draft.restore().0), None);
     }
 }

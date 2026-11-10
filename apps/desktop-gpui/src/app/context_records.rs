@@ -79,27 +79,6 @@ fn message_records(held: &ContextRecords, text: &str) -> Vec<Value> {
     records
 }
 
-/// `removeInlineContextReference`'s cuts: each chip with the space after it, else the one before.
-fn chip_removals(text: &str, mut spans: Vec<std::ops::Range<usize>>) -> Vec<std::ops::Range<usize>> {
-    spans.sort_by_key(|span| span.start);
-    let mut cuts: Vec<std::ops::Range<usize>> = Vec::with_capacity(spans.len());
-    for span in spans {
-        let previous_end = cuts.last().map_or(0, |cut| cut.end);
-        if span.start < previous_end {
-            continue;
-        }
-        let cut = if text[span.end..].starts_with(' ') {
-            span.start..span.end + 1
-        } else if span.start > previous_end && text[..span.start].ends_with(' ') {
-            span.start - 1..span.end
-        } else {
-            span
-        };
-        cuts.push(cut);
-    }
-    cuts
-}
-
 /// Where a chip goes into a set-aside prompt: after its text, a space apart.
 fn append_chip(prompt: &mut String, link: &str) {
     if !prompt.is_empty() && !prompt.ends_with(char::is_whitespace) {
@@ -152,10 +131,13 @@ impl Workspace {
     }
 
     /// The records of `target`'s prompt: the composer's on screen, else the set-aside prompt's
-    /// (a draft not on screen, or the prompt a question card holds).
+    /// (a draft not on screen, or the prompt a question card or queued message's edit holds).
     pub(super) fn draft_records(&self, target: &Target) -> Option<&ContextRecords> {
         if self.target.as_ref() == Some(target) {
-            return Some(self.question.as_ref().map_or(&self.context.records, |question| &question.prompt_records));
+            if let Some(question) = &self.question {
+                return Some(&question.prompt_records);
+            }
+            return Some(self.queue_edit_draft().map_or(&self.context.records, |(_, _, records)| records));
         }
         match self.composer_drafts.get(target)? {
             ComposerDraft::Prompt(_, _, records) => Some(records),
@@ -163,24 +145,39 @@ impl Workspace {
         }
     }
 
-    /// `target`'s prompt and records when the editor doesn't hold them: a draft not on screen,
-    /// or the prompt a question card set aside.
-    fn set_aside_prompt(&mut self, target: &Target) -> Option<(&mut String, &mut ContextRecords)> {
+    /// Whether the editor holds `target`'s own prompt: it is on screen, and neither a question
+    /// card nor a queued message's edit has the editor.
+    pub(super) fn composer_holds_prompt(&self, target: &Target) -> bool {
+        self.target.as_ref() == Some(target) && self.question.is_none() && !self.editing_queued()
+    }
+
+    /// `target`'s prompt, attachments and records when the editor doesn't hold them: a draft not
+    /// on screen, or the prompt a question card or queued message's edit set aside.
+    pub(super) fn set_aside_prompt(
+        &mut self,
+        target: &Target,
+    ) -> Option<(&mut String, &mut Vec<Attachment>, &mut ContextRecords)> {
         if self.target.as_ref() == Some(target) {
-            return self.question.as_mut().map(|question| (&mut question.prompt, &mut question.prompt_records));
+            if let Some(question) = &mut self.question {
+                return Some((&mut question.prompt, &mut question.prompt_attachments, &mut question.prompt_records));
+            }
+            let (prompt, attachments, records) = self.queue.edit_draft_mut()?;
+            return Some((prompt, attachments, records));
         }
         match self.composer_drafts.get_mut(target)? {
-            ComposerDraft::Prompt(prompt, _, records) => Some((prompt, records)),
-            ComposerDraft::Question(question) => Some((&mut question.prompt, &mut question.prompt_records)),
+            ComposerDraft::Prompt(prompt, attachments, records) => Some((prompt, attachments, records)),
+            ComposerDraft::Question(question) => {
+                Some((&mut question.prompt, &mut question.prompt_attachments, &mut question.prompt_records))
+            }
         }
     }
 
     /// Replaces a record `target`'s draft holds (a comment whose lines moved), keeping its chip.
     pub(super) fn replace_context_record(&mut self, target: &Target, record: Value, cx: &mut Context<Self>) {
-        let replaced = if self.target.as_ref() == Some(target) && self.question.is_none() {
+        let replaced = if self.composer_holds_prompt(target) {
             self.context.records.replace(record)
         } else {
-            self.set_aside_prompt(target).is_some_and(|(_, records)| records.replace(record))
+            self.set_aside_prompt(target).is_some_and(|(_, _, records)| records.replace(record))
         };
         if replaced {
             cx.notify();
@@ -198,29 +195,18 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let chip = Chip::Context { kind: kind.to_owned(), id: id.to_owned(), label: String::new() }.id();
-        if self.target.as_ref() == Some(target) && self.question.is_none() {
-            let state = self.composer.read(cx);
-            let spans: Vec<_> = state
-                .tokens()
-                .iter()
-                .filter(|span| span.token().id().as_ref() == chip.as_str())
-                .map(gpui_kit::base::input::InlineTokenSpan::range)
-                .collect();
-            let removals = chip_removals(&state.value(), spans);
-            if let Some(first) = removals.first().map(|range| range.start) {
+        if self.composer_holds_prompt(target) {
+            // Every reference, chip or not (rich text shows a fenced one as code), in one edit.
+            let removals = composer_text::context_reference_removals(&self.composer.read(cx).value(), &chip);
+            if let Some(first) = removals.last().map(|range| range.start) {
                 let edits: Vec<_> = removals.into_iter().map(|range| (range, String::new())).collect();
                 self.composer.update(cx, |state, cx| state.replace_ranges(&edits, first..first, window, cx));
                 self.sync_context_chips(cx);
             }
             self.context.records.remove(id);
             self.sync_composer_empty(cx);
-        } else if let Some((prompt, records)) = self.set_aside_prompt(target) {
-            let spans = composer_text::chips(prompt, |_| false)
-                .into_iter()
-                .filter(|(_, found)| found.id() == chip)
-                .map(|(range, _)| range)
-                .collect();
-            for range in chip_removals(prompt, spans).into_iter().rev() {
+        } else if let Some((prompt, _, records)) = self.set_aside_prompt(target) {
+            for range in composer_text::context_reference_removals(prompt, &chip) {
                 prompt.replace_range(range, "");
             }
             records.remove(id);
@@ -267,14 +253,14 @@ impl Workspace {
         if records.is_empty() {
             return;
         }
-        if self.target.as_ref() == Some(origin) && self.question.is_none() {
+        if self.composer_holds_prompt(origin) {
             self.context.records.extend(records.iter().cloned());
             return;
         }
         if self.target.as_ref() != Some(origin) {
             self.composer_drafts.entry(origin.clone()).or_insert_with(ComposerDraft::empty);
         }
-        if let Some((_, held)) = self.set_aside_prompt(origin) {
+        if let Some((_, _, held)) = self.set_aside_prompt(origin) {
             held.extend(records.iter().cloned());
         }
     }
@@ -442,10 +428,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let reference = format!("/{}/{}_{})", file.kind, file.kind, file.local_id);
+        let context_id = format!("{}_{}", file.kind, file.local_id);
         let text = self.composer.read(cx).value().to_string();
-        let on_screen = (self.target.as_ref(), text.as_str(), &mut self.attachments);
-        let Some(slot) = import_slot(origin, &reference, on_screen, &mut self.composer_drafts) else { return };
+        let on_screen = (self.target.as_ref(), text.as_str(), &self.context.records, &mut self.attachments);
+        let Some(slot) = import_slot(origin, &context_id, on_screen, &mut self.composer_drafts) else { return };
         if slot.len() >= MAX_ATTACHMENTS {
             return import_failed(&file.name, "The attachment limit has been reached.", window, cx);
         }
@@ -455,21 +441,35 @@ impl Workspace {
     }
 }
 
-/// The attachments of `origin`'s draft, on screen or set aside, while its text still holds
-/// `reference`; `None` once the chip is gone.
+/// The attachments of `origin`'s draft, on screen or set aside, while it still wants attachment
+/// `context_id`; `None` once the chip is gone.
 fn import_slot<'a>(
     origin: &Target,
-    reference: &str,
-    (active, text, attachments): (Option<&Target>, &str, &'a mut Vec<Attachment>),
+    context_id: &str,
+    (active, text, records, attachments): (Option<&Target>, &str, &ContextRecords, &'a mut Vec<Attachment>),
     drafts: &'a mut std::collections::HashMap<Target, ComposerDraft>,
 ) -> Option<&'a mut Vec<Attachment>> {
     if active == Some(origin) {
-        return text.contains(reference).then_some(attachments);
+        return wants_attachment(text, records, context_id).then_some(attachments);
     }
     match drafts.get_mut(origin) {
-        Some(ComposerDraft::Prompt(prompt, kept, _)) if prompt.contains(reference) => Some(kept),
+        Some(ComposerDraft::Prompt(prompt, kept, records)) if wants_attachment(prompt, records, context_id) => {
+            Some(kept)
+        }
         _ => None,
     }
+}
+
+/// Whether `text` still references attachment `context_id`: its own chip, or the chip of an
+/// annotation that owns it as its screenshot, which has no chip of its own.
+fn wants_attachment(text: &str, records: &ContextRecords, context_id: &str) -> bool {
+    let live = composer_context::referenced_ids(text);
+    live.contains(&context_id)
+        || records.iter().any(|record| {
+            record["kind"] == "preview-annotation"
+                && record["screenshotContextId"] == context_id
+                && record["contextId"].as_str().is_some_and(|id| live.contains(&id))
+        })
 }
 
 /// What a pasted attachment record becomes once its bytes arrive.
@@ -551,54 +551,43 @@ mod tests {
     fn pasted_bytes_land_in_the_draft_the_paste_went_to() {
         let (a, b) =
             (Target::Thread { env: "e".into(), id: "a".into() }, Target::Thread { env: "e".into(), id: "b".into() });
-        let reference = "/file/file_l1)";
+        let link = composer_text::context_link("file", "file_l1", "x");
+        let none = ContextRecords::default();
         let mut drafts = std::collections::HashMap::from([(
             a.clone(),
-            ComposerDraft::Prompt(
-                format!("see [x](t3-context://v1{reference} "),
-                Vec::new(),
-                ContextRecords::default(),
-            ),
+            ComposerDraft::Prompt(format!("see {link} "), Vec::new(), ContextRecords::default()),
         )]);
         let mut on_screen = Vec::new();
         // The user moved from a to b while the bytes downloaded.
-        let slot = import_slot(&a, reference, (Some(&b), "b's text", &mut on_screen), &mut drafts).unwrap();
+        let slot = import_slot(&a, "file_l1", (Some(&b), "b's text", &none, &mut on_screen), &mut drafts).unwrap();
         slot.push(Attachment::restored_as("l1".into(), "file", "x".into(), "text/plain".into(), vec![1]));
         assert!(on_screen.is_empty(), "nothing lands in the draft on screen");
         let Some(ComposerDraft::Prompt(_, kept, _)) = drafts.get(&a) else { panic!() };
         assert_eq!(kept.len(), 1);
 
-        assert!(import_slot(&b, reference, (Some(&b), "chip deleted", &mut on_screen), &mut drafts).is_none());
+        assert!(import_slot(&b, "file_l1", (Some(&b), "chip deleted", &none, &mut on_screen), &mut drafts).is_none());
+        assert!(import_slot(&b, "file_l1", (Some(&b), &link, &none, &mut on_screen), &mut drafts).is_some());
         assert!(
-            import_slot(
-                &b,
-                reference,
-                (Some(&b), &format!("[x](t3-context://v1{reference}"), &mut on_screen),
-                &mut drafts
-            )
-            .is_some()
-        );
-        assert!(
-            import_slot(&b, reference, (Some(&a), "", &mut on_screen), &mut drafts).is_none(),
+            import_slot(&b, "file_l1", (Some(&a), "", &none, &mut on_screen), &mut drafts).is_none(),
             "a draft left with nothing"
         );
-    }
 
-    #[test]
-    fn a_removed_chip_takes_one_space_with_it() {
-        let link = composer_text::context_link("review-comment", "rc", "a.ts L3");
-        let text = format!("fix {link} and {link}");
-        let first = 4..4 + link.len();
-        let second = text.len() - link.len()..text.len();
-        let cuts = chip_removals(&text, vec![second.clone(), first.clone()]);
-        assert_eq!(cuts, [first.start..first.end + 1, second.start - 1..second.end]);
-        let mut left = text;
-        for cut in cuts.into_iter().rev() {
-            left.replace_range(cut, "");
-        }
-        assert_eq!(left, "fix and");
-        let whole = 0..link.len();
-        assert_eq!(chip_removals(&link, std::iter::once(whole.clone()).collect()).first(), Some(&whole));
+        // An annotation's screenshot has no chip of its own; the annotation's chip keeps it wanted.
+        let annotation = composer_text::context_link("preview-annotation", "preview-annotation_p1", "Button");
+        let mut records = ContextRecords::default();
+        records.insert(json!({"version": 1, "kind": "preview-annotation", "contextId": "preview-annotation_p1",
+            "label": "Button", "screenshotContextId": "image_n2"}));
+        let on = |text: &str, records: &ContextRecords, on_screen: &mut Vec<Attachment>, drafts: &mut _| {
+            import_slot(&b, "image_n2", (Some(&b), text, records, on_screen), drafts).is_some()
+        };
+        assert!(on(&annotation, &records, &mut on_screen, &mut drafts), "the screenshot joins its annotation");
+        assert!(!on("annotation deleted", &records, &mut on_screen, &mut drafts));
+        assert!(!on(&annotation, &none, &mut on_screen, &mut drafts), "only an annotation that owns it");
+        drafts.insert(a.clone(), ComposerDraft::Prompt(annotation, Vec::new(), records));
+        assert!(
+            import_slot(&a, "image_n2", (Some(&b), "", &none, &mut on_screen), &mut drafts).is_some(),
+            "a set-aside draft's annotation keeps it too"
+        );
     }
 
     #[test]

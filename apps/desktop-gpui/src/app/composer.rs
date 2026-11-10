@@ -147,7 +147,7 @@ fn adds_chip(before: &[String], now: &[String]) -> bool {
 }
 
 /// A failed message first, then whatever was typed after it.
-fn merge_prompt(failed: String, newer: &str) -> String {
+pub(super) fn merge_prompt(failed: String, newer: &str) -> String {
     if newer.trim().is_empty() { failed } else { format!("{failed}\n\n{newer}") }
 }
 
@@ -468,32 +468,49 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.drafts_changed(cx);
-        if self.target.as_ref() == Some(origin) {
-            match &mut self.question {
-                Some(question) => question.prompt = merge_prompt(text, &question.prompt),
-                None => {
-                    let merged = merge_prompt(text, &self.composer.read(cx).value());
-                    self.set_composer_text(merged, window, cx);
-                }
-            }
+        if self.composer_holds_prompt(origin) {
+            let merged = merge_prompt(text, &self.composer.read(cx).value());
+            self.set_composer_text(merged, window, cx);
             return;
         }
-        let slot = match self.composer_drafts.get_mut(origin) {
-            Some(ComposerDraft::Prompt(prompt, ..)) => prompt,
-            Some(ComposerDraft::Question(question)) => &mut question.prompt,
-            None => {
-                let draft = ComposerDraft::Prompt(text, Vec::new(), ContextRecords::default());
-                self.composer_drafts.insert(origin.clone(), draft);
-                return;
+        if self.target.as_ref() != Some(origin) {
+            self.composer_drafts.entry(origin.clone()).or_insert_with(ComposerDraft::empty);
+        }
+        if let Some((prompt, ..)) = self.set_aside_prompt(origin) {
+            *prompt = merge_prompt(text, prompt);
+        }
+    }
+
+    /// A failed send's attachments, back with `origin`'s prompt wherever it waits: the composer,
+    /// or set aside under an open question or in a draft not on screen.
+    pub(super) fn give_back_attachments(
+        &mut self,
+        origin: &Target,
+        attachments: Vec<Attachment>,
+        cx: &mut Context<Self>,
+    ) {
+        if attachments.is_empty() {
+            return;
+        }
+        if self.composer_holds_prompt(origin) {
+            self.attachments.extend(attachments);
+        } else {
+            if self.target.as_ref() != Some(origin) {
+                self.composer_drafts.entry(origin.clone()).or_insert_with(ComposerDraft::empty);
             }
-        };
-        *slot = merge_prompt(text, slot);
+            if let Some((_, kept, _)) = self.set_aside_prompt(origin) {
+                kept.extend(attachments);
+            }
+        }
+        self.drafts_changed(cx);
     }
 
     /// Brings back the new target's composer; call after the target changes.
     /// `sync_question` drops a restored question once the thread shows it resolved.
     pub(super) fn restore_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_draft_workspace(cx);
+        // The question coming back is not the one a pick on another target was advancing.
+        self.composer_ui.question_advance = None;
         self.typing_guard.reset();
         self._typing_idle = None;
         self.sync_typing_guard(window, cx);
@@ -774,9 +791,7 @@ impl Workspace {
         // The open thread's card first, else the side chat's.
         let pane = if self.question.is_some() { ChatPane::Main } else { ChatPane::Side };
         let Some(draft) = self.question(pane) else { return false };
-        if draft.collapsed
-            || self.pending_question_request(pane).is_none_or(|(r, _)| r.capability() == Some("not_resumable"))
-        {
+        if draft.collapsed || !self.question_answerable(pane) {
             return false;
         }
         let Some(option) = draft.questions[draft.index].options.get(digit - 1) else { return false };
@@ -848,6 +863,23 @@ impl Workspace {
         self.question_slot(pane)?.as_mut()
     }
 
+    /// Replaces the pane's pending auto-advance; `None` cancels it, like the web clearing its
+    /// timer when the active question changes or the card unmounts.
+    fn set_question_advance(&mut self, pane: ChatPane, task: Option<gpui_kit::Task<()>>) {
+        let slot = match pane {
+            ChatPane::Main => Some(&mut self.composer_ui.question_advance),
+            ChatPane::Side => self.side_chat_advance_slot(),
+        };
+        if let Some(slot) = slot {
+            *slot = task;
+        }
+    }
+
+    pub(super) fn cancel_question_advances(&mut self) {
+        self.set_question_advance(ChatPane::Main, None);
+        self.set_question_advance(ChatPane::Side, None);
+    }
+
     /// Opens a fresh draft when the pane's first pending question changes. The editor
     /// then holds the question's answer, and the prompt waits in the draft
     /// until the last question closes.
@@ -860,6 +892,7 @@ impl Workspace {
             return;
         }
         let next = first.and_then(|(request, item)| QuestionDraft::new(request.id.clone(), requests::questions(item)));
+        self.set_question_advance(pane, None);
         let Some(previous) = self.question_slot(pane).map(Option::take) else { return };
         // The open thread's composer lists the question on screen's attachments; side chats take none.
         let main = pane == ChatPane::Main;
@@ -896,6 +929,7 @@ impl Workspace {
 
     /// Shows question `index` of the pane's card, with its attachments in the composer.
     fn show_question(&mut self, pane: ChatPane, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_question_advance(pane, None);
         match pane {
             ChatPane::Main => {
                 let Some(question) = self.question.as_mut() else { return };
@@ -939,8 +973,19 @@ impl Workspace {
         self.set_pane_text(pane, text, window, cx);
     }
 
+    /// The pane's question takes answers now: its request still waits and can resume, no answer
+    /// is on its way, and the connection may operate the thread (`responseDisabled`).
+    pub(super) fn question_answerable(&self, pane: ChatPane) -> bool {
+        !self.question_responding(pane)
+            && self.pane_can_operate(pane)
+            && self.pending_question_request(pane).is_some_and(|(r, _)| r.capability() != Some("not_resumable"))
+    }
+
     /// Next question, or submit on the last; a no-op while the active one is unanswered.
     pub(super) fn advance_question(&mut self, pane: ChatPane, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.question_answerable(pane) {
+            return;
+        }
         let Some(draft) = self.question(pane) else { return };
         let question = draft.active();
         let attached = self.question_attached(pane, &question.id);
@@ -955,9 +1000,6 @@ impl Workspace {
         let attached = |id: &str| self.question_attached(pane, id);
         let Some(answers) = requests::answers(&draft.questions, &draft.drafts, attached) else { return };
         let request_id = draft.request_id.clone();
-        if self.responding.is_some() {
-            return;
-        }
         let mut response = json!({"answers": answers});
         if pane == ChatPane::Main {
             match self.question_attachments_payload() {
@@ -983,31 +1025,43 @@ impl Workspace {
     }
 
     fn pick_option(&mut self, pane: ChatPane, value: String, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.question_answerable(pane) {
+            return;
+        }
+        let shown = self.pane_thread(pane);
         let Some(draft) = self.question_mut(pane) else { return };
         let question = &draft.questions[draft.index];
         let next = requests::toggle(question, draft.drafts.get(&question.id), &value);
         let advance = !question.multi_select;
         draft.drafts.insert(question.id.clone(), next);
-        let at = (draft.request_id.clone(), draft.index);
+        // Request ids repeat across environments, so the pane's thread is part of where it was.
+        let at = (shown, draft.request_id.clone(), draft.index);
         self.set_pane_text(pane, String::new(), window, cx);
         cx.notify();
-        if advance {
+        // A pick replaces the previous one's timer, as the web's does.
+        let task = advance.then(|| {
             cx.spawn_in(window, async move |this, cx| {
                 cx.background_executor().timer(AUTO_ADVANCE).await;
                 let _ = this.update_in(cx, |this, window, cx| {
-                    if this.question(pane).is_some_and(|q| (q.request_id.clone(), q.index) == at) {
+                    let now = this.question(pane).map(|q| (this.pane_thread(pane), q.request_id.clone(), q.index));
+                    if now.as_ref() == Some(&at) {
                         this.advance_question(pane, window, cx);
                     }
                 });
             })
-            .detach();
-        }
+        });
+        self.set_question_advance(pane, task);
     }
 
     fn dismiss_question(&mut self, pane: ChatPane, request_id: String, cx: &mut Context<Self>) {
-        let Some((_, _, thread_id)) = self.pane_client(pane, cx) else { return };
-        let command = json!({"type": "thread.user-input.dismiss", "commandId": new_id(), "threadId": thread_id, "requestId": request_id});
-        self.dispatch(command, cx);
+        self.dispatch_response(
+            pane,
+            request_id,
+            |thread_id, request_id| {
+                json!({"type": "thread.user-input.dismiss", "commandId": new_id(), "threadId": thread_id, "requestId": request_id})
+            },
+            cx,
+        );
     }
 
     /// Sending while an approval waits declines it: with the text as its
@@ -1051,9 +1105,11 @@ impl Workspace {
 
     pub(super) fn set_runtime_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
         match &self.target {
-            Some(Target::Thread { id: thread_id, .. }) => {
+            Some(Target::Thread { .. }) => {
+                // Changing a started thread needs `orchestration:operate` on its environment.
+                let Some((client, _, thread_id)) = self.pane_client(ChatPane::Main, cx) else { return };
                 let command = json!({"type": "thread.runtime-mode.set", "commandId": new_id(), "threadId": thread_id, "runtimeMode": mode});
-                self.dispatch(command, cx);
+                self.dispatch_on(client, vec![command], cx);
             }
             _ => self.runtime_mode_override = Some(mode.to_owned()),
         }
@@ -1407,7 +1463,13 @@ impl Workspace {
             )
     }
 
+    /// `canOperateThread`: this connection may change the open target's environment.
+    pub(super) fn target_can_operate(&self) -> bool {
+        self.target.as_ref().is_some_and(|target| self.can_operate(target.environment()))
+    }
+
     fn render_primary_action(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+        let operate = self.target_can_operate();
         let running = self
             .thread
             .as_ref()
@@ -1418,15 +1480,16 @@ impl Workspace {
                 .hover(|s| s.bg(t.error))
                 .child(div().size(px(8.)).rounded(px(1.5)).bg(t.primary_foreground))
                 .tooltip(|window, cx| Tooltip::new("Interrupt").build(window, cx))
-                .on_click(cx.listener(|this, _, _, cx| this.stop(cx)))
+                .when(operate, |el| el.on_click(cx.listener(|this, _, _, cx| this.stop(cx))))
         };
         if let Some(draft) = &self.question {
-            let responding = self.responding.as_ref() == Some(&draft.request_id);
+            let responding = self.pane_responding(ChatPane::Main, &draft.request_id);
             let can_respond = self
                 .pending_question_request(ChatPane::Main)
                 .is_some_and(|(r, _)| r.capability() != Some("not_resumable"));
             let attached = |id: &str| self.question_attached(ChatPane::Main, id);
             let (label, enabled) = question_submit(draft, attached, responding, can_respond);
+            let enabled = enabled && operate;
             let submit = div().id("submit-answer");
             let submit = if enabled { action_control(submit, &self.composer_action_focus[PRIMARY], t) } else { submit };
             return h_flex()
@@ -1472,9 +1535,10 @@ impl Workspace {
         if running && !sendable && !editing {
             return stop().into_any_element();
         }
-        let busy = self.sending || self.saving_queue_edit();
+        let sending = self.target_sending();
+        let busy = sending || self.saving_queue_edit();
         if can_resume && !sendable {
-            let enabled = !self.sending && !self.target_rewinding() && self.client().is_some();
+            let enabled = operate && !sending && !self.target_rewinding() && self.client().is_some();
             // The web's send button in its resume state: the same stage art, a filled play.
             let stage = self.stage_art();
             let (fill, icon) = if stage.is_some() {
@@ -1482,7 +1546,7 @@ impl Workspace {
             } else {
                 (t.primary, t.primary_foreground)
             };
-            let content = if self.sending {
+            let content = if sending {
                 Spinner::new().small().color(icon).into_any_element()
             } else {
                 Icon::empty().path("icons/app/play-filled.svg").with_size(px(16.)).text_color(icon).into_any_element()
@@ -1501,7 +1565,9 @@ impl Workspace {
                 .tooltip(|window, cx| Tooltip::new("Resume thread").build(window, cx))
                 .into_any_element();
         }
-        let disabled_reason: Option<SharedString> = if self.model_fanout().is_some_and(<[_]>::is_empty) {
+        let disabled_reason: Option<SharedString> = if !operate {
+            Some(super::side_chat::NOT_OPERATE.into())
+        } else if self.model_fanout().is_some_and(<[_]>::is_empty) {
             Some("Select at least one model.".into())
         } else if self.attachments_busy() {
             Some("Attachment(s) still uploading".into())
@@ -1642,29 +1708,27 @@ impl Workspace {
                         .collect()
                 },
             );
-        let enabled = request.is_live() && self.responding.as_ref() != Some(&request.id);
+        let enabled = request.is_live() && !self.pane_responding(pane, &request.id) && self.pane_can_operate(pane);
         let inline =
             |decision: &str, label: &str, warning: Option<SharedString>, tone: Hsla, cx: &mut Context<Self>| {
                 let request_id = request.id.clone();
                 let decision = decision.to_owned();
-                h_flex()
-                    .id(ElementId::Name(format!("approval-{}-{decision}", request.id).into()))
-                    .gap(px(4.))
+                // A button, so Tab reaches it and Enter or Space answers (`InlineButton`).
+                Button::new(ElementId::Name(format!("approval-{}-{decision}", request.id).into()))
+                    .text()
+                    .xsmall()
+                    .h(px(16.))
+                    .text_xs()
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(tone)
-                    .when(warning.is_some(), |el| el.child(Icon::new(Lucide::TriangleAlert).with_size(px(12.))))
-                    .child(label.to_owned())
-                    .when_some(warning, |el, warning| {
-                        el.tooltip(move |window, cx| Tooltip::new(warning.clone()).build(window, cx))
-                    })
+                    .when(warning.is_some(), |el| el.icon(Icon::new(Lucide::TriangleAlert).with_size(px(12.))))
+                    .label(label.to_owned())
+                    .when_some(warning, Button::tooltip)
+                    .disabled(!enabled)
                     .when(!enabled, |el| el.opacity(0.64))
-                    .when(enabled, |el| {
-                        el.cursor_pointer().hover(|s| s.underline().text_color(t.foreground)).on_click(cx.listener(
-                            move |this, _, _, cx| {
-                                this.respond(pane, request_id.clone(), json!({"decision": decision}), cx);
-                            },
-                        ))
-                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.respond(pane, request_id.clone(), json!({"decision": decision}), cx);
+                    }))
             };
         let primary: Vec<_> = options.iter().filter(|(d, ..)| d == "decline" || d == "accept").collect();
         let more: Rc<Vec<_>> =
@@ -1807,8 +1871,8 @@ impl Workspace {
 
     /// `modelFallbackBannerItem`: "Using X", why, and a way back to the default.
     fn render_fallback_banner(&self, joined: bool, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let Some(Target::Draft { project_id, .. }) = &self.target else { return None };
-        let project = self.shell.projects.iter().find(|p| &p.id == project_id);
+        let Some(Target::Draft { env, project_id, .. }) = &self.target else { return None };
+        let project = self.shell.projects.iter().find(|p| &p.environment_id == env && &p.id == project_id);
         let default = self.server_info().new_thread_model(project)?;
         let fallback = self.draft_usage_fallback(&default)?;
         let window = format!("{}:{}", fallback.exhausted_instance, fallback.resets_at.as_deref().unwrap_or_default());
@@ -1920,12 +1984,12 @@ impl Workspace {
         let draft = self.question(pane)?;
         let (request, item) = self.pending_question_request(pane)?;
         let question = &draft.questions[draft.index];
-        let disabled = request.capability() == Some("not_resumable") || self.responding.as_ref() == Some(&request.id);
+        let disabled = !self.question_answerable(pane);
         let dismissible = item.str("responseMode") == Some("message") || request.capability() == Some("message");
         let collapsed = draft.collapsed;
         let count = draft.questions.len();
-        let header = h_flex()
-            .id("question-toggle")
+        // The toggle, Dismiss and each option are buttons on the web, so Tab reaches them.
+        let header = super::chat::focusable(h_flex().id("question-toggle"), t)
             .w_full()
             .min_h(px(24.))
             .px(px(16.))
@@ -1985,19 +2049,20 @@ impl Workspace {
                     ))
                     .when(dismissible, |el| {
                         let request_id = request.id.clone();
+                        // Off while an answer or dismissal is on its way, as the web's `isResponding`.
+                        let responding = self.pane_responding(pane, &request.id);
                         el.child(
-                            icon_box(t)
-                                .id("question-dismiss")
-                                .cursor_pointer()
-                                .hover(|s| s.bg(t.accent))
+                            super::chat::focusable(icon_box(t).id("question-dismiss"), t)
                                 .child(Icon::new(Lucide::X).with_size(px(14.)))
                                 .tooltip(|window, cx| {
                                     Tooltip::new("Dismiss question without answering").build(window, cx)
                                 })
+                                .when(responding, |el| el.opacity(0.64))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
                                     this.dismiss_question(pane, request_id.clone(), cx);
-                                })),
+                                }))
+                                .when(!responding, |el| el.cursor_pointer().hover(|s| s.bg(t.accent))),
                         )
                     }),
             );
@@ -2023,7 +2088,7 @@ impl Workspace {
                         let value = option.value().to_owned();
                         let selected = requests::is_selected(question, draft_answer, &value);
                         render_option(question, option, index, selected, disabled, t).when(!disabled, |el| {
-                            el.on_click(cx.listener(move |this, _, window, cx| {
+                            super::chat::focusable(el, t).on_click(cx.listener(move |this, _, window, cx| {
                                 this.pick_option(pane, value.clone(), window, cx);
                             }))
                         })

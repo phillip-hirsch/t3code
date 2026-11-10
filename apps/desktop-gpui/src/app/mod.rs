@@ -228,7 +228,8 @@ pub struct Workspace {
     _working_tick: Option<Task<()>>,
     scroller: Entity<MessageScrollerState>,
     composer: Entity<TextareaState>,
-    sending: bool,
+    /// Targets whose send is in flight: each thread's or draft's own (`draftSendState`).
+    sending: HashSet<Target>,
     /// Threads whose rewind is still rolling back on the server; they take no sends.
     rewinding: HashSet<String>,
     /// Model picked in the composer; for an open thread it applies to the next message.
@@ -269,8 +270,8 @@ pub struct Workspace {
     draft_store: draft_store::DraftStore,
     /// The model and permissions picks of the targets not on screen (`composerDraftStore`).
     composer_selections: HashMap<Target, composer::ComposerSelection>,
-    /// The request whose response is in flight.
-    responding: Option<String>,
+    /// Responses in flight, by environment, thread and request: request ids repeat across them.
+    responding: HashSet<(SharedString, String, String)>,
     /// The `@` / `$` / `/` menu.
     menu: composer_menu::MenuState,
     picker: model_picker::PickerState,
@@ -526,7 +527,7 @@ impl Workspace {
             _working_tick: None,
             scroller,
             composer,
-            sending: false,
+            sending: HashSet::new(),
             rewinding: HashSet::new(),
             model_override: None,
             model_explicit: false,
@@ -546,7 +547,7 @@ impl Workspace {
             drafts: Default::default(),
             draft_store: Default::default(),
             composer_selections: HashMap::new(),
-            responding: None,
+            responding: HashSet::new(),
             menu: Default::default(),
             picker: Default::default(),
             draft_workspace: Default::default(),
@@ -1023,8 +1024,9 @@ impl Workspace {
             }
             None => Vec::new(),
         };
+        let env = self.target.as_ref().map(|target| target.environment().to_owned()).unwrap_or_default();
         let (sent, queued) = match self.thread.as_ref().and_then(|t| Some((&t.id, t.state.projection.as_ref()?))) {
-            Some((id, projection)) => send::pending_rows(&mut self.pending_sends, id, projection),
+            Some((id, projection)) => send::pending_rows(&mut self.pending_sends, &env, id, projection),
             None => Default::default(),
         };
         new_rows.extend(sent);
@@ -1331,15 +1333,15 @@ impl Workspace {
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
+        let Some((client, _, thread_id)) = self.pane_client(side_chat::ChatPane::Main, cx) else { return };
         let Some(projection) = self.thread.as_ref().and_then(|t| t.state.projection.as_ref()) else { return };
-        let thread_id = projection.thread.id.clone();
         let command = if self.server_info().capability("threadStop") {
             json!({"type": "thread.stop", "commandId": new_id(), "threadId": thread_id})
         } else {
             let Some(run) = projection.interruptible_run() else { return };
             json!({"type": "run.interrupt", "commandId": new_id(), "threadId": thread_id, "runId": run.id, "holdQueue": true})
         };
-        self.dispatch(command, cx);
+        self.dispatch_on(client, vec![command], cx);
     }
 
     /// `runtime-request.respond` for the open thread; `response` holds `decision`, `feedback` or `answers`.
@@ -1349,15 +1351,33 @@ impl Workspace {
 
     /// Answers a runtime request in the pane's thread; `response` holds `decision`, `feedback` or `answers`.
     fn respond(&mut self, pane: side_chat::ChatPane, request_id: String, response: Value, cx: &mut Context<Self>) {
+        self.dispatch_response(
+            pane,
+            request_id,
+            |thread_id, request_id| respond_value(thread_id, request_id, response),
+            cx,
+        );
+    }
+
+    /// Sends `command(thread_id, request_id)` for a request in the pane's thread, holding the
+    /// request's controls (`respondingRequestIds`) until it lands.
+    fn dispatch_response(
+        &mut self,
+        pane: side_chat::ChatPane,
+        request_id: String,
+        command: impl FnOnce(&str, &str) -> Value,
+        cx: &mut Context<Self>,
+    ) {
         let Some((client, env, thread_id)) = self.pane_client(pane, cx) else { return };
-        let command = respond_value(&thread_id, &request_id, response);
-        self.responding = Some(request_id.clone());
+        let command = command(&thread_id, &request_id);
+        let key = (env.clone(), thread_id.clone(), request_id);
+        if !self.responding.insert(key.clone()) {
+            return;
+        }
         cx.spawn(async move |this, cx| {
             let result = client.request("orchestration.dispatchCommand", command).await;
             let _ = this.update(cx, |this, cx| {
-                if this.responding.as_ref() == Some(&request_id) {
-                    this.responding = None;
-                }
+                this.responding.remove(&key);
                 if let Err(error) = result
                     && this.pane_shows(pane, &env, &thread_id)
                 {
@@ -1377,6 +1397,12 @@ impl Workspace {
     /// Dispatches dependent commands one after another, stopping at the first failure.
     fn dispatch_in_order(&mut self, commands: Vec<Value>, cx: &mut Context<Self>) {
         let Some(client) = commands.first().and_then(|command| self.command_client(command)) else { return };
+        self.dispatch_on(client, commands, cx);
+    }
+
+    /// [`Self::dispatch_in_order`] on `client`, the socket of the environment the commands' thread
+    /// lives on, for callers that know it: a bare thread id can name a thread on two environments.
+    fn dispatch_on(&mut self, client: RpcClient, commands: Vec<Value>, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             for command in commands {
                 if let Err(error) = client.request("orchestration.dispatchCommand", command).await {

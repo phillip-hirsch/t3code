@@ -344,19 +344,14 @@ impl Workspace {
     /// The pane's composer takes text: its chat is open, no answer or message is being sent, and
     /// an open question takes a typed answer (`insertComposerText`).
     pub(super) fn composer_takes_citations(&self, pane: ChatPane) -> bool {
-        let takes_answer = |q: &super::attachments::QuestionDraft| {
-            q.questions.get(q.index).is_some_and(crate::requests::Question::allows_custom)
+        let open = match pane {
+            ChatPane::Main => self.target.is_some(),
+            ChatPane::Side => self.pane_thread(ChatPane::Side).is_some() && !self.pane_sending(ChatPane::Side),
         };
-        match pane {
-            ChatPane::Main => {
-                self.target.is_some() && self.responding.is_none() && self.question.as_ref().is_none_or(takes_answer)
-            }
-            ChatPane::Side => {
-                self.pane_thread(ChatPane::Side).is_some()
-                    && !self.pane_sending(ChatPane::Side)
-                    && self.side_chat_question().is_none_or(takes_answer)
-            }
-        }
+        open && !self.question_responding(pane)
+            && self
+                .question(pane)
+                .is_none_or(|q| q.questions.get(q.index).is_some_and(crate::requests::Question::allows_custom))
     }
 
     /// `citeAssistantText`: the chip at the caret, after a space unless one is there, then a

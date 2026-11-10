@@ -80,6 +80,11 @@ impl QueueUi {
     fn begun_edit(&mut self, id: &str) -> Option<&mut QueueEdit> {
         self.edit.as_mut().filter(|edit| edit.id == id)
     }
+
+    /// The draft an open edit set aside, which a failed send rejoins.
+    pub(super) fn edit_draft_mut(&mut self) -> Option<&mut (String, Vec<Attachment>, ContextRecords)> {
+        self.edit.as_mut().map(|edit| &mut edit.saved)
+    }
 }
 
 impl Workspace {
@@ -100,12 +105,11 @@ impl Workspace {
     /// The pane's queue rows.
     pub(super) fn queue_rows(&mut self, pane: ChatPane) -> Vec<Row> {
         let state = match (self.pane_thread(pane), self.pane_projection(pane)) {
-            (Some((_, id)), Some(projection)) => {
+            (Some((env, id)), Some(projection)) => {
                 let archived = self
                     .shell
-                    .threads
-                    .iter()
-                    .any(|t| t.id == id && (t.archived_at.is_some() || t.deleted_at.is_some()));
+                    .thread(&crate::model::ScopedId::new(env, &id))
+                    .is_some_and(|t| t.archived_at.is_some() || t.deleted_at.is_some());
                 queue::derive(projection, archived)
             }
             _ => QueueState::default(),

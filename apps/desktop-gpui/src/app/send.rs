@@ -10,7 +10,6 @@ use gpui_kit::{Context, Keystroke, SharedString, Window};
 use serde_json::{Value, json};
 
 use super::attachments::ATTACHMENT_ONLY_PROMPT;
-use super::composer::ComposerDraft;
 use super::{Target, Workspace, draft_title, new_id};
 use crate::model::{ModelSelection, ThreadProjection};
 use crate::new_thread::{self, DraftWorkspace};
@@ -19,6 +18,8 @@ use crate::timeline::Row;
 
 /// A message sent to a thread that its projection doesn't show yet (`optimisticUserMessages`).
 pub(super) struct PendingSend {
+    /// Thread ids can repeat across environments (an imported thread).
+    env: SharedString,
     thread_id: String,
     message_id: String,
     text: SharedString,
@@ -66,15 +67,17 @@ impl PendingSend {
     }
 }
 
-/// Drops the sends `projection` (of `thread_id`) now shows, and returns the rows of the rest:
-/// messages for after the timeline, queued ones for after the queue.
+/// Drops the sends `projection` (of `env`'s `thread_id`) now shows, and returns the rows of the
+/// rest: messages for after the timeline, queued ones for after the queue.
 pub(super) fn pending_rows(
     pending: &mut Vec<PendingSend>,
+    env: &str,
     thread_id: &str,
     projection: &ThreadProjection,
 ) -> (Vec<Row>, Vec<Row>) {
-    pending.retain(|send| send.thread_id != thread_id || !send.landed(projection));
-    let shown = pending.iter().filter(|send| send.thread_id == thread_id);
+    let here = |send: &PendingSend| send.env == env && send.thread_id == thread_id;
+    pending.retain(|send| !here(send) || !send.landed(projection));
+    let shown = pending.iter().filter(|send| here(send));
     let (queued, sent): (Vec<_>, Vec<_>) = shown.partition(|send| send.queued);
     (sent.into_iter().map(PendingSend::row).collect(), queued.into_iter().map(PendingSend::row).collect())
 }
@@ -199,6 +202,9 @@ impl Workspace {
     }
 
     pub(super) fn submit_with(&mut self, intent: Intent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.target_can_operate() {
+            return;
+        }
         // `/side` beats an open question, unless side chats are off and it may be a literal answer.
         let prompt = self.composer.read(cx).value().to_string();
         if (self.question.is_none() || self.side_chat_disabled_reason().is_none())
@@ -231,7 +237,7 @@ impl Workspace {
         // Read once: an arm made while this send is in flight belongs to the next message.
         let fresh_arm = self.fresh_session_arm().filter(|_| fresh_session);
         if (text.is_empty() && !self.has_attachments())
-            || self.sending
+            || self.target_sending()
             || self.target_rewinding()
             || self.runtime_mode_ceiling().is_some()
             || self.clone_send_block().is_some()
@@ -268,7 +274,7 @@ impl Workspace {
         let mut compact_command = None;
         let mut pending_send = None;
         let (method, mut payload, new_thread_id, workspace) = match target {
-            Target::Thread { id: thread_id, .. } => {
+            Target::Thread { env, id: thread_id } => {
                 settings_commands.extend(self.interaction_mode_command(&thread_id));
                 let projection = self.thread.as_ref().and_then(|t| t.state.projection.as_ref());
                 let running = projection.is_some_and(super::super::model::ThreadProjection::is_running);
@@ -294,6 +300,7 @@ impl Workspace {
                 .command();
                 // Feedback answers an approval rather than posting a message.
                 pending_send = (!text_is_feedback).then(|| PendingSend {
+                    env,
                     thread_id: thread_id.clone(),
                     message_id: command["messageId"].as_str().unwrap_or_default().to_owned(),
                     text: command["text"].as_str().unwrap_or_default().to_owned().into(),
@@ -303,7 +310,7 @@ impl Workspace {
                 });
                 ("orchestration.dispatchCommand", command, None, None)
             }
-            Target::Draft { project_id, draft, .. } => {
+            Target::Draft { env, project_id, draft } => {
                 if let Some((title, description)) = self.load_balancing_send_block() {
                     window.push_notification(Notification::warning(description).title(title), cx);
                     return;
@@ -328,7 +335,7 @@ impl Workspace {
                 };
                 // Still loading the workspace controls: resolve it the same way at send.
                 let workspace = strategy.is_none().then(|| {
-                    let project = self.shell.projects.iter().find(|p| p.id == project_id)?;
+                    let project = self.shell.projects.iter().find(|p| p.environment_id == env && p.id == project_id)?;
                     let has_threads = self.shell.project_has_threads(project);
                     Some((
                         DraftWorkspace::new(self.server_info(), project, has_threads),
@@ -371,7 +378,7 @@ impl Workspace {
         if let Some(message_id) = started {
             self.anchor_new_turn(message_id.into(), cx);
         }
-        self.sending = true;
+        self.sending.insert(origin.clone());
         self.set_composer_text("", window, cx);
         self.release_typing_hold(false, window, cx);
         cx.spawn_in(window, async move |this, cx| {
@@ -412,7 +419,7 @@ impl Workspace {
                 }
             }
             let _ = this.update_in(cx, |this, window, cx| {
-                this.sending = false;
+                this.sending.remove(&origin);
                 match result {
                     Ok(_) => {
                         if !text_is_feedback {
@@ -464,11 +471,7 @@ impl Workspace {
                             this.give_back_context_records(&origin, sent_records);
                             this.give_back_prompt(&origin, text, window, cx);
                         }
-                        if this.target.as_ref() == Some(&origin) {
-                            this.attachments.extend(sent_attachments);
-                        } else if let Some(ComposerDraft::Prompt(_, kept, _)) = this.composer_drafts.get_mut(&origin) {
-                            kept.extend(sent_attachments);
-                        }
+                        this.give_back_attachments(&origin, sent_attachments, cx);
                     }
                 }
                 this.refresh_rows(cx);
@@ -486,12 +489,17 @@ impl Workspace {
             && self.open_projection().is_some_and(|p| p.resumable_run_id().is_some() || p.has_held_queued_runs())
     }
 
+    /// A send from the open target's composer is in flight; other targets' sends don't hold it.
+    pub(super) fn target_sending(&self) -> bool {
+        self.target.as_ref().is_some_and(|target| self.sending.contains(target))
+    }
+
     /// `useComposerResume`: "Continue where you left off." on the resumable run, then the
     /// held queue; with nothing to continue, only the queue.
     pub(super) fn resume_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(Target::Thread { id: thread_id, .. }) = self.target.clone() else { return };
         let (Some(client), Some(projection)) = (self.client(), self.open_projection()) else { return };
-        if self.sending || self.target_rewinding() {
+        if self.target_sending() || self.target_rewinding() || !self.target_can_operate() {
             return;
         }
         let run = projection.resumable_run_id().map(str::to_owned);
@@ -524,9 +532,9 @@ impl Workspace {
                 }
             }
         }
-        self.sending = true;
         self.error = None;
         let origin = self.target.clone();
+        self.sending.extend(origin.clone());
         cx.spawn_in(window, async move |this, cx| {
             let mut result = Ok(Value::Null);
             for command in commands {
@@ -536,7 +544,9 @@ impl Workspace {
                 }
             }
             let _ = this.update(cx, |this, cx| {
-                this.sending = false;
+                if let Some(origin) = &origin {
+                    this.sending.remove(origin);
+                }
                 match (result, &origin) {
                     (Err(error), Some(origin)) => {
                         this.set_error_for(origin, format!("Could not resume thread. {error}").into());
@@ -641,6 +651,7 @@ mod tests {
             state.projection.unwrap()
         };
         let send = |thread: &str, id: &str, queued: bool| PendingSend {
+            env: "local".into(),
             thread_id: thread.into(),
             message_id: id.into(),
             text: "hi".into(),
@@ -648,19 +659,26 @@ mod tests {
             queued,
             content: Default::default(),
         };
-        let mut pending = vec![send("t", "m1", false), send("t", "m2", true), send("other", "m3", false)];
+        let elsewhere = PendingSend { env: "remote".into(), ..send("t", "m4", false) };
+        let mut pending = vec![send("t", "m1", false), send("t", "m2", true), send("other", "m3", false), elsewhere];
         let empty = projection(json!([]), json!([]));
-        let (sent, queued) = pending_rows(&mut pending, "t", &empty);
+        let (sent, queued) = pending_rows(&mut pending, "local", "t", &empty);
         assert!(matches!(sent.as_slice(), [Row::User { id, .. }] if id.as_ref() == "optimistic:m1"));
         assert!(matches!(queued.as_slice(), [Row::Queued { message, .. }] if message.message_id.as_ref() == "m2"));
+        let (sent, _) = pending_rows(&mut pending, "remote", "t", &empty);
+        assert!(
+            matches!(sent.as_slice(), [Row::User { id, .. }] if id.as_ref() == "optimistic:m4"),
+            "another environment's thread with the same id shows only its own send"
+        );
 
         let landed = projection(
             json!([{"id": "i1", "type": "user_message", "threadId": "t", "messageId": "m1", "ordinal": 1}]),
             json!([{"id": "r2", "status": "queued", "ordinal": 2, "userMessageId": "m2"}]),
         );
-        let (sent, queued) = pending_rows(&mut pending, "t", &landed);
+        let (sent, queued) = pending_rows(&mut pending, "local", "t", &landed);
         assert!(sent.is_empty() && queued.is_empty(), "both landed");
-        assert_eq!(pending[0].message_id, "m3", "another thread's send waits for that thread");
+        let waiting: Vec<_> = pending.iter().map(|send| send.message_id.as_str()).collect();
+        assert_eq!(waiting, ["m3", "m4"], "other threads' sends wait for those threads");
     }
 
     #[test]

@@ -44,6 +44,15 @@ fn preview(prompt: &str, attachments: usize) -> String {
     format!("{attachments} attachment{}", if attachments == 1 { "" } else { "s" })
 }
 
+/// The prompt, attachments and records a question card set aside, leaving it an empty prompt.
+fn take_parked(
+    question: &mut crate::app::attachments::QuestionDraft,
+) -> (String, Vec<crate::app::attachments::Attachment>, crate::composer_context::ContextRecords) {
+    let prompt = std::mem::take(&mut question.prompt);
+    let attachments = std::mem::take(&mut question.prompt_attachments);
+    (prompt, attachments, std::mem::take(&mut question.prompt_records))
+}
+
 /// One draft row: the draft, its project on its environment, and its preview.
 pub(super) struct DraftRow {
     pub(super) target: Target,
@@ -96,7 +105,12 @@ impl Workspace {
 
     /// `discardComposerDraft`: clears the draft and offers to undo it.
     pub(super) fn discard_draft(&mut self, target: Target, window: &mut Window, cx: &mut Context<Self>) {
-        let (prompt, attachments, records) = if self.target.as_ref() == Some(&target) {
+        let on_screen = self.target.as_ref() == Some(&target);
+        let (prompt, attachments, records) = if on_screen && !self.composer_holds_prompt(&target) {
+            // A question card or queued message's edit holds the editor; the prompt waits beside it.
+            let Some((prompt, attachments, records)) = self.set_aside_prompt(&target) else { return };
+            (std::mem::take(prompt), std::mem::take(attachments), std::mem::take(records))
+        } else if on_screen {
             let prompt = self.composer.read(cx).value().to_string();
             let attachments = std::mem::take(&mut self.attachments);
             let records = self.take_context_records();
@@ -107,11 +121,9 @@ impl Workspace {
             match self.composer_drafts.remove(&target) {
                 Some(ComposerDraft::Prompt(prompt, attachments, records)) => (prompt, attachments, records),
                 Some(ComposerDraft::Question(mut question)) => {
-                    let prompt = std::mem::take(&mut question.prompt);
-                    let attachments = std::mem::take(&mut question.prompt_attachments);
-                    let records = std::mem::take(&mut question.prompt_records);
+                    let taken = take_parked(&mut question);
                     self.composer_drafts.insert(target.clone(), ComposerDraft::Question(question));
-                    (prompt, attachments, records)
+                    taken
                 }
                 None => return,
             }
@@ -128,17 +140,27 @@ impl Workspace {
     /// Puts a discarded draft back, unless its target has new content since.
     pub(super) fn restore_discarded(&mut self, discarded: Discarded, window: &mut Window, cx: &mut Context<Self>) {
         let Discarded { target, prompt, attachments, records } = discarded;
-        let fresh = if self.target.as_ref() == Some(&target) {
-            !self.composer.read(cx).value().trim().is_empty() || !self.attachments.is_empty()
-        } else {
-            self.composer_drafts.get(&target).is_some_and(ComposerDraft::has_content)
+        let on_screen = self.target.as_ref() == Some(&target);
+        let held = on_screen && !self.composer_holds_prompt(&target);
+        let set_aside = match &self.question {
+            Some(question) => Some((question.prompt.as_str(), question.prompt_attachments.as_slice())),
+            None => self.queue_edit_draft().map(|(prompt, attachments, _)| (prompt, attachments)),
+        };
+        let fresh = match set_aside.filter(|_| held) {
+            Some((prompt, attachments)) => !prompt.trim().is_empty() || !attachments.is_empty(),
+            None if on_screen => !self.composer.read(cx).value().trim().is_empty() || !self.attachments.is_empty(),
+            None => self.composer_drafts.get(&target).is_some_and(ComposerDraft::has_content),
         };
         if fresh {
             self.error = Some("Failed to restore draft: The draft has new content.".into());
             cx.notify();
             return;
         }
-        if self.target.as_ref() == Some(&target) {
+        if held {
+            if let Some((held_prompt, held_attachments, held_records)) = self.set_aside_prompt(&target) {
+                (*held_prompt, *held_attachments, *held_records) = (prompt, attachments, records);
+            }
+        } else if on_screen {
             self.attachments = attachments;
             self.context.records = records;
             self.set_composer_text(prompt, window, cx);
