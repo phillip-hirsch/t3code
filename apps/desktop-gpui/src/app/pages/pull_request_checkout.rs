@@ -33,6 +33,8 @@ const SETTLE: Duration = Duration::from_millis(450);
 /// The draft a checkout is for, as the dialog opened on it.
 #[derive(Clone, Debug, PartialEq)]
 struct Origin {
+    /// The draft itself; a project can hold several.
+    draft: Target,
     environment_id: SharedString,
     project_id: String,
     /// The project checkout the change request is read and prepared from.
@@ -97,11 +99,12 @@ impl Workspace {
         if !self.can_checkout_pull_request() {
             return;
         }
-        let Some(Target::Draft { env, project_id }) = self.target.clone() else { return };
+        let Some(draft @ Target::Draft { .. }) = self.target.clone() else { return };
+        let Target::Draft { env, project_id, .. } = draft.clone() else { return };
         let project = self.shell.projects.iter().find(|p| p.id == project_id && p.environment_id == env);
         let Some(cwd) = project.map(|p| p.workspace_root.clone()) else { return };
         let Some(thread_id) = self.terminal_thread(true) else { return };
-        let origin = Origin { environment_id: env, project_id, cwd, thread_id };
+        let origin = Origin { draft, environment_id: env, project_id, cwd, thread_id };
         let host = self.checkout_host();
         let placeholder = format!("{} URL, checkout command, or #42", host.terms.short);
         let initial = reference.clone().unwrap_or_default();
@@ -173,12 +176,10 @@ impl Workspace {
         };
     }
 
-    /// `openOrReuseProjectDraftThread`: the checkout lands on the project's draft, opened again
-    /// if the user left it meanwhile.
+    /// `openOrReuseProjectDraftThread`: the checkout lands on its draft, opened again if the user
+    /// left it meanwhile, or on the project's draft once that one is gone.
     fn place_checkout(&mut self, origin: &Origin, prepared: &Prepared, window: &mut Window, cx: &mut Context<Self>) {
-        let here = matches!(&self.target, Some(Target::Draft { env, project_id })
-            if *env == origin.environment_id && *project_id == origin.project_id);
-        if !here {
+        if self.target.as_ref() != Some(&origin.draft) {
             let known = self
                 .shell
                 .projects
@@ -187,7 +188,7 @@ impl Workspace {
             if !known {
                 return;
             }
-            self.start_draft_in(origin.environment_id.clone(), origin.project_id.clone(), window, cx);
+            self.open_draft_entry(origin.draft.clone(), window, cx);
         }
         self.point_draft_at_checkout(prepared);
         cx.notify();

@@ -108,7 +108,7 @@ fn merge_prompt(failed: String, newer: &str) -> String {
 }
 
 /// What a target keeps of the composer while another one is on screen, like
-/// the web's `composerDraftStore` (in memory only).
+/// the web's `composerDraftStore`; [`super::draft_store`] keeps it across restarts.
 pub(super) enum ComposerDraft {
     /// The prompt, its attachments and the context records its chips name.
     Prompt(String, Vec<Attachment>, ContextRecords),
@@ -119,6 +119,20 @@ pub(super) enum ComposerDraft {
 impl ComposerDraft {
     pub(super) fn empty() -> Self {
         ComposerDraft::Prompt(String::new(), Vec::new(), ContextRecords::default())
+    }
+
+    /// Its prompt and attachment count.
+    pub(super) fn content(&self) -> (&str, usize) {
+        match self {
+            Self::Prompt(prompt, attachments, _) => (prompt, attachments.len()),
+            Self::Question(question) => (&question.prompt, question.prompt_attachments.len()),
+        }
+    }
+
+    /// `composerDraftHasUserContent`.
+    pub(super) fn has_content(&self) -> bool {
+        let (prompt, attachments) = self.content();
+        !prompt.trim().is_empty() || attachments > 0
     }
 }
 
@@ -157,6 +171,7 @@ impl Workspace {
         self.sync_context_chips(cx);
         self.sync_trigger(cx);
         self.sync_composer_marks(cx);
+        self.drafts_changed(cx);
     }
 
     pub(super) fn sync_composer_empty(&mut self, cx: &mut Context<Self>) {
@@ -207,6 +222,7 @@ impl Workspace {
         self.drop_orphan_citation_comment(cx);
         self.sync_trigger(cx);
         self.sync_composer_marks(cx);
+        self.drafts_changed(cx);
     }
 
     /// Pasted file links, known skills and context links arrive as chips (`handlePaste`);
@@ -300,6 +316,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.drafts_changed(cx);
         if self.target.as_ref() == Some(origin) {
             match &mut self.question {
                 Some(question) => question.prompt = merge_prompt(text, &question.prompt),
@@ -340,6 +357,7 @@ impl Workspace {
                 self.attachments = attachments;
                 self.context.records = records;
                 self.set_composer_text(prompt, window, cx);
+                self.start_restored_uploads(cx);
             }
             None => {
                 self.question = None;
@@ -877,6 +895,7 @@ impl Workspace {
             }
             _ => self.runtime_mode_override = Some(mode.to_owned()),
         }
+        self.drafts_changed(cx);
         cx.notify();
     }
 
@@ -1316,6 +1335,8 @@ impl Workspace {
             Some("Select at least one model.".into())
         } else if self.attachments_busy() {
             Some("Attachment(s) still uploading".into())
+        } else if let Some(reason) = self.clone_send_block() {
+            Some(reason.into())
         } else {
             // An answer to an open question still goes through.
             self.runtime_mode_ceiling().filter(|_| self.question.is_none()).map(|(denial, _)| denial.into())
@@ -1591,6 +1612,7 @@ impl Workspace {
             .chain(self.render_recovery_banner(t, cx))
             .chain(self.render_extension_status_banner(t))
             .chain(self.render_usage_limits_banner(t, cx))
+            .chain(self.render_clone_banner(t, cx))
             .chain(self.render_fresh_session_banner(t, cx))
             .chain(self.render_branch_banner(t, cx))
             .chain(self.render_runtime_mode_ceiling_banner(t, cx))

@@ -251,8 +251,9 @@ impl Workspace {
         }
         let env = project.environment_id.clone();
         self.start_draft_in(env.clone(), project.project_id.clone(), window, cx);
-        let draft = Target::Draft { env, project_id: project.project_id };
-        if self.target.as_ref() != Some(&draft) || !self.write_pr_task(&task, window, cx) {
+        let opened = matches!(&self.target, Some(Target::Draft { env: e, project_id: p, .. })
+            if *e == env && *p == project.project_id);
+        if !opened || !self.write_pr_task(&task, window, cx) {
             toast_error(window, cx, "Could not open a thread", "Try again from the project, or open a thread first.");
             return;
         }
@@ -365,7 +366,7 @@ impl Workspace {
                     on_head: value["isOnPullRequestHead"].as_bool() != Some(false),
                 };
                 let (branch, worktree, on_head) = (&prepared.branch, &prepared.worktree_path, prepared.on_head);
-                if !matches!(&this.target, Some(Target::Draft { env, project_id: p }) if *p == project_id && *env == environment_id) {
+                if !matches!(&this.target, Some(Target::Draft { env, project_id: p, .. }) if *p == project_id && *env == environment_id) {
                     toast_error(
                         window,
                         cx,

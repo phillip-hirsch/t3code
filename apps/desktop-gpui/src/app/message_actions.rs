@@ -248,6 +248,7 @@ impl Workspace {
         for local_id in uploads {
             self.upload(local_id, cx);
         }
+        self.drafts_changed(cx);
     }
 
     /// Whether the open thread's provider can rewind its conversation.

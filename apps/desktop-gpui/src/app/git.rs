@@ -21,6 +21,33 @@ pub struct LineTotals {
     pub deletions: u64,
 }
 
+/// One `workingTree.files` entry; `path` is relative to the worktree root.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkingTreeFile {
+    pub path: String,
+    #[serde(default)]
+    pub insertions: u64,
+    #[serde(default)]
+    pub deletions: u64,
+}
+
+/// `workingTree`: the uncommitted changes and their totals.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkingTree {
+    /// The absolute worktree root every `files[].path` is relative to; absent when the server
+    /// could not resolve it.
+    #[serde(default)]
+    pub root_path: Option<String>,
+    #[serde(default)]
+    pub files: Vec<WorkingTreeFile>,
+    #[serde(default)]
+    pub insertions: u64,
+    #[serde(default)]
+    pub deletions: u64,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct BranchChanges {
@@ -56,7 +83,7 @@ pub struct VcsLocal {
     #[serde(default)]
     pub has_working_tree_changes: bool,
     #[serde(default)]
-    pub working_tree: LineTotals,
+    pub working_tree: WorkingTree,
     #[serde(default)]
     pub branch_changes: Option<BranchChanges>,
 }
@@ -399,6 +426,22 @@ pub fn deletion_color(tokens: &Tokens, scheme: DiffColorScheme) -> Hsla {
     .into()
 }
 
+/// `--diff-addition`: `--success` (emerald 500), or the blue-orange scheme's blue.
+pub fn addition_base_color(tokens: &Tokens, scheme: DiffColorScheme) -> Hsla {
+    match scheme {
+        DiffColorScheme::RedGreen => rgb(0x00bc7d).into(),
+        DiffColorScheme::BlueOrange => addition_color(tokens, scheme),
+    }
+}
+
+/// `--diff-deletion`: `--destructive`, or the blue-orange scheme's orange.
+pub fn deletion_base_color(tokens: &Tokens, scheme: DiffColorScheme) -> Hsla {
+    match scheme {
+        DiffColorScheme::RedGreen => tokens.error,
+        DiffColorScheme::BlueOrange => deletion_color(tokens, scheme),
+    }
+}
+
 /// `Intl.NumberFormat("en-US")` for a count.
 pub fn group_thousands(value: u64) -> String {
     let digits = value.to_string();
@@ -464,11 +507,28 @@ pub(super) struct GitRequest {
     pub commit_message: Option<String>,
     /// `featureBranch`: check out a new branch named from the changes, then run the action there.
     pub feature_branch: bool,
+    /// `filePaths`: commit only these; `None` commits every change.
+    pub file_paths: Option<Vec<String>>,
 }
 
 impl GitRequest {
     pub(super) fn new(action: &'static str) -> Self {
-        Self { action, commit_message: None, feature_branch: false }
+        Self { action, commit_message: None, feature_branch: false, file_paths: None }
+    }
+
+    /// The `git.runStackedAction` input for `cwd`, without the thread and project it ran for.
+    fn input(&self, action_id: String, cwd: &str) -> Value {
+        let mut input = json!({"actionId": action_id, "cwd": cwd, "action": self.action});
+        if let Some(message) = &self.commit_message {
+            input["commitMessage"] = message.clone().into();
+        }
+        if self.feature_branch {
+            input["featureBranch"] = true.into();
+        }
+        if let Some(paths) = &self.file_paths {
+            input["filePaths"] = paths.clone().into();
+        }
+        input
     }
 }
 
@@ -502,8 +562,22 @@ impl VcsWatch {
         self.env.as_deref() == env && self.cwd.as_deref() == Some(cwd)
     }
 
-    fn checkout(&self) -> Option<Checkout> {
+    pub(super) fn checkout(&self) -> Option<Checkout> {
         Some((self.env.clone(), self.cwd.clone()?))
+    }
+
+    /// Marks an action started on `checkout`, watched or not; false while one already runs there.
+    pub(super) fn start_on(&mut self, checkout: Checkout, label: impl Into<SharedString>) -> bool {
+        if self.running.contains_key(&checkout) {
+            return false;
+        }
+        self.running.insert(checkout, label.into());
+        true
+    }
+
+    /// Whether an action runs on `checkout`.
+    pub(super) fn is_running(&self, checkout: &Checkout) -> bool {
+        self.running.contains_key(checkout)
     }
 
     /// The watched checkout's git action in flight.
@@ -513,9 +587,8 @@ impl VcsWatch {
 
     /// Marks an action started on the watched checkout; `None` while one already runs there.
     pub(super) fn start(&mut self, label: impl Into<SharedString>) -> Option<Checkout> {
-        let checkout = self.checkout().filter(|checkout| !self.running.contains_key(checkout))?;
-        self.running.insert(checkout.clone(), label.into());
-        Some(checkout)
+        let checkout = self.checkout()?;
+        self.start_on(checkout.clone(), label).then_some(checkout)
     }
 
     fn progress(&mut self, checkout: &Checkout, label: SharedString) {
@@ -651,13 +724,7 @@ impl Workspace {
         }
         let Some(client) = self.vcs_client() else { return };
         let Some(checkout) = self.vcs.start("Starting source control action...") else { return };
-        let mut input = json!({"actionId": new_id(), "cwd": checkout.1, "action": request.action});
-        if let Some(message) = request.commit_message {
-            input["commitMessage"] = message.into();
-        }
-        if request.feature_branch {
-            input["featureBranch"] = true.into();
-        }
+        let mut input = request.input(new_id(), &checkout.1);
         if let Some(Target::Thread { id, .. }) = &self.target {
             input["threadId"] = id.clone().into();
         }
@@ -723,7 +790,7 @@ impl Workspace {
             BranchOwner::Thread { id, env, branch: had } => {
                 let fields = branch_metadata_patch(&branch, had.as_deref());
                 if let Some(fields) = fields.filter(|_| self.can_operate(&env)) {
-                    self.thread_command("thread.metadata.update", &id, fields, cx);
+                    self.thread_command("thread.metadata.update", &crate::model::ScopedId::new(env, id), fields, cx);
                 }
             }
             BranchOwner::Draft(project_id) => self.set_draft_branch(&project_id, branch, cx),
@@ -984,6 +1051,46 @@ mod tests {
             Some(json!({"branch": "t3/fix-login", "expectedBranch": null}))
         );
         assert_eq!(branch_metadata_patch("main", Some("main")), None);
+    }
+
+    #[test]
+    fn a_commit_request_sends_only_what_it_was_given() {
+        assert_eq!(
+            GitRequest::new("commit").input("a".into(), "/repo"),
+            json!({"actionId": "a", "cwd": "/repo", "action": "commit"})
+        );
+        let picked = GitRequest {
+            commit_message: Some("Fix login".into()),
+            feature_branch: true,
+            file_paths: Some(vec!["src/a.rs".into(), "README.md".into()]),
+            ..GitRequest::new("commit")
+        };
+        assert_eq!(
+            picked.input("b".into(), "/repo"),
+            json!({
+                "actionId": "b", "cwd": "/repo", "action": "commit", "commitMessage": "Fix login",
+                "featureBranch": true, "filePaths": ["src/a.rs", "README.md"],
+            })
+        );
+    }
+
+    #[test]
+    fn the_working_tree_carries_its_files_and_root() {
+        let tree = json!({
+            "rootPath": "/repo",
+            "files": [{"path": "src/a.rs", "insertions": 3, "deletions": 1}, {"path": "b.md", "insertions": 0, "deletions": 2}],
+            "insertions": 3, "deletions": 3,
+        });
+        let parsed = status(local(true, json!({"workingTree": tree})), Value::Null).local.working_tree;
+        assert_eq!(parsed.root_path.as_deref(), Some("/repo"));
+        assert_eq!(
+            parsed.files,
+            [
+                WorkingTreeFile { path: "src/a.rs".into(), insertions: 3, deletions: 1 },
+                WorkingTreeFile { path: "b.md".into(), insertions: 0, deletions: 2 },
+            ]
+        );
+        assert_eq!((parsed.insertions, parsed.deletions), (3, 3));
     }
 
     #[test]

@@ -16,6 +16,7 @@ use serde_json::json;
 use super::{icon, project_icon, tooltip};
 use crate::app::palette::View;
 use crate::app::{Workspace, new_id};
+use crate::model::ScopedId;
 use crate::project_groups::{self, ProjectGroup};
 use crate::theme::Tokens;
 
@@ -93,13 +94,16 @@ impl Workspace {
         let groups = self.project_groups();
         let shown = Self::filter_rows(&groups, &query);
         let highlight = filter.highlight;
-        // The thread pin shortcut pins the highlighted project here (`Sidebar.tsx`).
+        // The thread pin shortcut pins the highlighted project here (`Sidebar.tsx`), where this
+        // connection may.
         if self.is_pin_shortcut(&event.keystroke) {
             if let Some(Some(group)) = shown.get(highlight) {
-                let members: Vec<String> = group.members.iter().map(|m| m.project.id.clone()).collect();
+                let members = group.member_refs();
                 let pinned = group.pinned;
-                self.set_projects_pinned(&members, !pinned, cx);
-                cx.stop_propagation();
+                if self.can_pin_projects(&members) {
+                    self.set_projects_pinned(&members, !pinned, cx);
+                    cx.stop_propagation();
+                }
             }
             return;
         }
@@ -139,13 +143,73 @@ impl Workspace {
         cx.stop_propagation();
     }
 
-    /// `setProjectGroupPinned`: `projects.mutate project.update {pinned}` for every member.
-    pub(in crate::app) fn set_projects_pinned(&mut self, project_ids: &[String], pinned: bool, cx: &mut Context<Self>) {
-        for project_id in project_ids {
-            let mutation =
-                json!({"type": "project.update", "commandId": new_id(), "projectId": project_id, "pinned": pinned});
-            self.mutate_project(mutation, cx);
+    /// An environment's name, once its config has said it (`environmentLabel`).
+    fn env_label(&self, env: &str) -> Option<String> {
+        self.env_info(env).and_then(|info| info.environment_label.clone())
+    }
+
+    /// `canPinProjectGroup`: every member's server organizes projects and this connection may
+    /// change projects there.
+    pub(in crate::app) fn can_pin_projects(&self, members: &[ScopedId]) -> bool {
+        !members.is_empty()
+            && members.iter().all(|member| {
+                self.can_operate(&member.env)
+                    && self.env_info(&member.env).is_some_and(|info| info.capability("projectOrganization"))
+            })
+    }
+
+    /// `setProjectGroupPinned` (`updateProjectGroup`): `project.update {pinned}` on each member's
+    /// machine in turn, stopping at the first failure. Access is checked first and again before
+    /// each write, since it can be revoked between them.
+    pub(in crate::app) fn set_projects_pinned(&mut self, members: &[ScopedId], pinned: bool, cx: &mut Context<Self>) {
+        let title = if pinned { "Failed to pin project" } else { "Failed to unpin project" };
+        let denied = |label: Option<String>| {
+            let place = label.unwrap_or_else(|| "this environment".to_owned());
+            format!("This connection cannot change projects in {place}.")
+        };
+        let connected = |env: &str| {
+            self.env_client(env).is_some() && self.env_info(env).is_some_and(|info| info.environment_id.is_some())
+        };
+        let refusal = match members.iter().find(|m| !self.can_operate(&m.env)) {
+            Some(member) => Some(denied(self.env_label(&member.env))),
+            None => members.iter().find(|m| !connected(&m.env)).map(|member| {
+                let place = self.env_label(&member.env).unwrap_or_else(|| "the selected environment".to_owned());
+                format!("Connect {place} and try again.")
+            }),
+        };
+        if let Some(refusal) = refusal {
+            self.error = Some(super::actions::failure_message(Some(title), &refusal).into());
+            cx.notify();
+            return;
         }
+        let several = members.len() > 1;
+        let writes: Vec<_> = members
+            .iter()
+            .filter_map(|member| {
+                let mutation =
+                    json!({"type": "project.update", "commandId": new_id(), "projectId": member.id, "pinned": pinned});
+                Some((member.env.clone(), self.env_client(&member.env)?, mutation, self.env_label(&member.env)))
+            })
+            .collect();
+        cx.spawn(async move |this, cx| {
+            for (env, client, mutation, label) in writes {
+                let revoked = this.read_with(cx, |this, _| !this.can_operate(&env)).unwrap_or(true);
+                let (failure_title, error) = if revoked {
+                    (title.to_owned(), denied(label))
+                } else if let Err(error) = client.request("projects.mutate", mutation).await {
+                    let place = label.as_deref().unwrap_or("the current environment");
+                    (if several { format!("{title} on {place}") } else { title.to_owned() }, error.to_string())
+                } else {
+                    continue;
+                };
+                let _ = this.update(cx, |this, cx| {
+                    this.error = Some(super::actions::failure_message(Some(&failure_title), &error).into());
+                    cx.notify();
+                });
+                return;
+            }
+        })
+        .detach();
     }
 
     /// `chat.new` and the New thread button: a draft in the current project when
@@ -153,9 +217,9 @@ impl Workspace {
     /// filter shows), else "New thread in…" in the palette.
     pub(in crate::app) fn new_thread(&mut self, in_project: bool, window: &mut Window, cx: &mut Context<Self>) {
         if (in_project || !self.new_thread_opens_picker())
-            && let Some(project_id) = self.new_thread_project()
+            && let Some(project) = self.new_thread_project()
         {
-            self.start_draft(project_id, window, cx);
+            self.start_draft_in(project.env, project.id, window, cx);
             return;
         }
         self.sidebar_open.close_sheet();
@@ -336,11 +400,12 @@ impl Workspace {
                 None => div().ml_auto().size(px(24.)).flex_none(),
                 Some(g) => {
                     let pinned = g.pinned;
-                    let members: Vec<String> = g.members.iter().map(|m| m.project.id.clone()).collect();
+                    let members = g.member_refs();
+                    let can_pin = self.can_pin_projects(&members);
                     let name = &g.display_name;
                     let pin_title: SharedString = format!("{} {name}", if pinned { "Unpin" } else { "Pin" }).into();
                     let gear_title: SharedString = format!("Project settings for {name}").into();
-                    let settings_project = g.representative().id.clone();
+                    let settings_project = ScopedId::of_project(g.representative());
                     let pin_group: SharedString = format!("filter-pin-{}", g.key).into();
                     div()
                         .ml_auto()
@@ -360,37 +425,41 @@ impl Workspace {
                                 }))
                                 .child(gpui_kit::component::Icon::new(IconName::Settings).size(px(14.))),
                         )
-                        .child(
-                            small_button(pin_group.clone())
-                                .when(!pinned && !highlighted, gpui_kit::Styled::invisible)
-                                .tooltip(move |window, cx| {
-                                    gpui_kit::component::tooltip::Tooltip::new(pin_title.clone()).build(window, cx)
-                                })
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.set_projects_pinned(&members, !pinned, cx);
-                                }))
-                                // `ProjectPinButton`: a pinned project shows its pin, which turns
-                                // into PinOff while the button is hovered.
-                                .group(pin_group.clone())
-                                .relative()
-                                .child(
-                                    div()
-                                        .when(pinned, |el| {
-                                            el.group_hover(pin_group.clone(), gpui_kit::Styled::invisible)
-                                        })
-                                        .child(gpui_kit::component::Icon::new(IconName::Pin).size(px(14.))),
-                                )
-                                .when(pinned, |el| {
-                                    el.child(
+                        // A connection that can't pin it keeps the pin's room.
+                        .when(!can_pin, |el| el.child(div().size(px(24.)).flex_none()))
+                        .when(can_pin, |el| {
+                            el.child(
+                                small_button(pin_group.clone())
+                                    .when(!pinned && !highlighted, gpui_kit::Styled::invisible)
+                                    .tooltip(move |window, cx| {
+                                        gpui_kit::component::tooltip::Tooltip::new(pin_title.clone()).build(window, cx)
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.set_projects_pinned(&members, !pinned, cx);
+                                    }))
+                                    // `ProjectPinButton`: a pinned project shows its pin, which turns
+                                    // into PinOff while the button is hovered.
+                                    .group(pin_group.clone())
+                                    .relative()
+                                    .child(
                                         div()
-                                            .absolute()
-                                            .invisible()
-                                            .group_hover(pin_group, gpui_kit::Styled::visible)
-                                            .child(gpui_kit::component::Icon::new(IconName::PinOff).size(px(14.))),
+                                            .when(pinned, |el| {
+                                                el.group_hover(pin_group.clone(), gpui_kit::Styled::invisible)
+                                            })
+                                            .child(gpui_kit::component::Icon::new(IconName::Pin).size(px(14.))),
                                     )
-                                }),
-                        )
+                                    .when(pinned, |el| {
+                                        el.child(
+                                            div()
+                                                .absolute()
+                                                .invisible()
+                                                .group_hover(pin_group, gpui_kit::Styled::visible)
+                                                .child(gpui_kit::component::Icon::new(IconName::PinOff).size(px(14.))),
+                                        )
+                                    }),
+                            )
+                        })
                 }
             };
             h_flex()

@@ -250,6 +250,7 @@ impl Workspace {
             || self.sending
             || self.target_rewinding()
             || self.runtime_mode_ceiling().is_some()
+            || self.clone_send_block().is_some()
         {
             return;
         }
@@ -328,7 +329,7 @@ impl Workspace {
                 });
                 ("orchestration.dispatchCommand", command, None, None)
             }
-            Target::Draft { project_id, .. } => {
+            Target::Draft { project_id, draft, .. } => {
                 if let Some((title, description)) = self.load_balancing_send_block() {
                     window.push_notification(Notification::warning(description).title(title), cx);
                     return;
@@ -354,13 +355,13 @@ impl Workspace {
                 // Still loading the workspace controls: resolve it the same way at send.
                 let workspace = strategy.is_none().then(|| {
                     let project = self.shell.projects.iter().find(|p| p.id == project_id)?;
-                    let has_threads = self.shell.threads.iter().any(|t| t.project_id == project_id);
+                    let has_threads = self.shell.project_has_threads(project);
                     Some((
                         DraftWorkspace::new(self.server_info(), project, has_threads),
                         project.workspace_root.clone(),
                     ))
                 });
-                let thread_id = self.terminals.take_draft_thread(&project_id).unwrap_or_else(new_id);
+                let thread_id = self.terminals.take_draft_thread(&draft).unwrap_or_else(new_id);
                 let launched_message = new_id();
                 let mut initial =
                     json!({"messageId": launched_message, "text": message_text, "attachments": attachments});
@@ -449,8 +450,12 @@ impl Workspace {
                         }
                         this.record_prompt_sent(window, cx);
                         if new_thread_id.is_some() {
-                            // The launched draft's picks went with it.
+                            // The launched draft's picks went with it, and its project's next draft is new.
                             this.composer_selections.remove(&origin);
+                            if let Some(draft) = origin.draft_id() {
+                                this.drafts.promote(draft);
+                            }
+                            this.drafts_changed(cx);
                         }
                         let here = this.target.as_ref() == Some(&origin);
                         match (new_thread_id, background) {

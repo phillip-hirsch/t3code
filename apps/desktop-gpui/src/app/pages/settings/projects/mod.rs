@@ -425,6 +425,12 @@ impl Workspace {
             &group.display_name,
             environment_label.as_deref(),
             &self.shell.threads,
+            refs.iter()
+                .map(|m| {
+                    let project = std::slice::from_ref(&m.project.id);
+                    self.shell.unloaded_older_settled(&m.project.environment_id, Some(project))
+                })
+                .sum(),
         );
         let clear_selection = whole_group && !scoped.has_other_members;
         let (title, description) = message.split_once('\n').unwrap_or((&message, ""));
@@ -471,13 +477,7 @@ impl Workspace {
                         toast_error(window, cx, format!("Failed to remove \"{title}\""), error);
                         return true;
                     }
-                    // The project's draft goes with it.
-                    if let Some(draft) = this.draft_target(id) {
-                        this.composer_drafts.remove(&draft);
-                        if this.target.as_ref() == Some(&draft) {
-                            this.target = None;
-                        }
-                    }
+                    this.forget_project_drafts(id, cx);
                     false
                 });
                 if failed.unwrap_or(true) {

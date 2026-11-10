@@ -28,7 +28,7 @@ use gpui_kit::{Entity, SharedString};
 
 pub(super) use attachment::AttachmentFile;
 pub(super) use document::inline_video_page;
-pub(super) use logic::is_image;
+pub(super) use logic::{absolute_path, is_image};
 pub(super) use overlay::{FileOverlay, OverlayMode};
 pub(super) use tree::MentionDrag;
 

@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 use gpui_kit::SharedString;
 use serde_json::{Map, Value};
 
-use crate::model::{ProjectShell, RepositoryIdentity, ThreadShell};
+use crate::model::{ProjectShell, RepositoryIdentity, ScopedId, ThreadRef, ThreadShell};
 use crate::settings::Settings;
 
 pub const SCRATCH_PROJECT_TITLE: &str = "No project";
@@ -268,13 +268,23 @@ impl ProjectGroup {
         &self.members[0].project
     }
 
+    /// The members on their environments (`memberProjects`), which clients write together.
+    pub fn member_refs(&self) -> Vec<ScopedId> {
+        self.members.iter().map(|m| ScopedId::of_project(&m.project)).collect()
+    }
+
     pub fn contains(&self, project_id: &str) -> bool {
         self.project_ids.iter().any(|id| id == project_id)
     }
 
     /// Whether `project`, on its environment, is one of the group's records.
     pub fn contains_project(&self, project: &ProjectShell) -> bool {
-        self.project_refs.iter().any(|(env, id)| *env == project.environment_id && *id == project.id)
+        self.contains_ref(project.project_ref())
+    }
+
+    /// Whether the record `(environment, id)` is one of the group's.
+    pub fn contains_ref(&self, (environment, project_id): ThreadRef) -> bool {
+        self.project_refs.iter().any(|(env, id)| env == environment && id == project_id)
     }
 
     /// `buildSidebarProjectPickerEntries`' `targetProject`: the checkout on the current
@@ -426,10 +436,10 @@ pub fn sort_groups(groups: &mut Vec<ProjectGroup>, threads: &[ThreadShell], orde
     if order == SortOrder::Manual {
         return;
     }
-    let group_of: HashMap<&str, usize> = groups
+    let group_of: HashMap<ThreadRef, usize> = groups
         .iter()
         .enumerate()
-        .flat_map(|(index, group)| group.project_ids.iter().map(move |id| (id.as_str(), index)))
+        .flat_map(|(index, group)| group.project_refs.iter().map(move |(env, id)| ((env.as_ref(), id.as_str()), index)))
         .collect();
     let thread_time = |t: &ThreadShell| match order {
         SortOrder::CreatedAt => parse_ms(Some(&t.created_at)).or_else(|| parse_ms(Some(&t.updated_at))),
@@ -440,7 +450,7 @@ pub fn sort_groups(groups: &mut Vec<ProjectGroup>, threads: &[ThreadShell], orde
     let mut latest: Vec<Option<i64>> = vec![None; groups.len()];
     let listed = threads.iter().filter(|t| t.is_listed() && t.archived_at.is_none() && t.deleted_at.is_none());
     for thread in listed {
-        if let Some(&index) = group_of.get(thread.project_id.as_str()) {
+        if let Some(&index) = group_of.get(&thread.project_ref()) {
             let time = thread_time(thread).unwrap_or(i64::MIN);
             latest[index] = Some(latest[index].map_or(time, |l| l.max(time)));
         }
@@ -486,21 +496,22 @@ pub fn picker<'g>(groups: &'g [ProjectGroup], preferred: Option<&ProjectShell>) 
 
 /// `groupSidebarThreadsByProject`: boring sidebar folders in `groups` order, each with its
 /// threads in input order. A group without threads keeps a folder only when `keep_empty`
-/// says so; a thread in no group has no folder and is left out.
+/// says so; a thread in no group has no folder and is left out. `project_of` names a thread's
+/// project on its environment.
 pub fn folders<'g, T>(
     groups: &[&'g ProjectGroup],
     threads: Vec<T>,
-    project_of: impl Fn(&T) -> &str,
+    project_of: impl Fn(&T) -> ThreadRef<'_>,
     keep_empty: impl Fn(&ProjectGroup) -> bool,
 ) -> Vec<(&'g ProjectGroup, Vec<T>)> {
-    let folder_of: HashMap<&str, usize> = groups
+    let folder_of: HashMap<ThreadRef, usize> = groups
         .iter()
         .enumerate()
-        .flat_map(|(index, group)| group.project_ids.iter().map(move |id| (id.as_str(), index)))
+        .flat_map(|(index, group)| group.project_refs.iter().map(move |(env, id)| ((env.as_ref(), id.as_str()), index)))
         .collect();
     let mut folders: Vec<(&ProjectGroup, Vec<T>)> = groups.iter().map(|group| (*group, Vec::new())).collect();
     for thread in threads {
-        if let Some(&index) = folder_of.get(project_of(&thread)) {
+        if let Some(&index) = folder_of.get(&project_of(&thread)) {
             folders[index].1.push(thread);
         }
     }
@@ -592,11 +603,13 @@ mod tests {
     }
 
     fn thread(id: &str, project_id: &str, created: &str, message: Option<&str>) -> ThreadShell {
-        serde_json::from_value(json!({
+        let mut thread: ThreadShell = serde_json::from_value(json!({
             "id": id, "projectId": project_id, "title": id, "status": "idle", "lineage": {},
             "updatedAt": created, "createdAt": created, "latestUserMessageAt": message,
         }))
-        .unwrap()
+        .unwrap();
+        thread.environment_id = "env".into();
+        thread
     }
 
     fn keys(groups: &[ProjectGroup]) -> Vec<&str> {
@@ -724,6 +737,11 @@ mod tests {
             // Created long ago, but messaged most recently.
             thread("t1", "early", "2026-02-01T00:00:00.000Z", Some("2026-11-04T00:00:00.000Z")),
             thread("t2", "busy", "2026-10-25T00:00:00.000Z", None),
+            // `quiet`'s id on another machine is another project.
+            ThreadShell {
+                environment_id: "copy".into(),
+                ..thread("t3", "quiet", "2026-11-05T00:00:00.000Z", Some("2026-11-05T00:00:00.000Z"))
+            },
         ];
         let base = build_groups(&projects, &GroupingSettings::default(), &[], true);
         let sorted = |order| {
@@ -742,8 +760,10 @@ mod tests {
             [project("a", "/a", Value::Null), project("b", "/b", Value::Null), project("c", "/c", Value::Null)];
         let groups = build_groups(&projects, &GroupingSettings::default(), &[], true);
         let order: Vec<&ProjectGroup> = vec![&groups[2], &groups[0], &groups[1]];
-        let threads = vec![("t1", "a"), ("t2", "x"), ("t3", "c"), ("t4", "a")];
-        let folders = folders(&order, threads, |t| t.1, |g| g.key == "env:/b");
+        // `t5` names project `a` on another machine, which no folder holds.
+        let threads =
+            vec![("t1", "env", "a"), ("t2", "env", "x"), ("t3", "env", "c"), ("t4", "env", "a"), ("t5", "copy", "a")];
+        let folders = folders(&order, threads, |t| (t.1, t.2), |g| g.key == "env:/b");
         let shape: Vec<(&str, Vec<&str>)> =
             folders.iter().map(|(g, threads)| (g.key.as_str(), threads.iter().map(|t| t.0).collect())).collect();
         assert_eq!(shape, [("env:/c", vec!["t3"]), ("env:/a", vec!["t1", "t4"]), ("env:/b", vec![])]);

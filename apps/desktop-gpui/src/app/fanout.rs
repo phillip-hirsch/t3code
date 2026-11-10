@@ -365,7 +365,7 @@ mod tests {
     #[test]
     fn a_failed_launch_retries_the_same_prompt_with_its_ids() {
         let mut state = FanoutState::default();
-        let draft = Target::Draft { env: "e".into(), project_id: "p".into() };
+        let draft = Target::draft("e".into(), "p".into(), super::super::draft_sessions::DraftId::for_test("d"));
         let key = (draft, "codex".to_owned(), "gpt".to_owned());
         let first = state.launch_ids(&key, "Fix it");
         assert_ne!(state.launch_ids(&key, "Fix it"), first, "nothing failed yet");

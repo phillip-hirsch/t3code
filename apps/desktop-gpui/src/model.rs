@@ -581,6 +581,8 @@ pub struct RepositoryLocator {
 pub struct RepositoryOrigin {
     pub canonical_key: String,
     #[serde(default)]
+    pub remote_url: Option<String>,
+    #[serde(default)]
     pub display_name: Option<String>,
 }
 
@@ -620,6 +622,11 @@ pub struct ProjectShell {
 }
 
 impl ProjectShell {
+    /// The project's identity across environments, borrowed.
+    pub fn project_ref(&self) -> ThreadRef<'_> {
+        (&self.environment_id, &self.id)
+    }
+
     pub fn scope_project(&self) -> crate::settings::scope::Project {
         crate::settings::scope::Project {
             id: self.id.clone(),
@@ -968,10 +975,60 @@ impl ThreadShell {
     pub fn is_listed(&self) -> bool {
         self.lineage.relationship_to_parent.as_deref() != Some("subagent") && self.lineage.side_chat != Some(true)
     }
+
+    /// The thread's identity across environments, borrowed.
+    pub fn thread_ref(&self) -> ThreadRef<'_> {
+        (&self.environment_id, &self.id)
+    }
+
+    /// The thread's project's identity across environments, borrowed.
+    pub fn project_ref(&self) -> ThreadRef<'_> {
+        (&self.environment_id, &self.project_id)
+    }
 }
 
 /// `(environment id, thread id)`, a thread's identity across environments.
 pub type ThreadRef<'a> = (&'a str, &'a str);
+
+/// A thread's or project's id on its environment (`ScopedThreadRef`, `ScopedProjectRef`): ids
+/// repeat across environments, so a bare id can name the wrong record.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ScopedId {
+    pub env: SharedString,
+    pub id: String,
+}
+
+impl ScopedId {
+    pub fn new(env: impl Into<SharedString>, id: impl Into<String>) -> Self {
+        Self { env: env.into(), id: id.into() }
+    }
+
+    pub fn of_thread(thread: &ThreadShell) -> Self {
+        Self::new(thread.environment_id.clone(), thread.id.clone())
+    }
+
+    pub fn of_project(project: &ProjectShell) -> Self {
+        Self::new(project.environment_id.clone(), project.id.clone())
+    }
+
+    /// The thread's project on the thread's environment.
+    pub fn thread_project(thread: &ThreadShell) -> Self {
+        Self::new(thread.environment_id.clone(), thread.project_id.clone())
+    }
+
+    pub fn is_thread(&self, thread: &ThreadShell) -> bool {
+        self.env == thread.environment_id && self.id == thread.id
+    }
+
+    pub fn is_project(&self, project: &ProjectShell) -> bool {
+        self.env == project.environment_id && self.id == project.id
+    }
+
+    /// `(environment, id)`, borrowed.
+    pub fn pair(&self) -> ThreadRef<'_> {
+        (&self.env, &self.id)
+    }
+}
 
 /// `hiddenThreadTagsAtom`: the tags an environment's tag filter hides, `None` while it is off.
 pub fn hidden_thread_tags(settings: &crate::settings::Settings) -> Option<Vec<String>> {
@@ -1047,6 +1104,20 @@ struct ShellSnapshot {
     projects: Vec<ProjectShell>,
     #[serde(default, deserialize_with = "lossy")]
     threads: Vec<ThreadShell>,
+    /// Present when the subscription asked to leave older settled threads out.
+    #[serde(default, deserialize_with = "lenient")]
+    older_settled: Option<crate::older_settled::CutWire>,
+}
+
+/// Thread rows read outside the shell: an older settled page, a search's older matches, or a
+/// thread family (`OrchestrationV2ThreadFamily`).
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadRows {
+    #[serde(default)]
+    pub snapshot_sequence: u64,
+    #[serde(default, deserialize_with = "lossy")]
+    pub threads: Vec<ThreadShell>,
 }
 
 /// Every environment's projects and threads in one list (the web's merged shell selectors),
@@ -1068,6 +1139,12 @@ struct ShellCursor {
     needs_snapshot: bool,
     /// A full snapshot was applied; a fresh environment's is valid at sequence 0.
     has_snapshot: bool,
+    /// Counts full snapshots, so reads made before the latest one can tell they are stale.
+    generation: u64,
+    /// Where the snapshot cut older settled threads, when it left them out.
+    older: Option<crate::older_settled::Cut>,
+    /// The sequence of each thread's latest removal since the snapshot.
+    removed_at: HashMap<String, u64>,
 }
 
 impl ShellState {
@@ -1086,6 +1163,16 @@ impl ShellState {
         self.cursors.values().any(|cursor| cursor.live)
     }
 
+    /// The thread with this id on this environment.
+    pub fn thread(&self, key: &ScopedId) -> Option<&ThreadShell> {
+        self.threads.iter().find(|t| key.is_thread(t))
+    }
+
+    /// The project with this id on this environment.
+    pub fn project(&self, key: &ScopedId) -> Option<&ProjectShell> {
+        self.projects.iter().find(|p| key.is_project(p))
+    }
+
     /// The environment a thread lives on.
     pub fn thread_environment(&self, thread_id: &str) -> Option<&SharedString> {
         self.threads.iter().find(|t| t.id == thread_id).map(|t| &t.environment_id)
@@ -1094,6 +1181,90 @@ impl ShellState {
     /// The environment a project lives on.
     pub fn project_environment(&self, project_id: &str) -> Option<&SharedString> {
         self.projects.iter().find(|p| p.id == project_id).map(|p| &p.environment_id)
+    }
+
+    /// Counts the environment's full snapshots; a read made under an older one must not merge.
+    pub fn generation(&self, environment_id: &str) -> u64 {
+        self.cursors.get(environment_id).map_or(0, |cursor| cursor.generation)
+    }
+
+    /// The environment's older settled cut, when its shell leaves those threads out.
+    pub fn older_settled(&self, environment_id: &str) -> Option<&crate::older_settled::Cut> {
+        self.cursors.get(environment_id)?.older.as_ref()
+    }
+
+    /// Every environment whose shell leaves older settled threads out, with its cut.
+    pub fn older_settled_cuts(&self) -> impl Iterator<Item = (&SharedString, &crate::older_settled::Cut)> {
+        self.cursors.iter().filter_map(|(id, cursor)| Some((id, cursor.older.as_ref()?)))
+    }
+
+    /// The environment's [`crate::older_settled::count_key`] now, when it has a cut.
+    pub fn older_settled_count_key(&self, environment_id: &str) -> Option<u64> {
+        let cursor = self.cursors.get(environment_id)?;
+        let cut = cursor.older.as_ref()?;
+        let threads = self.threads.iter().filter(|t| t.environment_id == environment_id);
+        Some(crate::older_settled::count_key(threads, cut, &cursor.removed_at))
+    }
+
+    /// Takes a count read (`getOlderSettledThreads`, `limit: 0`) made for `key` under `generation`.
+    pub fn set_older_settled_counts(
+        &mut self,
+        environment_id: &str,
+        generation: u64,
+        key: u64,
+        counts: HashMap<String, usize>,
+    ) {
+        let Some(cursor) = self.cursors.get_mut(environment_id).filter(|c| c.generation == generation) else { return };
+        let Some(cut) = cursor.older.as_mut() else { return };
+        cut.set_counts(counts, key);
+        self.revision += 1;
+    }
+
+    /// `unloadedOlderSettledCount`: older settled threads of these projects (all for `None`) on
+    /// the environment that this client does not hold: the server's count minus the older rows
+    /// it has, in any section.
+    pub fn unloaded_older_settled(&self, environment_id: &str, projects: Option<&[String]>) -> usize {
+        let Some(cut) = self.older_settled(environment_id) else { return 0 };
+        let held = self
+            .threads
+            .iter()
+            .filter(|t| t.environment_id == environment_id)
+            .filter(|t| projects.is_none_or(|ids| ids.contains(&t.project_id)))
+            .filter(|t| crate::older_settled::is_older_settled(t, cut.before_ms))
+            .count();
+        cut.count(projects).saturating_sub(held)
+    }
+
+    /// The project has threads, counting older settled ones the shell left out.
+    pub fn project_has_threads(&self, project: &ProjectShell) -> bool {
+        self.threads.iter().any(|t| t.project_ref() == project.project_ref())
+            || self.unloaded_older_settled(&project.environment_id, Some(std::slice::from_ref(&project.id))) > 0
+    }
+
+    /// `threadFamilyRowsMissingFromShell`: merges rows read outside the shell behind its own,
+    /// which win since deltas carry every change. A row the shell removed after the read is
+    /// stale, and a read made under an earlier snapshot merges nothing. Merged rows then follow
+    /// deltas like any other, until the next snapshot replaces them.
+    pub fn mount_rows(&mut self, environment_id: &SharedString, generation: u64, read: ThreadRows) -> bool {
+        let Some(cursor) = self.cursors.get(environment_id.as_ref()) else { return false };
+        let cut_sequence = cursor.older.as_ref().map_or(0, |cut| cut.as_of_sequence);
+        if cursor.generation != generation || read.snapshot_sequence < cut_sequence {
+            return false;
+        }
+        let mut added = false;
+        for mut thread in read.threads {
+            let removed = cursor.removed_at.get(&thread.id).is_some_and(|&at| at > read.snapshot_sequence);
+            if removed || self.threads.iter().any(|t| t.environment_id == *environment_id && t.id == thread.id) {
+                continue;
+            }
+            thread.environment_id = environment_id.clone();
+            self.threads.push(thread);
+            added = true;
+        }
+        if added {
+            self.revision += 1;
+        }
+        added
     }
 
     /// Drops an environment that was removed or switched off.
@@ -1175,6 +1346,16 @@ impl ShellState {
                         cursor.sequence = snapshot.snapshot_sequence;
                         cursor.needs_snapshot = false;
                         cursor.has_snapshot = true;
+                        cursor.generation += 1;
+                        cursor.removed_at.clear();
+                        cursor.older = snapshot.older_settled.and_then(crate::older_settled::Cut::from_wire);
+                        if let Some(cut) = cursor.older.as_mut()
+                            && snapshot.snapshot_sequence == cut.as_of_sequence
+                        {
+                            // Exact as of this snapshot, until a later change moves the key.
+                            let held = self.threads.iter().filter(|t| ours(&t.environment_id));
+                            cut.counts_key = Some(crate::older_settled::count_key(held, cut, &cursor.removed_at));
+                        }
                     }
                 }
             }
@@ -1210,14 +1391,18 @@ impl ShellState {
                         (None, true) => self.threads.push(thread),
                         (Some(index), false) => {
                             self.threads.remove(index);
+                            cursor.removed_at.insert(thread.id, sequence.unwrap_or(cursor.sequence));
                         }
-                        (None, false) => {}
+                        (None, false) => {
+                            cursor.removed_at.insert(thread.id, sequence.unwrap_or(cursor.sequence));
+                        }
                     }
                 }
             },
             "thread.removed" => {
                 let id = item["threadId"].as_str().unwrap_or_default();
                 self.threads.retain(|t| !(ours(&t.environment_id) && t.id == id));
+                cursor.removed_at.insert(id.to_owned(), sequence.unwrap_or(cursor.sequence));
             }
             _ => {}
         }
@@ -2282,6 +2467,78 @@ mod tests {
         let ids: Vec<_> = shell.threads.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ids, ["u"]);
         assert_eq!(shell.sequence(ENV), 7);
+    }
+
+    #[test]
+    fn rows_read_outside_the_shell_merge_behind_it_and_count_against_the_cut() {
+        let env: SharedString = ENV.into();
+        let older = |id: &str, project: &str| {
+            let mut row = thread(id, "1");
+            row["projectId"] = json!(project);
+            row["settledOverride"] = json!("settled");
+            row["settledAt"] = json!("2024-01-01T00:00:00.000Z");
+            row
+        };
+        let cut = json!({"before": "2024-02-01T00:00:00.000Z", "asOfSequence": 5, "counts": [{"projectId": "p", "count": 3}, {"projectId": "q", "count": 1}]});
+        let mut shell = ShellState::default();
+        shell_snapshot(&mut shell, &env, json!([older("held", "p")]), Some(cut));
+        let generation = shell.generation(ENV);
+        assert_eq!(shell.older_settled(ENV).map(|cut| cut.count(None)), Some(4));
+        assert_eq!(shell.unloaded_older_settled(ENV, None), 3, "the held older row is loaded");
+        assert_eq!(shell.unloaded_older_settled(ENV, Some(&["q".into()])), 1);
+        let key = shell.older_settled_count_key(ENV);
+        assert_eq!(key, shell.older_settled(ENV).and_then(|cut| cut.counts_key), "exact as of the snapshot");
+
+        shell.apply(&env, &json!({"kind":"thread.removed","sequence":7,"threadId":"gone"})).unwrap();
+        assert_ne!(shell.older_settled_count_key(ENV), key, "a removal asks for fresh counts");
+        let rows = |sequence: u64, ids: &[&str]| ThreadRows {
+            snapshot_sequence: sequence,
+            threads: ids.iter().map(|id| serde_json::from_value(older(id, "p")).unwrap()).collect(),
+        };
+        // Read before the removal: the removed row is stale; the held row stays the shell's.
+        assert!(shell.mount_rows(&env, generation, rows(6, &["gone", "held", "page"])));
+        let ids: Vec<_> = shell.threads.iter().map(|t| (t.environment_id.as_ref(), t.id.as_str())).collect();
+        assert_eq!(ids, [(ENV, "held"), (ENV, "page")]);
+        assert_eq!(shell.unloaded_older_settled(ENV, None), 2);
+        assert!(!shell.mount_rows(&env, generation, rows(8, &["page"])), "already held");
+        assert!(shell.mount_rows(&env, generation, rows(8, &["gone"])), "read after the removal");
+        assert!(!shell.mount_rows(&env, generation, rows(4, &["early"])), "read before the cut's snapshot");
+        assert!(!shell.mount_rows(&env, generation + 1, rows(9, &["later"])), "another snapshot's read");
+
+        shell.set_older_settled_counts(ENV, generation, 1, HashMap::from([("p".to_owned(), 9)]));
+        assert_eq!(shell.unloaded_older_settled(ENV, None), 6);
+        // A fresh snapshot replaces the merged rows and the counts with its own.
+        shell_snapshot(&mut shell, &env, json!([]), None);
+        assert!(shell.older_settled(ENV).is_none() && shell.threads.is_empty());
+        assert_eq!(shell.generation(ENV), generation + 1);
+    }
+
+    fn shell_snapshot(shell: &mut ShellState, env: &SharedString, threads: Value, cut: Option<Value>) {
+        let mut snapshot = json!({"snapshotSequence": 5, "projects": [], "threads": threads});
+        if let Some(cut) = cut {
+            snapshot["olderSettled"] = cut;
+        }
+        shell.apply(env, &json!({"kind": "snapshot", "snapshot": snapshot})).unwrap();
+    }
+
+    #[test]
+    fn a_scoped_lookup_tells_equal_ids_on_two_environments_apart() {
+        let mut shell = ShellState::default();
+        let (a, b): (SharedString, SharedString) = ("env-a".into(), "env-b".into());
+        let snapshot = |title: &str| {
+            let mut thread = thread("t", "1");
+            thread["title"] = json!(title);
+            json!({"kind":"snapshot","snapshot":{"snapshotSequence":1,"projects":[project("/r", None)],"threads":[thread]}})
+        };
+        shell.apply(&a, &snapshot("on a")).unwrap();
+        shell.apply(&b, &snapshot("on b")).unwrap();
+        let title = |env: &SharedString| shell.thread(&ScopedId::new(env.clone(), "t")).map(|t| t.title.as_str());
+        assert_eq!((title(&a), title(&b)), (Some("on a"), Some("on b")));
+        assert!(shell.thread(&ScopedId::new("env-c", "t")).is_none());
+        let on_b = shell.project(&ScopedId::new(b.clone(), "/r")).map(|p| &p.environment_id);
+        assert_eq!(on_b, Some(&b));
+        let key = ScopedId::of_thread(&shell.threads[1]);
+        assert_eq!((key.env.as_ref(), key.is_thread(&shell.threads[0])), ("env-b", false));
     }
 
     #[test]

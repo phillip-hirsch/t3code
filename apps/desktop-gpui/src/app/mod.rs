@@ -13,18 +13,19 @@ use gpui_kit::component::message_scroller::MessageScrollerState;
 use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AppContext as _, AsyncWindowContext, Context, Entity, Focusable as _, InteractiveElement as _, IntoElement,
+    App, AppContext as _, AsyncWindowContext, Context, Entity, Focusable as _, InteractiveElement as _, IntoElement,
     KeyDownEvent, ParentElement as _, Render, SharedString, Styled as _, Subscription, Task, WeakEntity, Window, div,
 };
 use serde_json::{Value, json};
 
 use crate::backend;
 use crate::environments::{BackendStatus, PrimaryBackend};
-use crate::model::{ModelSelection, ProjectShell, ServerInfo, ShellState, ThreadState};
+use crate::model::{ModelSelection, ProjectShell, ScopedId, ServerInfo, ShellState, ThreadState};
 use crate::rpc::{self, ConnectOptions, RpcClient, RpcError, RpcStream, StreamEvent};
 use crate::runtime;
 use crate::timeline::{self, Row};
 
+mod add_to_machine;
 mod alerts;
 mod app_activation;
 mod attachment_preview;
@@ -47,6 +48,8 @@ mod context_strip;
 mod desktop;
 mod details;
 mod draft_picker;
+mod draft_sessions;
+mod draft_store;
 mod embed;
 pub(crate) mod environments;
 mod external_links;
@@ -82,6 +85,7 @@ mod palette_actions;
 mod plan_actions;
 mod positions;
 mod preview;
+mod project_clone;
 mod prompt_stash;
 mod queue;
 mod quit;
@@ -95,6 +99,7 @@ mod side_chat;
 mod sidebar;
 mod sidebar_sheet;
 mod snap_shot;
+mod source_control;
 mod subagents;
 mod terminal;
 mod theme_editor;
@@ -156,11 +161,26 @@ enum Target {
         env: SharedString,
         id: String,
     },
-    /// A new thread in this project, created by the first message.
+    /// An unsent draft in this project, whose first message creates the thread. Build one with
+    /// [`Target::draft`]; `draft` is its identity, which stays when it moves between projects.
     Draft {
         env: SharedString,
         project_id: String,
+        draft: draft_sessions::DraftId,
     },
+}
+
+impl Target {
+    fn draft(env: SharedString, project_id: String, draft: draft_sessions::DraftId) -> Self {
+        Self::Draft { env, project_id, draft }
+    }
+
+    fn draft_id(&self) -> Option<&draft_sessions::DraftId> {
+        match self {
+            Self::Draft { draft, .. } => Some(draft),
+            Self::Thread { .. } => None,
+        }
+    }
 }
 
 struct OpenThread {
@@ -238,6 +258,10 @@ pub struct Workspace {
     composer_action_focus: [gpui_kit::FocusHandle; 5],
     /// Composer text and question drafts of the targets not on screen.
     composer_drafts: HashMap<Target, composer::ComposerDraft>,
+    /// Every draft's identity and the draft each project opens.
+    drafts: draft_sessions::DraftSessions,
+    /// Drafts kept across restarts.
+    draft_store: draft_store::DraftStore,
     /// The model and permissions picks of the targets not on screen (`composerDraftStore`).
     composer_selections: HashMap<Target, composer::ComposerSelection>,
     /// The request whose response is in flight.
@@ -384,6 +408,8 @@ pub struct Workspace {
     fresh_sessions: fresh_session::FreshSessions,
     /// Window bounds persistence and other desktop shell state.
     desktop: desktop::DesktopShell,
+    /// Each environment's project clones and their toasts.
+    clones: project_clone::ProjectClones,
     /// Running threads synced in the background.
     keep_alive: keep_alive::KeepAlive,
     /// Paired remote environments and their background connections.
@@ -454,6 +480,12 @@ impl Workspace {
         let (desktop, desktop_subscriptions) = desktop::DesktopShell::new(window, cx);
         let mut subscriptions = subscriptions;
         subscriptions.extend(desktop_subscriptions);
+        // A window macOS closes takes its workspace with it; the next one reads these drafts.
+        subscriptions.push(cx.on_release(|this, cx| this.flush_drafts(cx)));
+        subscriptions.push(cx.on_app_quit(|this, cx| {
+            this.flush_drafts(cx);
+            async {}
+        }));
         let client_settings = crate::settings::ClientSettings::load();
         cx.set_global(crate::theme::Appearance::from_settings(&client_settings.values));
         crate::theme::set_preference(client_settings.theme_choice(), window, cx);
@@ -494,6 +526,8 @@ impl Workspace {
             _typing_idle: None,
             composer_action_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             composer_drafts: HashMap::new(),
+            drafts: Default::default(),
+            draft_store: Default::default(),
             composer_selections: HashMap::new(),
             responding: None,
             menu: Default::default(),
@@ -594,6 +628,7 @@ impl Workspace {
             banners: Default::default(),
             fresh_sessions: Default::default(),
             desktop,
+            clones: project_clone::ProjectClones::default(),
             keep_alive: Default::default(),
             saved_environments,
             theme_feed: Default::default(),
@@ -603,6 +638,7 @@ impl Workspace {
         workspace.resume_snap_shot_setup(window, cx);
         workspace.sync_saved_sessions(window, cx);
         workspace.start_theme_feed(window, cx);
+        workspace.load_drafts(window, cx);
         workspace
     }
 
@@ -873,9 +909,12 @@ impl Workspace {
     }
 
     /// Electron always opens the index route, which starts a draft in the most
-    /// recently active project (`IndexDraftLanding`); this is that landing.
+    /// recently active project (`IndexDraftLanding`); this is that landing. It waits for the
+    /// saved drafts, so it opens the project's own.
     fn land(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.landed || !self.primary_environment().is_some_and(|id| self.shell.has_snapshot(id)) {
+        let ready =
+            self.draft_store.restored() && self.primary_environment().is_some_and(|id| self.shell.has_snapshot(id));
+        if self.landed || !ready {
             return;
         }
         self.landed = true;
@@ -978,6 +1017,7 @@ impl Workspace {
     }
 
     fn select_thread_in(&mut self, env: SharedString, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.mount_thread_family(&env, &thread_id, cx);
         let target = Target::Thread { env, id: thread_id.clone() };
         if self.target.as_ref() == Some(&target) {
             // `navigateToThread` closes the sheet even when the thread is already open.
@@ -1026,11 +1066,46 @@ impl Workspace {
         self.start_draft_in(env, project_id, window, cx);
     }
 
-    /// A project's draft on `env`, for a project the shell may not list yet.
+    /// "New thread" in a project on `env`, which the shell may not list yet (`createNewThreadHandler`).
     fn start_draft_in(&mut self, env: SharedString, project_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let target = self.project_draft(env, project_id, cx);
+        self.open_draft(target, window, cx);
+    }
+
+    /// The draft "New thread" opens in a project, made that project's draft: an empty one it can
+    /// reopen, else a new one. A draft with content keeps its own identity and stays a sidebar row.
+    fn project_draft(&mut self, env: SharedString, project_id: String, cx: &App) -> Target {
+        let project = ScopedId::new(env.clone(), project_id.as_str());
+        let open = self.target.as_ref().and_then(Target::draft_id);
+        let reused = self.drafts.reusable(&project, open, |draft| {
+            let target = Target::draft(env.clone(), project_id.clone(), draft.clone());
+            if self.target.as_ref() == Some(&target) {
+                !self.composer_has_user_content(cx)
+            } else {
+                !self.composer_drafts.get(&target).is_some_and(composer::ComposerDraft::has_content)
+            }
+        });
+        let draft = reused.unwrap_or_else(|| self.drafts.create(project.clone()));
+        self.drafts.assign(project, &draft);
+        Target::draft(env, project_id, draft)
+    }
+
+    /// A history entry's draft: that draft while it is unsent and its project listed, else its
+    /// project's draft.
+    fn open_draft_entry(&mut self, target: Target, window: &mut Window, cx: &mut Context<Self>) {
+        let Target::Draft { env, project_id, draft } = &target else { return };
+        let listed = self.shell.projects.iter().any(|p| p.id == *project_id && p.environment_id == *env);
+        if listed && self.drafts.is_live(draft) {
+            self.open_draft(target, window, cx);
+        } else {
+            self.start_draft(project_id.clone(), window, cx);
+        }
+    }
+
+    /// Opens this exact draft, as its sidebar row does.
+    fn open_draft(&mut self, target: Target, window: &mut Window, cx: &mut Context<Self>) {
         self.page = None;
         self.stash_composer(cx);
-        let target = Target::Draft { env, project_id };
         let opened = self.target.as_ref() != Some(&target);
         if opened && !self.composer_drafts.contains_key(&target) {
             self.forget_draft_routing(&target);
@@ -1073,6 +1148,7 @@ impl Workspace {
         self.notify_sidebar(cx);
         cx.notify();
         self.record_location();
+        self.sync_clone_toasts(window, cx);
     }
 
     fn reset_timeline(&mut self, cx: &mut Context<Self>) {

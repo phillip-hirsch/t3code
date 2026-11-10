@@ -83,7 +83,8 @@ pub(super) fn has_default_icon(member: &Member) -> bool {
     }
 }
 
-/// `planProjectRemoval`: whether the whole group goes, and the confirmation to show.
+/// `planProjectRemoval`: whether the whole group goes, and the confirmation to show. `unloaded`
+/// counts the members' threads the shell left out (older settled ones).
 pub(super) fn plan_removal(
     members: &[&Member],
     group_member_count: usize,
@@ -91,11 +92,13 @@ pub(super) fn plan_removal(
     display_name: &str,
     environment_label: Option<&str>,
     threads: &[ThreadShell],
+    unloaded: usize,
 ) -> (bool, String) {
     let thread_count = threads
         .iter()
         .filter(|thread| thread.is_listed() && members.iter().any(|m| m.project.id == thread.project_id))
-        .count();
+        .count()
+        + unloaded;
     let whole_group = members.len() == group_member_count;
     let kind = if has_other_members || !whole_group { "checkout" } else { "project" };
     let single = if let [member] = members { Some(*member) } else { None };
@@ -210,7 +213,7 @@ mod tests {
             "updatedAt": "2026-11-01T00:00:00.000Z", "createdAt": "2026-11-01T00:00:00.000Z",
         }))
         .unwrap();
-        let (whole, message) = plan_removal(&[&member], 1, false, "api", Some("box"), &[thread]);
+        let (whole, message) = plan_removal(&[&member], 1, false, "api", Some("box"), &[thread], 0);
         assert!(whole);
         assert_eq!(
             message,
@@ -218,9 +221,14 @@ mod tests {
              Those threads and any archived threads are deleted from T3 Code. Provider sessions are kept.\n\
              This removes only the project entries, not the files on disk.\nThis action cannot be undone."
         );
-        let (whole, message) = plan_removal(&[&member], 2, false, "group", None, &[]);
+        let (whole, message) = plan_removal(&[&member], 2, false, "group", None, &[], 0);
         assert!(!whole);
         assert!(message.starts_with("Remove checkout \"api\"?\nPath: /src/api\nAny archived"));
+        // Older settled threads the shell left out count too.
+        let (_, message) = plan_removal(&[&member], 2, false, "group", None, &[], 2);
+        assert!(
+            message.starts_with("Remove checkout \"api\" and delete its 2 threads?\nPath: /src/api\nThose threads")
+        );
         assert!(message.contains("Other entries in this grouped project are unaffected."));
     }
 }

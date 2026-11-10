@@ -226,8 +226,8 @@ impl Workspace {
                 let shell = self.shell.threads.iter().find(|t| &t.id == id && &t.environment_id == env)?;
                 (env.clone(), Some(id.clone()), shell.project_id.clone(), format!("{env}:{id}"))
             }
-            Target::Draft { env, project_id } => {
-                (env.clone(), None, project_id.clone(), format!("{env}:draft:{project_id}"))
+            Target::Draft { env, project_id, draft } => {
+                (env.clone(), None, project_id.clone(), format!("{env}:draft:{draft}"))
             }
         };
         let shell = thread_id

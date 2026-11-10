@@ -1,13 +1,15 @@
 //! The command palette (`apps/web/src/components/CommandPalette*.tsx`): actions,
 //! recent threads, search over threads, projects and settings, message hits,
 //! "New thread in…", and the add-project flow (browse a folder, or pick one
-//! with the native dialog, then `projects.mutate`).
+//! with the native dialog, then `projects.mutate`; or clone a Git URL or a host's repository,
+//! then `projectClone.start`), and New project (`projects.createNew`).
 //!
 //! Go to file and Search project contents open the child searches in `files/`.
-//! Actions this client has no surface for yet (guest sharing, new project, clone, WSL folders) are left
-//! out, and the theme list has no environment-published themes.
+//! Actions this client has no surface for yet (guest sharing, WSL folders) are left out, and the
+//! theme list has no environment-published themes.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -23,16 +25,22 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, div, prelude::FluentBuilder as _, px,
     relative, svg,
 };
+use serde::Deserialize as _;
 use serde_json::{Value, json};
 
 use super::keymap;
 use super::pages::Page;
 use super::palette_actions::github_repository;
+use super::project_clone::paths as clone_paths;
+use super::source_control;
 use super::{Target, Workspace, new_id, project_name};
 use crate::inbox;
-use crate::model::ProjectShell;
+use crate::model::{ProjectShell, ScopedId};
 use crate::search::{self, Field, Weighted};
 use crate::theme::Tokens;
+
+mod clone_flow;
+mod new_project;
 
 const RECENT_LIMIT: usize = 12;
 const THREAD_LIMIT: usize = 20;
@@ -43,6 +51,8 @@ const MESSAGE_DEBOUNCE: Duration = Duration::from_millis(120);
 /// One message hit from `orchestration.searchThreads`.
 #[derive(Clone)]
 pub(super) struct MessageMatch {
+    /// The environment that answered: thread ids repeat across environments.
+    pub(super) environment_id: SharedString,
     pub(super) thread_id: String,
     pub(super) user: bool,
     pub(super) snippet: String,
@@ -55,10 +65,11 @@ pub(super) struct MessageMatch {
 }
 
 impl MessageMatch {
-    fn from_json(value: &Value) -> Option<Self> {
+    fn from_json(environment_id: &SharedString, value: &Value) -> Option<Self> {
         #[expect(clippy::cast_possible_truncation, reason = "a match quality near 1")]
         let quality = value["quality"].as_f64().map(|q| q as f32);
         Some(Self {
+            environment_id: environment_id.clone(),
             thread_id: value["threadId"].as_str()?.to_owned(),
             user: value["source"] == "user",
             snippet: value["snippet"].as_str()?.to_owned(),
@@ -68,13 +79,60 @@ impl MessageMatch {
             hits: value["hits"].as_u64().and_then(|hits| u32::try_from(hits).ok()),
         })
     }
+
+    /// The hit's thread on the environment that answered.
+    pub(super) fn thread_key(&self) -> ScopedId {
+        ScopedId::new(self.environment_id.clone(), self.thread_id.as_str())
+    }
+
+    fn is_from(&self, key: &ScopedId) -> bool {
+        self.environment_id == key.env && self.thread_id == key.id
+    }
+
+    pub(super) fn is_from_thread(&self, thread: &crate::model::ThreadShell) -> bool {
+        self.environment_id == thread.environment_id && self.thread_id == thread.id
+    }
+}
+
+/// How a search reaches environments whose shells leave older settled threads out
+/// (`ThreadSearchScope`); others ignore it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct SearchScope {
+    /// The sidebar filter's projects by environment; `None` searches every project.
+    pub(super) projects: Option<HashMap<SharedString, Vec<String>>>,
+    /// The caller's names for environments, which its own ranking also matches.
+    pub(super) labels: Option<HashMap<SharedString, SharedString>>,
+}
+
+/// `orchestration.searchThreads` for one environment, or `None` when it has nothing to search:
+/// messages need a word of three or more letters, while older settled titles below `before`
+/// (the environment's cut) match from two.
+fn search_input(query: &str, before: Option<&str>, scope: &SearchScope, environment: &str) -> Option<Value> {
+    let messages = search::has_long_token(query);
+    let Some(before) = before else { return messages.then(|| json!({"query": query})) };
+    if !messages && query.chars().count() < 2 {
+        return None;
+    }
+    let mut input = json!({"query": query, "olderSettledBefore": before});
+    if let Some(projects) = &scope.projects {
+        input["projectIds"] = json!(projects.get(environment).map_or(&[][..], Vec::as_slice));
+    }
+    if let Some(label) = scope.labels.as_ref().and_then(|labels| labels.get(environment)) {
+        input["environmentLabel"] = json!(label.as_ref());
+    }
+    if !messages {
+        input["titlesOnly"] = true.into();
+    }
+    Some(input)
 }
 
 /// Server message search for a query over every connected environment, debounced
-/// (`useThreadSearch`). Each environment's matches join as it answers.
+/// (`useThreadSearch`). Each environment's matches join as it answers, and the rows of its
+/// best older settled matches merge into the shell so the caller's own ranking finds them.
 #[derive(Default)]
 pub(super) struct MessageSearch {
     pub(super) query: String,
+    scope: SearchScope,
     pub(super) matches: Vec<MessageMatch>,
     /// Some environment has not answered yet.
     pub(super) pending: bool,
@@ -92,6 +150,10 @@ pub(super) enum View {
     /// The sources of [`Palette::add_environment`].
     AddProjectSources,
     Browse,
+    /// A clone source's repository field, then where to clone it ([`Palette::clone`]).
+    Clone,
+    /// New project's name, machine and repository option ([`Palette::new_project`]).
+    NewProject,
     /// "Change theme" (`theme.select`).
     Themes,
     /// "Change appearance".
@@ -100,24 +162,37 @@ pub(super) enum View {
 
 #[derive(Clone)]
 enum Run {
-    NewThread(String),
+    /// A draft in this project, on its environment.
+    NewThread(ScopedId),
     Open(View),
-    Thread(String),
+    Thread(ScopedId),
     /// A thread on this environment, which the shell may not list (an archived linked thread).
     ThreadIn(SharedString, String),
     /// A project group's members and the checkout to start a thread in when none has one.
-    Project(Vec<String>, String),
+    Project(Vec<ScopedId>, ScopedId),
     /// "Add project" (`openAddProjectFlow`).
     AddProject,
     /// An environment's sources (`startAddProjectSourceSelection`).
     AddProjectIn(SharedString),
     /// "Local folder": browse a folder on this environment (`startAddProjectBrowse`).
     BrowseIn(SharedString),
+    /// "Git URL" (`None`) or a host's repository: clone on this environment (`startAddProjectClone`).
+    CloneFrom(SharedString, Option<&'static str>),
+    /// The root's "New project" (`openNewProjectFlow`).
+    NewProject,
+    /// A machine's "New project" source (`startNewProject`).
+    NewProjectIn(SharedString),
+    /// New project's machine.
+    NewProjectMachine(SharedString),
+    /// New project's private repository toggle.
+    NewProjectPublish,
+    /// New project's "Add existing project".
+    NewProjectExisting,
     Settings(&'static str),
     /// One setting: its section, scrolled to its row.
     Setting(&'static crate::settings::SearchItem),
     /// Settings › Projects with this project's group picked.
-    ProjectSettings(String),
+    ProjectSettings(ScopedId),
     Page(Page),
     /// Browse into this directory (the query becomes it).
     BrowseTo(String),
@@ -125,7 +200,7 @@ enum Run {
     Find,
     /// A message hit: opens its thread with find on the query, at the message.
     FindIn {
-        thread_id: String,
+        thread: ScopedId,
         query: String,
         message_id: Option<String>,
     },
@@ -138,7 +213,7 @@ enum Run {
     CopyThread,
     RestartSession,
     /// Pins (`true`) or unpins these projects, a group's members.
-    PinProjects(Vec<String>, bool),
+    PinProjects(Vec<ScopedId>, bool),
     Theme(crate::themes::CardId),
     Appearance(crate::settings::ThemePreference),
     /// `themeEditor.toggle`.
@@ -171,7 +246,9 @@ impl Run {
 #[derive(Clone)]
 enum RowIcon {
     Lucide(IconName),
-    Project(String),
+    Project(ScopedId),
+    /// A source control host's mark.
+    Host(&'static str),
 }
 
 #[derive(Clone)]
@@ -188,7 +265,7 @@ enum Description {
 /// and whether it is the open thread.
 #[derive(Clone)]
 struct ThreadSubtitle {
-    project: Option<(String, SharedString)>,
+    project: Option<(ScopedId, SharedString)>,
     location: SharedString,
     branch: Option<SharedString>,
     worktree: bool,
@@ -212,7 +289,7 @@ struct Row {
     command: Option<SharedString>,
     chevron: bool,
     /// `ProjectPinButton`: the group's project ids and whether it is pinned.
-    pin: Option<(Vec<String>, bool)>,
+    pin: Option<(Vec<ScopedId>, bool)>,
     run: Run,
     /// Keywords that match besides the title (`searchTerms`).
     terms: &'static [&'static str],
@@ -222,10 +299,16 @@ struct Row {
     quality: f32,
     /// Shown dimmed, and neither highlighted nor run (`DisabledCommandPaletteResultRow`).
     disabled: bool,
+    /// A clone source that is not set up: Setup Required, with how (`titleTrailingContent`).
+    setup: Option<SharedString>,
     /// Listed after the other rows of its group (`secondary`).
     secondary: bool,
     /// The thread a thread result names, whose status slots it draws.
-    thread: Option<String>,
+    thread: Option<ScopedId>,
+    /// The chosen option of its group, marked with a check.
+    checked: bool,
+    /// A toggle row's checkbox and whether it is on.
+    toggle: Option<bool>,
 }
 
 impl Row {
@@ -247,8 +330,11 @@ impl Row {
             data_terms: Vec::new(),
             quality: 0.,
             disabled: false,
+            setup: None,
             secondary: false,
             thread: None,
+            checked: false,
+            toggle: None,
         }
     }
 }
@@ -297,7 +383,7 @@ pub(super) struct Palette {
     scroll: ScrollHandle,
     browse: Browse,
     messages: MessageSearch,
-    placeholder: &'static str,
+    placeholder: SharedString,
     /// The app is dark: the theme list marks the dark appearance's theme as current.
     dark: bool,
     /// The root view's Threads group, ranked once per query and shell change.
@@ -312,6 +398,16 @@ pub(super) struct Palette {
     new_thread_order: RefCell<Option<Vec<String>>>,
     /// The environment "Add project" adds on (`addProjectEnvironmentId`), once one is picked.
     add_environment: Option<SharedString>,
+    /// The clone flow, once a clone source is picked (`addProjectCloneFlow`).
+    clone: Option<CloneFlow>,
+    /// The New project flow, while it is open (`newProjectFlow`).
+    new_project: Option<new_project::NewProjectFlow>,
+    /// A repository lookup or a clone start is on its way (`isRemoteProjectPending`).
+    clone_pending: bool,
+    _clone_task: Option<Task<()>>,
+    /// `server.discoverSourceControl` for an add-project environment: clone sources' readiness.
+    discovery: Option<(SharedString, Option<Value>)>,
+    _discovery_task: Option<Task<()>>,
     /// Tab stays inside the palette while it is open (the web's modal dialog).
     trap: FocusHandle,
     _subscription: Subscription,
@@ -361,9 +457,9 @@ struct MessageOrder {
 
 /// `ShownOrder`: message result keys in the order the palette last showed them for `query`.
 #[derive(Debug, PartialEq)]
-struct ShownOrder {
+struct ShownOrder<K = ScopedId> {
     query: String,
-    keys: Vec<String>,
+    keys: Vec<K>,
     /// How many of `keys` are on screen; only those hold their places.
     shown: usize,
 }
@@ -373,14 +469,18 @@ const LATE_ROOM: usize = 3;
 
 /// `nextShownOrder`: shown rows keep their places when a slower environment answers, so the
 /// pointer and the arrows stay on the same row; its best matches may take a few rows more.
-fn next_shown_order(previous: Option<ShownOrder>, query: &str, ranked: Vec<String>, limit: usize) -> ShownOrder {
+fn next_shown_order<K: PartialEq + Clone>(
+    previous: Option<ShownOrder<K>>,
+    query: &str,
+    ranked: Vec<K>,
+    limit: usize,
+) -> ShownOrder<K> {
     let Some(previous) = previous.filter(|p| p.query == query) else {
         let shown = limit.min(ranked.len());
         return ShownOrder { query: query.to_owned(), keys: ranked, shown };
     };
-    let kept: Vec<String> =
-        previous.keys[..previous.shown].iter().filter(|key| ranked.contains(key)).cloned().collect();
-    let rest: Vec<String> = ranked.into_iter().filter(|key| !kept.contains(key)).collect();
+    let kept: Vec<K> = previous.keys[..previous.shown].iter().filter(|key| ranked.contains(key)).cloned().collect();
+    let rest: Vec<K> = ranked.into_iter().filter(|key| !kept.contains(key)).collect();
     let arrived = rest.iter().filter(|key| !previous.keys.contains(key)).count();
     let shown = (kept.len() + rest.len()).min(limit + LATE_ROOM).min(limit.max(kept.len() + arrived.min(LATE_ROOM)));
     ShownOrder { query: previous.query, keys: [kept, rest].concat(), shown }
@@ -450,7 +550,7 @@ struct ThreadRanking {
 struct RankingKey {
     query: String,
     revision: u64,
-    current: Option<String>,
+    current: Option<ScopedId>,
     /// Rows show "5m ago" and rank by recency.
     minute: i64,
 }
@@ -514,6 +614,43 @@ fn submit_path(browse: Option<&Browse>, query: &str) -> Option<String> {
     resolved.or_else(|| (!query.trim().is_empty()).then(|| query.trim().to_owned()))
 }
 
+/// `AddProjectCloneFlow`: where a clone happens and what it clones.
+#[derive(Clone, Debug, PartialEq)]
+struct CloneFlow {
+    environment: SharedString,
+    /// The host kind; `None` is a Git URL.
+    source: Option<&'static str>,
+    /// The resolved repository, once the flow moved on to its destination (`step: "confirm"`).
+    confirm: Option<CloneTarget>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct CloneTarget {
+    /// What the user typed.
+    input: String,
+    /// The looked-up repository's `nameWithOwner` and web URL.
+    repository: Option<(String, String)>,
+    remote_url: String,
+}
+
+impl CloneFlow {
+    /// `remoteProjectButtonLabel`.
+    fn submit_label(&self) -> &'static str {
+        if self.source.is_some() { "Lookup" } else { "Continue" }
+    }
+}
+
+/// Whether the view browses folders for `query`: the browse view, a path typed at the root, or
+/// the clone destination (`getFilesystemBrowsePath(…).isBrowsing`).
+fn browses(palette: &Palette, query: &str) -> bool {
+    match palette.view {
+        View::Browse => true,
+        View::Root => is_browse_query(query),
+        View::Clone => palette.clone.as_ref().is_some_and(|flow| flow.confirm.is_some()) && is_browse_query(query),
+        _ => false,
+    }
+}
+
 pub(super) fn filter_entries<'a>(entries: &'a [(String, String)], leaf: &str) -> Vec<&'a (String, String)> {
     let lower = leaf.to_lowercase();
     entries
@@ -547,7 +684,7 @@ impl Workspace {
             scroll: ScrollHandle::new(),
             browse: Browse::default(),
             messages: MessageSearch::default(),
-            placeholder: "",
+            placeholder: SharedString::default(),
             dark: crate::theme::tokens(cx).dark,
             threads: None,
             message_order: MessageOrder::default(),
@@ -555,6 +692,12 @@ impl Workspace {
             project_order: RefCell::default(),
             new_thread_order: RefCell::default(),
             add_environment: None,
+            clone: None,
+            new_project: None,
+            clone_pending: false,
+            _clone_task: None,
+            discovery: None,
+            _discovery_task: None,
             trap: cx.focus_handle(),
             _subscription: subscription,
         });
@@ -618,14 +761,7 @@ impl Workspace {
         let start = match view {
             // `getAddProjectInitialQueryForEnvironment`: the browse environment's base folder.
             View::Browse => {
-                let environment = self.browse_environment();
-                let info = environment.as_deref().and_then(|environment| self.env_info(environment));
-                let base = info
-                    .and_then(|info| info.settings.get("addProjectBaseDirectory").as_str())
-                    .unwrap_or_default()
-                    .trim()
-                    .trim_end_matches(['/', '\\']);
-                if base.is_empty() { "~/".to_owned() } else { format!("{base}/") }
+                self.browse_environment().map_or_else(|| "~/".to_owned(), |env| self.add_project_base(&env))
             }
             _ => String::new(),
         };
@@ -634,6 +770,9 @@ impl Workspace {
         palette.view = view;
         palette.highlight = None;
         self.set_palette_query(&start, window, cx);
+        if matches!(view, View::AddProject | View::AddProjectSources | View::NewProject) {
+            self.load_palette_discovery(cx);
+        }
     }
 
     /// The environment the add-project flow browses and adds on: the one picked, else the first
@@ -700,14 +839,7 @@ impl Workspace {
             .map(|option| {
                 let key = format!("add-project-environment:{}", option.id);
                 let run = Run::AddProjectIn(option.id.clone());
-                let mut row = Row::new(key, RowIcon::Lucide(option.machine), option.label.clone(), run);
-                let description = if option.primary { "This device".into() } else { option.id.clone() };
-                row.description = Some(Description::Text(description));
-                row.data_terms = vec![option.label.into(), option.id];
-                if option.primary {
-                    row.terms = &["this device"];
-                }
-                row
+                environment_row(option, key, run)
             })
             .collect()
     }
@@ -737,21 +869,33 @@ impl Workspace {
         let Some((view, query)) = palette.stack.pop() else { return };
         palette.view = view;
         palette.highlight = None;
+        // `popView`: Back leaves the clone flow, and drops what it was waiting on.
+        palette.clone = None;
+        palette.clone_pending = false;
+        palette._clone_task = None;
+        self.leave_new_project();
         self.set_palette_query(&query, window, cx);
     }
 
     fn palette_query_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let query = self.palette_query(cx);
         let Some(palette) = &mut self.palette else { return };
-        let browsing = palette.view == View::Browse || (palette.view == View::Root && is_browse_query(&query));
-        let placeholder = match (browsing, palette.stack.is_empty()) {
-            (true, true) => "Enter project path (e.g. ~/projects/my-app)",
-            (true, false) => "Enter path (e.g. ~/projects/my-app)",
-            (false, true) => "Search commands, projects, and threads...",
-            (false, false) => "Search...",
+        let browsing = browses(palette, &query);
+        let placeholder: SharedString = match (&palette.clone, browsing, palette.stack.is_empty()) {
+            _ if palette.view == View::NewProject => "Project name".into(),
+            // `remoteProjectInputPlaceholder`.
+            (Some(CloneFlow { source: None, confirm: None, .. }), ..) => "Enter Git clone URL".into(),
+            (Some(CloneFlow { source: Some(kind), confirm: None, .. }), ..) => {
+                let host = source_control::definition(kind);
+                format!("Enter {} repository ({})", host.label, host.path_hint).into()
+            }
+            (_, true, true) => "Enter project path (e.g. ~/projects/my-app)".into(),
+            (_, true, false) => "Enter path (e.g. ~/projects/my-app)".into(),
+            (_, false, true) => "Search commands, projects, and threads...".into(),
+            (_, false, false) => "Search...".into(),
         };
         if palette.placeholder != placeholder {
-            palette.placeholder = placeholder;
+            palette.placeholder = placeholder.clone();
             let input = palette.input.clone();
             input.update(cx, |input, cx| input.set_placeholder(placeholder, window, cx));
         }
@@ -769,7 +913,17 @@ impl Workspace {
             }
         } else if palette.view == View::Root {
             let query = if actions_filter(&query).0 { String::new() } else { query };
-            self.search_messages(query, |this| this.palette.as_mut().map(|p| &mut p.messages), cx);
+            // The palette matches environment names when there are several; older rows must too.
+            let labels = (self.sessions().len() > 1).then(|| {
+                let ids = self.sessions().iter().filter_map(|session| session.id.clone());
+                ids.map(|id| {
+                    let label = self.location_label(&id);
+                    (id, label)
+                })
+                .collect()
+            });
+            let scope = SearchScope { projects: None, labels };
+            self.search_messages(query, scope, |this| this.palette.as_mut().map(|p| &mut p.messages), cx);
         }
         cx.notify();
     }
@@ -821,21 +975,30 @@ impl Workspace {
     pub(super) fn search_messages(
         &mut self,
         query: String,
+        scope: SearchScope,
         slot: fn(&mut Workspace) -> Option<&mut MessageSearch>,
         cx: &mut Context<Self>,
     ) {
-        // Every connected environment is searched, as `useThreadSearch` does over its ids.
-        let clients: Vec<crate::rpc::RpcClient> =
-            self.sessions().iter().filter_map(|session| session.client.clone()).collect();
-        let Some(search) = slot(self) else { return };
         let query: String = query.trim().chars().take(200).collect::<String>().trim().to_owned();
-        if search.query == query {
+        // Every connected environment is searched, as `useThreadSearch` does over its ids. The
+        // generation keeps a read made under an earlier snapshot from merging rows.
+        let clients: Vec<(SharedString, crate::rpc::RpcClient, u64, Value)> = (self.sessions().iter())
+            .filter_map(|session| {
+                let id = session.id.clone()?;
+                let before = self.shell.older_settled(&id).map(|cut| cut.before.as_str());
+                let input = search_input(&query, before, &scope, &id)?;
+                Some((id.clone(), session.client.clone()?, self.shell.generation(&id), input))
+            })
+            .collect();
+        let Some(search) = slot(self) else { return };
+        if search.query == query && search.scope == scope {
             return;
         }
         search.query = query.clone();
+        search.scope = scope;
         search.matches.clear();
         search._task = None;
-        search.pending = search::has_long_token(&query) && !clients.is_empty();
+        search.pending = !clients.is_empty();
         if !search.pending {
             return;
         }
@@ -843,21 +1006,32 @@ impl Workspace {
             use futures::StreamExt as _;
             cx.background_executor().timer(MESSAGE_DEBOUNCE).await;
             let mut answers: futures::stream::FuturesUnordered<_> = clients
-                .iter()
-                .map(|client| client.request("orchestration.searchThreads", json!({"query": query})))
+                .into_iter()
+                .map(|(env, client, generation, input)| async move {
+                    let answer = client.request("orchestration.searchThreads", input).await;
+                    (env, generation, answer)
+                })
                 .collect();
             // Each environment's matches show as it answers; one that fails leaves the others'.
-            while let Some(answer) = answers.next().await {
+            while let Some((env, generation, answer)) = answers.next().await {
                 let settled = answers.is_empty();
-                let matches: Vec<MessageMatch> = answer
-                    .inspect_err(|error| log::warn!("orchestration.searchThreads: {error}"))
-                    .ok()
+                let answer = answer.inspect_err(|error| log::warn!("orchestration.searchThreads: {error}")).ok();
+                let matches: Vec<MessageMatch> = (answer.as_ref())
                     .and_then(|value| {
-                        value["matches"].as_array().map(|m| m.iter().filter_map(MessageMatch::from_json).collect())
+                        let matches = value["matches"].as_array()?;
+                        Some(matches.iter().filter_map(|m| MessageMatch::from_json(&env, m)).collect())
                     })
                     .unwrap_or_default();
+                let rows = answer.and_then(|value| crate::model::ThreadRows::deserialize(&value).ok());
                 let updated = this.update(cx, |this, cx| {
-                    let Some(search) = slot(this).filter(|s| s.query == query) else { return };
+                    if slot(this).is_none_or(|s| s.query != query) {
+                        return;
+                    }
+                    // Older settled matches the shell left out join it, so their hits list too.
+                    if let Some(rows) = rows {
+                        this.shell.mount_rows(&env, generation, rows);
+                    }
+                    let Some(search) = slot(this) else { return };
                     search.pending = !settled;
                     search.matches.extend(matches);
                     search.generation += 1;
@@ -875,8 +1049,10 @@ impl Workspace {
     /// The open thread's or draft's project, on the target's environment.
     pub(super) fn current_project(&self) -> Option<&ProjectShell> {
         let (env, id) = match self.target.as_ref()? {
-            Target::Thread { env, id } => (env, &self.shell.threads.iter().find(|t| &t.id == id)?.project_id),
-            Target::Draft { env, project_id } => (env, project_id),
+            Target::Thread { env, id } => {
+                (env, &self.shell.thread(&ScopedId::new(env.clone(), id.as_str()))?.project_id)
+            }
+            Target::Draft { env, project_id, .. } => (env, project_id),
         };
         self.shell.projects.iter().find(|p| &p.id == id && p.environment_id == *env)
     }
@@ -886,7 +1062,7 @@ impl Workspace {
         let groups = self.project_groups();
         groups
             .iter()
-            .find(|g| g.project_ids.contains(&project.id))
+            .find(|g| g.contains_project(project))
             .map_or_else(|| project_name(project), |g| g.display_name.clone().into())
     }
 
@@ -900,7 +1076,7 @@ impl Workspace {
             .map(|g| NoProjectEntry {
                 scratch: g.members[0].is_scratch,
                 pinned: g.pinned,
-                preferred: contextual.is_some_and(|p| g.contains(&p.id)),
+                preferred: contextual.is_some_and(|p| g.contains_project(p)),
             })
             .collect();
         let mut rows: Vec<(String, Row)> = pickable
@@ -909,8 +1085,8 @@ impl Workspace {
             .map(|g| {
                 let target = g.target_for(contextual);
                 // `runProject`: the contextual checkout when it is one of the group's, else the target.
-                let start = contextual.filter(|p| g.contains(&p.id)).unwrap_or(target);
-                let run = Run::NewThread(start.id.clone());
+                let start = contextual.filter(|p| g.contains_project(p)).unwrap_or(target);
+                let run = Run::NewThread(ScopedId::of_project(start));
                 let mut row = self.project_row(format!("new-in-{}", target.id), g, target, run);
                 // `buildNewThreadInProjectItems`: every member's name and path, and the machine.
                 row.data_terms.extend(
@@ -964,12 +1140,14 @@ impl Workspace {
     /// `buildProjectActionItems`: a project group's row at its `target` checkout, matched by its
     /// names and path.
     fn project_row(&self, key: String, group: &crate::project_groups::ProjectGroup, p: &ProjectShell, run: Run) -> Row {
-        let mut row = Row::new(key, RowIcon::Project(p.id.clone()), group.display_name.clone(), run);
+        let mut row = Row::new(key, RowIcon::Project(ScopedId::of_project(p)), group.display_name.clone(), run);
         let machine = self.location_machine(&p.environment_id);
         let location = self.location_label(&p.environment_id);
         row.description = Some(Description::Location(machine, location, p.workspace_root.clone().into()));
         row.data_terms = vec![p.title.clone().into(), p.workspace_root.clone().into()];
-        row.pin = Some((group.project_ids.clone(), group.pinned));
+        // `projectPin`: only where this connection may pin every member.
+        let members = group.member_refs();
+        row.pin = self.can_pin_projects(&members).then_some((members, group.pinned));
         row
     }
 
@@ -982,7 +1160,7 @@ impl Workspace {
             .into_iter()
             .map(|g| {
                 let p = g.target_for(contextual);
-                let run = Run::Project(g.project_ids.clone(), p.id.clone());
+                let run = Run::Project(g.member_refs(), ScopedId::of_project(p));
                 let mut row = self.project_row(format!("project-{}", p.id), g, p, run);
                 let mut labels: Vec<SharedString> = Vec::new();
                 for member in &g.members {
@@ -1019,8 +1197,12 @@ impl Workspace {
             Row::new(key, RowIcon::Lucide(icon), title, run)
         };
         if let Some(project) = current {
-            let mut row =
-                lucide("new-thread-here", IconName::SquarePen, "New thread in", Run::NewThread(project.id.clone()));
+            let mut row = lucide(
+                "new-thread-here",
+                IconName::SquarePen,
+                "New thread in",
+                Run::NewThread(ScopedId::of_project(project)),
+            );
             row.strong = Some(self.group_name(project));
             row.terms = &["new thread", "chat", "create", "draft"];
             self.bind_shortcut(&mut row, "chat.newLocal");
@@ -1051,10 +1233,7 @@ impl Workspace {
             row.terms = &["triage", "bug", "issue", "report", "broken", "debug", "help", "support"];
             rows.push(row);
         }
-        let thread = match &self.target {
-            Some(Target::Thread { id, .. }) => self.shell.threads.iter().find(|t| &t.id == id),
-            _ => None,
-        };
+        let thread = self.target.as_ref().and_then(Target::thread_key).and_then(|key| self.shell.thread(&key));
         if thread.is_some() && self.thread_find_available() {
             let mut row = lucide("find-current-thread", IconName::TextSearch, "Find in current thread", Run::Find);
             row.terms = &["find", "search", "messages", "plans"];
@@ -1130,6 +1309,7 @@ impl Workspace {
         row.terms = &["search project", "find in files", "grep", "content search", "text search"];
         row.shortcut = self.shortcut("projectSearch.toggle");
         rows.push(row);
+        rows.extend(self.new_project_row());
         rows.push(add_project_row());
         let mut row = lucide("change-theme", IconName::Palette, "Change theme", Run::Open(View::Themes));
         row.chevron = true;
@@ -1166,11 +1346,13 @@ impl Workspace {
         row.terms = &["settings", "preferences", "configuration", "keybindings"];
         rows.push(row);
         let groups = self.project_groups();
-        if let Some(group) = self.current_project().and_then(|p| groups.iter().find(|g| g.contains_project(p))) {
+        let pinnable = |g: &&crate::project_groups::ProjectGroup| self.can_pin_projects(&g.member_refs());
+        if let Some(group) =
+            self.current_project().and_then(|p| groups.iter().find(|g| g.contains_project(p))).filter(pinnable)
+        {
             let (title, icon) =
                 if group.pinned { ("Unpin project", IconName::PinOff) } else { ("Pin project", IconName::Pin) };
-            let ids = group.members.iter().map(|m| m.project.id.clone()).collect();
-            let mut row = lucide("project-pin", icon, title, Run::PinProjects(ids, !group.pinned));
+            let mut row = lucide("project-pin", icon, title, Run::PinProjects(group.member_refs(), !group.pinned));
             row.description = Some(Description::Text(group.display_name.clone().into()));
             row.terms = &["pin", "unpin", "project", "favorite"];
             rows.push(row);
@@ -1180,7 +1362,7 @@ impl Workspace {
             self.current_project().and_then(|p| Some((groups.iter().find(|g| g.contains_project(p))?, p)));
         let contextual = current_group.or_else(|| groups.first().map(|g| (g, g.representative())));
         if let Some((group, project)) = contextual {
-            let run = Run::ProjectSettings(project.id.clone());
+            let run = Run::ProjectSettings(ScopedId::of_project(project));
             let mut row = lucide("project-settings", IconName::Folder, "Project settings", run);
             row.description = Some(Description::Text(group.display_name.clone().into()));
             row.terms = &[
@@ -1249,10 +1431,10 @@ impl Workspace {
             format!("thread-{}", thread.id),
             RowIcon::Lucide(IconName::MessageSquare),
             thread.title.clone(),
-            Run::Thread(thread.id.clone()),
+            Run::Thread(ScopedId::of_thread(thread)),
         );
-        row.thread = Some(thread.id.clone());
-        let project = self.shell.projects.iter().find(|p| p.id == thread.project_id);
+        row.thread = Some(ScopedId::of_thread(thread));
+        let project = self.shell.project(&ScopedId::thread_project(thread));
         let project = project.map(|p| p.title.trim()).filter(|title| !title.is_empty());
         // `runtime?.providerInstanceId ?? modelSelection.instanceId`.
         let instance = thread
@@ -1261,12 +1443,12 @@ impl Workspace {
             .or_else(|| thread.model_selection.as_ref().map(|m| m.instance_id.as_str()));
         let driver = instance.and_then(|i| self.env_info(&thread.environment_id)?.provider(i)).map(|p| &p.driver);
         row.description = Some(Description::Thread(ThreadSubtitle {
-            project: project.map(|title| (thread.project_id.clone(), title.to_owned().into())),
+            project: project.map(|title| (ScopedId::thread_project(thread), title.to_owned().into())),
             location: self.location_label(&thread.environment_id),
             branch: thread.branch.as_deref().map(str::trim).filter(|b| !b.is_empty()).map(|b| b.to_owned().into()),
             worktree: thread.worktree_path.as_deref().is_some_and(|path| !path.trim().is_empty()),
             provider: driver.and_then(|driver| crate::assets::provider_icon(driver)),
-            current: self.open_thread_id() == Some(&*thread.id),
+            current: self.route_key() == Some(thread.thread_ref()),
         }));
         row.time = crate::timestamp::parse_ms(thread.latest_user_message_at.as_deref().unwrap_or(&thread.updated_at))
             .map(|at| ago(now - at));
@@ -1276,7 +1458,7 @@ impl Workspace {
     /// `ThreadRowContext`: the project, and the machine when there are several, for a row whose
     /// second line shows a message snippet instead.
     fn thread_context(&self, thread: &crate::model::ThreadShell) -> Option<SharedString> {
-        let project = self.shell.projects.iter().find(|p| p.id == thread.project_id).map(|p| p.title.trim());
+        let project = self.shell.project(&ScopedId::thread_project(thread)).map(|p| p.title.trim());
         let environment = (self.sessions().len() > 1).then(|| self.location_label(&thread.environment_id));
         let parts: Vec<&str> = project.into_iter().chain(environment.as_deref()).filter(|p| !p.is_empty()).collect();
         (!parts.is_empty()).then(|| parts.join(" · ").into())
@@ -1293,7 +1475,7 @@ impl Workspace {
 
     fn palette_groups(&self, query: &str) -> Vec<Group> {
         let Some(palette) = &self.palette else { return Vec::new() };
-        if palette.view == View::Browse || (palette.view == View::Root && is_browse_query(query)) {
+        if browses(palette, query) {
             return self.browse_groups(query);
         }
         let (actions_only, search_query) = actions_filter(query);
@@ -1317,13 +1499,18 @@ impl Workspace {
                     vec![Group { label: "Environments", rows: scope(self.add_project_environment_rows()) }]
                 }
                 AddProjectEntry::Sources(environment) => {
-                    vec![Group { label: "Sources", rows: scope(vec![local_folder_row(environment)]) }]
+                    vec![Group { label: "Sources", rows: scope(self.add_project_source_rows(environment)) }]
                 }
             },
             View::AddProjectSources => {
-                let rows = palette.add_environment.clone().map(local_folder_row).into_iter().collect();
+                let rows =
+                    palette.add_environment.clone().map(|env| self.add_project_source_rows(env)).unwrap_or_default();
                 vec![Group { label: "Sources", rows: scope(rows) }]
             }
+            // The repository field lists nothing; the destination lists folders while it is a path.
+            View::Clone => return Vec::new(),
+            // The query is the name, so the flow's rows are never filtered.
+            View::NewProject => return self.new_project_groups(query),
             View::Root | View::Browse => return self.search_groups(query, true),
         };
         if submenu_falls_back(&scoped, query) {
@@ -1421,13 +1608,14 @@ impl Workspace {
         let shown = shown.map_or(&[][..], |order| &order.keys[..order.shown]);
         let message_rows: Vec<Row> = shown
             .iter()
-            .filter_map(|thread_id| palette.messages.matches.iter().find(|m| &m.thread_id == thread_id))
+            .filter_map(|key| palette.messages.matches.iter().find(|m| m.is_from(key)))
             .filter_map(|m| {
-                let thread = self.palette_threads().find(|t| t.id == m.thread_id)?;
+                let thread = self.palette_threads().find(|t| m.is_from_thread(t))?;
                 let mut row = self.thread_row(thread, now);
-                row.key = format!("message-{}-{}", m.thread_id, m.at.as_deref().unwrap_or_default()).into();
+                let at = m.at.as_deref().unwrap_or_default();
+                row.key = format!("message-{}-{}-{at}", m.environment_id, m.thread_id).into();
                 row.run = Run::FindIn {
-                    thread_id: m.thread_id.clone(),
+                    thread: ScopedId::of_thread(thread),
                     query: super::find::query_for_message(&m.snippet, query),
                     message_id: m.message_id.clone(),
                 };
@@ -1465,12 +1653,12 @@ impl Workspace {
             .matches
             .iter()
             .filter_map(|found| {
-                let thread = self.palette_threads().find(|t| t.id == found.thread_id)?;
+                let thread = self.palette_threads().find(|t| found.is_from_thread(t))?;
                 let titled = self.match_thread_fields(thread, &tokens, false).is_some();
                 (!titled).then(|| (found, self.thread_use(thread)))
             })
             .collect();
-        let ranked = rank_messages(entries, &tokens, now).into_iter().map(|m| m.thread_id.clone()).collect();
+        let ranked = rank_messages(entries, &tokens, now).into_iter().map(MessageMatch::thread_key).collect();
         let Some(palette) = &mut self.palette else { return };
         let order = next_shown_order(palette.message_order.order.take(), &key.0, ranked, MESSAGE_LIMIT);
         palette.message_order = MessageOrder { key, order: Some(order) };
@@ -1490,7 +1678,7 @@ impl Workspace {
             id: &thread.id,
             title: &thread.title,
             branch: thread.branch.as_deref(),
-            project: self.shell.projects.iter().find(|p| p.id == thread.project_id).map(|p| p.title.as_str()),
+            project: self.shell.project(&ScopedId::thread_project(thread)).map(|p| p.title.as_str()),
             environment: environment.as_deref(),
             pull_requests: &pull_requests,
         };
@@ -1526,7 +1714,7 @@ impl Workspace {
         tokens: &Tokens,
         cx: &mut Context<Self>,
     ) -> ThreadSlots {
-        let Some(thread) = row.thread.as_ref().and_then(|id| self.palette_threads().find(|t| &t.id == id)) else {
+        let Some(thread) = row.thread.as_ref().and_then(|id| self.palette_threads().find(|t| id.is_thread(t))) else {
             return ThreadSlots::default();
         };
         let leading = self.render_thread_leading_status(thread, requests, cx);
@@ -1562,15 +1750,14 @@ impl Workspace {
     /// Ranks the root view's threads for `query` unless the last ranking still holds.
     fn rank_palette_threads(&mut self, query: &str) {
         let Some(palette) = &self.palette else { return };
-        let browsing = palette.view == View::Browse || (palette.view == View::Root && is_browse_query(query));
-        if browsing || actions_filter(query).0 {
+        if browses(palette, query) || actions_filter(query).0 {
             return;
         }
         let now = super::sidebar::now_ms();
         let key = RankingKey {
             query: query.to_owned(),
             revision: self.shell.revision,
-            current: self.route_thread().map(str::to_owned),
+            current: self.target.as_ref().and_then(Target::thread_key),
             minute: now / 60_000,
         };
         if palette.threads.as_ref().is_some_and(|ranking| ranking.key == key) {
@@ -1579,7 +1766,7 @@ impl Workspace {
         let tokens = search::fold_query(query);
         let (strict, typos) = if tokens.is_empty() {
             let mut recent: Vec<_> =
-                self.palette_threads().filter(|t| key.current.as_deref() != Some(t.id.as_str())).collect();
+                self.palette_threads().filter(|t| !key.current.as_ref().is_some_and(|c| c.is_thread(t))).collect();
             // Recent means used recently: written in or opened, whichever is later.
             recent.sort_by_cached_key(|t| std::cmp::Reverse(self.thread_use(t).recent()));
             let rows = recent.into_iter().take(RECENT_LIMIT).map(|t| (self.thread_row(t, now), false)).collect();
@@ -1596,12 +1783,12 @@ impl Workspace {
 
     /// Scores every listed thread, then builds rows for the first [`THREAD_LIMIT`] only.
     fn score_threads(&self, tokens: &[Vec<char>], typos: bool, now: i64) -> RankedThreads {
-        let current = self.route_thread();
+        let current = self.route_key();
         let mut scored: Vec<(&crate::model::ThreadShell, f32, bool, f32)> = self
             .palette_threads()
             .filter_map(|thread| {
                 let found = self.match_thread_fields(thread, tokens, typos)?;
-                let rank = if current == Some(thread.id.as_str()) {
+                let rank = if current == Some(thread.thread_ref()) {
                     -1.
                 } else {
                     found.quality * self.thread_use(thread).boost(now)
@@ -1636,41 +1823,86 @@ impl Workspace {
             return Vec::new();
         }
         let (directory, leaf) = split_browse(query);
+        // A clone's own folder stays at the end of its destination while the user browses.
+        let pinned = self.pinned_clone_folder();
+        let case_sensitive = !self.browse_on_windows();
+        let filter = pinned.as_deref().map_or(leaf, |pinned| clone_paths::pinned_filter(leaf, pinned, case_sensitive));
         let mut rows = Vec::new();
-        if leaf.is_empty()
+        if filter.is_empty()
             && let Some(parent) = up_path(directory)
         {
-            rows.push(Row::new("browse-up", RowIcon::Lucide(IconName::CornerLeftUp), "..", Run::BrowseTo(parent)));
+            let up = match pinned.as_deref() {
+                Some(pinned) => clone_paths::clone_destination_path(&parent, pinned),
+                None => parent,
+            };
+            rows.push(Row::new("browse-up", RowIcon::Lucide(IconName::CornerLeftUp), "..", Run::BrowseTo(up)));
         }
         if let Some(browse) = self.current_browse(directory) {
-            for (name, _) in filter_entries(&browse.entries, leaf) {
+            for (name, _) in filter_entries(&browse.entries, filter) {
+                let to = match pinned.as_deref() {
+                    Some(pinned) => clone_paths::clone_destination_browse_path(directory, name, pinned, case_sensitive),
+                    None => browse_into(directory, name),
+                };
                 rows.push(Row::new(
                     format!("dir-{name}"),
                     RowIcon::Lucide(IconName::Folder),
                     name.clone(),
-                    Run::BrowseTo(browse_into(directory, name)),
+                    Run::BrowseTo(to),
                 ));
             }
         }
-        vec![Group { label: "Directories", rows }]
+        let label = if pinned.is_some() { "Select where to clone" } else { "Directories" };
+        vec![Group { label, rows }]
+    }
+
+    /// `pinnedCloneDirectoryName`: the clone's own folder at its destination step.
+    fn pinned_clone_folder(&self) -> Option<String> {
+        let flow = self.palette.as_ref()?.clone.as_ref()?;
+        let target = flow.confirm.as_ref()?;
+        let repository = target.repository.as_ref().map_or(target.remote_url.as_str(), |(name, _)| name.as_str());
+        let name =
+            clone_paths::clone_directory_leaf_name(&target.remote_url, self.ghq_layout(&flow.environment), repository);
+        (!name.is_empty()).then_some(name)
+    }
+
+    /// `ghqCloneLayout` on the environment.
+    fn ghq_layout(&self, environment: &str) -> bool {
+        self.env_info(environment).is_some_and(|info| info.settings.get("ghqCloneLayout").as_bool() == Some(true))
+    }
+
+    /// The browse environment runs Windows, whose folder names match without case.
+    fn browse_on_windows(&self) -> bool {
+        let environment = self.browse_environment();
+        let os = environment.as_deref().and_then(|env| self.env_info(env)).and_then(|info| info.platform_os.as_deref());
+        os.is_some_and(is_windows_platform)
+    }
+
+    /// `getAddProjectInitialQueryForEnvironment`: the environment's base folder to browse from.
+    fn add_project_base(&self, environment: &str) -> String {
+        let info = self.env_info(environment);
+        let base = info.and_then(|info| info.settings.get("addProjectBaseDirectory").as_str());
+        clone_paths::add_project_initial_query(base)
     }
 
     /// Whether Enter can add the typed path and whether that creates its folder
     /// (`canSubmitBrowsePath`, `willCreateProjectPath`).
     fn browse_submit(&self, query: &str) -> BrowseSubmit {
         let connected = self.browse_environment().is_some_and(|environment| self.env_client(&environment).is_some());
-        let can_submit = connected && !self.relative_needs_project(query);
         let Some(palette) = &self.palette else { return BrowseSubmit::default() };
+        let cloning = palette.clone.as_ref().filter(|flow| flow.confirm.is_some());
+        let can_clone = cloning.is_none_or(|flow| self.can_clone_on(&flow.environment) && !palette.clone_pending);
+        let can_submit = connected && !self.relative_needs_project(query) && can_clone;
         let (directory, leaf) = split_browse(query);
         let browse = self.current_browse(directory);
         let settled = browse.is_some_and(|browse| !browse.loading);
+        let case_sensitive = cloning.is_none() || !self.browse_on_windows();
         // A folder that could not be read is one Enter creates.
         let found = browse.is_some_and(|browse| {
             browse.error.is_none()
                 && if leaf.is_empty() {
                     browse.parent.is_some()
                 } else {
-                    browse.entries.iter().any(|(name, _)| name == leaf)
+                    browse.entries.iter().any(|(name, _)| clone_paths::names_match(name, leaf, case_sensitive))
                 }
         });
         let will_create = can_submit && settled && !query.trim().is_empty() && palette.highlight.is_none() && !found;
@@ -1685,8 +1917,7 @@ impl Workspace {
         }
         let Some(palette) = &self.palette else { return false };
         let query = palette.input.read(cx).value().to_string();
-        let browsing = palette.view == View::Browse || (palette.view == View::Root && is_browse_query(&query));
-        if !browsing || self.relative_needs_project(&query) {
+        if !browses(palette, &query) || self.relative_needs_project(&query) {
             return false;
         }
         let highlighted = palette.highlight.and_then(|index| {
@@ -1697,10 +1928,20 @@ impl Workspace {
             (Some(Run::BrowseTo(path)), _) => Some(path),
             (_, None) => None,
             (_, Some(browse)) => {
+                let pinned = self.pinned_clone_folder();
+                let case_sensitive = !self.browse_on_windows();
+                let filter =
+                    pinned.as_deref().map_or(leaf, |pinned| clone_paths::pinned_filter(leaf, pinned, case_sensitive));
                 let names: Vec<&str> =
-                    filter_entries(&browse.entries, leaf).into_iter().map(|(name, _)| name.as_str()).collect();
-                tab_completion(&names, leaf).map(|(name, complete)| {
-                    if complete { browse_into(directory, &name) } else { format!("{directory}{name}") }
+                    filter_entries(&browse.entries, filter).into_iter().map(|(name, _)| name.as_str()).collect();
+                // A clone's destination only enters whole folders, keeping its own folder last.
+                tab_completion(&names, filter).and_then(|(name, complete)| match (complete, pinned.as_deref()) {
+                    (true, Some(pinned)) => {
+                        Some(clone_paths::clone_destination_browse_path(directory, &name, pinned, case_sensitive))
+                    }
+                    (true, None) => Some(browse_into(directory, &name)),
+                    (false, Some(_)) => None,
+                    (false, None) => Some(format!("{directory}{name}")),
                 })
             }
         };
@@ -1718,8 +1959,12 @@ impl Workspace {
 
     /// Adds the typed path as a project on the browse environment.
     fn submit_browse_path(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if let (Some(environment), Some(path)) = (self.browse_environment(), self.browse_submit_path(query)) {
-            self.add_project(environment, &path, window, cx);
+        let cloning =
+            self.palette.as_ref().and_then(|palette| palette.clone.as_ref()).is_some_and(|flow| flow.confirm.is_some());
+        match (self.browse_environment(), self.browse_submit_path(query)) {
+            (Some(_), Some(path)) if cloning => self.submit_clone_destination(&path, window, cx),
+            (Some(environment), Some(path)) => self.add_project(environment, &path, window, cx),
+            _ => {}
         }
     }
 
@@ -1745,6 +1990,16 @@ impl Workspace {
                 }
                 return self.push_palette_view(View::Browse, window, cx);
             }
+            Run::CloneFrom(environment, source) => {
+                return self.start_add_project_clone(environment, source, window, cx);
+            }
+            Run::NewProject => return self.open_new_project_flow(window, cx),
+            Run::NewProjectIn(environment) => {
+                return self.start_new_project(environment.clone(), Some(environment), window, cx);
+            }
+            Run::NewProjectMachine(environment) => return self.switch_new_project_environment(environment, cx),
+            Run::NewProjectPublish => return self.toggle_new_project_publish(cx),
+            Run::NewProjectExisting => return self.show_existing_project_sources(window, cx),
             _ => {}
         }
         self.close_palette(window, cx);
@@ -1753,10 +2008,10 @@ impl Workspace {
             self.settings = None;
         }
         match run {
-            Run::NewThread(project_id) => self.start_draft(project_id, window, cx),
-            Run::Thread(thread_id) => self.select_thread(thread_id, window, cx),
+            Run::NewThread(project) => self.start_draft_in(project.env, project.id, window, cx),
+            Run::Thread(thread) => self.select_thread_in(thread.env, thread.id, window, cx),
             Run::ThreadIn(environment, thread_id) => self.select_thread_in(environment, thread_id, window, cx),
-            Run::Project(members, project_id) => self.open_project_group(&members, project_id, window, cx),
+            Run::Project(members, project) => self.open_project_group(&members, project, window, cx),
             Run::Settings(section) => self.open_settings(section, cx),
             Run::Setting(item) => self.open_settings_search_result(item, window, cx),
             Run::ProjectSettings(project_id) => self.open_project_settings(&project_id, cx),
@@ -1781,8 +2036,8 @@ impl Workspace {
             Run::WorkspaceFocus(forward) => self.move_workspace_focus(forward, window, cx),
             Run::LinkPullRequest(thread_id) => self.open_link_pull_request(thread_id, window, cx),
             Run::LinkedPullRequests => self.open_surface(super::right_panel::Surface::PullRequests, window, cx),
-            Run::FindIn { thread_id, query, message_id } => {
-                self.select_thread(thread_id, window, cx);
+            Run::FindIn { thread, query, message_id } => {
+                self.select_thread_in(thread.env, thread.id, window, cx);
                 self.open_thread_find_on(&query, message_id, window, cx);
             }
             Run::Open(_)
@@ -1790,23 +2045,29 @@ impl Workspace {
             | Run::FileSearch(_)
             | Run::AddProject
             | Run::AddProjectIn(_)
-            | Run::BrowseIn(_) => {}
+            | Run::BrowseIn(_)
+            | Run::CloneFrom(..)
+            | Run::NewProject
+            | Run::NewProjectIn(_)
+            | Run::NewProjectMachine(_)
+            | Run::NewProjectPublish
+            | Run::NewProjectExisting => {}
         }
     }
 
     /// `openProjectFromSearch`: the group's latest thread by the sidebar's order, settled or not,
-    /// else a new draft in `project_id`.
+    /// else a new draft in `project`.
     fn open_project_group(
         &mut self,
-        members: &[String],
-        project_id: String,
+        members: &[ScopedId],
+        project: ScopedId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let sort_order = self.thread_sort_order();
-        match latest_thread(&self.shell.threads, members, &sort_order).map(|t| t.id.clone()) {
-            Some(thread_id) => self.select_thread(thread_id, window, cx),
-            None => self.start_draft(project_id, window, cx),
+        match latest_thread(&self.shell.threads, members, &sort_order).map(ScopedId::of_thread) {
+            Some(thread) => self.select_thread_in(thread.env, thread.id, window, cx),
+            None => self.start_draft_in(project.env, project.id, window, cx),
         }
     }
 
@@ -1863,19 +2124,19 @@ impl Workspace {
             p.environment_id == environment && crate::project_groups::normalize_path(&p.workspace_root) == key
         });
         if let Some(existing) = existing {
-            let project_id = existing.id.clone();
+            let project = ScopedId::of_project(existing);
             if existing.archived_at.is_some() {
-                let mutation = json!({"type": "project.update", "commandId": new_id(), "projectId": project_id, "archived": false});
-                self.mutate_project(mutation, cx);
+                let mutation = json!({"type": "project.update", "commandId": new_id(), "projectId": project.id, "archived": false});
+                self.mutate_project(&project.env, mutation, cx);
             }
             // A settled latest thread is left for a new draft.
             let sort_order = self.thread_sort_order();
-            let latest = latest_thread(&self.shell.threads, std::slice::from_ref(&project_id), &sort_order)
+            let latest = latest_thread(&self.shell.threads, std::slice::from_ref(&project), &sort_order)
                 .filter(|thread| thread.settled_override.as_deref() != Some("settled"))
-                .map(|thread| thread.id.clone());
+                .map(ScopedId::of_thread);
             match latest {
-                Some(thread_id) => self.select_thread(thread_id, window, cx),
-                None => self.start_draft(project_id, window, cx),
+                Some(thread) => self.select_thread_in(thread.env, thread.id, window, cx),
+                None => self.start_draft_in(project.env, project.id, window, cx),
             }
             return;
         }
@@ -1903,8 +2164,9 @@ impl Workspace {
         .detach();
     }
 
-    pub(super) fn mutate_project(&mut self, mutation: Value, cx: &mut Context<Self>) {
-        let Some(client) = self.command_client(&mutation) else { return };
+    /// `projects.mutate` on the project's environment.
+    pub(super) fn mutate_project(&mut self, environment: &str, mutation: Value, cx: &mut Context<Self>) {
+        let Some(client) = self.env_client(environment) else { return };
         cx.spawn(async move |this, cx| {
             if let Err(error) = client.request("projects.mutate", mutation).await {
                 let _ = this.update(cx, |this, cx| {
@@ -1948,8 +2210,7 @@ impl Workspace {
         let Some(query) = self.palette.as_ref().map(|p| p.input.read(cx).value().to_string()) else { return };
         self.prepare_palette(&query);
         let Some(palette) = &self.palette else { return };
-        let view = palette.view;
-        let browsing = view == View::Browse || (view == View::Root && is_browse_query(&query));
+        let browsing = browses(palette, &query);
         let groups = self.palette_groups(&query);
         // A disabled row is not an item: the arrows, Enter and the pointer pass over it.
         let rows: Vec<&Row> = groups.iter().flat_map(|g| g.rows.iter()).filter(|r| !r.disabled).collect();
@@ -1993,8 +2254,20 @@ impl Workspace {
         } else {
             modifiers.control && !modifiers.platform
         };
+        let repository_step = self.palette.as_ref().is_some_and(|palette| {
+            palette.view == View::Clone && palette.clone.as_ref().is_some_and(|flow| flow.confirm.is_none())
+        });
+        let new_project = self.palette.as_ref().is_some_and(|palette| palette.view == View::NewProject);
         match event.keystroke.key.as_str() {
             "escape" => self.close_palette(window, cx),
+            "enter" if repository_step => self.submit_clone_repository(window, cx),
+            // Enter creates unless a row is highlighted; Mod+Enter creates regardless.
+            "enter" if new_project && (highlight.is_none() || primary_modifier) => self.submit_new_project(window, cx),
+            "enter" if new_project => {
+                if let Some(run) = highlight.and_then(|i| rows.get(i)).map(|row| row.run.clone()) {
+                    self.run_palette_row(run, window, cx);
+                }
+            }
             "up" | "down" if !rows.is_empty() => {
                 let last = rows.len() - 1;
                 let next = match (event.keystroke.key.as_str(), highlight) {
@@ -2046,7 +2319,7 @@ impl Workspace {
         let palette = self.palette.as_ref()?;
         let tokens = *crate::theme::tokens(cx);
         let view = palette.view;
-        let browsing = view == View::Browse || (view == View::Root && is_browse_query(&query));
+        let browsing = browses(palette, &query);
         let in_submenu = !palette.stack.is_empty();
         // Only `highlightedItemValue` paints; Enter still runs the first row when it is `None`.
         let highlight = palette.highlight;
@@ -2072,29 +2345,109 @@ impl Workspace {
             Icon::new(IconName::Search).size(px(16.)).text_color(muted.opacity(0.8)).into_any_element()
         };
         let submit = browsing.then(|| self.browse_submit(&query));
-        // `CommandPaletteSubmitButton`: the trailing Add / Create & Add button while browsing.
-        let accessory = submit.map(|submit| {
-            let (label, shortcut) = browse_submit_labels(submit.will_create, highlight.is_some(), keymap::MAC);
-            let tooltip = format!("{label} ({shortcut})");
-            let query = query.clone();
-            let button = Button::new("palette-browse-submit")
+        let flow = palette.clone.as_ref().filter(|_| view == View::Clone);
+        let repository_step = flow.filter(|flow| flow.confirm.is_none());
+        let cloning_to = flow.and_then(|flow| flow.confirm.as_ref().map(|target| (flow, target)));
+        let pending = palette.clone_pending;
+        let new_project = view == View::NewProject;
+        let highlighted_run = highlight
+            .and_then(|i| groups.iter().flat_map(|g| g.rows.iter()).filter(|r| !r.disabled).nth(i))
+            .map(|r| &r.run);
+        // `CommandPaletteSubmitButton`: the trailing Add / Create & Add button while browsing, the
+        // clone flow's Continue / Lookup and Clone / Create & Clone, and New project's Create.
+        let accessory = if new_project {
+            self.render_new_project_submit(&query, highlighted_run, &tokens, cx).map(|button| div().child(button))
+        } else if let Some(flow) = repository_step {
+            let label = if pending { "Working" } else { flow.submit_label() };
+            let can_submit = !pending && !query.trim().is_empty() && self.env_client(&flow.environment).is_some();
+            let button = Button::new("palette-clone-submit")
                 .outline()
                 .xsmall()
                 .tab_stop(false)
                 .label(label)
-                .child(super::model_picker::kbd(&shortcut, &tokens))
-                .disabled(!submit.can_submit)
-                .tooltip(tooltip)
-                .on_click(cx.listener(move |this, _, window, cx| this.submit_browse_path(&query, window, cx)));
-            div().absolute().right(px(2.)).top_0().bottom_0().flex().items_center().child(button)
-        });
+                .child(super::model_picker::kbd("Enter", &tokens))
+                .disabled(!can_submit)
+                .tooltip(format!("{} (Enter)", flow.submit_label()))
+                .on_click(cx.listener(|this, _, window, cx| this.submit_clone_repository(window, cx)));
+            Some(div().absolute().right(px(2.)).top_0().bottom_0().flex().items_center().child(button))
+        } else {
+            submit.map(|submit| {
+                let (label, shortcut) = browse_submit_labels(submit.will_create, highlight.is_some(), keymap::MAC);
+                let tooltip = match cloning_to {
+                    Some((flow, _)) if !self.can_clone_on(&flow.environment) => {
+                        "This connection needs permission to write source control and add projects.".to_owned()
+                    }
+                    Some(_) => format!("{} ({shortcut})", clone_submit_label(label)),
+                    None => format!("{label} ({shortcut})"),
+                };
+                let label = match cloning_to {
+                    Some(_) if pending => "Cloning",
+                    Some(_) => clone_submit_label(label),
+                    None => label,
+                };
+                let query = query.clone();
+                let button = Button::new("palette-browse-submit")
+                    .outline()
+                    .xsmall()
+                    .tab_stop(false)
+                    .label(label)
+                    .child(super::model_picker::kbd(&shortcut, &tokens))
+                    .disabled(!submit.can_submit)
+                    .tooltip(tooltip)
+                    .on_click(cx.listener(move |this, _, window, cx| this.submit_browse_path(&query, window, cx)));
+                div().absolute().right(px(2.)).top_0().bottom_0().flex().items_center().child(button)
+            })
+        };
         // `browseInputEndPaddingClass`: room for the button's widest label.
         let input_end = match submit {
+            _ if new_project && highlight.is_some() => px(152.),
+            _ if repository_step.is_some() || new_project => px(128.),
             Some(submit) if submit.will_create => px(144.),
             Some(_) if highlight.is_some() => px(112.),
             Some(_) => px(88.),
             None => px(0.),
         };
+        // `RemoteRepositorySummary`: what the destination step clones.
+        let new_project_summary = self.render_new_project_summary(&query, &tokens);
+        let summary = cloning_to.map(|(flow, target)| {
+            let icon = match flow.source {
+                Some(kind) => source_control::definition(kind).mark(16., muted),
+                None => Icon::new(IconName::Link).size(px(16.)).text_color(muted).into_any_element(),
+            };
+            let (title, description) = match &target.repository {
+                Some((name, url)) => (name.clone(), url.clone()),
+                None => (target.input.clone(), target.remote_url.clone()),
+            };
+            v_flex()
+                .flex_none()
+                .p(px(8.))
+                .pb_0()
+                .child(
+                    div()
+                        .px(px(8.))
+                        .py(px(6.))
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(muted)
+                        .child("Repository"),
+                )
+                .child(
+                    h_flex()
+                        .min_h(px(32.))
+                        .items_center()
+                        .gap(px(8.))
+                        .px(px(8.))
+                        .py(px(6.))
+                        .child(div().flex_none().self_start().h(px(20.)).pt(px(2.)).child(icon))
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .child(div().truncate().text_sm().text_color(fg).child(title))
+                                .child(div().truncate().text_xs().text_color(muted.opacity(0.85)).child(description)),
+                        ),
+                )
+        });
         let input_row = h_flex().flex_none().h(px(46.)).px(px(8.)).py(px(6.)).child(
             h_flex()
                 .size_full()
@@ -2134,7 +2487,7 @@ impl Workspace {
             }
             for row in &group.rows {
                 if row.disabled {
-                    list.push(self.render_disabled_palette_row(row, &tokens));
+                    list.push(self.render_disabled_palette_row(row, &tokens, cx));
                     continue;
                 }
                 let slots = self.palette_thread_slots(row, &query, &requests, &tokens, cx);
@@ -2160,7 +2513,15 @@ impl Workspace {
             None
         };
         let empty = (total_rows == 0).then(|| {
-            let text = if browsing && self.relative_needs_project(&query) {
+            let text = if let Some(flow) = repository_step {
+                if flow.source.is_none() {
+                    "Enter a Git clone URL and press Enter to continue."
+                } else {
+                    "Enter a repository path and press Enter to look it up."
+                }
+            } else if cloning_to.is_some() {
+                "Choose a destination path and press Enter to clone."
+            } else if browsing && self.relative_needs_project(&query) {
                 "Relative paths require an active project."
             } else if submit.is_some_and(|submit| submit.will_create) {
                 "Press Enter to create this folder and add it as a project."
@@ -2209,7 +2570,12 @@ impl Workspace {
                 h_flex()
                     .gap(px(12.))
                     .child(hint(vec!["↑".into(), "↓".into()], "Navigate"))
-                    .when(!adds, |el| el.child(hint(vec!["Enter".into()], "Select")))
+                    .when(!adds, |el| {
+                        let label = self
+                            .new_project_footer_label(highlighted_run)
+                            .unwrap_or_else(|| repository_step.map_or("Select", CloneFlow::submit_label));
+                        el.child(hint(vec!["Enter".into()], label))
+                    })
                     .when(in_submenu, |el| el.child(hint(vec!["Backspace".into()], "Back")))
                     .child(hint(vec!["Esc".into()], "Close")),
             )
@@ -2266,6 +2632,8 @@ impl Workspace {
                             cx.listener(|this, event: &KeyDownEvent, window, cx| this.palette_key(event, window, cx)),
                         )
                         .child(input_row)
+                        .children(new_project_summary)
+                        .children(summary)
                         .children(
                             status.map(|text| div().px(px(16.)).py(px(12.)).text_sm().text_color(muted).child(text)),
                         )
@@ -2301,10 +2669,11 @@ impl Workspace {
             RowIcon::Lucide(name) => {
                 Icon::new(*name).size(px(16.)).text_color(tokens.muted_foreground).into_any_element()
             }
-            RowIcon::Project(project_id) => match self.shell.projects.iter().find(|p| &p.id == project_id) {
+            RowIcon::Project(project) => match self.shell.project(project) {
                 Some(project) => super::sidebar::project_icon(project, tokens, false, 16., self.favicon(project)),
                 None => div().size(px(16.)).into_any_element(),
             },
+            RowIcon::Host(kind) => source_control::definition(kind).mark(16., tokens.muted_foreground),
         }
     }
 
@@ -2313,8 +2682,8 @@ impl Workspace {
         let muted = tokens.muted_foreground;
         let dot = || div().flex_none().text_color(muted.opacity(0.5)).child("·");
         let mut parts: Vec<AnyElement> = Vec::new();
-        if let Some((project_id, title)) = &subtitle.project {
-            let project = self.shell.projects.iter().find(|p| &p.id == project_id);
+        if let Some((project, title)) = &subtitle.project {
+            let project = self.shell.project(project);
             let favicon = project.map(|p| super::sidebar::project_icon(p, tokens, false, 12., self.favicon(p)));
             parts.push(
                 h_flex()
@@ -2362,8 +2731,39 @@ impl Workspace {
         line.into_any_element()
     }
 
-    /// `DisabledCommandPaletteResultRow`: the icon, title and description at 64% opacity.
-    fn render_disabled_palette_row(&self, row: &Row, tokens: &Tokens) -> AnyElement {
+    /// `DisabledCommandPaletteResultRow`: the icon, title and description at 64% opacity, and a
+    /// clone source's Setup Required, which opens Source control settings.
+    fn render_disabled_palette_row(&self, row: &Row, tokens: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+        let setup = row.setup.clone().map(|hint| {
+            let warning = tokens.warning;
+            let ring = tokens.ring;
+            div()
+                .id(SharedString::from(format!("{}-setup", row.key)))
+                .flex_none()
+                .ml_auto()
+                .h(px(20.))
+                .px(px(5.))
+                .flex()
+                .items_center()
+                .rounded(px(4.))
+                .border_1()
+                .border_color(warning.opacity(0.32))
+                .bg(warning.opacity(0.08))
+                .text_size(px(11.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(tokens.warning_foreground)
+                .cursor_pointer()
+                .tab_index(0)
+                .focus_visible(move |style| style.border_color(ring))
+                .hover(move |s| s.border_color(warning.opacity(0.4)).bg(warning.opacity(0.16)))
+                .child("Setup Required")
+                .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(hint.clone()).build(window, cx))
+                .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.close_palette(window, cx);
+                    this.open_settings("source-control", cx);
+                }))
+        });
         let description = match &row.description {
             Some(Description::Text(text)) => Some(text.clone()),
             _ => None,
@@ -2397,6 +2797,7 @@ impl Workspace {
                             .child(text)
                     })),
             )
+            .children(setup)
             .into_any_element()
     }
 
@@ -2569,6 +2970,16 @@ impl Workspace {
                     .text_color(tokens.sidebar.secondary_label)
                     .child(shortcut)
             }))
+            .when(row.checked, |el| {
+                el.child(
+                    div().flex_none().child(Icon::new(IconName::Check).size(px(16.)).text_color(muted.opacity(0.7))),
+                )
+            })
+            .children(row.toggle.map(|on| {
+                let picker =
+                    matches!(row.run, Run::NewProjectPublish).then(|| self.render_publish_host_picker(tokens, cx));
+                h_flex().flex_none().gap(px(8.)).children(picker.flatten()).child(toggle_box(on, tokens))
+            }))
             .when(row.chevron, |el| {
                 el.child(
                     div()
@@ -2669,6 +3080,11 @@ fn browse_submit_labels(will_create: bool, highlighted: bool, mac: bool) -> (&'s
     (label, shortcut)
 }
 
+/// The clone destination's words for [`browse_submit_labels`]' label (`submitActionLabel`).
+fn clone_submit_label(label: &str) -> &'static str {
+    if label == "Create & Add" { "Create & Clone" } else { "Clone" }
+}
+
 /// What a shortcut pressed in the palette does (`handleKeyDown`).
 #[derive(Clone)]
 enum PaletteShortcut {
@@ -2747,11 +3163,11 @@ fn resolve_project_path(value: &str, cwd: Option<&str>) -> String {
     trim_trailing_separators(&format!("{root}{}", segments.join(separator)))
 }
 
-/// `sortThreads(..)[0]`: the newest unarchived thread of `project_ids` by the sidebar's thread
-/// order, settled ones included; a tie goes to the larger id.
+/// `sortThreads(..)[0]`: the newest unarchived thread of `projects` (on their environments) by
+/// the sidebar's thread order, settled ones included; a tie goes to the larger id.
 fn latest_thread<'a>(
     threads: &'a [crate::model::ThreadShell],
-    project_ids: &[String],
+    projects: &[ScopedId],
     sort_order: &str,
 ) -> Option<&'a crate::model::ThreadShell> {
     let parse = crate::timestamp::parse_ms;
@@ -2766,7 +3182,7 @@ fn latest_thread<'a>(
     };
     threads
         .iter()
-        .filter(|t| listed_in_palette(t) && project_ids.contains(&t.project_id))
+        .filter(|t| listed_in_palette(t) && projects.iter().any(|p| p.env == t.environment_id && p.id == t.project_id))
         .max_by(|a, b| sorted_at(a).cmp(&sorted_at(b)).then_with(|| a.id.cmp(&b.id)))
 }
 
@@ -2784,6 +3200,33 @@ fn connect_environment_row() -> Row {
     row.description = Some(Description::Text("No connected environment can add a project".into()));
     row.terms = &["connect", "environment", "connection", "settings"];
     row
+}
+
+/// `buildEnvironmentItem`: an environment's row, which runs `run`.
+fn environment_row(option: AddEnvironment, key: String, run: Run) -> Row {
+    let mut row = Row::new(key, RowIcon::Lucide(option.machine), option.label.clone(), run);
+    let description = if option.primary { "This device".into() } else { option.id.clone() };
+    row.description = Some(Description::Text(description));
+    row.data_terms = vec![option.label.into(), option.id];
+    if option.primary {
+        row.terms = &["this device"];
+    }
+    row
+}
+
+/// A toggle row's checkbox; the row takes the clicks and keys, so the box is no tab stop.
+fn toggle_box(on: bool, t: &Tokens) -> AnyElement {
+    div()
+        .size(px(16.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(4.))
+        .border_1()
+        .map(|el| if on { el.bg(t.primary).border_color(t.primary) } else { el.bg(t.background).border_color(t.input) })
+        .when(on, |el| el.child(Icon::new(IconName::Check).size(px(12.)).text_color(t.primary_foreground)))
+        .into_any_element()
 }
 
 /// The "Local folder" source of `environment`.
@@ -2953,6 +3396,32 @@ mod tests {
     }
 
     #[test]
+    fn a_search_asks_environments_with_a_cut_for_their_older_settled_matches() {
+        const CUT: &str = "2024-02-01T00:00:00.000Z";
+        let open = SearchScope::default();
+        assert_eq!(search_input("fix bug", None, &open, "a"), Some(json!({"query": "fix bug"})));
+        assert_eq!(search_input("fx", None, &open, "a"), None, "messages need a word of three letters");
+        assert_eq!(search_input("f", Some(CUT), &open, "a"), None);
+        // Older settled titles match from two letters, without the message search.
+        assert_eq!(
+            search_input("fx", Some(CUT), &open, "a"),
+            Some(json!({"query": "fx", "olderSettledBefore": CUT, "titlesOnly": true}))
+        );
+        let scoped = SearchScope {
+            projects: Some(HashMap::from([("a".into(), vec!["p1".to_owned()])])),
+            labels: Some(HashMap::from([("a".into(), "Laptop".into())])),
+        };
+        assert_eq!(
+            search_input("fix bug", Some(CUT), &scoped, "a"),
+            Some(
+                json!({"query": "fix bug", "olderSettledBefore": CUT, "projectIds": ["p1"], "environmentLabel": "Laptop"})
+            )
+        );
+        // The filter keeps no project there, so no older rows come back from it.
+        assert_eq!(search_input("fix bug", Some(CUT), &scoped, "b").unwrap()["projectIds"], json!([]));
+    }
+
+    #[test]
     fn project_rows_hold_their_opening_order_while_new_ones_join_at_the_end() {
         let order = RefCell::default();
         let keys = |items: Vec<(String, ())>| items.into_iter().map(|(key, ())| key).collect::<Vec<_>>();
@@ -2992,18 +3461,22 @@ mod tests {
         let row = |title: &str, run: Run| {
             Row::new(title.to_owned(), RowIcon::Lucide(IconName::Palette), title.to_owned(), run)
         };
-        let mut here = row("New thread in", Run::NewThread("p1".into()));
+        let mut here = row("New thread in", Run::NewThread(ScopedId::new("env", "p1")));
         here.strong = Some("t3code".into());
         let new_in = row("New thread in...", Run::Open(View::NewThreadIn));
         let themes = row("Change theme", Run::Open(View::Themes));
         let actions = vec![here, new_in.clone(), themes.clone()];
-        let mut project = row("t3code", Run::NewThread("p1".into()));
+        let mut project = row("t3code", Run::NewThread(ScopedId::new("env", "p1")));
         project.data_terms = vec![r"H:\Developer\t3code".into()];
         let children = || {
             vec![
                 (
                     &new_in,
-                    vec![project.clone(), row("docs", Run::NewThread("p2".into())), row("No project", Run::Triage)],
+                    vec![
+                        project.clone(),
+                        row("docs", Run::NewThread(ScopedId::new("env", "p2"))),
+                        row("No project", Run::Triage),
+                    ],
                 ),
                 (&themes, vec![row("Dracula", Run::Theme(Some("dracula".into())))]),
             ]
@@ -3062,6 +3535,7 @@ mod tests {
         const DAY: i64 = 86_400_000;
         let now = 100 * DAY;
         let hit = |thread_id: &str, quality: f32, hits: u32| MessageMatch {
+            environment_id: "env".into(),
             thread_id: thread_id.into(),
             user: true,
             snippet: String::new(),
@@ -3242,14 +3716,14 @@ mod tests {
             row.command = Some(command.to_owned().into());
             row
         };
-        let here = row("here", "chat.newLocal", Run::NewThread("p1".into()));
-        let jump = row("p2", "thread.jump.2", Run::NewThread("p2".into()));
+        let here = row("here", "chat.newLocal", Run::NewThread(ScopedId::new("env", "p1")));
+        let jump = row("p2", "thread.jump.2", Run::NewThread(ScopedId::new("env", "p2")));
         let rows = [&here, &jump];
         assert!(
-            matches!(palette_shortcut(&rows, "chat.newLocal"), PaletteShortcut::Run(Run::NewThread(id)) if id == "p1")
+            matches!(palette_shortcut(&rows, "chat.newLocal"), PaletteShortcut::Run(Run::NewThread(p)) if p.id == "p1")
         );
         assert!(
-            matches!(palette_shortcut(&rows, "thread.jump.2"), PaletteShortcut::Run(Run::NewThread(id)) if id == "p2")
+            matches!(palette_shortcut(&rows, "thread.jump.2"), PaletteShortcut::Run(Run::NewThread(p)) if p.id == "p2")
         );
         assert!(matches!(palette_shortcut(&rows, "thread.jump.3"), PaletteShortcut::Swallow), "a jump never leaves");
         assert!(matches!(palette_shortcut(&rows, "chat.new"), PaletteShortcut::Pass));
@@ -3274,7 +3748,7 @@ mod tests {
             if let (Some(base), Value::Object(extra)) = (fields.as_object_mut(), extra) {
                 base.extend(extra);
             }
-            thread(fields)
+            crate::model::ThreadShell { environment_id: "env".into(), ..thread(fields) }
         };
         let threads = [
             at("old", "p1", "2026-01-01T00:00:00Z", json!({})),
@@ -3282,10 +3756,12 @@ mod tests {
             at("archived", "p1", "2026-01-05T00:00:00Z", json!({"archivedAt": "2026-01-06T00:00:00Z"})),
             at("elsewhere", "p3", "2026-01-09T00:00:00Z", json!({})),
         ];
-        let group = ["p1".to_owned(), "p2".to_owned()];
+        let group = [ScopedId::new("env", "p1"), ScopedId::new("env", "p2")];
         let latest = |order: &str| latest_thread(&threads, &group, order).map(|t| t.id.as_str());
         assert_eq!(latest("updated_at"), Some("other-checkout"));
         assert_eq!(latest_thread(&threads, &group[..1], "updated_at").map(|t| t.id.as_str()), Some("old"));
-        assert_eq!(latest_thread(&threads, &["p4".to_owned()], "updated_at").map(|t| t.id.as_str()), None);
+        assert_eq!(latest_thread(&threads, &[ScopedId::new("env", "p4")], "updated_at").map(|t| t.id.as_str()), None);
+        // `p1` on another machine is another project.
+        assert_eq!(latest_thread(&threads, &[ScopedId::new("copy", "p1")], "updated_at").map(|t| t.id.as_str()), None);
     }
 }

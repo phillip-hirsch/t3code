@@ -460,7 +460,7 @@ mod tests {
     use super::*;
 
     fn draft(project: &str) -> Target {
-        Target::Draft { env: SharedString::from("env"), project_id: project.into() }
+        Target::draft(SharedString::from("env"), project.into(), crate::app::draft_sessions::DraftId::for_test(project))
     }
 
     #[test]

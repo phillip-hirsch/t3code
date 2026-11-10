@@ -126,7 +126,7 @@ impl ScopedErrors {
 fn target_key(target: Option<&Target>) -> String {
     match target {
         Some(Target::Thread { id, .. }) => id.clone(),
-        Some(Target::Draft { project_id, .. }) => format!("draft:{project_id}"),
+        Some(Target::Draft { draft, .. }) => format!("draft:{draft}"),
         None => String::new(),
     }
 }

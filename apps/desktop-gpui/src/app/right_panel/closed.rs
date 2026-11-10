@@ -284,7 +284,7 @@ impl Workspace {
         let environment = target.environment();
         let owner_exists = match &target {
             Target::Thread { env, id } => self.shell.threads.iter().any(|t| &t.id == id && &t.environment_id == env),
-            Target::Draft { env, project_id } => {
+            Target::Draft { env, project_id, .. } => {
                 self.shell.projects.iter().any(|p| &p.id == project_id && &p.environment_id == env)
             }
         };
@@ -319,7 +319,7 @@ impl Workspace {
                 };
                 (env, &thread.project_id)
             }
-            Target::Draft { env, project_id } => (env, project_id),
+            Target::Draft { env, project_id, .. } => (env, project_id),
         };
         self.shell.projects.iter().any(|p| &p.id == project_id && &p.environment_id == env)
     }
@@ -327,7 +327,7 @@ impl Workspace {
     fn open_owner(&mut self, target: &Target, window: &mut Window, cx: &mut Context<Self>) {
         match target.clone() {
             Target::Thread { env, id } => self.select_thread_in(env, id, window, cx),
-            Target::Draft { env, project_id } => self.start_draft_in(env, project_id, window, cx),
+            draft @ Target::Draft { .. } => self.open_draft_entry(draft, window, cx),
         }
     }
 

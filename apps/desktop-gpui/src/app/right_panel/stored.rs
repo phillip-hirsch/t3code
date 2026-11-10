@@ -20,17 +20,27 @@ const SAVE_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub(super) enum StoredTarget {
-    Thread { environment_id: String, thread_id: String },
-    Draft { environment_id: String, project_id: String },
+    Thread {
+        environment_id: String,
+        thread_id: String,
+    },
+    Draft {
+        environment_id: String,
+        project_id: String,
+        #[serde(default)]
+        draft_id: String,
+    },
 }
 
 impl From<&Target> for StoredTarget {
     fn from(target: &Target) -> Self {
         match target {
             Target::Thread { env, id } => Self::Thread { environment_id: env.to_string(), thread_id: id.clone() },
-            Target::Draft { env, project_id } => {
-                Self::Draft { environment_id: env.to_string(), project_id: project_id.clone() }
-            }
+            Target::Draft { env, project_id, draft } => Self::Draft {
+                environment_id: env.to_string(),
+                project_id: project_id.clone(),
+                draft_id: draft.as_str().to_owned(),
+            },
         }
     }
 }
@@ -41,9 +51,11 @@ impl StoredTarget {
             Self::Thread { environment_id, thread_id } => {
                 Target::Thread { env: environment_id.clone().into(), id: thread_id.clone() }
             }
-            Self::Draft { environment_id, project_id } => {
-                Target::Draft { env: environment_id.clone().into(), project_id: project_id.clone() }
-            }
+            Self::Draft { environment_id, project_id, draft_id } => Target::draft(
+                environment_id.clone().into(),
+                project_id.clone(),
+                crate::app::draft_sessions::DraftId::from_saved(draft_id.clone()),
+            ),
         }
     }
 }
@@ -223,7 +235,7 @@ mod tests {
             user_revision: 9,
             ..PanelState::default()
         };
-        let draft = Target::Draft { env: "env".into(), project_id: "p".into() };
+        let draft = Target::draft("env".into(), "p".into(), crate::app::draft_sessions::DraftId::for_test("d1"));
         let panels = HashMap::from([
             (thread("t"), panel),
             (draft.clone(), PanelState { width: Some(400.), ..PanelState::default() }),

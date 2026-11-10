@@ -17,13 +17,15 @@ use super::{Target, Workspace};
 use crate::backend::Endpoint;
 use crate::device::DeviceState;
 use crate::environments::Presented;
-use crate::model::ServerInfo;
+use crate::model::{ScopedId, ServerInfo};
 use crate::project_groups::ScratchRoot;
 use crate::rpc::RpcClient;
 use crate::theme::Tokens;
 
 /// The primary session's index in `Workspace::sessions`; it is always there.
 const PRIMARY: usize = 0;
+/// How long a first connection's shell waits for the config before subscribing without it.
+const SHELL_CONFIG_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 #[derive(Default)]
 pub(super) struct EnvironmentSession {
@@ -41,6 +43,9 @@ pub(super) struct EnvironmentSession {
     /// See `OpenThread::snapshot_failed` / `OpenThread::retried`.
     shell_snapshot_failed: bool,
     shell_retried: bool,
+    /// The shell subscription waits for this connection's first config, which says whether it
+    /// may leave older settled threads out.
+    shell_waits_for_config: bool,
     /// Config, terminal, preview and device streams, and the session's grants.
     _streams: Vec<Task<()>>,
     _shell: Option<Task<()>>,
@@ -76,6 +81,14 @@ impl Target {
     pub(super) fn environment(&self) -> &SharedString {
         match self {
             Target::Thread { env, .. } | Target::Draft { env, .. } => env,
+        }
+    }
+
+    /// The open thread's id on its environment.
+    pub(super) fn thread_key(&self) -> Option<ScopedId> {
+        match self {
+            Target::Thread { env, id } => Some(ScopedId::new(env.clone(), id.clone())),
+            Target::Draft { .. } => None,
         }
     }
 }
@@ -257,10 +270,14 @@ impl Workspace {
         let Some(session) = self.session_mut(&environment_id) else { return };
         let Some(client) = session.client.clone() else { return };
         session.shell_retried = false;
+        // A reconnect keeps the last config; only a first connection waits for one.
+        let config_known = !session.server_info.config.is_null();
+        session.shell_waits_for_config = !config_known;
         self.resume_file_saves(&environment_id, cx);
         let config = client
             .stream("subscribeServerConfig", json!({"workspaceSnapshotsOnDemand": true, "environmentThemes": true}));
         let id = environment_id.clone();
+        let config_id = environment_id.clone();
         let config_task = Self::pump(
             config,
             window,
@@ -278,6 +295,11 @@ impl Workspace {
             move |this, window, cx| {
                 // Whether it answers checks may have changed.
                 this.publish_pull_request_routing(cx);
+                if let Some(session) = this.session_mut(&config_id)
+                    && mem::take(&mut session.shell_waits_for_config)
+                {
+                    this.subscribe_shell(config_id.clone(), window, cx);
+                }
                 if primary {
                     this.sync_keymap(cx);
                     this.show_reload_toast(window, cx);
@@ -298,7 +320,11 @@ impl Workspace {
             self.subscribe_terminal_metadata(environment_id.clone(), &client, window, cx),
             self.subscribe_previews(&environment_id, &client, window, cx),
             self.subscribe_device_state(environment_id.clone(), &client, window, cx),
+            self.subscribe_project_clones(environment_id.clone(), &client, window, cx),
         ];
+        if !config_known {
+            streams.push(self.subscribe_shell_without_config(environment_id.clone(), window, cx));
+        }
         if let Some(endpoint) = self.session(&environment_id).and_then(|s| s.endpoint.clone()) {
             let id = environment_id.clone();
             streams.push(check_session(endpoint, cx, move |this, grants, cx| {
@@ -307,7 +333,9 @@ impl Workspace {
                     session.grants = grants;
                 }
                 this.apply_pr_write_grant(&id, before, cx);
+                this.drop_unoperable_renames();
                 this.notify_sidebar(cx);
+                cx.notify();
             }));
         }
         let Some(session) = self.session_mut(&environment_id) else { return };
@@ -320,8 +348,30 @@ impl Workspace {
             self.sync_worktree_setup(cx);
             self.sync_details(cx);
         }
-        self.subscribe_shell(environment_id, window, cx);
+        if config_known {
+            self.subscribe_shell(environment_id, window, cx);
+        }
         self.sync_pull_request_refreshes(cx);
+    }
+
+    /// A config that never comes must not keep the thread list away: the shell subscribes
+    /// without it after a while, keeping every settled thread.
+    fn subscribe_shell_without_config(
+        &mut self,
+        environment_id: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(SHELL_CONFIG_WAIT).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if let Some(session) = this.session_mut(&environment_id)
+                    && mem::take(&mut session.shell_waits_for_config)
+                {
+                    this.subscribe_shell(environment_id, window, cx);
+                }
+            });
+        })
     }
 
     /// Ends the open target's own streams (thread, worktree setup, tool output, side chat)
@@ -338,8 +388,16 @@ impl Workspace {
     fn subscribe_shell(&mut self, environment_id: SharedString, window: &mut Window, cx: &mut Context<Self>) {
         let Some(client) = self.env_client(&environment_id) else { return };
         let mut input = json!({"requestCompletionMarker": true});
+        // Older settled threads load on demand (the Settled shelf's pages, search, families).
+        let omit_older_settled = self
+            .session(&environment_id)
+            .is_some_and(|s| s.server_info.config.get("shellOlderSettled").and_then(Value::as_bool) == Some(true));
+        if omit_older_settled {
+            input["omitOlderSettled"] = true.into();
+        }
         let sequence = self.shell.sequence(&environment_id);
-        if sequence > 0 {
+        // Rows held under other omissions would resume incomplete or stale, so they reload.
+        if sequence > 0 && self.shell.older_settled(&environment_id).is_some() == omit_older_settled {
             input["afterSequence"] = sequence.into();
         }
         let stream = client.stream("orchestration.subscribeShell", input);
@@ -371,6 +429,7 @@ impl Workspace {
                 } else if sequence > 0 {
                     session.shell_retried = false;
                 }
+                this.verify_restored_drafts(cx);
                 this.land(window, cx);
                 this.open_pending_links(window, cx);
                 this.keep_running_threads(cx);
@@ -381,6 +440,7 @@ impl Workspace {
                 this.sync_now(cx);
                 this.sync_child_approvals(cx);
                 this.sync_lineage_titles(cx);
+                this.sync_older_settled_counts(&batch_id, cx);
             },
         );
         if let Some(session) = self.session_mut(&environment_id) {
@@ -532,9 +592,29 @@ impl Workspace {
         }
     }
 
-    /// A project's draft as a target, on the project's environment.
-    pub(super) fn draft_target(&self, project_id: &str) -> Option<Target> {
-        Some(Target::Draft { env: self.project_environment(project_id)?, project_id: project_id.to_owned() })
+    /// Whether `key` is the open thread, on its environment.
+    pub(super) fn is_open_thread(&self, key: &ScopedId) -> bool {
+        matches!(&self.target, Some(Target::Thread { env, id }) if *env == key.env && *id == key.id)
+    }
+
+    /// A removed project's drafts go with it, the open one too.
+    pub(super) fn forget_project_drafts(&mut self, project_id: &str, cx: &mut Context<Self>) {
+        let Some(env) = self.project_environment(project_id) else { return };
+        self.forget_scoped_project_drafts(&ScopedId::new(env, project_id), cx);
+    }
+
+    /// [`Self::forget_project_drafts`] for a project the shell may no longer list.
+    pub(super) fn forget_scoped_project_drafts(&mut self, project: &ScopedId, cx: &mut Context<Self>) {
+        let of_project = |target: &Target| match target {
+            Target::Draft { env, project_id, .. } => *env == project.env && *project_id == project.id,
+            Target::Thread { .. } => false,
+        };
+        self.composer_drafts.retain(|target, _| !of_project(target));
+        if self.target.as_ref().is_some_and(of_project) {
+            self.target = None;
+        }
+        self.drafts.forget_project(project);
+        self.drafts_changed(cx);
     }
 
     /// A listed thread as a target, on its environment.

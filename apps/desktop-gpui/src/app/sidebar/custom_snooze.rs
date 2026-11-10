@@ -13,10 +13,11 @@ use gpui_kit::{
 
 use crate::app::Workspace;
 use crate::inbox::{self, CustomSnooze, SnoozeUnit};
+use crate::model::ScopedId;
 
 pub(super) struct CustomSnoozeForm {
     workspace: WeakEntity<Workspace>,
-    thread_ids: Vec<String>,
+    thread_ids: Vec<ScopedId>,
     /// Move on from the open thread once it is snoozed, as the sidebar does.
     advance: bool,
     duration: bool,
@@ -172,7 +173,7 @@ impl Workspace {
     /// Opens the dialog, seeded with now + 1 h (date mode) and 2 hours (duration mode).
     pub(super) fn open_custom_snooze(
         &mut self,
-        thread_ids: &[String],
+        thread_ids: &[ScopedId],
         advance: bool,
         window: &mut Window,
         cx: &mut Context<Self>,

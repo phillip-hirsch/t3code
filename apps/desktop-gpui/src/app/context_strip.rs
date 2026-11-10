@@ -85,6 +85,8 @@ pub(super) enum PermissionsForm {
 #[derive(Default)]
 pub(super) struct DraftWorkspaceState {
     project_id: Option<String>,
+    /// The draft the picks belong to; another draft of the project starts without them.
+    draft: Option<super::draft_sessions::DraftId>,
     pub(super) choice: WorkspaceChoice,
     default_mode: Option<EnvMode>,
     start_from_origin_default: bool,
@@ -174,20 +176,22 @@ enum BranchItem {
 const NEXT_PAGE_DISTANCE: f32 = 96.;
 
 impl Workspace {
-    /// Loads the draft's default workspace mode and refs when its project changes.
+    /// Loads the draft's default workspace mode and refs when the draft or its project changes.
     pub(super) fn sync_draft_workspace(&mut self, cx: &mut Context<Self>) {
-        let Some(Target::Draft { project_id, .. }) = self.target.clone() else { return };
-        if self.draft_workspace.project_id.as_ref() == Some(&project_id) {
+        let Some(Target::Draft { project_id, draft, .. }) = self.target.clone() else { return };
+        let state = &self.draft_workspace;
+        if state.project_id.as_ref() == Some(&project_id) && state.draft.as_ref() == Some(&draft) {
             return;
         }
-        // Reset first, so nothing from the previous project survives; send.rs resolves the
+        // Reset first, so nothing from the previous draft survives; send.rs resolves the
         // workspace itself when this never loads.
-        self.draft_workspace = DraftWorkspaceState { project_id: Some(project_id.clone()), ..Default::default() };
+        self.draft_workspace =
+            DraftWorkspaceState { project_id: Some(project_id.clone()), draft: Some(draft), ..Default::default() };
         let (Some(client), Some(project)) = (self.client(), self.shell.projects.iter().find(|p| p.id == project_id))
         else {
             return;
         };
-        let has_threads = self.shell.threads.iter().any(|t| t.project_id == project_id);
+        let has_threads = self.shell.project_has_threads(project);
         let workspace = DraftWorkspace::new(self.server_info(), project, has_threads);
         self.draft_workspace.start_from_origin_default = workspace.start_from_origin();
         let cwd = project.workspace_root.clone();

@@ -122,7 +122,7 @@ impl Workspace {
         if archived {
             let mutation =
                 json!({"type": "project.update", "commandId": new_id(), "projectId": project_id, "archived": false});
-            self.mutate_project(mutation, cx);
+            self.mutate_project(&environment, mutation, cx);
         }
         self.settings = None;
         self.start_draft_in(environment, project_id.clone(), window, cx);
