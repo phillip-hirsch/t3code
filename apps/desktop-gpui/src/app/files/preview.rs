@@ -987,7 +987,7 @@ impl Workspace {
         }
         let image = matches!(self.files.previews.get(key).map(|s| &s.load), Some(Load::Image))
             .then(|| self.workspace_image(key, cx));
-        let media_menu = image.is_some().then(|| self.render_media_menu()).flatten();
+        let media_menu = image.as_ref().and_then(|_| self.render_media_menu(key, window, cx));
         // A truncated read, a host file, an attachment or a connection without write access shows
         // the source read-only.
         let editable = key.in_workspace()

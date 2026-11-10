@@ -377,7 +377,7 @@ impl Workspace {
         if let Some((_, global)) = viewer_of(kind) {
             self.sync_viewer_theme(key, global, cx);
         }
-        let menu = (kind == FileKind::Video).then(|| self.render_media_menu()).flatten();
+        let menu = if kind == FileKind::Video { self.render_media_menu(key, window, cx) } else { None };
         let Some(state) = self.files.documents.views.get(key) else { return div().into_any_element() };
         match (&state.view, &state.failed) {
             (Some(view), _) => {
