@@ -82,7 +82,8 @@ pub(super) enum PageEvent {
 
 /// The chords a focused page forwards (`setForwardedShortcuts`), and what they were resolved from.
 struct PageChords {
-    source: Option<(Rc<[crate::keybindings::Rule]>, bool)>,
+    /// The keymap, whether the terminal is open, and whether there are closed views to reopen.
+    source: Option<(Rc<[crate::keybindings::Rule]>, bool, bool)>,
     list: Vec<keymap::PageChord>,
     /// `list` as JSON, for the pages' script.
     json: Rc<str>,
@@ -1096,17 +1097,18 @@ impl Workspace {
         self.run_command(command, false, &context, window, cx);
     }
 
-    /// Resolves the chords pages forward again when the keymap or the terminal changed, and swaps
-    /// a changed set into every hosted page.
+    /// Resolves the chords pages forward again when the keymap, the terminal or the closed views
+    /// changed, and swaps a changed set into every hosted page.
     fn sync_page_chords(&mut self, cx: &App) {
-        let terminal_open = self.terminal_open();
+        let (terminal_open, closed_views) = (self.terminal_open(), self.has_closed_views());
         let chords = &mut self.preview.chords;
-        if chords.source.as_ref().is_some_and(|(rules, open)| Rc::ptr_eq(rules, &self.keymap) && *open == terminal_open)
-        {
+        if chords.source.as_ref().is_some_and(|(rules, open, closed)| {
+            Rc::ptr_eq(rules, &self.keymap) && *open == terminal_open && *closed == closed_views
+        }) {
             return;
         }
-        chords.source = Some((self.keymap.clone(), terminal_open));
-        let list = keymap::page_chords(&self.keymap, terminal_open);
+        chords.source = Some((self.keymap.clone(), terminal_open, closed_views));
+        let list = keymap::page_chords(&self.keymap, terminal_open, closed_views);
         if list == chords.list {
             return;
         }

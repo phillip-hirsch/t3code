@@ -236,8 +236,7 @@ fn effective_shortcut(rules: &[Rule], command: &str, context: &ShortcutContext, 
 }
 
 /// `PREVIEW_FORWARDED_COMMANDS`: the shell commands a focused browser page hands back to the app
-/// (`ReopenClosedViewShortcut.tsx`). `view.reopenClosed` joins them once this client keeps a
-/// closed-view history.
+/// (`ReopenClosedViewShortcut.tsx`), after `view.reopenClosed` while there are closed views.
 pub(super) const PAGE_FORWARDED_COMMANDS: [&str; 6] = [
     "workspace.focusNext",
     "workspace.focusPrevious",
@@ -260,14 +259,16 @@ pub(super) struct PageChord {
 
 /// The chords a focused browser page forwards, resolved as the web registers them: the preview
 /// focused and open, the terminal as it is, nothing else focused.
-pub(super) fn page_chords(rules: &[Rule], terminal_open: bool) -> Vec<PageChord> {
-    page_chords_on(rules, terminal_open, MAC)
+pub(super) fn page_chords(rules: &[Rule], terminal_open: bool, closed_views: bool) -> Vec<PageChord> {
+    page_chords_on(rules, terminal_open, closed_views, MAC)
 }
 
-fn page_chords_on(rules: &[Rule], terminal_open: bool, mac: bool) -> Vec<PageChord> {
+fn page_chords_on(rules: &[Rule], terminal_open: bool, closed_views: bool, mac: bool) -> Vec<PageChord> {
     let context = &ShortcutContext { preview_focus: true, preview_open: true, terminal_open, ..Default::default() };
-    PAGE_FORWARDED_COMMANDS
+    closed_views
+        .then_some("view.reopenClosed")
         .into_iter()
+        .chain(PAGE_FORWARDED_COMMANDS)
         .flat_map(|command| {
             effective_shortcuts(rules, command, context, mac).map(move |s| PageChord {
                 command,
@@ -631,7 +632,7 @@ mod tests {
         let chord =
             |command, key: &str, ctrl, shift, alt, meta| PageChord { command, key: key.into(), meta, ctrl, shift, alt };
         assert_eq!(
-            page_chords_on(defaults(), false, false),
+            page_chords_on(defaults(), false, false, false),
             [
                 chord("workspace.focusNext", "f6", true, false, false, false),
                 chord("workspace.focusNext", "f6", false, false, false, false),
@@ -643,7 +644,7 @@ mod tests {
             ],
             "every shortcut of each command, with `mod` as Ctrl; nothing binds toggleMaximized"
         );
-        let mac = page_chords_on(defaults(), false, true);
+        let mac = page_chords_on(defaults(), false, false, true);
         assert!(mac.contains(&chord("sidebar.toggle", "b", false, false, false, true)), "`mod` is Cmd on macOS");
 
         let custom = merge_with_defaults(&[
@@ -652,7 +653,7 @@ mod tests {
             compile("mod+alt+s", "sidebar.toggle", Some("terminalOpen")).unwrap(),
         ]);
         let commands = |terminal_open| {
-            page_chords_on(&custom, terminal_open, false)
+            page_chords_on(&custom, terminal_open, false, false)
                 .into_iter()
                 .map(|chord| (chord.command, chord.key))
                 .collect::<Vec<_>>()
@@ -662,6 +663,11 @@ mod tests {
         assert!(!closed.iter().any(|(command, _)| *command == "preview.focusUrl"), "a later rule claims its chord");
         assert!(!closed.contains(&("sidebar.toggle", "s".into())), "its condition needs an open terminal");
         assert!(commands(true).contains(&("sidebar.toggle", "s".into())));
+        // Reopen Closed Tab forwards only while there is something to reopen.
+        assert_eq!(
+            page_chords_on(defaults(), false, true, false).first(),
+            Some(&chord("view.reopenClosed", "t", true, true, false, false))
+        );
     }
 
     #[test]
