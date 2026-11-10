@@ -24,7 +24,8 @@ impl Workspace {
         if keymap::focus_in(&event.context_stack, CAPTURE_CONTEXT) || self.recording_shortcut(cx) {
             return false;
         }
-        if self.composer_menu_key(keystroke, window, cx)
+        if self.citation_key(keystroke, window, cx)
+            || self.composer_menu_key(keystroke, window, cx)
             || self.pr_completion_key(keystroke, window, cx)
             || self.palette_tab(keystroke, window, cx)
         {

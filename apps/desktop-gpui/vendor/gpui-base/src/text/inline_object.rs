@@ -365,6 +365,25 @@ impl Element for InlineObject {
         }
         if let Some(link) = self.link.clone() {
             window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+            if let Some(handler) = view
+                .as_ref()
+                .and_then(|view| view.read(cx).link_hover_handler.clone())
+            {
+                let hover_hitbox = hitbox.clone();
+                let url = link.url.clone();
+                let mut hovered = hitbox.is_hovered(window);
+                window.on_mouse_event(move |_: &gpui::MouseMoveEvent, phase, window, cx| {
+                    if !phase.bubble() || hover_hitbox.is_hovered(window) == hovered {
+                        return;
+                    }
+                    hovered = !hovered;
+                    let hover = hovered.then(|| super::text_view::LinkHover {
+                        url: url.clone(),
+                        bounds,
+                    });
+                    handler(hover, window, cx);
+                });
+            }
             let link_hitbox = hitbox.clone();
             let link_view = view.clone();
             let handler = self.link_click_handler.clone();

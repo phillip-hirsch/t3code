@@ -15,7 +15,7 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
-use self::lineage::{Relationships, Relative};
+use self::lineage::{Kind, MergeBack, Relationships, Relative, Workflow};
 use super::git::{self, GitRequest, QuickKind};
 use super::titlebar::{RIGHT_RESIZE_INSET, TITLEBAR_HEIGHT, icon};
 use super::{Target, Workspace, new_id};
@@ -30,6 +30,8 @@ pub(super) mod servers;
 const CARD_WIDTH: f32 = 280.;
 /// `quickActionDisabledReason` without `source-control:write`.
 const NO_SOURCE_CONTROL_WRITE: &str = "This connection cannot change source control.";
+/// `threadOperationFailure` without `orchestration:operate`.
+const NOT_OPERATE: &str = "This connection cannot change threads.";
 const CARD_INSET: f32 = 12.;
 const ROW_HEIGHT: f32 = 32.;
 const METER_ROW_HEIGHT: f32 = 24.;
@@ -1306,8 +1308,8 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// `ThreadRelationshipsControl`'s Lineage: the parent thread, running subagents, and
-    /// settled ones folded under "Previous agents".
+    /// `ThreadRelationshipsControl`'s Lineage: the parent, forks and context transfers, running
+    /// subagents, and settled ones folded under "Previous agents".
     fn lineage_section(
         &self,
         relationships: &Relationships,
@@ -1315,9 +1317,9 @@ impl Workspace {
         colors: &CardColors,
         cx: &mut Context<Self>,
     ) -> Option<Section> {
-        let Some(Target::Thread { id, .. }) = &self.target else { return None };
-        let thread = self.shell.threads.iter().find(|thread| &thread.id == id)?;
-        let Relationships { parent, active, previous, side_chats } = relationships;
+        let Some(Target::Thread { env, id }) = &self.target else { return None };
+        let thread = self.shell.threads.iter().find(|thread| &thread.id == id && thread.environment_id == *env)?;
+        let Relationships { related, active, previous, side_chats, merge } = relationships;
         let can_detach = self
             .open_projection()
             .and_then(|projection| projection.provider_session())
@@ -1332,7 +1334,7 @@ impl Workspace {
         });
         let running = unthreaded + active.iter().filter(|row| row.status.as_deref() == Some("running")).count();
         // Disconnect lives in this heading, so a thread with only side chats still shows it.
-        let visible = parent.is_some()
+        let visible = !related.is_empty()
             || !active.is_empty()
             || !previous.is_empty()
             || running > 0
@@ -1345,71 +1347,89 @@ impl Workspace {
             0 => "Lineage".into(),
             running => format!("Lineage · {running} running").into(),
         };
-        let mut rows = 0usize;
+        let mut height = 0.;
         // A lone "Previous agents" row names itself; the heading returns for status or actions.
-        let show_heading = running > 0 || can_detach || parent.is_some() || !active.is_empty() || delegated.is_some();
+        let show_heading =
+            running > 0 || can_detach || !related.is_empty() || !active.is_empty() || delegated.is_some();
         let mut section = v_flex().when(show_heading, |el| {
             let actions = can_detach.then(|| self.lineage_menu(tokens, colors, cx));
             el.child(section_heading(heading, tokens).children(actions))
         });
         if let Some(from) = delegated {
             section = section.child(self.delegated_from_row(from, thread, tokens, colors, cx));
-            rows += 1;
+            height += ROW_HEIGHT;
         }
-        if let Some(parent) = parent {
-            section =
-                section.child(self.relationship_row(parent, "icons/corner-left-up.svg", false, tokens, colors, cx));
-            rows += 1;
-        }
-        for child in active {
-            section = section.child(self.relationship_row(child, "icons/bot.svg", false, tokens, colors, cx));
-            rows += 1;
+        for relative in related.iter().chain(active) {
+            let (row, row_height) = self.lineage_row(relative, merge.as_ref(), tokens, colors, cx);
+            section = section.child(row);
+            height += row_height;
         }
         if !previous.is_empty() {
             let expanded = self.lineage_expanded.as_ref() == Some(id);
             let thread_id = id.clone();
-            rows += 1;
+            height += ROW_HEIGHT;
             section = section.child(
-                row(colors)
-                    .id("details-previous-agents")
-                    .cursor_pointer()
-                    .hover(|style| style.bg(colors.hover))
-                    .child(icon("icons/bot.svg").with_size(px(16.)).text_color(tokens.muted_foreground))
-                    .child(div().flex_1().min_w_0().truncate().child("Previous agents"))
-                    .when(!expanded, |el| {
-                        el.child(
-                            div()
-                                .flex_none()
-                                .text_xs()
-                                .font_weight(gpui_kit::FontWeight::NORMAL)
-                                .text_color(tokens.muted_foreground)
-                                .child(previous.len().to_string()),
-                        )
-                    })
-                    .child(
-                        icon("icons/chevron-down.svg")
-                            .with_size(px(16.))
+                keyboard_button(
+                    row(colors).id("details-previous-agents").cursor_pointer().hover(|style| style.bg(colors.hover)),
+                    colors,
+                )
+                .child(icon("icons/bot.svg").with_size(px(16.)).text_color(tokens.muted_foreground))
+                .child(div().flex_1().min_w_0().truncate().child("Previous agents"))
+                .when(!expanded, |el| {
+                    el.child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .font_weight(gpui_kit::FontWeight::NORMAL)
                             .text_color(tokens.muted_foreground)
-                            .when(!expanded, |icon| icon.rotate(gpui_kit::radians(-std::f32::consts::FRAC_PI_2))),
+                            .child(previous.len().to_string()),
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.lineage_expanded =
-                            (this.lineage_expanded.as_ref() != Some(&thread_id)).then(|| thread_id.clone());
-                        cx.notify();
-                    })),
+                })
+                .child(
+                    icon("icons/chevron-down.svg")
+                        .with_size(px(16.))
+                        .text_color(tokens.muted_foreground)
+                        .when(!expanded, |icon| icon.rotate(gpui_kit::radians(-std::f32::consts::FRAC_PI_2))),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.lineage_expanded =
+                        (this.lineage_expanded.as_ref() != Some(&thread_id)).then(|| thread_id.clone());
+                    cx.notify();
+                })),
             );
             if expanded {
-                for child in previous {
-                    section = section.child(self.relationship_row(child, "icons/bot.svg", false, tokens, colors, cx));
-                    rows += 1;
+                for relative in previous {
+                    let (row, row_height) = self.lineage_row(relative, None, tokens, colors, cx);
+                    section = section.child(row);
+                    height += row_height;
                 }
             }
         }
         Some(Section {
-            height: rows as f32 * ROW_HEIGHT + if show_heading { HEADING_HEIGHT } else { 0. },
+            height: height + if show_heading { HEADING_HEIGHT } else { 0. },
             element: section.into_any_element(),
             min_density: Density::Full,
         })
+    }
+
+    /// One lineage row and its height: a workflow with its members, the merge-back target's
+    /// split row, or a plain related thread.
+    fn lineage_row(
+        &self,
+        relative: &Relative,
+        merge: Option<&MergeBack>,
+        tokens: &Tokens,
+        colors: &CardColors,
+        cx: &mut Context<Self>,
+    ) -> (AnyElement, f32) {
+        if let Some(workflow) = &relative.workflow {
+            return self.workflow_row(relative, workflow, tokens, colors, cx);
+        }
+        let element = match merge.filter(|merge| merge.target_thread_id == relative.thread_id) {
+            Some(merge) => self.merge_row(relative, merge, tokens, colors, cx),
+            None => self.relationship_row(relative, tokens, colors, cx).into_any_element(),
+        };
+        (element, ROW_HEIGHT)
     }
 
     /// `ThreadRelationshipsControl`'s Side chats: the open thread's side chats, which open in
@@ -1430,11 +1450,9 @@ impl Workspace {
                 0 => "Side chats".into(),
                 running => format!("Side chats · {running} running").into(),
             };
-        let section = v_flex().child(section_heading(heading, tokens)).children(
-            side_chats
-                .iter()
-                .map(|row| self.relationship_row(row, "icons/messages-square.svg", true, tokens, colors, cx)),
-        );
+        let section = v_flex()
+            .child(section_heading(heading, tokens))
+            .children(side_chats.iter().map(|row| self.relationship_row(row, tokens, colors, cx)));
         Some(Section {
             height: side_chats.len() as f32 * ROW_HEIGHT + HEADING_HEIGHT,
             element: section.into_any_element(),
@@ -1442,19 +1460,29 @@ impl Workspace {
         })
     }
 
-    /// One related thread; a running subagent's row shows Stop on hover.
+    /// Opens a related thread on the open thread's environment; a side chat opens in the side
+    /// chat panel.
+    fn open_relative(&mut self, thread_id: String, kind: Kind, window: &mut Window, cx: &mut Context<Self>) {
+        if kind == Kind::SideChat {
+            self.open_surface(super::right_panel::Surface::SideChat(thread_id), window, cx);
+        } else if let Some(Target::Thread { env, .. }) = self.target.clone() {
+            self.select_thread_in(env, thread_id, window, cx);
+        }
+    }
+
+    /// One related thread; a running subagent's row shows Stop on hover. Rows other than
+    /// subagents carry their status and say what a click opens.
     fn relationship_row(
         &self,
         relative: &Relative,
-        path: &'static str,
-        side_chat: bool,
         tokens: &Tokens,
         colors: &CardColors,
         cx: &mut Context<Self>,
     ) -> gpui_kit::Stateful<gpui_kit::Div> {
-        let thread_id = relative.thread_id.clone();
+        let (thread_id, kind) = (relative.thread_id.clone(), relative.kind);
         let group: SharedString = format!("details-lineage-{thread_id}").into();
         let stopping = self.lineage.stopping.as_deref() == Some(thread_id.as_str());
+        let ring = super::chat::focus_ring(tokens);
         let stop = relative.stop.clone().map(|stop| {
             let (thread_id, title) = (thread_id.clone(), relative.title.clone());
             let busy = self.lineage.stopping.is_some();
@@ -1469,7 +1497,9 @@ impl Workspace {
                 .justify_center()
                 .rounded(px(8.))
                 .text_color(tokens.error)
-                .when(!stopping, |el| el.invisible().group_hover(group.clone(), gpui_kit::Styled::visible))
+                .when(!stopping, |el| el.opacity(0.).group_hover(group.clone(), |style| style.opacity(1.)))
+                .tab_index(0)
+                .focus_visible(move |style| style.opacity(1.).shadow(vec![ring]))
                 .when(!busy, |el| el.cursor_pointer().hover(|s| s.bg(tokens.error.opacity(0.1))))
                 .when(busy && !stopping, |el| el.opacity(0.5))
                 .child(if stopping {
@@ -1484,32 +1514,349 @@ impl Workspace {
                 }))
         });
         let has_stop = stop.is_some();
-        row(colors)
-            .id(ElementId::Name(group.clone()))
-            .group(group)
-            .relative()
-            .cursor_pointer()
-            .hover(|style| style.bg(colors.hover))
-            .child(icon(path).with_size(px(16.)).text_color(tokens.muted_foreground))
+        let agent = kind == Kind::Subagent;
+        let failed = matches!(relative.status.as_deref(), Some("failed" | "error"));
+        let status = (!agent).then(|| {
+            div()
+                .flex_none()
+                .text_size(px(11.))
+                .font_weight(gpui_kit::FontWeight::NORMAL)
+                .text_color(if failed { tokens.error } else { tokens.muted_foreground })
+                .child(lineage::status_label(relative.status.as_deref()))
+        });
+        let tip = (!agent).then(|| {
+            let hint: SharedString = format!("Open {} in this chat", kind.label().to_lowercase()).into();
+            lineage_tooltip(relative.title.clone(), hint)
+        });
+        keyboard_button(
+            row(colors)
+                .id(ElementId::Name(group.clone()))
+                .group(group)
+                .relative()
+                .cursor_pointer()
+                .hover(|style| style.bg(colors.hover)),
+            colors,
+        )
+        .child(icon(kind.icon()).with_size(px(16.)).text_color(tokens.muted_foreground))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_sm()
+                .line_height(px(16.))
+                .text_color(tokens.foreground.opacity(0.85))
+                .when(has_stop, |el| el.pr(px(24.)))
+                .child(relative.title.clone()),
+        )
+        .children(status)
+        .children(stop)
+        .when_some(tip, gpui_kit::StatefulInteractiveElement::tooltip)
+        .on_click(cx.listener(move |this, _, window, cx| this.open_relative(thread_id.clone(), kind, window, cx)))
+    }
+
+    /// The fork's source as a split row: open it, or Merge back into it
+    /// (`ThreadRelationshipsControl`'s merge-back target row).
+    fn merge_row(
+        &self,
+        relative: &Relative,
+        merge: &MergeBack,
+        tokens: &Tokens,
+        colors: &CardColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(Target::Thread { env, id }) = &self.target else { return div().into_any_element() };
+        let (thread_id, kind) = (relative.thread_id.clone(), relative.kind);
+        let group: SharedString = format!("details-lineage-merge-{thread_id}").into();
+        let busy = self.lineage.merging.as_deref() == Some(format!("{env}:{id}").as_str());
+        let can_operate = self.can_operate(env);
+        let enabled = can_operate && merge.run_id.is_some() && self.lineage.merging.is_none();
+        let merge_tip: SharedString = match (&merge.run_id, &merge.target_title) {
+            _ if !can_operate => NOT_OPERATE.into(),
+            (None, _) => "Complete a run in this fork before merging it back".into(),
+            (Some(_), Some(title)) => format!("Merge this conversation back into {title}").into(),
+            (Some(_), None) => "Merge this conversation back into its source".into(),
+        };
+        let hint: SharedString = format!("Open {} in this chat", kind.label().to_lowercase()).into();
+        let label = lineage::status_label(relative.status.as_deref());
+        split_row(group.clone(), colors, cx)
+            .child(
+                split_primary(format!("{group}-open"), colors, true, cx)
+                    .child(icon(kind.icon()).with_size(px(16.)).text_color(tokens.muted_foreground))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .line_height(px(16.))
+                            .text_color(tokens.foreground.opacity(0.85))
+                            .child(relative.title.clone()),
+                    )
+                    .tooltip(lineage_tooltip(relative.title.clone(), hint))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_relative(thread_id.clone(), kind, window, cx);
+                    })),
+            )
+            .child(split_hairline(group.clone(), colors))
+            .child(
+                split_secondary(format!("{group}-merge"), colors, enabled)
+                    .text_color(tokens.muted_foreground)
+                    .child(if busy {
+                        gpui_kit::component::spinner::Spinner::new().xsmall().into_any_element()
+                    } else {
+                        icon("icons/git-merge.svg").with_size(px(12.)).into_any_element()
+                    })
+                    .tooltip(move |window, cx| Tooltip::new(merge_tip.clone()).build(window, cx))
+                    .when(enabled, |el| el.on_click(cx.listener(|this, _, window, cx| this.merge_back(window, cx)))),
+            )
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_sm()
-                    .line_height(px(16.))
-                    .text_color(tokens.foreground.opacity(0.85))
-                    .when(has_stop, |el| el.pr(px(24.)))
-                    .child(relative.title.clone()),
+                    .flex_none()
+                    .pl(px(4.))
+                    .pr(px(10.))
+                    .text_size(px(11.))
+                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                    .text_color(tokens.muted_foreground)
+                    .child(label),
+            )
+            .into_any_element()
+    }
+
+    /// `ThreadLineageWorkflowRow`: the workflow opens its thread, Stop ends it, and the chevron
+    /// lists its members by phase.
+    fn workflow_row(
+        &self,
+        relative: &Relative,
+        workflow: &Workflow,
+        tokens: &Tokens,
+        colors: &CardColors,
+        cx: &mut Context<Self>,
+    ) -> (AnyElement, f32) {
+        let Some(Target::Thread { env, id }) = &self.target else { return (div().into_any_element(), 0.) };
+        let (thread_id, kind, title) = (relative.thread_id.clone(), relative.kind, relative.title.clone());
+        let key = lineage::row_key(env, id, &thread_id);
+        let expanded = self.lineage.workflows_open.contains(&key);
+        let group: SharedString = format!("details-lineage-workflow-{thread_id}").into();
+        let can_stop = workflow.stoppable && self.can_operate(env);
+        let stopping = self.lineage.stopping.as_deref() == Some(workflow.subagent_id.as_str());
+        let busy = self.lineage.stopping.is_some();
+        let ring = super::chat::focus_ring(tokens);
+        let stop = can_stop.then(|| {
+            let (subagent_id, error) = (workflow.subagent_id.clone(), tokens.error);
+            div()
+                .id(ElementId::Name(format!("{group}-stop").into()))
+                .absolute()
+                .right(px(36.))
+                .top(px((ROW_HEIGHT - 24.) / 2.))
+                .size(px(24.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .text_color(error)
+                .when(!stopping, |el| el.opacity(0.).group_hover(group.clone(), |style| style.opacity(1.)))
+                .tab_index(0)
+                .focus_visible(move |style| style.opacity(1.).shadow(vec![ring]))
+                .when(!busy, |el| el.cursor_pointer().hover(move |s| s.bg(error.opacity(0.1))))
+                .when(busy && !stopping, |el| el.opacity(0.5))
+                .child(if stopping {
+                    gpui_kit::component::spinner::Spinner::new().xsmall().into_any_element()
+                } else {
+                    div().size(px(9.)).rounded(px(1.5)).bg(error).into_any_element()
+                })
+                .tooltip(|window, cx| Tooltip::new("Stop entire workflow").build(window, cx))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.stop_workflow(subagent_id.clone(), window, cx);
+                }))
+        });
+        let toggle_key = key.clone();
+        let header = split_row(group.clone(), colors, cx)
+            .relative()
+            .child(
+                split_primary(format!("{group}-open"), colors, true, cx)
+                    .child(icon(kind.icon()).with_size(px(16.)).text_color(tokens.muted_foreground))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .line_height(px(16.))
+                            .text_color(tokens.foreground.opacity(0.85))
+                            .when(can_stop, |el| el.pr(px(28.)))
+                            .child(title),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_relative(thread_id.clone(), kind, window, cx);
+                    })),
             )
             .children(stop)
-            .on_click(cx.listener(move |this, _, window, cx| {
-                if side_chat {
-                    this.open_surface(super::right_panel::Surface::SideChat(thread_id.clone()), window, cx);
-                } else {
-                    this.select_thread(thread_id.clone(), window, cx);
+            .child(split_hairline(group.clone(), colors))
+            .child(
+                split_secondary(format!("{group}-toggle"), colors, true)
+                    .child(
+                        icon("icons/chevron-down.svg")
+                            .with_size(px(14.))
+                            .text_color(tokens.muted_foreground)
+                            .when(expanded, |icon| icon.rotate(gpui_kit::radians(std::f32::consts::PI))),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.lineage.workflows_open.remove(&toggle_key) {
+                            this.lineage.workflows_open.insert(toggle_key.clone());
+                        }
+                        cx.notify();
+                    })),
+            );
+        let mut height = ROW_HEIGHT;
+        let mut list = v_flex().child(header);
+        if expanded {
+            let mut members = v_flex().pl(px(26.));
+            for phase in &workflow.phases {
+                let open =
+                    self.lineage.phases_open.get(&(key.clone(), phase.index)).copied().unwrap_or(phase.running());
+                members = members.child(self.phase_header(&key, phase, open, tokens, cx));
+                height += ROW_HEIGHT;
+                if open {
+                    for member in &phase.members {
+                        members = members.child(self.member_row(&key, member, &workflow.driver, tokens, colors, cx));
+                        height += ROW_HEIGHT;
+                    }
                 }
+            }
+            for member in &workflow.unphased {
+                members = members.child(self.member_row(&key, member, &workflow.driver, tokens, colors, cx));
+                height += ROW_HEIGHT;
+            }
+            if workflow.phases.is_empty() && workflow.unphased.is_empty() {
+                members = members.child(
+                    div()
+                        .px(px(10.))
+                        .py(px(6.))
+                        .text_size(px(11.))
+                        .text_color(tokens.muted_foreground.opacity(0.7))
+                        .child("No agents yet"),
+                );
+                height += 28.;
+            }
+            list = list.child(members);
+        }
+        (list.into_any_element(), height)
+    }
+
+    /// `CollapsibleSectionHeader variant="panel"` for one workflow phase.
+    fn phase_header(
+        &self,
+        key: &str,
+        phase: &crate::workflow::Phase,
+        open: bool,
+        tokens: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::Stateful<gpui_kit::Div> {
+        let status = phase.status_label();
+        let running = phase.running();
+        let count = phase.members.len();
+        let agents = format!("{}/{count} {}", phase.settled, if count == 1 { "agent" } else { "agents" });
+        let elapsed = phase_elapsed(phase);
+        let ring = super::chat::focus_ring(tokens);
+        let toggle = (key.to_owned(), phase.index);
+        h_flex()
+            .id(ElementId::Name(format!("details-phase-{key}-{}", phase.index).into()))
+            .h(px(ROW_HEIGHT))
+            .w_full()
+            .flex_none()
+            .gap_2()
+            .pl(px(8.))
+            .pr(px(10.))
+            .rounded(px(6.))
+            .cursor_pointer()
+            .text_xs()
+            .font_weight(gpui_kit::FontWeight::MEDIUM)
+            .text_color(if running { tokens.foreground.opacity(0.8) } else { tokens.muted_foreground })
+            .tab_index(0)
+            .focus_visible(move |style| style.shadow(vec![ring]))
+            .child(div().min_w_0().truncate().child(phase.title.clone()))
+            .child(div().flex_1().min_w(px(8.)))
+            .when(status == "failed", |el| {
+                el.child(div().flex_none().text_size(px(10.)).text_color(tokens.error_foreground).child("Failed"))
+            })
+            .child(div().flex_none().text_size(px(11.)).font_weight(gpui_kit::FontWeight::NORMAL).child(agents))
+            .children(elapsed.map(|elapsed| {
+                div().flex_none().text_size(px(11.)).font_weight(gpui_kit::FontWeight::NORMAL).child(elapsed)
             }))
+            .child(
+                icon("icons/chevron-down.svg")
+                    .with_size(px(12.))
+                    .when(!open, |icon| icon.rotate(gpui_kit::radians(-std::f32::consts::FRAC_PI_2))),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.lineage.phases_open.insert(toggle.clone(), !open);
+                cx.notify();
+            }))
+    }
+
+    /// `WorkflowMemberRow`: one agent of a workflow, opening its thread when it has one.
+    fn member_row(
+        &self,
+        key: &str,
+        member: &crate::workflow::Member,
+        driver: &str,
+        tokens: &Tokens,
+        colors: &CardColors,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::Stateful<gpui_kit::Div> {
+        let child = member.child_thread_id.clone();
+        let hover = colors.hover;
+        let dot = match member.status.as_str() {
+            "pending" | "running" | "waiting" => tokens.info,
+            "failed" => tokens.error,
+            "completed" => tokens.success_foreground,
+            _ => tokens.muted_foreground.opacity(0.45),
+        };
+        let logo = match crate::assets::provider_icon(driver) {
+            Some((path, tint)) => icon(path).with_size(px(16.)).text_color(tint.unwrap_or(tokens.muted_foreground)),
+            None => icon("icons/bot.svg").with_size(px(16.)).text_color(tokens.muted_foreground),
+        };
+        let avatar = div().relative().size(px(16.)).flex_none().child(logo).child(
+            div()
+                .absolute()
+                .right(px(-4.))
+                .bottom(px(-4.))
+                .size(px(8.))
+                .rounded_full()
+                .border_2()
+                .border_color(colors.background)
+                .bg(dot),
+        );
+        let elapsed = member.started_ms.and_then(|start| {
+            let live = matches!(member.status.as_str(), "pending" | "running" | "waiting");
+            let end = member.completed_ms.or_else(|| live.then(super::sidebar::now_ms))?;
+            Some(crate::timeline::agent_elapsed(end.saturating_sub(start)))
+        });
+        let element = row(colors).id(ElementId::Name(format!("details-member-{key}-{}", member.id).into()));
+        let element = match child {
+            Some(_) => keyboard_button(element.cursor_pointer().hover(move |style| style.bg(hover)), colors),
+            None => element.opacity(0.64),
+        };
+        let hint: SharedString = format!("Open {} chat", member.title).into();
+        element
+            .child(avatar)
+            .child(div().flex_1().min_w_0().truncate().child(member.title.clone()))
+            .children(elapsed.map(|elapsed| {
+                div()
+                    .flex_none()
+                    .text_size(px(11.))
+                    .font_weight(gpui_kit::FontWeight::NORMAL)
+                    .text_color(tokens.muted_foreground)
+                    .child(elapsed)
+            }))
+            .tooltip(lineage_tooltip(member.title.clone().into(), hint))
+            .when_some(child, |el, child| {
+                el.on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_relative(child.clone(), Kind::Subagent, window, cx);
+                }))
+            })
     }
 
     /// `DelegatedFromRow`: the thread on a linked environment whose agent delegated this one.
@@ -1762,21 +2109,32 @@ fn keyboard_button(
 }
 
 /// `THREAD_DETAILS_PANEL_SPLIT_GROUP_CLASS`: the pair shares one hover fill and shows its hairline.
-fn split_row(id: &'static str, colors: &CardColors, _: &mut Context<Workspace>) -> gpui_kit::Stateful<gpui_kit::Div> {
-    let hover = colors.hover;
-    h_flex().id(id).group(id).h(px(ROW_HEIGHT)).w_full().flex_none().rounded(px(8.)).hover(move |style| style.bg(hover))
+fn split_row(
+    id: impl Into<SharedString>,
+    colors: &CardColors,
+    _: &mut Context<Workspace>,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
+    let (id, hover) = (id.into(), colors.hover);
+    h_flex()
+        .id(ElementId::Name(id.clone()))
+        .group(id)
+        .h(px(ROW_HEIGHT))
+        .w_full()
+        .flex_none()
+        .rounded(px(8.))
+        .hover(move |style| style.bg(hover))
 }
 
 /// The split's primary half; each half stacks its own fill over the group's.
 fn split_primary(
-    id: &'static str,
+    id: impl Into<SharedString>,
     colors: &CardColors,
     enabled: bool,
     _: &mut Context<Workspace>,
 ) -> gpui_kit::Stateful<gpui_kit::Div> {
     let hover = colors.hover;
     h_flex()
-        .id(id)
+        .id(ElementId::Name(id.into()))
         .flex_1()
         .min_w_0()
         .h_full()
@@ -1791,9 +2149,62 @@ fn split_primary(
 }
 
 /// The 1×16 `bg-border/65` hairline between the halves, shown while the pair is hovered.
-fn split_hairline(group: &'static str, colors: &CardColors) -> impl IntoElement {
+fn split_hairline(group: impl Into<SharedString>, colors: &CardColors) -> impl IntoElement {
     let line = colors.divider;
     div().w(px(1.)).h(px(16.)).flex_none().group_hover(group, move |style| style.bg(line))
+}
+
+/// The split's 32px secondary half (`part="secondary"`); a disabled one is dimmed and out of the
+/// tab order.
+fn split_secondary(
+    id: impl Into<SharedString>,
+    colors: &CardColors,
+    enabled: bool,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
+    let (hover, ring) = (colors.hover, colors.ring);
+    div()
+        .id(ElementId::Name(id.into()))
+        .w(px(32.))
+        .h_full()
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_r(px(8.))
+        .border_2()
+        .border_color(gpui_kit::transparent_black())
+        .when(enabled, |el| {
+            el.tab_index(0)
+                .cursor_pointer()
+                .hover(move |style| style.bg(hover))
+                .focus_visible(move |style| style.border_color(ring))
+        })
+        .when(!enabled, |el| el.opacity(0.64))
+}
+/// `LineageTooltipContent`: the full title, since the row truncates it, and what a click does.
+fn lineage_tooltip(title: SharedString, hint: SharedString) -> impl Fn(&mut Window, &mut App) -> gpui_kit::AnyView {
+    move |window, cx| {
+        let (title, hint) = (title.clone(), hint.clone());
+        Tooltip::element(move |_, cx| {
+            let muted = theme::tokens(cx).muted_foreground;
+            v_flex()
+                .child(div().font_weight(gpui_kit::FontWeight::MEDIUM).child(title.clone()))
+                .child(div().text_color(muted).child(hint.clone()))
+        })
+        .build(window, cx)
+    }
+}
+
+/// `phaseElapsed`: from the first member's start to the last one's end, or to now while the
+/// phase runs.
+fn phase_elapsed(phase: &crate::workflow::Phase) -> Option<String> {
+    let start = phase.members.iter().filter_map(|member| member.started_ms).min()?;
+    let end = if phase.running() {
+        super::sidebar::now_ms()
+    } else {
+        phase.members.iter().filter_map(|member| member.completed_ms).max()?
+    };
+    Some(crate::timeline::agent_elapsed(end.saturating_sub(start)))
 }
 
 /// `ThreadDetailsControl part="select"`: one trigger holding the row's label and its chevron.

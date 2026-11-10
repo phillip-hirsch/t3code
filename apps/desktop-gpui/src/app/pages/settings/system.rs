@@ -583,29 +583,7 @@ fn relative_label(iso: &str, now_ms: i64) -> String {
 
 /// `formatBytes` (`apps/web/src/lib/formatBytes.ts`).
 pub(super) fn format_bytes(value: f64) -> String {
-    if value.round() < 1024. {
-        return format!("{} B", value.round());
-    }
-    let scaled = |v: f64| {
-        format!(
-            "{v:.*}",
-            if v >= 100. {
-                0
-            } else if v >= 10. {
-                1
-            } else {
-                2
-            }
-        )
-    };
-    let units = ["KB", "MB", "GB", "TB"];
-    let mut next = value / 1024.;
-    let mut unit = 0;
-    while scaled(next).parse::<f64>().unwrap_or(0.) >= 1024. && unit < units.len() - 1 {
-        next /= 1024.;
-        unit += 1;
-    }
-    format!("{} {}", scaled(next), units[unit])
+    crate::user_message::format_bytes(value)
 }
 
 /// `AboutVersionTitle`: "Version" and the version, which copies itself.

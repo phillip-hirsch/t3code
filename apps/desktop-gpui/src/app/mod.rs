@@ -31,6 +31,7 @@ mod attachments;
 mod banners;
 mod changed_files;
 mod chat;
+mod citations;
 mod commands;
 mod compact_send;
 mod composer;
@@ -46,6 +47,7 @@ mod desktop;
 mod details;
 mod draft_picker;
 pub(crate) mod environments;
+mod external_links;
 mod fanout;
 mod files;
 mod find;
@@ -90,7 +92,9 @@ mod theme_editor;
 mod thread_menu;
 mod thread_menu_actions;
 mod thread_now;
+mod timeline_anchor;
 mod titlebar;
+mod user_message;
 mod visits;
 mod workflow;
 mod workspace_lookup;
@@ -213,6 +217,8 @@ pub struct Workspace {
     composer_height: f32,
     /// The transcript lane's width last frame; a change reflows its rows (see `render_body`).
     timeline_lane_width: std::cell::Cell<f32>,
+    /// A newly sent turn held near the top (see `timeline_anchor`); placed while rendering.
+    timeline_anchor: std::cell::RefCell<timeline_anchor::Anchor>,
     /// The question card's drafts, for the first pending question.
     question: Option<attachments::QuestionDraft>,
     /// Requests that arrived mid-typing, kept out of sight for now.
@@ -344,10 +350,12 @@ pub struct Workspace {
     queue: queue::QueueUi,
     now: thread_now::NowUi,
     markdown_images: markdown_images::ImageCache,
+    link_hover: external_links::LinkHoverState,
     entry_kinds: Arc<markdown_ui::EntryKinds>,
     workflow: workflow::WorkflowUi,
     setup: worktree_setup::SetupWatch,
     chat_menu: Option<markdown_ui::ChatMenu>,
+    citations: citations::CitationUi,
     requests: request_cards::RequestUi,
     subagents: subagents::SubagentUi,
     banners: banners::BannerUi,
@@ -456,6 +464,7 @@ impl Workspace {
             composer_ultrathink: Default::default(),
             composer_height: 0.,
             timeline_lane_width: std::cell::Cell::new(0.),
+            timeline_anchor: Default::default(),
             question: None,
             typing_guard: Default::default(),
             _typing_idle: None,
@@ -541,10 +550,12 @@ impl Workspace {
             queue: Default::default(),
             now: Default::default(),
             markdown_images: Default::default(),
+            link_hover: Default::default(),
             entry_kinds: Default::default(),
             workflow: Default::default(),
             setup: Default::default(),
             chat_menu: None,
+            citations: Default::default(),
             requests: Default::default(),
             subagents: Default::default(),
             banners: Default::default(),
@@ -906,6 +917,7 @@ impl Workspace {
         self.sync_subagent_tick(cx);
         self.sync_child_approvals(cx);
         self.sync_lineage_titles(cx);
+        self.sync_timeline_anchor(cx);
         let Some((range, count)) = timeline::changed_range(&self.rows, &new_rows) else { return };
         let total = new_rows.len();
         self.rows = Rc::from(new_rows);
@@ -921,6 +933,7 @@ impl Workspace {
         if self.open_projection().is_some() {
             self.restore_position(cx);
         }
+        self.reveal_pending_citation(cx);
     }
 
     /// Opens a listed thread on the environment it lives on.
@@ -1035,6 +1048,7 @@ impl Workspace {
         self.entry_kinds = Arc::default();
         self.details = inspector::Details::default();
         self._working_tick = None;
+        *self.timeline_anchor.get_mut() = Default::default();
         self.scroller.update(cx, |scroller, cx| scroller.reset(0, cx));
         self.recall_position();
     }
@@ -1204,6 +1218,7 @@ fn respond_value(thread_id: &str, request_id: &str, response: Value) -> Value {
 }
 
 fn draft_title(text: &str) -> String {
+    let text = crate::assistant_citations::to_plain_text(text);
     let line = text.lines().next().unwrap_or_default().trim();
     match line.char_indices().nth(60) {
         Some((end, _)) => format!("{}…", &line[..end]),
@@ -1350,6 +1365,7 @@ impl Render for Workspace {
                                         match self.target.clone() {
                                             Some(Target::Draft { project_id, .. }) => el
                                                 .child(self.render_draft_stage(&project_id, window, cx))
+                                                .children(self.render_citation_comment(cx))
                                                 .children(self.render_details_card(window, cx)),
                                             _ => el
                                                 .child(
@@ -1365,15 +1381,32 @@ impl Render for Workspace {
                                                                     gpui_kit::MouseButton::Left,
                                                                     |_, window, cx| window.blur(cx),
                                                                 )
+                                                                // The Cite button follows selections the text
+                                                                // views make, so it listens ahead of them.
+                                                                .capture_any_mouse_down(cx.listener(
+                                                                    |this, _: &gpui_kit::MouseDownEvent, _, cx| {
+                                                                        this.chat_mouse_down(cx);
+                                                                    },
+                                                                ))
+                                                                .capture_any_mouse_up(cx.listener(
+                                                                    |this, event: &gpui_kit::MouseUpEvent, window, cx| {
+                                                                        if event.button == gpui_kit::MouseButton::Left {
+                                                                            this.chat_mouse_up(event.position, window, cx);
+                                                                        }
+                                                                    },
+                                                                ))
                                                                 .child(self.render_body(window, cx)),
                                                         )
                                                         .child(self.render_floating_composer(window, cx)),
                                                 )
                                                 .children(self.render_find_bar(cx))
+                                                .children(self.render_cite_toolbar(cx))
+                                                .children(self.render_citation_comment(cx))
                                                 .children(self.render_details_card(window, cx)),
                                         }
                                     })
                                     .children(mini_player)
+                                    .children(self.render_link_hover(cx))
                                     .children(self.render_banner_lane(cx))
                                     .on_drop(cx.listener(|this, paths: &gpui_kit::ExternalPaths, window, cx| {
                                         this.drop_paths(paths, window, cx);

@@ -25,6 +25,8 @@ pub(super) struct PendingSend {
     text: SharedString,
     created_at: SharedString,
     queued: bool,
+    /// The sent attachments and context records, which the row shows until the thread does.
+    content: std::sync::Arc<crate::timeline::UserContent>,
 }
 
 impl PendingSend {
@@ -52,7 +54,7 @@ impl PendingSend {
         }
         Row::User {
             id: format!("optimistic:{}", self.message_id).into(),
-            text: self.text.clone(),
+            text: crate::user_message::without_bootstrap_prompt(&self.text).to_owned().into(),
             steer: None,
             grouped_with_previous: false,
             grouped_with_next: false,
@@ -60,6 +62,7 @@ impl PendingSend {
             created_at: self.created_at.clone(),
             revert: None,
             attribution: None,
+            content: self.content.clone(),
         }
     }
 }
@@ -321,6 +324,7 @@ impl Workspace {
                     text: command["text"].as_str().unwrap_or_default().to_owned().into(),
                     created_at: crate::timestamp::iso(crate::timestamp::now_ms()).unwrap_or_default().into(),
                     queued: (running || compacts) && command.get("deliveryIntent").is_none(),
+                    content: std::sync::Arc::new(crate::timeline::UserContent::parse(&command)),
                 });
                 ("orchestration.dispatchCommand", command, None, None)
             }
@@ -357,7 +361,9 @@ impl Workspace {
                     ))
                 });
                 let thread_id = self.terminals.take_draft_thread(&project_id).unwrap_or_else(new_id);
-                let mut initial = json!({"messageId": new_id(), "text": message_text, "attachments": attachments});
+                let launched_message = new_id();
+                let mut initial =
+                    json!({"messageId": launched_message, "text": message_text, "attachments": attachments});
                 if let Some(context) = context {
                     initial["context"] = context;
                 }
@@ -375,7 +381,7 @@ impl Workspace {
                     "initialMessage": initial,
                 });
                 background = intent != Intent::Foreground;
-                ("orchestration.launchThread", input, Some(thread_id), workspace.flatten())
+                ("orchestration.launchThread", input, Some((thread_id, launched_message)), workspace.flatten())
             }
         };
         let new_draft_after = intent == Intent::AndNewThread && matches!(origin, Target::Thread { .. });
@@ -383,7 +389,11 @@ impl Workspace {
         let sent_attachments = std::mem::take(&mut self.attachments);
         let sent_records = self.take_context_records();
         let pending_id = pending_send.as_ref().map(|send| send.message_id.clone());
+        let started = pending_send.as_ref().filter(|send| !send.queued).map(|send| send.message_id.clone());
         self.pending_sends.extend(pending_send);
+        if let Some(message_id) = started {
+            self.anchor_new_turn(message_id.into(), cx);
+        }
         self.sending = true;
         self.set_composer_text("", window, cx);
         self.release_typing_hold(false, window, cx);
@@ -453,12 +463,13 @@ impl Workspace {
                                 }
                             }
                             // Follow the new thread only from the draft that launched it.
-                            (Some(thread_id), false) if here => {
+                            (Some((thread_id, message_id)), false) if here => {
                                 // The draft is used up; the project's next draft starts fresh.
                                 this.draft_workspace = Default::default();
                                 // It launched on the draft's environment; the shell may not list it yet.
                                 let environment = origin.environment().clone();
                                 this.select_thread_in(environment, thread_id, window, cx);
+                                this.anchor_new_turn(message_id.into(), cx);
                             }
                             _ if new_draft_after && here => {
                                 if let Some(project_id) = project_id {
@@ -660,6 +671,7 @@ mod tests {
             text: "hi".into(),
             created_at: "now".into(),
             queued,
+            content: Default::default(),
         };
         let mut pending = vec![send("t", "m1", false), send("t", "m2", true), send("other", "m3", false)];
         let empty = projection(json!([]), json!([]));

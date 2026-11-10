@@ -315,7 +315,8 @@ impl Store {
 
 /// `stashEntrySnippet`: the prompt on one line, or what it carried.
 fn snippet(entry: &StashEntry) -> String {
-    let collapsed = entry.prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    let prompt = crate::assistant_citations::to_plain_text(&entry.prompt);
+    let collapsed = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
     if !collapsed.is_empty() {
         return match collapsed.char_indices().nth(SNIPPET_MAX_CHARS) {
             Some((at, _)) => format!("{}…", &collapsed[..at]),

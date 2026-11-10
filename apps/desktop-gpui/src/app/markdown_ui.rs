@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use super::Workspace;
+use crate::artifact_templates::{Kind as TemplateKind, Template};
 use crate::file_links;
 use crate::theme::Tokens;
 
@@ -35,7 +36,7 @@ pub(super) struct ChatMenu {
 
 impl Workspace {
     /// Opens `build`'s menu at `position` (window coordinates) until it dismisses.
-    fn open_chat_menu(
+    pub(super) fn open_chat_menu(
         &mut self,
         position: Point<Pixels>,
         window: &mut Window,
@@ -532,11 +533,11 @@ impl MarkdownPlugin for SkillChips {
         Some(MarkdownNode::new("t3-skill", name.clone()).text(label).markdown(format!("${name}")))
     }
 
-    fn render(&self, node: &MarkdownNode, _: &mut Window, _: &mut App) -> impl IntoElement {
+    fn render(&self, node: &MarkdownNode, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let name = node.data::<String>().cloned().unwrap_or_default();
         let workspace = self.workspace.clone();
-        h_flex()
-            .id(SharedString::from(format!("skill-chip:{name}")))
+        let tokens = crate::theme::tokens(cx);
+        super::chat::focusable(h_flex().id(SharedString::from(format!("skill-chip:{name}"))), tokens)
             .gap(px(3.))
             .rounded(px(4.))
             .font_weight(FontWeight::MEDIUM)
@@ -551,6 +552,52 @@ impl MarkdownPlugin for SkillChips {
     }
 }
 
+/// `AssistantCitationChip`: a citation link draws as its quote chip; a click opens the quote
+/// with Go to source. Copying keeps the citation's Markdown.
+pub(super) struct CitationChips {
+    pub workspace: WeakEntity<Workspace>,
+}
+
+impl MarkdownPlugin for CitationChips {
+    fn name(&self) -> &'static str {
+        "t3-citation"
+    }
+
+    fn parse(
+        &self,
+        node: &gpui_kit::component::text::markdown_ast::Node,
+        cx: &MarkdownParseContext<'_>,
+    ) -> Option<MarkdownNode> {
+        let gpui_kit::component::text::markdown_ast::Node::Link(link) = node else { return None };
+        let citation = crate::assistant_citations::parse_href(&link.url)?;
+        let label = citation.label();
+        let markdown = cx.node_source(node).map_or_else(|| citation.markdown(), str::to_owned);
+        Some(MarkdownNode::new("t3-citation", citation).text(label).markdown(markdown))
+    }
+
+    fn render(&self, node: &MarkdownNode, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let Some(citation) = node.data::<crate::assistant_citations::AssistantCitation>().cloned() else {
+            return div().into_any_element();
+        };
+        let workspace = self.workspace.clone();
+        let id = format!("citation-chip:{}:{}:{}", citation.message_id, citation.start, citation.end);
+        super::chat::focusable(h_flex().id(SharedString::from(id)), crate::theme::tokens(cx))
+            .max_w_full()
+            .gap(px(3.))
+            .rounded(px(4.))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(rgb(super::citations::CITATION_ACCENT))
+            .cursor_pointer()
+            .child(Icon::new(IconName::Quote).size(px(14.)).flex_none())
+            .child(div().min_w_0().truncate().hover(gpui_kit::Styled::underline).child(node.as_text().to_owned()))
+            .on_click(move |event, window, cx| {
+                let (citation, position) = (citation.clone(), event.position());
+                let _ = workspace.update(cx, |w, cx| w.open_citation_menu(citation, position, window, cx));
+            })
+            .into_any_element()
+    }
+}
+
 /// What a file chip opens: the path as written (with any position) and the path its icon reads.
 struct FileChip {
     path: String,
@@ -562,7 +609,7 @@ struct FileChip {
 }
 
 /// The text of `nodes` and everything inside them (`nodeToPlainText`).
-fn link_text(nodes: &[gpui_kit::component::text::markdown_ast::Node]) -> String {
+pub(super) fn link_text(nodes: &[gpui_kit::component::text::markdown_ast::Node]) -> String {
     use gpui_kit::component::text::markdown_ast::Node;
     nodes
         .iter()
@@ -751,55 +798,61 @@ impl MarkdownPlugin for FileChips {
         } else {
             Icon::empty().path(asset).text_color(icon_color)
         };
-        // `documentChipKindForFileName`: documents take their kind's ink, everything else `mention`.
-        let ink = match asset.rsplit('/').next().unwrap_or_default() {
-            "t3-file-icon-pdf.svg" => rgb(0xd55755),
-            "t3-file-icon-word.svg" => rgb(0x368bd3),
-            "t3-file-icon-spreadsheet.svg" => rgb(0x449c56),
-            "t3-file-icon-slides.svg" => rgb(0xc26e27),
-            "t3-file-icon-epub.svg" => rgb(0x8871de),
-            _ => rgb(0x0096af),
-        };
+        let ink = document_ink(asset).unwrap_or_else(|| rgb(0x0096af));
         let (path, line) = (chip.path.clone(), chip.line);
         let (open, menu) = (self.workspace.clone(), self.workspace.clone());
         let menu_path = path.clone();
         let tooltip: SharedString = path.clone().into();
-        let element = h_flex()
-            .id(SharedString::from(format!("file-chip:{path}")))
-            .max_w_full()
-            .gap(px(3.))
-            .rounded(px(4.))
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(ink)
-            .cursor_pointer()
-            .child(icon.size(px(14.)).flex_none())
-            .child(div().min_w_0().truncate().hover(gpui_kit::Styled::underline).child(chip.label.clone()))
-            .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx))
-            .on_click(move |event, window, cx| {
-                let editor = event.modifiers().secondary(cx);
-                let _ = open.update(cx, |w, cx| w.open_file_chip(&path, line, editor, window, cx));
-            })
-            .on_mouse_down(gpui_kit::MouseButton::Right, move |event, window, cx| {
-                cx.stop_propagation();
-                let position = event.position;
-                let _ = menu.update(cx, |w, cx| {
-                    let target = file_links::resolve_target(&menu_path, w.git_cwd().as_deref());
-                    if let Some(target) = target {
-                        w.with_workspace_match(&menu_path, target, window, cx, move |w, target, window, cx| {
-                            w.open_file_menu(target, position, window, cx);
-                        });
-                    }
-                });
+        let element = super::chat::focusable(
+            h_flex().id(SharedString::from(format!("file-chip:{path}"))),
+            crate::theme::tokens(cx),
+        )
+        .max_w_full()
+        .gap(px(3.))
+        .rounded(px(4.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(ink)
+        .cursor_pointer()
+        .child(icon.size(px(14.)).flex_none())
+        .child(div().min_w_0().truncate().hover(gpui_kit::Styled::underline).child(chip.label.clone()))
+        .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx))
+        .on_click(move |event, window, cx| {
+            let editor = event.modifiers().secondary(cx);
+            let _ = open.update(cx, |w, cx| w.open_file_chip(&path, line, editor, window, cx));
+        })
+        .on_mouse_down(gpui_kit::MouseButton::Right, move |event, window, cx| {
+            cx.stop_propagation();
+            let position = event.position;
+            let _ = menu.update(cx, |w, cx| {
+                let target = file_links::resolve_target(&menu_path, w.git_cwd().as_deref());
+                if let Some(target) = target {
+                    w.with_workspace_match(&menu_path, target, window, cx, move |w, target, window, cx| {
+                        w.open_file_menu(target, position, window, cx);
+                    });
+                }
             });
+        });
         // The link's text flows before the chip as plain prose; only the chip opens the file.
         if chip.after_text { element.ml(px(4.)).into_any_element() } else { element.into_any_element() }
     }
 }
 
+/// `documentChipKindForFileName`: a document's kind ink for its icon asset, `None` for others.
+pub(super) fn document_ink(asset: &str) -> Option<gpui_kit::Rgba> {
+    Some(match asset.rsplit('/').next().unwrap_or_default() {
+        "t3-file-icon-pdf.svg" => rgb(0xd55755),
+        "t3-file-icon-word.svg" => rgb(0x368bd3),
+        "t3-file-icon-spreadsheet.svg" => rgb(0x449c56),
+        "t3-file-icon-slides.svg" => rgb(0xc26e27),
+        "t3-file-icon-epub.svg" => rgb(0x8871de),
+        _ => return None,
+    })
+}
+
 impl Workspace {
     /// `handleOpenInFilePreview`: a file in the workspace, or a host file or folder outside it,
     /// opens in the thread's panel; the platform modifier, or host media, opens the preferred editor.
-    fn open_file_chip(
+    pub(super) fn open_file_chip(
         &mut self,
         path: &str,
         line: Option<u32>,
@@ -860,50 +913,63 @@ impl MarkdownPlugin for ThreadChips {
 
     fn render(&self, node: &MarkdownNode, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let Some(chip) = node.data::<ThreadChip>() else { return div().into_any_element() };
-        let Some(workspace) = self.workspace.upgrade() else { return div().into_any_element() };
-        let tokens = *crate::theme::tokens(cx);
-        let w = workspace.read(cx);
-        let message_environment = w.active_environment().cloned();
-        let thread = resolve_thread_link(&chip.link, message_environment.as_deref(), &w.shell.threads);
-        let id = SharedString::from(format!(
-            "thread-chip:{}:{}",
-            chip.link.environment_id.as_deref().unwrap_or_default(),
-            chip.link.thread_id
-        ));
-        let row = h_flex().id(id).max_w_full().gap(px(3.)).rounded(px(4.)).font_weight(FontWeight::MEDIUM);
-        let Some(thread) = thread else {
-            let unknown = crate::thread_links::unknown_label(&chip.link, message_environment.as_deref());
-            let label: SharedString = chip.label.clone().map_or_else(|| unknown.into(), Into::into);
-            return row
-                .child(Icon::new(IconName::CircleDashed).size(px(14.)).flex_none())
-                .child(div().min_w_0().truncate().child(label))
-                .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(unknown).build(window, cx))
-                .into_any_element();
-        };
-        let project =
-            w.shell.projects.iter().find(|p| p.id == thread.project_id && p.environment_id == thread.environment_id);
-        let icon = match project {
-            Some(project) => super::sidebar::project_icon(project, &tokens, false, 14., w.favicon(project)),
-            None => Icon::new(IconName::MessagesSquare).size(px(14.)).flex_none().into_any_element(),
-        };
-        let title = thread.title.trim();
-        let title: SharedString = if title.is_empty() {
-            chip.label.clone().unwrap_or_else(|| "Untitled thread".to_owned()).into()
-        } else {
-            title.to_owned().into()
-        };
-        let (environment, thread_id) = (thread.environment_id.clone(), thread.id.clone());
-        let open = self.workspace.clone();
-        row.text_color(rgb(0x009c96))
-            .cursor_pointer()
-            .child(div().flex_none().child(icon))
-            .child(div().min_w_0().truncate().hover(gpui_kit::Styled::underline).child(title))
-            .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Open thread").build(window, cx))
-            .on_click(move |_, window, cx| {
-                let _ = open.update(cx, |w, cx| w.select_thread_in(environment.clone(), thread_id.clone(), window, cx));
-            })
-            .into_any_element()
+        thread_chip(&chip.link, chip.label.clone(), &self.workspace, cx)
     }
+}
+
+/// `MarkdownThreadLink` and `ThreadContextChip`: the thread's project icon and title, which
+/// opens it; a thread not here draws dashed with why.
+pub(super) fn thread_chip(
+    link: &crate::thread_links::ThreadLink,
+    label: Option<String>,
+    workspace: &WeakEntity<Workspace>,
+    cx: &App,
+) -> AnyElement {
+    let chip = ThreadChip { link: link.clone(), label };
+    let Some(workspace) = workspace.upgrade() else { return div().into_any_element() };
+    let tokens = *crate::theme::tokens(cx);
+    let w = workspace.read(cx);
+    let message_environment = w.active_environment().cloned();
+    let thread = resolve_thread_link(&chip.link, message_environment.as_deref(), &w.shell.threads);
+    let id = SharedString::from(format!(
+        "thread-chip:{}:{}",
+        chip.link.environment_id.as_deref().unwrap_or_default(),
+        chip.link.thread_id
+    ));
+    let row = h_flex().id(id).max_w_full().gap(px(3.)).rounded(px(4.)).font_weight(FontWeight::MEDIUM);
+    let Some(thread) = thread else {
+        let unknown = crate::thread_links::unknown_label(&chip.link, message_environment.as_deref());
+        let label: SharedString = chip.label.clone().map_or_else(|| unknown.into(), Into::into);
+        return row
+            .child(Icon::new(IconName::CircleDashed).size(px(14.)).flex_none())
+            .child(div().min_w_0().truncate().child(label))
+            .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(unknown).build(window, cx))
+            .into_any_element();
+    };
+    let project =
+        w.shell.projects.iter().find(|p| p.id == thread.project_id && p.environment_id == thread.environment_id);
+    let icon = match project {
+        Some(project) => super::sidebar::project_icon(project, &tokens, false, 14., w.favicon(project)),
+        None => Icon::new(IconName::MessagesSquare).size(px(14.)).flex_none().into_any_element(),
+    };
+    let title = thread.title.trim();
+    let title: SharedString = if title.is_empty() {
+        chip.label.clone().unwrap_or_else(|| "Untitled thread".to_owned()).into()
+    } else {
+        title.to_owned().into()
+    };
+    let (environment, thread_id) = (thread.environment_id.clone(), thread.id.clone());
+    let open = workspace.downgrade();
+    super::chat::focusable(row, &tokens)
+        .text_color(rgb(0x009c96))
+        .cursor_pointer()
+        .child(div().flex_none().child(icon))
+        .child(div().min_w_0().truncate().hover(gpui_kit::Styled::underline).child(title))
+        .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Open thread").build(window, cx))
+        .on_click(move |_, window, cx| {
+            let _ = open.update(cx, |w, cx| w.select_thread_in(environment.clone(), thread_id.clone(), window, cx));
+        })
+        .into_any_element()
 }
 
 /// Where a chat link to a thread opens: the thread's environment and id, as [`ThreadChips`]
@@ -1066,6 +1132,191 @@ pub(super) fn table_actions(
 
 /// `useCopyToClipboard({ timeout: 1200 })`.
 const TABLE_COPIED_FOR: std::time::Duration = std::time::Duration::from_millis(1200);
+
+/// `CodexArtifactTemplateCard`: a reply's `::artifact-template` line draws as a card with the
+/// template kind's artwork, its name and kind, and Use template, which drafts the template's
+/// prompt into the composer.
+pub(super) struct ArtifactTemplates {
+    pub workspace: WeakEntity<Workspace>,
+    /// The message the cards are in, which picks the composer Use template writes to.
+    pub key: SharedString,
+    /// Whether Use template shows (`onUseArtifactTemplate`): in replies, not in prompts.
+    pub usable: bool,
+}
+
+impl MarkdownPlugin for ArtifactTemplates {
+    fn is_block(&self) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "t3-artifact-template"
+    }
+
+    fn parse(
+        &self,
+        node: &gpui_kit::component::text::markdown_ast::Node,
+        cx: &MarkdownParseContext<'_>,
+    ) -> Option<MarkdownNode> {
+        let gpui_kit::component::text::markdown_ast::Node::Paragraph(_) = node else { return None };
+        let templates = crate::artifact_templates::parse_paragraph(cx.node_source(node)?)?;
+        let text = templates.iter().map(Template::copy_text).collect::<Vec<_>>().join("\n\n");
+        let label = templates.iter().map(|t| format!("{} template", t.display_name)).collect::<Vec<_>>().join(", ");
+        Some(
+            MarkdownNode::new("t3-artifact-template", templates)
+                .text(text.clone())
+                .markdown(text)
+                .accessibility_label(label),
+        )
+    }
+
+    fn render(&self, node: &MarkdownNode, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let t = crate::theme::tokens(cx);
+        let at = node.source_range().map_or(0, |range| range.start);
+        let templates = node.data::<Vec<Template>>().cloned().unwrap_or_default();
+        v_flex().w_full().min_w_0().gap(gpui_kit::rems(0.65)).children(templates.into_iter().enumerate().map(
+            |(ix, template)| {
+                let id = SharedString::from(format!("artifact-template:{}:{at}:{ix}", self.key));
+                artifact_template_card(id, template, self.usable.then(|| self.workspace.clone()), &self.key, t)
+            },
+        ))
+    }
+}
+
+/// `ARTIFACT_TEMPLATE_ICON_BY_KIND`.
+fn artifact_template_icon(kind: TemplateKind) -> IconName {
+    match kind {
+        TemplateKind::Document | TemplateKind::GoogleDocs => IconName::FileText,
+        TemplateKind::Presentation | TemplateKind::GoogleSlides => IconName::Presentation,
+        TemplateKind::Spreadsheet | TemplateKind::GoogleSheets => IconName::FileSpreadsheet,
+        TemplateKind::Site => IconName::Globe,
+        TemplateKind::Image => IconName::Image,
+        TemplateKind::Email => IconName::Mail,
+        TemplateKind::Slack => IconName::MessageSquare,
+    }
+}
+
+fn artifact_template_card(
+    id: SharedString,
+    template: Template,
+    workspace: Option<WeakEntity<Workspace>>,
+    key: &SharedString,
+    t: &Tokens,
+) -> AnyElement {
+    let shadow = vec![gpui_kit::BoxShadow::new(px(0.), px(1.), gpui_kit::hsla(0., 0., 0., 0.05)).blur_radius(px(2.))];
+    let artwork = div()
+        .relative()
+        .size(px(36.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(8.))
+        .border_1()
+        .border_color(Hsla { a: t.border.a * 0.7, ..t.border })
+        .bg(t.background)
+        .text_color(t.muted_foreground)
+        .shadow(shadow.clone())
+        .child(Icon::new(artifact_template_icon(template.kind)).size(px(20.)))
+        .child(
+            div()
+                .absolute()
+                .right(px(-4.))
+                .bottom(px(-4.))
+                .size(px(16.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .border_1()
+                .border_color(t.background)
+                .bg(t.primary)
+                .text_color(t.primary_foreground)
+                .shadow(shadow.clone())
+                .child(Icon::new(IconName::Sparkles).size(px(10.))),
+        );
+    let identity = v_flex()
+        .min_w_0()
+        .child(
+            div()
+                .truncate()
+                .text_sm()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(t.foreground)
+                .child(template.display_name.clone()),
+        )
+        .child(div().text_xs().text_color(t.muted_foreground).child(template.kind.label()));
+    let use_button = workspace.map(|workspace| {
+        let key = key.clone();
+        gpui_kit::component::button::Button::new(SharedString::from(format!("{id}:use")))
+            .outline()
+            .small()
+            .flex_none()
+            .h(px(t.breakpoint.pick(32., 28.)))
+            .px(px(9.))
+            .rounded(px(8.))
+            .border_color(t.input)
+            .bg(if t.dark { Hsla { a: t.input.a * 0.32, ..t.input } } else { t.popover })
+            .text_sm()
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(t.foreground)
+            .label("Use template")
+            .on_click(move |_, window, cx| {
+                let _ = workspace.update(cx, |w, cx| w.use_artifact_template(&key, &template, window, cx));
+            })
+    });
+    h_flex()
+        .id(id)
+        .w_full()
+        .min_w_0()
+        .gap(px(12.))
+        .px(px(12.))
+        .py(px(10.))
+        .rounded(px(12.))
+        .border_1()
+        .border_color(Hsla { a: t.border.a * 0.7, ..t.border })
+        .bg(Hsla { a: t.card.a * 0.6, ..t.card })
+        .text_color(t.foreground)
+        .shadow(shadow)
+        .child(h_flex().flex_1().min_w_0().gap(px(12.)).child(artwork).child(identity))
+        .children(use_button)
+        .into_any_element()
+}
+
+impl Workspace {
+    /// `insertArtifactTemplate`: the template's prompt goes at the end of the composer of the
+    /// chat its reply is in, after a space, unless the draft already ends with it; the composer
+    /// takes focus.
+    fn use_artifact_template(&mut self, key: &str, template: &Template, window: &mut Window, cx: &mut Context<Self>) {
+        let side = self
+            .side_chat
+            .view
+            .as_ref()
+            .filter(|_| !self.rows.iter().any(|row| super::chat::shows_markdown(row, key)))
+            .filter(|side| side.rows.iter().any(|row| super::chat::shows_markdown(row, key)));
+        let composer = match side {
+            Some(side) => side.ready_composer().cloned(),
+            None => self.composer_takes_citations().then(|| self.composer.clone()),
+        };
+        let Some(composer) = composer else {
+            let notification =
+                Notification::error("The composer is busy; try again once it is ready.").title("Unable to add to chat");
+            window.push_notification(notification, cx);
+            return;
+        };
+        let draft = composer.read(cx).value().to_string();
+        if let Some(prompt) = template.prompt_to_append(&draft) {
+            composer.update(cx, |state, cx| {
+                let end = draft.len();
+                let leading = !draft.is_empty() && !draft.ends_with(char::is_whitespace);
+                state.set_selected_range(end..end, cx);
+                state.replace(format!("{}{prompt}", if leading { " " } else { "" }), window, cx);
+            });
+            self.sync_composer_empty(cx);
+        }
+        composer.update(cx, |state, cx| state.focus(window, cx));
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -2,6 +2,7 @@
 //! Usage), or the Settings modal on top, plus back/forward history over them.
 
 mod pull_request_detail;
+pub(super) use pull_request_detail::{avatar as pr_avatar, state_glyph as pr_state_glyph};
 mod pull_request_surface;
 mod pull_requests;
 pub(super) mod settings;

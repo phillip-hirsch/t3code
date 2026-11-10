@@ -285,9 +285,79 @@ own width, so the row could span the block only when the caller knew its width. 
 the actions at the block's left edge too, so the row can fill it. `src/text/node.rs`: the
 `actions` container in `CodeBlock::render`.
 
+**`<details>` is a disclosure.** The chat renders `<details>`/`<summary>` as an expandable
+disclosure (the web's `MarkdownDetails`): a summary row with a chevron that opens a panel of the
+Markdown inside, between hairlines, and the thread find opens a closed one to show a match. 0.9.0
+flattens the element's children into ordinary blocks, and CommonMark ends an HTML block at a blank
+line, so the open tag, the Markdown inside and `</details>` arrive as sibling blocks. The patch:
+
+- `src/text/format/details.rs` (new): `DetailsGrouper` pairs `<details>` and `</details>` tags
+  across a container's sibling blocks, as rehype-raw's re-parse does (nested, several in one HTML
+  block, a summary in a later HTML block, one never closed holding the rest of the document, as a
+  streamed reply reads); test `tags_are_found_whole_and_case_blind`.
+- `src/text/format/markdown.rs`: `block_children` runs the root's, blockquotes' and list items'
+  blocks through it; tests `details_tags_hold_the_markdown_blocks_between_them`,
+  `details_nest_close_and_open_within_one_html_block`,
+  `a_details_element_in_one_html_block_is_a_disclosure`,
+  `a_summary_in_its_own_html_block_still_labels_the_disclosure`.
+- `src/text/format/html.rs`: a `details` arm and `parse_details`, the first `<summary>` as inline
+  text and the rest as blocks.
+- `src/text/node.rs`: `BlockNode::Details` (summary, children, the `open` attribute, span) in every
+  traversal; `render_details` draws it, the row keyboard-focusable with a focus ring;
+  `Disclosures`, the open state the reader toggled, keyed by the disclosure's source start so it
+  survives streamed re-parses, reached through `NodeContext::disclosures`.
+- `src/text/state.rs`: `TextViewState` owns the `Disclosures`; `reveal_range` opens every
+  disclosure whose panel holds the revealed text (the web's `beforematch`); test
+  `revealing_text_in_a_closed_disclosure_opens_it`.
+- `src/text/range_highlight.rs`, `src/text/stream_fade.rs`: the summary is a text leaf and the
+  panel's text stays in the rendered text while closed, so find counts it; the index records each
+  panel's range for `reveal_range`.
+
+**Links can drop their underline.** The chat's links show by color alone (`.chat-markdown a {
+text-decoration: none }`); 0.9.0 always draws a hairline under every link. The patch adds an
+opt-in flag; other views keep the underline. Files:
+
+- `src/text/style.rs`: `TextViewStyle::link_underline`, `with_link_underline`.
+- `src/text/text_view.rs`: `TextView::link_underline`, applied to the frame's style.
+- `src/text/node.rs`: `link_underline`, read wherever a link mark is styled.
+
+gpui-component's `src/text/compat.rs` forwards `link_underline` from its `TextView`.
+
+**Links report hover.** The chat opens a pull request link's preview card, and shows any web
+link's URL in a tooltip, when the pointer rests on it (`PullRequestLinkPreview`). 0.9.0 tracks the
+hovered link only to set the cursor. The patch adds `TextView::on_link_hover`: the handler gets
+`Some(LinkHover)` (the URL and the line box of the link under the pointer, in window coordinates)
+when the pointer enters a link, and `None` when it leaves it. A link wrapped over lines, or led by
+an inline object, reports from each piece, so one event can carry a leave and an enter in either
+order; the app resolves them together. Files:
+
+- `src/text/text_view.rs`: `LinkHover`, `LinkHoverFn`, the `link_hover_handler` field and builder;
+  test `link_hover_reports_entering_and_leaving_a_link`.
+- `src/text/state.rs`: the handler, set each frame like the task toggle's.
+- `src/text/inline.rs`: the mouse-move listener reports changes, also when the pointer leaves the
+  text; `InlineState::reported_hover` keeps the last report across frames, so a repaint under a
+  still pointer reports nothing and a link drawn under the pointer reports on the first move;
+  `link_line_bounds`. `src/text/node.rs`: `set_leaf_key` initializes the new field.
+- `src/text/inline_object.rs`: an object inside a link reports its own bounds.
+
+gpui-component's `src/text/compat.rs` forwards `on_link_hover`, and `src/text/mod.rs` re-exports
+`LinkHover`.
+
+**A plugin object can lead a link.** The chat draws a host mark (the GitHub icon, a favicon, a
+globe) before a web link's text (`MarkdownExternalLinkContent`), and a click or right click on it
+is the link's. 0.9.0's inline plugins replace the node they claim. The patch adds
+`MarkdownNode::leading()`: for a claimed link, the converter places the object first with the
+link's mark, then converts the link as if no plugin claimed it. The object's text and Markdown stay
+empty, so it adds nothing to the text, find or copies. Files:
+
+- `src/text/markdown_ext.rs`: the `leading` flag and builder.
+- `src/text/format/markdown.rs`: the leading branch of `parse_paragraph`, `link_text_mark` (shared
+  with the `Node::Link` arm); test `a_leading_object_opens_the_link_whose_text_follows_it`.
+
 The crate's own tests need `--features test-support` and `include_str!` a `README.md` four levels
 above `src/text`, which this folder lacks: run them from a scratch copy laid out as
-`<dir>/crates/gpui-base` with a `<dir>/README.md`.
+`<dir>/crates/gpui-base` with a `<dir>/README.md`, with `[patch.crates-io]` pointing `gpui-pre` and
+`gpui-pre-linux` at the vendored copies (`--config 'patch.crates-io.gpui-pre.path="…"'`).
 
 ## gpui-component 0.9.0
 
@@ -383,12 +453,20 @@ gpui-base) adds `mixed`, exposed as `aria-checked="mixed"` like the web's mixed 
 `src/menu/dropdown_menu.rs` adds `DropdownMenuPopover::open`, passed to its `Popover` as
 `Popover::open` is, so a caller can hold the open state with `on_open_change`.
 
+**Text views pass link styling and hover through.** `src/text/compat.rs`: `TextView::link_underline`
+and `TextView::on_link_hover` forward to gpui-base's (see its "Links can drop their underline" and
+"Links report hover"); `src/text/mod.rs` re-exports `LinkHover`.
+
 **Soft breaks can render as line breaks.** `src/text/compat.rs`: `TextView::markdown_line_breaks`,
 passing through to gpui-base's (see its "Soft breaks can render as line breaks").
 
 **A thread's timeline reopens where it was left.** 0.9.0's `MessageScrollerState` scrolls only to
 a row's top. `src/message_scroller.rs`: `scroll_to_offset` scrolls to a row and an offset into
 it, the `logical_scroll_top` it reported.
+
+**A newly started turn anchors near the top.** The web reserves end space under a sent message
+so it can sit near the top while the reply streams in, which needs the rows' measured positions.
+`src/message_scroller.rs`: `bounds_for_item` and `viewport_bounds` pass the list's through.
 
 **A diff says which files are near the viewport, and pins the current file's header.** The web
 reads a large diff's patches as their headers come within 600px of the viewport, and its file

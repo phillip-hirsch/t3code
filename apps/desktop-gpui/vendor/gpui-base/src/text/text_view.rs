@@ -108,6 +108,16 @@ pub(crate) type ImageSourceFn = dyn Fn(&gpui::SharedUri) -> gpui::ImageSource + 
 
 pub(crate) type LinkClickHandlerFn =
     dyn Fn(&SharedString, &ClickEvent, &mut Window, &mut App) + Send + Sync;
+/// The link under the pointer: its destination, and the line box of the link
+/// text under the pointer, in window coordinates.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LinkHover {
+    pub url: SharedString,
+    pub bounds: Bounds<Pixels>,
+}
+
+/// The pointer entered a link (`Some`), or left the link it was on (`None`).
+pub(crate) type LinkHoverFn = dyn Fn(Option<LinkHover>, &mut Window, &mut App) + Send + Sync;
 /// A task checkbox's toggle: its list item's source offset and the state it asks for.
 pub(crate) type TaskToggleFn = dyn Fn(usize, bool, &mut Window, &mut App) + Send + Sync;
 
@@ -172,6 +182,7 @@ pub struct TextView {
     table_actions: Option<Arc<TableActionsFn>>,
     link_click_handler: Option<Arc<LinkClickHandlerFn>>,
     task_toggle_handler: Option<Arc<TaskToggleFn>>,
+    link_hover_handler: Option<Arc<LinkHoverFn>>,
     image_source: Option<Arc<ImageSourceFn>>,
     reveal_handler: Option<Rc<RevealHandlerFn>>,
     markdown_extensions: Arc<MarkdownExtensions>,
@@ -224,6 +235,7 @@ impl TextView {
             table_actions: None,
             link_click_handler: None,
             task_toggle_handler: None,
+            link_hover_handler: None,
             image_source: None,
             reveal_handler: None,
             markdown_extensions: Arc::default(),
@@ -253,6 +265,7 @@ impl TextView {
             table_actions: None,
             link_click_handler: None,
             task_toggle_handler: None,
+            link_hover_handler: None,
             image_source: None,
             reveal_handler: None,
             markdown_extensions: Arc::default(),
@@ -282,6 +295,7 @@ impl TextView {
             table_actions: None,
             link_click_handler: None,
             task_toggle_handler: None,
+            link_hover_handler: None,
             image_source: None,
             reveal_handler: None,
             markdown_extensions: Arc::default(),
@@ -462,6 +476,19 @@ impl TextView {
         F: Fn(&SharedString, &ClickEvent, &mut Window, &mut App) + Send + Sync + 'static,
     {
         self.link_click_handler = Some(Arc::new(handler));
+        self
+    }
+
+    /// Report the link under the pointer: `Some` when the pointer enters a
+    /// link's text (or moves to another link), `None` when it leaves it. A link
+    /// wrapped over several lines, or split around an inline object, reports
+    /// from each piece, so a move between pieces can report a leave and an
+    /// enter in the same event, in either order.
+    pub fn on_link_hover<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(Option<LinkHover>, &mut Window, &mut App) + Send + Sync + 'static,
+    {
+        self.link_hover_handler = Some(Arc::new(handler));
         self
     }
 
@@ -795,6 +822,7 @@ impl Element for TextView {
             state.table_actions = self.table_actions.clone();
             state.link_click_handler = self.link_click_handler.clone();
             state.task_toggle_handler = self.task_toggle_handler.clone();
+            state.link_hover_handler = self.link_hover_handler.clone();
             state.image_source = self.image_source.clone();
             state.set_markdown_extensions(self.markdown_extensions.clone(), cx);
             if let Some(motion) = &self.motion {
@@ -3443,6 +3471,60 @@ mod tests {
         assert!(clicks[1].1.is_middle_click());
         assert!(clicks[2].1.is_right_click());
         assert_eq!(cx.opened_url(), None);
+    }
+
+    #[gpui::test]
+    fn link_hover_reports_entering_and_leaving_a_link(cx: &mut TestAppContext) {
+        use std::sync::{Arc, Mutex};
+
+        struct HoverRoot {
+            text_view: Entity<TextViewState>,
+            hovers: Arc<Mutex<Vec<Option<super::LinkHover>>>>,
+        }
+
+        impl Render for HoverRoot {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let hovers = self.hovers.clone();
+                div().w(px(400.)).child(
+                    TextView::new(&self.text_view).on_link_hover(move |hover, _, _| {
+                        hovers.lock().unwrap().push(hover);
+                    }),
+                )
+            }
+        }
+
+        cx.update(crate::init);
+        let hovers = Arc::new(Mutex::new(Vec::new()));
+        let captured = hovers.clone();
+        let (_, cx) = cx.add_window_view(move |_, cx| HoverRoot {
+            text_view: cx.new(|cx| {
+                TextViewState::markdown("[example](https://example.com) and plain words", cx)
+            }),
+            hovers,
+        });
+        let cx: &mut VisualTestContext = cx;
+        let mut move_to = |x: f32, y: f32| {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            cx.simulate_mouse_move(point(px(x), px(y)), None, Modifiers::default());
+        };
+        move_to(10., 10.);
+        move_to(14., 10.);
+        move_to(300., 10.);
+        move_to(10., 10.);
+        move_to(10., 300.);
+        let hovers = captured.lock().unwrap();
+        let urls: Vec<_> = hovers
+            .iter()
+            .map(|hover| hover.as_ref().map(|hover| hover.url.to_string()))
+            .collect();
+        let link = Some("https://example.com".to_owned());
+        // A move within the link reports nothing; off it, by text or by leaving the view, reports once.
+        assert_eq!(urls, [link.clone(), None, link, None]);
+        let bounds = hovers[0].as_ref().unwrap().bounds;
+        assert!(bounds.left() <= px(10.) && bounds.right() > px(14.) && bounds.right() < px(300.));
+        assert!(bounds.top() <= px(10.) && bounds.bottom() > px(10.));
     }
 
     #[gpui::test]

@@ -24,7 +24,7 @@ use gpui_kit::{
 use gpui_kit::assets::IconName;
 
 use super::side_chat::ChatPane;
-use super::{Target, Workspace, message_actions};
+use super::{Target, Workspace, message_actions, timeline_anchor};
 use crate::theme::{self, Tokens};
 use crate::timeline::{self, DetailEntry, Row, Steer, WorkRow, WorkRowKind};
 use crate::work_log::{self, Activity, Entry, Status, WorkIcon};
@@ -38,9 +38,12 @@ const GUEST: u32 = 0xe12afb;
 const COLLAPSE_CHARS: usize = 600;
 const COLLAPSE_LINES: usize = 8;
 
-/// `shouldCollapseUserMessage`; it stops counting at the limits.
+/// `shouldCollapseUserMessage`, measuring the text as it reads: links and citations as their labels.
 pub(super) fn should_collapse(text: &str) -> bool {
-    text.chars().nth(COLLAPSE_CHARS).is_some() || text.lines().nth(COLLAPSE_LINES).is_some()
+    let visible = crate::assistant_citations::visible_prompt_text(text);
+    !visible.trim().is_empty()
+        && (crate::assistant_citations::js_len(&visible) > COLLAPSE_CHARS
+            || visible.split('\n').nth(COLLAPSE_LINES).is_some())
 }
 
 impl Workspace {
@@ -84,6 +87,7 @@ impl Workspace {
                     self.scroller.update(cx, gpui_kit::component::message_scroller::MessageScrollerState::remeasure);
                 }
                 let composer = self.composer_height;
+                let (end_space, anchored) = self.settle_timeline_anchor(window, cx);
                 // `.chat-scroll-to-bottom` spans the lane, not the canvas, and clears the composer.
                 let pill_offset = lane.left - lane.right;
                 let mut jump_style = StyleRefinement::default().mb(px(composer - 6.));
@@ -108,11 +112,13 @@ impl Workspace {
                         .with_list_style(
                             StyleRefinement::default()
                                 .pt(px(16.))
-                                .pb(px(16. + composer))
+                                .pb(px(16. + composer + end_space))
                                 .pl(px(lane.left))
                                 .pr(px(lane.right)),
                         )
                         .with_row_style(StyleRefinement::default().pb(px(0.)))
+                        // Pinned to an anchored message, the list is at its live end.
+                        .jump_button(!anchored)
                         .with_jump_button_label("Scroll to end")
                         .with_jump_button_style(jump_style)
                         .with_jump_button_renderer(move |button| scroll_to_end_button(button, &t)),
@@ -153,6 +159,7 @@ impl Workspace {
                 side.scroller.update(cx, |scroller, cx| scroller.remeasure_items(index..index + 1, cx));
             }
             this.paint_find(&row_key, cx);
+            this.paint_citation(&row_key, cx);
         });
         self.markdown
             .0
@@ -193,6 +200,88 @@ impl Workspace {
     /// Keeps a once-a-second repaint alive while a "Working for …" row shows.
     pub(super) fn sync_working_tick(&mut self, rows: &[Row], cx: &mut Context<Self>) {
         sync_tick(&mut self._working_tick, rows, cx);
+    }
+
+    /// `anchorNewTurn`: sending returns the timeline to its end, and holds the thread's first
+    /// message near the top while its reply streams in.
+    pub(super) fn anchor_new_turn(&mut self, message_id: SharedString, cx: &mut Context<Self>) {
+        self.timeline_anchor.get_mut().arm(message_id);
+        self.scroller.update(cx, gpui_kit::component::message_scroller::MessageScrollerState::scroll_to_end);
+    }
+
+    /// Anchors a run another client started while the end was followed, and lets the anchor go
+    /// once its run works or finishes.
+    pub(super) fn sync_timeline_anchor(&mut self, cx: &mut Context<Self>) {
+        let Some(thread) = self.thread.as_ref() else { return };
+        let projection = thread.state.projection.as_ref();
+        let following = self.scroller.read(cx).is_following_tail();
+        let anchor = self.timeline_anchor.get_mut();
+        let run =
+            projection.and_then(|p| p.runs.iter().rev().find(|run| crate::model::is_active_run_status(&run.status)));
+        let observation = timeline_anchor::RunObservation {
+            thread: thread.id.clone(),
+            hydrated: projection.is_some(),
+            run: run.map(|run| run.id.clone()),
+        };
+        let queued = run.is_some_and(|run| run.status == "queued");
+        let message = run.and_then(|run| run.user_message_id.as_deref());
+        anchor.observe(observation, queued, message, following || anchor.is_pinned());
+        if projection.is_some_and(|projection| anchor.run_moved_on(projection)) {
+            let pinned = anchor.is_pinned();
+            anchor.release();
+            let last = self.rows.len().saturating_sub(1);
+            self.scroller.update(cx, |scroller, cx| {
+                scroller.remeasure_items(last..last + 1, cx);
+                if pinned {
+                    scroller.scroll_to_end(cx);
+                }
+            });
+        }
+    }
+
+    /// Places the anchored message from the list's last layout: the end space under the last
+    /// row, and whether the list is pinned to the message.
+    fn settle_timeline_anchor(&self, window: &mut Window, cx: &mut Context<Self>) -> (f32, bool) {
+        use timeline_anchor::{AnchorRow, Layout, Settle};
+        let mut anchor = self.timeline_anchor.borrow_mut();
+        let Some(message) = anchor.message() else { return (0., false) };
+        let row = timeline_anchor::anchor_row(&self.rows, &timeline_anchor::row_id(self.open_projection(), message));
+        let layout = match row {
+            AnchorRow::First(index) => {
+                let scroller = self.scroller.read(cx);
+                let bounds = |ix: usize| scroller.bounds_for_item(ix);
+                Some(Layout {
+                    index,
+                    rows: self.rows.len(),
+                    top: scroller.logical_scroll_top(),
+                    viewport_height: scroller.viewport_bounds().size.height,
+                    anchor_top: bounds(index).map(|b| b.top()),
+                    previous_height: index.checked_sub(1).and_then(bounds).map(|b| b.size.height),
+                    last_bottom: self.rows.len().checked_sub(1).and_then(bounds).map(|b| b.bottom()),
+                })
+            }
+            AnchorRow::Missing | AnchorRow::NotFirst => None,
+        };
+        let last = self.rows.len().saturating_sub(1);
+        match anchor.settle(row, layout) {
+            Settle::Idle => {}
+            Settle::Wait => window.request_animation_frame(),
+            Settle::Released { to_end } => self.scroller.update(cx, |scroller, cx| {
+                scroller.remeasure_items(last..last + 1, cx);
+                if to_end {
+                    scroller.scroll_to_end(cx);
+                }
+            }),
+            Settle::Placed { remeasure, pin } => self.scroller.update(cx, |scroller, cx| {
+                if remeasure {
+                    scroller.remeasure_items(last..last + 1, cx);
+                }
+                if let Some(pin) = pin {
+                    scroller.scroll_to_offset(pin, cx);
+                }
+            }),
+        }
+        (anchor.end_space(), anchor.is_pinned())
     }
 }
 
@@ -250,7 +339,7 @@ pub(super) fn markdown(
     t: &Tokens,
     cx: &mut App,
 ) -> AnyElement {
-    markdown_with(this, key, text, MarkdownKind::Assistant { streaming }, None, t, cx)
+    markdown_with(this, key, text, MarkdownKind::Assistant { streaming }, None, None, t, cx)
 }
 
 fn markdown_with(
@@ -259,6 +348,7 @@ fn markdown_with(
     text: &SharedString,
     kind: MarkdownKind,
     width: Option<f32>,
+    content: Option<&Arc<timeline::UserContent>>,
     t: &Tokens,
     cx: &mut App,
 ) -> AnyElement {
@@ -270,7 +360,7 @@ fn markdown_with(
         (workspace.markdown_state(key, text, cx), wrap, workspace.markdown_images.clone(), math, chips)
     }) {
         Ok((state, wrap, images, math, chips)) => {
-            markdown_view(&state, kind, key_for_view, wrap, width, this, chips, t)
+            markdown_view(&state, kind, key_for_view, wrap, width, this, chips, content, t)
                 .image_source(images.resolver())
                 .when(math, |view| view.plugin(super::markdown_ui::InlineMath).plugin(super::markdown_ui::DisplayMath))
                 .into_any_element()
@@ -738,6 +828,17 @@ fn alpha(color: Hsla, factor: f32) -> Hsla {
     Hsla { a: color.a * factor, ..color }
 }
 
+/// A `<button>`, or a `role="button"` row: a tab stop that Enter and Space click, with
+/// `focus-visible:ring-2 ring-inset ring-ring/70`, an inset shadow so nothing moves.
+pub(super) fn focusable(element: gpui_kit::Stateful<gpui_kit::Div>, t: &Tokens) -> gpui_kit::Stateful<gpui_kit::Div> {
+    let ring = focus_ring(t);
+    element.tab_index(0).focus_visible(move |style| style.shadow(vec![ring]))
+}
+
+pub(super) fn focus_ring(t: &Tokens) -> gpui_kit::BoxShadow {
+    gpui_kit::BoxShadow::new(px(0.), px(0.), alpha(t.ring, 0.7)).spread_radius(px(2.)).inset()
+}
+
 fn toggle(this: &WeakEntity<Workspace>, key: SharedString) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
     let this = this.clone();
     move |_, _, cx| {
@@ -765,16 +866,44 @@ pub(super) fn render_row(
             created_at,
             revert,
             attribution,
+            content,
         } => {
+            use super::user_message as attachments;
             let expanded =
                 this.upgrade().is_some_and(|workspace| workspace.read(cx).expanded.contains(&timeline::entry_key(id)));
-            let fold = folded_message(attribution.as_ref(), text, this, cx);
-            let actions = message_actions::user_actions(this, id, text, created_at, revert.as_ref(), &t, cx);
-            let body = markdown_with(this, id.clone(), text, MarkdownKind::User, None, &t, cx);
+            let fold = folded_message(attribution.as_ref(), &crate::user_message::plain_text(text), this, cx);
+            let actions = message_actions::user_actions(
+                this,
+                id,
+                text,
+                created_at,
+                revert.as_ref(),
+                Some("timeline-row"),
+                &t,
+                cx,
+            );
+            // A folded agent message and a guest's keep their attachments inside the bubble.
+            let guest = matches!(attribution, Some(timeline::Attribution::Guest { .. }));
+            let layout = crate::user_message::layout(content, text, fold.is_none() && !guest);
+            let corners = attachments::Corners {
+                top_right: *grouped_with_previous,
+                bottom_right: layout.media_above_text || *grouped_with_next,
+            };
+            let media = attachments::media_block(id, &layout, corners, this, &t, window, cx);
+            let (media_above, media_inside) = if layout.media_above_text { (media, None) } else { (None, media) };
+            let inside: Vec<AnyElement> = media_inside
+                .into_iter()
+                .chain(attachments::audio_block(id, &layout, this, &t))
+                .chain(layout.file_cards_only.then(|| attachments::file_cards(id, &layout, this, &t)))
+                .chain(attachments::file_list(id, &layout, this, &t).filter(|_| !layout.file_cards_only))
+                .collect();
+            let body = (!layout.file_cards_only && !layout.audio_only && !text.trim().is_empty())
+                .then(|| markdown_with(this, id.clone(), text, MarkdownKind::User, None, Some(content), &t, cx));
+            let bare = layout.media_only || layout.file_cards_only || layout.audio_only;
             user_row(
                 id,
                 text,
-                body,
+                UserBody { media_above, attachments: inside, body, bare },
                 actions,
                 steer.filter(|_| !*continues_steer),
                 UserRowLook {
@@ -789,10 +918,18 @@ pub(super) fn render_row(
             )
         }
         Row::AssistantMeta { id, text, updated_at, status, fork } => {
-            let meta =
-                message_actions::assistant_meta(this, id, text, false, updated_at, status, fork.as_ref(), &t, cx)
-                    .opacity(0.)
-                    .group_hover("timeline-meta", |style| style.opacity(1.));
+            let meta = message_actions::assistant_meta(
+                this,
+                id,
+                text,
+                false,
+                updated_at,
+                status,
+                fork.as_ref(),
+                Some("timeline-meta"),
+                &t,
+                cx,
+            );
             lane(16., v_flex().group("timeline-meta").child(meta)).into_any_element()
         }
         Row::Assistant { id, text, streaming, terminal, updated_at, status, fork, changes, .. } => {
@@ -808,14 +945,24 @@ pub(super) fn render_row(
                     text,
                     MarkdownKind::Assistant { streaming: *streaming },
                     Some(lane_width - 8.),
+                    None,
                     &t,
                     cx,
                 ));
             // The finished reply's actions (`AssistantMessageMeta`) hold their space while hidden.
             let meta = terminal.then(|| {
-                message_actions::assistant_meta(this, id, text, *streaming, updated_at, status, fork.as_ref(), &t, cx)
-                    .opacity(0.)
-                    .group_hover("timeline-row", |style| style.opacity(1.))
+                message_actions::assistant_meta(
+                    this,
+                    id,
+                    text,
+                    *streaming,
+                    updated_at,
+                    status,
+                    fork.as_ref(),
+                    Some("timeline-row"),
+                    &t,
+                    cx,
+                )
             });
             let changes = changes.as_ref().map(|c| super::changed_files::card(c, this, lane_width - 8., &t, cx));
             lane(
@@ -840,11 +987,11 @@ pub(super) fn render_row(
         }
         Row::TurnFold { key, label, expanded, created_at } => {
             let chevron = if *expanded { IconName::ChevronDown } else { IconName::ChevronRight };
-            let button = h_flex()
-                .id(ElementId::Name(key.clone()))
+            let button = focusable(h_flex().id(ElementId::Name(key.clone())), &t)
                 .h(px(24.))
                 .px(px(4.))
                 .gap(px(4.))
+                .rounded(px(6.))
                 .cursor_pointer()
                 .text_color(t.muted_foreground)
                 .hover(|style| style.text_color(t.foreground))
@@ -897,8 +1044,7 @@ pub(super) fn render_row(
         }
         Row::AttemptFold { key, expanded } => {
             let chevron = if *expanded { IconName::ChevronDown } else { IconName::ChevronRight };
-            let button = h_flex()
-                .id(ElementId::Name(key.clone()))
+            let button = focusable(h_flex().id(ElementId::Name(key.clone())), &t)
                 .w_full()
                 .gap(px(8.))
                 .px(px(10.))
@@ -1062,7 +1208,7 @@ fn system_divider(divider: &timeline::SystemDivider, this: &WeakEntity<Workspace
     let center = match &divider.action {
         Some((label, thread_id)) => {
             let (this, thread_id, label) = (this.clone(), thread_id.clone(), label.clone());
-            content(div().id(ElementId::Name(format!("divider:{}", divider.id).into())))
+            focusable(content(div().id(ElementId::Name(format!("divider:{}", divider.id).into()))), t)
                 .px(px(10.))
                 .py(px(4.))
                 .rounded_full()
@@ -1101,9 +1247,9 @@ fn entry_open_link(entry: &Entry, this: &WeakEntity<Workspace>, t: &Tokens) -> O
     };
     let (this, thread_id) = (this.clone(), thread_id.to_owned());
     Some(
-        div()
-            .id(ElementId::Name(format!("open-thread:{}", entry.id).into()))
+        focusable(div().id(ElementId::Name(format!("open-thread:{}", entry.id).into())), t)
             .flex_none()
+            .rounded(px(4.))
             .font_weight(FontWeight::MEDIUM)
             .text_color(color)
             .cursor_pointer()
@@ -1210,7 +1356,8 @@ pub(super) fn subagent_card(
     match target {
         Some((env, thread_id)) => {
             let this = this.clone();
-            row.cursor_pointer()
+            focusable(row, t)
+                .cursor_pointer()
                 .hover(|style| style.bg(alpha(t.accent, 0.2)))
                 .child(Icon::new(IconName::ChevronRight).size(px(14.)).text_color(alpha(muted, 0.6)))
                 .on_click(move |_, window, cx| {
@@ -1260,8 +1407,7 @@ fn subagent_group(
             })
     };
     let more = cards.len().saturating_sub(3);
-    let header = h_flex()
-        .id(ElementId::Name(key.clone()))
+    let header = focusable(h_flex().id(ElementId::Name(key.clone())), t)
         .w_full()
         .min_w_0()
         .gap(px(10.))
@@ -1429,8 +1575,7 @@ fn embed_card(embed: &Rc<timeline::Embed>, this: &WeakEntity<Workspace>, t: &Tok
                 })),
         )
         .child(
-            h_flex()
-                .id(ElementId::Name(format!("embed-open:{}", embed.id).into()))
+            focusable(h_flex().id(ElementId::Name(format!("embed-open:{}", embed.id).into())), t)
                 .flex_none()
                 .h(px(24.))
                 .px(px(7.))
@@ -1547,6 +1692,17 @@ fn working_duration(ms: i64) -> String {
 // ---------------------------------------------------------------------------
 // Messages
 
+/// What a user message bubble holds.
+struct UserBody {
+    /// Media sent with words, standing above the bubble as its own shape.
+    media_above: Option<AnyElement>,
+    /// Attachments inside the bubble, above the words.
+    attachments: Vec<AnyElement>,
+    body: Option<AnyElement>,
+    /// Only media, cards or a recording, each with its own shape: no surface around them.
+    bare: bool,
+}
+
 /// How a user message bubble sits among its neighbours, and how much of it shows.
 struct UserRowLook<'a> {
     grouped_with_previous: bool,
@@ -1631,7 +1787,7 @@ fn folded_message(
 fn user_row(
     id: &SharedString,
     text: &SharedString,
-    body: AnyElement,
+    contents: UserBody,
     actions: gpui_kit::Div,
     steer: Option<Steer>,
     look: UserRowLook,
@@ -1649,7 +1805,9 @@ fn user_row(
             .child(Icon::new(IconName::Redo2).size(px(12.)))
             .child("Steer")
     });
+    let UserBody { media_above, attachments, body, bare } = contents;
     if let Some(fold) = fold {
+        let body = v_flex().children(attachments).children(body).into_any_element();
         return folded_row(id, body, actions, steer_label, fold, expanded, this, t);
     }
     let guest = match attribution {
@@ -1659,20 +1817,21 @@ fn user_row(
     // `bg-guest-surface`: `color-mix(in srgb, var(--guest) 14%, var(--message-surface))`.
     let surface =
         if guest.is_some() { theme::mix_srgb(t.message_surface, rgb(GUEST).into(), 0.14) } else { t.message_surface };
-    let collapsible = should_collapse(text);
+    let collapsible = body.is_some() && should_collapse(text);
     let collapsed = collapsible && !expanded;
     let mut bubble = div()
         .relative()
+        .min_w_0()
         .max_w(relative(0.8))
-        .p(px(12.))
         .rounded(px(16.))
-        .bg(surface)
+        .when(!bare, |el| el.p(px(12.)).bg(surface))
         .text_color(t.foreground)
         .text_size(px(TEXT))
         .line_height(px(LINE))
-        .when(grouped_with_previous, |this| this.rounded_tr(px(6.)))
+        .when(grouped_with_previous || media_above.is_some(), |this| this.rounded_tr(px(6.)))
         .when(grouped_with_next, |this| this.rounded_br(px(6.)))
-        .child(div().when(collapsed, |this| this.max_h(px(176.)).overflow_hidden()).child(body));
+        .children(attachments)
+        .children(body.map(|body| div().when(collapsed, |this| this.max_h(px(176.)).overflow_hidden()).child(body)));
     if collapsed {
         bubble = bubble.child(div().absolute().left_0().right_0().bottom(px(12.)).h(px(28.)).bg(linear_gradient(
             180.,
@@ -1681,8 +1840,7 @@ fn user_row(
         )));
     }
     let toggle_button = collapsible.then(|| {
-        h_flex()
-            .id(ElementId::Name(format!("user-collapse:{id}").into()))
+        focusable(h_flex().id(ElementId::Name(format!("user-collapse:{id}").into())), t)
             .mt(px(6.))
             .h(px(24.))
             .px(px(7.))
@@ -1695,14 +1853,7 @@ fn user_row(
             .on_click(toggle(this, timeline::entry_key(id)))
     });
     // Hover actions under the bubble keep their 24px row while hidden.
-    let actions = h_flex()
-        .w_full()
-        .max_w(relative(0.8))
-        .justify_end()
-        .pr(px(4.))
-        .opacity(0.)
-        .group_hover("timeline-row", |style| style.opacity(1.))
-        .child(actions);
+    let actions = h_flex().w_full().max_w(relative(0.8)).justify_end().pr(px(4.)).child(actions);
     // `text-2xs`: 0.6875rem.
     let attribution = match (attribution, guest) {
         (Some(timeline::Attribution::T3Code), _) => Some(
@@ -1724,6 +1875,7 @@ fn user_row(
         .gap(px(4.))
         .children(attribution)
         .children(steer_label)
+        .children(media_above.map(|media| h_flex().max_w(relative(0.8)).justify_end().child(media)))
         .child(bubble)
         .children(toggle_button)
         .child(actions);
@@ -1744,8 +1896,7 @@ fn folded_row(
     t: &Tokens,
 ) -> AnyElement {
     let muted = t.muted_foreground;
-    let header = h_flex()
-        .id(ElementId::Name(format!("agent-fold:{id}").into()))
+    let header = focusable(h_flex().id(ElementId::Name(format!("agent-fold:{id}").into())), t)
         .w_full()
         .min_w_0()
         .gap(px(6.))
@@ -1791,35 +1942,30 @@ fn folded_row(
             FoldLink::Thread(_) => "Open thread",
             FoldLink::Automation { .. } => "Open automation",
         };
-        div()
-            .id(ElementId::Name(format!("agent-open-thread:{id}").into()))
-            .text_xs()
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(muted)
-            .cursor_pointer()
-            .hover(|s| s.text_color(t.foreground).underline())
-            .child(label)
-            .on_click(move |_, window, cx| {
-                let _ = this.update(cx, |workspace, cx| match &link {
-                    FoldLink::Thread(sender) => workspace.select_thread(sender.to_string(), window, cx),
-                    FoldLink::Automation { environment: Some(environment), task_id } => {
-                        workspace.open_scheduled_task(environment.clone(), task_id.clone(), cx);
-                    }
-                    FoldLink::Automation { environment: None, .. } => workspace.open_settings("scheduled-tasks", cx),
-                });
-            })
+        message_actions::control(
+            div().id(ElementId::Name(format!("agent-open-thread:{id}").into())),
+            Some("timeline-row"),
+            t,
+        )
+        .rounded(px(4.))
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(muted)
+        .cursor_pointer()
+        .hover(|s| s.text_color(t.foreground).underline())
+        .child(label)
+        .on_click(move |_, window, cx| {
+            let _ = this.update(cx, |workspace, cx| match &link {
+                FoldLink::Thread(sender) => workspace.select_thread(sender.to_string(), window, cx),
+                FoldLink::Automation { environment: Some(environment), task_id } => {
+                    workspace.open_scheduled_task(environment.clone(), task_id.clone(), cx);
+                }
+                FoldLink::Automation { environment: None, .. } => workspace.open_settings("scheduled-tasks", cx),
+            });
+        })
     });
     let actions = (fold.actions_when_folded || expanded).then(|| {
-        h_flex()
-            .w_full()
-            .max_w(relative(0.8))
-            .justify_end()
-            .gap(px(8.))
-            .pr(px(4.))
-            .opacity(0.)
-            .group_hover("timeline-row", |style| style.opacity(1.))
-            .children(link)
-            .child(actions)
+        h_flex().w_full().max_w(relative(0.8)).justify_end().gap(px(8.)).pr(px(4.)).children(link).child(actions)
     });
     let column =
         v_flex().group("timeline-row").items_end().gap(px(4.)).children(steer_label).child(bubble).children(actions);
@@ -1834,13 +1980,19 @@ fn markdown_view(
     width: Option<f32>,
     this: &WeakEntity<Workspace>,
     (cwd, kinds): (Option<String>, Arc<super::markdown_ui::EntryKinds>),
+    content: Option<&Arc<timeline::UserContent>>,
     t: &Tokens,
 ) -> TextView {
     let streaming = matches!(kind, MarkdownKind::Assistant { streaming: true });
     let inline_code = inline_code_style(t);
     let t = *t;
-    let (header_this, link_this, table_this) = (this.clone(), this.clone(), this.clone());
-    let table_key = key.clone();
+    let (header_this, link_this, table_this, hover_this) = (this.clone(), this.clone(), this.clone(), this.clone());
+    let (table_key, message_key) = (key.clone(), key.clone());
+    let templates = super::markdown_ui::ArtifactTemplates {
+        workspace: this.clone(),
+        key: key.clone(),
+        usable: kind != MarkdownKind::User,
+    };
     TextView::new(state)
         .style(markdown_style(&t, kind == MarkdownKind::User, wrap))
         .inline_code_style(inline_code)
@@ -1857,8 +2009,18 @@ fn markdown_view(
             })
         })
         .table_actions(move |table, _, cx| super::markdown_ui::table_actions(table, &table_this, &table_key, &t, cx))
+        // A sent message's context chips, ahead of the plugins that read other links.
+        .when_some(content, |view, content| {
+            view.plugin(super::user_message::ContextChips {
+                workspace: this.clone(),
+                content: content.clone(),
+                message: message_key,
+            })
+        })
         .plugin(super::markdown_ui::SkillChips { workspace: this.clone() })
+        .plugin(super::markdown_ui::CitationChips { workspace: this.clone() })
         .plugin(super::markdown_ui::ThreadChips { workspace: this.clone() })
+        .plugin(templates)
         .plugin(super::markdown_ui::FileChips {
             workspace: this.clone(),
             dark: t.dark,
@@ -1867,7 +2029,12 @@ fn markdown_view(
             kinds,
             suffixes: Default::default(),
         })
+        .plugin(super::external_links::LinkMarks { workspace: this.clone() })
+        .on_link_hover(move |hover, _, cx| {
+            let _ = hover_this.update(cx, |workspace, cx| workspace.link_hovered(hover, cx));
+        })
         .on_link_click(move |url, event, window, cx| {
+            let _ = link_this.update(cx, Workspace::close_link_hover);
             // A right click opens the link menu (`externalLinkContextMenu`), and only for web links.
             let right = matches!(event, ClickEvent::Mouse(click) if click.up.button == gpui_kit::MouseButton::Right);
             // A link to a file opens in the editor, or its file menu (`MarkdownFileLink`).
@@ -1949,8 +2116,7 @@ pub(super) fn code_block_header(
     let at = block.span.as_ref().map_or_else(|| fnv1a(&code), |span| span.start as u64);
     let id: SharedString = format!("code:{key}:{at:x}").into();
     let wrap_this = this.clone();
-    let wrap_button = div()
-        .id("wrap")
+    let wrap_button = focusable(div().id("wrap"), t)
         .size(px(24.))
         .flex()
         .items_center()
@@ -1973,8 +2139,7 @@ pub(super) fn code_block_header(
         .filter(|_| run && !streaming && this.upgrade().is_some_and(|w| w.read(cx).git_cwd().is_some()))
         .map(|command| {
             let this = this.clone();
-            div()
-                .id("run")
+            focusable(div().id("run"), t)
                 .size(px(24.))
                 .flex()
                 .items_center()
@@ -2226,6 +2391,7 @@ fn plan_card(
             body_text,
             MarkdownKind::Assistant { streaming: false },
             Some(lane_width - 42.),
+            None,
             t,
             cx,
         ));
@@ -2240,8 +2406,7 @@ fn plan_card(
     }
     let toggle_button = collapsible.then(|| {
         h_flex().w_full().justify_center().mt(px(16.)).child(
-            div()
-                .id(ElementId::Name(format!("plan-toggle:{id}").into()))
+            focusable(div().id(ElementId::Name(format!("plan-toggle:{id}").into())), t)
                 .h(px(32.))
                 .px(px(12.))
                 .flex()
@@ -2372,19 +2537,20 @@ fn work_row(work: &WorkRow, this: &WeakEntity<Workspace>, t: &Tokens, cx: &mut A
     let row = div().w_full().min_w_0().rounded(px(6.)).px(px(2.)).py(px(2.));
     let content: AnyElement = match &work.kind {
         WorkRowKind::Single { entry, label, expanded } => single_entry(entry, label, *expanded, this, t, cx),
-        WorkRowKind::Toggle { group, summary, icon, created_at, .. } => row
-            .id(ElementId::Name(work.id.clone()))
-            .group("timeline-row")
-            .cursor_pointer()
-            .child(work_line(
-                *icon,
-                icon_color(t),
-                summary.clone(),
-                muted,
-                hover_timestamp(this, format!("time:{}", work.id), created_at, t, cx),
-            ))
-            .on_click(toggle(this, group.clone()))
-            .into_any_element(),
+        WorkRowKind::Toggle { group, summary, icon, created_at, .. } => {
+            focusable(row.id(ElementId::Name(work.id.clone())), t)
+                .group("timeline-row")
+                .cursor_pointer()
+                .child(work_line(
+                    *icon,
+                    icon_color(t),
+                    summary.clone(),
+                    muted,
+                    hover_timestamp(this, format!("time:{}", work.id), created_at, t, cx),
+                ))
+                .on_click(toggle(this, group.clone()))
+                .into_any_element()
+        }
         WorkRowKind::Details { entries } => v_flex()
             .id(ElementId::Name(work.id.clone()))
             .max_h(px(288.))
@@ -2418,7 +2584,7 @@ fn work_row(work: &WorkRow, this: &WeakEntity<Workspace>, t: &Tokens, cx: &mut A
             v_flex()
                 .children(thought_line)
                 .child(
-                    row.id(ElementId::Name(work.id.clone()))
+                    focusable(row.id(ElementId::Name(work.id.clone())), t)
                         .cursor_pointer()
                         .child(work_line(
                             entry.icon(),
@@ -2435,8 +2601,7 @@ fn work_row(work: &WorkRow, this: &WeakEntity<Workspace>, t: &Tokens, cx: &mut A
             let label = preview.clone().unwrap_or_else(|| "Thinking".into());
             let line = work_line(WorkIcon::Brain, icon_color(t), label, muted, None);
             match group {
-                Some(group) => row
-                    .id(ElementId::Name(work.id.clone()))
+                Some(group) => focusable(row.id(ElementId::Name(work.id.clone())), t)
                     .cursor_pointer()
                     .child(line)
                     .on_click(toggle(this, group.clone()))
@@ -2655,8 +2820,8 @@ fn thread_read_label(
     let title = div().min_w_0().truncate().child(SharedString::from(title.to_owned()));
     let title = if linked {
         let (this, env, id) = (this.clone(), thread.environment_id.clone(), thread.id.clone());
-        title
-            .id(ElementId::Name(format!("read-thread:{}", entry.id).into()))
+        focusable(title.id(ElementId::Name(format!("read-thread:{}", entry.id).into())), t)
+            .rounded(px(4.))
             .text_color(t.foreground)
             .cursor_pointer()
             .hover(gpui_kit::Styled::underline)
@@ -2709,7 +2874,8 @@ fn question_history(
         match file.id.clone() {
             Some(attachment_id) => {
                 let this = this.clone();
-                link.cursor_pointer()
+                focusable(link, t)
+                    .cursor_pointer()
                     .on_click(move |_, _, cx| {
                         let _ = this.update(cx, |workspace, cx| workspace.open_answer_attachment(&attachment_id, cx));
                     })
@@ -2802,7 +2968,7 @@ fn single_entry(
     let line = work_line(entry.icon(), color, label_text, label_color, Some(trailing.into_any_element()));
     let row = row.id(ElementId::Name(entry.id.clone())).child(line).children(details);
     if expandable {
-        row.cursor_pointer().on_click(toggle(this, timeline::entry_key(&entry.id))).into_any_element()
+        focusable(row, t).cursor_pointer().on_click(toggle(this, timeline::entry_key(&entry.id))).into_any_element()
     } else {
         row.into_any_element()
     }
@@ -2840,13 +3006,25 @@ fn detail_entry(detail: &DetailEntry, this: &WeakEntity<Workspace>, t: &Tokens, 
             ),
         ))
         .children(details)
-        .when(expandable, |row| row.on_click(toggle(this, timeline::entry_key(&entry.id))))
+        .when(expandable, |row| focusable(row, t).on_click(toggle(this, timeline::entry_key(&entry.id))))
         .into_any_element()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_messages_fold_by_the_text_they_show() {
+        assert!(should_collapse(&"a".repeat(601)));
+        assert!(!should_collapse(&"a".repeat(600)));
+        assert!(should_collapse(&"a\n".repeat(8)));
+        assert!(!should_collapse(&"a\n".repeat(7)));
+        assert!(!should_collapse(&" \n".repeat(20)));
+        // A long link destination reads as its short label.
+        let link = format!("[file]({})", "a/".repeat(400));
+        assert!(!should_collapse(&link));
+    }
 
     #[test]
     fn only_single_visible_shell_commands_run() {

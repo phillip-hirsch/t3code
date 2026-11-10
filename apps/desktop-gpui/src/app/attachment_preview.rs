@@ -1,6 +1,7 @@
-//! A draft attachment's preview (`ComposerFilePreviewDialog`, `AttachmentFilePreview.tsx`):
-//! its text or image, with copy, save and remove. Rich renderers (markdown, tables,
-//! PDFs, office files) stay in the web; other files get its "No preview" notice.
+//! An attachment's preview (`ComposerFilePreviewDialog`, `AttachmentFilePreview.tsx`): a draft's
+//! or a sent message's file, its text or image, with copy, save and (for a draft) remove. Rich
+//! renderers (markdown, tables, PDFs, office files) stay in the web; other files get its
+//! "No preview" notice.
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -49,20 +50,52 @@ fn text_lines(bytes: &[u8]) -> Option<(Vec<SharedString>, bool)> {
     Some((text.lines().map(|line| SharedString::from(line.replace('\t', "    "))).collect(), truncated))
 }
 
+/// Where a save dialog opens: the user's Downloads folder.
+pub(super) fn downloads_dir() -> std::path::PathBuf {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(|home| std::path::PathBuf::from(home).join("Downloads"))
+        .unwrap_or_default()
+}
+
+/// What the dialog previews: a draft's attachment, which it can remove, or a sent one.
+pub(super) struct Preview {
+    /// The breadcrumb before the name: "Draft", or "Attachment" for a sent file.
+    pub origin: &'static str,
+    pub name: String,
+    pub bytes: bytes::Bytes,
+    pub image: Option<Arc<Image>>,
+    /// The draft attachment Remove takes out.
+    pub removable: Option<String>,
+}
+
 impl Workspace {
     /// Opens a composer attachment's preview.
     pub(super) fn open_attachment_preview(&mut self, local_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(attachment) = self.attachments.iter().find(|a| a.local_id() == local_id) else { return };
-        let (name, bytes) = (SharedString::from(attachment.name().to_owned()), attachment.bytes().clone());
+        let preview = Preview {
+            origin: "Draft",
+            name: attachment.name().to_owned(),
+            bytes: attachment.bytes().clone(),
+            image: attachment.image(),
+            removable: Some(local_id.to_owned()),
+        };
+        self.open_preview_dialog(preview, window, cx);
+    }
+
+    /// `AttachmentFilePreview` in a dialog: the file's text or image, with copy, save and,
+    /// for a draft's attachment, remove.
+    pub(super) fn open_preview_dialog(&mut self, preview: Preview, window: &mut Window, cx: &mut Context<Self>) {
+        let Preview { origin, name, bytes, image, removable } = preview;
         let size = super::attachments::format_size(bytes.len() as u64);
-        let body = match (attachment.image(), text_lines(&bytes)) {
+        let body = match (image, text_lines(&bytes)) {
             (Some(image), _) => Body::Image(image),
             (None, Some((lines, truncated))) => Body::Text(Rc::from(lines), truncated),
             (None, None) => Body::None,
         };
-        let extension = attachment.name().rsplit_once('.').map(|(_, e)| e.to_owned()).filter(|e| !e.is_empty());
+        let extension = name.rsplit_once('.').map(|(_, e)| e.to_owned()).filter(|e| !e.is_empty());
+        let name = SharedString::from(name);
         let view = cx.weak_entity();
-        let local_id = local_id.to_owned();
         let body = Rc::new(body);
         window.open_dialog(cx, move |dialog, window, cx| {
             let t = *crate::theme::tokens(cx);
@@ -92,11 +125,7 @@ impl Workspace {
             let save = {
                 let (bytes, name) = (bytes.clone(), name.clone());
                 action("preview-save", Lucide::Download, "Save file").on_click(move |_, window, cx| {
-                    let downloads = std::env::var_os("USERPROFILE")
-                        .or_else(|| std::env::var_os("HOME"))
-                        .map(|home| std::path::PathBuf::from(home).join("Downloads"))
-                        .unwrap_or_default();
-                    let picked = cx.prompt_for_new_path(&downloads, Some(&name));
+                    let picked = cx.prompt_for_new_path(&downloads_dir(), Some(&name));
                     let bytes = bytes.clone();
                     window
                         .spawn(cx, async move |cx| {
@@ -112,13 +141,13 @@ impl Workspace {
                         .detach();
                 })
             };
-            let remove = {
-                let (view, local_id) = (view.clone(), local_id.clone());
+            let remove = removable.clone().map(|local_id| {
+                let view = view.clone();
                 action("preview-remove", Lucide::Trash, "Remove attachment").on_click(move |_, window, cx| {
                     window.close_dialog(cx);
                     let _ = view.update(cx, |this, cx| this.request_remove_attachment(&local_id, window, cx));
                 })
-            };
+            });
             let close = action("preview-close", Lucide::X, "Close").on_click(|_, window, cx| window.close_dialog(cx));
             let header = h_flex()
                 .h(px(40.))
@@ -132,7 +161,7 @@ impl Workspace {
                         .flex_1()
                         .min_w_0()
                         .text_xs()
-                        .child(div().flex_none().px(px(2.)).text_color(t.muted_foreground).child("Draft"))
+                        .child(div().flex_none().px(px(2.)).text_color(t.muted_foreground).child(origin))
                         .child(
                             Icon::new(Lucide::ChevronRight)
                                 .size(px(14.))
@@ -152,7 +181,7 @@ impl Workspace {
                 )
                 .children(copy)
                 .child(save)
-                .child(remove)
+                .children(remove)
                 .child(close);
             let content = match &*body {
                 Body::Text(lines, truncated) => {

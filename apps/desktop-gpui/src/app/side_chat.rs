@@ -67,6 +67,13 @@ pub(super) struct SideChatView {
     _events: Vec<Subscription>,
 }
 
+impl SideChatView {
+    /// The composer, unless a message is being sent from it.
+    pub(super) fn ready_composer(&self) -> Option<&Entity<TextareaState>> {
+        (!self.sending).then_some(&self.composer)
+    }
+}
+
 #[derive(Default)]
 pub(super) struct SideChats {
     pub(super) view: Option<SideChatView>,
@@ -154,7 +161,7 @@ pub(super) fn parse_command(text: &str) -> Option<&str> {
 }
 
 /// `resolveLatestMergeBackRun`: the newest finished reply, unless a newer run is under way.
-fn merge_back_run(projection: &ThreadProjection) -> Option<&Run> {
+pub(super) fn merge_back_run(projection: &ThreadProjection) -> Option<&Run> {
     let latest = projection
         .runs
         .iter()

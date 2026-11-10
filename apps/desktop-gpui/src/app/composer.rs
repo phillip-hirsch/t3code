@@ -145,6 +145,7 @@ impl Workspace {
         }
         self.save_custom_answer(ChatPane::Main, cx);
         self.sync_composer_empty(cx);
+        self.drop_orphan_citation_comment(cx);
         self.reveal_branch_banner();
         let state = self.composer.read(cx);
         if self.prompt_history.as_ref().is_some_and(|h| *h.recalled != *state.value()) {
@@ -203,6 +204,7 @@ impl Workspace {
         self.reset_context_chips(&text);
         self.composer.update(cx, |composer, cx| composer.set_value(content, window, cx));
         self.sync_composer_empty(cx);
+        self.drop_orphan_citation_comment(cx);
         self.sync_trigger(cx);
         self.sync_composer_marks(cx);
     }
@@ -262,6 +264,7 @@ impl Workspace {
         }
         let attachments = std::mem::take(&mut self.attachments);
         let records = self.take_context_records();
+        let commented = self.stash_citation_comment(cx);
         let draft = match (self.question.take(), self.take_queue_edit_draft()) {
             (Some(mut question), _) => {
                 question.park(attachments);
@@ -269,7 +272,11 @@ impl Workspace {
             }
             // A queued message's edit ends here; the thread keeps its own draft.
             (None, Some((prompt, attachments, records))) => ComposerDraft::Prompt(prompt, attachments, records),
-            (None, None) => ComposerDraft::Prompt(self.composer.read(cx).value().to_string(), attachments, records),
+            (None, None) => ComposerDraft::Prompt(
+                commented.unwrap_or_else(|| self.composer.read(cx).value().to_string()),
+                attachments,
+                records,
+            ),
         };
         self.prompt_history = None;
         self.menu = Default::default();
@@ -977,6 +984,12 @@ impl Workspace {
                         trimmed.len() == 2 && trimmed.ends_with(':') && trimmed.as_bytes()[0].is_ascii_alphabetic();
                     let path = if trimmed.is_empty() || drive_root { path.clone() } else { trimmed.to_owned() };
                     let _ = chip_view.update(cx, |this, cx| this.open_file_surface(path, window, cx));
+                }
+                Some(Chip::Citation { .. }) => {
+                    let (id, range, bounds) = (event.token().id().to_string(), event.range(), event.bounds());
+                    let _ = chip_view.update(cx, |this, cx| {
+                        this.citation_chip_clicked(id, range, bounds, event.click(), window, cx);
+                    });
                 }
                 _ => {}
             })
@@ -1987,6 +2000,13 @@ struct ChipRecords<'a> {
 fn render_chip(token: &InlineTokenContext, records: &ChipRecords, t: &Tokens) -> AnyElement {
     let id = token.token().id();
     let chip = Chip::from_id(id);
+    if let Some(Chip::Citation { .. }) = chip {
+        let label = token.token().label().clone();
+        return super::citations::citation_chip(label, t.fonts.prompt_size, token.is_selected(), t)
+            .h(token.line_height())
+            .max_w(token.available_width())
+            .into_any_element();
+    }
     // A record-backed chip whose record is gone sends nothing (`UnresolvedContextChip`);
     // attachments and machines carry their own.
     let unresolved = matches!(&chip, Some(Chip::Context { kind, id, .. })
@@ -2042,10 +2062,10 @@ const REVIEW_COMMENT: &str = "review-comment";
 /// `PullRequestContextMetadata`: the change request a review-comment chip names.
 #[derive(Clone, Debug, serde::Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-struct PullRequestContext {
-    number: u64,
+pub(super) struct PullRequestContext {
+    pub(super) number: u64,
     title: String,
-    url: String,
+    pub(super) url: String,
     head_branch: String,
     base_branch: String,
     state: String,
@@ -2053,7 +2073,7 @@ struct PullRequestContext {
 }
 
 impl PullRequestContext {
-    fn state(&self) -> (Lucide, &'static str, u32, u32, f32) {
+    pub(super) fn state(&self) -> (Lucide, &'static str, u32, u32, f32) {
         pull_request_state(&self.state, self.is_draft)
     }
 
@@ -2085,6 +2105,37 @@ pub(super) fn pull_request_tone(light: u32, dark: u32, alpha: f32, t: &Tokens) -
     if t.dark { Hsla::from(rgb(dark)).opacity(alpha) } else { rgb(light).into() }
 }
 
+/// `PullRequestContextDetails`: the change request's number, state, title and branches.
+pub(super) fn pull_request_details(pr: &PullRequestContext, t: &Tokens) -> gpui_kit::Div {
+    let (glyph, label, light, dark, alpha) = pr.state();
+    let tone = pull_request_tone(light, dark, alpha, t);
+    let branch = |name: &str| div().min_w_0().truncate().font_family(t.fonts.mono).child(name.to_owned());
+    v_flex()
+        .max_w(px(320.))
+        .gap(px(4.))
+        .py(px(2.))
+        .overflow_hidden()
+        .child(
+            h_flex()
+                .gap(px(6.))
+                .font_weight(FontWeight::MEDIUM)
+                .child(Icon::new(glyph).with_size(px(14.)).flex_none().text_color(tone))
+                .child(div().text_color(t.foreground).child(format!("{} #{}", pr.noun(), pr.number)))
+                .child(div().text_color(tone).child(label)),
+        )
+        .child(div().text_color(t.foreground).child(pr.title.clone()))
+        .child(
+            h_flex()
+                .min_w_0()
+                .gap(px(4.))
+                .text_size(px(10.))
+                .text_color(t.muted_foreground)
+                .child(branch(&pr.head_branch))
+                .child(Icon::new(Lucide::ArrowRight).with_size(px(12.)).flex_none())
+                .child(branch(&pr.base_branch)),
+        )
+}
+
 /// The review-comment records' change requests, by the context id their chips carry.
 fn pull_request_contexts<'a>(records: impl IntoIterator<Item = &'a Value>) -> HashMap<String, PullRequestContext> {
     records
@@ -2107,33 +2158,7 @@ impl Workspace {
         let (chip, bounds) = self.composer_ui.chip_hover.as_ref()?;
         let Some(Chip::Context { kind, id, .. }) = Chip::from_id(chip) else { return None };
         let pr = pull_requests.get(&id).filter(|_| kind == REVIEW_COMMENT)?;
-        let (glyph, label, light, dark, alpha) = pr.state();
-        let tone = pull_request_tone(light, dark, alpha, t);
-        let branch = |name: &str| div().min_w_0().truncate().font_family(t.fonts.mono).child(name.to_owned());
-        let details = v_flex()
-            .max_w(px(320.))
-            .gap(px(4.))
-            .py(px(2.))
-            .overflow_hidden()
-            .child(
-                h_flex()
-                    .gap(px(6.))
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(Icon::new(glyph).with_size(px(14.)).flex_none().text_color(tone))
-                    .child(div().text_color(t.foreground).child(format!("{} #{}", pr.noun(), pr.number)))
-                    .child(div().text_color(tone).child(label)),
-            )
-            .child(div().text_color(t.foreground).child(pr.title.clone()))
-            .child(
-                h_flex()
-                    .min_w_0()
-                    .gap(px(4.))
-                    .text_size(px(10.))
-                    .text_color(t.muted_foreground)
-                    .child(branch(&pr.head_branch))
-                    .child(Icon::new(Lucide::ArrowRight).with_size(px(12.)).flex_none())
-                    .child(branch(&pr.base_branch)),
-            );
+        let details = pull_request_details(pr, t);
         // `TooltipPopup side="top"`, placed in window coordinates over the chip.
         let at = gpui_kit::point(bounds.left(), bounds.top() - px(4.));
         Some(

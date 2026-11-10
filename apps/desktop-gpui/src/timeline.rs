@@ -8,12 +8,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui_kit::SharedString;
 use serde_json::Value;
 
 use crate::model::{self, Run, ThreadProjection, TurnItem, is_active_run_status};
 pub use crate::queue::Attribution;
+pub use crate::user_message::UserContent;
 use crate::work_log::{self, Activity, Entry, Status, Tone, WorkIcon};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -32,6 +34,8 @@ pub enum Row {
         /// Who sent it when not the user (`resolveUserMessagePresentation`); such a message is
         /// not the user's own words, so it never groups.
         attribution: Option<Attribution>,
+        /// Its attachments and context records, which its media and chips show.
+        content: Arc<UserContent>,
     },
     Assistant {
         id: SharedString,
@@ -759,6 +763,7 @@ enum Kind {
         fresh_context: bool,
         /// `modelSwitch`: the model or effort change that took effect with it.
         model_switch: Option<Rc<(model::ModelSelection, model::ModelSelection)>>,
+        content: Arc<UserContent>,
     },
     Assistant {
         text: SharedString,
@@ -917,8 +922,12 @@ fn timeline_entry(item: &Rc<TurnItem>, inherited: bool) -> Option<TimelineEntry>
             };
             let revertible = matches!(intent, Some("turn_start" | "queued_turn"));
             let (shown, attribution) = crate::queue::user_message_presentation(item);
+            // The agent needs words to start a turn; people sent only the attachments.
+            let shown =
+                if attribution.is_none() { crate::user_message::without_bootstrap_prompt(&shown) } else { &shown };
             Kind::User {
-                text: shown.into(),
+                content: Arc::new(UserContent::parse(&item.raw)),
+                text: shown.to_owned().into(),
                 steer,
                 revertible,
                 attribution,
@@ -2089,7 +2098,7 @@ pub fn rows(
                     });
                 }
             }
-            Kind::User { text, steer, attribution, fresh_context, model_switch, .. } => {
+            Kind::User { text, steer, attribution, fresh_context, model_switch, content, .. } => {
                 if *fresh_context {
                     rows.push(Row::System(Rc::new(SystemDivider {
                         id: format!("fresh-session:{}", entry.id).into(),
@@ -2115,6 +2124,7 @@ pub fn rows(
                     created_at: entry.created_at.clone(),
                     revert: reverts.get(&entry.id).cloned(),
                     attribution: attribution.clone(),
+                    content: content.clone(),
                 });
             }
             Kind::Assistant { text, streaming } => rows.push(Row::Assistant {
@@ -2418,6 +2428,7 @@ mod tests {
             created_at: SharedString::default(),
             revert: None,
             attribution: None,
+            content: Default::default(),
         }
     }
 
@@ -3161,6 +3172,15 @@ mod tests {
         };
         assert_eq!(sender_thread.as_deref(), Some("parent"));
         assert!(matches!(rows[1], Row::User { attribution: None, grouped_with_previous: false, .. }));
+
+        // Attachments sent alone show without the words the agent was given to start its turn.
+        let files_only = json!({"text": format!("Ultrathink:\n{}", crate::composer_text::ATTACHMENT_ONLY_PROMPT),
+            "attachments": [{"type": "image", "id": "a1", "name": "a.png", "mimeType": "image/png", "sizeBytes": 1}],
+            "context": {"version": 1, "records": [{"kind": "image", "contextId": "c1", "label": "a.png", "attachmentId": "a1"}]}});
+        let p = projection(vec![item("u7", "user_message", "r4", "2026-11-04T10:00:00.000Z", files_only)], json!([]));
+        let rows = super::rows(&p, &HashSet::new(), &RowOptions::default(), &mut EntryCache::default());
+        let Row::User { text, content, .. } = &rows[0] else { panic!("{:?}", describe(&rows)) };
+        assert_eq!((text.as_ref(), content.attachments.len(), content.records.len()), ("", 1, 1));
 
         // An automation names its task; a legacy one loses its trigger line. A guest's message
         // shows the guest's own words and name. Neither groups with the user's own.

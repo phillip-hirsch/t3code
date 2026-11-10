@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
 mod app;
+mod artifact_templates;
 mod assets;
+mod assistant_citations;
 mod backend;
 mod browser_history;
 mod caret;
@@ -15,6 +17,7 @@ mod composer_text;
 mod desktop;
 mod device;
 mod environments;
+mod external_links;
 mod file_icons;
 mod file_links;
 mod handoff;
@@ -60,6 +63,7 @@ mod timeline;
 mod timestamp;
 mod turn_diff_tree;
 mod usage;
+mod user_message;
 mod vscode_theme;
 mod work_log;
 mod workflow;

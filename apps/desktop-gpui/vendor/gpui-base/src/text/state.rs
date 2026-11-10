@@ -26,7 +26,7 @@ use crate::{
         RangeHighlight, RangeHighlightError, RenderedText, TableActionsFn, TextViewStyle,
         document::ParsedDocument,
         format,
-        node::{self, NodeContext},
+        node::{self, Disclosures, NodeContext},
         range_highlight::{
             LeafRemap, PendingReveal, RangeHighlightFrame, RenderedIndex, RevealRequest,
         },
@@ -132,6 +132,7 @@ pub struct TextViewState {
     pub(super) image_source: Option<std::sync::Arc<super::text_view::ImageSourceFn>>,
     pub(super) link_click_handler: Option<std::sync::Arc<LinkClickHandlerFn>>,
     pub(super) task_toggle_handler: Option<std::sync::Arc<super::text_view::TaskToggleFn>>,
+    pub(super) link_hover_handler: Option<std::sync::Arc<super::text_view::LinkHoverFn>>,
     pub(super) markdown_extensions: Arc<MarkdownExtensions>,
 
     pub(super) is_selecting: bool,
@@ -163,6 +164,8 @@ pub struct TextViewState {
     rendered_index: Arc<OnceLock<RenderedIndex>>,
     range_highlights: Option<Arc<RangeHighlightFrame>>,
     pub(super) pending_reveal: Option<PendingReveal>,
+    /// The `<details>` disclosures the reader opened or closed.
+    disclosures: Disclosures,
     pub(super) selection_revision: usize,
     compatible_layout_update: bool,
     layout_text_style: Option<(gpui::TextStyle, Pixels)>,
@@ -238,6 +241,7 @@ impl TextViewState {
             table_actions: None,
             link_click_handler: None,
             task_toggle_handler: None,
+            link_hover_handler: None,
             image_source: None,
             markdown_extensions: Arc::default(),
             is_selecting: false,
@@ -257,6 +261,7 @@ impl TextViewState {
             rendered_index: Arc::default(),
             range_highlights: None,
             pending_reveal: None,
+            disclosures: Disclosures::new(cx.entity_id()),
             selection_revision: 0,
             compatible_layout_update: false,
             layout_text_style: None,
@@ -728,6 +733,10 @@ impl TextViewState {
         self.pending_reveal = Some(
             PendingReveal::new(&text, &range, now).ok_or(RangeHighlightError::InvalidRange(0))?,
         );
+        // A match inside a closed disclosure opens it (`beforematch`).
+        for key in text.disclosures_hiding(range.start) {
+            self.disclosures.open(key);
+        }
         cx.notify();
         Ok(())
     }
@@ -1143,6 +1152,7 @@ impl Render for TextViewState {
             stream_fade,
             range_highlights: self.range_highlights.clone(),
             reveal,
+            disclosures: Some(self.disclosures.clone()),
             body_font_size,
         };
 
@@ -2531,6 +2541,24 @@ mod tests {
                     state.rendered_text().as_str(),
                     "Title\nhello world *\nitem\na b\nc d\n\nlet x\n"
                 );
+            });
+        }
+
+        #[gpui::test]
+        fn revealing_text_in_a_closed_disclosure_opens_it(cx: &mut TestAppContext) {
+            let state = state(
+                "<details>\n<summary>More</summary>\n\nhidden word\n\n</details>\n\nshown word",
+                cx,
+            );
+            state.update(cx, |state, cx| {
+                let text = state.rendered_text();
+                assert_eq!(text.as_str(), "More\nhidden word\n\nshown word\n");
+                let shown = text.as_str().rfind("word").unwrap();
+                state.reveal_range(shown..shown + 4, cx).unwrap();
+                assert!(!state.disclosures.is_open(0, false));
+                let hidden = text.as_str().find("word").unwrap();
+                state.reveal_range(hidden..hidden + 4, cx).unwrap();
+                assert!(state.disclosures.is_open(0, false));
             });
         }
 

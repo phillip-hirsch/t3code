@@ -2700,7 +2700,7 @@ fn meta_line<const N: usize>(segments: [Option<AnyElement>; N], t: &Tokens) -> g
 }
 
 /// `PullRequestActorAvatar`: the picture once read, else the login's initial.
-fn avatar(actor: Option<&Actor>, size: f32, t: &Tokens) -> gpui_kit::Div {
+pub(in crate::app) fn avatar(actor: Option<&Actor>, size: f32, t: &Tokens) -> gpui_kit::Div {
     let login = actor.map_or("ghost", |a| a.login.as_str());
     let initial = div()
         .size(px(size))
@@ -2766,7 +2766,7 @@ fn diff_stat(additions: u64, deletions: u64, size: f32, t: &Tokens) -> Option<im
     })
 }
 
-fn state_glyph(state: list_logic::State, draft: bool, t: &Tokens) -> (Lucide, Hsla, &'static str) {
+pub(in crate::app) fn state_glyph(state: list_logic::State, draft: bool, t: &Tokens) -> (Lucide, Hsla, &'static str) {
     match (state, draft) {
         (list_logic::State::Merged, _) => (Lucide::GitMerge, tone(t, 0x7f22fe, 0xc4b4ff, 0.9), "Merged"),
         (list_logic::State::Closed, _) => (Lucide::GitPullRequestClosed, tone(t, 0xe7000b, 0xffa2a2, 0.9), "Closed"),

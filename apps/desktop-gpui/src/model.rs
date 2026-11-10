@@ -851,6 +851,9 @@ pub struct ThreadShell {
     pub link_origin: Option<LinkOrigin>,
     #[serde(default)]
     pub delegated_from: Option<DelegatedFrom>,
+    /// `{type: "run", threadId, runId}` for a fork at a run, which names its parent.
+    #[serde(default)]
+    pub forked_from: Option<Value>,
     #[serde(default, deserialize_with = "lossy")]
     pub tags: Vec<String>,
     #[serde(default)]
@@ -1634,6 +1637,11 @@ pub struct Subagent {
     pub status: String,
     #[serde(default)]
     pub started_at: Option<String>,
+    #[serde(default)]
+    pub completed_at: Option<String>,
+    /// A provider-native workflow coordinator's plan and agents (`OrchestrationV2SubagentWorkflow`).
+    #[serde(default)]
+    pub workflow: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]

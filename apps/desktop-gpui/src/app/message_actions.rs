@@ -11,7 +11,7 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, WindowExt as _, v_flex};
 use gpui_kit::{
     App, ClipboardItem, Context, ElementId, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Task, WeakEntity, Window, div, prelude::FluentBuilder as _, px,
+    StatefulInteractiveElement as _, Styled as _, Task, WeakEntity, Window, div, px,
 };
 use serde_json::{Value, json};
 
@@ -335,6 +335,29 @@ pub(super) async fn download_attachments(
     Ok(restored)
 }
 
+/// Where a message's actions wait unseen: the hover group that shows them
+/// (`opacity-0 group-hover:opacity-100 focus-within:opacity-100`).
+pub(super) type Reveal = Option<&'static str>;
+
+/// Hides `element` until its row's `reveal` group is hovered.
+pub(super) fn hidden<E: gpui_kit::InteractiveElement + gpui_kit::Styled>(element: E, reveal: Reveal) -> E {
+    match reveal {
+        Some(group) => element.opacity(0.).group_hover(group, |style| style.opacity(1.)),
+        None => element,
+    }
+}
+
+/// A control in a message's actions: a tab stop with the focus ring, shown while it has
+/// keyboard focus even when its row hides it.
+pub(super) fn control(
+    element: gpui_kit::Stateful<gpui_kit::Div>,
+    reveal: Reveal,
+    t: &Tokens,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
+    let ring = super::chat::focus_ring(t);
+    hidden(element, reveal).tab_index(0).focus_visible(move |style| style.opacity(1.).shadow(vec![ring]))
+}
+
 /// A 24px `icon-xs` button: `ghost` (foreground) or `ghost-muted`.
 fn icon_button(
     id: SharedString,
@@ -358,25 +381,13 @@ fn icon_button(
         .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
 }
 
-/// Copies `text`; its icon turns into a primary check for a second.
-pub(super) fn copy_button(
-    this: &WeakEntity<Workspace>,
-    id: SharedString,
-    text: SharedString,
-    label: &'static str,
-    icon: IconName,
-    t: &Tokens,
-    cx: &App,
-) -> impl IntoElement {
-    copy_button_with(this, id, label, icon, t, cx, move || Some(text.to_string()))
-}
-
-/// [`copy_button`] for text that is derived only when clicked.
-fn copy_button_with(
+/// Copies what `text` derives when clicked; its icon turns into a primary check for a second.
+fn copy_button(
     this: &WeakEntity<Workspace>,
     id: SharedString,
     label: &'static str,
     icon: IconName,
+    reveal: Reveal,
     t: &Tokens,
     cx: &App,
     text: impl Fn() -> Option<String> + 'static,
@@ -384,7 +395,8 @@ fn copy_button_with(
     let copied = this.upgrade().is_some_and(|w| w.read(cx).copy_feedback.id.as_ref() == Some(&id));
     let glyph = if copied { Icon::new(IconName::Check).text_color(t.primary) } else { Icon::new(icon) };
     let this = this.clone();
-    icon_button(id.clone(), glyph, if copied { "Copied!" } else { label }, true, t).on_click(move |_, _, cx| {
+    let button = icon_button(id.clone(), glyph, if copied { "Copied!" } else { label }, true, t);
+    control(button, reveal, t).on_click(move |_, _, cx| {
         let Some(text) = text() else { return };
         cx.write_to_clipboard(ClipboardItem::new_string(text));
         let _ = this.update(cx, |workspace, cx| workspace.copied(id.clone(), COPIED_FOR, cx));
@@ -402,12 +414,13 @@ pub(super) fn code_copy_button(
     let copied = this.upgrade().is_some_and(|w| w.read(cx).copy_feedback.id.as_ref() == Some(&id));
     let glyph = Icon::new(if copied { IconName::Check } else { IconName::Copy });
     let this = this.clone();
-    icon_button("copy".into(), glyph, if copied { "Copied" } else { "Copy code" }, true, t)
-        .text_color(gpui_kit::Hsla { a: t.foreground.a * 0.72, ..t.foreground })
-        .on_click(move |_, _, cx| {
+    let button = icon_button("copy".into(), glyph, if copied { "Copied" } else { "Copy code" }, true, t);
+    control(button, None, t).text_color(gpui_kit::Hsla { a: t.foreground.a * 0.72, ..t.foreground }).on_click(
+        move |_, _, cx| {
             cx.write_to_clipboard(ClipboardItem::new_string(code.to_string()));
             let _ = this.update(cx, |workspace, cx| workspace.copied(id.clone(), CODE_COPIED_FOR, cx));
-        })
+        },
+    )
 }
 
 /// `TimelineRowTimestamp` text: "3:04 PM", with the full date as its tooltip (built on hover).
@@ -417,7 +430,7 @@ pub(super) fn timestamp(
     iso: &SharedString,
     t: &Tokens,
     cx: &App,
-) -> Option<impl IntoElement> {
+) -> Option<gpui_kit::Stateful<gpui_kit::Div>> {
     let format = this.upgrade().and_then(|w| w.read(cx).client_settings.values.get("timestampFormat").as_str());
     let hour12 = crate::timestamp::hour12(format.unwrap_or_default());
     let text = crate::timestamp::day_aware(iso, &chrono::Local::now(), hour12)?;
@@ -437,6 +450,7 @@ pub(super) fn user_actions(
     text: &SharedString,
     created_at: &SharedString,
     revert: Option<&Checkpoint>,
+    reveal: Reveal,
     t: &Tokens,
     cx: &App,
 ) -> gpui_kit::Div {
@@ -450,38 +464,32 @@ pub(super) fn user_actions(
     });
     let edit = revert.filter(|_| can_rewind).map(|checkpoint| {
         let (this, id, checkpoint) = (this.clone(), id.clone(), checkpoint.clone());
-        icon_button(format!("edit:{id}").into(), Icon::new(IconName::Pencil), "Edit from here", false, t)
-            .when(working, |button| button.opacity(0.5).cursor_default())
-            .on_click(move |_, window, cx| {
-                if !working {
-                    confirm_rewind(this.clone(), id.clone(), checkpoint.clone(), window, cx);
-                }
-            })
+        let button = icon_button(format!("edit:{id}").into(), Icon::new(IconName::Pencil), "Edit from here", false, t);
+        // A disabled button is no tab stop.
+        let button =
+            if working { hidden(button, reveal).opacity(0.5).cursor_default() } else { control(button, reveal, t) };
+        button.on_click(move |_, window, cx| {
+            if !working {
+                confirm_rewind(this.clone(), id.clone(), checkpoint.clone(), window, cx);
+            }
+        })
     });
     let link = prompt_link_fits(text).then(|| {
         let text = text.clone();
-        copy_button_with(this, format!("link:{id}").into(), "Copy prompt link", IconName::Link, t, cx, move || {
+        copy_button(this, format!("link:{id}").into(), "Copy prompt link", IconName::Link, reveal, t, cx, move || {
             prompt_link(&text)
         })
     });
+    let copy = {
+        let text = text.clone();
+        copy_button(this, format!("copy:{id}").into(), "Copy message", IconName::Copy, reveal, t, cx, move || {
+            Some(text.to_string())
+        })
+    };
     gpui_kit::component::h_flex()
         .gap(px(8.))
-        .children(timestamp(this, format!("time:{id}").into(), created_at, t, cx))
-        .child(
-            gpui_kit::component::h_flex()
-                .gap(px(2.))
-                .children(edit)
-                .child(copy_button(
-                    this,
-                    format!("copy:{id}").into(),
-                    text.clone(),
-                    "Copy message",
-                    IconName::Copy,
-                    t,
-                    cx,
-                ))
-                .children(link),
-        )
+        .children(timestamp(this, format!("time:{id}").into(), created_at, t, cx).map(|time| hidden(time, reveal)))
+        .child(gpui_kit::component::h_flex().gap(px(2.)).children(edit).child(copy).children(link))
 }
 
 /// `AssistantMessageMeta`: status, copy, fork, then the time.
@@ -493,11 +501,12 @@ pub(super) fn assistant_meta(
     updated_at: &SharedString,
     status: &str,
     fork: Option<&(SharedString, SharedString)>,
+    reveal: Reveal,
     t: &Tokens,
     cx: &App,
 ) -> gpui_kit::Div {
     let pill = (status != "completed").then(|| {
-        div()
+        hidden(div(), reveal)
             .px(px(6.))
             .py(px(2.))
             .rounded_full()
@@ -508,22 +517,29 @@ pub(super) fn assistant_meta(
             .text_color(t.muted_foreground)
             .child(status.to_owned())
     });
-    let copy = (!streaming && !text.trim().is_empty())
-        .then(|| copy_button(this, format!("copy:{id}").into(), text.clone(), "Copy message", IconName::Copy, t, cx));
+    // A template line copies as its card's text (`renderCodexDirectivesForCopy`).
+    let copy = (!streaming && !text.trim().is_empty()).then(|| {
+        let text = text.clone();
+        copy_button(this, format!("copy:{id}").into(), "Copy message", IconName::Copy, reveal, t, cx, move || {
+            Some(crate::artifact_templates::render_for_copy(&text))
+        })
+    });
     let fork = fork.map(|(thread, run)| {
         let (this, thread, run) = (this.clone(), thread.clone(), run.clone());
-        icon_button(format!("fork:{id}").into(), Icon::new(IconName::GitFork), "Fork from this response", false, t)
-            .on_click(move |_, window, cx| {
-                let _ = this.update(cx, |workspace, cx| workspace.fork_from(thread.clone(), run.clone(), window, cx));
-            })
+        let button =
+            icon_button(format!("fork:{id}").into(), Icon::new(IconName::GitFork), "Fork from this response", false, t);
+        control(button, reveal, t).on_click(move |_, window, cx| {
+            let _ = this.update(cx, |workspace, cx| workspace.fork_from(thread.clone(), run.clone(), window, cx));
+        })
     });
+    let time = (!streaming).then(|| timestamp(this, format!("time:{id}").into(), updated_at, t, cx)).flatten();
     gpui_kit::component::h_flex()
         .mt(px(6.))
         .gap(px(8.))
         .children(pill)
         .children(copy)
         .children(fork)
-        .children((!streaming).then(|| timestamp(this, format!("time:{id}").into(), updated_at, t, cx)).flatten())
+        .children(time.map(|time| hidden(time, reveal)))
 }
 
 /// The "Edit from here?" confirmation (`ChatOverlayHosts`).
