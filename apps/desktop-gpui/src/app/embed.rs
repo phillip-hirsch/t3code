@@ -423,6 +423,7 @@ impl super::Workspace {
     /// Starts the frame's embeds before anything draws: what covers each layer, and the pages'
     /// own upkeep.
     pub(super) fn begin_embed_frame(&mut self, window: &mut Window, cx: &mut gpui_kit::Context<Self>) {
+        self.release_left_image_viewer();
         let over_everything = self.settings.is_some()
             || self.palette.is_some()
             || self.image_viewer_open()
