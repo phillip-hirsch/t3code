@@ -643,6 +643,7 @@ impl Workspace {
             || self.shell.older_settled(&environment).is_some();
         let has_runtime = Facts::new(thread, &std::collections::HashMap::new()).runtime_status().is_some();
         let project_root = removable.map(|p| p.workspace_root.clone());
+        let side_chats = self.listed_side_chats(&environment, &key.id);
         let key = key.clone();
         let thread_id = key.id.clone();
         cx.spawn_in(window, async move |this, cx| {
@@ -689,6 +690,7 @@ impl Workspace {
                 if was_open {
                     this.land_after_delete(&key, fallback, window, cx);
                 }
+                this.forget_deleted_thread(&environment, &thread_id, &side_chats, cx);
                 remove && this.env_grants(&environment, "source-control:write")
             });
             let (Some(path), Some(root), Ok(true)) = (orphan.filter(|_| remove), project_root, removing) else {
@@ -1236,7 +1238,7 @@ impl ThreadMenu {
             let (view, id) = (view.clone(), self.thread.clone());
             menu = menu.submenu("Auto-settle behavior", window, cx, move |menu, _, cx| {
                 let mut menu = native_rows(menu, cx);
-                for (label, on) in [("Enabled", true), ("Disabled", false)] {
+                for (label, on) in [("Follow settings", true), ("Never", false)] {
                     let (view, id) = (view.clone(), id.clone());
                     menu = menu.item(PopupMenuItem::new(label).checked(enabled == on).on_click(move |_, _, cx| {
                         let _ = view.update(cx, |this, cx| {

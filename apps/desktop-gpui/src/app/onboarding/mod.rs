@@ -101,9 +101,9 @@ impl Workspace {
         )
     }
 
-    /// `FirstRunGate`'s inputs, read from the primary session, every environment's shell and
-    /// this device's settings.
-    fn first_run_evidence(&self) -> Evidence {
+    /// `FirstRunGate`'s inputs, read from the primary session, every environment's shell, the
+    /// saved environments and this device's settings.
+    fn first_run_evidence(&self, cx: &gpui_kit::App) -> Evidence {
         let hydrated = !self.client_settings.read_failed;
         let completed = completed(&self.client_settings);
         let primary = self.primary_environment().map(SharedString::as_ref);
@@ -134,8 +134,8 @@ impl Workspace {
                 .chain(threads.iter().map(|t| &t.environment_id))
                 .all(|id| live(id)),
             workspace_provenance_authoritative: Welcome::provenance_authoritative(self.onboarding.welcome.as_ref()),
-            // Saved environments load from disk before the window opens.
-            catalog_ready: true,
+            // The saved environments are read off the UI thread; until then nothing is decided.
+            catalog_ready: !self.saved_environments.read(cx).loading(),
             server_config_available: !info.config.is_null(),
             workspace_fresh,
             project_count: projects.len(),
@@ -146,7 +146,7 @@ impl Workspace {
     /// Moves the gate with the latest evidence, records setup as finished once a used workspace
     /// is confirmed, and runs the timeout while the decision waits on a connected server.
     pub(super) fn follow_first_run(&mut self, cx: &mut Context<Self>) {
-        let evidence = self.first_run_evidence();
+        let evidence = self.first_run_evidence(cx);
         if !evidence.hydrated {
             return;
         }

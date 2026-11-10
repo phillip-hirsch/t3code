@@ -92,10 +92,45 @@ struct Pane {
     _events: Subscription,
 }
 
+/// A drawer's thread on its environment (`scopedThreadKey`); thread ids repeat across environments.
+/// An older build saved drawers by thread id alone: those have no environment until one adopts them.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct DrawerKey {
+    env: Option<String>,
+    thread_id: String,
+}
+
+impl DrawerKey {
+    fn new(env: &str, thread_id: &str) -> Self {
+        Self { env: Some(env.to_owned()), thread_id: thread_id.to_owned() }
+    }
+
+    /// The drawer an older build saved for this thread.
+    fn legacy(&self) -> Self {
+        Self { env: None, thread_id: self.thread_id.clone() }
+    }
+
+    /// The web's `environmentId:threadId`; a legacy drawer keeps its bare thread id.
+    fn stored(&self) -> String {
+        match &self.env {
+            Some(env) => format!("{env}:{}", self.thread_id),
+            None => self.thread_id.clone(),
+        }
+    }
+
+    /// `parseScopedThreadKey`, else a legacy thread id.
+    fn parse(key: &str) -> Self {
+        match key.split_once(':').filter(|(env, thread_id)| !env.is_empty() && !thread_id.is_empty()) {
+            Some((env, thread_id)) => Self::new(env, thread_id),
+            None => Self { env: None, thread_id: key.to_owned() },
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Terminals {
-    /// By thread; changed through [`Terminals::drawer`] and [`Terminals::drawer_mut`].
-    drawers: HashMap<String, DrawerLayout>,
+    /// Changed through [`Terminals::drawer`] and [`Terminals::drawer_mut`].
+    drawers: HashMap<DrawerKey, DrawerLayout>,
     drawers_changed: bool,
     /// The drawers as last saved (`t3code:terminal-state:v1`).
     persisted: Value,
@@ -104,7 +139,9 @@ pub(super) struct Terminals {
     panes: HashMap<String, Pane>,
     /// Hidden threads' open drawer sessions, kept so switching back finds them as they were;
     /// least recently shown first.
-    parked: Vec<(String, HashMap<String, Pane>)>,
+    parked: Vec<(DrawerKey, HashMap<String, Pane>)>,
+    /// The drawer whose sessions `panes` holds.
+    mounted: Option<DrawerKey>,
     /// By thread, in server order; `None` until the first snapshot.
     summaries: Option<HashMap<String, Vec<Summary>>>,
     /// The environment whose metadata stream reported each thread's terminals.
@@ -152,22 +189,18 @@ fn drawers_path() -> Option<PathBuf> {
 }
 
 /// The stored drawers, normalized; a missing or unreadable file restores none.
-fn read_drawers(path: &Path) -> HashMap<String, DrawerLayout> {
+fn read_drawers(path: &Path) -> HashMap<DrawerKey, DrawerLayout> {
     let stored: HashMap<String, DrawerLayout> =
         std::fs::read(path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
-    stored.into_iter().map(|(thread_id, drawer)| (thread_id, drawer.restored())).collect()
+    stored.into_iter().map(|(key, drawer)| (DrawerKey::parse(&key), drawer.restored())).collect()
 }
 
-/// The drawers that differ from the default, by thread id.
-fn stored_drawers(drawers: &HashMap<String, DrawerLayout>) -> Value {
-    let mut stored: Vec<(&String, &DrawerLayout)> =
-        drawers.iter().filter_map(|(thread_id, drawer)| Some((thread_id, drawer.stored()?))).collect();
-    stored.sort_by_key(|(thread_id, _)| *thread_id);
-    stored
-        .into_iter()
-        .map(|(thread_id, drawer)| (thread_id.clone(), json!(drawer)))
-        .collect::<serde_json::Map<_, _>>()
-        .into()
+/// The drawers that differ from the default, by [`DrawerKey::stored`].
+fn stored_drawers(drawers: &HashMap<DrawerKey, DrawerLayout>) -> Value {
+    let mut stored: Vec<(String, &DrawerLayout)> =
+        drawers.iter().filter_map(|(key, drawer)| Some((key.stored(), drawer.stored()?))).collect();
+    stored.sort_by(|(a, _), (b, _)| a.cmp(b));
+    stored.into_iter().map(|(key, drawer)| (key, json!(drawer))).collect::<serde_json::Map<_, _>>().into()
 }
 
 impl Terminals {
@@ -186,14 +219,30 @@ impl Terminals {
         self.focus_pending.take().filter(|(pending, _)| pending == thread_id).map(|(_, terminal_id)| terminal_id)
     }
 
-    fn drawer(&mut self, thread_id: String) -> &mut DrawerLayout {
-        self.drawers_changed = true;
-        self.drawers.entry(thread_id).or_default()
+    /// `key`'s drawer, else the one an older build saved for its thread.
+    fn drawer_ref(&self, key: &DrawerKey) -> Option<&DrawerLayout> {
+        self.drawers.get(key).or_else(|| self.drawers.get(&key.legacy()))
     }
 
-    fn drawer_mut(&mut self, thread_id: &str) -> Option<&mut DrawerLayout> {
+    /// The first environment to change a thread's drawer takes over the one an older build saved.
+    fn adopt(&mut self, key: &DrawerKey) {
+        if !self.drawers.contains_key(key)
+            && let Some(legacy) = self.drawers.remove(&key.legacy())
+        {
+            self.drawers.insert(key.clone(), legacy);
+        }
+    }
+
+    fn drawer(&mut self, key: &DrawerKey) -> &mut DrawerLayout {
         self.drawers_changed = true;
-        self.drawers.get_mut(thread_id)
+        self.adopt(key);
+        self.drawers.entry(key.clone()).or_default()
+    }
+
+    fn drawer_mut(&mut self, key: &DrawerKey) -> Option<&mut DrawerLayout> {
+        self.drawers_changed = true;
+        self.adopt(key);
+        self.drawers.get_mut(key)
     }
 
     /// Saves the drawers once they settle, if they changed since the last save.
@@ -214,6 +263,68 @@ impl Terminals {
                 log::warn!("could not save {}: {error}", path.display());
             }
         }));
+    }
+
+    /// `clearTerminalUiState`: a deleted thread's drawer goes back to its default.
+    pub(super) fn forget_thread(&mut self, env: &str, thread_id: &str, cx: &App) {
+        if self.remove_drawer(&DrawerKey::new(env, thread_id)) {
+            self.persist(cx);
+        }
+    }
+
+    /// Drops `key`'s drawer only: another environment's and an unadopted legacy one stay.
+    fn remove_drawer(&mut self, key: &DrawerKey) -> bool {
+        if self.drawers.remove(key).is_none() {
+            return false;
+        }
+        self.drawers_changed = true;
+        self.parked.retain(|(parked, _)| parked != key);
+        true
+    }
+
+    /// Mounted drawers follow the server's terminal list (`PersistentThreadTerminalDrawer`), each
+    /// for the environment that reported its thread's terminals.
+    fn reconcile(&mut self, shown: Option<&DrawerKey>) {
+        if self.summaries.is_none() {
+            return;
+        }
+        // The shown thread's view while it still falls back to an older build's drawer.
+        let fallback = shown.filter(|key| !self.drawers.contains_key(key));
+        let keys: Vec<DrawerKey> = self.drawers.keys().cloned().collect();
+        for key in keys {
+            // An unreported thread's list is empty, which never changes a drawer.
+            let Some(reporter) = self.summary_environments.get(&key.thread_id) else { continue };
+            let owner = DrawerKey::new(reporter, &key.thread_id);
+            let open = self.drawers[&key].open;
+            let reconciled = match key.env {
+                Some(_) => key == owner && (open || shown == Some(&key)),
+                // An older build's drawer stands in for the reporter's until a change adopts it.
+                None => match fallback.filter(|viewer| viewer.thread_id == key.thread_id) {
+                    Some(viewer) => *viewer == owner,
+                    None => open && !self.drawers.contains_key(&owner),
+                },
+            };
+            if !reconciled {
+                continue;
+            }
+            // A panel tab's terminals stay out of the drawer.
+            let in_panel = |id: &str| {
+                self.panel.values().any(|g| g.thread_id == key.thread_id && g.terminal_ids.iter().any(|t| t == id))
+            };
+            let ids: Vec<String> = self
+                .summaries(&key.thread_id)
+                .iter()
+                .filter(|s| !in_panel(&s.terminal_id))
+                .map(|s| s.terminal_id.clone())
+                .collect();
+            let Some(drawer) = self.drawers.get_mut(&key) else { continue };
+            let before = key.env.is_none().then(|| drawer.clone());
+            drawer.reconcile(&ids);
+            if before.is_some_and(|before| before != *drawer) {
+                self.adopt(&owner);
+            }
+        }
+        self.drawers_changed = true;
     }
 
     /// The thread id `draft` launches with, if its terminal drawer used one.
@@ -292,10 +403,10 @@ impl Terminals {
     }
 }
 
-/// Keeps `value` as `thread_id`'s, the most recent of at most `max`.
-fn park<T>(parked: &mut Vec<(String, T)>, thread_id: String, value: T, max: usize) {
-    parked.retain(|(id, _)| *id != thread_id);
-    parked.push((thread_id, value));
+/// Keeps `value` as `key`'s, the most recent of at most `max`.
+fn park<K: PartialEq, T>(parked: &mut Vec<(K, T)>, key: K, value: T, max: usize) {
+    parked.retain(|(id, _)| *id != key);
+    parked.push((key, value));
     let excess = parked.len().saturating_sub(max);
     parked.drain(..excess);
 }
@@ -335,6 +446,35 @@ impl Workspace {
         }
     }
 
+    /// `thread_id`'s drawer key: on the open target's environment when it shows the thread, else
+    /// on the environment that lists it.
+    fn drawer_key(&self, thread_id: &str) -> DrawerKey {
+        let env = match &self.target {
+            Some(target) if self.shown_terminal_thread() == Some(thread_id) => Some(target.environment().clone()),
+            _ => self.thread_environment(thread_id),
+        };
+        DrawerKey { env: env.map(|env| env.to_string()), thread_id: thread_id.to_owned() }
+    }
+
+    fn shown_drawer_key(&self) -> Option<DrawerKey> {
+        self.shown_terminal_thread().map(|thread_id| self.drawer_key(thread_id))
+    }
+
+    /// The shown thread's drawer, if it has one.
+    fn shown_drawer(&self) -> Option<&DrawerLayout> {
+        self.terminals.drawer_ref(&self.shown_drawer_key()?)
+    }
+
+    fn terminal_drawer(&mut self, thread_id: &str) -> &mut DrawerLayout {
+        let key = self.drawer_key(thread_id);
+        self.terminals.drawer(&key)
+    }
+
+    fn terminal_drawer_mut(&mut self, thread_id: &str) -> Option<&mut DrawerLayout> {
+        let key = self.drawer_key(thread_id);
+        self.terminals.drawer_mut(&key)
+    }
+
     /// Where new terminals start: the thread's worktree, else its project root.
     fn terminal_launch(&self) -> Option<Launch> {
         let (project_id, worktree_path) = match self.target.as_ref()? {
@@ -366,7 +506,7 @@ impl Workspace {
     }
 
     pub(super) fn terminal_open(&self) -> bool {
-        self.shown_terminal_thread().and_then(|id| self.terminals.drawers.get(id)).is_some_and(|d| d.open)
+        self.shown_drawer().is_some_and(|d| d.open)
     }
 
     /// Streams one environment's terminal list and reattaches the shown terminals that run there.
@@ -389,48 +529,28 @@ impl Workspace {
                 this.notify_sidebar(cx);
             },
         );
-        let parked = self.terminals.parked.iter().flat_map(|(_, panes)| panes.values());
-        for pane in self.terminals.panes.values().chain(parked) {
-            let thread_id = &pane.session.read(cx).thread_id;
-            if self.thread_environment(thread_id).as_ref() == Some(&environment) {
-                pane.session.update(cx, |session, cx| session.attach(client.clone(), cx));
+        let terminals = &self.terminals;
+        let mounted = terminals.mounted.iter().map(|key| (key, &terminals.panes));
+        for (key, panes) in mounted.chain(terminals.parked.iter().map(|(key, panes)| (key, panes))) {
+            if key.env.as_deref() == Some(environment.as_ref()) {
+                for pane in panes.values() {
+                    pane.session.update(cx, |session, cx| session.attach(client.clone(), cx));
+                }
             }
         }
         self.reattach_setup_terminal(&environment, client, cx);
         task
     }
 
-    /// Mounted drawers follow the server's terminal list (`PersistentThreadTerminalDrawer`).
     fn reconcile_terminals(&mut self) {
-        let shown = self.shown_terminal_thread().map(str::to_owned);
-        let Some(all) = &self.terminals.summaries else { return };
-        for (thread_id, drawer) in &mut self.terminals.drawers {
-            if !drawer.open && shown.as_ref() != Some(thread_id) {
-                continue;
-            }
-            // A panel tab's terminals stay out of the drawer.
-            let in_panel = |id: &str| {
-                self.terminals
-                    .panel
-                    .values()
-                    .any(|g| g.thread_id == *thread_id && g.terminal_ids.iter().any(|t| t == id))
-            };
-            let ids: Vec<String> = all
-                .get(thread_id)
-                .into_iter()
-                .flatten()
-                .filter(|s| !in_panel(&s.terminal_id))
-                .map(|s| s.terminal_id.clone())
-                .collect();
-            drawer.reconcile(&ids);
-        }
-        self.terminals.drawers_changed = true;
+        let shown = self.shown_drawer_key();
+        self.terminals.reconcile(shown.as_ref());
     }
 
     /// `toggleTerminalVisibility`.
     pub(super) fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(thread_id) = self.terminal_thread(true) else { return };
-        let drawer = self.terminals.drawer(thread_id.clone());
+        let drawer = self.terminal_drawer(&thread_id);
         if drawer.open {
             drawer.open = false;
             self.focus_composer(window, cx);
@@ -438,12 +558,12 @@ impl Workspace {
             // A setup or agent-started shell already runs: show it instead of starting another.
             match self.terminals.drawer_reuse(&thread_id) {
                 Some(id) => {
-                    self.terminals.drawer(thread_id.clone()).ensure(&id);
+                    self.terminal_drawer(&thread_id).ensure(&id);
                     self.terminals.focus_later(&thread_id, &id);
                 }
                 // Without the grant the drawer opens on its empty state.
                 None if !self.terminal_operable(&thread_id) => {
-                    self.terminals.drawer(thread_id).open = true;
+                    self.terminal_drawer(&thread_id).open = true;
                 }
                 None => self.launch_terminal(thread_id, Place::New, cx),
             }
@@ -457,13 +577,13 @@ impl Workspace {
 
     fn open_drawer_for_action(&mut self) -> Option<String> {
         let thread_id = self.terminal_thread(true)?;
-        self.terminals.drawer(thread_id.clone()).open = true;
+        self.terminal_drawer(&thread_id).open = true;
         Some(thread_id)
     }
 
     fn split_terminal(&mut self, split: Split, cx: &mut Context<Self>) {
         let Some(thread_id) = self.open_drawer_for_action() else { return };
-        if self.terminals.drawers.get(&thread_id).is_some_and(DrawerLayout::split_limit_reached) {
+        if self.terminals.drawer_ref(&self.drawer_key(&thread_id)).is_some_and(DrawerLayout::split_limit_reached) {
             return;
         }
         self.launch_terminal(thread_id, Place::Split(split), cx);
@@ -492,7 +612,7 @@ impl Workspace {
         launch.stop_on_settle = Some(run.stop_on_settle);
         let input = format!(" {}\r", run.command);
         let running: Vec<String> = self.terminals.running(&thread_id).into_iter().map(str::to_owned).collect();
-        let drawer = self.terminals.drawer(thread_id.clone());
+        let drawer = self.terminal_drawer(&thread_id);
         let idle: Vec<&String> = drawer.terminal_ids.iter().filter(|id| !running.contains(id)).collect();
         let reuse = idle.iter().find(|id| ***id == drawer.active_id).or(idle.first()).map(|id| (*id).clone());
         let written = match reuse.filter(|_| !run.stop_on_settle) {
@@ -532,7 +652,7 @@ impl Workspace {
             return Task::ready(false);
         }
         let terminal_id = self.next_terminal_id(&thread_id);
-        if !self.terminals.drawer(thread_id.clone()).place(&terminal_id, place) {
+        if !self.terminal_drawer(&thread_id).place(&terminal_id, place) {
             return Task::ready(false);
         }
         self.open_terminal_session(thread_id, terminal_id, launch, then_write, cx)
@@ -540,7 +660,8 @@ impl Workspace {
 
     /// A terminal id no drawer, panel tab or server session of the thread uses yet.
     fn next_terminal_id(&self, thread_id: &str) -> String {
-        let drawer_ids = self.terminals.drawers.get(thread_id).map(|d| d.terminal_ids.clone()).unwrap_or_default();
+        let drawer_ids =
+            self.terminals.drawer_ref(&self.drawer_key(thread_id)).map(|d| d.terminal_ids.clone()).unwrap_or_default();
         let panel_ids = self.terminals.panel_ids(thread_id);
         let known = self.terminals.summaries(thread_id).iter().map(|s| s.terminal_id.as_str());
         let suffix = self.terminals.summaries.is_none().then(super::new_id);
@@ -590,7 +711,7 @@ impl Workspace {
 
     fn activate_terminal(&mut self, terminal_id: &str, cx: &mut Context<Self>) {
         let Some(thread_id) = self.shown_terminal_thread().map(str::to_owned) else { return };
-        if let Some(drawer) = self.terminals.drawer_mut(&thread_id) {
+        if let Some(drawer) = self.terminal_drawer_mut(&thread_id) {
             drawer.set_active(terminal_id);
             self.terminals.focus_later(&thread_id, terminal_id);
             cx.notify();
@@ -599,14 +720,14 @@ impl Workspace {
 
     /// `confirmTerminalClose`, then [`Self::close_terminal`].
     fn request_close_terminal(&mut self, terminal_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(thread_id) = self.shown_terminal_thread().map(str::to_owned) else { return };
-        if !self.terminal_operable(&thread_id) {
+        let Some(key) = self.shown_drawer_key() else { return };
+        if !self.terminal_operable(&key.thread_id) {
             return;
         }
-        let label = self.terminals.label(&thread_id, &terminal_id);
+        let label = self.terminals.label(&key.thread_id, &terminal_id);
         let workspace = cx.weak_entity();
         window.open_alert_dialog(cx, move |alert, _, _| {
-            let (workspace, thread_id, terminal_id) = (workspace.clone(), thread_id.clone(), terminal_id.clone());
+            let (workspace, key, terminal_id) = (workspace.clone(), key.clone(), terminal_id.clone());
             alert
                 .title(format!("Close terminal \"{label}\"?"))
                 .description("This stops the running process and clears its history.")
@@ -617,13 +738,12 @@ impl Workspace {
                 .width(px(512.))
                 .on_ok(move |_, window, cx| {
                     // After the dialog hands focus back, so the next terminal can take it.
-                    let (workspace, thread_id, terminal_id) =
-                        (workspace.clone(), thread_id.clone(), terminal_id.clone());
+                    let (workspace, key, terminal_id) = (workspace.clone(), key.clone(), terminal_id.clone());
                     window.defer(cx, move |_, cx| {
                         // The grant is read again: it may have changed while the dialog was open.
                         let _ = workspace.update(cx, |this, cx| {
-                            if this.terminal_operable(&thread_id) {
-                                this.close_terminal(&thread_id, &terminal_id, cx);
+                            if this.terminal_operable(&key.thread_id) {
+                                this.close_terminal(&key, &terminal_id, cx);
                             }
                         });
                     });
@@ -633,11 +753,12 @@ impl Workspace {
     }
 
     /// Ends the session and deletes its history; a failed close types `exit`.
-    fn close_terminal(&mut self, thread_id: &str, terminal_id: &str, cx: &mut Context<Self>) {
+    fn close_terminal(&mut self, key: &DrawerKey, terminal_id: &str, cx: &mut Context<Self>) {
+        let thread_id = key.thread_id.as_str();
         self.close_panel_terminal(thread_id, terminal_id);
         // Only a shown drawer hands focus on, as the web's `visible` guard does.
-        let shown = self.shown_terminal_thread() == Some(thread_id);
-        if let Some(drawer) = self.terminals.drawer_mut(thread_id) {
+        let shown = self.shown_drawer_key().as_ref() == Some(key);
+        if let Some(drawer) = self.terminals.drawer_mut(key) {
             drawer.close(terminal_id);
             if drawer.open && shown {
                 let active = drawer.active_id.clone();
@@ -660,11 +781,11 @@ impl Workspace {
 
     /// Parks the sessions of a thread that stopped showing while its drawer is open, unparks the
     /// shown thread's, and drops parked threads whose drawers closed.
-    fn park_terminal_panes(&mut self, shown_thread: Option<&str>, cx: &App) {
+    fn park_terminal_panes(&mut self, shown: Option<&DrawerKey>) {
         let terminals = &mut self.terminals;
-        let previous = terminals.panes.values().next().map(|pane| pane.session.read(cx).thread_id.clone());
-        if let Some(previous) = previous.filter(|previous| Some(previous.as_str()) != shown_thread) {
-            let group = terminals.drawers.get(&previous).filter(|d| d.open).and_then(|d| d.active_group());
+        let previous = std::mem::replace(&mut terminals.mounted, shown.cloned());
+        if let Some(previous) = previous.filter(|previous| Some(previous) != shown) {
+            let group = terminals.drawer_ref(&previous).filter(|d| d.open).and_then(|d| d.active_group());
             let ids = group.map(|group| group.terminal_ids.clone()).unwrap_or_default();
             let mut panes = std::mem::take(&mut terminals.panes);
             panes.retain(|id, _| ids.contains(id));
@@ -672,35 +793,36 @@ impl Workspace {
                 park(&mut terminals.parked, previous, panes, MAX_HIDDEN_THREADS);
             }
         }
-        if let Some(shown) = shown_thread
-            && let Some(index) = terminals.parked.iter().position(|(thread_id, _)| thread_id == shown)
+        if let Some(shown) = shown
+            && let Some(index) = terminals.parked.iter().position(|(key, _)| key == shown)
         {
             terminals.panes.extend(terminals.parked.remove(index).1);
         }
-        let drawers = &terminals.drawers;
-        terminals.parked.retain(|(thread_id, _)| drawers.get(thread_id).is_some_and(|d| d.open));
+        let mut parked = std::mem::take(&mut terminals.parked);
+        parked.retain(|(key, _)| terminals.drawer_ref(key).is_some_and(|d| d.open));
+        terminals.parked = parked;
     }
 
     /// Mounts sessions for the shown group and unmounts the rest (hidden threads' open drawers are
     /// parked). Unmounted terminals keep running on the server and replay their history on return.
     fn sync_terminal_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let thread_id = self.shown_terminal_thread().map(str::to_owned);
-        let shown: Vec<String> = match (&thread_id, self.page) {
-            (Some(thread_id), None) => self
+        let key = self.shown_drawer_key();
+        let thread_id = key.as_ref().map(|key| key.thread_id.clone());
+        let shown: Vec<String> = match (&key, self.page) {
+            (Some(key), None) => self
                 .terminals
-                .drawers
-                .get(thread_id)
+                .drawer_ref(key)
                 .filter(|d| d.open)
                 .and_then(|d| d.active_group())
                 .map(|group| group.terminal_ids.clone())
                 .unwrap_or_default()
                 .into_iter()
-                .chain(self.shown_panel_terminals(thread_id))
+                .chain(self.shown_panel_terminals(&key.thread_id))
                 .collect(),
             _ => Vec::new(),
         };
         self.terminals.persist(cx);
-        self.park_terminal_panes(thread_id.as_deref().filter(|_| self.page.is_none()), cx);
+        self.park_terminal_panes(key.as_ref().filter(|_| self.page.is_none()));
         let thread_id = thread_id.unwrap_or_default();
         self.terminals.panes.retain(|id, pane| shown.contains(id) && pane.session.read(cx).thread_id == thread_id);
         for terminal_id in &shown {
@@ -719,12 +841,11 @@ impl Workspace {
             let (thread, terminal) = (thread_id.clone(), terminal_id.clone());
             let read_only = !self.terminal_operable(&thread_id);
             let session = cx.new(|cx| TerminalSession::new(thread, terminal, launch, client, read_only, window, cx));
-            let _events = cx.subscribe_in(&session, window, |this, session, event: &SessionEvent, window, cx| {
-                let (thread_id, terminal_id) = {
-                    let session = session.read(cx);
-                    (session.thread_id.clone(), session.terminal_id.clone())
-                };
-                this.on_session_event(&thread_id, &terminal_id, event, window, cx);
+            // Its drawer's key, kept while it is parked behind a same-id thread on another environment.
+            let Some(owner) = key.clone() else { continue };
+            let _events = cx.subscribe_in(&session, window, move |this, session, event: &SessionEvent, window, cx| {
+                let terminal_id = session.read(cx).terminal_id.clone();
+                this.on_session_event(&owner, &terminal_id, event, window, cx);
             });
             self.terminals.panes.insert(terminal_id.clone(), Pane { session, _events });
         }
@@ -747,8 +868,7 @@ impl Workspace {
 
     /// Focuses the open drawer's active terminal: the terminal stop of the F6 cycle.
     pub(super) fn focus_terminal_drawer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(thread_id) = self.shown_terminal_thread() else { return false };
-        let Some(drawer) = self.terminals.drawers.get(thread_id).filter(|d| d.open) else { return false };
+        let Some(drawer) = self.shown_drawer().filter(|d| d.open) else { return false };
         let Some(pane) = self.terminals.panes.get(&drawer.active_id) else { return false };
         let focus = pane.session.read(cx).focus.clone();
         focus.focus(window, cx);
@@ -757,22 +877,25 @@ impl Workspace {
 
     fn on_session_event(
         &mut self,
-        thread_id: &str,
+        key: &DrawerKey,
         terminal_id: &str,
         event: &SessionEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let thread_id = key.thread_id.as_str();
         match event {
             // `handleSessionExited`: only a client that may operate the terminal cleans it up.
             SessionEvent::Exited if self.terminal_operable(thread_id) => {
-                self.close_terminal(thread_id, terminal_id, cx);
+                self.close_terminal(key, terminal_id, cx);
             }
             SessionEvent::Exited => {}
             SessionEvent::Activated => {
                 self.activate_panel_terminal(thread_id, terminal_id, cx);
-                if let Some(drawer) = self.terminals.drawer_mut(thread_id)
-                    && drawer.active_id != terminal_id
+                // Only a focus that changes the drawer adopts one an older build saved: not the
+                // active terminal again, and not a panel tab's terminal the drawer does not hold.
+                if self.terminals.drawer_ref(key).is_some_and(|d| d.activates(terminal_id))
+                    && let Some(drawer) = self.terminals.drawer_mut(key)
                 {
                     drawer.set_active(terminal_id);
                     cx.notify();
@@ -839,8 +962,7 @@ impl Workspace {
                 cx.listener(|this, action: &super::RunInTerminal, window, cx| this.run_in_terminal(action, window, cx)),
             )
             .on_action(cx.listener(|this, _: &CloseTerminal, window, cx| {
-                let active =
-                    this.shown_terminal_thread().and_then(|id| this.terminals.drawers.get(id)).filter(|d| d.open);
+                let active = this.shown_drawer().filter(|d| d.open);
                 if let Some(active) = active.map(|d| d.active_id.clone()).filter(|id| !id.is_empty()) {
                     this.request_close_terminal(active, window, cx);
                 }
@@ -851,7 +973,7 @@ impl Workspace {
     pub(super) fn render_terminal_drawer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         self.sync_terminal_panes(window, cx);
         let thread_id = self.shown_terminal_thread()?.to_owned();
-        let drawer = self.terminals.drawers.get(&thread_id).filter(|d| d.open)?;
+        let drawer = self.shown_drawer().filter(|d| d.open)?;
         let tokens = *theme::tokens(cx);
         let border = tokens.border.opacity(0.8);
         let viewport = window.viewport_size().height;
@@ -935,7 +1057,7 @@ impl Workspace {
                 .on_drag_move(cx.listener(move |this, event: &DragMoveEvent<DrawerResize>, _, cx| {
                     let Some(thread_id) = this.shown_terminal_thread().map(str::to_owned) else { return };
                     let height = f32::from(event.bounds.bottom() - event.event.position.y).round();
-                    if let Some(drawer) = this.terminals.drawer_mut(&thread_id) {
+                    if let Some(drawer) = this.terminal_drawer_mut(&thread_id) {
                         drawer.height = height.clamp(MIN_DRAWER_HEIGHT, max);
                         cx.notify();
                     }
@@ -1364,7 +1486,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.select_thread(thread_id.clone(), window, cx);
-        self.terminals.drawer(thread_id.clone()).ensure(&terminal_id);
+        self.terminal_drawer(&thread_id).ensure(&terminal_id);
         self.terminals.focus_later(&thread_id, &terminal_id);
         cx.notify();
     }
@@ -1465,20 +1587,82 @@ mod tests {
     #[test]
     fn drawers_survive_a_relaunch_and_default_ones_are_not_stored() {
         let mut drawers = HashMap::new();
-        drawers.insert("closed".to_owned(), DrawerLayout::default());
+        drawers.insert(DrawerKey::new("a", "closed"), DrawerLayout::default());
         let mut open = DrawerLayout::default();
         open.place("term-1", Place::New);
-        drawers.insert("thread".to_owned(), open.clone());
+        drawers.insert(DrawerKey::new("a", "thread"), open.clone());
         let stored = stored_drawers(&drawers);
-        assert_eq!(stored.as_object().unwrap().keys().collect::<Vec<_>>(), ["thread"]);
+        assert_eq!(stored.as_object().unwrap().keys().collect::<Vec<_>>(), ["a:thread"]);
 
         let dir = std::env::temp_dir().join(format!("t3-gpui-terminal-state-{}", std::process::id()));
         let path = dir.join("terminal-state.json");
         assert!(read_drawers(&path).is_empty());
         crate::settings::write_atomically(&path, &stored).unwrap();
-        assert_eq!(read_drawers(&path), HashMap::from([("thread".to_owned(), open)]));
+        assert_eq!(read_drawers(&path), HashMap::from([(DrawerKey::new("a", "thread"), open.clone())]));
+
+        // An older build's file keys drawers by thread id alone; they stay unowned.
+        let old = json!({"thread": {"terminalOpen": true, "terminalIds": ["term-1"], "activeTerminalId": "term-1"}});
+        crate::settings::write_atomically(&path, &old).unwrap();
+        let restored = read_drawers(&path);
+        let legacy = DrawerKey { env: None, thread_id: "thread".to_owned() };
+        assert_eq!(restored[&legacy].terminal_ids, ["term-1"]);
+        assert_eq!(stored_drawers(&restored).as_object().unwrap().keys().collect::<Vec<_>>(), ["thread"]);
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn same_id_threads_on_two_environments_keep_their_own_drawers() {
+        let (a, b) = (DrawerKey::new("a", "t"), DrawerKey::new("b", "t"));
+        let mut terminals = Terminals::default();
+        terminals.drawer(&a).place("term-1", Place::New);
+        terminals.drawer(&b).height = 420.;
+        assert_eq!(terminals.drawer_ref(&a).unwrap().height, DrawerLayout::default().height);
+        assert!(terminals.drawer_ref(&b).unwrap().terminal_ids.is_empty());
+
+        assert!(terminals.remove_drawer(&a));
+        assert!(terminals.drawer_ref(&a).is_none());
+        assert_eq!(terminals.drawer_ref(&b).unwrap().height, 420.);
+        assert_eq!(stored_drawers(&terminals.drawers).as_object().unwrap().keys().collect::<Vec<_>>(), ["b:t"]);
+    }
+
+    #[test]
+    fn an_older_builds_drawer_is_adopted_by_the_first_environment_to_change_it() {
+        let legacy = DrawerKey { env: None, thread_id: "t".to_owned() };
+        let (a, b) = (DrawerKey::new("a", "t"), DrawerKey::new("b", "t"));
+        let mut terminals = Terminals::default();
+        let saved: DrawerLayout = serde_json::from_value(json!({"terminalOpen": true, "terminalHeight": 300})).unwrap();
+        terminals.drawers.insert(legacy.clone(), saved.restored());
+
+        assert!(!terminals.remove_drawer(&a), "an environment that never adopted it leaves it");
+        assert_eq!(terminals.drawer_ref(&b).map(|d| d.height), Some(300.), "the fallback for every environment");
+        terminals.drawer(&b).open = false;
+        assert!(!terminals.drawers.contains_key(&legacy));
+        assert!(terminals.drawer_ref(&a).is_none(), "b owns it now");
+        assert!(terminals.remove_drawer(&b));
+        assert!(terminals.drawers.is_empty());
+    }
+
+    #[test]
+    fn an_older_builds_drawer_is_adopted_only_by_a_reconcile_that_changes_it() {
+        let legacy = DrawerKey { env: None, thread_id: "t".to_owned() };
+        let (a, b) = (DrawerKey::new("a", "t"), DrawerKey::new("b", "t"));
+        let mut terminals = Terminals::default();
+        let saved: DrawerLayout =
+            serde_json::from_value(json!({"terminalOpen": false, "terminalHeight": 300})).unwrap();
+        terminals.drawers.insert(legacy.clone(), saved.restored());
+        let summary = json!({"threadId": "t", "terminalId": "term-1", "hasRunningSubprocess": false, "label": ""});
+        terminals.apply_metadata(&"b".into(), &json!({"type": "snapshot", "terminals": [summary]}));
+
+        terminals.reconcile(Some(&a));
+        assert!(terminals.drawers.contains_key(&legacy), "a viewed it without changing it");
+        assert!(!terminals.remove_drawer(&a));
+        assert_eq!(terminals.drawer_ref(&b).map(|d| d.height), Some(300.), "still b's fallback");
+
+        terminals.reconcile(Some(&b));
+        assert!(!terminals.drawers.contains_key(&legacy));
+        let adopted = terminals.drawer_ref(&b).map(|d| (d.height, d.terminal_ids.clone()));
+        assert_eq!(adopted, Some((300., vec!["term-1".to_owned()])));
     }
 
     #[test]

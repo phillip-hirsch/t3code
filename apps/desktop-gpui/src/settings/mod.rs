@@ -583,4 +583,22 @@ mod tests {
         assert_eq!(settings.theme_id, None);
         std::fs::remove_dir_all(blocker.parent().unwrap()).unwrap();
     }
+
+    #[test]
+    fn a_setting_that_must_land_reports_a_failed_write_and_keeps_the_old_value() {
+        let patch = Map::from_iter([("onboardingCompletedAt".to_owned(), json!("2026-11-09T00:00:00.000Z"))]);
+        let path = scratch("must-land");
+        let mut settings = ClientSettings::load_from(Some(path.clone()));
+        settings.try_apply(&patch).unwrap();
+        let reread = ClientSettings::load_from(Some(path.clone()));
+        assert_eq!(reread.values.get("onboardingCompletedAt"), &json!("2026-11-09T00:00:00.000Z"), "saved to disk");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+
+        let blocker = scratch("must-land-fails");
+        std::fs::write(&blocker, "").unwrap();
+        let mut settings = ClientSettings::from_stored(&json!({}), Some(blocker.join("client-settings.json")));
+        assert!(settings.try_apply(&patch).is_err());
+        assert!(settings.values.get("onboardingCompletedAt").is_null(), "a failed write leaves setup unfinished");
+        std::fs::remove_dir_all(blocker.parent().unwrap()).unwrap();
+    }
 }

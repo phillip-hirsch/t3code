@@ -482,14 +482,11 @@ pub fn pickable(groups: &[ProjectGroup]) -> Vec<&ProjectGroup> {
 }
 
 /// `buildSidebarProjectPickerEntries`: the pickable groups, with the group holding `preferred`
-/// (the current project) leading the unpinned ones; pinned groups stay first.
+/// (the current project) first, even ahead of pinned groups.
 pub fn picker<'g>(groups: &'g [ProjectGroup], preferred: Option<&ProjectShell>) -> Vec<&'g ProjectGroup> {
     let mut entries = pickable(groups);
-    let Some(at) = preferred.and_then(|p| entries.iter().position(|g| g.contains_project(p))) else { return entries };
-    if !entries[at].pinned {
-        let group = entries.remove(at);
-        let pinned = entries.iter().filter(|g| g.pinned).count();
-        entries.insert(pinned, group);
+    if let Some(at) = preferred.and_then(|p| entries.iter().position(|g| g.contains_project(p))) {
+        entries[..=at].rotate_right(1);
     }
     entries
 }
@@ -770,7 +767,7 @@ mod tests {
     }
 
     #[test]
-    fn pickable_groups_drop_archived_and_lead_with_pinned_then_the_current_project() {
+    fn pickable_groups_drop_archived_and_lead_with_the_current_project_then_pinned() {
         let mut pinned = project("p", "/p", Value::Null);
         pinned.pinned_at = Some("2026-11-01T00:00:00.000Z".into());
         let mut archived = project("x", "/x", Value::Null);
@@ -779,11 +776,11 @@ mod tests {
         let groups = build_groups(&projects, &GroupingSettings::default(), &[], true);
         let picked: Vec<&str> = pickable(&groups).iter().map(|g| g.key.as_str()).collect();
         assert_eq!(picked, ["env:/p", "env:/a", "env:/b"]);
-        // The picker moves the current project to the front of the unpinned ones.
+        // The picker moves the current project to the front, ahead of pinned ones.
         let keys = |preferred: Option<&ProjectShell>| {
             picker(&groups, preferred).iter().map(|g| g.key.clone()).collect::<Vec<_>>()
         };
-        assert_eq!(keys(Some(&projects[3])), ["env:/p", "env:/b", "env:/a"]);
+        assert_eq!(keys(Some(&projects[3])), ["env:/b", "env:/p", "env:/a"]);
         assert_eq!(keys(Some(&projects[2])), ["env:/p", "env:/a", "env:/b"]);
         assert_eq!(keys(None), ["env:/p", "env:/a", "env:/b"]);
         // `b` on another machine is another project, not the one in this group.

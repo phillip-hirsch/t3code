@@ -455,7 +455,7 @@ impl Workspace {
             })
     }
 
-    fn authorized_clients(&self, state: &Entity<AccessState>, cx: &App, t: &Tokens) -> AnyElement {
+    fn authorized_clients(&self, state: &Entity<AccessState>, cx: &Context<Self>, t: &Tokens) -> AnyElement {
         static EMPTY: AccessSnapshot = AccessSnapshot { pairing_links: Vec::new(), client_sessions: Vec::new() };
         let s = state.read(cx);
         let (can_read, can_write) = (s.grants(ACCESS_READ), s.grants(ACCESS_WRITE));
@@ -502,7 +502,9 @@ impl Workspace {
                         text_xs(div().min_w_0().truncate().text_color(t.muted_foreground)).child(snapshot.summary()),
                     ),
             )
-            .when(can_write, |el| el.child(self.authorized_clients_actions(state, s, can_read, t)));
+            .when(can_write, |el| {
+                el.child(self.authorized_clients_actions(state, s, can_read, cx.entity().downgrade(), t))
+            });
 
         let mut body: Vec<AnyElement> = Vec::new();
         if !can_read {
@@ -554,14 +556,23 @@ impl Workspace {
         card(rows, t)
     }
 
-    /// `AuthorizedClientsHeaderAction`: "Revoke others" and "Create link".
+    /// `AuthorizedClientsHeaderAction`: "Use in another app (MCP)", "Revoke others" and "Create link".
     fn authorized_clients_actions(
         &self,
         state: &Entity<AccessState>,
         s: &AccessState,
         can_read: bool,
+        workspace: WeakEntity<Workspace>,
         t: &Tokens,
     ) -> AnyElement {
+        let environment = self.settings_environment();
+        let use_in_another_app = WebButton::new("use-in-another-app", "Use in another app (MCP)")
+            .icon(IconName::Plug)
+            .on_click(move |_, window, cx| {
+                let _ = workspace.update(cx, |this, cx| {
+                    this.open_use_in_another_app(environment.as_deref(), window, cx);
+                });
+            });
         let endpoint = self.settings_endpoint().cloned();
         // Unknown sessions keep the button on, as the web does without a snapshot.
         let others =
@@ -600,7 +611,7 @@ impl Workspace {
             }
         };
         let _ = t;
-        h_flex().gap(px(8.)).child(revoke_others).child(create).into_any_element()
+        h_flex().gap(px(8.)).child(use_in_another_app).child(revoke_others).child(create).into_any_element()
     }
 }
 

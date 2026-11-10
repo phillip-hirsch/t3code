@@ -116,7 +116,18 @@ fn key_action_on(
             _ => {}
         }
     }
+    // macOS Option composes the layout's characters, which arrive as text (`ghosttyConsumedMods`).
+    if mac && alt && !ctrl && produces_character(keystroke) {
+        return None;
+    }
     encode(key, ctrl, alt, shift, app_cursor, keystroke.key_char.as_deref()).map(KeyAction::Send)
+}
+
+/// The key types one printable character, or a dead key's base letter.
+fn produces_character(keystroke: &Keystroke) -> bool {
+    let text = keystroke.key_char.as_deref().filter(|c| !c.is_empty()).unwrap_or(&keystroke.key);
+    let mut chars = text.chars();
+    matches!((chars.next(), chars.next()), (Some(c), None) if !c.is_control())
 }
 
 #[expect(clippy::fn_params_excessive_bools, reason = "xterm's modifier bits and cursor-key mode")]
@@ -244,6 +255,24 @@ mod tests {
         assert_eq!(mac("ctrl-c", true), Some(KeyAction::Send("".into())), "Ctrl+C interrupts even over a selection");
         assert_eq!(mac("ctrl-v", false), Some(KeyAction::Send("".into())));
         assert_eq!(mac("shift-pageup", false), Some(KeyAction::Scroll(History::PageUp)));
+    }
+
+    #[test]
+    fn macos_option_text_reaches_the_input_handler() {
+        let typed = |spec: &'static str, text: Option<&str>, mac: bool| {
+            let keystroke = Keystroke { key_char: text.map(str::to_owned), ..key(spec) };
+            key_action_on(&keystroke, false, false, false, mac)
+        };
+        assert_eq!(typed("alt-l", Some("@"), true), None);
+        assert_eq!(typed("alt-shift-a", Some("Å"), true), None);
+        assert_eq!(typed("alt-space", Some("\u{a0}"), true), None);
+        assert_eq!(typed("alt-e", None, true), None, "a dead key composes through the input handler");
+        assert_eq!(typed("alt-enter", Some("\r"), true), Some(KeyAction::Send("\x1b\r".into())));
+        assert_eq!(typed("alt-backspace", None, true), Some(KeyAction::Send("\x1b\x7f".into())));
+        assert_eq!(typed("alt-left", None, true), Some(KeyAction::Send("\x1bb".into())));
+        assert_eq!(typed("ctrl-alt-x", None, true), Some(KeyAction::Send("\x1b\x18".into())));
+        // Alt stays Meta off macOS.
+        assert_eq!(typed("alt-l", Some("l"), false), Some(KeyAction::Send("\x1bl".into())));
     }
 
     fn send(spec: &'static str) -> Option<String> {

@@ -68,6 +68,10 @@ pub(super) struct SideChatView {
 }
 
 impl SideChatView {
+    fn is(&self, env: &str, thread_id: &str) -> bool {
+        self.env == env && self.thread_id == thread_id
+    }
+
     /// The composer, unless a message is being sent from it.
     pub(super) fn ready_composer(&self) -> Option<&Entity<TextareaState>> {
         (!self.sending).then_some(&self.composer)
@@ -81,18 +85,32 @@ pub(super) struct SideChats {
     starting: bool,
     bringing_back: bool,
     deleting: bool,
-    /// Unsent composer text of side chats not on screen, by thread id.
-    drafts: HashMap<String, String>,
+    /// Unsent composer text of side chats not on screen. Ids repeat across environments.
+    drafts: HashMap<Key, String>,
     /// The parent composer's model pick for a side chat that started without a question; its
     /// first message runs on it (`setModelSelection` on the side chat's draft).
-    models: HashMap<String, ModelSelection>,
+    models: HashMap<Key, ModelSelection>,
 }
+
+/// A side chat: its environment and thread id.
+type Key = (SharedString, String);
 
 impl SideChats {
     /// Drops the side chat's stream with the socket it ran on; it subscribes again on reconnect.
     pub(super) fn disconnect(&mut self) {
         if let Some(view) = &mut self.view {
             view._subscription = None;
+        }
+    }
+
+    /// Drops what this client keeps for a deleted side chat. A view still on screen goes without
+    /// saving its text, and the next sync shows the chat as deleted.
+    pub(super) fn forget(&mut self, env: &SharedString, thread_id: &str) {
+        let key = (env.clone(), thread_id.to_owned());
+        self.drafts.remove(&key);
+        self.models.remove(&key);
+        if self.view.as_ref().is_some_and(|view| view.is(env, thread_id)) {
+            self.view = None;
         }
     }
 
@@ -105,10 +123,11 @@ impl SideChats {
             (None, Some((text, ..))) => text,
             (None, None) => view.composer.read(cx).value().to_string(),
         };
+        let key = (view.env, view.thread_id);
         if text.is_empty() {
-            self.drafts.remove(&view.thread_id);
+            self.drafts.remove(&key);
         } else {
-            self.drafts.insert(view.thread_id, text);
+            self.drafts.insert(key, text);
         }
     }
 }
@@ -297,13 +316,13 @@ impl Workspace {
                     _ => None,
                 };
                 match failure {
-                    Some(error) => this.error = Some(error.into()),
+                    Some(error) => this.set_error_for(&origin, error.into()),
                     // The source thread left the screen meanwhile; its tab would open on another
                     // thread's panel, so a side chat that never ran goes.
                     None if this.target.as_ref() != Some(&origin) => delete_unused(cx),
                     None => {
                         if let Some(model) = model.filter(|_| !asked) {
-                            this.side_chat.models.insert(target.clone(), model);
+                            this.side_chat.models.insert((origin.environment().clone(), target.clone()), model);
                         }
                         this.open_surface(Surface::SideChat(target), window, cx);
                         on_started(this, window, cx);
@@ -360,7 +379,9 @@ impl Workspace {
 
     /// `releaseSurfaceResources` for a side chat: the server keeps one that ran or got a message.
     pub(super) fn release_side_chat(&mut self, thread_id: &str, cx: &mut Context<Self>) {
-        self.side_chat.models.remove(thread_id);
+        if let Some(env) = self.active_environment() {
+            self.side_chat.models.remove(&(env.clone(), thread_id.to_owned()));
+        }
         if self.shell_thread(thread_id).is_some() {
             self.dispatch(delete_command(thread_id, true), cx);
         }
@@ -368,19 +389,18 @@ impl Workspace {
 
     /// Subscribes the side chat on screen and drops the one that left it.
     pub(super) fn sync_side_chat(&mut self, shown: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
-        let client = self.client();
+        let (client, env) = (self.client(), self.active_environment().cloned());
         // While the socket is down the view keeps what it last showed.
         if let Some(view) = &self.side_chat.view
             && Some(view.thread_id.as_str()) == shown
+            && Some(&view.env) == env.as_ref()
             && (view._subscription.is_some() || client.is_none())
         {
             return;
         }
         self.side_chat.release_view(cx);
-        let (Some(thread_id), Some(client), Some(env)) = (shown, client, self.active_environment().cloned()) else {
-            return;
-        };
-        let draft = self.side_chat.drafts.remove(thread_id).unwrap_or_default();
+        let (Some(thread_id), Some(client), Some(env)) = (shown, client, env) else { return };
+        let draft = self.side_chat.drafts.remove(&(env.clone(), thread_id.to_owned())).unwrap_or_default();
         let empty = draft.trim().is_empty();
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
@@ -407,19 +427,20 @@ impl Workspace {
         events.push(cx.observe(&scroller, |_, _, cx| cx.notify()));
         let stream = client
             .stream("orchestration.subscribeThread", json!({"threadId": thread_id, "requestCompletionMarker": true}));
-        let (apply_id, batch_id) = (thread_id.to_owned(), thread_id.to_owned());
+        let apply: Key = (env.clone(), thread_id.to_owned());
+        let batch = apply.clone();
         let subscription = Self::pump(
             stream,
             window,
             cx,
             move |this, value| {
-                let Some(view) = this.side_chat.view.as_mut().filter(|v| v.thread_id == apply_id) else { return };
+                let Some(view) = this.side_chat.view.as_mut().filter(|v| v.is(&apply.0, &apply.1)) else { return };
                 if let Err(error) = view.state.apply(value) {
                     log::warn!("bad side chat event: {error}");
                 }
             },
             move |this, window, cx| {
-                if this.side_chat.view.as_ref().is_some_and(|v| v.thread_id == batch_id) {
+                if this.side_chat.view.as_ref().is_some_and(|v| v.is(&batch.0, &batch.1)) {
                     this.refresh_side_chat_rows(cx);
                     this.sync_question(ChatPane::Side, window, cx);
                     this.sync_queue_edit(ChatPane::Side, window, cx);
@@ -517,9 +538,11 @@ impl Workspace {
         } else {
             self.client_settings.values.get("followUpBehavior").as_str().unwrap_or("steer")
         };
-        let model = self.side_chat.models.get(&view.thread_id);
+        let key = (view.env.clone(), view.thread_id.clone());
+        let model = self.side_chat.models.get(&key);
         let command = turn_command(&view.thread_id, &text, running, follow_up, model);
-        let Some((client, thread_id)) = self.pane_client(ChatPane::Side, cx) else { return };
+        let Some((client, _)) = self.pane_client(ChatPane::Side, cx) else { return };
+        let origin = self.target.clone();
         if let Some(view) = self.side_chat.view.as_mut() {
             view.sending = true;
         }
@@ -528,16 +551,17 @@ impl Workspace {
             let result = client.request("orchestration.dispatchCommand", command).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 if result.is_ok() {
-                    this.side_chat.models.remove(&thread_id);
+                    this.side_chat.models.remove(&key);
                 }
-                let Some(view) = this.side_chat.view.as_mut().filter(|v| v.thread_id == thread_id) else { return };
-                view.sending = false;
-                if let Err(error) = result {
+                if let Some(view) = this.side_chat.view.as_mut().filter(|v| v.is(&key.0, &key.1)) {
+                    view.sending = false;
                     // Gives the text back rather than lose it.
-                    if view.composer.read(cx).value().is_empty() {
+                    if result.is_err() && view.composer.read(cx).value().is_empty() {
                         this.set_pane_text(ChatPane::Side, text.clone(), window, cx);
                     }
-                    this.error = Some(error.to_string().into());
+                }
+                if let Err(error) = result {
+                    this.set_error_from(origin.as_ref(), error.to_string().into());
                 }
                 cx.notify();
             });
@@ -616,6 +640,7 @@ impl Workspace {
         if self.side_chat.deleting || !self.side_chat_operable() {
             return;
         }
+        let (Some(client), Some(origin)) = (self.client(), self.target.clone()) else { return };
         let confirm = self.client_settings.values.get("confirmThreadDelete").as_bool() == Some(true);
         let answer = confirm.then(|| {
             let message = format!(
@@ -624,14 +649,12 @@ This permanently clears its conversation history."
             );
             super::confirm::confirm(&message, true, window, cx)
         });
-        let client = self.client();
         cx.spawn_in(window, async move |this, cx| {
             if let Some(answer) = answer
                 && answer.await != Ok(true)
             {
                 return;
             }
-            let Some(client) = client else { return };
             let _ = this.update(cx, |this, cx| {
                 this.side_chat.deleting = true;
                 cx.notify();
@@ -640,7 +663,15 @@ This permanently clears its conversation history."
             let _ = this.update_in(cx, |this, window, cx| {
                 this.side_chat.deleting = false;
                 match result {
-                    Ok(_) => this.close_side_chat_tab(&thread_id, window, cx),
+                    // Closing the tab keeps its unsent text, so the deleted chat's state goes after.
+                    Ok(_) => {
+                        if this.target.as_ref() == Some(&origin) {
+                            this.close_side_chat_tab(&thread_id, window, cx);
+                        } else {
+                            this.drop_surface(&origin, &Surface::SideChat(thread_id.clone()));
+                        }
+                        this.forget_deleted_thread(origin.environment(), &thread_id, &[], cx);
+                    }
                     Err(error) => window.push_notification(
                         Notification::error(error.to_string()).title("Could not delete the side chat"),
                         cx,
@@ -966,7 +997,10 @@ impl Workspace {
     pub(super) fn pane_model(&self, pane: ChatPane) -> Option<&ModelSelection> {
         match pane {
             ChatPane::Main => self.model_override.as_ref(),
-            ChatPane::Side => self.side_chat.models.get(&self.side_chat.view.as_ref()?.thread_id),
+            ChatPane::Side => {
+                let view = self.side_chat.view.as_ref()?;
+                self.side_chat.models.get(&(view.env.clone(), view.thread_id.clone()))
+            }
         }
     }
 
@@ -1188,5 +1222,22 @@ mod tests {
             options: Some(vec![json!({"id": "reasoningEffort", "value": "high"})]),
         };
         assert_eq!(turn_command("t", "hi", false, "steer", Some(&model))["modelSelection"], model.to_json());
+    }
+
+    #[test]
+    fn a_deleted_side_chat_forgets_only_its_environments_draft_and_model() {
+        let (a, b) = (SharedString::from("a"), SharedString::from("b"));
+        let model = ModelSelection { instance_id: "codex".into(), model: "gpt".into(), options: None };
+        let mut side_chats = SideChats::default();
+        for env in [&a, &b] {
+            side_chats.drafts.insert((env.clone(), "side".to_owned()), format!("{env} text"));
+            side_chats.models.insert((env.clone(), "side".to_owned()), model.clone());
+        }
+        side_chats.forget(&a, "side");
+        assert_eq!(
+            side_chats.drafts.into_iter().collect::<Vec<_>>(),
+            [((b.clone(), "side".to_owned()), "b text".to_owned())]
+        );
+        assert_eq!(side_chats.models.into_keys().collect::<Vec<_>>(), [(b, "side".to_owned())]);
     }
 }

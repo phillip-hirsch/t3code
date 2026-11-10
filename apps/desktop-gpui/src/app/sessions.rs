@@ -521,6 +521,8 @@ impl Workspace {
         }
         // Connections and grants both change here.
         self.publish_pull_request_routing(cx);
+        // A launch that waited on the paired computers decides now.
+        self.land(window, cx);
         cx.notify();
     }
 
@@ -671,7 +673,7 @@ impl Workspace {
 }
 
 /// `resolveAccessEnvironmentId`: the picked environment while it is listed, else the primary.
-fn access_session_index(sessions: &[EnvironmentSession], selected: Option<&str>) -> usize {
+pub(super) fn access_session_index(sessions: &[EnvironmentSession], selected: Option<&str>) -> usize {
     selected.and_then(|id| sessions.iter().position(|session| session.is(id))).unwrap_or(PRIMARY)
 }
 

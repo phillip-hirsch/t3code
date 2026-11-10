@@ -113,7 +113,7 @@ impl Workspace {
             .map(|(at, t)| (at, t, crate::thread_pull_requests::search_entries(t)))
             .collect();
         let score = |typos: bool| {
-            let mut found: Vec<(usize, f32, bool)> = candidates
+            let mut found: Vec<(usize, search::Match, f32)> = candidates
                 .iter()
                 .filter_map(|(at, thread, pull_requests)| {
                     let subject = ThreadSubject {
@@ -126,17 +126,15 @@ impl Workspace {
                     };
                     let found = search::match_thread(&tokens, &subject, typos)?;
                     let used = search::ThreadUse::of(thread, self.local_opened_at(&thread.id));
-                    Some((*at, found.quality * used.boost(now), found.strong))
+                    let score = found.quality * used.boost(now);
+                    Some((*at, found, score))
                 })
                 .collect();
-            found.sort_by(|a, b| {
-                let class = |q: f32| search::class(q).min(2);
-                class(b.1).cmp(&class(a.1)).then(b.1.total_cmp(&a.1))
-            });
+            found.sort_by(|a, b| search::compare_ranked((&a.1, a.2), (&b.1, b.2)));
             found
         };
         let mut found = score(false);
-        if !found.iter().any(|(_, _, strong)| *strong) {
+        if !found.iter().any(|(_, found, _)| found.strong) {
             found = score(true);
         }
         let threads: Rc<[usize]> = found.into_iter().map(|(at, ..)| at).collect();

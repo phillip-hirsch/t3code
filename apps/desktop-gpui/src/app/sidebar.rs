@@ -1572,7 +1572,7 @@ impl Workspace {
             .children(super::theme_inspect::probe(&["sidebar", "sidebarForeground", "sidebarBorder"], cx))
             .relative()
             .h_full()
-            .when(!sheet, |el| el.w(self.sidebar_width()))
+            .map(|el| if sheet { el.w_full() } else { el.w(self.sidebar_width()) })
             .flex_none()
             .bg(surface)
             .text_color(sb.foreground)

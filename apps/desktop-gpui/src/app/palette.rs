@@ -226,6 +226,8 @@ enum Run {
     LinkPullRequest(String),
     /// "Show linked pull requests": the right panel's Linked pull requests surface.
     LinkedPullRequests,
+    /// "Use T3 Code in another app (MCP)" for this environment, else the one Sharing & access picks.
+    UseInAnotherApp(Option<SharedString>),
 }
 
 impl Run {
@@ -256,8 +258,9 @@ enum Description {
     Text(SharedString),
     /// "You:" / "Agent:" and the snippet in highlighted runs.
     Snippet(bool, Vec<(String, bool)>),
-    /// `ProjectLocationDescription`: a remote machine's icon, where the project lives, and its path.
-    Location(Option<IconName>, SharedString, SharedString),
+    /// `ProjectLocationDescription`: a remote machine's icon, where the project lives, its path,
+    /// and whether it leads with "Current".
+    Location(Option<IconName>, SharedString, SharedString, bool),
     Thread(ThreadSubtitle),
 }
 
@@ -1088,6 +1091,9 @@ impl Workspace {
                 let start = contextual.filter(|p| g.contains_project(p)).unwrap_or(target);
                 let run = Run::NewThread(ScopedId::of_project(start));
                 let mut row = self.project_row(format!("new-in-{}", target.id), g, target, run);
+                if let Some(Description::Location(.., current)) = &mut row.description {
+                    *current = self.current_project().is_some_and(|p| g.contains_project(p));
+                }
                 // `buildNewThreadInProjectItems`: every member's name and path, and the machine.
                 row.data_terms.extend(
                     g.members
@@ -1143,7 +1149,7 @@ impl Workspace {
         let mut row = Row::new(key, RowIcon::Project(ScopedId::of_project(p)), group.display_name.clone(), run);
         let machine = self.location_machine(&p.environment_id);
         let location = self.location_label(&p.environment_id);
-        row.description = Some(Description::Location(machine, location, p.workspace_root.clone().into()));
+        row.description = Some(Description::Location(machine, location, p.workspace_root.clone().into(), false));
         row.data_terms = vec![p.title.clone().into(), p.workspace_root.clone().into()];
         // `projectPin`: only where this connection may pin every member.
         let members = group.member_refs();
@@ -1328,6 +1334,27 @@ impl Workspace {
         let mut row =
             lucide("pull-requests", IconName::GitPullRequestArrow, "Open pull requests", Run::Page(Page::PullRequests));
         row.terms = &["pull requests", "prs", "pr", "review", "merge", "branch"];
+        rows.push(row);
+        let environment = self.target.as_ref().map(|target| target.environment().clone());
+        let mut row = lucide(
+            "use-in-another-app",
+            IconName::Plug,
+            "Use T3 Code in another app (MCP)",
+            Run::UseInAnotherApp(environment),
+        );
+        row.terms = &[
+            "mcp",
+            "connector",
+            "another app",
+            "poke",
+            "claude",
+            "chatgpt",
+            "grok",
+            "muse",
+            "instinct",
+            "openclaw",
+            "hermes",
+        ];
         rows.push(row);
         let mut usage = lucide("usage", IconName::ChartNoAxesColumn, "Open usage", Run::Page(Page::Usage));
         usage.terms = &["usage", "use", "tokens", "cost", "spend", "limits", "stats", "analytics"];
@@ -1785,7 +1812,7 @@ impl Workspace {
     /// Scores every listed thread, then builds rows for the first [`THREAD_LIMIT`] only.
     fn score_threads(&self, tokens: &[Vec<char>], typos: bool, now: i64) -> RankedThreads {
         let current = self.route_key();
-        let mut scored: Vec<(&crate::model::ThreadShell, f32, bool, f32)> = self
+        let mut scored: Vec<(&crate::model::ThreadShell, search::Match, f32)> = self
             .palette_threads()
             .filter_map(|thread| {
                 let found = self.match_thread_fields(thread, tokens, typos)?;
@@ -1794,25 +1821,20 @@ impl Workspace {
                 } else {
                     found.quality * self.thread_use(thread).boost(now)
                 };
-                Some((thread, found.quality, found.strong, rank))
+                Some((thread, found, rank))
             })
             .collect();
         scored.sort_by(|a, b| {
-            let (class_a, class_b) = (search::class(a.1), search::class(b.1));
-            (b.3 >= 0.)
-                .cmp(&(a.3 >= 0.))
-                .then(class_b.min(2).cmp(&class_a.min(2)))
-                .then(class_b.cmp(&class_a))
-                .then(b.3.total_cmp(&a.3))
+            (b.2 >= 0.).cmp(&(a.2 >= 0.)).then_with(|| search::compare_ranked((&a.1, a.2), (&b.1, b.2)))
         });
-        let strong = scored.iter().any(|(_, _, strong, _)| *strong);
+        let strong = scored.iter().any(|(_, found, _)| found.strong);
         let rows = scored
             .into_iter()
             .take(THREAD_LIMIT)
-            .map(|(thread, quality, strong, _)| {
+            .map(|(thread, found, _)| {
                 let mut row = self.thread_row(thread, now);
-                row.quality = quality;
-                (row, strong)
+                row.quality = found.quality;
+                (row, found.strong)
             })
             .collect();
         RankedThreads { rows, strong }
@@ -2037,6 +2059,7 @@ impl Workspace {
             Run::WorkspaceFocus(forward) => self.move_workspace_focus(forward, window, cx),
             Run::LinkPullRequest(thread_id) => self.open_link_pull_request(thread_id, window, cx),
             Run::LinkedPullRequests => self.open_surface(super::right_panel::Surface::PullRequests, window, cx),
+            Run::UseInAnotherApp(environment) => self.open_use_in_another_app(environment.as_deref(), window, cx),
             Run::FindIn { thread, query, message_id } => {
                 self.select_thread_in(thread.env, thread.id, window, cx);
                 self.open_thread_find_on(&query, message_id, window, cx);
@@ -2815,14 +2838,20 @@ impl Workspace {
         let icon = self.palette_row_icon(row, tokens);
         let description: Option<AnyElement> = row.description.as_ref().map(|d| match d {
             Description::Text(text) => div().truncate().child(text.clone()).into_any_element(),
-            Description::Location(machine, label, path) => h_flex()
-                .min_w_0()
-                .gap(px(4.))
-                .children(machine.map(|icon| Icon::new(icon).size(px(12.)).flex_none().text_color(muted.opacity(0.7))))
-                .child(div().min_w_0().truncate().child(label.clone()))
-                .child(div().flex_none().text_color(muted.opacity(0.5)).child("·"))
-                .child(div().min_w_0().truncate().child(path.clone()))
-                .into_any_element(),
+            Description::Location(machine, label, path, current) => {
+                let dot = || div().flex_none().text_color(muted.opacity(0.5)).child("·");
+                h_flex()
+                    .min_w_0()
+                    .gap(px(4.))
+                    .when(*current, |el| el.child(div().flex_none().child("Current")).child(dot()))
+                    .children(
+                        machine.map(|icon| Icon::new(icon).size(px(12.)).flex_none().text_color(muted.opacity(0.7))),
+                    )
+                    .child(div().min_w_0().truncate().child(label.clone()))
+                    .child(dot())
+                    .child(div().min_w_0().flex_1().truncate().child(path.clone()))
+                    .into_any_element()
+            }
             Description::Snippet(user, parts) => h_flex()
                 .min_w_0()
                 .overflow_hidden()
