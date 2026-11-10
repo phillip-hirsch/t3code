@@ -262,7 +262,8 @@ pub fn chips_with_models(
 
 /// `skillChipReplacements`, once the known skills or models change: which `tokens` (each its
 /// range, token id and label) go back to text, and which runs of `text` become skill or model
-/// chips. Other chips stay; a model chip whose name changed comes back relabelled.
+/// chips. Other chips stay; a model chip whose name changed comes back relabelled. In `rich`
+/// text, one inside fenced code goes back to text.
 pub fn reconcile_chips(
     text: &str,
     rich: bool,
@@ -270,12 +271,14 @@ pub fn reconcile_chips(
     is_skill: impl Fn(&str) -> bool,
     model_label: impl Fn(&str, &str) -> Option<String>,
 ) -> (Vec<Range<usize>>, ChipSpans) {
+    let code = if rich && text.contains(['`', '~']) { crate::composer_edit::fenced_ranges(text) } else { Vec::new() };
+    let in_code = |range: &Range<usize>| code.iter().any(|block| block.start < range.end && range.start < block.end);
     let stale: Vec<Range<usize>> = tokens
         .iter()
-        .filter(|(_, id, label)| match Chip::from_id(id) {
-            Some(Chip::Skill { name }) => !is_skill(&name),
+        .filter(|(range, id, label)| match Chip::from_id(id) {
+            Some(Chip::Skill { name }) => in_code(range) || !is_skill(&name),
             Some(Chip::Model { instance_id, model, .. }) => {
-                model_label(&instance_id, &model).as_deref() != Some(*label)
+                in_code(range) || model_label(&instance_id, &model).as_deref() != Some(*label)
             }
             _ => false,
         })
@@ -759,6 +762,13 @@ mod tests {
         assert_eq!(reconcile_chips(text, true, &[pasted], skill, codex_model), (vec![], vec![]), "inside another chip");
         let fenced = format!("```\n{text}\n```");
         assert_eq!(reconcile_chips(&fenced, true, &[], skill, codex_model), (vec![], vec![]), "code stays as written");
+        let in_code = [(4..11, "skill:review", "review"), (12..31, "model:codex/gpt-6.1", "GPT-6.1")];
+        assert_eq!(
+            reconcile_chips(&fenced, true, &in_code, skill, codex_model),
+            (vec![4..11, 12..31], vec![]),
+            "chips made with rich text off go back to text in code once it is on"
+        );
+        assert_eq!(reconcile_chips(&fenced, false, &in_code, skill, codex_model), (vec![], vec![]));
 
         let gpt = (8..27, "model:codex/gpt-6.1", "GPT-6.1");
         let restored = |model_label: fn(&str, &str) -> Option<String>| {
