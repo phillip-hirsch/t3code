@@ -1340,12 +1340,12 @@ impl Workspace {
     }
 
     fn dispatch(&mut self, command: Value, cx: &mut Context<Self>) {
-        self.dispatch_in_order(vec![command], cx);
+        let Some(client) = self.command_client(&command) else { return };
+        self.dispatch_in_order(client, vec![command], cx);
     }
 
-    /// Dispatches dependent commands one after another, stopping at the first failure.
-    fn dispatch_in_order(&mut self, commands: Vec<Value>, cx: &mut Context<Self>) {
-        let Some(client) = commands.first().and_then(|command| self.command_client(command)) else { return };
+    /// Dispatches dependent commands one after another on `client`, stopping at the first failure.
+    fn dispatch_in_order(&mut self, client: RpcClient, commands: Vec<Value>, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             for command in commands {
                 if let Err(error) = client.request("orchestration.dispatchCommand", command).await {

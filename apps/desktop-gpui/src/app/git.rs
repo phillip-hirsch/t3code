@@ -535,7 +535,7 @@ impl GitRequest {
 /// The thread (with the branch it had when the action started) or draft a git action ran for.
 enum BranchOwner {
     Thread { id: String, env: SharedString, branch: Option<String> },
-    Draft(String),
+    Draft(Target),
 }
 
 /// The open target's status subscription; it follows the git cwd and its environment.
@@ -617,14 +617,12 @@ impl Workspace {
     /// `gitCwd`: the thread's worktree (a draft's picked existing worktree), else its project root.
     pub(super) fn git_cwd(&self) -> Option<String> {
         let worktree = match self.target.as_ref()? {
-            Target::Thread { id, .. } => self
+            Target::Thread { env, id } => self
                 .shell
-                .threads
-                .iter()
-                .find(|thread| &thread.id == id)
+                .thread(&crate::model::ScopedId::new(env.clone(), id.as_str()))
                 .and_then(|thread| thread.worktree_path.clone())
                 .or_else(|| self.open_projection().and_then(|p| p.thread.worktree_path.clone())),
-            Target::Draft { project_id, .. } => self.draft_workspace.existing_worktree(project_id).map(str::to_owned),
+            Target::Draft { .. } => self.draft_workspace.existing_worktree(self.target.as_ref()).map(str::to_owned),
         };
         worktree.or_else(|| self.target_project().map(|project| project.workspace_root.clone()))
     }
@@ -772,14 +770,14 @@ impl Workspace {
     fn branch_owner(&self) -> Option<BranchOwner> {
         match self.target.as_ref()? {
             Target::Thread { id, env } => {
-                let shell = self.shell.threads.iter().find(|thread| &thread.id == id);
+                let shell = self.shell.thread(&crate::model::ScopedId::new(env.clone(), id.as_str()));
                 let branch = match shell {
                     Some(thread) => thread.branch.clone(),
                     None => self.open_projection().and_then(|p| p.thread.branch.clone()),
                 };
                 Some(BranchOwner::Thread { id: id.clone(), env: env.clone(), branch })
             }
-            Target::Draft { project_id, .. } => Some(BranchOwner::Draft(project_id.clone())),
+            draft @ Target::Draft { .. } => Some(BranchOwner::Draft(draft.clone())),
         }
     }
 
@@ -793,7 +791,7 @@ impl Workspace {
                     self.thread_command("thread.metadata.update", &crate::model::ScopedId::new(env, id), fields, cx);
                 }
             }
-            BranchOwner::Draft(project_id) => self.set_draft_branch(&project_id, branch, cx),
+            BranchOwner::Draft(draft) => self.set_draft_branch(&draft, branch, cx),
         }
     }
 

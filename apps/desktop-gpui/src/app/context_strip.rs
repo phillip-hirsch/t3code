@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 use super::banners::{Variant, composer_banner, corner_action};
 use super::composer::{control_button, runtime_modes};
 use super::{Target, Workspace};
+use crate::model::ScopedId;
 use crate::new_thread::{self, DraftWorkspace, EnvMode, WorkspaceChoice};
 use crate::theme::Tokens;
 
@@ -117,10 +118,18 @@ pub(super) struct DraftWorkspaceState {
 }
 
 impl DraftWorkspaceState {
-    /// The existing worktree the draft of `project_id` picked (the web draft's `worktreePath`).
-    pub(super) fn existing_worktree(&self, project_id: &str) -> Option<&str> {
+    /// Whether these picks are `target`'s: the same draft, in the same project on the same environment.
+    pub(super) fn is_for(&self, target: Option<&Target>) -> bool {
+        matches!(target, Some(Target::Draft { env, project_id, draft })
+            if self.env.as_ref() == Some(env)
+                && self.project_id.as_ref() == Some(project_id)
+                && self.draft.as_ref() == Some(draft))
+    }
+
+    /// The existing worktree `target`'s draft picked (the web draft's `worktreePath`).
+    pub(super) fn existing_worktree(&self, target: Option<&Target>) -> Option<&str> {
         let path = self.choice.existing_worktree.as_ref()?;
-        (self.project_id.as_deref() == Some(project_id)).then_some(path.as_str())
+        self.is_for(target).then_some(path.as_str())
     }
 }
 
@@ -165,6 +174,37 @@ impl RefSearch {
     }
 }
 
+/// A started thread's checkout when a branch change began: the change lands on it, wherever
+/// the user went meanwhile (`setThreadBranch`'s captured thread).
+struct ThreadCheckout {
+    thread: ScopedId,
+    worktree: Option<String>,
+    live_sessions: Vec<String>,
+}
+
+/// `resolvePreviousWorktreeSeed` over the threads of `project` (on its environment): the newest
+/// open one in a worktree other than `current`, with its branch.
+fn previous_worktree_seed(
+    threads: &[crate::model::ThreadShell],
+    project: &ScopedId,
+    current: Option<&str>,
+) -> Option<(String, Option<String>)> {
+    threads
+        .iter()
+        .filter(|t| {
+            t.environment_id == project.env
+                && t.project_id == project.id
+                && t.archived_at.is_none()
+                && t.deleted_at.is_none()
+        })
+        .filter_map(|t| {
+            let path = t.worktree_path.as_deref().filter(|path| Some(*path) != current)?;
+            Some((t.updated_at.as_str(), path.to_owned(), t.branch.clone()))
+        })
+        .max_by(|a, b| a.0.cmp(b.0))
+        .map(|(_, path, branch)| (path, branch))
+}
+
 /// One row of the branch picker: "Checkout pull request" for the reference the search names, a
 /// ref, or "Create new ref".
 enum BranchItem {
@@ -179,12 +219,9 @@ const NEXT_PAGE_DISTANCE: f32 = 96.;
 impl Workspace {
     /// Loads the draft's default workspace mode and refs when the draft or its project changes.
     pub(super) fn sync_draft_workspace(&mut self, cx: &mut Context<Self>) {
-        let Some(Target::Draft { env, project_id, draft }) = self.target.clone() else { return };
-        let state = &self.draft_workspace;
-        if state.env.as_ref() == Some(&env)
-            && state.project_id.as_ref() == Some(&project_id)
-            && state.draft.as_ref() == Some(&draft)
-        {
+        let Some(target) = self.target.clone() else { return };
+        let Target::Draft { env, project_id, draft } = &target else { return };
+        if self.draft_workspace.is_for(Some(&target)) {
             return;
         }
         // Reset first, so nothing from the previous draft survives but the picks this draft made;
@@ -193,12 +230,12 @@ impl Workspace {
         self.draft_workspace = DraftWorkspaceState {
             env: Some(env.clone()),
             project_id: Some(project_id.clone()),
-            choice: self.drafts.workspace(&draft),
+            choice: self.drafts.workspace(draft),
             draft: Some(draft.clone()),
             ..Default::default()
         };
         let key = crate::model::ScopedId::new(env.clone(), project_id.as_str());
-        let (Some(client), Some(project)) = (self.env_client(&env), self.shell.project(&key)) else {
+        let (Some(client), Some(project)) = (self.env_client(env), self.shell.project(&key)) else {
             return;
         };
         let has_threads = self.shell.project_has_threads(project);
@@ -209,11 +246,7 @@ impl Workspace {
             let mode = workspace.default_mode(&client).await;
             let refs = new_thread::list_refs(&client, &cwd).await;
             let _ = this.update(cx, |this, cx| {
-                let state = &this.draft_workspace;
-                if state.env.as_ref() != Some(&env)
-                    || state.project_id.as_ref() != Some(&project_id)
-                    || state.draft.as_ref() != Some(&draft)
-                {
+                if !this.draft_workspace.is_for(Some(&target)) {
                     return;
                 }
                 this.draft_workspace.default_mode = Some(mode);
@@ -333,9 +366,14 @@ impl Workspace {
         };
         let (Some(client), Some(cwd)) = (self.client(), self.composer_cwd()) else { return };
         let query = self.draft_workspace.branch_pages.query.clone();
+        let origin = self.target.clone();
         let task = cx.spawn(async move |this, cx| {
             let page = new_thread::list_ref_page(&client, &cwd, &query, cursor).await;
             let _ = this.update(cx, |this, cx| {
+                // The picker's search or its thread or draft moved on while the page loaded.
+                if this.target != origin || this.composer_cwd().as_ref() != Some(&cwd) {
+                    return;
+                }
                 let pages = &mut this.draft_workspace.branch_pages;
                 if pages.query != query {
                     return;
@@ -398,7 +436,7 @@ impl Workspace {
     fn refresh_refs(&mut self, cx: &mut Context<Self>) {
         let (Some(client), Some(cwd)) = (self.client(), self.composer_cwd()) else { return };
         let thread = matches!(self.target, Some(Target::Thread { .. }));
-        let project_id = self.draft_workspace.project_id.clone();
+        let origin = self.target.clone();
         let environment = self.active_environment().cloned();
         cx.spawn(async move |this, cx| {
             let refs = new_thread::list_refs(&client, &cwd).await;
@@ -411,7 +449,7 @@ impl Workspace {
                     }
                 };
                 let state = &mut this.draft_workspace;
-                if !thread && state.project_id != project_id {
+                if !thread && !state.is_for(origin.as_ref()) {
                     return;
                 }
                 // An open picker without a search or further pages lists the fresh first page.
@@ -439,12 +477,6 @@ impl Workspace {
             }
             _ => self.draft_workspace.refs.as_ref(),
         }
-    }
-
-    /// The previous worktree a draft of `project_id` reuses, once picked.
-    pub(super) fn draft_reused_worktree(&self, project_id: &str) -> Option<String> {
-        let state = &self.draft_workspace;
-        state.choice.existing_worktree.clone().filter(|_| state.project_id.as_deref() == Some(project_id))
     }
 
     pub(super) fn draft_env_mode(&self) -> EnvMode {
@@ -497,16 +529,11 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The newest other thread of this project that ran in a worktree (`resolvePreviousWorktreeSeed`).
+    /// The newest other thread of the draft's project that ran in a worktree.
     fn previous_worktree(&self) -> Option<(String, Option<String>)> {
-        let Some(Target::Draft { project_id, .. }) = &self.target else { return None };
-        self.shell
-            .threads
-            .iter()
-            .filter(|t| &t.project_id == project_id && t.archived_at.is_none() && t.deleted_at.is_none())
-            .filter_map(|t| Some((t.updated_at.as_str(), t.worktree_path.clone()?, t.branch.clone())))
-            .max_by(|a, b| a.0.cmp(b.0))
-            .map(|(_, path, branch)| (path, branch))
+        let Some(Target::Draft { env, project_id, .. }) = &self.target else { return None };
+        let current = self.draft_workspace.existing_worktree(self.target.as_ref());
+        previous_worktree_seed(&self.shell.threads, &ScopedId::new(env.clone(), project_id.as_str()), current)
     }
 
     fn pick_previous_worktree(&mut self, path: String, branch: Option<String>, cx: &mut Context<Self>) {
@@ -530,8 +557,8 @@ impl Workspace {
     /// Worktree mode just records the base; local mode switches the checkout (`vcs.switchRef`).
     fn select_branch(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
         self.draft_workspace.branch_open = false;
-        if let Some(Target::Thread { id: thread_id, .. }) = self.target.clone() {
-            self.select_thread_branch(thread_id, name, cx);
+        if let Some(thread) = self.target.as_ref().and_then(Target::thread_key) {
+            self.select_thread_branch(thread, name, cx);
             self.focus_composer(window, cx);
             return;
         }
@@ -553,9 +580,9 @@ impl Workspace {
         self.run_ref_command("vcs.switchRef", json!({"cwd": root, "refName": name}), name, "Failed to switch ref.", cx);
     }
 
-    /// `setDraftThreadContext` after a git action created `branch` for the draft of `project_id`.
-    pub(super) fn set_draft_branch(&mut self, project_id: &str, branch: String, cx: &mut Context<Self>) {
-        if self.draft_workspace.project_id.as_deref() == Some(project_id) {
+    /// `setDraftThreadContext` after a git action created `branch` for `draft`.
+    pub(super) fn set_draft_branch(&mut self, draft: &Target, branch: String, cx: &mut Context<Self>) {
+        if self.draft_workspace.is_for(Some(draft)) {
             self.draft_workspace.choice.branch = Some(branch);
             cx.notify();
         }
@@ -564,10 +591,10 @@ impl Workspace {
     fn create_branch(&mut self, name: String, cx: &mut Context<Self>) {
         self.draft_workspace.branch_open = false;
         let cwd = self.composer_cwd();
-        if let Some(Target::Thread { id: thread_id, .. }) = self.target.clone() {
+        if let Some(thread) = self.target.as_ref().and_then(Target::thread_key) {
             let worktree = self.open_projection().and_then(|p| p.thread.worktree_path.clone());
             let input = json!({"cwd": cwd, "refName": name, "switchRef": true});
-            self.run_thread_ref_command(thread_id, "vcs.createRef", input, name, worktree, cx);
+            self.run_thread_ref_command(thread, "vcs.createRef", input, name, worktree, cx);
             return;
         }
         self.run_ref_command(
@@ -589,14 +616,13 @@ impl Workspace {
     ) {
         let Some(client) = self.client() else { return };
         self.draft_workspace.choice.branch = Some(name.clone());
-        let project_id = self.draft_workspace.project_id.clone();
         let origin = self.target.clone();
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = client.request(method, input).await;
             let _ = this.update(cx, |this, cx| {
                 // The draft moved on while the ref switched.
-                if this.draft_workspace.project_id != project_id {
+                if !this.draft_workspace.is_for(origin.as_ref()) {
                     return;
                 }
                 match result {
@@ -651,7 +677,7 @@ impl Workspace {
 
     /// `selectBranch` on a started thread: reuse the worktree that has the ref checked
     /// out, else switch the thread's checkout (`resolveBranchSelectionTarget`).
-    fn select_thread_branch(&mut self, thread_id: String, name: String, cx: &mut Context<Self>) {
+    fn select_thread_branch(&mut self, thread: ScopedId, name: String, cx: &mut Context<Self>) {
         let Some(root) = self.target_project().map(|p| p.workspace_root.clone()) else { return };
         let active = self.open_projection().and_then(|p| p.thread.worktree_path.clone());
         let picked = self.find_ref(&name);
@@ -659,33 +685,37 @@ impl Workspace {
         let is_default = picked.as_ref().is_some_and(|r| r["isDefault"].as_bool() == Some(true));
         if let Some(path) = elsewhere {
             let next = (!is_within(&root, &path)).then_some(path);
-            self.set_thread_branch(&thread_id, &name, next, cx);
+            if let Some(checkout) = self.thread_checkout(&thread) {
+                self.set_thread_branch(&checkout, &name, next, cx);
+            }
             return;
         }
         let next = active.filter(|_| !is_default);
         let checkout = next.clone().unwrap_or(root);
         let input = json!({"cwd": checkout, "refName": name});
-        self.run_thread_ref_command(thread_id, "vcs.switchRef", input, name, next, cx);
+        self.run_thread_ref_command(thread, "vcs.switchRef", input, name, next, cx);
     }
 
     fn run_thread_ref_command(
         &mut self,
-        thread_id: String,
+        thread: ScopedId,
         method: &'static str,
         input: Value,
         name: String,
         worktree: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.thread_client(&thread_id) else { return };
-        let origin = self.thread_target(&thread_id);
+        let (Some(client), Some(checkout)) = (self.env_client(&thread.env), self.thread_checkout(&thread)) else {
+            return;
+        };
+        let origin = Some(Target::Thread { env: thread.env, id: thread.id });
         cx.spawn(async move |this, cx| {
             let result = client.request(method, input).await;
             let _ = this.update(cx, |this, cx| {
                 match result {
                     Ok(value) => {
                         let switched = value.get("refName").and_then(Value::as_str).map(str::to_owned);
-                        this.set_thread_branch(&thread_id, &switched.unwrap_or(name), worktree, cx);
+                        this.set_thread_branch(&checkout, &switched.unwrap_or(name), worktree, cx);
                         this.refresh_refs(cx);
                     }
                     Err(error) => {
@@ -703,21 +733,38 @@ impl Workspace {
         .detach();
     }
 
+    /// The open thread's checkout as a branch change starts on it.
+    fn thread_checkout(&self, thread: &ScopedId) -> Option<ThreadCheckout> {
+        let open = self.target.as_ref().and_then(Target::thread_key);
+        let projection = self.open_projection().filter(|_| open.as_ref() == Some(thread))?;
+        let live = projection.provider_sessions.iter().filter(|s| !matches!(s.status.as_str(), "stopped" | "error"));
+        Some(ThreadCheckout {
+            thread: thread.clone(),
+            worktree: projection.thread.worktree_path.clone(),
+            live_sessions: live.map(|s| s.id.clone()).collect(),
+        })
+    }
+
     /// `setThreadBranch`: a move to another checkout detaches the live provider
-    /// sessions first, then the thread records its branch and worktree.
-    fn set_thread_branch(&mut self, thread_id: &str, branch: &str, worktree: Option<String>, cx: &mut Context<Self>) {
-        let Some(projection) = self.open_projection() else { return };
+    /// sessions first, then the thread records its branch and worktree, on its own environment.
+    fn set_thread_branch(
+        &mut self,
+        checkout: &ThreadCheckout,
+        branch: &str,
+        worktree: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.env_client(&checkout.thread.env) else { return };
+        let thread_id = &checkout.thread.id;
         let mut commands = Vec::new();
-        if worktree != projection.thread.worktree_path {
+        if worktree != checkout.worktree {
             let command_id = super::new_id();
-            for session in
-                projection.provider_sessions.iter().filter(|s| !matches!(s.status.as_str(), "stopped" | "error"))
-            {
+            for session in &checkout.live_sessions {
                 commands.push(json!({
                     "type": "provider-session.detach",
-                    "commandId": format!("{command_id}:detach:{}", session.id),
+                    "commandId": format!("{command_id}:detach:{session}"),
                     "threadId": thread_id,
-                    "providerSessionId": session.id,
+                    "providerSessionId": session,
                     "reason": "client-requested",
                 }));
             }
@@ -729,7 +776,7 @@ impl Workspace {
             "branch": branch,
             "worktreePath": worktree,
         }));
-        self.dispatch_in_order(commands, cx);
+        self.dispatch_in_order(client, commands, cx);
     }
 
     /// `shouldShowComposerContextStrip`: always under a draft; under a started thread
@@ -1486,19 +1533,64 @@ fn step_highlight(current: Option<usize>, count: usize, down: bool) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use super::super::Target;
+    use super::super::draft_sessions::DraftId;
     use super::{
-        DraftWorkspaceState, RefSearch, clipboard_path, runtime_mode_denial, runtime_mode_fallback, step_highlight,
-        step_permission,
+        DraftWorkspaceState, RefSearch, clipboard_path, previous_worktree_seed, runtime_mode_denial,
+        runtime_mode_fallback, step_highlight, step_permission,
     };
+    use crate::model::ScopedId;
     use serde_json::json;
 
     #[test]
-    fn a_draft_uses_the_worktree_it_picked_for_its_own_project() {
-        let mut state = DraftWorkspaceState { project_id: Some("p".into()), ..Default::default() };
-        assert_eq!(state.existing_worktree("p"), None);
+    fn a_draft_uses_the_worktree_it_picked_for_itself_only() {
+        let draft = |env: &str, project: &str, id: &str| {
+            Some(Target::Draft {
+                env: env.to_owned().into(),
+                project_id: project.into(),
+                draft: DraftId::from_saved(id.into()),
+            })
+        };
+        let mut state = DraftWorkspaceState {
+            env: Some("a".into()),
+            project_id: Some("p".into()),
+            draft: Some(DraftId::from_saved("d1".into())),
+            ..Default::default()
+        };
+        assert_eq!(state.existing_worktree(draft("a", "p", "d1").as_ref()), None);
         state.choice.existing_worktree = Some("/repo/wt".into());
-        assert_eq!(state.existing_worktree("p"), Some("/repo/wt"));
-        assert_eq!(state.existing_worktree("other"), None, "another project's draft keeps its root");
+        assert_eq!(state.existing_worktree(draft("a", "p", "d1").as_ref()), Some("/repo/wt"));
+        assert_eq!(state.existing_worktree(draft("a", "other", "d1").as_ref()), None, "another project keeps its root");
+        assert_eq!(state.existing_worktree(draft("a", "p", "d2").as_ref()), None, "another draft keeps its root");
+        assert_eq!(state.existing_worktree(draft("b", "p", "d1").as_ref()), None, "another environment keeps its root");
+        assert!(!state.is_for(None));
+    }
+
+    #[test]
+    fn the_previous_worktree_comes_from_the_drafts_own_environment() {
+        let thread = |env: &str, id: &str, updated: &str, worktree: Option<&str>| -> crate::model::ThreadShell {
+            let value = json!({
+                "id": id, "projectId": "p", "title": id, "status": "idle", "worktreePath": worktree,
+                "branch": format!("{env}-{id}"), "createdAt": updated, "updatedAt": updated,
+                "lineage": {"rootThreadId": id},
+            });
+            crate::model::ThreadShell {
+                environment_id: env.to_owned().into(),
+                ..serde_json::from_value(value).unwrap()
+            }
+        };
+        let threads = [
+            thread("a", "old", "2026-11-01T00:00:00.000Z", Some("/a/old")),
+            thread("a", "plain", "2026-11-04T00:00:00.000Z", None),
+            thread("a", "open", "2026-11-02T00:00:00.000Z", Some("/a/open")),
+            thread("b", "newest", "2026-11-03T00:00:00.000Z", Some("/b/newest")),
+        ];
+        let on_a = ScopedId::new("a", "p");
+        let seed = previous_worktree_seed(&threads, &on_a, None);
+        assert_eq!(seed, Some(("/a/open".into(), Some("a-open".into()))), "not B's newer worktree");
+        let seed = previous_worktree_seed(&threads, &on_a, Some("/a/open"));
+        assert_eq!(seed, Some(("/a/old".into(), Some("a-old".into()))), "not the worktree it already uses");
+        assert_eq!(previous_worktree_seed(&threads, &ScopedId::new("c", "p"), None), None);
     }
 
     #[test]
