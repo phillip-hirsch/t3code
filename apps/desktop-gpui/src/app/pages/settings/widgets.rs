@@ -1035,9 +1035,8 @@ impl Workspace {
         if !plan.client_patch.is_empty() {
             self.client_settings.apply(&plan.client_patch);
             theme::set_appearance(theme::Appearance::from_settings(&self.client_settings.values), window, cx);
-            // The web remounts its editor on this toggle, so chips are rebuilt for the new mode.
             if plan.client_patch.contains_key("composerRichTextEnabled") {
-                self.reconcile_composer_chips(false, cx);
+                self.reconcile_composer_chips(crate::app::composer::ChipSync::Remount, cx);
             }
             // `composerRichTextEnabled` and the theme's colors.
             self.sync_composer_marks(cx);

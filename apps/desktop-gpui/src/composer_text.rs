@@ -309,6 +309,26 @@ pub fn reconcile_restored_chips(
     (stale, fresh)
 }
 
+/// Rich text turned on or off: the web remounts its editor, rebuilding every chip from the text
+/// (`buildDocJson`). Which `tokens` go back to text and which runs become chips, so the editor
+/// ends with exactly [`chips_with_models`]'s; a chip already in place stays as it is.
+pub fn remount_chips(
+    text: &str,
+    rich: bool,
+    tokens: &[(Range<usize>, &str, &str)],
+    is_skill: impl Fn(&str) -> bool,
+    model_label: impl Fn(&str, &str) -> Option<String>,
+) -> (Vec<Range<usize>>, ChipSpans) {
+    let rebuilt = chips_with_models(text, rich, is_skill, model_label);
+    let same = |(range, id, label): &(Range<usize>, &str, &str), (other, chip): &(Range<usize>, Chip)| {
+        range == other && *id == chip.id() && (!matches!(chip, Chip::Model { .. }) || *label == chip.label())
+    };
+    let stale = tokens.iter().filter(|token| !rebuilt.iter().any(|chip| same(token, chip)));
+    let stale = stale.map(|(range, ..)| range.clone()).collect();
+    let fresh = rebuilt.into_iter().filter(|chip| !tokens.iter().any(|token| same(token, chip))).collect();
+    (stale, fresh)
+}
+
 const MODEL_PREFIX: &str = "model:";
 
 /// `formatComposerModelMention`: the prompt text naming a provider instance's model for the
@@ -769,6 +789,17 @@ mod tests {
             "chips made with rich text off go back to text in code once it is on"
         );
         assert_eq!(reconcile_chips(&fenced, false, &in_code, skill, codex_model), (vec![], vec![]));
+
+        // Turning rich text on or off rebuilds file and context chips from the text too.
+        let refs = "```\n[a.ts](src/a.ts) ![shot.png](t3-context://v1/image/img_1) \n```";
+        let file = Chip::File { path: "src/a.ts".into() };
+        let image = Chip::Context { kind: "image".into(), id: "img_1".into(), label: "shot.png".into() };
+        let chipped = [(4..20, "file:src/a.ts", "a.ts"), (21..61, "context:image/img_1", "shot.png")];
+        assert_eq!(remount_chips(refs, true, &chipped, skill, none), (vec![4..20, 21..61], vec![]), "on");
+        assert_eq!(remount_chips(refs, false, &[], skill, none), (vec![], vec![(4..20, file), (21..61, image)]), "off");
+        assert_eq!(remount_chips(refs, false, &chipped, skill, none), (vec![], vec![]));
+        let (stale, fresh) = remount_chips(&fenced, false, &[], skill, codex_model);
+        assert_eq!((stale, fresh.len()), (vec![], 2), "skills and models too");
 
         let gpt = (8..27, "model:codex/gpt-6.1", "GPT-6.1");
         let restored = |model_label: fn(&str, &str) -> Option<String>| {

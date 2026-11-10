@@ -101,6 +101,17 @@ impl FooterText {
     }
 }
 
+/// Which composer chips a catch-up may change; a later kind covers every earlier one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum ChipSync {
+    /// After an undo or redo: only the chips it brought back for a skill or model that is gone.
+    Restored,
+    /// The skills or models chips resolve against changed (`skillChipReplacements`).
+    Lists,
+    /// Rich text turned on or off: every chip is rebuilt from the text, as the web's remount does.
+    Remount,
+}
+
 /// Records `now` as the provider chips resolve against; whether it differs from the one before.
 fn note_provider(seen: &mut Option<String>, now: Option<&str>) -> bool {
     if seen.as_deref() == now {
@@ -163,7 +174,7 @@ impl Workspace {
         let previous = std::mem::replace(&mut self.chip_ids, chips);
         self.sync_attachment_chips(&previous, cx);
         if restored {
-            self.reconcile_composer_chips(true, cx);
+            self.reconcile_composer_chips(ChipSync::Restored, cx);
         }
         self.sync_trigger(cx);
         self.sync_composer_marks(cx);
@@ -255,7 +266,7 @@ impl Workspace {
     pub(super) fn chip_lists_changed(&mut self, cx: &mut Context<Self>) {
         let provider = self.composer_provider().map(|p| p.instance_id.clone());
         note_provider(&mut self.chip_provider, provider.as_deref());
-        self.reconcile_composer_chips(false, cx);
+        self.reconcile_composer_chips(ChipSync::Lists, cx);
         self.markdown.chips_changed();
         cx.notify();
     }
@@ -271,13 +282,17 @@ impl Workspace {
         }
     }
 
-    /// Brings the composer's skill and model chips in line with the lists it knows once they load
-    /// or change (`skillChipReplacements`), outside the undo history and keeping the selection.
-    /// After an undo or redo (`restored`), only the chips it brought back for gone ones change.
-    pub(super) fn reconcile_composer_chips(&mut self, restored: bool, cx: &mut Context<Self>) {
+    /// Brings the composer's chips in line with the text and the lists it knows, outside the undo
+    /// history and keeping the selection; `sync` says which chips may change. Attachments keep
+    /// their records: like the web's, a send reads their references from the text.
+    pub(super) fn reconcile_composer_chips(&mut self, sync: ChipSync, cx: &mut Context<Self>) {
         let state = self.composer.read(cx);
         let (text, spans) = (state.value(), state.tokens().to_vec());
-        if spans.is_empty() && !text.contains(composer_text::is_currency) && !text.contains("model:") {
+        if sync != ChipSync::Remount
+            && spans.is_empty()
+            && !text.contains(composer_text::is_currency)
+            && !text.contains("model:")
+        {
             return;
         }
         let skills = self.skill_names();
@@ -286,10 +301,10 @@ impl Workspace {
         let rich = self.client_settings.values.bool("composerRichTextEnabled");
         let is_skill = |name: &str| skills.iter().any(|s| s == name);
         let model_label = |instance_id: &str, model: &str| self.model_mention(instance_id, model).map(|m| m.label);
-        let (stale, fresh) = if restored {
-            composer_text::reconcile_restored_chips(&text, rich, &tokens, is_skill, model_label)
-        } else {
-            composer_text::reconcile_chips(&text, rich, &tokens, is_skill, model_label)
+        let (stale, fresh) = match sync {
+            ChipSync::Restored => composer_text::reconcile_restored_chips(&text, rich, &tokens, is_skill, model_label),
+            ChipSync::Lists => composer_text::reconcile_chips(&text, rich, &tokens, is_skill, model_label),
+            ChipSync::Remount => composer_text::remount_chips(&text, rich, &tokens, is_skill, model_label),
         };
         if stale.is_empty() && fresh.is_empty() {
             return;
