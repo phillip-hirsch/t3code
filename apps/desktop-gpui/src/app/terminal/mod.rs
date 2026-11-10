@@ -141,10 +141,9 @@ pub(super) struct Terminals {
     parked: Vec<(DrawerKey, HashMap<String, Pane>)>,
     /// The drawer whose sessions `panes` holds.
     mounted: Option<DrawerKey>,
-    /// By thread, in server order; `None` until the first snapshot.
-    summaries: Option<HashMap<String, Vec<Summary>>>,
-    /// The environment whose metadata stream reported each thread's terminals.
-    summary_environments: HashMap<String, SharedString>,
+    /// By environment, then thread, in server order; `None` until the first snapshot. Thread ids
+    /// repeat across environments, and each environment's stream reports only its own.
+    summaries: Option<HashMap<String, HashMap<String, Vec<Summary>>>>,
     /// The id a draft's thread will launch with, so its terminals carry over.
     draft_threads: HashMap<DraftId, String>,
     /// The terminal to focus once it mounts, by drawer: another thread's request never lands.
@@ -291,26 +290,27 @@ impl Terminals {
         let fallback = shown.filter(|key| !self.drawers.contains_key(key));
         let keys: Vec<DrawerKey> = self.drawers.keys().cloned().collect();
         for key in keys {
-            // An unreported thread's list is empty, which never changes a drawer.
-            let Some(reporter) = self.summary_environments.get(&key.thread_id) else { continue };
-            let owner = DrawerKey::new(reporter, &key.thread_id);
             let open = self.drawers[&key].open;
-            let reconciled = match key.env {
-                Some(_) => key == owner && (open || shown == Some(&key)),
-                // An older build's drawer stands in for the reporter's until a change adopts it.
+            // The drawer whose environment's list this one follows.
+            let owner = match key.env {
+                Some(_) => (open || shown == Some(&key)).then(|| key.clone()),
+                // An older build's drawer stands in for the viewer's, else for the one environment
+                // listing the thread without a drawer of its own, until a change adopts it.
                 None => match fallback.filter(|viewer| viewer.thread_id == key.thread_id) {
-                    Some(viewer) => *viewer == owner,
-                    None => open && !self.drawers.contains_key(&owner),
+                    Some(viewer) => Some(viewer.clone()),
+                    None if open => {
+                        self.sole_reporter(&key.thread_id).filter(|owner| !self.drawers.contains_key(owner))
+                    }
+                    None => None,
                 },
             };
-            if !reconciled {
-                continue;
-            }
+            // An unreported thread's list is empty, which never changes a drawer.
+            let Some(owner) = owner.filter(|owner| self.reported(owner)) else { continue };
             // A panel tab's terminals stay out of the drawer.
             let in_panel =
                 |id: &str| self.panel.values().any(|g| g.key == owner && g.terminal_ids.iter().any(|t| t == id));
             let ids: Vec<String> = self
-                .summaries(&key.thread_id)
+                .summaries(&owner)
                 .iter()
                 .filter(|s| !in_panel(&s.terminal_id))
                 .map(|s| s.terminal_id.clone())
@@ -335,41 +335,59 @@ impl Terminals {
         self.draft_threads.iter().find(|(_, id)| *id == thread_id).map(|(draft, _)| draft)
     }
 
-    fn summaries(&self, thread_id: &str) -> &[Summary] {
-        self.summaries.as_ref().and_then(|all| all.get(thread_id)).map_or(&[], Vec::as_slice)
+    /// `key`'s terminals as its environment's stream lists them.
+    fn summaries(&self, key: &DrawerKey) -> &[Summary] {
+        self.listed(key.env.as_deref(), &key.thread_id)
     }
 
-    pub(in crate::app) fn running(&self, thread_id: &str) -> Vec<&str> {
-        self.summaries(thread_id).iter().filter(|s| s.running_subprocess).map(|s| s.terminal_id.as_str()).collect()
+    fn listed(&self, env: Option<&str>, thread_id: &str) -> &[Summary] {
+        let list = env.and_then(|env| self.summaries.as_ref()?.get(env)?.get(thread_id));
+        list.map_or(&[], Vec::as_slice)
+    }
+
+    /// Whether `key`'s environment has listed its thread.
+    fn reported(&self, key: &DrawerKey) -> bool {
+        let threads = key.env.as_deref().and_then(|env| self.summaries.as_ref()?.get(env));
+        threads.is_some_and(|threads| threads.contains_key(&key.thread_id))
+    }
+
+    /// The one environment listing `thread_id`; `None` when none or several do.
+    fn sole_reporter(&self, thread_id: &str) -> Option<DrawerKey> {
+        let mut reporters = self.summaries.iter().flatten().filter(|(_, threads)| threads.contains_key(thread_id));
+        let (env, _) = reporters.next()?;
+        reporters.next().is_none().then(|| DrawerKey::new(env, thread_id))
+    }
+
+    /// `thread_id`'s terminals on `env` with a process running.
+    pub(in crate::app) fn running(&self, env: Option<&str>, thread_id: &str) -> Vec<&str> {
+        let list = self.listed(env, thread_id);
+        list.iter().filter(|s| s.running_subprocess).map(|s| s.terminal_id.as_str()).collect()
     }
 
     /// The server terminal an empty drawer opens on: a running one first, never a panel tab's.
     fn drawer_reuse(&self, key: &DrawerKey) -> Option<String> {
-        let thread_id = key.thread_id.as_str();
         let panel = self.panel_ids(key);
         let free = |id: &&str| !panel.iter().any(|p| p == id);
-        let known = self.summaries(thread_id).iter().map(|s| s.terminal_id.as_str());
-        self.running(thread_id).into_iter().find(free).or_else(|| known.into_iter().find(free)).map(str::to_owned)
+        let known = self.summaries(key).iter().map(|s| s.terminal_id.as_str());
+        let running = self.running(key.env.as_deref(), &key.thread_id);
+        running.into_iter().find(free).or_else(|| known.into_iter().find(free)).map(str::to_owned)
     }
 
-    fn label(&self, thread_id: &str, terminal_id: &str) -> String {
-        let summary = self.summaries(thread_id).iter().find(|s| s.terminal_id == terminal_id);
+    fn label(&self, key: &DrawerKey, terminal_id: &str) -> String {
+        let summary = self.summaries(key).iter().find(|s| s.terminal_id == terminal_id);
         layout::terminal_label(terminal_id, summary.map(|s| s.label.as_str()))
     }
 
     /// Applies one element of `environment`'s `subscribeTerminalMetadata`; a snapshot replaces
     /// only that environment's threads.
     fn apply_metadata(&mut self, environment: &SharedString, event: &Value) {
-        let all = self.summaries.get_or_insert_default();
-        let owners = &mut self.summary_environments;
+        let all = self.summaries.get_or_insert_default().entry(environment.to_string()).or_default();
         match event["type"].as_str() {
             Some("snapshot") => {
-                all.retain(|thread_id, _| owners.get(thread_id) != Some(environment));
-                owners.retain(|_, owner| owner != environment);
+                all.clear();
                 for (thread_id, summary) in
                     event["terminals"].as_array().into_iter().flatten().filter_map(Summary::parse)
                 {
-                    owners.insert(thread_id.clone(), environment.clone());
                     all.entry(thread_id).or_default().push(summary);
                 }
                 for list in all.values_mut() {
@@ -378,7 +396,6 @@ impl Terminals {
             }
             Some("upsert") => {
                 let Some((thread_id, summary)) = Summary::parse(&event["terminal"]) else { return };
-                owners.insert(thread_id.clone(), environment.clone());
                 let list = all.entry(thread_id).or_default();
                 match list.iter_mut().find(|s| s.terminal_id == summary.terminal_id) {
                     Some(existing) => *existing = summary,
@@ -635,7 +652,9 @@ impl Workspace {
         launch.cwd.clone_from(&run.cwd);
         launch.stop_on_settle = Some(run.stop_on_settle);
         let input = format!(" {}\r", run.command);
-        let running: Vec<String> = self.terminals.running(&thread_id).into_iter().map(str::to_owned).collect();
+        let env = self.drawer_key(&thread_id).env;
+        let running: Vec<String> =
+            self.terminals.running(env.as_deref(), &thread_id).into_iter().map(str::to_owned).collect();
         let drawer = self.terminal_drawer(&thread_id);
         let idle: Vec<&String> = drawer.terminal_ids.iter().filter(|id| !running.contains(id)).collect();
         let reuse = idle.iter().find(|id| ***id == drawer.active_id).or(idle.first()).map(|id| (*id).clone());
@@ -688,8 +707,11 @@ impl Workspace {
     fn next_terminal_id(&self, key: &DrawerKey) -> String {
         let drawer_ids = self.terminals.drawer_ref(key).map(|d| d.terminal_ids.clone()).unwrap_or_default();
         let panel_ids = self.terminals.panel_ids(key);
-        let known = self.terminals.summaries(&key.thread_id).iter().map(|s| s.terminal_id.as_str());
-        let suffix = self.terminals.summaries.is_none().then(super::new_id);
+        let known = self.terminals.summaries(key).iter().map(|s| s.terminal_id.as_str());
+        // Until its environment lists its terminals, a fresh id cannot collide with an unseen one.
+        let listed =
+            key.env.as_deref().is_some_and(|env| self.terminals.summaries.iter().any(|all| all.contains_key(env)));
+        let suffix = (!listed).then(super::new_id);
         let taken = known.chain(drawer_ids.iter().map(String::as_str)).chain(panel_ids.iter().map(String::as_str));
         layout::next_terminal_id(taken, suffix.as_deref())
     }
@@ -750,7 +772,7 @@ impl Workspace {
         if !self.drawer_operable(&key) {
             return;
         }
-        let label = self.terminals.label(&key.thread_id, &terminal_id);
+        let label = self.terminals.label(&key, &terminal_id);
         let workspace = cx.weak_entity();
         window.open_alert_dialog(cx, move |alert, _, _| {
             let (workspace, key, terminal_id) = (workspace.clone(), key.clone(), terminal_id.clone());
@@ -862,7 +884,7 @@ impl Workspace {
             let Some(owner) = key.clone() else { continue };
             let Some(mut launch) = self.terminal_launch() else { continue };
             // A known terminal reattaches where it was started.
-            if let Some(summary) = self.terminals.summaries(&thread_id).iter().find(|s| &s.terminal_id == terminal_id)
+            if let Some(summary) = self.terminals.summaries(&owner).iter().find(|s| &s.terminal_id == terminal_id)
                 && !summary.cwd.is_empty()
             {
                 launch.cwd = summary.cwd.clone();
@@ -931,7 +953,7 @@ impl Workspace {
                 }
             }
             SessionEvent::AddToChat(selected) => {
-                self.add_terminal_context(thread_id, terminal_id, selected, window, cx);
+                self.add_terminal_context(key, terminal_id, selected, window, cx);
             }
             // `openTerminalLinkInPreview`: the in-app browser when links open there, else the system's.
             SessionEvent::OpenUrl { url, force_browser } => {
@@ -968,14 +990,14 @@ impl Workspace {
     /// goes with the message that keeps the chip.
     fn add_terminal_context(
         &mut self,
-        thread_id: &str,
+        key: &DrawerKey,
         terminal_id: &str,
         selected: &session::Selected,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(target) = self.target.clone() else { return };
-        let terminal_label = self.terminals.label(thread_id, terminal_id);
+        let terminal_label = self.terminals.label(key, terminal_id);
         let id = format!("terminal_{}", super::new_id());
         let record = context_record(&id, terminal_id, &terminal_label, selected);
         if self.add_context_record(&target, record, window, cx).is_some() {
@@ -1392,7 +1414,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let RowModel { key, terminal_id, active, scope } = *row;
-        let label = self.terminals.label(&key.thread_id, terminal_id);
+        let label = self.terminals.label(key, terminal_id);
         let close_label: SharedString = if active {
             self.with_terminal_shortcut(&format!("Close {label}"), "terminal.close")
         } else {
@@ -1479,8 +1501,13 @@ impl Workspace {
 
     /// The sidebar row's indicator: teal while a terminal process runs. It
     /// does not pulse; a looping animation would repaint the sidebar forever.
-    pub(super) fn render_running_terminals(&self, thread_id: &str, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let running = self.terminals.running(thread_id);
+    pub(super) fn render_running_terminals(
+        &self,
+        env: &SharedString,
+        thread_id: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let running = self.terminals.running(Some(env), thread_id);
         let first = running.first()?.to_string();
         let tokens = theme::tokens(cx);
         let color = if tokens.dark { rgb(0x46ecd5).into() } else { gpui_kit::Hsla::from(rgb(0x009689)) };
@@ -1490,10 +1517,10 @@ impl Workspace {
         } else {
             format!("{} terminal processes running. Open terminal", running.len()).into()
         };
-        let thread_id = thread_id.to_owned();
+        let (env, thread_id) = (env.clone(), thread_id.to_owned());
         Some(
             div()
-                .id(SharedString::from(format!("terminal-status-{thread_id}")))
+                .id(SharedString::from(format!("terminal-status-{env}-{thread_id}")))
                 .flex_none()
                 .flex()
                 .items_center()
@@ -1503,7 +1530,7 @@ impl Workspace {
                 .tooltip(tooltip(label))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
-                    this.reveal_thread_terminal(thread_id.clone(), first.clone(), window, cx);
+                    this.reveal_thread_terminal(env.clone(), thread_id.clone(), first.clone(), window, cx);
                 }))
                 .child(icon("icons/terminal.svg").with_size(px(14.)).text_color(color)),
         )
@@ -1512,13 +1539,14 @@ impl Workspace {
     /// `revealThreadTerminal`: open the thread with that terminal shown.
     pub(super) fn reveal_thread_terminal(
         &mut self,
+        env: SharedString,
         thread_id: String,
         terminal_id: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.select_thread(thread_id.clone(), window, cx);
-        let key = self.drawer_key(&thread_id);
+        let key = DrawerKey::new(&env, &thread_id);
+        self.select_thread_in(env, thread_id, window, cx);
         self.terminals.drawer(&key).ensure(&terminal_id);
         self.terminals.focus_later(&key, &terminal_id);
         cx.notify();
@@ -1699,6 +1727,31 @@ mod tests {
         assert!(!terminals.drawers.contains_key(&legacy));
         let adopted = terminals.drawer_ref(&b).map(|d| (d.height, d.terminal_ids.clone()));
         assert_eq!(adopted, Some((300., vec!["term-1".to_owned()])));
+    }
+
+    #[test]
+    fn same_id_threads_on_two_environments_follow_only_their_own_terminals() {
+        let (a, b) = (DrawerKey::new("a", "t"), DrawerKey::new("b", "t"));
+        let summary = |id: &str| json!({"threadId": "t", "terminalId": id, "cwd": format!("/{id}"), "hasRunningSubprocess": true, "label": ""});
+        let mut terminals = Terminals::default();
+        terminals.apply_metadata(&"a".into(), &json!({"type": "snapshot", "terminals": [summary("term-1")]}));
+        terminals.apply_metadata(&"b".into(), &json!({"type": "snapshot", "terminals": [summary("term-2")]}));
+        terminals.drawer(&a).open = true;
+        terminals.drawer(&b).open = true;
+        terminals.reconcile(Some(&b));
+        assert_eq!(terminals.drawers[&b].terminal_ids, ["term-2"], "A's terminal never attaches on B");
+        assert_eq!(terminals.drawers[&a].terminal_ids, ["term-1"], "A's drawer still follows A");
+
+        // An upsert and a snapshot each change only their own environment's list.
+        terminals.apply_metadata(&"a".into(), &json!({"type": "upsert", "terminal": summary("term-3")}));
+        terminals.apply_metadata(&"b".into(), &json!({"type": "snapshot", "terminals": [summary("term-2")]}));
+        terminals.reconcile(Some(&b));
+        assert_eq!(terminals.drawers[&b].terminal_ids, ["term-2"]);
+        assert_eq!(terminals.drawers[&a].terminal_ids, ["term-1", "term-3"]);
+        assert_eq!(terminals.running(Some("b"), "t"), ["term-2"]);
+        assert_eq!(terminals.summaries(&a).iter().map(|s| s.cwd.as_str()).collect::<Vec<_>>(), ["/term-1", "/term-3"]);
+        assert_eq!(terminals.drawer_reuse(&b).as_deref(), Some("term-2"));
+        assert_eq!(terminals.sole_reporter("t"), None, "two environments list it");
     }
 
     #[test]

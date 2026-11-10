@@ -298,7 +298,11 @@ pub(super) fn setup_row(
         actions = actions.child(button("setup-terminal", IconName::Terminal, "Open terminal").on_click(
             move |_, window, cx| {
                 let (thread_id, terminal_id) = (thread_id.clone(), terminal_id.clone());
-                let _ = this.update(cx, |w, cx| w.reveal_thread_terminal(thread_id, terminal_id, window, cx));
+                let _ = this.update(cx, |w, cx| {
+                    // The setup shown is the open thread's, so its terminal runs on that environment.
+                    let Some(env) = w.target.as_ref().map(|target| target.environment().clone()) else { return };
+                    w.reveal_thread_terminal(env, thread_id, terminal_id, window, cx);
+                });
             },
         ));
     }

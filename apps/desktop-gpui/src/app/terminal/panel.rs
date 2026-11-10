@@ -177,7 +177,7 @@ impl Workspace {
     /// The tab's label: its active terminal's.
     pub(in crate::app) fn terminal_surface_title(&self, surface: &str) -> SharedString {
         match self.terminals.panel.get(surface) {
-            Some(group) => self.terminals.label(&group.key.thread_id, &group.active).into(),
+            Some(group) => self.terminals.label(&group.key, &group.active).into(),
             None => "Terminal".into(),
         }
     }
@@ -204,13 +204,9 @@ impl Workspace {
             cx.notify();
             return;
         };
-        let mut labels: Vec<String> = vec![self.terminals.label(&group.key.thread_id, &group.active)];
+        let mut labels: Vec<String> = vec![self.terminals.label(&group.key, &group.active)];
         labels.extend(
-            group
-                .terminal_ids
-                .iter()
-                .filter(|id| **id != group.active)
-                .map(|id| self.terminals.label(&group.key.thread_id, id)),
+            group.terminal_ids.iter().filter(|id| **id != group.active).map(|id| self.terminals.label(&group.key, id)),
         );
         let (title, description) = if labels.len() == 1 {
             (
