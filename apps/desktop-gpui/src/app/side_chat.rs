@@ -289,6 +289,15 @@ pub(super) fn parse_command(text: &str) -> Option<&str> {
     (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim())
 }
 
+/// A message's context records that keep `/side` from starting (`useComposerSend`): any but a
+/// terminal selection with no text, which a message drops (`filterTerminalContextsWithText`).
+fn carries_context(records: &[Value]) -> bool {
+    records.iter().any(|record| {
+        record["kind"] != "terminal"
+            || record["text"].as_str().is_some_and(|text| !text.trim_matches(['\r', '\n']).is_empty())
+    })
+}
+
 /// `resolveLatestMergeBackRun`: the newest finished reply, unless a newer run is under way.
 pub(super) fn merge_back_run(projection: &ThreadProjection) -> Option<&Run> {
     let latest = projection
@@ -475,7 +484,7 @@ impl Workspace {
         if !self.side_chats_offered() {
             return false;
         }
-        if self.has_attachments() {
+        if self.has_attachments() || carries_context(&self.message_context_records(text)) {
             warn("Side chats take text only", "Remove the attachments and context, then send it again.", window, cx);
             return true;
         }
@@ -1362,6 +1371,16 @@ fn delete_command(thread_id: &str, only_if_unused: bool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn side_chats_refuse_structured_context_but_not_an_empty_terminal_selection() {
+        assert!(!carries_context(&[]));
+        assert!(!carries_context(&[json!({"kind": "terminal", "text": "\r\n\n"})]));
+        assert!(carries_context(&[json!({"kind": "terminal", "text": "ls"})]));
+        for kind in ["review-comment", "thread", "environment", "preview-annotation"] {
+            assert!(carries_context(&[json!({"kind": kind})]), "{kind}");
+        }
+    }
 
     #[test]
     fn delegated_and_subagent_threads_offer_no_side_chats() {
