@@ -1836,7 +1836,7 @@ fn markdown_view(
     let streaming = matches!(kind, MarkdownKind::Assistant { streaming: true });
     let inline_code = inline_code_style(t);
     let t = *t;
-    let (header_this, link_this, table_this) = (this.clone(), this.clone(), this.clone());
+    let (header_this, link_this, table_this, hover_this) = (this.clone(), this.clone(), this.clone(), this.clone());
     let table_key = key.clone();
     let templates = super::markdown_ui::ArtifactTemplates {
         workspace: this.clone(),
@@ -1871,7 +1871,12 @@ fn markdown_view(
             kinds,
             suffixes: Default::default(),
         })
+        .plugin(super::external_links::LinkMarks { workspace: this.clone() })
+        .on_link_hover(move |hover, _, cx| {
+            let _ = hover_this.update(cx, |workspace, cx| workspace.link_hovered(hover, cx));
+        })
         .on_link_click(move |url, event, window, cx| {
+            let _ = link_this.update(cx, Workspace::close_link_hover);
             // A right click opens the link menu (`externalLinkContextMenu`), and only for web links.
             let right = matches!(event, ClickEvent::Mouse(click) if click.up.button == gpui_kit::MouseButton::Right);
             // A link to a file opens in the editor, or its file menu (`MarkdownFileLink`).

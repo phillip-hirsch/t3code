@@ -45,6 +45,7 @@ mod desktop;
 mod details;
 mod draft_picker;
 pub(crate) mod environments;
+mod external_links;
 mod files;
 mod find;
 mod fresh_session;
@@ -339,6 +340,7 @@ pub struct Workspace {
     queue: queue::QueueUi,
     now: thread_now::NowUi,
     markdown_images: markdown_images::ImageCache,
+    link_hover: external_links::LinkHoverState,
     entry_kinds: Arc<markdown_ui::EntryKinds>,
     workflow: workflow::WorkflowUi,
     setup: worktree_setup::SetupWatch,
@@ -531,6 +533,7 @@ impl Workspace {
             queue: Default::default(),
             now: Default::default(),
             markdown_images: Default::default(),
+            link_hover: Default::default(),
             entry_kinds: Default::default(),
             workflow: Default::default(),
             setup: Default::default(),
@@ -1377,6 +1380,7 @@ impl Render for Workspace {
                                         }
                                     })
                                     .children(mini_player)
+                                    .children(self.render_link_hover(cx))
                                     .children(self.render_banner_lane(cx))
                                     .on_drop(cx.listener(|this, paths: &gpui_kit::ExternalPaths, window, cx| {
                                         this.drop_paths(paths, window, cx);

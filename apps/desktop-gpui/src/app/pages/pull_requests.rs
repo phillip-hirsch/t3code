@@ -228,7 +228,7 @@ impl PullRequestsState {
     }
 
     /// The listed row for a pull request, which the panel shows while its detail loads.
-    pub(super) fn entry_for(&self, reference: &Reference) -> Option<Rc<Entry>> {
+    pub(in crate::app) fn entry_for(&self, reference: &Reference) -> Option<Rc<Entry>> {
         self.held_entries().find(|e| reference_of(e) == *reference).cloned()
     }
 

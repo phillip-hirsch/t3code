@@ -15,6 +15,7 @@ mod composer_text;
 mod desktop;
 mod device;
 mod environments;
+mod external_links;
 mod file_icons;
 mod file_links;
 mod handoff;

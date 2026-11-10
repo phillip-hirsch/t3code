@@ -610,7 +610,7 @@ struct FileChip {
 }
 
 /// The text of `nodes` and everything inside them (`nodeToPlainText`).
-fn link_text(nodes: &[gpui_kit::component::text::markdown_ast::Node]) -> String {
+pub(super) fn link_text(nodes: &[gpui_kit::component::text::markdown_ast::Node]) -> String {
     use gpui_kit::component::text::markdown_ast::Node;
     nodes
         .iter()

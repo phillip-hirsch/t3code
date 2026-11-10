@@ -386,7 +386,7 @@ impl Workspace {
 }
 
 /// The bytes' format when the server named none.
-fn sniff(bytes: &[u8]) -> Option<ImageFormat> {
+pub(super) fn sniff(bytes: &[u8]) -> Option<ImageFormat> {
     match bytes {
         [0x89, b'P', b'N', b'G', ..] => Some(ImageFormat::Png),
         [0xFF, 0xD8, ..] => Some(ImageFormat::Jpeg),
@@ -401,7 +401,7 @@ fn sniff(bytes: &[u8]) -> Option<ImageFormat> {
 const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 
 /// The image's MIME type and bytes, or `None` when it fails or passes [`MAX_IMAGE_BYTES`].
-async fn fetch(url: String) -> Option<(Option<String>, Vec<u8>)> {
+pub(super) async fn fetch(url: String) -> Option<(Option<String>, Vec<u8>)> {
     crate::runtime()
         .spawn(async move {
             let mut response = reqwest::get(url).await?.error_for_status()?;

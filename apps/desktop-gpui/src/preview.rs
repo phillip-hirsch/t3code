@@ -711,7 +711,7 @@ fn is_local_loopback_host(host: &str) -> bool {
 }
 
 /// `isPrivateNetworkHost` (`packages/shared/src/hostClassification.ts`).
-fn is_private_network_host(host: &str) -> bool {
+pub(crate) fn is_private_network_host(host: &str) -> bool {
     let host = normalize_hostname(host);
     if host == "::"
         || host == "home.arpa"
