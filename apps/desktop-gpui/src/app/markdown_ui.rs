@@ -705,7 +705,7 @@ struct ModelChip {
 }
 
 /// Draws `t3-model:` links as the composer's model chip (`ModelMentionChip`): the provider's
-/// logo and the model's name; a click opens its details.
+/// logo and the model's name; a click, Enter or Space opens its details.
 pub(super) struct ModelChips {
     pub workspace: WeakEntity<Workspace>,
 }
@@ -718,26 +718,38 @@ impl MarkdownPlugin for ModelChips {
     fn parse(
         &self,
         node: &gpui_kit::component::text::markdown_ast::Node,
-        _: &MarkdownParseContext<'_>,
+        context: &MarkdownParseContext<'_>,
     ) -> Option<MarkdownNode> {
         let gpui_kit::component::text::markdown_ast::Node::Link(link) = node else { return None };
         let chip = parse_model_link(&link.url)?;
+        // Where the chip sits keeps two chips of one model apart, each with its own focus.
+        let at = context.offset() + node.position().map_or(0, |position| position.start.offset);
         let label = link_text(&link.children);
         let source = crate::composer_text::model_mention(&chip.instance_id, &chip.model);
         Some(
-            MarkdownNode::new("t3-model", chip)
+            MarkdownNode::new("t3-model", (chip, at))
                 .accessibility_label(format!("Model {label}"))
                 .text(label)
                 .markdown(source),
         )
     }
 
-    fn render(&self, node: &MarkdownNode, _: &mut Window, _: &mut App) -> impl IntoElement {
-        let Some(chip) = node.data::<ModelChip>().cloned() else { return div().into_any_element() };
+    fn render(&self, node: &MarkdownNode, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let Some((chip, at)) = node.data::<(ModelChip, usize)>().cloned() else { return div().into_any_element() };
         let accent = super::composer::model_chip_accent(&chip.driver);
         let workspace = self.workspace.clone();
+        let id = format!("model-chip:{at}:{}/{}", chip.instance_id, chip.model);
+        let focus = window
+            .use_keyed_state(SharedString::from(format!("{id}:focus")), cx, |_, cx| cx.focus_handle().tab_stop(true))
+            .read(cx)
+            .clone();
+        // `focus-visible:outline-2 -outline-offset-2 outline-current`, drawn over the chip so the prose doesn't move.
+        let ring = (focus.is_focused(window) && window.last_input_was_keyboard())
+            .then(|| div().absolute().inset_0().rounded(px(4.)).border_2().border_color(accent));
         h_flex()
-            .id(SharedString::from(format!("model-chip:{}/{}", chip.instance_id, chip.model)))
+            .id(SharedString::from(id))
+            .track_focus(&focus)
+            .relative()
             .gap(px(3.))
             .rounded(px(4.))
             .font_weight(FontWeight::MEDIUM)
@@ -745,6 +757,7 @@ impl MarkdownPlugin for ModelChips {
             .cursor_pointer()
             .child(super::composer::model_chip_icon(&chip.driver, accent).size(px(14.)).flex_none())
             .child(node.as_text().to_owned())
+            .children(ring)
             .on_click(move |event, window, cx| {
                 let position = event.position();
                 let _ = workspace
