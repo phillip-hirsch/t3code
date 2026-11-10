@@ -532,7 +532,7 @@ fn scroll_target_marker(pending: Rc<Cell<u8>>, scroll: ScrollHandle) -> impl Int
     .size_full()
 }
 
-fn section_frame(
+pub(in crate::app) fn section_frame(
     id: impl Into<ElementId>,
     title: impl IntoElement,
     action: Option<AnyElement>,

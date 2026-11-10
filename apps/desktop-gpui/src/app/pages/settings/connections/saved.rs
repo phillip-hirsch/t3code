@@ -181,7 +181,7 @@ fn empty_state(t: &Tokens) -> AnyElement {
 
 /// `EmptyMedia variant="icon"`: a raised 36px card over two smaller ones tilted 10° out to
 /// each side (drawn as one shape and its outline, since a div can't rotate), then `mb-6`.
-fn empty_media(icon: &'static str, t: &Tokens) -> impl IntoElement {
+pub(in crate::app::pages::settings) fn empty_media(icon: &'static str, t: &Tokens) -> impl IntoElement {
     let back = |path: &'static str, color| {
         svg().path(path).absolute().left(px(-10.)).top(px(-10.)).w(px(56.)).h(px(50.)).text_color(color)
     };

@@ -86,6 +86,7 @@ const LUCIDE_ICONS: &[(&str, &[u8])] = lucide![
     "chart-no-axes-column",
     "chevrons-left-right-ellipsis",
     "check",
+    "clock-3",
     "chevron-down",
     "circle-arrow-up",
     "circle-alert",

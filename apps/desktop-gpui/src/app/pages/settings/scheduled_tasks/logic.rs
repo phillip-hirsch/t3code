@@ -488,6 +488,44 @@ pub(super) fn matches_scope(scope: &Scope, environment_id: &str, project_id: &st
     }
 }
 
+/// One selected environment's list, as `ScheduledTaskEnvironmentList` summarizes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ListState<'a> {
+    /// Not connected, with its `connectionStatusTitle`.
+    Disconnected(&'a str),
+    Loading,
+    Failed(&'a str),
+    /// How many of its tasks match the scope.
+    Loaded(usize),
+}
+
+/// The status lines under a list of several environments' tasks: one per kind of machine that
+/// shows no tasks, naming each by its label. Empty machines are named only beside a populated one.
+pub(super) fn list_summaries(states: &[(&str, ListState)]) -> Vec<String> {
+    let populated = states.iter().any(|(_, state)| matches!(state, ListState::Loaded(count) if *count > 0));
+    let mut lines: [(&str, Vec<String>); 4] = [
+        ("Not connected:", Vec::new()),
+        ("Loading scheduled tasks on", Vec::new()),
+        ("Could not load scheduled tasks:", Vec::new()),
+        ("No tasks on", Vec::new()),
+    ];
+    for (label, state) in states {
+        let (line, entry) = match state {
+            ListState::Disconnected(status) => (0, format!("{label} ({status})")),
+            ListState::Loading => (1, (*label).to_owned()),
+            ListState::Failed(error) => (2, format!("{label}: {error}")),
+            ListState::Loaded(0) if populated => (3, (*label).to_owned()),
+            ListState::Loaded(_) => continue,
+        };
+        lines[line].1.push(entry);
+    }
+    lines
+        .into_iter()
+        .filter(|(_, entries)| !entries.is_empty())
+        .map(|(title, entries)| format!("{title} {}", entries.join(", ")))
+        .collect()
+}
+
 const RUNTIME_MODES: [&str; 4] = ["approval-required", "auto-accept-edits", "auto", "full-access"];
 
 /// `clampManagedRuntimeMode`: tasks have no mode picker, so a mode above the
@@ -800,6 +838,32 @@ mod tests {
             json!({"projectSettingsOverrides": {"p": {"defaultModelSelection": {"instanceId": "codex", "model": "a"}}}}),
         );
         assert_eq!(default_model(&override_info, Some(&project("p", false, false))).map(|s| s.model), Some("a".into()));
+    }
+
+    #[test]
+    fn several_environments_summarize_the_machines_that_show_no_tasks() {
+        use ListState::{Disconnected, Failed, Loaded, Loading};
+        let states = [
+            ("Studio", Loaded(2)),
+            ("Laptop", Disconnected("Reconnecting...")),
+            ("Cloud", Failed("boom")),
+            ("Mini", Loading),
+            ("Server", Loaded(0)),
+            ("Spare", Loaded(0)),
+            ("Box", Disconnected("Connection failed")),
+        ];
+        assert_eq!(
+            list_summaries(&states),
+            [
+                "Not connected: Laptop (Reconnecting...), Box (Connection failed)",
+                "Loading scheduled tasks on Mini",
+                "Could not load scheduled tasks: Cloud: boom",
+                "No tasks on Server, Spare",
+            ]
+        );
+        // With nothing listed, "No scheduled tasks" stands for the empty machines instead.
+        assert_eq!(list_summaries(&[("Studio", Loaded(0)), ("Mini", Loading)]), ["Loading scheduled tasks on Mini"]);
+        assert!(list_summaries(&[("Studio", Loaded(3))]).is_empty());
     }
 
     #[test]

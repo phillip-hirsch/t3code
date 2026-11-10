@@ -24,7 +24,7 @@ pub(super) fn text_2xs<E: Styled>(el: E) -> E {
 }
 
 /// `--success` (emerald-500); the theme carries only its foreground shade.
-pub(super) fn success() -> Hsla {
+pub(in crate::app::pages::settings) fn success() -> Hsla {
     rgb(0x00bc7d).into()
 }
 
@@ -47,7 +47,11 @@ pub(super) fn item_row(details: impl IntoElement, actions: Option<AnyElement>) -
 }
 
 /// `ConnectionStatusDot`, without the ping animation (no continuous repaints).
-pub(super) fn status_dot(id: impl Into<ElementId>, color: Hsla, tip: Option<SharedString>) -> AnyElement {
+pub(in crate::app::pages::settings) fn status_dot(
+    id: impl Into<ElementId>,
+    color: Hsla,
+    tip: Option<SharedString>,
+) -> AnyElement {
     let dot = div().size(px(8.)).rounded_full().bg(color);
     let frame = div().id(id.into()).size(px(12.)).flex_none().flex().items_center().justify_center().child(dot);
     match tip {

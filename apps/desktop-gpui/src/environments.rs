@@ -965,6 +965,15 @@ impl ConnectionState {
         }
     }
 
+    /// `connectionStatusTitle`: [`Self::status_text`] without the failure's detail.
+    pub fn status_title(&self) -> String {
+        match (self.presented(), self.error()) {
+            (Presented::Reconnecting, Some(_)) => "Failed to connect. Reconnecting...".into(),
+            (Presented::Error, _) => "Connection failed".into(),
+            _ => self.status_text(),
+        }
+    }
+
     /// `savedBackendStatus`: the row's status and whether it reads as an error.
     pub fn saved_status(&self, enabled: bool) -> (String, bool) {
         let presented = self.presented();
@@ -1288,9 +1297,12 @@ mod tests {
             ("Connection failed: The environment credential is invalid.".into(), true)
         );
         assert_eq!(
-            state(Phase::Blocked, 1, Some(refused)).status_text(),
+            state(Phase::Blocked, 1, Some(refused.clone())).status_text(),
             "Connection failed. Reason: The environment credential is invalid."
         );
+        assert_eq!(state(Phase::Blocked, 1, Some(refused)).status_title(), "Connection failed");
+        let backoff = state(Phase::Backoff, 2, Some(Failure::transport("closed")));
+        assert_eq!(backoff.status_title(), "Failed to connect. Reconnecting...");
         let unsupported = descriptor(Some(3), json!({})).compatibility_error();
         assert_eq!(state(Phase::Blocked, 1, unsupported).saved_status(false), ("Client not supported".into(), false));
     }
