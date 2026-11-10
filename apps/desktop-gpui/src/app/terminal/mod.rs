@@ -494,8 +494,12 @@ impl Workspace {
     /// `canOperateTerminal`: the thread's environment lets this client start, type into, resize
     /// and close its terminals.
     pub(super) fn terminal_operable(&self, thread_id: &str) -> bool {
-        let session = self.thread_environment(thread_id).and_then(|env| self.session(&env));
-        session.is_none_or(super::sessions::EnvironmentSession::operates_terminals)
+        self.terminals_operable_on(self.thread_environment(thread_id).as_deref())
+    }
+
+    /// `canOperateTerminal` on `env`, which a drawer's key names.
+    fn terminals_operable_on(&self, env: Option<&str>) -> bool {
+        env.and_then(|env| self.session(env)).is_none_or(super::sessions::EnvironmentSession::operates_terminals)
     }
 
     /// `terminalAvailable`: the chat has a project to start a shell in.
@@ -823,10 +827,15 @@ impl Workspace {
         self.park_terminal_panes(key.as_ref().filter(|_| self.page.is_none()));
         let thread_id = thread_id.unwrap_or_default();
         self.terminals.panes.retain(|id, pane| shown.contains(id) && pane.session.read(cx).thread_id == thread_id);
+        // The drawer's environment runs its sessions: the socket and the grant name the same one.
+        let env = key.as_ref().and_then(|key| key.env.clone());
+        let read_only = !self.terminals_operable_on(env.as_deref());
         for terminal_id in &shown {
             if self.terminals.panes.contains_key(terminal_id) {
                 continue;
             }
+            // Its drawer's key, kept while it is parked behind a same-id thread on another environment.
+            let Some(owner) = key.clone() else { continue };
             let Some(mut launch) = self.terminal_launch() else { continue };
             // A known terminal reattaches where it was started.
             if let Some(summary) = self.terminals.summaries(&thread_id).iter().find(|s| &s.terminal_id == terminal_id)
@@ -835,19 +844,15 @@ impl Workspace {
                 launch.cwd = summary.cwd.clone();
                 launch.worktree_path = summary.worktree_path.clone();
             }
-            let client = self.thread_client(&thread_id);
+            let client = env.as_deref().and_then(|env| self.env_client(env));
             let (thread, terminal) = (thread_id.clone(), terminal_id.clone());
-            let read_only = !self.terminal_operable(&thread_id);
             let session = cx.new(|cx| TerminalSession::new(thread, terminal, launch, client, read_only, window, cx));
-            // Its drawer's key, kept while it is parked behind a same-id thread on another environment.
-            let Some(owner) = key.clone() else { continue };
             let _events = cx.subscribe_in(&session, window, move |this, session, event: &SessionEvent, window, cx| {
                 let terminal_id = session.read(cx).terminal_id.clone();
                 this.on_session_event(&owner, &terminal_id, event, window, cx);
             });
             self.terminals.panes.insert(terminal_id.clone(), Pane { session, _events });
         }
-        let read_only = !self.terminal_operable(&thread_id);
         for pane in self.terminals.panes.values() {
             pane.session.update(cx, |session, cx| session.set_read_only(read_only, cx));
         }
