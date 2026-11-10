@@ -622,15 +622,20 @@ impl gpui_kit::Render for TabDragPreview {
     }
 }
 
-/// `draft`'s panel becomes `thread`'s: the web keys it by the thread id a draft launches with.
+/// `draft`'s panel becomes `thread`'s: the web keys it by environment and the thread id a draft
+/// launches with, so it follows the draft to its thread or another project on its environment.
 fn carry_panel(panels: &mut HashMap<Target, PanelState>, draft: &Target, thread: &Target) -> bool {
+    if draft.environment() != thread.environment() {
+        return false;
+    }
     let Some(panel) = panels.remove(draft) else { return false };
     panels.insert(thread.clone(), panel);
     true
 }
 
 impl Workspace {
-    /// A launched draft's open panel (its tabs, terminal groups, width) goes on with its thread.
+    /// A draft's open panel (its tabs, terminal groups, width) goes on with it: to its thread at
+    /// launch, or to the project it moved to on its environment.
     pub(super) fn carry_draft_panel(&mut self, draft: &Target, thread: &Target) {
         if carry_panel(&mut self.right_panel.panels, draft, thread) {
             self.right_panel.layout.changed = true;
@@ -3850,6 +3855,18 @@ mod tests {
         assert_eq!((carried.active.clone(), carried.width), (Some(Surface::Files), Some(480.)));
         assert!(!carry_panel(&mut panels, &draft, &thread), "nothing left to carry");
         assert_eq!(panels.len(), 1);
+
+        // A draft moved to another project keeps its panel there, but only on its environment,
+        // where its terminals run.
+        let moved = |env: &str, project_id: &str| Target::Draft {
+            env: env.into(),
+            project_id: project_id.into(),
+            draft: super::super::draft_sessions::DraftId::for_test("d"),
+        };
+        let mut panels = HashMap::from([(draft.clone(), PanelState::default())]);
+        assert!(!carry_panel(&mut panels, &draft, &moved("b", "p")), "another machine's draft starts its own");
+        assert!(carry_panel(&mut panels, &draft, &moved("a", "q")));
+        assert_eq!(panels.keys().collect::<Vec<_>>(), [&moved("a", "q")]);
     }
 
     #[test]
