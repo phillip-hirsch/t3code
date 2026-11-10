@@ -190,12 +190,14 @@ pub const PRESETS: [Preset; 17] = [
 /// never enlarged: its on-screen size and the scale, which the page zoom also takes so the page
 /// still lays out at the viewport's CSS width.
 /// The server's size is outside data: an empty one counts as 1px, so the scale is never NaN.
+/// So does an empty or negative area, which still shrinks the viewport to fit, however small.
 pub fn fit_viewport(viewport: (f32, f32), available: (f32, f32), zoom: f64) -> ((f32, f32), f32) {
     #[expect(clippy::cast_possible_truncation, reason = "zoom factors fit f32")]
     let zoom = if zoom.is_finite() && zoom > 0. { zoom as f32 } else { 1. };
     let (width, height) = (viewport.0.max(1.) * zoom, viewport.1.max(1.) * zoom);
-    let scale = (available.0 / width).min(available.1 / height);
-    let scale = if scale.is_finite() { scale.clamp(0.05, 1.) } else { 1. };
+    let area = |side: f32| if side.is_nan() { side } else { side.max(1.) };
+    let scale = (area(available.0) / width).min(area(available.1) / height);
+    let scale = if scale.is_finite() && scale > 0. { scale.min(1.) } else { 1. };
     ((width * scale, height * scale), scale)
 }
 
@@ -1514,9 +1516,14 @@ mod tests {
         assert_eq!(fit_viewport((820., 1180.), (410., 1180.), 1.), ((410., 590.), 0.5));
         assert_eq!(
             fit_viewport((0., 0.), (0., 0.), 1.),
-            ((0.05, 0.05), 0.05),
-            "an empty viewport never makes a NaN size"
+            ((1., 1.), 1.),
+            "an empty viewport in an empty area is 1px, never a NaN size"
         );
+        // A 3840x2160 viewport at 500% still fits a narrow panel, however small that makes it.
+        let ((width, height), scale) = fit_viewport((3840., 2160.), (380., 1000.), 5.);
+        assert!((width - 380.).abs() < 1e-3 && height <= 1000. && (scale - 380. / 19200.).abs() < 1e-6);
+        // Rails wider than the panel leave a 1px area, as the web's `Math.max(1, …)`.
+        assert_eq!(fit_viewport((100., 100.), (-20., 100.), 1.), ((1., 1.), 0.01));
         assert_eq!(fit_viewport((375., 667.), (f32::NAN, f32::NAN), 1.), ((375., 667.), 1.));
         // At 200% a 390x844 viewport draws 780x1688, so the page still lays out 390 CSS px wide.
         assert_eq!(fit_viewport((390., 844.), (2000., 2000.), 2.), ((780., 1688.), 1.));
