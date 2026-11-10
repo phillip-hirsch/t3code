@@ -57,11 +57,7 @@ impl Workspace {
             // `IndexDraftLanding`: with no project the home asks what to work on, once every
             // environment's shell has loaded, since a pending one can't prove there is none.
             (None, _) if !self.shell.projects.iter().any(|p| p.archived_at.is_none()) => {
-                if self.shells_bootstrapped() {
-                    self.no_projects_hero(window, cx)
-                } else {
-                    div().into_any_element()
-                }
+                if self.shells_bootstrapped(cx) { self.no_projects_hero(window, cx) } else { div().into_any_element() }
             }
             (None, _) => no_thread(&t),
             // The draft stage (`render_draft_stage`) draws drafts; nothing else does.

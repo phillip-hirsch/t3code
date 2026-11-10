@@ -1224,9 +1224,10 @@ fn unhex(text: &str) -> Option<Vec<u8>> {
     (0..text.len()).step_by(2).map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok()).collect()
 }
 
-/// The workspace's environment: `T3_SERVER_URL`, else the local server, or the first enabled
-/// saved environment while the local environment is off (Electron then starts no server).
-pub async fn resolve_workspace_endpoint() -> anyhow::Result<(Endpoint, Option<LocalServer>)> {
+/// The workspace's environment: `T3_SERVER_URL`, else the local server; `None` while the local
+/// environment is off. Electron then starts no server, and every saved environment connects as
+/// itself through its own supervisor, as on the web.
+pub async fn resolve_workspace_endpoint() -> anyhow::Result<Option<(Endpoint, Option<LocalServer>)>> {
     let overridden = std::env::var_os("T3_SERVER_URL").is_some() && std::env::var_os("T3_SERVER_TOKEN").is_some();
     if !overridden {
         // File IO and decrypting every token would block one of the runtime's two workers.
@@ -1235,63 +1236,10 @@ pub async fn resolve_workspace_endpoint() -> anyhow::Result<(Endpoint, Option<Lo
             anyhow::anyhow!("Saved environments could not be read: {error}")
         })?;
         if !catalog.local_environment_enabled {
-            return Ok((remote_workspace_endpoint(&catalog).await?, None));
+            return Ok(None);
         }
     }
-    backend::resolve_endpoint().await
-}
-
-/// The routes the workspace may start through while the local environment is off: every
-/// enabled environment's signed-in routes, in saved order.
-fn remote_workspace_routes(catalog: &Catalog) -> Vec<(&str, &Address, &str)> {
-    let enabled = catalog.environments.iter().filter(|environment| environment.enabled);
-    enabled
-        .flat_map(|environment| {
-            environment.routes.iter().filter_map(|route| match &route.credential {
-                Credential::Token(token) => Some((environment.environment_id.as_str(), &route.address, token.as_str())),
-                Credential::Missing | Credential::Locked { .. } => None,
-            })
-        })
-        .collect()
-}
-
-/// The first of [`remote_workspace_routes`] that answers; an SSH route starts its forward first.
-async fn remote_workspace_endpoint(catalog: &Catalog) -> anyhow::Result<Endpoint> {
-    let mut unreachable = None;
-    for (environment_id, address, token) in remote_workspace_routes(catalog) {
-        let http_base = match address {
-            Address::Direct(http_base) => http_base.clone(),
-            Address::Ssh(target) => match ssh_workspace_base(environment_id, target).await {
-                Ok(http_base) => http_base,
-                Err(error) => {
-                    log::warn!("could not start through {}: {error}", target.alias);
-                    unreachable = Some(error);
-                    continue;
-                }
-            },
-        };
-        return Ok(Endpoint::bearer(&http_base, token.to_owned()));
-    }
-    match unreachable {
-        // Retried: the host may answer on the next attempt.
-        Some(error) => Err(anyhow::anyhow!(error)),
-        None => Err(backend::Unrecoverable(
-            "The local environment is off. Turn it on in Settings › Environments, or add an environment there.".into(),
-        )
-        .into()),
-    }
-}
-
-/// `prepareDesktopSshEnvironment` with the saved token: the forward to `target`, once it
-/// answers as `environment_id`.
-async fn ssh_workspace_base(environment_id: &str, target: &SshTarget) -> Result<String, String> {
-    let bootstrap = crate::ssh::ensure(target, false).await.map_err(|error| error.message)?;
-    // Identity first, before the saved token is sent anywhere.
-    let descriptor = fetch_descriptor(&bootstrap.http_base).await.map_err(|failure| failure.detail)?;
-    if descriptor.environment_id != environment_id {
-        return Err(different_machine(&descriptor.label, "host"));
-    }
-    Ok(bootstrap.http_base)
+    backend::resolve_endpoint().await.map(Some)
 }
 
 /// The workspace's environment for the whole app run, started once and shared by every
@@ -1319,6 +1267,8 @@ pub enum BackendStatus {
     /// It keeps failing to start, or cannot be started again (another server owns the T3
     /// home). Only the first kind is still retried on its own.
     Failed(String),
+    /// The local environment is off: the workspace has no server of its own.
+    Off,
 }
 
 /// One start of the backend, as [`supervise`] sees it.
@@ -1334,6 +1284,8 @@ enum Start {
         reason: String,
         retry: bool,
     },
+    /// See [`BackendStatus::Off`].
+    Off,
     Quit,
 }
 
@@ -1388,7 +1340,8 @@ async fn start_workspace() -> Start {
         return Start::Quit;
     }
     match resolve_workspace_endpoint().await {
-        Ok((endpoint, server)) => Start::Ready { endpoint, exited: server.map(|server| server.run().boxed()) },
+        Ok(Some((endpoint, server))) => Start::Ready { endpoint, exited: server.map(|server| server.run().boxed()) },
+        Ok(None) => Start::Off,
         Err(_) if backend::quitting_now() => Start::Quit,
         Err(error) => Start::Failed {
             retry: error.downcast_ref::<backend::Unrecoverable>().is_none(),
@@ -1408,6 +1361,11 @@ where
     loop {
         let reason = match start().await {
             Start::Quit => return,
+            Start::Off => {
+                log::info!("the local environment is off; starting no server");
+                shared.status.send_replace(BackendStatus::Off);
+                return;
+            }
             Start::Ready { endpoint, exited } => {
                 log::info!("server ready at {}", endpoint.http_base);
                 attempt = 0;
@@ -1695,6 +1653,7 @@ mod tests {
             BackendStatus::Ready(endpoint) => format!("ready {}", endpoint.http_base),
             BackendStatus::Restarting(reason) => format!("restarting {reason}"),
             BackendStatus::Failed(reason) => format!("failed {reason}"),
+            BackendStatus::Off => "off".into(),
         }
     }
 
@@ -1754,6 +1713,16 @@ mod tests {
         drop(quit);
         tokio::time::sleep(MAX_RESTART_DELAY * 6).await;
         assert_eq!(describe(&backend.status()), "ready http://a");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn with_the_local_environment_off_the_workspace_starts_no_server_and_connects_nowhere() {
+        // Every saved environment then connects as itself, through its own supervisor.
+        let mut backend = supervised(vec![Start::Off]);
+        assert_eq!(next(&mut backend).await, "off");
+        backend.restart();
+        tokio::time::sleep(MAX_RESTART_DELAY * 6).await;
+        assert_eq!(describe(&backend.status()), "off", "nothing is started again");
     }
 
     #[test]
@@ -1955,7 +1924,6 @@ mod tests {
         let expected = Credential::Locked { stored: stored.as_str().unwrap().into(), error };
         assert_eq!(*credential(&locked.environments[0]), expected);
         assert_eq!(*credential(&locked.environments[1]), Credential::Missing);
-        assert!(remote_workspace_routes(&locked).is_empty(), "a locked token opens no session");
 
         // Rename it, switch it off and pair another environment, then save.
         locked.environments[0].label = "Renamed".into();
@@ -2153,26 +2121,6 @@ mod tests {
 
     fn addresses(environment: &SavedEnvironment) -> Vec<String> {
         environment.routes.iter().map(Route::address_text).collect()
-    }
-
-    #[test]
-    fn with_the_local_environment_off_the_workspace_starts_through_any_signed_in_route() {
-        let mut ssh_only = saved("s", Credential::Missing);
-        ssh_only.routes = vec![ssh_route("box", Credential::Token("token-s".into()))];
-        let off = SavedEnvironment { enabled: false, ..saved("off", Credential::Token("token-off".into())) };
-        let catalog = Catalog {
-            local_environment_enabled: false,
-            environments: vec![off, saved("signed-out", Credential::Missing), ssh_only],
-            ..Catalog::default()
-        };
-        let routes = remote_workspace_routes(&catalog);
-        let ssh = Address::Ssh(SshTarget {
-            alias: "box".into(),
-            hostname: "box.lan".into(),
-            username: Some("me".into()),
-            port: None,
-        });
-        assert_eq!(routes, [("s", &ssh, "token-s")], "an SSH-only environment is a way in");
     }
 
     #[test]

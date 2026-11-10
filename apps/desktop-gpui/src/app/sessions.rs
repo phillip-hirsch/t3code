@@ -1,6 +1,7 @@
 //! One session per connected environment (the web's per-environment runtime): its socket,
-//! server config and shell subscription. The workspace's own server is the primary session;
-//! each enabled saved environment adds one on the socket `SavedEnvironments` keeps open.
+//! server config and shell subscription. The workspace's own server is the primary session
+//! (none while the local environment is off); each enabled saved environment adds one on the
+//! socket `SavedEnvironments` keeps open.
 //! Every environment's projects and threads land in the one merged `Workspace::shell`.
 //!
 //! `client()`, `server_info()` and `endpoint()` resolve the open target's environment, so code
@@ -17,13 +18,14 @@ use super::pages::settings::{SessionLoad, check_session, operates_terminals};
 use super::{Target, Workspace};
 use crate::backend::Endpoint;
 use crate::device::DeviceState;
-use crate::environments::Presented;
+use crate::environments::{ConnectionState, Phase, Presented};
 use crate::model::{ScopedId, ServerInfo};
 use crate::project_groups::ScratchRoot;
 use crate::rpc::RpcClient;
 use crate::theme::Tokens;
 
-/// The primary session's index in `Workspace::sessions`; it is always there.
+/// The primary session's index in `Workspace::sessions`; it is always there, without an id
+/// while the local environment is off.
 const PRIMARY: usize = 0;
 /// How long a first connection's shell waits for the config before subscribing without it.
 const SHELL_CONFIG_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
@@ -549,10 +551,21 @@ impl Workspace {
         scratch_environment_of(&self.sessions, fallback)
     }
 
-    /// `allEnvironmentShellsBootstrappedAtom`: every environment has its shell snapshot or is
-    /// offline; the primary counts only once its id is known.
-    pub(super) fn shells_bootstrapped(&self) -> bool {
-        self.sessions.iter().all(|s| s.id.as_deref().is_some_and(|id| self.shell.has_snapshot(id) || !s.is_connected()))
+    /// `allEnvironmentShellsBootstrappedAtom`: the saved environments are read and every
+    /// environment has its shell snapshot or is offline; the primary counts only once its id is
+    /// known, and not at all while the local environment is off.
+    pub(super) fn shells_bootstrapped(&self, cx: &App) -> bool {
+        let saved = self.saved_environments.read(cx);
+        let primary = &self.sessions[PRIMARY];
+        let primary_settled = matches!(self.connection, super::Connection::Off)
+            || primary.id.as_deref().is_some_and(|id| self.shell.has_snapshot(id) || !primary.is_connected());
+        let saved_settled = |session: &EnvironmentSession| {
+            session.id.as_deref().is_some_and(|id| {
+                let state = saved.session(id).map(|s| &s.state);
+                saved_shell_settled(self.shell.has_snapshot(id), state.unwrap_or(&ConnectionState::default()))
+            })
+        };
+        !saved.loading() && primary_settled && self.sessions[PRIMARY + 1..].iter().all(saved_settled)
     }
 
     /// [`Self::scratch_roots`] equals `cached`, compared without collecting them.
@@ -610,7 +623,7 @@ impl Workspace {
 
     /// Sharing & access shows the primary, the one server this app may have started.
     pub(super) fn access_is_primary(&self) -> bool {
-        self.access_session_index() == PRIMARY
+        !matches!(self.connection, super::Connection::Off) && self.access_session_index() == PRIMARY
     }
 
     /// The scope's server config, or an empty one (the contract's defaults, no providers)
@@ -648,9 +661,28 @@ fn target_session_index(sessions: &[EnvironmentSession], target: Option<&str>) -
     }
 }
 
-/// `resolveAccessEnvironmentId`: the picked environment while it is listed, else the primary.
+/// `resolveAccessEnvironmentId`: the picked environment while it is listed, else the primary,
+/// else (the local environment off) the first connected saved one, else the first.
 pub(super) fn access_session_index(sessions: &[EnvironmentSession], selected: Option<&str>) -> usize {
-    selected.and_then(|id| sessions.iter().position(|session| session.is(id))).unwrap_or(PRIMARY)
+    let listed = |id: &str| sessions.iter().position(|session| session.is(id));
+    let saved = || sessions.iter().enumerate().skip(PRIMARY + 1);
+    selected
+        .and_then(listed)
+        .or_else(|| sessions[PRIMARY].id.as_ref().map(|_| PRIMARY))
+        .or_else(|| saved().find(|(_, session)| session.is_connected()).map(|(index, _)| index))
+        .or_else(|| saved().next().map(|(index, _)| index))
+        .unwrap_or(PRIMARY)
+}
+
+/// `allEnvironmentShellsBootstrappedAtom` for one saved environment: it has its snapshot, or is
+/// disconnected and past the first retries, which may still bring it in.
+fn saved_shell_settled(has_snapshot: bool, state: &ConnectionState) -> bool {
+    has_snapshot
+        || match state.phase {
+            Phase::Connecting | Phase::Connected => false,
+            Phase::Backoff => state.attempt > 2,
+            Phase::Available | Phase::Blocked => true,
+        }
 }
 
 /// Device pages read the primary; every other page reads only `scoped`'s session.
@@ -735,5 +767,28 @@ mod tests {
         assert_eq!(access_session_index(&sessions, Some("remote")), 1);
         assert_eq!(access_session_index(&sessions, Some("removed")), PRIMARY);
         assert_eq!(access_session_index(&sessions, None), PRIMARY);
+
+        // With the local environment off there is no primary: the first connected machine, else the first.
+        let connected = |id: &str| EnvironmentSession {
+            client: Some(RpcClient::unopened()),
+            ..EnvironmentSession::saved(id.into())
+        };
+        let sessions = [EnvironmentSession::default(), EnvironmentSession::saved("a".into()), connected("b")];
+        assert_eq!(access_session_index(&sessions, None), 2);
+        assert_eq!(access_session_index(&sessions, Some("a")), 1);
+        assert_eq!(access_session_index(&sessions[..2], None), 1);
+        assert_eq!(access_session_index(&sessions[..1], None), PRIMARY);
+    }
+
+    #[test]
+    fn a_saved_shell_settles_once_it_has_a_snapshot_or_is_offline_past_its_first_retries() {
+        let state = |phase, attempt| ConnectionState { phase, attempt, ..ConnectionState::default() };
+        assert!(saved_shell_settled(true, &state(Phase::Connecting, 0)));
+        assert!(!saved_shell_settled(false, &state(Phase::Connecting, 0)), "still connecting");
+        assert!(!saved_shell_settled(false, &state(Phase::Connected, 1)), "connected, snapshot pending");
+        assert!(!saved_shell_settled(false, &state(Phase::Backoff, 2)), "an early retry may still connect");
+        assert!(saved_shell_settled(false, &state(Phase::Backoff, 3)));
+        assert!(saved_shell_settled(false, &state(Phase::Blocked, 1)));
+        assert!(saved_shell_settled(false, &state(Phase::Available, 0)));
     }
 }

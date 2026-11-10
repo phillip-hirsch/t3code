@@ -862,11 +862,7 @@ async fn connect_route(environment_id: String, route: Route) -> Result<Connected
     let endpoint = Endpoint::bearer(&http_base, token);
     let descriptor =
         environments::fetch_descriptor(&endpoint.http_base).await.map_err(|failure| Box::new((failure, None)))?;
-    if descriptor.environment_id != environment_id {
-        let failure = Failure::environment_mismatch(&environment_id, &descriptor.environment_id);
-        return Err(Box::new((failure, Some(descriptor))));
-    }
-    if let Some(failure) = descriptor.compatibility_error() {
+    if let Some(failure) = descriptor_failure(&environment_id, &descriptor) {
         return Err(Box::new((failure, Some(descriptor))));
     }
     let options = ConnectOptions { ws_url: endpoint.ws_url(), bearer_token: endpoint.bearer_token.clone() };
@@ -877,6 +873,15 @@ async fn connect_route(environment_id: String, route: Route) -> Result<Connected
         }
         Err(error) => Err(Box::new((Failure::transport(format!("{error:#}")), Some(descriptor)))),
     }
+}
+
+/// Why a route whose public descriptor answered this way gets no token: it is another
+/// environment (the saved address moved to another server), or a server this client can't use.
+fn descriptor_failure(environment_id: &str, descriptor: &environments::Descriptor) -> Option<Failure> {
+    if descriptor.environment_id != environment_id {
+        return Some(Failure::environment_mismatch(environment_id, &descriptor.environment_id));
+    }
+    descriptor.compatibility_error()
 }
 
 /// `prepareDesktopSshEnvironment`: starts or reuses the server over SSH and forwards to it. The
@@ -1209,6 +1214,21 @@ mod tests {
         (result, tried.into_inner())
     }
 
+    #[test]
+    fn a_route_answering_as_another_environment_is_refused_before_its_token_is_sent() {
+        let descriptor = |id: &str, protocol: u64| -> environments::Descriptor {
+            let json =
+                serde_json::json!({"environmentId": id, "label": "Box", "orchestrationProtocolVersion": protocol});
+            serde_json::from_value(json).unwrap()
+        };
+        assert_eq!(descriptor_failure("env-a", &descriptor("env-a", 2)), None);
+        let other = descriptor_failure("env-a", &descriptor("env-b", 2)).expect("another environment is refused");
+        assert_eq!(other, Failure::environment_mismatch("env-a", "env-b"));
+        assert!(other.reason.blocks(), "its routes stay blocked until the user acts");
+        let outdated = descriptor_failure("env-a", &descriptor("env-a", 1)).expect("an outdated server is refused");
+        assert_eq!(outdated.reason, environments::Reason::Unsupported);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn routes_connect_in_order_passing_over_ones_that_do_not_answer() {
         use environments::Reason;
@@ -1235,6 +1255,9 @@ mod tests {
         assert_eq!((result, tried), (Err(Reason::Network), vec![0, 1, 2]));
         let (result, _) = over_routes(vec![answered; 2], vec![Err(Reason::Authentication); 2]).await;
         assert_eq!(result, Err(Reason::Authentication));
+        // A saved address that now reaches another environment fails over to the next route.
+        let (result, tried) = over_routes(vec![answered; 2], vec![Err(Reason::Configuration), Ok(())]).await;
+        assert_eq!((result, tried), (Ok(1), vec![0, 1]));
         let (result, tried) = over_routes(vec![answered; 2], vec![Err(Reason::Unsupported), Ok(())]).await;
         assert_eq!((result, tried), (Err(Reason::Unsupported), vec![0]));
         assert_eq!(over_routes(Vec::new(), Vec::new()).await.0, Err(Reason::EndpointUnavailable));

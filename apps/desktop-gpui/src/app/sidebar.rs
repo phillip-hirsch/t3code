@@ -1840,6 +1840,12 @@ impl Workspace {
                 Some((format!("Reconnecting: {reason}").into(), tokens.warning_foreground))
             }
             Connection::Failed(reason) => Some((reason.clone(), tokens.error_foreground)),
+            Connection::Off if self.saved_environments.read(cx).environments().iter().any(|e| e.enabled) => None,
+            Connection::Off => Some((
+                "The local environment is off. Turn it on in Settings › Environments, or add an environment there."
+                    .into(),
+                tokens.muted_foreground,
+            )),
         };
         h_flex()
             .flex_none()

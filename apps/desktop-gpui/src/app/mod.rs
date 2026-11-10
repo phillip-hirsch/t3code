@@ -158,6 +158,9 @@ enum Connection {
     Connected,
     Disconnected(SharedString),
     Failed(SharedString),
+    /// The local environment is off, so there is no primary session; saved environments carry
+    /// every thread.
+    Off,
 }
 
 /// Where the composer sends, on the environment the thread or project lives on.
@@ -678,7 +681,7 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             loop {
                 let status = backend.status();
-                let shown = this.update(cx, |this, cx| match &status {
+                let shown = this.update_in(cx, |this, window, cx| match &status {
                     BackendStatus::Starting => {
                         this.connection = Connection::Starting;
                         this.set_connection(Connection::Starting, cx);
@@ -693,6 +696,10 @@ impl Workspace {
                     }
                     BackendStatus::Failed(reason) => {
                         this.set_connection(Connection::Failed(reason.clone().into()), cx);
+                    }
+                    BackendStatus::Off => {
+                        this.set_connection(Connection::Off, cx);
+                        this.land(window, cx);
                     }
                 });
                 if shown.is_err() {
@@ -972,8 +979,12 @@ impl Workspace {
     fn land(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.follow_first_run(cx);
         if !self.landed {
-            let ready =
-                self.draft_store.restored() && self.primary_environment().is_some_and(|id| self.shell.has_snapshot(id));
+            let shells = match self.primary_environment() {
+                Some(id) => self.shell.has_snapshot(id),
+                // `IndexDraftLanding` waits for every environment's shell.
+                None => matches!(self.connection, Connection::Off) && self.shells_bootstrapped(cx),
+            };
+            let ready = self.draft_store.restored() && shells;
             if self.onboarding.pending() || !ready {
                 return;
             }
