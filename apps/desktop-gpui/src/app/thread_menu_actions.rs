@@ -47,9 +47,12 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let input = json!({"threadId": key.id});
+        if !self.env_permits(&key.env, "projects.createFromThread", &input) {
+            return;
+        }
         let Some(client) = self.env_client(&key.env) else { return };
         let title = self.shell.thread(key).map(|t| t.title.clone()).unwrap_or_default();
-        let input = json!({"threadId": key.id});
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("projects.createFromThread", input).await;
             let _ = this.update_in(cx, |_, window, cx| {

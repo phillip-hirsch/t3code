@@ -1486,7 +1486,8 @@ impl Workspace {
         let key = lineage::row_key(env, id, &thread_id);
         let expanded = self.lineage.workflows_open.contains(&key);
         let group: SharedString = format!("details-lineage-workflow-{thread_id}").into();
-        let can_stop = workflow.stoppable && self.can_operate(env);
+        let stop = json!({"threadId": id, "subagentId": workflow.subagent_id});
+        let can_stop = workflow.stoppable && self.env_permits(env, "orchestration.stopWorkflow", &stop);
         let stopping = self.lineage.stopping.as_deref() == Some(workflow.subagent_id.as_str());
         let busy = self.lineage.stopping.is_some();
         let ring = super::chat::focus_ring(tokens);
