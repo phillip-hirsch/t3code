@@ -1597,12 +1597,11 @@ impl Workspace {
                 }
                 // The viewport's size and presets are in the device toolbar this shows.
                 let toolbar = if fill { "Show device toolbar" } else { "Hide device toolbar" };
-                menu =
-                    menu.item(PopupMenuItem::new(toolbar).disabled(!has_page && !server).on_click(
-                        window.listener_for(&view, |this, _: &ClickEvent, window, cx| {
-                            this.toggle_device_toolbar(window, cx)
-                        }),
-                    ));
+                menu = menu.item(PopupMenuItem::new(toolbar).disabled(!has_page && !server).on_click(
+                    window.listener_for(&view, |this, _: &ClickEvent, window, cx| {
+                        this.toggle_device_toolbar(window, cx);
+                    }),
+                ));
                 menu = menu.separator().label("Appearance");
                 for option in Appearance::ALL {
                     menu = menu.item(
