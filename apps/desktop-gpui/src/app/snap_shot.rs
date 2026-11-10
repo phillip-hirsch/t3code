@@ -22,6 +22,7 @@ use serde_json::Value;
 use super::pages::settings::keybindings;
 use super::{Target, Workspace, new_id};
 use crate::desktop::snap_shot::{self as platform, Capture, Registration};
+use crate::model::ScopedId;
 use crate::snap_shot::setup::{self, Mode, PortalShortcut, Step};
 use crate::snap_shot::{self, Modifier, Shortcut, Sound};
 use crate::theme::Tokens;
@@ -498,10 +499,16 @@ impl Workspace {
         cx.notify();
     }
 
+    /// The pinned target is still there on its own environment: the thread, or a live draft
+    /// still in that listed project.
     fn target_exists(&self, target: &Target) -> bool {
         match target {
-            Target::Thread { id, .. } => self.shell.threads.iter().any(|thread| &thread.id == id),
-            Target::Draft { project_id, .. } => self.shell.projects.iter().any(|project| &project.id == project_id),
+            Target::Thread { env, id } => self.shell.thread(&ScopedId::new(env.clone(), id.as_str())).is_some(),
+            Target::Draft { env, project_id, draft } => {
+                self.drafts.is_live(draft)
+                    && self.drafts.target(draft).as_ref() == Some(target)
+                    && self.shell.project(&ScopedId::new(env.clone(), project_id.as_str())).is_some()
+            }
         }
     }
 
