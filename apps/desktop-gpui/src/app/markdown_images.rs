@@ -11,7 +11,9 @@ use markdown::mdast::Node;
 use serde_json::{Value, json};
 
 use super::Workspace;
+use super::chat::view_pane;
 use super::image_viewer::{Reference, ViewerImage, file_reference};
+use super::side_chat::ChatPane;
 
 /// A 1×1 transparent PNG, drawn while an image loads or when it cannot.
 static BLANK: LazyLock<Arc<Image>> = LazyLock::new(|| {
@@ -25,30 +27,78 @@ static BLANK: LazyLock<Arc<Image>> = LazyLock::new(|| {
 });
 
 /// Loaded images by the destination the markdown wrote, for one thread: a relative
-/// destination resolves against that thread's checkout. `None` is loading or failed.
+/// destination resolves against that thread's checkout. A slot remembers which panes asked for
+/// it, so a side chat's images go with it ([`Self::release_side`]).
 #[derive(Clone, Default)]
-pub(super) struct ImageCache(Arc<Mutex<HashMap<String, Option<Arc<Image>>>>>);
+pub(super) struct ImageCache(Arc<Mutex<Slots>>);
+
+#[derive(Default)]
+struct Slots {
+    slots: HashMap<String, Slot>,
+    /// The side chat has claimed a slot since it last released.
+    side_claimed: bool,
+}
+
+struct Slot {
+    /// `None` while it loads or when it could not.
+    image: Option<Arc<Image>>,
+    main: bool,
+    side: bool,
+}
 
 impl ImageCache {
     /// The loaded image for `destination`, if it has loaded.
     pub(super) fn get(&self, destination: &str) -> Option<Arc<Image>> {
-        self.0.lock().ok()?.get(destination).cloned().flatten()
+        self.0.lock().ok()?.slots.get(destination)?.image.clone()
+    }
+
+    /// Whether `destination` has loaded, is loading, or could not load.
+    fn contains(&self, destination: &str) -> bool {
+        self.0.lock().is_ok_and(|cache| cache.slots.contains_key(destination))
     }
 
     /// Marks `destination` loading; false when the cache has already seen it.
     pub(super) fn claim(&self, destination: &str) -> bool {
-        let Ok(mut cache) = self.0.lock() else { return false };
-        if cache.contains_key(destination) {
-            return false;
-        }
-        cache.insert(destination.to_owned(), None);
-        true
+        self.claim_for(ChatPane::Main, destination)
     }
 
-    pub(super) fn store(&self, destination: String, image: Arc<Image>) {
-        if let Ok(mut cache) = self.0.lock() {
-            cache.insert(destination, Some(image));
+    /// [`Self::claim`] for an image `pane` shows, which it then holds until it releases.
+    pub(super) fn claim_for(&self, pane: ChatPane, destination: &str) -> bool {
+        let Ok(mut cache) = self.0.lock() else { return false };
+        cache.side_claimed |= pane == ChatPane::Side;
+        let (main, side) = (pane == ChatPane::Main, pane == ChatPane::Side);
+        match cache.slots.get_mut(destination) {
+            Some(slot) => {
+                slot.main |= main;
+                slot.side |= side;
+                false
+            }
+            None => {
+                cache.slots.insert(destination.to_owned(), Slot { image: None, main, side });
+                true
+            }
         }
+    }
+
+    /// Fills a claimed slot; a load whose slot was released keeps nothing.
+    pub(super) fn store(&self, destination: String, image: Arc<Image>) {
+        if let Ok(mut cache) = self.0.lock()
+            && let Some(slot) = cache.slots.get_mut(&destination)
+        {
+            slot.image = Some(image);
+        }
+    }
+
+    /// Drops the images only the side chat held, once it shows another chat or none.
+    pub(super) fn release_side(&self) {
+        let Ok(mut cache) = self.0.lock() else { return };
+        if !std::mem::take(&mut cache.side_claimed) {
+            return;
+        }
+        cache.slots.retain(|_, slot| {
+            slot.side = false;
+            slot.main
+        });
     }
 
     pub(super) fn same(&self, other: &Self) -> bool {
@@ -59,7 +109,7 @@ impl ImageCache {
     pub(super) fn resolver(&self) -> impl Fn(&SharedUri) -> ImageSource + Send + Sync + 'static {
         let cache = self.0.clone();
         move |uri| {
-            let image = cache.lock().ok().and_then(|cache| cache.get(uri.as_ref()).cloned().flatten());
+            let image = cache.lock().ok().and_then(|cache| cache.slots.get(uri.as_ref())?.image.clone());
             ImageSource::Image(image.unwrap_or_else(|| BLANK.clone()))
         }
     }
@@ -296,13 +346,10 @@ impl Workspace {
     fn load_sources(&mut self, key: &SharedString, sources: Vec<(String, Source)>, cx: &mut Context<Self>) {
         let thread_id = self.thread.as_ref().map(|t| t.id.clone());
         let cache = self.markdown_images.clone();
+        let pane = view_pane(key).0;
         for (destination, source) in sources {
-            {
-                let Ok(mut cache) = cache.0.lock() else { return };
-                if cache.contains_key(&destination) {
-                    continue;
-                }
-                cache.insert(destination.clone(), None);
+            if !cache.claim_for(pane, &destination) {
+                continue;
             }
             let resource = match &source {
                 Source::WorkspaceFile(path) => {
@@ -360,10 +407,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(image) = image else { return };
-        if let Ok(mut cache) = cache.0.lock() {
-            cache.insert(destination, Some(image));
-        }
-        if !Arc::ptr_eq(&cache.0, &self.markdown_images.0) {
+        cache.store(destination, image);
+        if !cache.same(&self.markdown_images) {
             return;
         }
         if let Some(index) = self.rows.iter().rposition(|row| super::chat::shows_markdown(row, key)) {
@@ -432,6 +477,7 @@ impl Workspace {
     /// (`useAssetUrls`). Their tiles keep their size, so a finished load only repaints.
     pub(super) fn load_attachment_images<'a>(
         &mut self,
+        pane: ChatPane,
         ids: impl IntoIterator<Item = &'a str>,
         cx: &mut Context<Self>,
     ) {
@@ -439,12 +485,8 @@ impl Workspace {
         let cache = self.markdown_images.clone();
         for id in ids {
             let key = attachment_key(id);
-            {
-                let Ok(mut cache) = cache.0.lock() else { return };
-                if cache.contains_key(&key) {
-                    continue;
-                }
-                cache.insert(key.clone(), None);
+            if !cache.claim_for(pane, &key) {
+                continue;
             }
             let resource = json!({"_tag": "attachment", "attachmentId": id});
             let (client, base, cache) = (client.clone(), base.clone(), cache.clone());
@@ -464,11 +506,9 @@ impl Workspace {
                     Some(Arc::new(Image::from_bytes(format, bytes)))
                 });
                 let Some(image) = image else { return };
-                if let Ok(mut cache) = cache.0.lock() {
-                    cache.insert(key, Some(image));
-                }
+                cache.store(key, image);
                 let _ = this.update(cx, |this, cx| {
-                    if Arc::ptr_eq(&cache.0, &this.markdown_images.0) {
+                    if cache.same(&this.markdown_images) {
                         cx.notify();
                     }
                 });
@@ -479,12 +519,12 @@ impl Workspace {
 
     /// A loaded image attachment; `None` while it loads or when it could not.
     pub(super) fn attachment_image(&self, id: &str) -> Option<Arc<Image>> {
-        self.markdown_images.0.lock().ok()?.get(&attachment_key(id)).cloned().flatten()
+        self.markdown_images.get(&attachment_key(id))
     }
 
     /// The image attachment has loaded, is loading, or could not load.
     pub(super) fn attachment_image_requested(&self, id: &str) -> bool {
-        self.markdown_images.0.lock().is_ok_and(|cache| cache.contains_key(&attachment_key(id)))
+        self.markdown_images.contains(&attachment_key(id))
     }
 }
 
@@ -568,6 +608,27 @@ mod tests {
         );
         assert!(!links_to_image("https://x.dev"));
         assert!(links_to_image("https://x.dev/full.png?s=1"));
+    }
+
+    #[test]
+    fn a_side_chat_releases_only_the_images_it_alone_asked_for() {
+        let png = || BLANK.clone();
+        let cache = ImageCache::default();
+        assert!(cache.claim_for(ChatPane::Main, "main.png"));
+        assert!(cache.claim_for(ChatPane::Side, "side.png"));
+        assert!(cache.claim_for(ChatPane::Side, "both.png"));
+        assert!(!cache.claim_for(ChatPane::Main, "both.png"));
+        assert!(cache.claim_for(ChatPane::Side, "late.png"));
+        for destination in ["main.png", "side.png", "both.png"] {
+            cache.store(destination.to_owned(), png());
+        }
+        cache.release_side();
+        assert!(cache.get("main.png").is_some() && cache.get("both.png").is_some());
+        assert!(cache.get("side.png").is_none());
+        // A load that lands after its side chat left keeps nothing.
+        cache.store("late.png".to_owned(), png());
+        assert!(cache.get("late.png").is_none());
+        assert!(cache.claim_for(ChatPane::Side, "side.png"));
     }
 
     #[test]

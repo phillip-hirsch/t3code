@@ -42,7 +42,7 @@ const UNAVAILABLE: &str = "This context is no longer available.";
 const ATTACHMENT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The image's thumbnail once loaded; the first ask starts its load (`useAssetUrls`).
-fn thumbnail(this: &WeakEntity<Workspace>, id: &str, cx: &mut App) -> Option<Arc<Image>> {
+fn thumbnail(this: &WeakEntity<Workspace>, pane: ChatPane, id: &str, cx: &mut App) -> Option<Arc<Image>> {
     let workspace = this.upgrade()?;
     let w = workspace.read(cx);
     if let Some(image) = w.attachment_image(id) {
@@ -51,7 +51,7 @@ fn thumbnail(this: &WeakEntity<Workspace>, id: &str, cx: &mut App) -> Option<Arc
     if !w.attachment_image_requested(id) {
         let (this, id) = (this.clone(), id.to_owned());
         cx.defer(move |cx| {
-            let _ = this.update(cx, |w, cx| w.load_attachment_images([id.as_str()], cx));
+            let _ = this.update(cx, |w, cx| w.load_attachment_images(pane, [id.as_str()], cx));
         });
     }
     None
@@ -311,7 +311,7 @@ fn image_tile(
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
-    let picture = thumbnail(this, &image.id, cx);
+    let picture = thumbnail(this, view_pane(message).0, &image.id, cx);
     let own_width = lone && picture.is_some();
     let body = match picture {
         // A lone image takes its width from its own shape.
@@ -722,7 +722,7 @@ impl ContextChips {
             "environment" => self.environment_chip(id, label, record, &t, cx),
             "image" => {
                 let Some(image) = self.content.record_attachment(record) else { return unavailable(id, label, &t) };
-                let icon = match thumbnail(&self.workspace, &image.id, cx) {
+                let icon = match thumbnail(&self.workspace, view_pane(&self.message).0, &image.id, cx) {
                     Some(picture) => {
                         img(picture).size(px(14.)).rounded(px(2.)).object_fit(ObjectFit::Cover).into_any_element()
                     }
@@ -1064,7 +1064,7 @@ fn annotation_details(
     cx: &mut App,
 ) -> AnyElement {
     let screenshot = content.annotation_image(record);
-    let crop = match screenshot.and_then(|image| thumbnail(view, &image.id, cx).map(|picture| (image, picture))) {
+    let crop = match screenshot.and_then(|image| thumbnail(view, pane, &image.id, cx).map(|picture| (image, picture))) {
         Some((image, picture)) => button(div().id(ElementId::Name(format!("annotation-crop:{}", image.id).into())), t)
             .max_h(px(256.))
             .w_full()

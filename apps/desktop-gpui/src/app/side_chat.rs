@@ -411,6 +411,8 @@ impl Workspace {
         }
         self.stash_side_citation_comment(window, cx);
         self.side_chat.release_view(cx);
+        self.markdown_images.release_side();
+        self.sync_side_markdown();
         let (Some(thread_id), Some(client), Some(env)) = (shown, client, env) else { return };
         let draft = self.side_chat.drafts.remove(&(env.clone(), thread_id.to_owned())).unwrap_or_default();
         let empty = draft.trim().is_empty();
@@ -501,7 +503,7 @@ impl Workspace {
         rows.extend(self.queue_rows(ChatPane::Side));
         self.load_queue_images(ChatPane::Side, cx);
         let answer_images: Vec<String> = rows.iter().flat_map(Row::open_answer_images).map(str::to_owned).collect();
-        self.load_attachment_images(answer_images.iter().map(String::as_str), cx);
+        self.load_attachment_images(ChatPane::Side, answer_images.iter().map(String::as_str), cx);
         let Some(view) = self.side_chat.view.as_mut() else { return };
         super::chat::sync_tick(&mut view._tick, &rows, cx);
         let was_empty = view.rows.is_empty();

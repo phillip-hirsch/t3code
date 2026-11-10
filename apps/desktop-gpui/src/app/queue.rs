@@ -373,7 +373,7 @@ impl Workspace {
     pub(super) fn load_queue_images(&mut self, pane: ChatPane, cx: &mut Context<Self>) {
         let Some(state) = self.queue_ui(pane).map(|ui| ui.state.clone()) else { return };
         let images = state.queued.iter().flat_map(|message| message.images.iter().map(|image| image.id.as_ref()));
-        self.load_attachment_images(images, cx);
+        self.load_attachment_images(pane, images, cx);
     }
 
     /// `ComposerQueuedAttachmentRow`: the edited message's attachments, already uploaded.
