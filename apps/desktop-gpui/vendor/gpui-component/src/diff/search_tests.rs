@@ -212,6 +212,37 @@ fn regex_character_classes_follow_javascript() {
 }
 
 #[test]
+fn regex_escapes_follow_javascript() {
+    let patch = "diff --git a/e.txt b/e.txt\n--- a/e.txt\n+++ b/e.txt\n@@ -0,0 +1,2 @@\n+AqzehK8kB-\n+p{L}ſ\u{1}aa\n";
+    let files = DiffFile::parse(patch).unwrap();
+    let find = |query: &str| {
+        collect_matches(
+            &files,
+            query,
+            SearchOptions {
+                regex: true,
+                case_sensitive: true,
+                ..SearchOptions::default()
+            },
+        )
+        .into_iter()
+        .map(|found| (found.line, found.range))
+        .collect::<Vec<_>>()
+    };
+    // A backslash before a character with no escape meaning is that character.
+    assert_eq!(find(r"\A"), [(0, 0..1)]);
+    assert_eq!(find(r"\q"), [(0, 1..2)]);
+    assert_eq!(find(r"\z\e\h\K"), [(0, 2..6)]);
+    assert_eq!(find(r"\8\k[\B][\-]"), [(0, 6..10)]);
+    assert_eq!(find(r"\p{L}"), [(1, 0..4)]);
+    // `\1` with no group is an octal escape; one before its group matches empty.
+    assert_eq!(find(r"\1"), [(1, 6..7)]);
+    assert_eq!(find(r"\1(a)"), [(1, 7..8), (1, 8..9)]);
+    assert_eq!(find(r"[Ā-Ȁ]"), [(1, 4..6)], "a range holds `ſ`");
+    assert!(find("a\\").is_empty(), "a trailing backslash is invalid");
+}
+
+#[test]
 fn steps_wrap_at_both_ends() {
     assert_eq!(step(None, 3, true), Some(0));
     assert_eq!(step(None, 3, false), Some(2));

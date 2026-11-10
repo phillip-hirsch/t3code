@@ -119,7 +119,10 @@ pub(crate) fn collect_matches(
     } else {
         fancy_regex::escape(query)
     };
-    let Ok(pattern) = fancy_regex::RegexBuilder::new(&js_regex::translate(&pattern))
+    let Some(pattern) = js_regex::translate(&pattern) else {
+        return Vec::new();
+    };
+    let Ok(pattern) = fancy_regex::RegexBuilder::new(&pattern)
         .case_insensitive(!options.case_sensitive)
         .build()
     else {

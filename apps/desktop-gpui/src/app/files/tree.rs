@@ -79,7 +79,7 @@ pub(super) struct TreeState {
     loading: Rc<HashSet<String>>,
     queue: VecDeque<String>,
     in_flight: usize,
-    errors: HashMap<String, String>,
+    errors: HashMap<String, Failure>,
     expanded: HashSet<String>,
     /// "Expand all" keeps opening folders as they list.
     expand_all: bool,
@@ -101,6 +101,20 @@ pub(super) struct TreeState {
     reveal: Reveal,
     mutation: Option<(Option<String>, Option<String>)>,
     _subscription: Subscription,
+}
+
+/// A folder that did not list, and the socket it failed on.
+struct Failure {
+    message: String,
+    on: Option<crate::rpc::SocketId>,
+}
+
+impl Failure {
+    /// A failure stands until a new socket, so folders that failed offline list once the
+    /// environment reconnects, as the web's do on a new session.
+    fn retries_on(&self, socket: &crate::rpc::SocketId) -> bool {
+        self.on.as_ref() != Some(socket)
+    }
 }
 
 /// Which selections the tree reveals (`handledRevealRef`, `treeSelectionPathRef`).
@@ -150,7 +164,8 @@ impl TreeState {
         let folders: HashSet<&str> = std::iter::once("")
             .chain(entries.iter().filter(|e| e.kind == EntryKind::Directory).map(|e| e.path.as_str()))
             .collect();
-        self.error = self.errors.iter().find(|(path, _)| folders.contains(path.as_str())).map(|(_, e)| e.clone());
+        self.error =
+            self.errors.iter().find(|(path, _)| folders.contains(path.as_str())).map(|(_, e)| e.message.clone());
         let expandable = self.expandable_in(&entries);
         self.all_open =
             self.expand_all || (!expandable.is_empty() && expandable.iter().all(|p| self.expanded.contains(p)));
@@ -186,7 +201,7 @@ impl TreeState {
     pub(super) fn folder(&self, folder: &str) -> Result<Option<&[Entry]>, &str> {
         match (self.listed.get(folder), self.errors.get(folder)) {
             (Some(entries), _) => Ok(Some(entries)),
-            (None, Some(error)) => Err(error),
+            (None, Some(error)) => Err(&error.message),
             (None, None) => Ok(None),
         }
     }
@@ -263,10 +278,11 @@ impl Workspace {
             let Some(folder) = tree.queue.pop_front() else { break };
             let Some(client) = client.clone() else {
                 Rc::make_mut(&mut tree.loading).remove(&folder);
-                tree.errors.insert(folder, "Not connected.".into());
+                tree.errors.insert(folder, Failure { message: "Not connected.".into(), on: None });
                 continue;
             };
             tree.in_flight += 1;
+            let socket = client.socket_id();
             let root = root.clone();
             let input = logic::list_entries_input(&root.cwd, &folder);
             cx.spawn(async move |this, cx| {
@@ -295,7 +311,8 @@ impl Workspace {
                             tree.errors.remove(&folder);
                         }
                         Err(error) => {
-                            tree.errors.insert(folder.clone(), logic::error_message(&error));
+                            let message = logic::error_message(&error);
+                            tree.errors.insert(folder.clone(), Failure { message, on: Some(socket) });
                         }
                     }
                     tree.rows_dirty = true;
@@ -424,8 +441,8 @@ impl Workspace {
         window.blur(cx);
     }
 
-    /// Keeps the tree current: a new workspace mutation lists the open folders again, and a new
-    /// selection opens the folders above it and scrolls to it.
+    /// Keeps the tree current: a new workspace mutation lists the open folders again, a new socket
+    /// lists the failed ones again, and a new selection opens the folders above it and scrolls to it.
     fn sync_tree(
         &mut self,
         root: &Checkout,
@@ -435,10 +452,17 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let mutation = self.files.mutation.clone();
+        let socket = self.env_client(&root.env).map(|client| client.socket_id());
         let Some(tree) = self.tree(root) else { return };
         let previous = tree.mutation.replace(mutation.clone());
+        let failed: Vec<String> = socket
+            .map(|socket| tree.errors.iter().filter(|(_, f)| f.retries_on(&socket)).map(|(p, _)| p.clone()).collect())
+            .unwrap_or_default();
         if previous.is_some_and(|p| p != mutation) {
             self.refresh_tree(root, cx);
+        }
+        for folder in failed {
+            self.load_folder(root, folder, true, cx);
         }
         let Some(selected) = selected.filter(|s| !s.is_empty()) else { return };
         let Some(tree) = self.tree(root) else { return };
@@ -918,7 +942,17 @@ impl Workspace {
 
 #[cfg(test)]
 mod tests {
-    use super::Reveal;
+    use super::{Failure, Reveal};
+
+    #[test]
+    fn a_failed_folder_lists_again_on_a_new_socket() {
+        let (first, second) = (crate::rpc::RpcClient::unopened(), crate::rpc::RpcClient::unopened());
+        let offline = Failure { message: "Not connected.".into(), on: None };
+        assert!(offline.retries_on(&first.socket_id()), "failed with no socket: the first one reads");
+        let failed = Failure { message: "closed".into(), on: Some(first.socket_id()) };
+        assert!(!failed.retries_on(&first.socket_id()), "the failure stands on that socket");
+        assert!(failed.retries_on(&second.socket_id()), "a reconnect reads again");
+    }
 
     #[test]
     fn files_opened_from_the_tree_are_not_revealed_again() {

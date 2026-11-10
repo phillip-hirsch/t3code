@@ -290,8 +290,8 @@ const VIEWER_KEYS: [&str; 6] = ["a", "c", "f", "v", "x", "z"];
 
 /// The chords a focused file viewer page (PDF, Office) hands back. The web's viewers sit in its
 /// DOM, where the shell's shortcuts reach the app as `context` resolves them (project scripts from
-/// `scripts`, as [`resolve_chat`] does); a page forwards those with Cmd, Ctrl or a function key,
-/// which type no text, but the viewer's own.
+/// `scripts`, as [`resolve_chat`] does); a page forwards those with Cmd, Ctrl, a function key, or
+/// Alt on a named key such as an arrow, which type no text, but the viewer's own.
 pub(super) fn viewer_chords(primary: &[Rule], scripts: &[Rule], context: &ShortcutContext) -> Vec<PageChord<String>> {
     viewer_chords_on(primary, scripts, context, MAC)
 }
@@ -312,6 +312,8 @@ fn viewer_chords_on(
         }
     }
     let function = |key: &str| key.strip_prefix('f').is_some_and(|n| n.parse::<u8>().is_ok());
+    // Alt on a character key types one (Option+G is ©, AltGr letters).
+    let named = |key: &str| key.chars().count() > 1;
     commands
         .into_iter()
         .flat_map(|(rules, command)| {
@@ -319,7 +321,7 @@ fn viewer_chords_on(
         })
         .filter(|c| {
             let own = (c.meta, c.ctrl, c.shift, c.alt) == (mac, !mac, false, false) && VIEWER_KEYS.contains(&&*c.key);
-            (c.meta || c.ctrl || function(&c.key)) && !own
+            (c.meta || c.ctrl || function(&c.key) || (c.alt && named(&c.key))) && !own
         })
         .collect()
 }
@@ -740,11 +742,15 @@ mod tests {
         let primary = merge_with_defaults(&[
             compile("g", "chat.new", None).unwrap(),
             compile("mod+shift+r", "script.lint.run", None).unwrap(),
+            compile("alt+arrowleft", "navigation.back", None).unwrap(),
+            compile("alt+g", "chat.newLocal", None).unwrap(),
         ]);
         let scripts = [compile("mod+shift+y", "script.build.run", None).unwrap()];
         let commands: Vec<_> =
             viewer_chords_on(&primary, &scripts, &rest, false).into_iter().map(|c| (c.command, c.key)).collect();
         assert!(!commands.contains(&("chat.new".into(), "g".into())), "a plain key stays the page's text");
+        assert!(commands.contains(&("navigation.back".into(), "arrowleft".into())), "Alt on a key that types nothing");
+        assert!(!commands.contains(&("chat.newLocal".into(), "g".into())), "Alt on a letter types text (Option+G)");
         assert!(commands.contains(&("script.build.run".into(), "y".into())), "the environment's project scripts");
         assert!(!commands.iter().any(|(command, _)| command == "script.lint.run"), "the primary binds no script");
     }
