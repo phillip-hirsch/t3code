@@ -600,7 +600,7 @@ mod tests {
         let web = ScopedId::new("local", "web");
         let launched = sessions.create(web.clone());
         sessions.assign(web.clone(), &launched);
-        sessions.promote(&launched);
+        sessions.promote(&launched, thread("launched"));
         let unmapped_empty = sessions.create(web.clone());
         let unmapped_written = sessions.create(web);
         let [launched, unmapped_empty, unmapped_written] =

@@ -439,9 +439,9 @@ impl Workspace {
                             // The launched draft's picks went with it, and its project's next draft is new.
                             this.composer_selections.remove(&origin);
                             if let Some(draft) = origin.draft_id() {
-                                this.drafts.promote(draft);
                                 let thread =
                                     Target::Thread { env: origin.environment().clone(), id: thread_id.clone() };
+                                this.drafts.promote(draft, thread.clone());
                                 this.retarget_closed_views(&origin, &thread);
                                 this.carry_draft_panel(&origin, &thread);
                             }

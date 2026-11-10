@@ -47,8 +47,9 @@ struct Session {
     /// When it was made, in milliseconds and strictly increasing (`createdAt`): the sidebar
     /// lists drafts newest first, across restarts too.
     created: i64,
-    /// It launched its thread (`promotedTo`), so no project opens it again.
-    promoted: bool,
+    /// The thread it launched (`promotedTo`), so no project opens it again and history opens that
+    /// thread instead (`promotedDraftRedirects`).
+    promoted: Option<Target>,
     /// The id its thread launches with (`DraftSessionState.threadId`), assigned once by its first
     /// terminal or its send, so both share it; it goes when the draft launches or goes.
     thread_id: Option<String>,
@@ -78,7 +79,7 @@ impl DraftSessions {
         let session = Session {
             project,
             created: self.last_created,
-            promoted: false,
+            promoted: None,
             thread_id: None,
             workspace: Default::default(),
         };
@@ -88,13 +89,13 @@ impl DraftSessions {
 
     /// The id `draft`'s thread launches with, once assigned.
     pub(super) fn thread_id(&self, draft: &DraftId) -> Option<&str> {
-        self.sessions.get(draft).filter(|session| !session.promoted)?.thread_id.as_deref()
+        self.sessions.get(draft).filter(|session| session.promoted.is_none())?.thread_id.as_deref()
     }
 
     /// The id `draft`'s thread launches with, assigned on first use, and whether this call
     /// assigned it. `None` for a draft that launched or is gone.
     pub(super) fn reserve_thread(&mut self, draft: &DraftId) -> Option<(String, bool)> {
-        let session = self.sessions.get_mut(draft).filter(|session| !session.promoted)?;
+        let session = self.sessions.get_mut(draft).filter(|session| session.promoted.is_none())?;
         let assigned = session.thread_id.is_none();
         let id = session.thread_id.get_or_insert_with(super::new_id).clone();
         Some((id, assigned))
@@ -103,7 +104,7 @@ impl DraftSessions {
     /// The unsent draft on `env` whose thread launches with `thread_id`; `None` for `env` is a
     /// legacy key that names no environment, matched by the thread id alone.
     pub(super) fn launching_with(&self, env: Option<&str>, thread_id: &str) -> Option<&DraftId> {
-        let mut live = self.sessions.iter().filter(|(_, session)| !session.promoted);
+        let mut live = self.sessions.iter().filter(|(_, session)| session.promoted.is_none());
         live.find(|(_, session)| {
             session.thread_id.as_deref() == Some(thread_id) && env.is_none_or(|env| session.project.env == env)
         })
@@ -135,7 +136,7 @@ impl DraftSessions {
         empty: impl Fn(&DraftId) -> bool,
     ) -> Option<DraftId> {
         let open = open.filter(|draft| {
-            self.sessions.get(draft).is_some_and(|session| !session.promoted && session.project == *project)
+            self.sessions.get(draft).is_some_and(|session| session.promoted.is_none() && session.project == *project)
         });
         self.of_project(project).filter(|draft| empty(draft)).or(open.filter(|draft| empty(draft))).cloned()
     }
@@ -155,7 +156,7 @@ impl DraftSessions {
 
     /// The draft still opens as itself: it exists and has not launched its thread.
     pub(super) fn is_live(&self, draft: &DraftId) -> bool {
-        self.sessions.get(draft).is_some_and(|session| !session.promoted)
+        self.sessions.get(draft).is_some_and(|session| session.promoted.is_none())
     }
 
     /// The draft as a target, on its project's environment.
@@ -169,10 +170,15 @@ impl DraftSessions {
         self.sessions.get(draft).map_or(0, |session| session.created)
     }
 
-    /// The draft launched its thread: its project's next draft starts fresh.
-    pub(super) fn promote(&mut self, draft: &DraftId) {
+    /// The thread `draft` launched, once it has.
+    pub(super) fn promoted_to(&self, draft: &DraftId) -> Option<&Target> {
+        self.sessions.get(draft)?.promoted.as_ref()
+    }
+
+    /// The draft launched `thread`: its project's next draft starts fresh.
+    pub(super) fn promote(&mut self, draft: &DraftId, thread: Target) {
         if let Some(session) = self.sessions.get_mut(draft) {
-            session.promoted = true;
+            session.promoted = Some(thread);
             session.thread_id = None;
         }
         self.by_project.retain(|_, mapped| mapped != draft);
@@ -195,7 +201,7 @@ impl DraftSessions {
     pub(super) fn saved(&self, with_content: impl Fn(&DraftId) -> bool) -> Vec<SavedSession> {
         let mapped = |id: &DraftId| self.by_project.values().any(|mapped| mapped == id);
         let mut saved: Vec<SavedSession> = (self.sessions.iter())
-            .filter(|(id, session)| !session.promoted && (mapped(id) || with_content(id)))
+            .filter(|(id, session)| session.promoted.is_none() && (mapped(id) || with_content(id)))
             .map(|(id, session)| SavedSession {
                 draft_id: id.to_string(),
                 environment_id: session.project.env.to_string(),
@@ -227,7 +233,7 @@ impl DraftSessions {
             let session = Session {
                 project,
                 created: saved.created_at,
-                promoted: false,
+                promoted: None,
                 thread_id: saved.thread_id,
                 workspace: saved.workspace,
             };
@@ -270,6 +276,10 @@ mod tests {
         ScopedId::new("local", id)
     }
 
+    fn launched_thread() -> Target {
+        Target::Thread { env: "local".into(), id: "launched".into() }
+    }
+
     #[test]
     fn a_project_holds_several_drafts_but_opens_one() {
         let mut drafts = DraftSessions::default();
@@ -298,7 +308,7 @@ mod tests {
         // A populated draft lost its place; the open, empty draft of the project stays open.
         let unmapped = drafts.create(project("web"));
         assert_eq!(drafts.reusable(&web, Some(&unmapped), |d| *d == unmapped), Some(unmapped.clone()));
-        drafts.promote(&unmapped);
+        drafts.promote(&unmapped, launched_thread());
         assert_eq!(drafts.reusable(&web, Some(&unmapped), |d| *d == unmapped), None, "a launched draft");
     }
 
@@ -323,9 +333,10 @@ mod tests {
         let mut drafts = DraftSessions::default();
         let draft = drafts.create(project("web"));
         drafts.assign(project("web"), &draft);
-        drafts.promote(&draft);
+        drafts.promote(&draft, launched_thread());
         assert_eq!(drafts.of_project(&project("web")), None);
         assert!(!drafts.is_live(&draft));
+        assert_eq!(drafts.promoted_to(&draft), Some(&launched_thread()), "its history opens the launched thread");
     }
 
     #[test]
@@ -337,7 +348,7 @@ mod tests {
         let empty = drafts.create(project("api"));
         let launched = drafts.create(project("api"));
         drafts.assign(project("api"), &launched);
-        drafts.promote(&launched);
+        drafts.promote(&launched, launched_thread());
         let saved = drafts.saved(|id| *id == written);
         let ids: Vec<String> = saved.iter().map(|s| s.draft_id.clone()).collect();
         assert_eq!(ids, [mapped.to_string(), written.to_string()], "not the empty or launched ones");
@@ -426,7 +437,7 @@ mod tests {
         assert_eq!(next.thread_id(&draft), Some(id.as_str()), "it outlives a restart with the draft");
         assert_eq!(next.launching_with(Some("local"), &id), Some(&draft));
 
-        drafts.promote(&draft);
+        drafts.promote(&draft, launched_thread());
         assert_eq!(drafts.launching_with(Some("local"), &id), None, "the launched thread owns it now");
         assert_eq!(drafts.reserve_thread(&draft), None, "a launched draft takes no new thread");
         next.forget(&draft);
