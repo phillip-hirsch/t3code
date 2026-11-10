@@ -31,6 +31,9 @@ use crate::app::model_picker::{OnPick, PickHost};
 use crate::app::pages::settings::connections::logic::SETTINGS_WRITE;
 use crate::app::pages::settings::model_select::generates_text;
 use crate::app::pages::settings::widgets::{Switch, section_with_action};
+use crate::app::request_cards::{
+    INVALID_REFERENCE, REFERENCE_PLACEHOLDER, SecretSource, secret_reference, secret_sources,
+};
 use crate::model::{ModelSelection, Provider};
 use crate::rpc::RpcError;
 use crate::theme::{Tokens, tokens};
@@ -617,6 +620,77 @@ fn generator_icon(brand: &str, name: &str, size: Pixels, t: &Tokens) -> AnyEleme
 
 const STEPS: &[&str] = &["Connect", "Use it"];
 
+/// `SecretSourceInput` for the API key: a typed value, or a reference a secret provider reads.
+#[derive(Debug, Default, PartialEq)]
+struct KeySource {
+    /// The committed `{provider, reference}`; `None` while the key is a typed value.
+    secret: Option<Value>,
+    /// A provider picked here; it applies once a reference for it is committed.
+    pending: Option<String>,
+    /// Reference text the provider can't read, kept in the field beside its message.
+    rejected: Option<String>,
+}
+
+impl KeySource {
+    fn of(api_key: Option<&Value>) -> Self {
+        Self { secret: api_key.filter(|key| key.is_object()).cloned(), ..Self::default() }
+    }
+
+    /// The provider the key is read from; `None` is Value.
+    fn provider(&self) -> Option<&str> {
+        self.pending.as_deref().or_else(|| self.secret.as_ref()?["provider"].as_str())
+    }
+
+    /// The reference field's text.
+    fn reference(&self) -> &str {
+        let committed = self.secret.as_ref().filter(|secret| secret["provider"].as_str() == self.provider());
+        self.rejected.as_deref().or_else(|| committed?["reference"].as_str()).unwrap_or_default()
+    }
+
+    /// The picked source and committed field can be saved (`onValidityChange`).
+    fn valid(&self) -> bool {
+        self.pending.is_none() && self.rejected.is_none()
+    }
+
+    fn pick(&mut self, source: Option<&str>) {
+        self.rejected = None;
+        match source {
+            None => {
+                self.pending = None;
+                self.secret = None;
+            }
+            Some(source) => {
+                let committed = self.secret.as_ref().is_some_and(|secret| secret["provider"] == source);
+                self.pending = (!committed).then(|| source.to_owned());
+            }
+        }
+    }
+
+    /// Commits the reference field: blank clears a committed reference, and only a provider
+    /// this build reads checks the syntax.
+    fn commit(&mut self, text: &str, sources: &[SecretSource]) {
+        let Some(provider) = self.provider().map(str::to_owned) else { return };
+        let reference = text.trim();
+        if reference.is_empty() {
+            self.rejected = None;
+            if self.pending.is_none() {
+                self.secret = None;
+            }
+            return;
+        }
+        let known = sources.iter().any(|source| source.id == provider.as_str());
+        let decoded = if known {
+            secret_reference(&provider, reference)
+        } else {
+            Some(json!({ "provider": provider, "reference": reference }))
+        };
+        match decoded {
+            Some(secret) => *self = Self { secret: Some(secret), ..Self::default() },
+            None => self.rejected = Some(text.to_owned()),
+        }
+    }
+}
+
 /// `TextGeneratorWizard`: Connect checks the settings by listing the service's models and saves
 /// the generator; Use it then shows each text task's model picker, so any of them can switch to
 /// it. A typed key goes once to the environment's secret storage; settings keep a redaction marker.
@@ -629,6 +703,9 @@ struct GeneratorWizard {
     preset: usize,
     base_url: Entity<InputState>,
     key: Entity<InputState>,
+    key_source: KeySource,
+    /// The key's secret reference while it is read from a secret provider.
+    reference: Entity<InputState>,
     label: Entity<InputState>,
     checking: bool,
     check_error: Option<String>,
@@ -652,7 +729,7 @@ impl GeneratorWizard {
         let config = existing.as_ref().map(|(_, config)| config);
         let saved_url = config.and_then(|c| c["baseUrl"].as_str()).unwrap_or(PRESETS[0].base_url).to_owned();
         let saved_label = config.and_then(|c| c["label"].as_str()).unwrap_or_default().to_owned();
-        let configured = config.is_some_and(|c| c["apiKey"] != "");
+        let configured = config.is_some_and(|c| c["apiKey"].as_str().is_some_and(|key| !key.is_empty()));
         let base_url =
             cx.new(|cx| InputState::new(window, cx).placeholder("http://localhost:11434/v1").default_value(saved_url));
         let key = cx.new(|cx| {
@@ -664,7 +741,11 @@ impl GeneratorWizard {
         });
         let label_placeholder = config.map_or_else(|| PRESETS[0].label.to_owned(), display_name);
         let label = cx.new(|cx| InputState::new(window, cx).placeholder(label_placeholder).default_value(saved_label));
-        let subscriptions = [&base_url, &key, &label]
+        let key_source = KeySource::of(config.map(|c| &c["apiKey"]));
+        let reference_text = key_source.reference().to_owned();
+        let reference =
+            cx.new(|cx| InputState::new(window, cx).placeholder(REFERENCE_PLACEHOLDER).default_value(reference_text));
+        let mut subscriptions: Vec<Subscription> = [&base_url, &key, &label]
             .into_iter()
             .map(|input| {
                 cx.subscribe_in(input, window, |this, _, event: &InputEvent, window, cx| match event {
@@ -677,6 +758,20 @@ impl GeneratorWizard {
                 })
             })
             .collect();
+        // A `DraftInput`: the reference applies on blur or Enter.
+        subscriptions.push(cx.subscribe_in(
+            &reference,
+            window,
+            |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { .. } => this.connect(window, cx),
+                InputEvent::Blur => this.commit_reference(window, cx),
+                InputEvent::Change => {
+                    this.check_error = None;
+                    cx.notify();
+                }
+                InputEvent::Focus => {}
+            },
+        ));
         if existing.is_none() {
             key.update(cx, |key, cx| key.focus(window, cx));
         }
@@ -689,6 +784,8 @@ impl GeneratorWizard {
             preset: 0,
             base_url,
             key,
+            key_source,
+            reference,
             label,
             checking: false,
             check_error: None,
@@ -726,7 +823,12 @@ impl GeneratorWizard {
             return None;
         }
         let typed = read(&self.key);
-        let api_key = if typed.is_empty() { existing.map_or(json!(""), |c| c["apiKey"].clone()) } else { json!(typed) };
+        // A saved literal key arrives redacted; sending the marker back keeps it.
+        let stored = existing.and_then(|c| c["apiKey"].as_str()).unwrap_or_default();
+        let api_key = match &self.key_source.secret {
+            Some(secret) => secret.clone(),
+            None => json!(if typed.is_empty() { stored } else { typed.as_str() }),
+        };
         let kind = existing.and_then(|c| c["kind"].as_str()).unwrap_or(PRESETS[self.preset].kind);
         let mut config = json!({
             "kind": kind,
@@ -742,7 +844,45 @@ impl GeneratorWizard {
     }
 
     fn can_connect(&self, cx: &App) -> bool {
-        self.config(cx).is_some_and(|config| !self.key_required() || config["apiKey"] != "")
+        self.key_source.valid() && self.config(cx).is_some_and(|config| !self.key_required() || config["apiKey"] != "")
+    }
+
+    /// `useSecretSources`: the secret providers the key can be read from; none unless the build
+    /// has the secrets feature and the environment reads references.
+    fn key_sources(&self, cx: &App) -> Vec<SecretSource> {
+        if !crate::app::pages::settings::secrets_enabled() {
+            return Vec::new();
+        }
+        let Some(workspace) = self.workspace.upgrade() else { return Vec::new() };
+        let Some(info) = workspace.read(cx).env_info(&self.environment) else { return Vec::new() };
+        secret_sources(info.config["secretReferences"] == true, info.settings.get("secretProviders"))
+    }
+
+    fn pick_key_source(&mut self, source: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.checking {
+            return;
+        }
+        self.key_source.pick(source.as_deref());
+        self.check_error = None;
+        let text = self.key_source.reference().to_owned();
+        self.reference.update(cx, |input, cx| input.set_value(text, window, cx));
+        let focus = if self.key_source.provider().is_some() { &self.reference } else { &self.key };
+        focus.update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    fn commit_reference(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.key_source.provider().is_none() {
+            return;
+        }
+        let text = self.reference.read(cx).value().to_string();
+        let sources = self.key_sources(cx);
+        self.key_source.commit(&text, &sources);
+        if self.key_source.secret.is_some() && self.key_source.rejected.is_none() {
+            // The committed reference replaces a typed key, as the web's single draft does.
+            self.key.update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        cx.notify();
     }
 
     fn select_preset(&mut self, preset: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -769,7 +909,14 @@ impl GeneratorWizard {
 
     /// Lists the models the form reaches; on success saves the generator and moves to Use it.
     fn connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.step != 0 || self.checking || !self.can_connect(cx) {
+        if self.step != 0 || self.checking {
+            return;
+        }
+        // Pressing Connect blurs the reference field first on the web, which commits it.
+        if self.key_source.reference() != self.reference.read(cx).value().as_ref() {
+            self.commit_reference(window, cx);
+        }
+        if !self.can_connect(cx) {
             return;
         }
         let Some(config) = self.config(cx) else { return };
@@ -911,9 +1058,93 @@ impl GeneratorWizard {
             .gap(px(16.))
             .children(services)
             .when(self.shows_base_url(), |el| el.child(field("Base URL", &self.base_url)))
-            .child(field(if self.key_required() { "API key" } else { "API key (optional)" }, &self.key))
+            .child(self.render_key_field(t, cx))
             .child(field("Name (optional)", &self.label))
             .children(self.check_error.clone().map(|error| div().text_sm().text_color(t.error_foreground).child(error)))
+            .into_any_element()
+    }
+
+    /// The API key: its source (`SecretSourceSelect`) when there is one to pick, then the typed
+    /// value, or the reference with its message.
+    fn render_key_field(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+        let sources = self.key_sources(cx);
+        let provider = self.key_source.provider().map(str::to_owned);
+        let picker = (!sources.is_empty() || provider.is_some())
+            .then(|| self.render_key_source(provider.as_deref(), &sources, t, cx));
+        let value: AnyElement = match provider {
+            None => Input::new(&self.key).small().disabled(self.checking).into_any_element(),
+            Some(_) => v_flex()
+                .gap(px(4.))
+                .child(
+                    div().font_family(t.fonts.mono).child(Input::new(&self.reference).small().disabled(self.checking)),
+                )
+                .children(
+                    self.key_source
+                        .rejected
+                        .is_some()
+                        .then(|| div().text_xs().text_color(t.error_foreground).child(INVALID_REFERENCE)),
+                )
+                .into_any_element(),
+        };
+        let label = if self.key_required() { "API key" } else { "API key (optional)" };
+        v_flex()
+            .gap(px(6.))
+            .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(label))
+            .child(h_flex().items_start().gap(px(6.)).children(picker).child(div().flex_1().min_w_0().child(value)))
+            .into_any_element()
+    }
+
+    /// `SecretSourceSelect`: Value, each source, and a saved provider no longer among them.
+    fn render_key_source(
+        &self,
+        provider: Option<&str>,
+        sources: &[SecretSource],
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let known = provider.is_none_or(|id| sources.iter().any(|source| source.id == id));
+        let one_password = || Icon::empty().path("icons/app/onepassword.svg");
+        let icon = match provider {
+            None => Icon::new(Lucide::Type),
+            Some(_) if known => one_password(),
+            Some(_) => Icon::new(Lucide::KeyRound),
+        };
+        let title: SharedString = match provider {
+            None => "Value".into(),
+            Some(id) => {
+                sources.iter().find(|source| source.id == id).map_or_else(|| id.to_owned().into(), |s| s.label.clone())
+            }
+        };
+        let view = cx.entity();
+        let sources = sources.to_vec();
+        let unknown = provider.filter(|_| !known).map(str::to_owned);
+        Button::new("text-generator-key-source")
+            .outline()
+            .small()
+            .disabled(self.checking)
+            .icon(icon.size(px(14.)).text_color(t.muted_foreground))
+            .tooltip(format!("API key source: {title}"))
+            .dropdown_menu(move |menu, window, _| {
+                let entry = |icon: Icon, text: SharedString, source: Option<String>| {
+                    PopupMenuItem::element(move |_, _| {
+                        h_flex().gap(px(8.)).child(icon.clone().size(px(14.))).child(text.clone())
+                    })
+                    .on_click(window.listener_for(
+                        &view,
+                        move |this: &mut Self, _, window, cx| {
+                            this.pick_key_source(source.clone(), window, cx);
+                        },
+                    ))
+                };
+                let mut menu = menu.item(entry(Icon::new(Lucide::Type), "Value".into(), None));
+                for source in &sources {
+                    menu = menu.item(entry(one_password(), source.label.clone(), Some(source.id.to_string())));
+                }
+                if let Some(id) = &unknown {
+                    menu = menu.item(entry(Icon::new(Lucide::KeyRound), id.clone().into(), Some(id.clone())));
+                }
+                menu
+            })
             .into_any_element()
     }
 
@@ -1303,6 +1534,37 @@ impl ModelsDialog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_api_key_picks_a_secret_source_and_commits_references_like_the_web() {
+        let work = SecretSource { id: "work".into(), label: "Work".into() };
+        let sources = [work];
+        let saved = json!({"provider": "work", "reference": "op://Vault/Item/key"});
+        let mut key = KeySource::of(Some(&saved));
+        assert_eq!((key.provider(), key.reference(), key.valid()), (Some("work"), "op://Vault/Item/key", true));
+
+        key.pick(Some("home"));
+        assert_eq!((key.provider(), key.reference(), key.valid()), (Some("home"), "", false), "waits for a reference");
+        key.commit("", &sources);
+        assert!(!key.valid(), "a blank reference for a new source is not a key");
+        key.commit("op://Vault/New/key", &sources);
+        assert_eq!(key.secret, Some(json!({"provider": "home", "reference": "op://Vault/New/key"})));
+        assert!(key.valid(), "a source no longer configured takes any reference");
+
+        key.pick(Some("work"));
+        key.commit("not a reference", &sources);
+        assert_eq!((key.reference(), key.valid()), ("not a reference", false), "1Password checks its syntax");
+        key.commit(" op://Vault/Item/key ", &sources);
+        assert_eq!(key.secret, Some(saved.clone()));
+        assert!(key.valid());
+
+        key.commit("", &sources);
+        assert_eq!((key.secret.as_ref(), key.provider()), (None, None), "clearing it returns to Value");
+        assert_eq!(KeySource::of(Some(&json!("********"))), KeySource::default(), "a literal key is a Value");
+        let mut key = KeySource::of(Some(&saved));
+        key.pick(None);
+        assert_eq!((key.secret.as_ref(), key.valid()), (None, true));
+    }
 
     #[test]
     fn base_urls_follow_the_contract() {

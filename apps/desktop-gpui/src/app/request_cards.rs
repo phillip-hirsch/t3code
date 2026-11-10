@@ -49,8 +49,8 @@ pub(super) struct SecretSource {
 }
 
 /// 1Password's definition: `referencePlaceholder` and `invalidReferenceMessage`.
-const REFERENCE_PLACEHOLDER: &str = "op://vault/item/field";
-const INVALID_REFERENCE: &str = "Use a 1Password reference like op://vault/item/field.";
+pub(super) const REFERENCE_PLACEHOLDER: &str = "op://vault/item/field";
+pub(super) const INVALID_REFERENCE: &str = "Use a 1Password reference like op://vault/item/field.";
 
 /// `secretRequestSources`: empty unless the server accepts reference answers; providers this
 /// build can't read (any kind but 1Password, or a config that no longer decodes) are left out.
