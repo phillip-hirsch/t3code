@@ -546,14 +546,18 @@ impl Workspace {
         self.terminals.drawer_ref(&self.shown_drawer_key()?)
     }
 
-    /// Where new terminals start: the thread's worktree, else its project root.
+    /// Where new terminals start: the thread's worktree (a draft's picked existing worktree), else
+    /// its project root.
     fn terminal_launch(&self) -> Option<Launch> {
-        let (env, project_id, worktree_path) = match self.target.as_ref()? {
+        let target = self.target.as_ref()?;
+        let (env, project_id, worktree_path) = match target {
             Target::Thread { env, id } => {
                 let thread = self.shell.thread(&ScopedId::new(env.clone(), id.clone()))?;
                 (env, thread.project_id.as_str(), thread.worktree_path.clone())
             }
-            Target::Draft { env, project_id, .. } => (env, project_id.as_str(), None),
+            Target::Draft { env, project_id, .. } => {
+                (env, project_id.as_str(), self.draft_workspace.existing_worktree(Some(target)).map(str::to_owned))
+            }
         };
         let project = self.shell.project(&ScopedId::new(env.clone(), project_id))?;
         Some(Launch {
