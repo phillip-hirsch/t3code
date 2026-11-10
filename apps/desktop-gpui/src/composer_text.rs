@@ -292,6 +292,20 @@ pub fn reconcile_chips(
     (stale, fresh)
 }
 
+/// [`reconcile_chips`] after an undo or redo: only chips it brought back for a skill or model
+/// that is gone return to text (a renamed model's relabelled); plain text stays as it was.
+pub fn reconcile_restored_chips(
+    text: &str,
+    rich: bool,
+    tokens: &[(Range<usize>, &str, &str)],
+    is_skill: impl Fn(&str) -> bool,
+    model_label: impl Fn(&str, &str) -> Option<String>,
+) -> (Vec<Range<usize>>, ChipSpans) {
+    let (stale, mut fresh) = reconcile_chips(text, rich, tokens, is_skill, model_label);
+    fresh.retain(|(range, _)| stale.contains(range));
+    (stale, fresh)
+}
+
 const MODEL_PREFIX: &str = "model:";
 
 /// `formatComposerModelMention`: the prompt text naming a provider instance's model for the
@@ -745,6 +759,16 @@ mod tests {
         assert_eq!(reconcile_chips(text, true, &[pasted], skill, codex_model), (vec![], vec![]), "inside another chip");
         let fenced = format!("```\n{text}\n```");
         assert_eq!(reconcile_chips(&fenced, true, &[], skill, codex_model), (vec![], vec![]), "code stays as written");
+
+        let gpt = (8..27, "model:codex/gpt-6.1", "GPT-6.1");
+        let restored = |model_label: fn(&str, &str) -> Option<String>| {
+            reconcile_restored_chips(text, true, &[gpt.clone()], skill, model_label)
+        };
+        assert_eq!(restored(|_, _| None), (vec![8..27], vec![]), "an undo brings back a chip for a model that went");
+        assert_eq!(restored(codex_model), (vec![], vec![]), "plain `$review` the user left as text stays text");
+        let renamed = |_: &str, _: &str| Some("GPT-6".to_owned());
+        let relabelled = Chip::Model { instance_id: "codex".into(), model: "gpt-6.1".into(), label: "GPT-6".into() };
+        assert_eq!(restored(renamed), (vec![8..27], vec![(8..27, relabelled)]));
     }
 
     #[test]

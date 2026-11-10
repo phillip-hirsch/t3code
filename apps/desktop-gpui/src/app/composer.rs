@@ -143,8 +143,13 @@ impl Workspace {
             self.prompt_history = None;
         }
         let chips: Vec<String> = state.tokens().iter().map(|s| s.token().id().to_string()).collect();
+        // A chip an undo or redo brings back may name a skill or model that has gone since.
+        let restored = chips.iter().any(|id| !self.chip_ids.contains(id));
         let previous = std::mem::replace(&mut self.chip_ids, chips);
         self.sync_attachment_chips(&previous, cx);
+        if restored {
+            self.reconcile_composer_chips(true, cx);
+        }
         self.sync_trigger(cx);
         self.sync_composer_marks(cx);
     }
@@ -233,14 +238,15 @@ impl Workspace {
     /// The skills or models chips resolve against may have changed: the composer's chips and
     /// the messages that name one catch up.
     pub(super) fn chip_lists_changed(&mut self, cx: &mut Context<Self>) {
-        self.reconcile_composer_chips(cx);
+        self.reconcile_composer_chips(false, cx);
         self.markdown.chips_changed();
         cx.notify();
     }
 
     /// Brings the composer's skill and model chips in line with the lists it knows once they load
     /// or change (`skillChipReplacements`), outside the undo history and keeping the selection.
-    pub(super) fn reconcile_composer_chips(&mut self, cx: &mut Context<Self>) {
+    /// After an undo or redo (`restored`), only the chips it brought back for gone ones change.
+    pub(super) fn reconcile_composer_chips(&mut self, restored: bool, cx: &mut Context<Self>) {
         let state = self.composer.read(cx);
         let (text, spans) = (state.value(), state.tokens().to_vec());
         if spans.is_empty() && !text.contains(composer_text::is_currency) && !text.contains("model:") {
@@ -249,13 +255,14 @@ impl Workspace {
         let skills = self.skill_names();
         let tokens: Vec<_> =
             spans.iter().map(|s| (s.range(), s.token().id().as_ref(), s.token().label().as_ref())).collect();
-        let (stale, fresh) = composer_text::reconcile_chips(
-            &text,
-            self.client_settings.values.bool("composerRichTextEnabled"),
-            &tokens,
-            |name| skills.iter().any(|s| s == name),
-            |instance_id, model| self.model_mention(instance_id, model).map(|m| m.label),
-        );
+        let rich = self.client_settings.values.bool("composerRichTextEnabled");
+        let is_skill = |name: &str| skills.iter().any(|s| s == name);
+        let model_label = |instance_id: &str, model: &str| self.model_mention(instance_id, model).map(|m| m.label);
+        let (stale, fresh) = if restored {
+            composer_text::reconcile_restored_chips(&text, rich, &tokens, is_skill, model_label)
+        } else {
+            composer_text::reconcile_chips(&text, rich, &tokens, is_skill, model_label)
+        };
         if stale.is_empty() && fresh.is_empty() {
             return;
         }
