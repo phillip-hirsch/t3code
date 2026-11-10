@@ -498,103 +498,61 @@ pub(super) fn skill_links(
     skills: &[InlineSkill],
     model: impl Fn(&str, &str) -> Option<(String, String)>,
 ) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut fenced = false;
-    for line in text.split_inclusive('\n') {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            fenced = !fenced;
-            out.push_str(line);
-            continue;
+    let mut links: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    for prose in prose_ranges(text) {
+        let part = &text[prose.clone()];
+        // A token may end the text, as the web's `(?=\s|$)` allows.
+        let probe = format!("{part} ");
+        let at = |range: std::ops::Range<usize>| prose.start + range.start..prose.start + range.end;
+        for (range, chip) in crate::composer_text::chips(&probe, |name| skills.iter().any(|s| s.name == name)) {
+            let crate::composer_text::Chip::Skill { name } = chip else { continue };
+            let Some(skill) = skills.iter().find(|s| s.name == name) else { continue };
+            links.push((at(range), format!("[{}]({SKILL_SCHEME}{})", skill.label.replace(']', "\\]"), skill.name)));
         }
-        if fenced || line.starts_with("    ") || line.starts_with('\t') {
-            out.push_str(line);
-            continue;
-        }
-        // Backtick spans stay as written.
-        for (index, part) in line.split('`').enumerate() {
-            if index > 0 {
-                out.push('`');
-            }
-            if index % 2 == 1 {
-                out.push_str(part);
-                continue;
-            }
-            // A token may end the part, as the web's `(?=\s|$)` allows.
-            let probe = format!("{part} ");
-            let mut links: Vec<(std::ops::Range<usize>, String)> = Vec::new();
-            for (range, chip) in crate::composer_text::chips(&probe, |name| skills.iter().any(|s| s.name == name)) {
-                let crate::composer_text::Chip::Skill { name } = chip else { continue };
-                let Some(skill) = skills.iter().find(|s| s.name == name) else { continue };
-                links.push((range, format!("[{}]({SKILL_SCHEME}{})", skill.label.replace(']', "\\]"), skill.name)));
-            }
-            for mention in crate::composer_text::model_mentions(part) {
-                let Some((label, driver)) = model(&mention.instance_id, &mention.model) else { continue };
-                let url = model_link(&driver, &mention.instance_id, &mention.model);
-                links.push((mention.range, format!("[{}]({url})", escape_link_text(&label))));
-            }
-            let linked = link_spans(part);
-            links.retain(|(range, _)| !linked.iter().any(|span| range.start < span.end && span.start < range.end));
-            links.sort_by_key(|(range, _)| range.start);
-            let mut last = 0;
-            for (range, link) in links {
-                if range.start < last {
-                    continue;
-                }
-                out.push_str(&part[last..range.start]);
-                out.push_str(&link);
-                last = range.end;
-            }
-            out.push_str(&part[last..]);
+        for mention in crate::composer_text::model_mentions(part) {
+            let Some((label, driver)) = model(&mention.instance_id, &mention.model) else { continue };
+            let url = model_link(&driver, &mention.instance_id, &mention.model);
+            links.push((at(mention.range), format!("[{}]({url})", escape_link_text(&label))));
         }
     }
+    links.sort_by_key(|(range, _)| range.start);
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for (range, link) in links {
+        if range.start < last {
+            continue;
+        }
+        out.push_str(&text[last..range.start]);
+        out.push_str(&link);
+        last = range.end;
+    }
+    out.push_str(&text[last..]);
     out
 }
 
-/// Byte ranges of inline links and images (`[text](url)`), whose text stays as written.
-fn link_spans(text: &str) -> Vec<std::ops::Range<usize>> {
-    let bytes = text.as_bytes();
-    let mut spans = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => i += 2,
-            b'[' => match closing(bytes, i, b'[', b']')
-                .filter(|end| bytes.get(end + 1) == Some(&b'('))
-                .and_then(|end| closing(bytes, end + 1, b'(', b')'))
-            {
-                Some(close) => {
-                    spans.push(i..close + 1);
-                    i = close + 1;
-                }
-                None => i += 1,
-            },
-            _ => i += 1,
+/// Source ranges of the prose text nodes the renderer draws, outside links, link references,
+/// images, definitions, HTML and code, as the web leaves `a` and `code` children alone.
+fn prose_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    use markdown::mdast::Node;
+    fn walk(node: &Node, out: &mut Vec<std::ops::Range<usize>>) {
+        match node {
+            Node::Text(_) => out.extend(node.position().map(|p| p.start.offset..p.end.offset)),
+            Node::Link(_)
+            | Node::LinkReference(_)
+            | Node::Image(_)
+            | Node::ImageReference(_)
+            | Node::Definition(_)
+            | Node::Html(_)
+            | Node::InlineCode(_)
+            | Node::Code(_) => {}
+            _ => node.children().into_iter().flatten().for_each(|child| walk(child, out)),
         }
     }
-    spans
-}
-
-/// The index of the bracket closing the one at `open`, past escaped and nested pairs.
-fn closing(bytes: &[u8], open: usize, left: u8, right: u8) -> Option<usize> {
-    let mut depth = 0usize;
-    let mut i = open;
-    while let Some(&byte) = bytes.get(i) {
-        if byte == b'\\' {
-            i += 2;
-            continue;
-        }
-        if byte == left {
-            depth += 1;
-        } else if byte == right {
-            depth -= 1;
-            if depth == 0 {
-                return Some(i);
-            }
-        }
-        i += 1;
-    }
-    None
+    // Unclaimed math renders as prose, so it parses without math, as the renderer re-parses it.
+    let Ok(root) = markdown::to_mdast(text, &markdown::ParseOptions::gfm()) else { return Vec::new() };
+    let mut out = Vec::new();
+    walk(&root, &mut out);
+    out
 }
 
 /// Draws `t3-skill:` links as the composer's skill chip; a click opens its popover.
@@ -1327,6 +1285,16 @@ mod tests {
         // Links keep their text as written, as the web leaves `a` children alone.
         let linked = "[use model:codex/gpt-6.1 now](https://example.com) ![model:codex/gpt-6.1](a.png)";
         assert_eq!(links(linked), linked);
+        let coded = "[use `x` model:codex/gpt-6.1 now](https://example.com)";
+        assert_eq!(links(coded), coded, "a code span inside a link's text");
+        let reference =
+            "[use model:codex/gpt-6.1 and $design][ref]\n\n[ref]: https://x.dev \"model:codex/gpt-6.1 $design\"\n";
+        assert_eq!(links(reference), reference, "reference links and their definitions");
+        assert_eq!(
+            links("**$design** and [model:codex/gpt-6.1]"),
+            "**[Design](t3-skill:design)** and [[GPT\\-6\\.1](t3-model:codex/codex/gpt-6.1)]",
+            "an undefined reference is prose"
+        );
         assert_eq!(
             links("[a [b] model:codex/gpt-6.1](u (v)) model:codex/gpt-6.1"),
             "[a [b] model:codex/gpt-6.1](u (v)) [GPT\\-6\\.1](t3-model:codex/codex/gpt-6.1)"
