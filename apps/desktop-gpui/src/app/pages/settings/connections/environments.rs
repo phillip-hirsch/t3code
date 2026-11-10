@@ -21,28 +21,37 @@ use super::super::widgets::{RowFrame, section_with_action};
 use super::linking::{ANOTHER_ADDRESS, LinkableMachine, machine_badge, mint_link_code};
 use super::logic::{self, ACCESS_READ, ACCESS_WRITE, LinkTone};
 use super::ui::{self, Size, Variant, WebButton, text_sm, text_xs};
-use super::{SessionLoad, check_session, error_toast, success_toast};
+use super::{error_toast, success_toast};
 use crate::app::Workspace;
 use crate::app::pages::settings::widgets::SettingsView;
 use crate::app::sidebar::now_ms;
 use crate::backend::Endpoint;
-use crate::rpc::{RpcClient, RpcError};
+use crate::rpc::{RpcClient, RpcError, SocketId};
 use crate::theme::{self, Tokens};
 
 #[derive(Default)]
 pub(super) struct EnvironmentsState {
-    started: bool,
-    session: SessionLoad,
+    /// The socket `peerLinks.list` was read on; a new connection reads again.
+    loaded_on: Option<SocketId>,
     /// `peerLinks.list`: `None` while loading.
     links: Option<Result<Vec<Value>, String>>,
     forgetting: Option<String>,
-    _tasks: Vec<Task<()>>,
+    /// The latest listing; a newer one replaces it, so an older answer never lands.
+    _load: Option<Task<()>>,
 }
 
 impl EnvironmentsState {
+    /// Lists the links on `client`'s socket unless they were read there already.
+    fn sync_links(&mut self, client: RpcClient, cx: &mut Context<Self>) {
+        if self.loaded_on.as_ref() != Some(&client.socket_id()) {
+            self.load_links(Some(client), cx);
+        }
+    }
+
     fn load_links(&mut self, client: Option<RpcClient>, cx: &mut Context<Self>) {
         let Some(client) = client else { return };
-        self._tasks.push(cx.spawn(async move |this, cx| {
+        self.loaded_on = Some(client.socket_id());
+        self._load = Some(cx.spawn(async move |this, cx| {
             let result = client.request("peerLinks.list", json!({})).await;
             let _ = this.update(cx, |this, cx| {
                 this.links = Some(match result {
@@ -64,8 +73,8 @@ impl Workspace {
     ) -> AnyElement {
         let t = *theme::tokens(cx);
         let mut sections = vec![self.this_app_section(cx, &t), self.saved_environments_section(window, cx)];
-        // `usePeerLinkHosts`: connected hosts offering links whose session may read them.
-        let hosts: Vec<(SharedString, String, RpcClient, Endpoint)> = self
+        // `usePeerLinkHosts`: connected hosts offering links whose current session may read them.
+        let hosts: Vec<(SharedString, String, RpcClient)> = self
             .sessions
             .iter()
             .filter(|s| {
@@ -74,28 +83,16 @@ impl Workspace {
             .filter_map(|s| {
                 let id = s.id.clone()?;
                 let label = s.server_info.environment_label.clone().unwrap_or_else(|| id.to_string());
-                Some((id, label, s.client.clone()?, s.endpoint.clone()?))
+                Some((id, label, s.client.clone()?))
             })
+            .filter(|(id, ..)| self.env_grants(id, ACCESS_READ))
             .collect();
         let mut readable = Vec::new();
-        for (id, label, client, endpoint) in hosts {
+        for (id, label, client) in hosts {
             let key = SharedString::from(format!("settings-environments:{id}"));
             let state = window.use_keyed_state(key, cx, |_, _| EnvironmentsState::default());
-            if !state.read(cx).started {
-                let loader = client;
-                state.update(cx, |state, cx| {
-                    state.started = true;
-                    state._tasks.push(check_session(endpoint, cx, move |this, session, cx| {
-                        if session.grants(ACCESS_READ) {
-                            this.load_links(Some(loader.clone()), cx);
-                        }
-                        this.session = session;
-                    }));
-                });
-            }
-            if state.read(cx).session.grants(ACCESS_READ) {
-                readable.push((id, label, state));
-            }
+            state.update(cx, |state, cx| state.sync_links(client, cx));
+            readable.push((id, label, state));
         }
         let multiple = readable.len() > 1;
         let workspace = cx.entity().downgrade();
@@ -124,7 +121,7 @@ impl Workspace {
         t: &Tokens,
     ) -> AnyElement {
         let s = state.read(cx);
-        let can_link = s.session.grants(ACCESS_WRITE);
+        let can_link = self.env_grants(&host.id, ACCESS_WRITE);
         let row_host = host.clone();
         let action = can_link.then(|| {
             let state = state.downgrade();

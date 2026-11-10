@@ -672,6 +672,11 @@ impl Workspace {
     pub(super) fn settings_environment(&self) -> Option<SharedString> {
         self.settings_session()?.id.clone()
     }
+
+    /// This client's session on the environment Settings reads, rechecked on each connection.
+    pub(super) fn settings_auth(&self) -> Option<&SessionLoad> {
+        Some(&self.settings_session()?.grants)
+    }
 }
 
 /// `resolveAccessEnvironmentId`: the picked environment while it is listed, else the primary.

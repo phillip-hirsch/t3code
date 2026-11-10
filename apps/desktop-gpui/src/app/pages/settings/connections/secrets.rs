@@ -10,27 +10,24 @@ use gpui_kit::component::{WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, ElementId, Entity, FontWeight, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task,
-    WeakEntity, Window, div, px,
+    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, WeakEntity,
+    Window, div, px,
 };
 use serde_json::{Value, json};
 
 use super::super::widgets::{RowFrame, section_with_action, settings_section};
 use super::logic::{self, PROVIDERS_MANAGE, SETTINGS_WRITE, SecretProviderDraft};
 use super::ui::{self, Size, Variant, WebButton, text_sm, text_xs};
-use super::{SessionLoad, check_session, error_toast, update_settings};
+use super::{error_toast, update_settings};
 use crate::app::Workspace;
 use crate::app::pages::settings::widgets::SettingsView;
 use crate::settings::scope::ScopeKind;
 use crate::theme::{self, Tokens};
 
-/// What the page keeps: the session (for `providers:manage`) and revealed accounts.
+/// The accounts the page has revealed.
 #[derive(Default)]
 pub(super) struct SecretsState {
-    started: bool,
-    session: SessionLoad,
     revealed: HashSet<String>,
-    _session_task: Option<Task<()>>,
 }
 
 impl Workspace {
@@ -42,13 +39,6 @@ impl Workspace {
     ) -> AnyElement {
         let state =
             window.use_keyed_state(self.settings_state_key("settings-secrets"), cx, |_, _| SecretsState::default());
-        let started = state.read(cx).started;
-        if let (Some(endpoint), Some(_), false) = (self.settings_endpoint().cloned(), self.settings_client(), started) {
-            state.update(cx, |state, cx| {
-                state.started = true;
-                state._session_task = Some(check_session(endpoint, cx, |this, session, _| this.session = session));
-            });
-        }
         let t = *theme::tokens(cx);
         let config = &self.settings_info().config;
         let connected = self.settings_client().is_some() && config.is_object();
@@ -79,7 +69,7 @@ impl Workspace {
     ) -> AnyElement {
         let s = state.read(cx);
         // Provider settings and secret providers need the same grant; a project can't own them.
-        let read_only = !s.session.grants(PROVIDERS_MANAGE) || project_scoped;
+        let read_only = !self.settings_grants(PROVIDERS_MANAGE) || project_scoped;
         let empty = serde_json::Map::new();
         let providers = self.server_settings()["secretProviders"].as_object().unwrap_or(&empty);
         let ids: Vec<String> = providers.keys().cloned().collect();

@@ -119,6 +119,12 @@ pub(in crate::app) fn operates_terminals(load: &SessionLoad) -> bool {
 }
 
 impl Workspace {
+    /// `useEnvironmentScope` on the Settings environment: this client's current session there
+    /// grants `scope`. A pending or failed check grants nothing.
+    fn settings_grants(&self, scope: &str) -> bool {
+        self.settings_auth().is_some_and(|auth| auth.grants(scope))
+    }
+
     pub(super) fn render_settings_connections(
         &mut self,
         view: &SettingsView,

@@ -26,23 +26,24 @@ use serde_json::{Value, json};
 use super::super::widgets::{RowFrame, card, hairlines, section_with_action};
 use super::logic::{
     self, ACCESS_READ, ACCESS_WRITE, AccessSnapshot, ClientSession, ENVIRONMENT_MAINTAIN, PairingLink, SETTINGS_WRITE,
+    Session,
 };
 use super::pairing::{self, AdvertisedEndpoint, Qr};
 use super::ui::{self, Size, Variant, WebButton, text_2xs, text_sm, text_xs};
-use super::{SessionLoad, auth_request, check_session, error_toast, success_toast, update_settings};
+use super::{SessionLoad, auth_request, error_toast, success_toast, update_settings};
 use crate::app::Workspace;
 use crate::app::pages::settings::widgets::SettingsView;
 use crate::app::sidebar::now_ms;
 use crate::backend::Endpoint;
-use crate::rpc::{RpcClient, StreamEvent};
+use crate::rpc::{RpcClient, SocketId, StreamEvent};
 use crate::settings::scope;
 use crate::theme::{self, Tokens};
 
 /// Everything the access page holds while it is open.
 #[derive(Default)]
 pub(super) struct AccessState {
-    started: bool,
-    session: SessionLoad,
+    /// The socket `subscribeAuthAccess` runs on; a new connection subscribes again.
+    subscribed_on: Option<SocketId>,
     /// `None` until `subscribeAuthAccess` sends its snapshot.
     access: Option<AccessSnapshot>,
     access_error: Option<SharedString>,
@@ -61,26 +62,25 @@ pub(super) struct AccessState {
     qr_codes: RefCell<HashMap<String, Option<Rc<Qr>>>>,
     clients_open: bool,
     permissions_open: bool,
-    _session_task: Option<Task<()>>,
     _stream_task: Option<Task<()>>,
     /// Repaints "Expires in …" once a second while a pairing link is live.
     _tick: Option<Task<()>>,
 }
 
 impl AccessState {
-    /// Starts the session check, then the access stream, once there is a connection.
-    fn start(&mut self, client: Option<RpcClient>, endpoint: Option<Endpoint>, cx: &mut Context<Self>) {
-        let (Some(client), Some(endpoint)) = (client, endpoint) else { return };
-        if self.started {
+    /// Subscribes on `reader`, the connection whose session may read access, once per socket;
+    /// `None` (no connection or no `access:read`) stops the stream.
+    fn sync(&mut self, reader: Option<RpcClient>, cx: &mut Context<Self>) {
+        let Some(client) = reader else {
+            self.subscribed_on = None;
+            self._stream_task = None;
             return;
+        };
+        let socket = client.socket_id();
+        if self.subscribed_on.as_ref() != Some(&socket) {
+            self.subscribed_on = Some(socket);
+            self.subscribe(client, cx);
         }
-        self.started = true;
-        self._session_task = Some(check_session(endpoint, cx, move |this, session, cx| {
-            if session.grants(ACCESS_READ) {
-                this.subscribe(client.clone(), cx);
-            }
-            this.session = session;
-        }));
     }
 
     fn subscribe(&mut self, client: RpcClient, cx: &mut Context<Self>) {
@@ -99,8 +99,6 @@ impl AccessState {
                             if let Err(error) = result {
                                 this.access_error = Some(error.to_string().into());
                             }
-                            // Resubscribe on the next connection.
-                            this.started = false;
                             true
                         }
                     };
@@ -138,10 +136,6 @@ impl AccessState {
                 }
             }
         }));
-    }
-
-    fn grants(&self, scope: &str) -> bool {
-        self.session.grants(scope)
     }
 
     fn share_open(&self, link_id: &str) -> bool {
@@ -254,14 +248,13 @@ impl Workspace {
         // Keyed by environment, so pairing credentials and pending work never carry over.
         let key = format!("settings-access:{}", self.settings_environment().as_deref().unwrap_or_default());
         let state = window.use_keyed_state(SharedString::from(key), cx, |_, _| AccessState::default());
-        let (client, endpoint) = (self.settings_client(), self.settings_endpoint().cloned());
-        state.update(cx, |state, cx| state.start(client, endpoint, cx));
+        let reader = self.settings_client().filter(|_| self.settings_grants(ACCESS_READ));
+        state.update(cx, |state, cx| state.sync(reader, cx));
         let t = *theme::tokens(cx);
         let local_rows = if self.access_is_primary() { self.local_backend_rows(window, cx, &t) } else { None };
         let mut sections: Vec<AnyElement> = self.access_environment_picker(cx, &t).into_iter().collect();
-        sections.push(self.environment_card(&state, local_rows, window, cx, &t));
-        let s = state.read(cx);
-        if s.grants(ACCESS_READ) || s.grants(ACCESS_WRITE) {
+        sections.push(self.environment_card(&state, local_rows, cx, &t));
+        if self.settings_grants(ACCESS_READ) || self.settings_grants(ACCESS_WRITE) {
             sections.push(self.authorized_clients(&state, cx, &t));
         }
         self.settings_page("access", view, sections, cx)
@@ -344,8 +337,7 @@ impl Workspace {
         &self,
         state: &Entity<AccessState>,
         local_rows: Option<Vec<AnyElement>>,
-        window: &mut Window,
-        cx: &App,
+        cx: &Context<Self>,
         t: &Tokens,
     ) -> AnyElement {
         let s = state.read(cx);
@@ -362,7 +354,7 @@ impl Workspace {
                 .map(str::to_owned);
             rows.push(managed_notice(organization, support, t));
         }
-        if s.grants(ENVIRONMENT_MAINTAIN) {
+        if self.settings_grants(ENVIRONMENT_MAINTAIN) {
             let version = config.pointer("/environment/serverVersion").and_then(Value::as_str);
             let url = self.settings_endpoint().map(|e| e.http_base.as_str());
             let parts: Vec<&str> = [version, url].into_iter().flatten().collect();
@@ -376,11 +368,11 @@ impl Workspace {
             // A server this app started is exposed from here (`renderNetworkAccessRow`).
             match local_rows {
                 Some(local) => rows.extend(local),
-                None => rows.push(network_access_row(s, t)),
+                None => rows.push(network_access_row(self.settings_auth().and_then(SessionLoad::session), t)),
             }
         }
-        rows.push(permissions_details(state, s, self.settings_client().is_some(), t));
-        let more = self.icon_menu(s, window).into_any_element();
+        rows.push(permissions_details(state, s, self.settings_auth(), self.settings_client().is_some(), t));
+        let more = self.icon_menu().into_any_element();
         let icon = ui::glyph(logic::machine_icon(self.settings_info().machine_kind()), 16., t.foreground);
         section_with_action(
             "connections-environment",
@@ -392,11 +384,11 @@ impl Workspace {
     }
 
     /// The "…" menu with its Icon submenu (`EnvironmentIconMenu`).
-    fn icon_menu(&self, s: &AccessState, _: &mut Window) -> impl IntoElement {
+    fn icon_menu(&self) -> impl IntoElement {
         let config = &self.settings_info().config;
         let lock = if !config.is_object() {
             Some("Connect to this environment to change its icon.")
-        } else if !s.grants(SETTINGS_WRITE) {
+        } else if !self.settings_grants(SETTINGS_WRITE) {
             Some("Your session on this environment cannot change its settings.")
         } else {
             None
@@ -458,7 +450,7 @@ impl Workspace {
     fn authorized_clients(&self, state: &Entity<AccessState>, cx: &Context<Self>, t: &Tokens) -> AnyElement {
         static EMPTY: AccessSnapshot = AccessSnapshot { pairing_links: Vec::new(), client_sessions: Vec::new() };
         let s = state.read(cx);
-        let (can_read, can_write) = (s.grants(ACCESS_READ), s.grants(ACCESS_WRITE));
+        let (can_read, can_write) = (self.settings_grants(ACCESS_READ), self.settings_grants(ACCESS_WRITE));
         let snapshot = s.access.as_ref().unwrap_or(&EMPTY);
         let now = now_ms();
         let links: Vec<&PairingLink> =
@@ -590,10 +582,11 @@ impl Workspace {
             move |_, window, cx| revoke(&state, endpoint.clone(), Revoke::Others, window, cx)
         });
         let denial = logic::remote_clients_denial(&self.settings_info().managed_policy);
-        let delegatable: Vec<String> = match &s.session {
-            SessionLoad::Ready(session) => session.delegatable().to_vec(),
-            _ => Vec::new(),
-        };
+        let delegatable: Vec<String> = self
+            .settings_auth()
+            .and_then(SessionLoad::session)
+            .map(|session| session.delegatable().to_vec())
+            .unwrap_or_default();
         let create =
             WebButton::new("create-pairing-link", "Create link").variant(Variant::Primary).icon(IconName::Plus);
         let create = match denial {
@@ -648,11 +641,8 @@ fn managed_notice(organization: &str, support: Option<String>, t: &Tokens) -> An
 }
 
 /// `renderDisabledNetworkAccessRow`: exposure is decided where the server starts.
-fn network_access_row(s: &AccessState, t: &Tokens) -> AnyElement {
-    let policy = match &s.session {
-        SessionLoad::Ready(session) => session.policy.as_deref(),
-        _ => None,
-    };
+fn network_access_row(session: Option<&Session>, t: &Tokens) -> AnyElement {
+    let policy = session.and_then(|session| session.policy.as_deref());
     let description = match policy {
         Some("remote-reachable") => {
             "Remote access is already configured. Change network exposure where the server starts."
@@ -679,7 +669,13 @@ fn network_access_row(s: &AccessState, t: &Tokens) -> AnyElement {
 }
 
 /// The "Permissions" disclosure (`SessionPermissions`).
-fn permissions_details(state: &Entity<AccessState>, s: &AccessState, connected: bool, t: &Tokens) -> AnyElement {
+fn permissions_details(
+    state: &Entity<AccessState>,
+    s: &AccessState,
+    auth: Option<&SessionLoad>,
+    connected: bool,
+    t: &Tokens,
+) -> AnyElement {
     let open = s.permissions_open;
     let toggle = {
         let state = state.clone();
@@ -699,30 +695,36 @@ fn permissions_details(state: &Entity<AccessState>, s: &AccessState, connected: 
         .on_click(toggle)
         .child(text_sm(div().font_weight(FontWeight::MEDIUM)).child("Permissions"))
         .child(ui::chevron(open, 12., t.muted_foreground));
-    let body = open.then(|| match (&s.session, connected) {
-        (SessionLoad::Ready(session), true) if session.authenticated => text_xs(v_flex().gap(px(12.)).py(px(12.)))
-            .child(
-                div()
-                    .text_color(t.muted_foreground)
-                    .child("These permissions apply to this client\u{2019}s current connection."),
-            )
-            .child(div().flex().flex_wrap().gap_y(px(8.)).children(logic::SCOPE_OPTIONS.iter().map(
-                |(scope, title, _)| {
-                    let granted = session.grants(scope);
-                    // Two columns 24px apart (`sm:grid-cols-2 gap-x-6`).
-                    h_flex().w(gpui_kit::relative(0.5)).pr(px(12.)).justify_between().gap(px(12.)).child(*title).child(
-                        div().flex_none().text_color(t.muted_foreground).child(if granted {
-                            "Allowed"
-                        } else {
-                            "Not granted"
-                        }),
-                    )
-                },
-            )))
-            .into_any_element(),
+    let body = open.then(|| match (auth, connected) {
+        (Some(SessionLoad::Ready(session)), true) if session.authenticated => {
+            text_xs(v_flex().gap(px(12.)).py(px(12.)))
+                .child(
+                    div()
+                        .text_color(t.muted_foreground)
+                        .child("These permissions apply to this client\u{2019}s current connection."),
+                )
+                .child(div().flex().flex_wrap().gap_y(px(8.)).children(logic::SCOPE_OPTIONS.iter().map(
+                    |(scope, title, _)| {
+                        let granted = session.grants(scope);
+                        // Two columns 24px apart (`sm:grid-cols-2 gap-x-6`).
+                        h_flex()
+                            .w(gpui_kit::relative(0.5))
+                            .pr(px(12.))
+                            .justify_between()
+                            .gap(px(12.))
+                            .child(*title)
+                            .child(div().flex_none().text_color(t.muted_foreground).child(if granted {
+                                "Allowed"
+                            } else {
+                                "Not granted"
+                            }))
+                    },
+                )))
+                .into_any_element()
+        }
         (session, connected) => {
-            let failed = matches!(session, SessionLoad::Failed);
-            let rejected = matches!(session, SessionLoad::Ready(s) if !s.authenticated);
+            let failed = matches!(session, Some(SessionLoad::Failed));
+            let rejected = matches!(session, Some(SessionLoad::Ready(s)) if !s.authenticated);
             text_xs(div().py(px(12.)).text_color(t.muted_foreground))
                 .child(logic::permissions_unavailable_message(connected, failed, rejected))
                 .into_any_element()
