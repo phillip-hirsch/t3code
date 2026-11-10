@@ -500,13 +500,15 @@ gpui-component's `src/text/compat.rs` forwards `on_link_hover`, and `src/text/mo
 **A plugin object can lead a link.** The chat draws a host mark (the GitHub icon, a favicon, a
 globe) before a web link's text (`MarkdownExternalLinkContent`), and a click or right click on it
 is the link's. 0.9.0's inline plugins replace the node they claim. The patch adds
-`MarkdownNode::leading()`: for a claimed link, the converter places the object first with the
-link's mark, then converts the link as if no plugin claimed it. The object's text and Markdown stay
+`MarkdownNode::leading()`: for a claimed link or link reference, the converter places the object
+first with the link's mark (a reference's resolves through its definition when drawn), then
+converts the link as if no plugin claimed it. The object's text and Markdown stay
 empty, so it adds nothing to the text, find or copies. Files:
 
 - `src/text/markdown_ext.rs`: the `leading` flag and builder.
-- `src/text/format/markdown.rs`: the leading branch of `parse_paragraph`, `link_text_mark` (shared
-  with the `Node::Link` arm); test `a_leading_object_opens_the_link_whose_text_follows_it`.
+- `src/text/format/markdown.rs`: the leading branch of `parse_paragraph`, `link_text_mark` and
+  `reference_text_mark` (shared with the `Node::Link` and `Node::LinkReference` arms); test
+  `a_leading_object_opens_the_link_whose_text_follows_it`.
 
 **Markdown images open on a click.** The web's chat markdown makes an image that is not inside a
 link a button (`role="button"`, `tabIndex={0}`) whose click, Enter or Space opens the expanded

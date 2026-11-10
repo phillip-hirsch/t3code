@@ -249,8 +249,19 @@ struct AppFrame {
     context: Option<ContextKey>,
     /// The frame this app last drew in.
     used: u64,
+    /// The stored call's or tool definition's last read failed, so a reconnect reads it again.
+    detail_failed: bool,
+    tool_info_failed: bool,
     _detail: Option<Task<()>>,
     _tool_info: Option<Task<()>>,
+}
+
+/// What a reconnect reads again for one app.
+#[derive(Debug, PartialEq)]
+struct Retry {
+    document: bool,
+    detail: bool,
+    tool_info: bool,
 }
 
 #[derive(Default)]
@@ -261,6 +272,24 @@ pub(super) struct McpApps {
     /// The full screen layer's, so its controls take the keyboard once clicked.
     focus: Option<FocusHandle>,
     theme: Option<(ThemeKey, ThemeVariables)>,
+}
+
+impl McpApps {
+    /// `environment`'s apps with a read that failed: a document that could not load, or the
+    /// stored call or tool definition it shows.
+    fn failed_reads(&self, environment: &str) -> Vec<(AppKey, Retry)> {
+        (self.apps.iter())
+            .filter(|(key, _)| key.owner.env == environment)
+            .filter_map(|(key, app)| {
+                let retry = Retry {
+                    document: app.document.as_ref().is_some_and(|doc| doc.failed && doc.embed.is_none()),
+                    detail: app.detail_failed,
+                    tool_info: app.tool_info_failed,
+                };
+                (retry.document || retry.detail || retry.tool_info).then(|| (key.clone(), retry))
+            })
+            .collect()
+    }
 }
 
 /// Asks the reader in the confirm dialog, with the app back inline so it stays in view. A
@@ -412,6 +441,8 @@ impl Workspace {
             dark: crate::theme::tokens(cx).dark,
             context: None,
             used: self.embeds.frame(),
+            detail_failed: false,
+            tool_info_failed: false,
             _detail: None,
             _tool_info: None,
         };
@@ -428,24 +459,26 @@ impl Workspace {
         let client = self.app_client(key);
         let Some(app) = self.mcp_apps.apps.get_mut(key) else { return };
         app.revision = revision.clone();
+        app.detail_failed = client.is_none();
         let Some(client) = client else { return };
         let mut payload = app.scope.target();
         payload.insert("revision".into(), revision.to_string().into());
         let key = key.clone();
         app._detail = Some(cx.spawn(async move |this, cx| {
             let response = client.request("orchestration.getTurnItem", Value::Object(payload)).await;
-            let call = match response {
-                Ok(response) => ToolCall::from_item(&response["item"]),
-                Err(error) => {
-                    log::debug!("orchestration.getTurnItem for an MCP app: {error}");
-                    None
-                }
-            };
-            let Some(call) = call else { return };
             let _ = this.update(cx, |this, cx| {
                 let Some(app) = this.mcp_apps.apps.get_mut(&key).filter(|app| app.revision == revision) else {
                     return;
                 };
+                let response = match response {
+                    Ok(response) => response,
+                    Err(error) => {
+                        log::debug!("orchestration.getTurnItem for an MCP app: {error}");
+                        app.detail_failed = true;
+                        return;
+                    }
+                };
+                let Some(call) = ToolCall::from_item(&response["item"]) else { return };
                 app.tool_call = Some(call.clone());
                 if let Some(document) = app.document.as_mut() {
                     document.host.set_tool_call(call);
@@ -459,17 +492,26 @@ impl Workspace {
     fn fetch_app_tool_definition(&mut self, key: &AppKey, cx: &mut Context<Self>) {
         let client = self.app_client(key);
         let Some(app) = self.mcp_apps.apps.get_mut(key) else { return };
+        app.tool_info_failed = client.is_none();
         let Some(client) = client else { return };
         let mut payload = app.scope.target();
         payload.insert("name".into(), app.reference.tool.clone().into());
         let key = key.clone();
         app._tool_info = Some(cx.spawn(async move |this, cx| {
-            let Ok(info) = client.request("mcpApps.toolInfo", Value::Object(payload)).await else { return };
-            let Some(tool) = info.get("tool").filter(|tool| !tool.is_null()).cloned() else { return };
+            let info = client.request("mcpApps.toolInfo", Value::Object(payload)).await;
             let _ = this.update(cx, |this, cx| {
-                if let Some(app) = this.mcp_apps.apps.get_mut(&key) {
-                    app.tool_definition = Some(tool);
-                    cx.notify();
+                let Some(app) = this.mcp_apps.apps.get_mut(&key) else { return };
+                match info {
+                    Ok(info) => {
+                        if let Some(tool) = info.get("tool").filter(|tool| !tool.is_null()) {
+                            app.tool_definition = Some(tool.clone());
+                            cx.notify();
+                        }
+                    }
+                    Err(error) => {
+                        log::debug!("mcpApps.toolInfo for an MCP app: {error}");
+                        app.tool_info_failed = true;
+                    }
                 }
             });
         }));
@@ -766,17 +808,21 @@ impl Workspace {
         self.remeasure_page_row(&key.attachment, cx);
     }
 
-    /// Opens a fresh document for each app on `environment` whose document could not load.
+    /// Reads again what failed for each app on `environment`: a fresh document for one that
+    /// could not load, and its stored call and tool definition.
     pub(super) fn retry_failed_mcp_apps(&mut self, environment: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let failed: Vec<AppKey> = (self.mcp_apps.apps.iter())
-            .filter(|(key, app)| {
-                key.owner.env == environment
-                    && app.document.as_ref().is_some_and(|doc| doc.failed && doc.embed.is_none())
-            })
-            .map(|(key, _)| key.clone())
-            .collect();
-        for key in failed {
-            self.open_app_document(&key, window, cx);
+        for (key, retry) in self.mcp_apps.failed_reads(environment) {
+            if retry.detail
+                && let Some(revision) = self.mcp_apps.apps.get(&key).map(|app| app.revision.clone())
+            {
+                self.fetch_app_tool_call(&key, revision, cx);
+            }
+            if retry.tool_info {
+                self.fetch_app_tool_definition(&key, cx);
+            }
+            if retry.document {
+                self.open_app_document(&key, window, cx);
+            }
         }
     }
 
@@ -1177,6 +1223,69 @@ mod tests {
         assert!(shell.contains("src=\"http://h/api/a?x=1&amp;y=&quot;2&quot;\" title=\"Maps &lt;x> app\""));
         assert!(shell.contains("sandbox=\"allow-scripts allow-forms\"") && !shell.contains("allow-same-origin"));
         assert!(shell.contains("allow=\"geolocation\"") && shell.contains("const n='abc123'"));
+    }
+
+    #[test]
+    fn a_reconnect_reads_again_only_what_failed_on_that_environment() {
+        let reference = Rc::new(app());
+        let frame = |document_failed: Option<bool>, detail_failed, tool_info_failed| AppFrame {
+            scope: Scope {
+                environment: "a".into(),
+                thread_id: "t".into(),
+                item_id: "i".into(),
+                conversation: "t".into(),
+                server: "s".into(),
+            },
+            reference: reference.clone(),
+            revision: "1".into(),
+            tool_call: None,
+            tool_definition: None,
+            document: document_failed.map(|failed| Document {
+                generation: 1,
+                host: Host::new(&reference, APP_VERSION),
+                nonce: String::new(),
+                failed,
+                navigated_away: false,
+                loads: 0,
+                embed: None,
+                closing: None,
+                _task: None,
+                _messages: None,
+            }),
+            height: mcp_apps::DEFAULT_HEIGHT,
+            display: DisplayMode::Inline,
+            width: 0.,
+            awaiting: false,
+            dark: false,
+            context: None,
+            used: 0,
+            detail_failed,
+            tool_info_failed,
+            _detail: None,
+            _tool_info: None,
+        };
+        let key = |env: &str, attachment: &str| AppKey {
+            owner: PaneOwner { pane: ChatPane::Main, env: env.to_owned().into(), thread: "t".into() },
+            attachment: attachment.to_owned().into(),
+        };
+        let mut apps = McpApps::default();
+        apps.apps.insert(key("a", "loaded"), frame(Some(false), false, false));
+        apps.apps.insert(key("a", "document"), frame(Some(true), false, false));
+        apps.apps.insert(key("a", "detail"), frame(Some(false), true, false));
+        apps.apps.insert(key("a", "closed"), frame(None, false, true));
+        apps.apps.insert(key("b", "detail"), frame(Some(true), true, true));
+        let mut failed: Vec<_> =
+            (apps.failed_reads("a").into_iter()).map(|(key, retry)| (key.attachment.to_string(), retry)).collect();
+        failed.sort_by(|a, b| a.0.cmp(&b.0));
+        let retry = |document, detail, tool_info| Retry { document, detail, tool_info };
+        assert_eq!(
+            failed,
+            [
+                ("closed".to_owned(), retry(false, false, true)),
+                ("detail".to_owned(), retry(false, true, false)),
+                ("document".to_owned(), retry(true, false, false)),
+            ]
+        );
     }
 
     #[test]

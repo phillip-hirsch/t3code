@@ -96,12 +96,12 @@ impl MarkdownPlugin for LinkMarks {
     fn parse(
         &self,
         node: &gpui_kit::component::text::markdown_ast::Node,
-        _: &MarkdownParseContext<'_>,
+        cx: &MarkdownParseContext<'_>,
     ) -> Option<MarkdownNode> {
-        let gpui_kit::component::text::markdown_ast::Node::Link(link) = node else { return None };
-        let host = logic::web_link_host(&link.url)?;
+        let (url, children) = super::markdown_ui::link_destination(node, cx)?;
+        let host = logic::web_link_host(url)?;
         // An image link has no text to lead (`hastHasText`).
-        if super::markdown_ui::link_text(&link.children).trim().is_empty() {
+        if super::markdown_ui::link_text(children).trim().is_empty() {
             return None;
         }
         Some(MarkdownNode::new("t3-link-mark", logic::link_mark(&host)).leading())

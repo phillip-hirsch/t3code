@@ -779,6 +779,18 @@ fn link_text_mark(link: &mdast::Link) -> TextMark {
     }
 }
 
+/// The mark a link reference puts on its text, resolved through its definition when drawn.
+fn reference_text_mark(link: &mdast::LinkReference) -> TextMark {
+    TextMark {
+        link: Some(LinkMark {
+            url: "".into(),
+            title: link.label.clone().map(Into::into),
+            identifier: Some(link.identifier.clone().into()),
+        }),
+        ..Default::default()
+    }
+}
+
 fn parse_paragraph(
     source: &str,
     paragraph: &mut Paragraph,
@@ -797,14 +809,18 @@ fn parse_paragraph(
     let node_source = |node: &Node| node.position().and_then(|p| source.get(p.start.offset..p.end.offset));
     let parse_cx = MarkdownParseContext::new(source, cx.offset, &cx.link_refs);
     if let Some(mut custom) = cx.markdown_extensions.parse_inline(node, &parse_cx) {
+        let led = match node {
+            Node::Link(link) => Some((link_text_mark(link), &link.children)),
+            Node::LinkReference(link) => Some((reference_text_mark(link), &link.children)),
+            _ => None,
+        };
         if custom.leading
-            && let Node::Link(link) = node
+            && let Some((mark, children)) = led
         {
-            let mark = link_text_mark(link);
             let mut lead = InlineNode::custom(custom);
             lead.marks.push((0..lead.text.len(), mark.clone()));
             paragraph.push(lead);
-            let text = merge_children_with_mark(source, paragraph, &link.children, mark, cx);
+            let text = merge_children_with_mark(source, paragraph, children, mark, cx);
             return text;
         }
         let label_start = paragraph.children.len();
@@ -975,22 +991,8 @@ fn parse_paragraph(
             )]));
         }
         Node::LinkReference(link) => {
-            let link_mark = LinkMark {
-                url: "".into(),
-                title: link.label.clone().map(Into::into),
-                identifier: Some(link.identifier.clone().into()),
-            };
-
-            text = merge_children_with_mark(
-                source,
-                paragraph,
-                &link.children,
-                TextMark {
-                    link: Some(link_mark),
-                    ..Default::default()
-                },
-                cx,
-            );
+            text =
+                merge_children_with_mark(source, paragraph, &link.children, reference_text_mark(link), cx);
         }
         _ => {
             if cfg!(debug_assertions) {
@@ -2551,6 +2553,7 @@ mod tests {
                     Node::Link(link) if link.url.starts_with("https:") => {
                         Some(MarkdownNode::new("icon", ()).leading())
                     }
+                    Node::LinkReference(_) => Some(MarkdownNode::new("icon", ()).leading()),
                     _ => None,
                 }
             }),
@@ -2591,6 +2594,21 @@ mod tests {
         assert_eq!(bold_runs(paragraph), ["docs"]);
         // The object adds no text, and copying writes each link once.
         assert_eq!(document.text(), "See the docs and https://b.dev\n");
+        // A reference's object leads its text and opens its definition once drawn.
+        let document = parse("[the docs][a]\n\n[a]: https://a.dev", &mut cx).unwrap();
+        let BlockNode::Paragraph(paragraph) = &document.blocks[0] else {
+            panic!()
+        };
+        let references: Vec<_> = paragraph
+            .children
+            .iter()
+            .map(|node| {
+                let link = node.marks.iter().find_map(|(_, mark)| mark.link.as_ref());
+                let identifier = link.and_then(|link| link.identifier.as_deref());
+                (node.text.as_str(), node.custom.is_some(), identifier)
+            })
+            .collect();
+        assert_eq!(references, [("", true, Some("a")), ("the docs", false, Some("a"))]);
         let document = parse("See [docs](https://a.dev) and <https://b.dev>", &mut cx).unwrap();
         assert_eq!(
             document.to_markdown(),
