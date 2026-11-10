@@ -479,12 +479,12 @@ impl Workspace {
             warn("Side chats take text only", "Remove the attachments and context, then send it again.", window, cx);
             return true;
         }
-        let sent = text.to_owned();
+        let (sent, origin) = (text.to_owned(), self.attachment_origin());
         self.start_side_chat(
             Some(prompt.to_owned()),
             move |this, window, cx| {
-                // Clear only what was sent; the draft may have changed meanwhile.
-                if this.composer.read(cx).value().trim() == sent.trim() {
+                // Clear only what was sent; the draft may have changed or left the editor meanwhile.
+                if this.attachment_origin() == origin && this.composer.read(cx).value().trim() == sent.trim() {
                     this.set_composer_text("", window, cx);
                 }
             },

@@ -166,6 +166,12 @@ impl ThreadMessage<'_> {
     }
 }
 
+/// Whether a send reads its text as `/side` (`useComposerSend`): it beats an open question,
+/// unless side chats are off and it may be a literal answer; a queued message's edit saves it.
+fn reads_side_command(editing_queued: bool, asking: bool, side_chats_off: bool) -> bool {
+    !editing_queued && (!asking || !side_chats_off)
+}
+
 /// The `/compact` a send into a stale session runs first (`idleCompaction: onReturn`).
 fn compact_before(thread_id: &str, model: Option<&ModelSelection>) -> Value {
     let mut command = json!({
@@ -205,11 +211,13 @@ impl Workspace {
         if !self.target_can_operate() {
             return;
         }
-        // `/side` beats an open question, unless side chats are off and it may be a literal answer.
         let prompt = self.composer.read(cx).value().to_string();
-        if (self.question.is_none() || self.side_chat_disabled_reason().is_none())
-            && self.submit_side_chat_command(&prompt, window, cx)
-        {
+        let reads_side = reads_side_command(
+            self.editing_queued(),
+            self.question.is_some(),
+            self.side_chat_disabled_reason().is_some(),
+        );
+        if reads_side && self.submit_side_chat_command(&prompt, window, cx) {
             return;
         }
         if self.question.is_some() {
@@ -585,6 +593,15 @@ mod tests {
         assert_eq!(dispatch_fields(true, queues("queue", Intent::Alternate, true)), steer);
         assert_eq!(dispatch_fields(true, queues("steer", Intent::Foreground, false)), queue, "compaction queues");
         assert_eq!(dispatch_fields(true, queues("queue", Intent::Alternate, false)), queue);
+    }
+
+    #[test]
+    fn a_send_reads_side_except_in_a_queued_edit() {
+        assert!(reads_side_command(false, false, false));
+        assert!(reads_side_command(false, true, false), "`/side` beats an open question");
+        assert!(reads_side_command(false, false, true), "with side chats off it warns");
+        assert!(!reads_side_command(false, true, true), "with side chats off it may be a literal answer");
+        assert!(!reads_side_command(true, false, false), "an edit saves `/side …` as its text");
     }
 
     #[test]

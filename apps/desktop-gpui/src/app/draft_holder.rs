@@ -42,6 +42,16 @@ impl PromptHolder {
             (true, false, false) => Self::Editor,
         }
     }
+
+    /// Where the editor's content (the prompt, or a queued message's edit) waits: context
+    /// records join and are found there, as the web's `composerDraftTarget` is the edit's.
+    pub(super) fn of_editor_content(on_screen: bool, asking: bool) -> Self {
+        match (on_screen, asking) {
+            (false, _) => Self::OffScreen,
+            (true, true) => Self::Question,
+            (true, false) => Self::Editor,
+        }
+    }
 }
 
 /// What the editor's content belongs to: a target's prompt, or the queued message's edit begun
@@ -126,6 +136,24 @@ impl ComposerDraft {
         }
     }
 
+    /// What the editor shows once back on screen, as a draft: a queued message's edit left open,
+    /// else the target's own prompt (its text a card parked, if one is open).
+    pub(super) fn editor_content_mut(&mut self) -> DraftMut<'_> {
+        self.editor_mut().own_prompt_mut()
+    }
+
+    fn editor_content(&self) -> DraftRef<'_> {
+        self.editor().own_prompt()
+    }
+
+    /// Every prompt it keeps that can hold a chip: its own, and a queued message's edit left open.
+    fn prompts_mut(&mut self) -> Vec<DraftMut<'_>> {
+        match self {
+            Self::QueueEdit(edit, editor) => vec![edit.saved_mut(), editor.own_prompt_mut()],
+            draft => vec![draft.own_prompt_mut()],
+        }
+    }
+
     /// Ends a queued message's edit left open, as its cancel does: the editor gets the target's
     /// own prompt back, or the card it showed parks it.
     pub(super) fn end_edit(self) -> ComposerDraft {
@@ -201,11 +229,35 @@ impl Workspace {
         }
     }
 
+    /// Where `target`'s editor content waits (see [`PromptHolder::of_editor_content`]).
+    pub(super) fn editor_content_holder(&self, target: &Target) -> PromptHolder {
+        PromptHolder::of_editor_content(self.target.as_ref() == Some(target), self.question.is_some())
+    }
+
+    /// `target`'s editor content when the editor doesn't show it: parked under the question
+    /// card, or the draft off screen.
+    pub(super) fn parked_editor_content(&mut self, target: &Target) -> Option<DraftMut<'_>> {
+        match self.editor_content_holder(target) {
+            PromptHolder::Editor | PromptHolder::QueueEdit => None,
+            PromptHolder::Question => self.question.as_mut().map(QuestionDraft::prompt_mut),
+            PromptHolder::OffScreen => self.composer_drafts.get_mut(target).map(ComposerDraft::editor_content_mut),
+        }
+    }
+
+    /// [`Self::parked_editor_content`], to read.
+    pub(super) fn parked_editor_content_ref(&self, target: &Target) -> Option<DraftRef<'_>> {
+        match self.editor_content_holder(target) {
+            PromptHolder::Editor | PromptHolder::QueueEdit => None,
+            PromptHolder::Question => self.question.as_ref().map(parked),
+            PromptHolder::OffScreen => self.composer_drafts.get(target).map(ComposerDraft::editor_content),
+        }
+    }
+
     /// Every set-aside prompt of `target`'s that can hold a chip: the editor's content a card
-    /// parked, the prompt an edit set aside, or the draft not on screen.
+    /// parked, the prompt an edit set aside, or the draft not on screen (with an edit left open).
     pub(super) fn set_aside_prompts(&mut self, target: &Target) -> Vec<DraftMut<'_>> {
         if self.target.as_ref() != Some(target) {
-            return self.set_aside_prompt(target).into_iter().collect();
+            return self.composer_drafts.get_mut(target).map(ComposerDraft::prompts_mut).unwrap_or_default();
         }
         let parked = self.question.as_mut().map(QuestionDraft::prompt_mut);
         let saved = self.queue.edit_draft_mut();
@@ -306,6 +358,9 @@ mod tests {
         assert_eq!(draft.own_prompt_mut().0, "own");
         assert_eq!(draft.edit_content_mut("edit").map(|(text, ..)| text.clone()).as_deref(), Some("edited"));
         assert!(draft.edit_content_mut("a later edit").is_none());
+        assert_eq!(draft.editor_content().0, "edited", "a comment added off screen joins the edit");
+        let prompts: Vec<String> = draft.prompts_mut().into_iter().map(|(text, ..)| text.clone()).collect();
+        assert_eq!(prompts, ["own", "edited"], "an imported chip is found in either");
         let ComposerDraft::Prompt(text, ..) = draft.end_edit() else { panic!("the edit's composer was a prompt") };
         assert_eq!(text, "own", "a save landing while away gives the composer back its own prompt");
     }
@@ -323,5 +378,15 @@ mod tests {
         assert_eq!(draft.edit_content_mut("edit").map(|(text, ..)| text.clone()).as_deref(), Some("edited"));
         let ComposerDraft::Question(card) = draft.end_edit() else { panic!("the card stays") };
         assert_eq!(card.prompt, "own", "the card parks the thread's own prompt once the edit ends");
+    }
+
+    #[test]
+    fn context_follows_the_editor_content_not_the_prompt_an_edit_set_aside() {
+        use PromptHolder::*;
+        // During an edit the prompt waits with it, but a comment joins and is found in the edit.
+        assert_eq!(PromptHolder::of(true, true, false), QueueEdit);
+        assert_eq!(PromptHolder::of_editor_content(true, false), Editor);
+        assert_eq!(PromptHolder::of_editor_content(true, true), Question, "the card parked the editor's content");
+        assert_eq!(PromptHolder::of_editor_content(false, false), OffScreen);
     }
 }
