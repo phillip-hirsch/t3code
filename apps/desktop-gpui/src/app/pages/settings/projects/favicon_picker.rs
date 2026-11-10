@@ -12,11 +12,13 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent, ObjectFit,
     ParentElement as _, PathPromptOptions, Render, ScrollStrategy, SharedString, StatefulInteractiveElement as _,
-    Styled as _, StyledImage as _, Subscription, UniformListScrollHandle, Window, div, img, px, uniform_list,
+    Styled as _, StyledImage as _, Subscription, UniformListScrollHandle, WeakEntity, Window, div, img, px,
+    uniform_list,
 };
 use serde_json::json;
 
 use super::icon::Images;
+use crate::app::Workspace;
 use crate::backend::Endpoint;
 use crate::rpc::RpcClient;
 use crate::theme;
@@ -57,8 +59,9 @@ fn is_favicon_path(path: &str) -> bool {
 pub(super) struct FaviconPicker {
     cwd: String,
     project_name: SharedString,
-    client: Option<RpcClient>,
-    endpoint: Option<Endpoint>,
+    workspace: WeakEntity<Workspace>,
+    /// The project's environment, whose socket and address are looked up at each read.
+    environment: SharedString,
     images: Entity<Images>,
     query: Entity<InputState>,
     /// Image file paths in server rank order.
@@ -79,8 +82,8 @@ impl FaviconPicker {
     pub(super) fn new(
         cwd: String,
         project_name: SharedString,
-        client: Option<RpcClient>,
-        endpoint: Option<Endpoint>,
+        workspace: WeakEntity<Workspace>,
+        environment: SharedString,
         images: Entity<Images>,
         pick_external: bool,
         on_pick: OnPick,
@@ -100,8 +103,8 @@ impl FaviconPicker {
         let mut picker = Self {
             cwd,
             project_name,
-            client,
-            endpoint,
+            workspace,
+            environment,
             images,
             query,
             entries: Rc::default(),
@@ -119,9 +122,16 @@ impl FaviconPicker {
         picker
     }
 
+    /// The environment's socket and address now: a reconnect replaces both.
+    fn connection(&self, cx: &App) -> (Option<RpcClient>, Option<Endpoint>) {
+        let Some(workspace) = self.workspace.upgrade() else { return (None, None) };
+        let workspace = workspace.read(cx);
+        (workspace.env_client(&self.environment), workspace.env_endpoint(&self.environment).cloned())
+    }
+
     /// `useProjectFilePickerQuery(..., { imageOnly: true })`; an empty query lists files too.
     fn search(&mut self, cx: &mut Context<Self>) {
-        let Some(client) = self.client.clone() else {
+        let Some(client) = self.connection(cx).0 else {
             self.error = Some("Not connected.".into());
             return;
         };
@@ -236,7 +246,7 @@ impl FaviconPicker {
         let tokens = *theme::tokens(cx);
         let name = path.rsplit('/').next().unwrap_or(path).to_owned();
         let resource = json!({"_tag": "draft-workspace-file", "cwd": self.cwd, "path": path});
-        let (client, endpoint) = (self.client.clone(), self.endpoint.clone());
+        let (client, endpoint) = self.connection(cx);
         let thumbnail = self.images.update(cx, |images, cx| images.get(resource, client, endpoint, cx));
         let highlighted = index == self.highlighted;
         let picked = path.to_owned();

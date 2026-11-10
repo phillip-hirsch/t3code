@@ -619,23 +619,25 @@ impl Workspace {
                 let representative_env = representative.project.environment_id.clone();
                 let project_name: SharedString = group.display_name.clone().into();
                 let pick_external = self.can_pick_external_favicon(&group.members);
-                cx.listener(move |this, _, window, cx| {
+                cx.listener(move |_, _, window, cx| {
                     let workspace = cx.weak_entity();
                     let (ids, panel) = (ids.clone(), panel.clone());
-                    let on_pick: favicon_picker::OnPick = Rc::new(move |path, window, cx| {
-                        let update = json!({"faviconPath": path, "projectIcon": null});
-                        let _ = workspace
-                            .update(cx, |this, cx| this.set_project_icon(&panel, ids.clone(), update, window, cx));
+                    let on_pick: favicon_picker::OnPick = Rc::new({
+                        let workspace = workspace.clone();
+                        move |path, window, cx| {
+                            let update = json!({"faviconPath": path, "projectIcon": null});
+                            let _ = workspace
+                                .update(cx, |this, cx| this.set_project_icon(&panel, ids.clone(), update, window, cx));
+                        }
                     });
-                    let client = this.env_client(&representative_env);
-                    let endpoint = this.env_endpoint(&representative_env).cloned();
                     let (cwd, project_name, images) = (cwd.clone(), project_name.clone(), images.clone());
+                    let environment = representative_env.clone();
                     let picker = cx.new(|cx| {
                         favicon_picker::FaviconPicker::new(
                             cwd,
                             project_name,
-                            client,
-                            endpoint,
+                            workspace,
+                            environment,
                             images,
                             pick_external,
                             on_pick,
