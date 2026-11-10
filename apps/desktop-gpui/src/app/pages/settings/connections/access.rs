@@ -18,8 +18,8 @@ use gpui_kit::component::{Disableable as _, Sizable as _, WindowExt as _, h_flex
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, ClipboardItem, Context, ElementId, Entity, FontWeight, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Task,
-    WeakEntity, Window, div, px,
+    IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
+    Task, WeakEntity, Window, div, px,
 };
 use serde_json::{Value, json};
 
@@ -571,11 +571,6 @@ impl Workspace {
             move |_, window, cx| revoke(&state, &host, Revoke::Others, window, cx)
         });
         let denial = logic::remote_clients_denial(&self.settings_info().managed_policy);
-        let delegatable: Vec<String> = self
-            .settings_auth()
-            .and_then(SessionLoad::session)
-            .map(|session| session.delegatable().to_vec())
-            .unwrap_or_default();
         let create =
             WebButton::new("create-pairing-link", "Create link").variant(Variant::Primary).icon(IconName::Plus);
         let create = match denial {
@@ -589,7 +584,7 @@ impl Workspace {
                 let state = state.downgrade();
                 create
                     .on_click(move |_, window, cx| {
-                        open_create_link_dialog(state.clone(), host.clone(), delegatable.clone(), window, cx);
+                        open_create_link_dialog(state.clone(), host.clone(), window, cx);
                     })
                     .into_any_element()
             }
@@ -1088,10 +1083,10 @@ fn client_session_row(
 struct CreateLinkForm {
     label: Entity<InputState>,
     scopes: Vec<String>,
-    delegatable: Vec<String>,
     busy: bool,
     access: WeakEntity<AccessState>,
     host: AccessHost,
+    _observe: Option<Subscription>,
 }
 
 /// The environment the access page shows, read again when a link is created or access is
@@ -1113,22 +1108,29 @@ impl AccessHost {
             .then(|| workspace.env_endpoint(environment).cloned())
             .flatten()
     }
+
+    /// The scopes this session may hand on there now, as the web's live `delegatableScopes`.
+    fn delegatable(&self, cx: &App) -> Vec<String> {
+        let Some(workspace) = self.workspace.upgrade() else { return Vec::new() };
+        let auth = self.environment.as_deref().and_then(|environment| workspace.read(cx).env_auth(environment));
+        auth.and_then(SessionLoad::session).map(|session| session.delegatable().to_vec()).unwrap_or_default()
+    }
 }
 
 impl CreateLinkForm {
-    fn selected(&self) -> Vec<String> {
-        self.scopes.iter().filter(|s| self.delegatable.contains(s)).cloned().collect()
+    fn selected(&self, delegatable: &[String]) -> Vec<String> {
+        self.scopes.iter().filter(|s| delegatable.contains(s)).cloned().collect()
     }
 
     fn preset(&mut self, scopes: &[&str], cx: &mut Context<Self>) {
-        self.scopes =
-            scopes.iter().map(std::string::ToString::to_string).filter(|s| self.delegatable.contains(s)).collect();
+        let delegatable = self.host.delegatable(cx);
+        self.scopes = scopes.iter().map(std::string::ToString::to_string).filter(|s| delegatable.contains(s)).collect();
         cx.notify();
     }
 
     fn create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let scopes = self.selected();
-        if self.busy || scopes.is_empty() || !scopes.iter().all(|s| self.delegatable.contains(s)) {
+        let scopes = self.selected(&self.host.delegatable(cx));
+        if self.busy || scopes.is_empty() {
             return;
         }
         let Some(endpoint) = self.host.endpoint(&scopes, cx) else { return };
@@ -1139,33 +1141,41 @@ impl CreateLinkForm {
         if !label.is_empty() {
             body["label"] = label.into();
         }
-        cx.spawn_in(window, async move |this, cx| {
-            let result = auth_request(Some(endpoint), "/api/auth/pairing-token", Some(body)).await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.busy = false;
-                cx.notify();
-                match result {
-                    Ok(created) => {
-                        let (Some(id), Some(credential)) = (created["id"].as_str(), created["credential"].as_str())
-                        else {
-                            let message = "The environment sent no pairing credential.";
-                            return error_toast(window, cx, "Could not create pairing URL", message.to_owned());
-                        };
-                        let _ = this.access.update(cx, |access, cx| {
-                            access.credentials.insert(id.to_owned(), credential.to_owned());
-                            access.newest_link = Some(id.to_owned());
-                            cx.notify();
-                        });
-                        window.close_dialog(cx);
+        let (form, access) = (cx.weak_entity(), self.access.clone());
+        // On the window, not the form: the credential shows once, so a closed dialog must not drop it.
+        window
+            .spawn(cx, async move |cx| {
+                let result = auth_request(Some(endpoint), "/api/auth/pairing-token", Some(body)).await;
+                let created =
+                    result.and_then(|created| match (created["id"].as_str(), created["credential"].as_str()) {
+                        (Some(id), Some(credential)) => Ok((id.to_owned(), credential.to_owned())),
+                        _ => Err("The environment sent no pairing credential.".to_owned()),
+                    });
+                drop(cx.update(|window, cx| {
+                    let open = form.update(cx, |form, cx| {
+                        form.busy = false;
+                        cx.notify();
+                    });
+                    match created {
+                        Ok((id, credential)) => {
+                            drop(access.update(cx, |access, cx| {
+                                access.credentials.insert(id.clone(), credential);
+                                access.newest_link = Some(id);
+                                cx.notify();
+                            }));
+                            if open.is_ok() {
+                                window.close_dialog(cx);
+                            }
+                        }
+                        Err(error) => {
+                            let message =
+                                if error.is_empty() { "Failed to create pairing URL.".to_owned() } else { error };
+                            error_toast(window, cx, "Could not create pairing URL", message);
+                        }
                     }
-                    Err(error) => {
-                        let message = if error.is_empty() { "Failed to create pairing URL.".to_owned() } else { error };
-                        error_toast(window, cx, "Could not create pairing URL", message);
-                    }
-                }
-            });
-        })
-        .detach();
+                }));
+            })
+            .detach();
     }
 }
 
@@ -1173,8 +1183,9 @@ impl Render for CreateLinkForm {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *theme::tokens(cx);
         let busy = self.busy;
-        let selected = self.selected();
-        let options = logic::SCOPE_OPTIONS.iter().filter(|(scope, ..)| self.delegatable.iter().any(|d| d == scope));
+        let delegatable = self.host.delegatable(cx);
+        let selected = self.selected(&delegatable);
+        let options = logic::SCOPE_OPTIONS.iter().filter(|(scope, ..)| delegatable.iter().any(|d| d == scope));
         let warning = if selected.is_empty() {
             Some((t.error_foreground, "Select at least one permission."))
         } else if selected.iter().any(|s| s == ACCESS_WRITE) {
@@ -1275,16 +1286,14 @@ impl Render for CreateLinkForm {
     }
 }
 
-fn open_create_link_dialog(
-    access: WeakEntity<AccessState>,
-    host: AccessHost,
-    delegatable: Vec<String>,
-    window: &mut Window,
-    cx: &mut App,
-) {
+fn open_create_link_dialog(access: WeakEntity<AccessState>, host: AccessHost, window: &mut Window, cx: &mut App) {
     let label = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. Living room iPad"));
     label.update(cx, |input, cx| input.focus(window, cx));
     let scopes = logic::STANDARD_SCOPES.iter().map(std::string::ToString::to_string).collect();
-    let form = cx.new(|_| CreateLinkForm { label, scopes, delegatable, busy: false, access, host });
+    let form = cx.new(|cx| {
+        // Re-filter the permissions when this session's grants there change, as the web's render does.
+        let observe = host.workspace.upgrade().map(|workspace| cx.observe(&workspace, |_, _, cx| cx.notify()));
+        CreateLinkForm { label, scopes, busy: false, access, host, _observe: observe }
+    });
     window.open_dialog(cx, move |dialog, _, _| dialog.title("Create pairing link").w(px(448.)).child(form.clone()));
 }
