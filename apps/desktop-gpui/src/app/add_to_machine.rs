@@ -22,7 +22,6 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use super::details::commit_dialog::{Check, check_box};
-use super::git::SOURCE_CONTROL_WRITE;
 use super::host_picker::machine_icon;
 use super::pages::settings::{format_bytes, resolve_pasted_path};
 use super::project_clone::Phase;
@@ -32,6 +31,7 @@ use crate::model::{ProjectShell, ScopedId};
 use crate::theme::Tokens;
 
 /// `COPYABLE_FILE_MAX_BYTES`: the server's read cap; a larger file would arrive truncated.
+const CLONE_START: &str = "projectClone.start";
 const COPYABLE_FILE_MAX_BYTES: u64 = 1024 * 1024;
 
 /// A machine the project can be cloned to (`AddProjectTarget`).
@@ -178,7 +178,7 @@ impl Workspace {
             .filter(|session| session.is_connected() && !session.server_info.config.is_null())
             .filter_map(|session| session.id.clone())
             .filter(|id| *id != project.environment_id && !existing.contains(id))
-            .filter(|id| self.env_grants(id, SOURCE_CONTROL_WRITE))
+            .filter(|id| self.env_permits(id, CLONE_START, &json!({"projectId": project.id})))
             .map(|id| {
                 let option = self.option_for(&id, None);
                 AddTarget { environment_id: id, label: option.label, machine: option.machine }
@@ -242,7 +242,14 @@ impl Workspace {
     /// lands on the new project. Errors go back to the dialog, which stays open.
     fn start_add_to_machine(&mut self, request: Request, window: &mut Window, cx: &mut Context<Self>) {
         let target = ScopedId::new(request.target.environment_id.clone(), request.project_id.as_str());
-        if !self.env_grants(&target.env, SOURCE_CONTROL_WRITE) {
+        let input = json!({
+            "projectId": request.project_id,
+            "title": request.title,
+            "createdAt": crate::timestamp::iso(crate::timestamp::now_ms()),
+            "remoteUrl": request.remote_url,
+            "destinationPath": request.destination,
+        });
+        if !self.env_permits(&target.env, CLONE_START, &input) {
             let message = "This connection needs permission to write source control.".to_owned();
             return fail_add(self, &target, &request.dialog, message, cx);
         }
@@ -255,15 +262,8 @@ impl Workspace {
         if !request.reads.is_empty() {
             self.clones.copies.states.insert(target.clone(), FileCopy::Copying);
         }
-        let input = json!({
-            "projectId": request.project_id,
-            "title": request.title,
-            "createdAt": crate::timestamp::iso(crate::timestamp::now_ms()),
-            "remoteUrl": request.remote_url,
-            "destinationPath": request.destination,
-        });
         cx.spawn_in(window, async move |this, cx| {
-            let result = client.request("projectClone.start", input).await;
+            let result = client.request(CLONE_START, input).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 let started = match result {
                     Ok(started) => started,

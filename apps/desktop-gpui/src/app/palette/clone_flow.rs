@@ -33,9 +33,9 @@ fn default_clone_url(repository: &Value) -> Option<String> {
 }
 
 impl Workspace {
-    /// Clone needs `source-control:write` and `orchestration:operate` there.
+    /// `projectClone.start`'s `permissionAtom`, and `orchestration:operate` to add the project.
     pub(super) fn can_clone_on(&self, environment: &str) -> bool {
-        self.env_grants(environment, super::super::git::SOURCE_CONTROL_WRITE) && self.can_operate(environment)
+        self.env_permits(environment, "projectClone.start", &Value::Null) && self.can_operate(environment)
     }
 
     /// The environment's discovery, once [`Self::load_palette_discovery`] answered for it.
@@ -234,6 +234,9 @@ impl Workspace {
             "remoteUrl": target.remote_url,
             "destinationPath": destination,
         });
+        if !self.env_permits(&environment, "projectClone.start", &input) {
+            return toast_error(window, cx, "Clone unavailable", NEEDS_GRANTS);
+        }
         if let Some(palette) = &mut self.palette {
             palette.clone_pending = true;
         }

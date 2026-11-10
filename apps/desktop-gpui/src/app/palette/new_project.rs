@@ -13,9 +13,8 @@ use gpui_kit::{
     AnyElement, Context, InteractiveElement as _, IntoElement as _, ParentElement as _, SharedString,
     StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
-use super::super::git::SOURCE_CONTROL_WRITE;
 use super::super::project_clone::paths;
 use super::super::source_control::{self, PublishTarget};
 use super::super::{Workspace, keymap};
@@ -23,6 +22,7 @@ use super::{Description, Group, Row, RowIcon, Run, View, environment_row};
 use crate::theme::Tokens;
 
 /// The publish toggle's row (`newProjectPublishToggleValue`).
+const PUBLISH: &str = "sourceControl.publishRepository";
 const PUBLISH_KEY: &str = "new-project:publish";
 
 /// `newProjectFlow` and the state beside it.
@@ -175,7 +175,7 @@ impl Workspace {
     /// `getNewProjectPublishTargets` for the flow's machine; none where this connection cannot
     /// publish, since `sourceControl.publishRepository` needs `source-control:write`.
     fn new_project_publish_targets(&self, environment: &str) -> Vec<PublishTarget> {
-        if !self.env_grants(environment, SOURCE_CONTROL_WRITE) {
+        if !self.env_permits(environment, PUBLISH, &Value::Null) {
             return Vec::new();
         }
         source_control::new_project_publish_targets(self.palette_discovery(environment))
@@ -325,20 +325,20 @@ impl Workspace {
             let toast = Notification::error(description).title(format!("Could not create the {label} repository"));
             window.push_notification(toast, cx);
         };
-        if !self.env_grants(&environment, SOURCE_CONTROL_WRITE) {
-            return failed("This connection needs permission to write source control.".to_owned(), window, cx);
-        }
-        let Some(client) = self.env_client(&environment) else {
-            return failed("This environment is not connected.".to_owned(), window, cx);
-        };
         let input = json!({
             "cwd": workspace_root,
             "provider": target.host.kind,
             "repository": source_control::new_project_repository(target.owner.as_deref(), &workspace_root),
             "visibility": "private",
         });
+        if !self.env_permits(&environment, PUBLISH, &input) {
+            return failed("This connection needs permission to write source control.".to_owned(), window, cx);
+        }
+        let Some(client) = self.env_client(&environment) else {
+            return failed("This environment is not connected.".to_owned(), window, cx);
+        };
         cx.spawn_in(window, async move |this, cx| {
-            let result = client.request("sourceControl.publishRepository", input).await;
+            let result = client.request(PUBLISH, input).await;
             let _ = this.update_in(cx, |this, window, cx| match result {
                 Err(error) => failed(error.message(), window, cx),
                 Ok(published) => {
