@@ -412,15 +412,6 @@ fn project_change_request_url(identity: &crate::model::RepositoryIdentity, numbe
     })
 }
 
-/// `parsePullRequestReference`'s checkout commands: `gh pr checkout 12`, `glab mr checkout 12`.
-fn checkout_argument(input: &str) -> Option<&str> {
-    let words: Vec<&str> = input.split_whitespace().collect();
-    match words.as_slice() {
-        ["gh", "pr", "checkout", argument] | ["glab", "mr", "checkout", argument] => Some(argument),
-        _ => None,
-    }
-}
-
 /// `resolveLinkPullRequestInput`: a change request URL, or `123` / `#123` in the thread's own
 /// repository. `None` is input that names nothing yet; an error says what is missing.
 pub fn resolve_link_input(
@@ -428,16 +419,15 @@ pub fn resolve_link_input(
     identity: Option<&crate::model::RepositoryIdentity>,
 ) -> Option<Result<ResolvedLink, String>> {
     let trimmed = input.trim();
-    let reference = checkout_argument(trimmed).unwrap_or(trimmed);
-    if let Some(link) = crate::pull_request_detail::parse_change_request(reference) {
+    let reference = match crate::pull_request_detail::parse_change_request(trimmed) {
+        Some(_) => trimmed.to_owned(),
+        None => crate::pull_request_checkout::parse_reference(trimmed)?,
+    };
+    if let Some(link) = crate::pull_request_detail::parse_change_request(&reference) {
         let (host, repository, number) = (link.host, link.repository, link.number);
-        return Some(Ok(ResolvedLink { host, repository, number, url: reference.to_owned() }));
+        return Some(Ok(ResolvedLink { host, repository, number, url: reference }));
     }
-    let digits = reference.strip_prefix('#').unwrap_or(reference);
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let number: u64 = digits.parse().ok().filter(|n| (1..=9_007_199_254_740_991).contains(n))?;
+    let number: u64 = reference.parse().ok().filter(|n| (1..=9_007_199_254_740_991).contains(n))?;
     let Some(identity) = identity.filter(|i| i.display_name.is_some() || (i.owner.is_some() && i.name.is_some()))
     else {
         return Some(Err(

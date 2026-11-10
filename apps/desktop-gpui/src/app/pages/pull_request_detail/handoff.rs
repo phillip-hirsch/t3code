@@ -8,7 +8,7 @@ use super::*;
 use crate::app::Target;
 use crate::app::git::SOURCE_CONTROL_WRITE;
 use crate::model::ProjectShell;
-use crate::new_thread::{EnvMode, WorkspaceChoice};
+use crate::pull_request_checkout::Prepared;
 use crate::pull_request_detail::{CheckoutMode, CheckoutRequest};
 
 /// A project on one environment (`scopeProjectRef`): project ids repeat across environments.
@@ -328,9 +328,12 @@ impl Workspace {
                         return;
                     }
                 };
-                let branch = value["branch"].as_str().unwrap_or_default().to_owned();
-                let worktree = value["worktreePath"].as_str().map(str::to_owned);
-                let on_head = value["isOnPullRequestHead"].as_bool() != Some(false);
+                let prepared = Prepared {
+                    branch: value["branch"].as_str().unwrap_or_default().to_owned(),
+                    worktree_path: value["worktreePath"].as_str().map(str::to_owned),
+                    on_head: value["isOnPullRequestHead"].as_bool() != Some(false),
+                };
+                let (branch, worktree, on_head) = (&prepared.branch, &prepared.worktree_path, prepared.on_head);
                 if !matches!(&this.target, Some(Target::Draft { env, project_id: p }) if *p == project_id && *env == environment_id) {
                     toast_error(
                         window,
@@ -340,20 +343,7 @@ impl Workspace {
                     );
                     return;
                 }
-                this.draft_workspace.choice = match &worktree {
-                    Some(path) => WorkspaceChoice {
-                        mode: Some(EnvMode::Worktree),
-                        branch: Some(branch),
-                        existing_worktree: Some(path.clone()),
-                        start_from_origin: None,
-                    },
-                    None => WorkspaceChoice {
-                        mode: Some(EnvMode::Local),
-                        branch: Some(branch),
-                        existing_worktree: None,
-                        start_from_origin: None,
-                    },
-                };
+                this.point_draft_at_checkout(&prepared);
                 if let Some(task) = &task {
                     this.write_pr_task(task, window, cx);
                 }

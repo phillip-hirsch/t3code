@@ -35,6 +35,9 @@ pub struct BranchChanges {
 pub struct SourceControlProvider {
     #[serde(default)]
     pub kind: String,
+    /// The host's display name ("GitHub Self-Hosted"), when the server names it.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// `VcsStatusLocalResult`.

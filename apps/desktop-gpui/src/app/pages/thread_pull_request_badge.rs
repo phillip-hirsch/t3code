@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, ClickEvent, Context, ElementId, FontWeight, Hsla, InteractiveElement as _, IntoElement, MouseButton,
     ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Task, WeakEntity, Window, div, px,
@@ -24,7 +25,9 @@ use crate::model::ThreadShell;
 use crate::pull_request_detail::Reference;
 use crate::pull_requests::{Entry, State};
 use crate::theme::{self, Tokens};
-use crate::thread_pull_requests::{self as links, BadgeView, Glyph, LinkedPullRequest, Shown, Source, Tone};
+use crate::thread_pull_requests::{
+    self as links, BadgeView, Glyph, LinkedPullRequest, PullRequestLink, Shown, Source, Tone,
+};
 
 /// `staleTimeMs`: a row's read is asked again after this, unless its change request merged.
 const STALE: Duration = Duration::from_secs(60);
@@ -128,12 +131,12 @@ struct MiniItem {
 
 /// `ThreadPullRequestsMiniList`'s lines, or the one change request a thread without links shows.
 fn mini_items(
-    thread: &ThreadShell,
+    pull_requests: &[PullRequestLink],
     view: &BadgeView,
     shown: Option<&Shown>,
     subject: Option<(u64, &str)>,
 ) -> Vec<MiniItem> {
-    let lines = links::list_lines(&thread.pull_requests);
+    let lines = links::list_lines(pull_requests);
     if lines.is_empty() {
         let Some((number, url)) = subject else { return Vec::new() };
         let title = shown.map_or_else(|| view.label.clone(), |shown| shown.title.clone());
@@ -163,7 +166,26 @@ struct RowThread {
     thread_id: String,
 }
 
-fn mini_list(items: &[MiniItem], row: &RowThread, view: &WeakEntity<Workspace>, t: &Tokens) -> AnyElement {
+/// One badge control's content and where it acts.
+struct Badge {
+    id: SharedString,
+    view: BadgeView,
+    items: Vec<MiniItem>,
+    row: RowThread,
+    url: Option<String>,
+    /// Opens the change request in the thread's panel rather than the Pull requests page.
+    in_panel: bool,
+    /// Drawn as the composer's control rather than a sidebar row's.
+    composer: bool,
+}
+
+fn mini_list(
+    items: &[MiniItem],
+    row: &RowThread,
+    in_panel: bool,
+    view: &WeakEntity<Workspace>,
+    t: &Tokens,
+) -> AnyElement {
     let lines = items.iter().enumerate().map(|(index, item)| {
         let (icon, color) = item.tone.map_or((Lucide::GitPullRequestArrow, t.muted_foreground), |g| glyph(g, t));
         let (url, row, view) = (item.url.clone(), row.clone(), view.clone());
@@ -180,7 +202,7 @@ fn mini_list(items: &[MiniItem], row: &RowThread, view: &WeakEntity<Workspace>, 
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(move |event: &ClickEvent, window, cx| {
                 cx.stop_propagation();
-                let _ = view.update(cx, |this, cx| this.open_row_pull_request(&row, &url, true, event, window, cx));
+                let _ = view.update(cx, |this, cx| this.open_row_pull_request(&row, &url, in_panel, event, window, cx));
             })
             .child(Icon::new(icon).with_size(px(12.)).flex_none().text_color(color))
             .child(div().flex_none().font_family(t.fonts.mono).child(format!("#{}", item.number)))
@@ -333,52 +355,121 @@ impl Workspace {
         let current = links::current(&thread.pull_requests).filter(|_| supports);
         let number = shown.as_ref().map(|s| s.number).or(current.map(|l| l.number));
         let url = shown.as_ref().map(|s| s.url.clone()).or(current.map(|l| l.url.clone()));
+        let items = mini_items(&thread.pull_requests, &view, shown.as_ref(), number.zip(url.as_deref()));
+        let badge = Badge {
+            id: format!("thread-pr-badge-{}-{}", thread.environment_id, thread.id).into(),
+            view,
+            items,
+            row: RowThread { environment_id: thread.environment_id.to_string(), thread_id: thread.id.clone() },
+            url,
+            in_panel: matches!(self.target, Some(super::super::Target::Thread { .. })),
+            composer: false,
+        };
+        Some(self.badge_control(badge, cx))
+    }
+
+    /// The composer's control beside the branch trigger (`BranchToolbarBranchSelector`'s
+    /// `ThreadPullRequestBadgeControl`): the thread's linked change requests, else the change
+    /// request of the branch the trigger shows while the thread (or draft) is on it.
+    pub(in crate::app) fn render_composer_pull_request_badge(
+        &self,
+        trigger_branch: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let (environment_id, thread, thread_branch) = match self.target.as_ref()? {
+            super::super::Target::Thread { env, id } => {
+                let thread = self.shell.threads.iter().find(|t| &t.id == id && &t.environment_id == env)?;
+                (env, Some(thread), thread.branch.as_deref())
+            }
+            super::super::Target::Draft { env, .. } => (env, None, self.draft_workspace.choice.branch.as_deref()),
+        };
+        let supports = self.supports_pull_request_links(environment_id);
+        let pull_requests = thread.map_or(&[][..], |t| t.pull_requests.as_slice());
+        let current = links::current(pull_requests).filter(|_| supports);
+        // `resolveBranchToolbarPrBranch`: the checkout's change request while the trigger shows the thread's branch.
+        let branch_pr = thread_branch.filter(|b| trigger_branch == Some(*b)).and_then(|branch| {
+            let status = self.vcs.status.as_ref().filter(|s| s.local.ref_name.as_deref() == Some(branch))?;
+            let pr = status.remote.pr.as_ref()?;
+            Some(Shown {
+                number: pr.number,
+                url: pr.url.clone(),
+                title: pr.title.clone(),
+                tone: Tone::of(&pr.state, pr.is_draft),
+                provider: status.local.source_control_provider.as_ref().map_or_else(String::new, |p| p.kind.clone()),
+            })
+        });
+        let shown = thread.and_then(|t| self.row_pull_request(t, cx)).or(branch_pr.filter(|_| current.is_none()));
+        let number = current.map(|l| l.number).or(shown.as_ref().map(|s| s.number));
+        let url = current.map(|l| l.url.clone()).or(shown.as_ref().map(|s| s.url.clone()));
+        let badge = links::badge(pull_requests).filter(|_| supports);
+        let view = links::badge_view(badge, number, url.as_deref(), shown.as_ref())?;
+        let items = mini_items(pull_requests, &view, shown.as_ref(), number.zip(url.as_deref()));
+        let badge = Badge {
+            id: "composer-pr-badge".into(),
+            view,
+            items,
+            row: RowThread {
+                environment_id: environment_id.to_string(),
+                thread_id: thread.map_or_else(String::new, |t| t.id.clone()),
+            },
+            url,
+            in_panel: thread.is_some(),
+            composer: true,
+        };
+        Some(self.badge_control(badge, cx))
+    }
+
+    /// A [`Badge`] as a control: a sidebar row's link-like glyph and number, or the composer's
+    /// `ComposerControl` (`size="xs"`).
+    fn badge_control(&self, badge: Badge, cx: &mut Context<Self>) -> AnyElement {
+        let Badge { id, view, items, row, url, in_panel, composer } = badge;
         let t = *theme::tokens(cx);
         let (icon, color) = glyph(view.glyph, &t);
-        let row = RowThread { environment_id: thread.environment_id.to_string(), thread_id: thread.id.clone() };
-        let items = mini_items(thread, &view, shown.as_ref(), number.zip(url.as_deref()));
         let weak = cx.entity().downgrade();
         let (tip_row, tip_items) = (row.clone(), items);
-        let in_panel = matches!(self.target, Some(super::super::Target::Thread { .. }));
         let opens_list = view.opens_list;
         let label: SharedString = view.label.into();
-        Some(
-            h_flex()
-                .id(SharedString::from(format!("thread-pr-badge-{}-{}", thread.environment_id, thread.id)))
-                .flex_none()
-                .gap(px(2.))
-                .rounded(px(2.))
-                .border_1()
-                .border_color(gpui_kit::transparent_black())
-                .cursor_pointer()
-                .focusable()
-                .tab_stop(true)
-                .focus_visible(move |s| s.border_color(t.ring))
-                .hover(gpui_kit::Styled::underline)
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                    cx.stop_propagation();
-                    if opens_list {
-                        this.open_row_pull_requests(&row, window, cx);
-                    } else if let Some(url) = &url {
-                        this.open_row_pull_request(&row, url, in_panel, event, window, cx);
+        let text_color = if composer { t.muted_foreground } else { t.sidebar.secondary_label };
+        h_flex()
+            .id(id)
+            .flex_none()
+            .border_1()
+            .border_color(gpui_kit::transparent_black())
+            .cursor_pointer()
+            .focusable()
+            .tab_stop(true)
+            .focus_visible(move |s| s.border_color(t.ring))
+            .map(|el| {
+                if composer {
+                    let height = px(t.breakpoint.pick(28., 24.));
+                    el.h(height).px(px(7.)).gap(px(4.)).rounded(px(8.)).hover(|s| s.bg(t.accent))
+                } else {
+                    el.gap(px(2.)).rounded(px(2.)).hover(gpui_kit::Styled::underline)
+                }
+            })
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                cx.stop_propagation();
+                if opens_list {
+                    this.open_row_pull_requests(&row, window, cx);
+                } else if let Some(url) = &url {
+                    this.open_row_pull_request(&row, url, in_panel, event, window, cx);
+                }
+            }))
+            .hoverable_tooltip(move |window, cx| {
+                let (items, row, weak, label) = (tip_items.clone(), tip_row.clone(), weak.clone(), label.clone());
+                Tooltip::element(move |_, cx| {
+                    let t = *theme::tokens(cx);
+                    if items.is_empty() {
+                        return div().child(label.clone()).into_any_element();
                     }
-                }))
-                .hoverable_tooltip(move |window, cx| {
-                    let (items, row, weak, label) = (tip_items.clone(), tip_row.clone(), weak.clone(), label.clone());
-                    Tooltip::element(move |_, cx| {
-                        let t = *theme::tokens(cx);
-                        if items.is_empty() {
-                            return div().child(label.clone()).into_any_element();
-                        }
-                        mini_list(&items, &row, &weak, &t)
-                    })
-                    .build(window, cx)
+                    mini_list(&items, &row, in_panel, &weak, &t)
                 })
-                .child(Icon::new(icon).with_size(px(12.)).flex_none().text_color(color))
-                .child(div().text_xs().text_color(t.sidebar.secondary_label).child(view.text))
-                .into_any_element(),
-        )
+                .build(window, cx)
+            })
+            .child(Icon::new(icon).with_size(px(12.)).flex_none().text_color(color))
+            .child(div().text_xs().text_color(text_color).child(view.text))
+            .into_any_element()
     }
 
     /// `ThreadRowLeadingStatus`: the change request's state glyph (the open thread's checkout

@@ -1720,7 +1720,7 @@ struct RowOrigin {
 
 /// A source control host's mark (`getSourceControlPresentationForKind(kind).Icon`): GitHub's is
 /// one color and follows the text, the others are drawn as they are.
-fn host_mark(kind: &str, size: f32, color: Hsla) -> AnyElement {
+pub(super) fn host_mark(kind: &str, size: f32, color: Hsla) -> AnyElement {
     let path = match kind {
         "github" => {
             return svg()
