@@ -4,28 +4,34 @@
 //! instead, so IME and dead keys keep working.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
 
 use gpui_kit::Keystroke;
 
-use super::core::{Core, KeyAction as Press, KeyInput, Modifiers};
+use super::core::{Core, KeyAction as Press, KeyId, KeyInput, Modifiers};
 
 /// Typing across key events: the keys whose press the program heard, and an IME or dead-key
 /// composition in progress.
 #[derive(Debug, Default)]
 pub(super) struct Keyboard {
     /// `encodedKeyCodes`: these keys' releases go to the program too.
-    encoded: HashSet<String>,
+    encoded: Vec<KeyId>,
     /// The marked text's length in UTF-16 units.
     preedit: usize,
 }
 
 impl Keyboard {
     /// A fresh press proves a release was missed.
-    pub fn forget_missed_release(&mut self, keystroke: &Keystroke, held: bool) {
+    pub fn forget_missed_release(&mut self, keystroke: &Keystroke, numpad: bool, held: bool) {
         if !held {
-            self.encoded.remove(&keystroke.key);
+            self.forget(&KeyId::of(&keystroke.key, numpad));
         }
+    }
+
+    /// Whether the key's press was encoded.
+    fn forget(&mut self, id: &KeyId) -> bool {
+        let before = self.encoded.len();
+        self.encoded.retain(|held| held != id);
+        self.encoded.len() < before
     }
 
     /// The input handler's marked text: non-empty while the IME or a dead key composes.
@@ -45,13 +51,15 @@ impl Keyboard {
     }
 
     /// `isTerminalCompositionKey`: keys mid-composition belong to the IME. X11 Compose sequences
-    /// mark no text, but GPUI strips the character from each key they swallow.
-    pub fn composing(&self, keystroke: &Keystroke) -> bool {
+    /// mark no text, but GPUI strips the character from each key they swallow. A Windows dead
+    /// key carries its spacing character and asks for character input; encoding it would skip
+    /// the `TranslateMessage` that starts the composition.
+    pub fn composing(&self, keystroke: &Keystroke, prefer_character_input: bool) -> bool {
         let m = &keystroke.modifiers;
+        let plain = !(m.control || m.alt || m.platform || m.function);
         self.preedit > 0
-            || (keystroke.key_char.is_none()
-                && !(m.control || m.alt || m.platform || m.function)
-                && single_char(&keystroke.key).is_some_and(|c| !c.is_control()))
+            || (plain && prefer_character_input)
+            || (plain && keystroke.key_char.is_none() && single_char(&keystroke.key).is_some_and(|c| !c.is_control()))
     }
 
     /// `encodeKey` for a press: bytes for the program, or `None` when there is nothing to send
@@ -62,16 +70,19 @@ impl Keyboard {
         if data.is_empty() {
             return None;
         }
-        self.encoded.insert(input.key.to_owned());
+        let id = KeyId::of(input.key, input.numpad);
+        if !self.encoded.contains(&id) {
+            self.encoded.push(id);
+        }
         (Some(data.as_str()) != input.text.as_deref()).then_some(data)
     }
 
     /// Kitty sessions that asked for releases hear them, for the keys whose press they heard.
-    pub fn release(&mut self, core: &mut Core, keystroke: &Keystroke, mac: bool) -> Option<String> {
-        if !self.encoded.remove(&keystroke.key) || self.preedit > 0 {
+    pub fn release(&mut self, core: &mut Core, keystroke: &Keystroke, numpad: bool, mac: bool) -> Option<String> {
+        if !self.forget(&KeyId::of(&keystroke.key, numpad)) || self.preedit > 0 {
             return None;
         }
-        let data = core.encode_key(&key_input(keystroke, Press::Release, mac));
+        let data = core.encode_key(&KeyInput { numpad, ..key_input(keystroke, Press::Release, mac) });
         (!data.is_empty()).then_some(data)
     }
 }
@@ -243,7 +254,15 @@ pub(super) fn key_input(keystroke: &Keystroke, action: Press, mac: bool) -> KeyI
     } else {
         Modifiers { shift: m.shift, alt: m.alt, ..Modifiers::default() }
     };
-    KeyInput { action, key: &keystroke.key, mods, consumed, text, unshifted: base.and_then(|c| unshifted(c, m.shift)) }
+    KeyInput {
+        action,
+        key: &keystroke.key,
+        mods,
+        consumed,
+        text,
+        unshifted: base.and_then(|c| unshifted(c, m.shift)),
+        numpad: false,
+    }
 }
 
 /// The character a key names: its own, or a space for `"space"`.
@@ -294,12 +313,33 @@ mod tests {
 
     /// [`sent`], with the keyboard's state carried across keys.
     fn pressed(keyboard: &mut Keyboard, core: &mut Core, keystroke: &Keystroke, mac: bool) -> Option<String> {
-        if keyboard.composing(keystroke) {
+        pressed_as(keyboard, core, keystroke, Platform { mac, ..Platform::default() })
+    }
+
+    /// What the platform said about a key besides its keystroke.
+    #[derive(Clone, Copy, Default)]
+    struct Platform {
+        mac: bool,
+        /// `KeyDownEvent::prefer_character_input`.
+        character_input: bool,
+        /// `Window::key_on_numpad`.
+        numpad: bool,
+    }
+
+    /// The session's `key_down` for a platform-shaped event.
+    fn pressed_as(
+        keyboard: &mut Keyboard,
+        core: &mut Core,
+        keystroke: &Keystroke,
+        platform: Platform,
+    ) -> Option<String> {
+        keyboard.forget_missed_release(keystroke, platform.numpad, false);
+        if keyboard.composing(keystroke, platform.character_input) {
             return None;
         }
-        match key_action_on(keystroke, false, core.alt_screen(), false, mac)? {
+        match key_action_on(keystroke, false, core.alt_screen(), false, platform.mac)? {
             KeyAction::Send(data) => Some(data.to_owned()),
-            KeyAction::Encode(input) => keyboard.press(core, &input),
+            KeyAction::Encode(input) => keyboard.press(core, &KeyInput { numpad: platform.numpad, ..input }),
             _ => None,
         }
     }
@@ -416,8 +456,8 @@ mod tests {
         core.write(b"\x1b[>3u");
         let mut keyboard = Keyboard::default();
         assert_eq!(pressed(&mut keyboard, &mut core, &a, false), None);
-        assert_eq!(keyboard.release(&mut core, &a, false).as_deref(), Some("\x1b[97;1:3u"));
-        assert_eq!(keyboard.release(&mut core, &a, false), None, "one release per press");
+        assert_eq!(keyboard.release(&mut core, &a, false, false).as_deref(), Some("\x1b[97;1:3u"));
+        assert_eq!(keyboard.release(&mut core, &a, false, false), None, "one release per press");
     }
 
     #[test]
@@ -430,6 +470,28 @@ mod tests {
         assert_eq!(sent(&mut core, &question, false).as_deref(), Some("\x1b[47:63;2u"));
         let unshifted = with_held_shift(&typed("?", Some("?")), false);
         assert_eq!(sent(&mut core, &unshifted, false).as_deref(), Some("\x1b[63::47u"), "a layout's own ?, unshifted");
+        // Shift let go first: the key comes up as "/", still the key whose press was heard.
+        let mut keyboard = Keyboard::default();
+        assert_eq!(pressed(&mut keyboard, &mut core, &question, false).as_deref(), Some("\x1b[47:63;2u"));
+        assert_eq!(keyboard.release(&mut core, &typed("/", Some("/")), false, false).as_deref(), Some("\x1b[47;1:3u"));
+    }
+
+    #[test]
+    fn keypad_keys_keep_their_identity() {
+        let mut core = core(80, 24);
+        let numpad = Platform { numpad: true, ..Platform::default() };
+        let keypad =
+            |core: &mut Core, keystroke: Keystroke| pressed_as(&mut Keyboard::default(), core, &keystroke, numpad);
+        assert_eq!(keypad(&mut core, typed("1", Some("1"))), None, "legacy sessions get the typed digit");
+        assert_eq!(keypad(&mut core, key("enter")).as_deref(), Some("\r"));
+        assert_eq!(keypad(&mut core, key("end")).as_deref(), Some("\x1b[F"), "NumLock off keeps navigation keys");
+        // Linux names keypad keys by keysym (KP_1 is "1", KP_Add "add"); Windows and macOS by character.
+        core.write(b"\x1b[>11u");
+        assert_eq!(keypad(&mut core, typed("1", Some("1"))).as_deref(), Some("\x1b[57400u"));
+        assert_eq!(keypad(&mut core, typed("add", Some("+"))).as_deref(), Some("\x1b[57413u"));
+        assert_eq!(keypad(&mut core, typed("+", Some("+"))).as_deref(), Some("\x1b[57413u"));
+        assert_eq!(keypad(&mut core, key("enter")).as_deref(), Some("\x1b[57414u"));
+        assert_eq!(sent(&mut core, &typed("1", Some("1")), false).as_deref(), Some("\x1b[49u"), "the main row's 1");
     }
 
     #[test]
@@ -442,8 +504,11 @@ mod tests {
         keyboard.set_preedit("´");
         assert_eq!(pressed(&mut keyboard, &mut core, &e, false), None);
         assert_eq!(pressed(&mut keyboard, &mut core, &key("enter"), false), None, "Enter commits");
-        assert_eq!(keyboard.release(&mut core, &e, false), None);
+        assert_eq!(keyboard.release(&mut core, &e, false, false), None);
         assert_eq!(keyboard.commit("é"), Some("é"));
+        // Windows gives a dead key its spacing character and asks for character input.
+        let dead = Platform { character_input: true, ..Platform::default() };
+        assert_eq!(pressed_as(&mut keyboard, &mut core, &typed("'", Some("'")), dead), None);
         assert_eq!(keyboard.preedit(), None);
         assert_eq!(pressed(&mut keyboard, &mut core, &e, false).as_deref(), Some("\x1b[101u"));
         // X11 Compose sequences show no marked text; their keys carry no character until composed.

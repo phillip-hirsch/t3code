@@ -103,6 +103,17 @@ registered for the current focus, because Windows `WM_CHAR` and IME callbacks re
 handler without checking focus. Pointer events are untouched. Tests:
 `focus_next_skips_an_inert_subtree`, `cached_view_replay_recomputes_inertness`.
 
+**Key events say whether they came from the numeric keypad.** The terminal reports keypad keys
+apart from the main ones (Kitty's `KP_*` codes), as the web does from `KeyboardEvent.code`.
+0.3.11 names a keypad key like its main-row twin (`1`, `+`, `enter`) and keeps no other trace of
+it. A field on `KeyDownEvent` would break the platforms that build it without one (gpui-pre-macos
+is not vendored), so the patch adds `PlatformWindow::key_on_numpad` (default `false`), which the
+Windows and Linux platforms answer for the key event they are dispatching, and
+`Window::key_on_numpad`, which reads it. macOS keeps the default. Files:
+
+- `src/platform.rs`: the trait method.
+- `src/window.rs`: `Window::key_on_numpad`.
+
 The crate's tests need `--features test-support`; run them from a scratch copy outside this
 repository (`cargo test --features test-support --lib`). The copy needs the published crate's
 missing pieces: put it two levels below a folder whose `assets/fonts/ibm-plex-sans` and
@@ -125,6 +136,14 @@ the environment variable still works. Files:
 - `src/platform.rs`: the `DIRECT_COMPOSITION_DISABLED` flag, its setter, and the check in `WindowsPlatform::new`.
 - `src/gpui_windows.rs`: exports the setter.
 
+**Key events say whether they came from the numeric keypad** (see gpui-pre's patch of that name).
+`handle_key_event` records it for every key message: the `VK_NUMPAD*` and operator keys, an
+extended `VK_RETURN`, and the navigation keys without the extended bit (the keypad with NumLock
+off). Files:
+
+- `src/events.rs`: `is_numpad_key`, called in `handle_key_event`.
+- `src/window.rs`: `WindowsWindowState::last_key_on_numpad` and `key_on_numpad`.
+
 ## gpui-pre-linux 0.3.11
 
 GPUI's Linux platform (Zed's `gpui_linux`), which gpui-kit pulls in through `gpui-pre-platform`.
@@ -141,6 +160,15 @@ so saved bounds include no shadow. The app keeps its resize edges for that case
 (`render_resize_edges` in `src/app/titlebar.rs`). Files:
 
 - `src/linux/x11/window.rs`: `request_decorations`, `window_decorations` and `set_client_inset`.
+
+**Key events say whether they came from the numeric keypad** (see gpui-pre's patch of that name).
+Each key press, repeat and release records whether its keysym is a keypad one
+(`Keysym::is_keypad_key`); an IBus commit sent as a key is not. Files:
+
+- `src/linux/x11/client.rs`, `src/linux/x11/window.rs`: `X11ClientState::key_on_numpad`, set
+  in the `KeyPress` and `KeyRelease` arms, and `key_on_numpad`.
+- `src/linux/wayland/client.rs`, `src/linux/wayland/window.rs`: `WaylandClientState::key_on_numpad`,
+  set in the keyboard `Key` event, the repeat timer and `CommitString`, and `key_on_numpad`.
 
 ## gpui-base 0.9.0
 

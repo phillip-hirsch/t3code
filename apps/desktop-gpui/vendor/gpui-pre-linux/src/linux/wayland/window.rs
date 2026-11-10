@@ -1846,6 +1846,10 @@ impl PlatformWindow for WaylandWindow {
         self.borrow().client.get_client().borrow().capslock
     }
 
+    fn key_on_numpad(&self) -> bool {
+        self.borrow().client.get_client().borrow().key_on_numpad
+    }
+
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
         self.borrow_mut().input_handler = Some(input_handler);
     }

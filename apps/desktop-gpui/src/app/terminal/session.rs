@@ -21,7 +21,7 @@ mod pointer;
 use gpui_kit::component::input;
 use gpui_kit::component::menu::ContextMenuExt as _;
 
-use super::core::Core;
+use super::core::{Core, KeyInput};
 use super::grid::{Batched, CursorCell, Frame, Geometry, TerminalGrid, TerminalTheme, batch};
 use super::keys::{self, KeyAction, key_action};
 use super::model::{ScreenLink, ViewportPoint};
@@ -640,8 +640,9 @@ impl TerminalSession {
             return;
         }
         let keystroke = &keys::with_held_shift(&event.keystroke, window.modifiers().shift);
-        self.keyboard.forget_missed_release(keystroke, event.is_held);
-        if self.keyboard.composing(keystroke) {
+        let numpad = window.key_on_numpad();
+        self.keyboard.forget_missed_release(keystroke, numpad, event.is_held);
+        if self.keyboard.composing(keystroke, event.prefer_character_input) {
             return;
         }
         self.pointer.cancel_selection_menu();
@@ -663,6 +664,7 @@ impl TerminalSession {
             }
             Some(KeyAction::Send(data)) => self.input(data, cx),
             Some(KeyAction::Encode(input)) => {
+                let input = KeyInput { numpad, ..input };
                 let Some(data) = self.keyboard.press(&mut self.core, &input) else { return };
                 self.input(&data, cx);
             }
@@ -681,7 +683,8 @@ impl TerminalSession {
     /// Kitty sessions that asked for releases hear them, for the keys whose press they heard.
     fn key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = keys::with_held_shift(&event.keystroke, window.modifiers().shift);
-        if let Some(data) = self.keyboard.release(&mut self.core, &keystroke, cfg!(target_os = "macos")) {
+        let numpad = window.key_on_numpad();
+        if let Some(data) = self.keyboard.release(&mut self.core, &keystroke, numpad, cfg!(target_os = "macos")) {
             self.send_input(&data, cx);
             cx.stop_propagation();
         }

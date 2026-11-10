@@ -3664,6 +3664,12 @@ impl Window {
         self.capslock
     }
 
+    /// Whether the key event being dispatched came from the numeric keypad, for terminals that
+    /// report keypad keys apart (Kitty). `false` on platforms that do not tell (macOS).
+    pub fn key_on_numpad(&self) -> bool {
+        self.platform_window.key_on_numpad()
+    }
+
     /// Produces a new frame and assigns it to `rendered_frame`. To actually show
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]

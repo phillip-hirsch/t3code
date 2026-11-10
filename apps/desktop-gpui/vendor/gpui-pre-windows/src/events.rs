@@ -1564,8 +1564,24 @@ where
         }
         vkey => {
             let keystroke = parse_normal_key(vkey, lparam, modifiers)?;
+            state.last_key_on_numpad.set(is_numpad_key(vkey, lparam));
             Some(f(keystroke.0, keystroke.1))
         }
+    }
+}
+
+/// The keypad's digits and operators, its Enter (an extended `VK_RETURN`), and with NumLock off
+/// its navigation keys (the dedicated ones are extended).
+fn is_numpad_key(vkey: VIRTUAL_KEY, lparam: LPARAM) -> bool {
+    let extended = lparam.0 & (1 << 24) != 0;
+    match vkey {
+        VK_NUMPAD0 | VK_NUMPAD1 | VK_NUMPAD2 | VK_NUMPAD3 | VK_NUMPAD4 | VK_NUMPAD5
+        | VK_NUMPAD6 | VK_NUMPAD7 | VK_NUMPAD8 | VK_NUMPAD9 | VK_MULTIPLY | VK_ADD
+        | VK_SEPARATOR | VK_SUBTRACT | VK_DECIMAL | VK_DIVIDE => true,
+        VK_RETURN => extended,
+        VK_INSERT | VK_DELETE | VK_HOME | VK_END | VK_PRIOR | VK_NEXT | VK_UP | VK_DOWN
+        | VK_LEFT | VK_RIGHT | VK_CLEAR => !extended,
+        _ => false,
     }
 }
 

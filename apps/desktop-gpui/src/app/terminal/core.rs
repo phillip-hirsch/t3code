@@ -71,6 +71,25 @@ pub(super) struct KeyInput<'a> {
     pub text: Option<std::borrow::Cow<'a, str>>,
     /// The key's character without Shift, for Kitty's alternate keys.
     pub unshifted: Option<char>,
+    /// The key is on the numeric keypad (`Numpad*` codes).
+    pub numpad: bool,
+}
+
+/// A key's identity across its press and release (`event.code`): its W3C code, so `/` released
+/// after Shift is still the key that typed `?`, or its name when it has no code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum KeyId {
+    Code(key::Key),
+    Name(String),
+}
+
+impl KeyId {
+    pub fn of(name: &str, numpad: bool) -> Self {
+        match ghostty_key(name, numpad) {
+            key::Key::Unidentified => Self::Name(name.to_owned()),
+            code => Self::Code(code),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -185,8 +204,11 @@ fn read_bytes(mut fill: impl FnMut(&mut [u8]) -> Result<usize, Error>) -> Option
 
 /// GPUI's key names as Ghostty's W3C key codes (`ghosttyKeyForEvent`), with shifted US
 /// symbols on the key that types them.
-fn ghostty_key(name: &str) -> key::Key {
+fn ghostty_key(name: &str, numpad: bool) -> key::Key {
     use key::Key as K;
+    if numpad && let Some(key) = numpad_key(name) {
+        return key;
+    }
     let mut chars = name.chars();
     if let (Some(c), None) = (chars.next(), chars.next()) {
         const LETTERS: [K; 26] = [
@@ -301,6 +323,33 @@ fn ghostty_key(name: &str) -> key::Key {
         "menu" => K::ContextMenu,
         _ => K::Unidentified,
     }
+}
+
+/// A keypad key by the name GPUI gives it: its character on Windows and macOS, and on Linux
+/// its keysym without `KP_`.
+fn numpad_key(name: &str) -> Option<key::Key> {
+    use key::Key as K;
+    Some(match name {
+        "0" => K::Numpad0,
+        "1" => K::Numpad1,
+        "2" => K::Numpad2,
+        "3" => K::Numpad3,
+        "4" => K::Numpad4,
+        "5" => K::Numpad5,
+        "6" => K::Numpad6,
+        "7" => K::Numpad7,
+        "8" => K::Numpad8,
+        "9" => K::Numpad9,
+        "+" | "add" => K::NumpadAdd,
+        "-" | "subtract" => K::NumpadSubtract,
+        "*" | "multiply" => K::NumpadMultiply,
+        "/" | "divide" => K::NumpadDivide,
+        "." | "decimal" => K::NumpadDecimal,
+        "separator" => K::NumpadSeparator,
+        "=" | "equal" => K::NumpadEqual,
+        "enter" => K::NumpadEnter,
+        _ => return None,
+    })
 }
 
 impl Core {
@@ -505,7 +554,7 @@ impl Core {
         };
         self.key_event
             .set_action(action)
-            .set_key(ghostty_key(input.key))
+            .set_key(ghostty_key(input.key, input.numpad))
             .set_mods(input.mods.mods())
             .set_consumed_mods(input.consumed.mods())
             .set_composing(false)

@@ -60,6 +60,8 @@ pub struct WindowsWindowState {
     pub pending_surrogate: Cell<Option<u16>>,
     pub last_reported_modifiers: Cell<Option<Modifiers>>,
     pub last_reported_capslock: Cell<Option<Capslock>>,
+    /// Whether the last key message came from the numeric keypad.
+    pub last_key_on_numpad: Cell<bool>,
     pub hovered: Cell<bool>,
     pub last_visibility: Cell<Option<WindowVisibility>>,
     pub direct_manipulation: DirectManipulationHandler,
@@ -176,6 +178,7 @@ impl WindowsWindowState {
             pending_surrogate: Cell::new(pending_surrogate),
             last_reported_modifiers: Cell::new(last_reported_modifiers),
             last_reported_capslock: Cell::new(last_reported_capslock),
+            last_key_on_numpad: Cell::new(false),
             hovered: Cell::new(hovered),
             last_visibility: Cell::new(None),
             renderer: RefCell::new(renderer),
@@ -710,6 +713,10 @@ impl PlatformWindow for WindowsWindow {
 
     fn capslock(&self) -> Capslock {
         current_capslock()
+    }
+
+    fn key_on_numpad(&self) -> bool {
+        self.state.last_key_on_numpad.get()
     }
 
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
