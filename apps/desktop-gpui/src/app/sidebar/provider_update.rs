@@ -276,8 +276,7 @@ impl Workspace {
                 .bg(bg)
                 .text_color(fg)
                 .child(
-                    h_flex()
-                        .id("provider-update-pill")
+                    crate::app::chat::focusable(h_flex().id("provider-update-pill"), tokens)
                         .flex_1()
                         .min_w_0()
                         .gap(px(8.))
@@ -292,8 +291,7 @@ impl Workspace {
                 )
                 .when_some(view.dismissible.then_some(key), |el, key| {
                     el.child(
-                        div()
-                            .id("provider-update-dismiss")
+                        crate::app::chat::focusable(div().id("provider-update-dismiss"), tokens)
                             .mr(px(4.))
                             .size(px(20.))
                             .flex()
