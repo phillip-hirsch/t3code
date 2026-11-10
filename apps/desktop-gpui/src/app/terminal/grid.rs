@@ -618,6 +618,18 @@ mod tests {
         assert!(core.snapshot().revision > before, "the cached batch is rebuilt");
         assert_eq!(to_rgb(batched.background), Rgb { r: 0x12, g: 0x34, b: 0x56 });
         assert!(batched.backgrounds.is_empty());
+        // So do palette (OSC 4) and default foreground (OSC 10) changes, for the text on them.
+        core.write(b"\x1b[31mr\x1b[0m");
+        for (output, color) in [
+            (&b"\x1b]4;1;rgb:aa/bb/cc\x07"[..], Rgb { r: 0xaa, g: 0xbb, b: 0xcc }),
+            (b"\x1b]10;rgb:11/22/33\x07", Rgb { r: 0x11, g: 0x22, b: 0x33 }),
+        ] {
+            let before = core.snapshot().revision;
+            core.write(output);
+            let batched = batch(core.snapshot(), &theme);
+            assert!(core.snapshot().revision > before, "{output:?}");
+            assert!(batched.runs.iter().any(|run| to_rgb(run.style.color) == color), "{output:?}");
+        }
     }
 
     #[test]
