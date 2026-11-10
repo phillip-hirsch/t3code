@@ -686,7 +686,7 @@ impl Workspace {
                     .py(px(6.))
                     .border_b_1()
                     .border_color(tokens.warning.opacity(0.2))
-                    .bg(tokens.warning.opacity(0.08))
+                    .bg(tokens.warning_surface)
                     .text_size(gpui_kit::rems(0.625))
                     .text_color(tokens.warning_foreground)
                     .child(format!(

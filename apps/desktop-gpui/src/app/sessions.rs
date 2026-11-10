@@ -175,6 +175,11 @@ impl Workspace {
         self.settings_session()?.device_state.as_ref()
     }
 
+    /// One environment's device state, `None` until its stream's first state arrives.
+    pub(super) fn env_device_state(&self, environment_id: &str) -> Option<&DeviceState> {
+        self.session(environment_id)?.device_state.as_ref()
+    }
+
     pub(super) fn set_device_state(&mut self, environment_id: &str, state: DeviceState) {
         if let Some(session) = self.session_mut(environment_id) {
             session.device_state = Some(state);
@@ -253,7 +258,8 @@ impl Workspace {
         let Some(client) = session.client.clone() else { return };
         session.shell_retried = false;
         self.resume_file_saves(&environment_id, cx);
-        let config = client.stream("subscribeServerConfig", json!({"workspaceSnapshotsOnDemand": true}));
+        let config = client
+            .stream("subscribeServerConfig", json!({"workspaceSnapshotsOnDemand": true, "environmentThemes": true}));
         let id = environment_id.clone();
         let config_task = Self::pump(
             config,
@@ -282,6 +288,7 @@ impl Workspace {
                 this.notify_sidebar(cx);
                 // Skills arrive with provider updates.
                 this.refresh_menu_items(cx);
+                this.sync_theme_feed(window, cx);
             },
         );
         let mut streams = vec![
@@ -443,6 +450,7 @@ impl Workspace {
         if !removed.is_empty() {
             self.retract_hidden_alerts(window, cx);
             self.notify_sidebar(cx);
+            self.sync_theme_feed(window, cx);
         }
         cx.notify();
     }

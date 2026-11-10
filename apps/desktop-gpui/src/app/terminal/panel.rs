@@ -272,7 +272,11 @@ impl Workspace {
             .flex_1()
             .min_h_0()
             .flex()
-            .bg(tokens.background)
+            .bg(tokens.terminal.background)
+            .children(crate::app::theme_inspect::probe(
+                &["terminalBackground", "terminalForeground", "terminalCursor", "terminalSelection"],
+                cx,
+            ))
             .when(has_sidebar, |el| el.gap(px(6.)))
             .child(panes)
             .child(side)

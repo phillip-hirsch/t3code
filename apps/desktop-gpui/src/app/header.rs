@@ -29,8 +29,10 @@ impl Workspace {
             .flex_none()
             .pl(if self.sidebar_open.docked() { px(20.) } else { titlebar::collapsed_content_left(window) })
             .pr(if panel_open { px(20.) } else { controls_inset })
-            .bg(tokens.background);
-        let header = titlebar::drag_region(header);
+            // `bg-background`, which a theme replaces with its toolbar (`[data-chat-header]`).
+            .bg(tokens.toolbar.background);
+        let header = titlebar::drag_region(header)
+            .children(crate::app::theme_inspect::probe(&["toolbar", "toolbarForeground"], cx));
         if let Some(page) = self.page.filter(|page| !page.is_modal()) {
             return header.child(div().text_sm().font_medium().text_color(tokens.foreground).child(page.title()));
         }
@@ -203,6 +205,7 @@ impl Workspace {
             .occlude()
             .cursor_pointer()
             .text_color(tokens.foreground)
+            .children(crate::app::theme_inspect::probe(&["text"], cx))
             .child(div().min_w_0().truncate().child(title))
             .child(
                 div()

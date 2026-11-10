@@ -43,18 +43,18 @@ pub(super) struct RequestUi {
 
 /// A configured secret provider a pending card can read its answer from (`SecretRequestSource`).
 #[derive(Clone, Debug, PartialEq)]
-pub(super) struct SecretSource {
+pub(in crate::app) struct SecretSource {
     pub id: SharedString,
     pub label: SharedString,
 }
 
 /// 1Password's definition: `referencePlaceholder` and `invalidReferenceMessage`.
-const REFERENCE_PLACEHOLDER: &str = "op://vault/item/field";
-const INVALID_REFERENCE: &str = "Use a 1Password reference like op://vault/item/field.";
+pub(in crate::app) const REFERENCE_PLACEHOLDER: &str = "op://vault/item/field";
+pub(in crate::app) const INVALID_REFERENCE: &str = "Use a 1Password reference like op://vault/item/field.";
 
 /// `secretRequestSources`: empty unless the server accepts reference answers; providers this
 /// build can't read (any kind but 1Password, or a config that no longer decodes) are left out.
-pub(super) fn secret_sources(accepts_references: bool, providers: &Value) -> Vec<SecretSource> {
+pub(in crate::app) fn secret_sources(accepts_references: bool, providers: &Value) -> Vec<SecretSource> {
     if !accepts_references {
         return Vec::new();
     }
@@ -71,7 +71,7 @@ pub(super) fn secret_sources(accepts_references: bool, providers: &Value) -> Vec
 
 /// 1Password's `isReference`: `op://` then three or four names, and an optional `?key=value`.
 /// Names outside this charset must be written as item ids.
-fn is_one_password_reference(reference: &str) -> bool {
+pub(in crate::app) fn is_one_password_reference(reference: &str) -> bool {
     let name_ok = |name: &str| {
         let edge = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
         name.chars().next().is_some_and(edge)
@@ -335,7 +335,7 @@ fn secret_card(
     let state = workspace.read(cx);
     let busy = state.requests.busy.contains(&card.item_id);
     let source = state.requests.sources.get(&card.item_id).and_then(|id| sources.iter().find(|s| &s.id == id));
-    let picker = (!sources.is_empty()).then(|| source_picker(card, label, source, sources, workspace, t));
+    let picker = (!sources.is_empty()).then(|| source_picker(card, label, source, sources, workspace));
     let error = state.requests.errors.get(&card.item_id).cloned();
     let empty = input.read(cx).value().trim().is_empty();
     let privacy = if file {
@@ -404,39 +404,19 @@ fn source_picker(
     source: Option<&SecretSource>,
     sources: &[SecretSource],
     workspace: &Entity<Workspace>,
-    t: &Tokens,
 ) -> AnyElement {
-    let icon = match source {
-        Some(_) => Icon::empty().path("icons/app/onepassword.svg"),
-        None => Icon::new(IconName::Type),
-    };
-    let title: SharedString = source.map_or_else(|| "Value".into(), |s| s.label.clone());
-    let (view, item_id, sources) = (workspace.downgrade(), card.item_id.clone(), sources.to_vec());
-    Button::new("secret-source")
-        .outline()
-        .small()
-        .icon(icon.size(px(14.)).text_color(t.muted_foreground))
-        .tooltip(format!("{label} source: {title}"))
-        .dropdown_menu(move |menu, _, _| {
-            let pick = |source: Option<SharedString>| {
-                let (view, item_id) = (view.clone(), item_id.clone());
-                move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
-                    let _ = view.update(cx, |w, cx| w.set_secret_source(&item_id, source.clone(), cx));
-                }
-            };
-            let entry = |icon: Icon, text: SharedString| {
-                PopupMenuItem::element(move |_, _| {
-                    h_flex().gap(px(8.)).child(icon.clone().size(px(14.))).child(text.clone())
-                })
-            };
-            let mut menu = menu.item(entry(Icon::new(IconName::Type), "Value".into()).on_click(pick(None)));
-            for source in &sources {
-                let item = entry(Icon::empty().path("icons/app/onepassword.svg"), source.label.clone());
-                menu = menu.item(item.on_click(pick(Some(source.id.clone()))));
-            }
-            menu
-        })
-        .into_any_element()
+    let (view, item_id) = (workspace.downgrade(), card.item_id.clone());
+    super::pages::settings::source_select(
+        "secret-source".into(),
+        label,
+        source.map(|source| &source.id),
+        sources,
+        false,
+        move |source, _, cx| {
+            let _ = view.update(cx, |w, cx| w.set_secret_source(&item_id, source, cx));
+        },
+    )
+    .into_any_element()
 }
 
 fn link_card(card: &Rc<RequestCard>, workspace: &Entity<Workspace>, t: &Tokens, cx: &mut App) -> AnyElement {

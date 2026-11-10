@@ -2,10 +2,15 @@
 //! and a large or `metadataOnly` comparison sends its patches one file per request.
 
 use std::collections::VecDeque;
+use std::rc::Rc;
 
+use crate::app::Workspace;
+use crate::rpc::RpcClient;
 use crate::turn_diff_tree::natural_cmp;
 
-use gpui_kit::component::diff::{DiffFile, DiffParseOptions};
+use anyhow::anyhow;
+use gpui_kit::component::diff::{DiffContentsLoader, DiffFile, DiffFileContents, DiffFileStatus, DiffParseOptions};
+use gpui_kit::{App, WeakEntity};
 use serde_json::{Value, json};
 
 /// `OUTPUT_TRUNCATED_MARKER`, which the server appends to a patch cut at its byte cap.
@@ -217,6 +222,44 @@ pub(super) fn carried_rows<R: Clone>(previous: &[FileStat], rows: &[Option<R>], 
         .collect()
 }
 
+/// `createDiffFileContentsLoader`: reads a file's old and new text with `method`, `source` naming
+/// the comparison, so the diff can show the unchanged lines outside its hunks. The socket is
+/// looked up at each read, so a reconnect does not strand the loader.
+pub(in crate::app) fn contents_loader(
+    workspace: WeakEntity<Workspace>,
+    client: impl Fn(&Workspace) -> Option<RpcClient> + 'static,
+    method: &'static str,
+    source: Value,
+) -> DiffContentsLoader {
+    Rc::new(move |file: &DiffFile, cx: &mut App| {
+        let input = contents_input(&source, file);
+        let client = workspace.upgrade().and_then(|workspace| client(workspace.read(cx)));
+        cx.spawn(async move |_| -> anyhow::Result<DiffFileContents> {
+            let client = client.ok_or_else(|| anyhow!("This environment is not connected."))?;
+            let reply = client.request(method, input).await?;
+            parse_contents(&reply).ok_or_else(|| anyhow!("Unreadable file contents."))
+        })
+    })
+}
+
+/// The file contents request: the comparison's `source` with the file's change type and paths.
+fn contents_input(source: &Value, file: &DiffFile) -> Value {
+    let mut input = source.clone();
+    let change_type = if file.status() == DiffFileStatus::Renamed { "rename-changed" } else { "change" };
+    input["changeType"] = change_type.into();
+    input["oldPath"] = file.original_path().unwrap_or(file.path()).as_ref().into();
+    input["newPath"] = file.modified_path().unwrap_or(file.path()).as_ref().into();
+    input
+}
+
+/// `{oldContents, newContents}` from either file contents request.
+fn parse_contents(reply: &Value) -> Option<DiffFileContents> {
+    Some(DiffFileContents {
+        original: reply["oldContents"].as_str()?.to_owned(),
+        modified: reply["newContents"].as_str()?.to_owned(),
+    })
+}
+
 /// A header-only row that names the file, for a patch that did not load or is still on its way.
 pub(super) fn placeholder(file: &FileStat) -> Vec<DiffFile> {
     let previous = file.previous_path.as_deref().unwrap_or(&file.path);
@@ -350,5 +393,26 @@ mod tests {
             rows.iter().map(|f| (f.original_path().cloned(), f.path().clone())).collect::<Vec<_>>(),
             [(Some("old.txt".into()), "new.txt".into())]
         );
+    }
+
+    #[test]
+    fn file_contents_requests_name_the_change_and_both_paths() {
+        let source = json!({"cwd": "/repo", "sourceKind": "branch-range", "baseRef": "main", "headRef": null});
+        let patch = concat!(
+            "diff --git a/old.rs b/new.rs\n",
+            "similarity index 90%\nrename from old.rs\nrename to new.rs\n",
+            "--- a/old.rs\n+++ b/new.rs\n@@ -1 +1 @@\n-a\n+b\n",
+            "--- a/same.rs\n+++ b/same.rs\n@@ -1 +1 @@\n-a\n+b\n",
+        );
+        let files = parse_patch(patch, false);
+        let input = |ix: usize| {
+            let input = contents_input(&source, &files[ix]);
+            (input["changeType"].clone(), input["oldPath"].clone(), input["newPath"].clone(), input["baseRef"].clone())
+        };
+        assert_eq!(input(0), (json!("rename-changed"), json!("old.rs"), json!("new.rs"), json!("main")));
+        assert_eq!(input(1), (json!("change"), json!("same.rs"), json!("same.rs"), json!("main")));
+        let contents = parse_contents(&json!({"oldContents": "a\n", "newContents": ""})).unwrap();
+        assert_eq!((contents.original.as_str(), contents.modified.as_str()), ("a\n", ""));
+        assert!(parse_contents(&json!({"oldContents": "a"})).is_none());
     }
 }

@@ -360,12 +360,9 @@ fn render_preview(
             // `render_diff` sizes rows from the rem and the code font; Pierre pads the code 8px
             // below its last row.
             let row = fonts.interface_size * fonts.code_size / 16. * 1.6;
-            // `--code-background`: `color-mix(in srgb, var(--card) 90%, var(--background))`.
-            let code_background = t.background.blend(t.card.opacity(0.9));
             let preview = Diff::new(diff)
                 .header_visible(false)
                 .border_0()
-                .bg(code_background)
                 .hunk_separator(DiffHunkSeparator::LineInfo)
                 .change_indicator(DiffChangeIndicator::Bars)
                 .h(px(8. + row * DIFF_PREVIEW_ROWS))
@@ -384,7 +381,7 @@ fn render_preview(
                 .mt(px(4.))
                 .mb(px(8.))
                 .overflow_hidden()
-                .bg(code_background)
+                .bg(t.code_background)
                 .child(diff_preview_header(fonts, t, scheme))
                 .child(preview)
                 .into_any_element()

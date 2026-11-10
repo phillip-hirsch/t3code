@@ -243,6 +243,8 @@ pub(super) struct ConfigForm {
     divided: bool,
     /// Controls sit under their titles (`super::rows_stacked`).
     stacked: bool,
+    /// The secret providers a credential field can read from (`useSecretSources`).
+    pub(super) sources: Vec<crate::app::request_cards::SecretSource>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -269,6 +271,7 @@ impl ConfigForm {
             locks,
             divided,
             stacked: false,
+            sources: Vec::new(),
             _subscriptions: Vec::new(),
         };
         for field in driver.fields.iter().filter(|f| !matches!(f.control, Control::Select(_))) {
@@ -389,7 +392,20 @@ impl ConfigForm {
         self.publish(next, window, cx);
     }
 
-    fn render_control(&self, field: Field, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+    /// A committed secret reference, or `None` back to a typed value (`SecretSettingsControl`).
+    fn set_secret(&mut self, field: Field, secret: Option<Value>, window: &mut Window, cx: &mut Context<Self>) {
+        let next = match secret {
+            Some(secret) => {
+                let mut base = self.config.as_object().cloned().unwrap_or_default();
+                base.insert(field.key.into(), secret);
+                Some(Value::Object(base))
+            }
+            None => next_config(&self.config, &field, ""),
+        };
+        self.publish(next, window, cx);
+    }
+
+    fn render_control(&self, field: Field, t: &Tokens, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let locked = self.locks.as_ref().filter(|(keys, _)| keys.contains(field.key)).map(|(_, reason)| reason.clone());
         let id = |part: &str| ElementId::Name(format!("{}-{}{part}", self.id_prefix, field.key).into());
         let control = match field.control {
@@ -426,10 +442,32 @@ impl ConfigForm {
             _ => {
                 let input = self.inputs[field.key].clone();
                 let configured = field.secret && has_secret(&self.config, field.key);
+                let disabled = locked.is_some();
+                let value_field = || Input::new(&input).small().flex_1().disabled(disabled).into_any_element();
+                let value = if field.secret {
+                    let form = cx.entity().downgrade();
+                    crate::app::pages::settings::secret_source::secret_source_input(
+                        format!("{}-{}", self.id_prefix, field.key),
+                        field.label,
+                        self.config.get(field.key),
+                        &self.sources,
+                        disabled,
+                        value_field,
+                        move |secret, window, cx| {
+                            let _ = form.update(cx, |form, cx| form.set_secret(field, secret, window, cx));
+                        },
+                        window,
+                        cx,
+                    )
+                    .row()
+                } else {
+                    value_field()
+                };
                 h_flex()
                     .map(|el| if self.stacked { el.w_full() } else { el.w(px(224.)) })
+                    .items_start()
                     .gap(px(8.))
-                    .child(Input::new(&input).small().flex_1().disabled(locked.is_some()))
+                    .child(value)
                     .when(configured && locked.is_none(), |row| {
                         row.child(
                             Button::new(id("-clear"))
@@ -496,14 +534,14 @@ impl ConfigForm {
 }
 
 impl Render for ConfigForm {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *tokens(cx);
         let fields = visible_fields(self.driver, &self.config);
         let local = is_local_acp(self.driver.kind, &self.config);
         let rows = fields
             .into_iter()
             .map(|field| {
-                let control = self.render_control(field, &t, cx);
+                let control = self.render_control(field, &t, window, cx);
                 stackable_row(
                     SharedString::from(format!("{}-{}", self.id_prefix, field.key)),
                     field.label,
@@ -561,9 +599,11 @@ impl Workspace {
             },
         );
         let stacked = self.settings_ui.provider_rows_stacked;
+        let sources = self.settings_secret_sources();
         form.update(cx, |form, cx| {
-            if form.stacked != stacked {
+            if form.stacked != stacked || form.sources != sources {
                 form.stacked = stacked;
+                form.sources = sources;
                 cx.notify();
             }
             form.set_config(config, window, cx);
@@ -806,8 +846,14 @@ impl AddProviderWizard {
         }
         let config = self.config().clone();
         let locks = self.info(cx).and_then(|info| config_locks(&info.managed_policy, driver.kind));
+        let sources = (self.workspace.upgrade().zip(self.scope.as_ref()))
+            .map(|(workspace, scope)| workspace.read(cx).secret_sources_on(scope))
+            .unwrap_or_default();
         let form = cx.new(|cx| {
-            ConfigForm::new(driver, config, format!("add-provider-{}", driver.kind), locks, false, window, cx)
+            let mut form =
+                ConfigForm::new(driver, config, format!("add-provider-{}", driver.kind), locks, false, window, cx);
+            form.sources = sources;
+            form
         });
         self._subscriptions.push(cx.subscribe(&form, move |this, _, ConfigChanged(next), cx| {
             match next {

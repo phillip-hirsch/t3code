@@ -57,8 +57,9 @@ impl Workspace {
     /// `ensureClientSettingsHydrated`: reads the file again and, once it reads, applies what
     /// the app took from the defaults at startup.
     fn retry_client_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let settings = crate::settings::ClientSettings::load();
+        let mut settings = crate::settings::ClientSettings::load();
         if !settings.read_failed {
+            settings.themes = settings.themes.with_published(self.client_settings.themes.published().clone());
             cx.set_global(crate::theme::Appearance::from_settings(&settings.values));
             crate::theme::set_preference(settings.theme_choice(), window, cx);
             self.details_visibility = super::details::DetailsVisibility::from_stored(

@@ -96,6 +96,8 @@ mod snap_shot;
 mod subagents;
 mod terminal;
 mod theme_editor;
+mod theme_feed;
+mod theme_inspect;
 mod thread_menu;
 mod thread_menu_actions;
 mod thread_now;
@@ -380,6 +382,8 @@ pub struct Workspace {
     keep_alive: keep_alive::KeepAlive,
     /// Paired remote environments and their background connections.
     saved_environments: Entity<environments::SavedEnvironments>,
+    /// The theme environment's published palettes and default theme.
+    theme_feed: theme_feed::ThemeFeed,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -584,11 +588,13 @@ impl Workspace {
             desktop,
             keep_alive: Default::default(),
             saved_environments,
+            theme_feed: Default::default(),
             _subscriptions: subscriptions,
         };
         workspace.sync_snap_shot(window, cx);
         workspace.resume_snap_shot_setup(window, cx);
         workspace.sync_saved_sessions(window, cx);
+        workspace.start_theme_feed(window, cx);
         workspace
     }
 
@@ -1282,6 +1288,7 @@ impl Render for Workspace {
             self.focus.focus(window, cx);
         }
         self.sync_vcs(window, cx);
+        theme_inspect::begin_frame(self.theme_editor.as_ref(), cx);
         #[cfg(windows)]
         if !self.preview.warm_requested && self.right_panel_open() {
             self.preview.warm_requested = true;
@@ -1299,11 +1306,14 @@ impl Render for Workspace {
         self.begin_embed_frame(window, cx);
         let terminal_drawer = self.render_terminal_drawer(window, cx);
         let theme = cx.theme();
+        let canvas = theme.background;
         div()
             .size_full()
             .relative()
             .track_focus(&self.focus)
-            .bg(theme.background)
+            .children(theme_inspect::probe(&["chrome"], cx))
+            // `html, body`: the app chrome, behind the panes that paint the canvas.
+            .bg(crate::theme::tokens(cx).chrome)
             .text_color(theme.foreground)
             .text_sm()
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
@@ -1320,6 +1330,10 @@ impl Render for Workspace {
             .map(|el| self.on_terminal_actions(el, cx))
             .map(|el| self.on_menu_actions(el, cx))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if this.theme_inspect_escape(event, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
                 if this.quit_key_down(event, cx) {
                     cx.stop_propagation();
                     return;
@@ -1374,12 +1388,16 @@ impl Render for Workspace {
             .child(
                 h_flex()
                     .size_full()
-                    .when(self.sidebar_open.docked(), |el| el.child(self.render_cached_sidebar()))
+                    .when(self.sidebar_open.docked(), |el| el.child(self.render_cached_sidebar(cx)))
                     .child(
                         v_flex()
                             .flex_1()
                             .h_full()
                             .min_w_0()
+                            // `SidebarInset`'s `bg-background`.
+                            .bg(canvas)
+                            .relative()
+                            .children(theme_inspect::probe(&["canvas", "text"], cx))
                             .when(right_panel.is_none(), |el| el.pr(titlebar::RIGHT_RESIZE_INSET))
                             // A maximized panel takes the row; the chat column keeps its state at zero width.
                             .when(self.right_panel_maximized(), |el| el.w_0().flex_none().overflow_hidden())
@@ -1466,6 +1484,7 @@ impl Render for Workspace {
             .children(self.render_mcp_app_fullscreen(cx))
             .children(self.render_page_modal(window, cx))
             .children(self.render_settings(window, cx))
+            .children(theme_inspect::render_overlay(self.theme_editor.as_ref(), cx))
             .children(self.theme_editor.clone())
             .children(self.render_palette(window, cx))
             .children(self.render_file_overlay(window, cx))

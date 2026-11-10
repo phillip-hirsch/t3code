@@ -251,7 +251,7 @@ impl Workspace {
         let view = self.provider_pill_view(cx)?;
         let sb = tokens.sidebar;
         let (bg, hover, fg): (Hsla, Hsla, Hsla) = match view.tone {
-            Tone::Loading | Tone::Success => (tokens.secondary, sb.row_hover, sb.foreground),
+            Tone::Loading | Tone::Success => (sb.control_surface, sb.row_hover, sb.foreground),
             Tone::Warning => (tokens.warning.opacity(0.12), tokens.warning.opacity(0.18), tokens.warning),
             Tone::Error => (tokens.error.opacity(0.12), tokens.error.opacity(0.18), tokens.error),
         };

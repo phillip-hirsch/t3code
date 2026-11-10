@@ -389,6 +389,9 @@ pub struct ServerInfo {
     pub provider_instances: Value,
     /// Model picker favorites as `(instanceId, model)`.
     pub favorites: Vec<(String, String)>,
+    /// `config.environmentThemes`, the palettes it publishes, or null for none. Only the theme
+    /// stream sends them, so a snapshot keeps the last set.
+    pub environment_themes: Value,
 }
 
 impl ServerInfo {
@@ -429,6 +432,11 @@ impl ServerInfo {
                 self.providers_json = event["payload"]["providers"].as_array().cloned().unwrap_or_default();
             }
             "settingsUpdated" => self.apply_settings(&event["payload"]["settings"])?,
+            "environmentThemesUpdated" => {
+                let themes = &event["payload"]["themes"];
+                let published = themes.as_array().is_some_and(|themes| !themes.is_empty());
+                self.environment_themes = if published { themes.clone() } else { Value::Null };
+            }
             "usageLimitSourcesUpdated" => {
                 if let Some(config) = self.config.as_object_mut() {
                     config.insert("usageLimitSources".into(), event["payload"]["sources"].clone());
@@ -2456,6 +2464,14 @@ mod tests {
         let project: ProjectShell =
             serde_json::from_value(json!({"id": "p", "title": "P", "workspaceRoot": "/p"})).unwrap();
         assert_eq!(info.new_thread_model(Some(&project)).unwrap().model, "haiku", "the project's override wins");
+
+        let themes =
+            json!([{"id": "aurora", "name": "Aurora", "appearance": "dark", "canvas": "#000", "accent": "#f0f"}]);
+        info.apply(&json!({"version": 1, "type": "environmentThemesUpdated", "payload": {"themes": themes}})).unwrap();
+        info.apply(&json!({"version": 1, "type": "snapshot", "config": {"providers": []}})).unwrap();
+        assert_eq!(info.environment_themes, themes, "snapshots never carry themes, so the last set stays");
+        info.apply(&json!({"version": 1, "type": "environmentThemesUpdated", "payload": {"themes": []}})).unwrap();
+        assert_eq!(info.environment_themes, Value::Null);
     }
 
     #[test]

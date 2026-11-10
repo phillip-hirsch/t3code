@@ -525,7 +525,7 @@ fn alert(message: String, t: &Tokens) -> AnyElement {
         .rounded(px(8.))
         .border_1()
         .border_color(t.error.opacity(0.32))
-        .bg(t.error.opacity(0.04))
+        .bg(t.error_surface)
         .px(px(12.))
         .py(px(10.))
         .text_sm()

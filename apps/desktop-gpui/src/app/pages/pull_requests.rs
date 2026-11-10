@@ -131,6 +131,8 @@ pub(in crate::app) struct PullRequestsState {
     pub(super) panel: Option<super::pull_request_detail::Panel>,
     /// The merge method last picked in any panel (`uiStateStore.pullRequestMergeMethod`).
     pub(super) last_merge_method: &'static str,
+    /// The Code tab's file tree shows, in every panel (`t3code.pullRequestFileTreeOpen`).
+    pub(super) file_tree_open: bool,
     /// Unsent reviews by pull request, kept across panels (`usePullRequestReviewStore`).
     pub(super) reviews: std::collections::HashMap<String, super::pull_request_detail::write::ReviewDraft>,
     /// Open pull requests in tab order; `panel` is the shown one and `parked` holds the rest.
@@ -207,6 +209,7 @@ impl PullRequestsState {
             _search_subscription: subscription,
             panel: None,
             last_merge_method: "merge",
+            file_tree_open: super::pull_request_detail::stored_file_tree_open(),
             reviews: std::collections::HashMap::new(),
             tabs: Vec::new(),
             parked: std::collections::HashMap::new(),
@@ -1933,7 +1936,7 @@ fn stale_banner(error: SharedString, view: &Entity<Workspace>, t: &Tokens, windo
         .rounded(px(8.))
         .border_1()
         .border_color(Hsla { a: 0.3, ..t.warning })
-        .bg(Hsla { a: 0.08, ..t.warning })
+        .bg(t.warning_surface)
         .px(px(12.))
         .py(px(8.))
         .text_xs()

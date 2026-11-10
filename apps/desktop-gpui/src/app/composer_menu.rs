@@ -508,8 +508,8 @@ impl Workspace {
     pub(super) fn render_command_menu(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
         let trigger = self.menu.trigger.as_ref()?;
         let items = self.menu.items.clone();
-        let outline = if t.dark { gpui_kit::hsla(0., 0., 1., 0.05) } else { gpui_kit::hsla(0., 0., 0., 0.08) };
-        let surface = t.background.blend(t.card.opacity(t.glass));
+        let outline = t.composer_outline();
+        let surface = t.background.blend(t.composer_glass().opacity(t.glass));
         let body: AnyElement = if items.is_empty() {
             let text: SharedString = match (self.menu.loading, trigger.kind) {
                 (true, TriggerKind::Path) => "Searching workspace files...".into(),

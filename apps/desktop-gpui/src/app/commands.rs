@@ -58,7 +58,8 @@ impl Workspace {
             self.held_key = Some(keystroke.clone());
             return true;
         }
-        if self.pull_request_find_key(keystroke, window, cx) {
+        // Inside a diff, Mod+F opens the diff's own find, whose handler runs first on the web.
+        if !keymap::focus_in(&event.context_stack, "Diff") && self.pull_request_find_key(keystroke, window, cx) {
             return true;
         }
         self.composer_key(keystroke, &context, window, cx)

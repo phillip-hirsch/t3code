@@ -62,6 +62,7 @@ pub(super) fn section(scope: &DiffScope, turns: &[TurnSummary], label: &str) -> 
             let number = turns.iter().find(|turn| &turn.run_id == run).map(|turn| turn.turn_count.to_string());
             (format!("turn:{run}"), format!("Turn {}", number.as_deref().unwrap_or("?")))
         }
+        DiffScope::ToolCall { thread_id, item_id } => (format!("tool-call:{thread_id}:{item_id}"), "Tool call".into()),
     }
 }
 
@@ -229,5 +230,25 @@ impl Workspace {
         diff.update(cx, |diff, cx| diff.set_selected_lines(None, cx));
         window.focus(&diff.focus_handle(cx), cx);
         cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_scope_names_the_review_section_the_web_does() {
+        let turns = [TurnSummary { run_id: "r1".into(), turn_count: 3, completed_at: String::new() }];
+        let tool_call = DiffScope::ToolCall { thread_id: "t1".into(), item_id: "i1".into() };
+        for (scope, id, title) in [
+            (DiffScope::Branch, "branch", "Changes"),
+            (DiffScope::Commit("abc".into()), "commit:abc", "Changes"),
+            (DiffScope::Turn("r1".into()), "turn:r1", "Turn 3"),
+            (DiffScope::Turn("gone".into()), "turn:gone", "Turn ?"),
+            (tool_call, "tool-call:t1:i1", "Tool call"),
+        ] {
+            assert_eq!(section(&scope, &turns, "Changes"), (id.to_owned(), title.to_owned()), "{scope:?}");
+        }
     }
 }

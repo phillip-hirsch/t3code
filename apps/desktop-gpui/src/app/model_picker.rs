@@ -1206,12 +1206,14 @@ impl Workspace {
                                 .py(px(1.))
                                 .rounded(px(4.))
                                 .border_1()
-                                .border_color(t.primary.opacity(0.35))
-                                .bg(t.primary.opacity(0.15))
+                                .border_color(t.update.opacity(0.35))
+                                .bg(t.update.opacity(0.15))
                                 .text_size(px(10.))
                                 .line_height(px(10.))
                                 .font_weight(FontWeight::BOLD)
-                                .text_color(t.info_foreground)
+                                .text_color(t.update_foreground)
+                                .relative()
+                                .children(super::theme_inspect::probe(&["update", "updateForeground"], cx))
                                 .child("NEW"),
                         )
                     }),

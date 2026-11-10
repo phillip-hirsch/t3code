@@ -25,6 +25,8 @@ mod row_layout;
 pub(in crate::app) use providers::{chatgpt_usage_button, idle_compaction, redacted_email, uses_chatgpt_sharing};
 pub(in crate::app) use widgets::device_only;
 mod search;
+pub(in crate::app) mod secret_source;
+pub(in crate::app) use secret_source::source_select;
 mod snap_shot;
 mod star_prompt;
 mod system;
