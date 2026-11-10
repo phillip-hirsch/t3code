@@ -642,6 +642,7 @@ fn managed_notice(organization: &str, support: Option<String>, t: &Tokens) -> An
                                     .text_color(t.foreground)
                                     .underline()
                                     .cursor_pointer()
+                                    .map(|el| ui::tab_stop(el, t.ring))
                                     .on_click(move |_, _, cx| cx.open_url(&url))
                                     .child("Get help"),
                             )
@@ -1227,22 +1228,23 @@ impl Render for CreateLinkForm {
                             .border_color(t.input)
                             .bg(t.muted.opacity(0.25))
                             .children(options.enumerate().map(|(index, (scope, title, description))| {
-                                let checked = self.scopes.iter().any(|s| s == scope);
-                                h_flex()
-                                    .id(ElementId::Name(format!("pairing-scope-{scope}").into()))
-                                    .items_start()
+                                // The row is the checkbox, as the web's <label> is: one tab stop
+                                // that a click, Enter or Space toggles once.
+                                Checkbox::new(ElementId::Name(format!("pairing-scope-{scope}").into()))
+                                    .checked(self.scopes.iter().any(|s| s == scope))
+                                    .disabled(busy)
+                                    .accessibility_label(*title)
+                                    .on_change(cx.listener(move |this, checked: &bool, _, cx| {
+                                        this.scopes = logic::toggle_scope(&this.scopes, scope, *checked);
+                                        cx.notify();
+                                    }))
+                                    .w_full()
                                     .gap(px(12.))
                                     .px(px(12.))
                                     .py(px(10.))
                                     .when(index > 0, |el| el.border_t_1().border_color(hairline))
                                     .hover(|style| style.bg(t.muted.opacity(0.4)))
-                                    .when(!busy, |el| {
-                                        el.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
-                                            this.scopes = logic::toggle_scope(&this.scopes, scope, !checked);
-                                            cx.notify();
-                                        }))
-                                    })
-                                    .child(div().mt(px(2.)).child(Checkbox::new(*scope).checked(checked).disabled(busy)))
+                                    .when(!busy, gpui_kit::Styled::cursor_pointer)
                                     .child(
                                         text_xs(v_flex().min_w_0())
                                             .child(div().font_weight(FontWeight::MEDIUM).child(*title))

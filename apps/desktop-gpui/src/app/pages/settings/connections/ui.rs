@@ -68,6 +68,13 @@ pub(super) fn fold_trigger(el: Stateful<Div>, ring: Hsla) -> Stateful<Div> {
     })
 }
 
+/// A link or toggle as a tab stop that Enter and Space click, with `focus-visible:ring-2`.
+pub(super) fn tab_stop(el: Stateful<Div>, ring: Hsla) -> Stateful<Div> {
+    el.rounded(px(2.)).tab_index(0).focus_visible(move |style| {
+        style.shadow(vec![gpui_kit::BoxShadow::new(px(0.), px(0.), ring).spread_radius(px(2.))])
+    })
+}
+
 /// A chevron that points right when folded and down when open.
 pub(super) fn chevron(open: bool, size: f32, color: Hsla) -> AnyElement {
     let name = if open { gpui_kit::assets::IconName::ChevronDown } else { gpui_kit::assets::IconName::ChevronRight };

@@ -172,6 +172,7 @@ fn redacted_account(state: &Entity<SecretsState>, id: &str, account: &str, revea
         .min_w_0()
         .truncate()
         .cursor_pointer()
+        .map(|el| ui::tab_stop(el, t.ring))
         .font_family(t.fonts.mono)
         .text_size(px(11.))
         .text_color(t.muted_foreground)
