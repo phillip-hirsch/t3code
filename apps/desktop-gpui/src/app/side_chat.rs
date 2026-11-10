@@ -59,6 +59,12 @@ pub(super) struct SideChats {
 /// A side chat: its environment and thread id.
 type Key = (SharedString, String);
 
+impl SideChatView {
+    fn is(&self, env: &str, thread_id: &str) -> bool {
+        self.environment == env && self.thread_id == thread_id
+    }
+}
+
 impl SideChats {
     /// Drops the side chat's stream with the socket it ran on; it subscribes again on reconnect.
     pub(super) fn disconnect(&mut self) {
@@ -73,7 +79,7 @@ impl SideChats {
         let key = (env.clone(), thread_id.to_owned());
         self.drafts.remove(&key);
         self.models.remove(&key);
-        if self.view.as_ref().is_some_and(|view| view.environment == *env && view.thread_id == thread_id) {
+        if self.view.as_ref().is_some_and(|view| view.is(env, thread_id)) {
             self.view = None;
         }
     }
@@ -275,7 +281,7 @@ impl Workspace {
                     _ => None,
                 };
                 match failure {
-                    Some(error) => this.error = Some(error.into()),
+                    Some(error) => this.set_error_for(&origin, error.into()),
                     // The source thread left the screen meanwhile; its tab would open on another
                     // thread's panel, so a side chat that never ran goes.
                     None if this.target.as_ref() != Some(&origin) => delete_unused(cx),
@@ -377,19 +383,20 @@ impl Workspace {
         events.push(cx.observe(&scroller, |_, _, cx| cx.notify()));
         let stream = client
             .stream("orchestration.subscribeThread", json!({"threadId": thread_id, "requestCompletionMarker": true}));
-        let (apply_id, batch_id) = (thread_id.to_owned(), thread_id.to_owned());
+        let apply: Key = (env.clone(), thread_id.to_owned());
+        let batch = apply.clone();
         let subscription = Self::pump(
             stream,
             window,
             cx,
             move |this, value| {
-                let Some(view) = this.side_chat.view.as_mut().filter(|v| v.thread_id == apply_id) else { return };
+                let Some(view) = this.side_chat.view.as_mut().filter(|v| v.is(&apply.0, &apply.1)) else { return };
                 if let Err(error) = view.state.apply(value) {
                     log::warn!("bad side chat event: {error}");
                 }
             },
             move |this, _, cx| {
-                if this.side_chat.view.as_ref().is_some_and(|v| v.thread_id == batch_id) {
+                if this.side_chat.view.as_ref().is_some_and(|v| v.is(&batch.0, &batch.1)) {
                     this.refresh_side_chat_rows(cx);
                 }
             },
@@ -467,7 +474,7 @@ impl Workspace {
         let model = self.side_chat.models.get(&key);
         let command = turn_command(&view.thread_id, &text, running, follow_up, model);
         let (Some(client), composer) = (self.client(), view.composer.clone()) else { return };
-        let thread_id = view.thread_id.clone();
+        let origin = self.target.clone();
         if let Some(view) = self.side_chat.view.as_mut() {
             view.sending = true;
         }
@@ -478,14 +485,16 @@ impl Workspace {
                 if result.is_ok() {
                     this.side_chat.models.remove(&key);
                 }
-                let Some(view) = this.side_chat.view.as_mut().filter(|v| v.thread_id == thread_id) else { return };
-                view.sending = false;
-                if let Err(error) = result {
+                let view = this.side_chat.view.as_mut().filter(|v| v.is(&key.0, &key.1));
+                if let Some(view) = view {
+                    view.sending = false;
                     // Gives the text back rather than lose it.
-                    if view.composer.read(cx).value().is_empty() {
+                    if result.is_err() && view.composer.read(cx).value().is_empty() {
                         view.composer.update(cx, |state, cx| state.set_value(text.clone(), window, cx));
                     }
-                    this.error = Some(error.to_string().into());
+                }
+                if let Err(error) = result {
+                    this.set_error_from(origin.as_ref(), error.to_string().into());
                 }
                 cx.notify();
             });
@@ -570,6 +579,7 @@ impl Workspace {
         if self.side_chat.deleting {
             return;
         }
+        let (Some(client), Some(origin)) = (self.client(), self.target.clone()) else { return };
         let confirm = self.client_settings.values.get("confirmThreadDelete").as_bool() == Some(true);
         let answer = confirm.then(|| {
             let message = format!(
@@ -578,14 +588,12 @@ This permanently clears its conversation history."
             );
             super::confirm::confirm(&message, true, window, cx)
         });
-        let (client, environment) = (self.client(), self.active_environment().cloned());
         cx.spawn_in(window, async move |this, cx| {
             if let Some(answer) = answer
                 && answer.await != Ok(true)
             {
                 return;
             }
-            let (Some(client), Some(environment)) = (client, environment) else { return };
             let _ = this.update(cx, |this, cx| {
                 this.side_chat.deleting = true;
                 cx.notify();
@@ -596,8 +604,12 @@ This permanently clears its conversation history."
                 match result {
                     // Closing the tab keeps its unsent text, so the deleted chat's state goes after.
                     Ok(_) => {
-                        this.close_side_chat_tab(&thread_id, window, cx);
-                        this.forget_deleted_thread(&environment, &thread_id, &[], cx);
+                        if this.target.as_ref() == Some(&origin) {
+                            this.close_side_chat_tab(&thread_id, window, cx);
+                        } else {
+                            this.drop_surface(&origin, &Surface::SideChat(thread_id.clone()));
+                        }
+                        this.forget_deleted_thread(origin.environment(), &thread_id, &[], cx);
                     }
                     Err(error) => window.push_notification(
                         Notification::error(error.to_string()).title("Could not delete the side chat"),
