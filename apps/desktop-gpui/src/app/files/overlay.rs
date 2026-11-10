@@ -200,6 +200,25 @@ impl Workspace {
         cx.notify();
     }
 
+    /// `useActiveProjectTarget` is live on the web: after navigating, the search answers for the
+    /// new checkout. The file picker keeps its query; the content search remounts on the new key.
+    fn retarget_file_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(overlay) = &self.files.overlay else { return };
+        if overlay.target == self.project_target() {
+            return;
+        }
+        let (mode, parent_query) = (overlay.mode, overlay.parent_query.clone());
+        let query = (mode == OverlayMode::Files).then(|| overlay.query(cx));
+        self.open_file_overlay(mode, parent_query, window, cx);
+        if let Some(query) = query.filter(|q| !q.is_empty())
+            && let Some(overlay) = &self.files.overlay
+        {
+            let input = overlay.input.clone();
+            input.update(cx, |input, cx| input.set_value(query, window, cx));
+            self.run_file_search(cx);
+        }
+    }
+
     pub(in crate::app) fn close_file_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.files.overlay.take().is_some() {
             self.focus_composer(window, cx);
@@ -338,7 +357,9 @@ impl Workspace {
 
     /// Opens the highlighted row: a file, or a hit at its line.
     fn open_overlay_selection(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(overlay) = &self.files.overlay else { return };
+        let Some(overlay) = self.files.overlay.as_ref().filter(|o| o.target == self.project_target()) else {
+            return;
+        };
         let opened = match overlay.mode {
             OverlayMode::Files => overlay.picks.get(index).map(|pick| (pick.path.clone(), None)),
             OverlayMode::Content => {
@@ -393,6 +414,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        self.retarget_file_overlay(window, cx);
         let overlay = self.files.overlay.as_ref()?;
         let tokens = *crate::theme::tokens(cx);
         let (fg, muted) = (tokens.foreground, tokens.muted_foreground);
