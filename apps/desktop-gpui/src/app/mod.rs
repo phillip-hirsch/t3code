@@ -950,10 +950,11 @@ impl Workspace {
             self.landed = true;
             if self.target.is_none()
                 && !self.welcome_owns_home()
-                && let Some(project_id) =
-                    crate::inbox::most_recent_project(&self.shell.projects, &self.shell.threads).map(|p| p.id.clone())
+                && let Some((env, project_id)) =
+                    crate::inbox::most_recent_project(&self.shell.projects, &self.shell.threads)
+                        .map(|p| (p.environment_id.clone(), p.id.clone()))
             {
-                self.start_draft(project_id, window, cx);
+                self.start_draft_in(env, project_id, window, cx);
             }
         }
         if self.welcome_owns_home() {

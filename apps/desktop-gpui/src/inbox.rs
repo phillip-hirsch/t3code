@@ -41,14 +41,16 @@ pub fn projects_by_recency<'a>(projects: &'a [ProjectShell], threads: &[ThreadSh
     let thread_time = |t: &ThreadShell| {
         ms(t.latest_user_message_at.as_deref()).or_else(|| parse_ms(&t.updated_at)).or_else(|| parse_ms(&t.created_at))
     };
-    let mut latest: HashMap<&str, i64> = HashMap::new();
+    // By environment and project: project ids repeat across environments.
+    let mut latest: HashMap<(&str, &str), i64> = HashMap::new();
     for thread in threads.iter().filter(|t| t.archived_at.is_none()) {
         let time = thread_time(thread).unwrap_or(i64::MIN);
-        latest.entry(thread.project_id.as_str()).and_modify(|l| *l = (*l).max(time)).or_insert(time);
+        let key = (thread.environment_id.as_ref(), thread.project_id.as_str());
+        latest.entry(key).and_modify(|l| *l = (*l).max(time)).or_insert(time);
     }
     let project_time = |p: &ProjectShell| {
         latest
-            .get(p.id.as_str())
+            .get(&(p.environment_id.as_ref(), p.id.as_str()))
             .copied()
             .or_else(|| ms(p.updated_at.as_deref().or(p.created_at.as_deref())))
             .unwrap_or(i64::MIN)
@@ -1250,6 +1252,9 @@ mod tests {
         // Equal times fall back to the title.
         let tied = [project("y", "Yak", Some("2026-11-04T09:00:00.000Z"), false), projects[0].clone()];
         assert_eq!(most_recent_project(&tied, &[]).map(|p| p.id.as_str()), Some("a"));
+        // Activity in project `b` on another environment says nothing about this one's `b`.
+        let elsewhere = [ThreadShell { environment_id: "other".into(), ..thread("b", "2026-11-04T10:00:00.000Z") }];
+        assert_eq!(most_recent_project(&projects, &elsewhere).map(|p| p.id.as_str()), Some("a"));
     }
     use serde::Deserialize as _;
     use serde_json::{Value, json};
