@@ -238,6 +238,8 @@ pub struct Workspace {
     prompt_history: Option<crate::composer_text::HistoryPosition>,
     /// The editor's chip ids after the last edit, to notice deleted attachment chips.
     chip_ids: Vec<String>,
+    /// The provider instance the composer's and messages' skill chips last resolved against.
+    chip_provider: Option<String>,
     /// The composer's Markdown styling, made the first time `composerRichTextEnabled` paints.
     composer_marks: Option<gpui_kit::component::input::TextDecorationCollection<TextareaMode>>,
     /// Ctrl (Cmd) is down, which turns steer into queue.
@@ -464,6 +466,7 @@ impl Workspace {
             prompt_stash: Default::default(),
             prompt_history: None,
             chip_ids: Vec::new(),
+            chip_provider: None,
             composer_marks: None,
             ctrl_held: false,
             environment_remote: false,
@@ -807,6 +810,8 @@ impl Workspace {
                     return;
                 }
                 this.refresh_rows(cx);
+                // Another client may have moved the thread to a provider with other skills.
+                this.sync_chip_provider(cx);
                 this.refresh_thread_find(cx);
                 this.sync_typing_guard(window, cx);
                 this.sync_question(window, cx);

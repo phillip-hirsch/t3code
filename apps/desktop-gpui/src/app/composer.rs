@@ -101,6 +101,15 @@ impl FooterText {
     }
 }
 
+/// Records `now` as the provider chips resolve against; whether it differs from the one before.
+fn note_provider(seen: &mut Option<String>, now: Option<&str>) -> bool {
+    if seen.as_deref() == now {
+        return false;
+    }
+    *seen = now.map(str::to_owned);
+    true
+}
+
 /// A failed message first, then whatever was typed after it.
 fn merge_prompt(failed: String, newer: &str) -> String {
     if newer.trim().is_empty() { failed } else { format!("{failed}\n\n{newer}") }
@@ -238,9 +247,22 @@ impl Workspace {
     /// The skills or models chips resolve against may have changed: the composer's chips and
     /// the messages that name one catch up.
     pub(super) fn chip_lists_changed(&mut self, cx: &mut Context<Self>) {
+        let provider = self.composer_provider().map(|p| p.instance_id.clone());
+        note_provider(&mut self.chip_provider, provider.as_deref());
         self.reconcile_composer_chips(false, cx);
         self.markdown.chips_changed();
         cx.notify();
+    }
+
+    /// The composer's provider, whose skills chips name, changed from outside a pick (another
+    /// client's model change on the open thread): chips catch up. A model change within the
+    /// provider leaves them, since a model chip names any provider's model.
+    pub(super) fn sync_chip_provider(&mut self, cx: &mut Context<Self>) {
+        let provider = self.composer_provider().map(|p| p.instance_id.clone());
+        if note_provider(&mut self.chip_provider, provider.as_deref()) {
+            self.refresh_menu_items(cx);
+            self.chip_lists_changed(cx);
+        }
     }
 
     /// Brings the composer's skill and model chips in line with the lists it knows once they load
@@ -2343,6 +2365,17 @@ fn black(alpha: f32) -> Hsla {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chips_catch_up_once_the_composer_provider_changes() {
+        let mut seen = None;
+        assert!(note_provider(&mut seen, Some("codex")), "the thread's provider arrives");
+        assert!(!note_provider(&mut seen, Some("codex")), "a model change within it");
+        assert!(note_provider(&mut seen, Some("claudeAgent")), "another client moved the thread");
+        assert_eq!(seen.as_deref(), Some("claudeAgent"));
+        assert!(note_provider(&mut seen, None), "its provider went");
+        assert!(!note_provider(&mut seen, None));
+    }
 
     #[test]
     fn enter_opens_a_model_chip_only_while_the_selection_is_that_chip() {
