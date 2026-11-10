@@ -1627,8 +1627,12 @@ impl Render for Workspace {
                                                     return el.child(page);
                                                 }
                                                 match self.target.clone() {
-                                                    Some(Target::Draft { project_id, .. }) => el
-                                                        .child(self.render_draft_stage(&project_id, window, cx))
+                                                    Some(Target::Draft { env, project_id, .. }) => el
+                                                        .child(self.render_draft_stage(
+                                                            &ScopedId::new(env, project_id),
+                                                            window,
+                                                            cx,
+                                                        ))
                                                         .children(self.render_citation_comment(cx))
                                                         .children(self.render_details_card(window, cx)),
                                                     _ => el

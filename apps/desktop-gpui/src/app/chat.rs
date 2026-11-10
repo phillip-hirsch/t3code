@@ -724,12 +724,12 @@ impl Workspace {
     /// in the middle however tall the headline wraps.
     pub(super) fn render_draft_stage(
         &mut self,
-        project_id: &str,
+        project: &crate::model::ScopedId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let (lane, _) = self.chat_layout(window);
-        let headline = self.render_draft_headline(project_id, lane.width, window, cx);
+        let headline = self.render_draft_headline(project, lane.width, window, cx);
         // `[@media(max-height:34rem)]:items-end`: short windows pin the composer to the bottom.
         let short = f32::from(window.viewport_size().height) <= 544.;
         div()
@@ -761,13 +761,13 @@ impl Workspace {
     /// "or start without a project". A "No project" draft asks "What should we work on?".
     fn render_draft_headline(
         &self,
-        project_id: &str,
+        project: &crate::model::ScopedId,
         width: f32,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = *theme::tokens(cx);
-        let project = self.shell.projects.iter().find(|p| p.id == project_id);
+        let project = self.shell.project(project);
         let is_scratch = self.draft_is_scratch();
         let scratch_env = self.scratch_environment();
         let viewport = f32::from(window.viewport_size().width);

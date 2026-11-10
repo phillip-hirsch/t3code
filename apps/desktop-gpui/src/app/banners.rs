@@ -125,7 +125,7 @@ impl ScopedErrors {
 
 fn target_key(target: Option<&Target>) -> String {
     match target {
-        Some(Target::Thread { id, .. }) => id.clone(),
+        Some(Target::Thread { env, id }) => format!("{env}\0{id}"),
         Some(Target::Draft { draft, .. }) => format!("draft:{draft}"),
         None => String::new(),
     }
@@ -353,8 +353,7 @@ impl Workspace {
     }
 
     fn open_shell_thread(&self) -> Option<&ThreadShell> {
-        let Some(Target::Thread { id, .. }) = &self.target else { return None };
-        self.shell.threads.iter().find(|thread| &thread.id == id)
+        self.shell.thread(&self.target.as_ref()?.thread_key()?)
     }
 
     fn thread_key(&self) -> String {
