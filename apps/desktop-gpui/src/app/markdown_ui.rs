@@ -1007,13 +1007,13 @@ impl MarkdownPlugin for FileChips {
         let ink = document_ink(asset).unwrap_or_else(|| rgb(0x0096af));
         let (path, line) = (chip.path.clone(), chip.line);
         let (open, menu) = (self.workspace.clone(), self.workspace.clone());
-        let (menu_path, pane) = (path.clone(), Some(self.pane));
+        let (menu_path, pane) = (path.clone(), self.pane);
         let open_menu = std::rc::Rc::new(move |position: Point<Pixels>, window: &mut Window, cx: &mut App| {
             let _ = menu.update(cx, |w, cx| {
                 let target = file_links::resolve_target(&menu_path, w.git_cwd().as_deref());
                 if let Some(target) = target {
-                    w.with_workspace_match(&menu_path, target, window, cx, move |w, target, window, cx| {
-                        w.open_file_menu(target, pane, position, window, cx);
+                    w.with_workspace_match(pane, &menu_path, target, window, cx, move |w, target, window, cx| {
+                        w.open_file_menu(target, Some(pane), position, window, cx);
                     });
                 }
             });
@@ -1035,7 +1035,7 @@ impl MarkdownPlugin for FileChips {
         .tooltip(move |window, cx| code_tooltip(tooltip.clone(), window, cx))
         .on_click(move |event, window, cx| {
             let editor = event.modifiers().secondary(cx);
-            let _ = open.update(cx, |w, cx| w.open_file_chip(&path, line, editor, window, cx));
+            let _ = open.update(cx, |w, cx| w.open_file_chip(pane, &path, line, editor, window, cx));
         })
         .on_mouse_down(gpui_kit::MouseButton::Right, move |event, window, cx| {
             cx.stop_propagation();
@@ -1079,6 +1079,7 @@ impl Workspace {
     /// opens in the thread's panel; the platform modifier, or host media, opens the preferred editor.
     pub(super) fn open_file_chip(
         &mut self,
+        pane: ChatPane,
         path: &str,
         line: Option<u32>,
         editor: bool,
@@ -1086,7 +1087,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(target) = file_links::resolve_target(path, self.git_cwd().as_deref()) else { return };
-        self.with_workspace_match(path, target, window, cx, move |this, target, window, cx| {
+        self.with_workspace_match(pane, path, target, window, cx, move |this, target, window, cx| {
             if this.opens_file_link_in_browser(&target, editor) {
                 this.open_host_file_in_browser(without_position(&target), window, cx);
                 return;

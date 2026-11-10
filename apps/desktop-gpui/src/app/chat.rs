@@ -2264,6 +2264,7 @@ fn markdown_view(
                     let authored = url.split(['?', '#']).next().unwrap_or_default().replace("%20", " ");
                     let _ = link_this.update(cx, |workspace, cx| {
                         workspace.with_workspace_match(
+                            pane,
                             &authored,
                             target,
                             window,

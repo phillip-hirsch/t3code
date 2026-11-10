@@ -696,7 +696,7 @@ impl ContextChips {
                     .text_color(ink)
                     .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
                     .on_click(move |_, window, cx| {
-                        let _ = this.update(cx, |w, cx| w.open_file_chip(&path, None, false, window, cx));
+                        let _ = this.update(cx, |w, cx| w.open_file_chip(pane, &path, None, false, window, cx));
                     })
                     .into_any_element()
             }
