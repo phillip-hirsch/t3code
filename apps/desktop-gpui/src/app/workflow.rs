@@ -274,7 +274,7 @@ pub(super) fn workflow_row(
                                 .text_color(muted)
                                 .label(if expanded { "Show less" } else { "Show full script" })
                                 .on_click(move |_, _, cx| {
-                                    let _ = toggle_this.update(cx, |w, cx| w.toggle_expanded(key.clone(), cx));
+                                    let _ = toggle_this.update(cx, |w, cx| w.toggle_expanded(pane, key.clone(), cx));
                                 }),
                         ),
                     )

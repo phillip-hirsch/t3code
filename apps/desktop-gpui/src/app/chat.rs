@@ -2,7 +2,7 @@
 //! colors follow `apps/web/src/components/chat/MessagesTimeline.tsx`, `WorkLog.tsx`
 //! and `index.css` (`.chat-markdown`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
@@ -249,11 +249,27 @@ impl Workspace {
         }
     }
 
-    /// Opens or closes a work group, turn fold or entry, holding the toggled heading where it
-    /// is on screen (`preserveDisclosurePosition`).
-    pub(super) fn toggle_expanded(&mut self, key: SharedString, cx: &mut Context<Self>) {
-        if !self.expanded.remove(&key) {
-            self.expanded.insert(key);
+    /// The work groups, turn folds and entries open in `pane`'s timeline.
+    fn pane_expanded(&mut self, pane: ChatPane) -> Option<&mut HashSet<SharedString>> {
+        match pane {
+            ChatPane::Main => Some(&mut self.expanded),
+            ChatPane::Side => self.side_chat.view.as_mut().map(|view| &mut view.expanded),
+        }
+    }
+
+    pub(super) fn is_expanded(&self, pane: ChatPane, key: &str) -> bool {
+        match pane {
+            ChatPane::Main => self.expanded.contains(key),
+            ChatPane::Side => self.side_chat.view.as_ref().is_some_and(|view| view.expanded.contains(key)),
+        }
+    }
+
+    /// Opens or closes a work group, turn fold or entry in `pane`, holding the toggled heading
+    /// where it is on screen (`preserveDisclosurePosition`).
+    pub(super) fn toggle_expanded(&mut self, pane: ChatPane, key: SharedString, cx: &mut Context<Self>) {
+        let Some(expanded) = self.pane_expanded(pane) else { return };
+        if !expanded.remove(&key) {
+            expanded.insert(key);
         }
         let running = |projection: Option<&ThreadProjection>| projection.is_some_and(ThreadProjection::is_running);
         let main_rows = Rc::clone(&self.rows);
@@ -1013,10 +1029,14 @@ pub(super) fn focus_ring(t: &Tokens) -> gpui_kit::BoxShadow {
     gpui_kit::BoxShadow::new(px(0.), px(0.), alpha(t.ring, 0.7)).spread_radius(px(2.)).inset()
 }
 
-fn toggle(this: &WeakEntity<Workspace>, key: SharedString) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
+fn toggle(
+    this: &WeakEntity<Workspace>,
+    pane: ChatPane,
+    key: SharedString,
+) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
     let this = this.clone();
     move |_, _, cx| {
-        let _ = this.update(cx, |workspace, cx| workspace.toggle_expanded(key.clone(), cx));
+        let _ = this.update(cx, |workspace, cx| workspace.toggle_expanded(pane, key.clone(), cx));
     }
 }
 
@@ -1044,7 +1064,7 @@ pub(super) fn render_row(
         } => {
             use super::user_message as attachments;
             let expanded =
-                this.upgrade().is_some_and(|workspace| workspace.read(cx).expanded.contains(&timeline::entry_key(id)));
+                this.upgrade().is_some_and(|workspace| workspace.read(cx).is_expanded(pane, &timeline::entry_key(id)));
             let fold = folded_message(attribution.as_ref(), &crate::user_message::plain_text(text), this, cx);
             let actions = message_actions::user_actions(
                 this,
@@ -1082,6 +1102,7 @@ pub(super) fn render_row(
                 actions,
                 steer.filter(|_| !*continues_steer),
                 UserRowLook {
+                    pane,
                     grouped_with_previous: *grouped_with_previous,
                     grouped_with_next: *grouped_with_next,
                     expanded,
@@ -1170,7 +1191,7 @@ pub(super) fn render_row(
                 .hover(|style| style.text_color(t.foreground))
                 .child(label.clone())
                 .child(Icon::new(chevron).size(px(14.)))
-                .on_click(toggle(this, key.clone()));
+                .on_click(toggle(this, pane, key.clone()));
             let time = hover_timestamp(this, format!("time:{key}"), created_at, &t, cx);
             lane(6., rule_row(&t).group("timeline-row").flex().items_center().child(button).children(time))
                 .into_any_element()
@@ -1209,7 +1230,7 @@ pub(super) fn render_row(
         // Subagent rows carry no bottom space of their own.
         Row::Subagent(card) => lane(0., subagent_card(card, this, &t, cx)).into_any_element(),
         Row::SubagentGroup { key, cards, expanded } => {
-            lane(0., subagent_group(key, cards, *expanded, this, &t, cx)).into_any_element()
+            lane(0., subagent_group(key, cards, *expanded, pane, this, &t, cx)).into_any_element()
         }
         // `HtmlRenderTimelineRow` and `McpAppTimelineRow`: the page or the app, inline.
         Row::Embed(embed) => {
@@ -1246,7 +1267,7 @@ pub(super) fn render_row(
                         .child("Superseded attempt"),
                 )
                 .child(div().text_size(px(11.)).text_color(t.muted_foreground).child("Cut off by a steer"))
-                .on_click(toggle(this, key.clone()));
+                .on_click(toggle(this, pane, key.clone()));
             lane(8., button).into_any_element()
         }
         Row::Queued { message, last } => super::queue::queued_row(message, *last, pane, this, &t, cx),
@@ -1561,6 +1582,7 @@ fn subagent_group(
     key: &SharedString,
     cards: &[Rc<timeline::SubagentCard>],
     expanded: bool,
+    pane: ChatPane,
     this: &WeakEntity<Workspace>,
     t: &Tokens,
     cx: &App,
@@ -1649,7 +1671,7 @@ fn subagent_group(
                 .size(px(14.))
                 .text_color(muted),
         )
-        .on_click(toggle(this, key.clone()));
+        .on_click(toggle(this, pane, key.clone()));
     v_flex()
         .w_full()
         .pb(px(8.))
@@ -1809,6 +1831,7 @@ struct UserBody {
 
 /// How a user message bubble sits among its neighbours, and how much of it shows.
 struct UserRowLook<'a> {
+    pane: ChatPane,
     grouped_with_previous: bool,
     grouped_with_next: bool,
     expanded: bool,
@@ -1900,7 +1923,7 @@ fn user_row(
     this: &WeakEntity<Workspace>,
     t: &Tokens,
 ) -> AnyElement {
-    let UserRowLook { grouped_with_previous, grouped_with_next, expanded, attribution, fold, probe } = look;
+    let UserRowLook { pane, grouped_with_previous, grouped_with_next, expanded, attribution, fold, probe } = look;
     let steer_label = steer.map(|_| {
         h_flex()
             .mr(px(4.))
@@ -1914,7 +1937,7 @@ fn user_row(
     let UserBody { media_above, attachments, body, bare } = contents;
     if let Some(fold) = fold {
         let body = v_flex().children(attachments).children(body).into_any_element();
-        return folded_row(id, body, actions, steer_label, fold, expanded, this, t);
+        return folded_row(id, body, actions, steer_label, fold, (pane, expanded), this, t);
     }
     let guest = match attribution {
         Some(timeline::Attribution::Guest { name }) => Some(name.clone()),
@@ -1957,7 +1980,7 @@ fn user_row(
             .text_color(t.muted_foreground)
             .hover(|style| style.bg(t.accent).text_color(t.foreground))
             .child(if expanded { "Show less" } else { "Show full message" })
-            .on_click(toggle(this, timeline::entry_key(id)))
+            .on_click(toggle(this, pane, timeline::entry_key(id)))
     });
     // Hover actions under the bubble keep their 24px row while hidden.
     let actions = h_flex().w_full().max_w(relative(0.8)).justify_end().pr(px(4.)).child(actions);
@@ -1998,7 +2021,7 @@ fn folded_row(
     actions: gpui_kit::Div,
     steer_label: Option<gpui_kit::Div>,
     fold: FoldedMessage,
-    expanded: bool,
+    (pane, expanded): (ChatPane, bool),
     this: &WeakEntity<Workspace>,
     t: &Tokens,
 ) -> AnyElement {
@@ -2021,7 +2044,7 @@ fn folded_row(
                 .flex_none()
                 .text_color(muted),
         )
-        .on_click(toggle(this, timeline::entry_key(id)));
+        .on_click(toggle(this, pane, timeline::entry_key(id)));
     let bubble = v_flex()
         .min_w_0()
         .max_w(relative(0.8))
@@ -2557,7 +2580,7 @@ fn plan_card(
     t: &Tokens,
 ) -> AnyElement {
     let key = timeline::entry_key(id);
-    let expanded = this.upgrade().is_some_and(|workspace| workspace.read(cx).expanded.contains(&key));
+    let expanded = this.upgrade().is_some_and(|workspace| workspace.read(cx).is_expanded(pane, &key));
     let collapsible = plan.preview.is_some();
     let (body_key, body_text): (SharedString, &SharedString) = match &plan.preview {
         Some(preview) if !expanded => (view_key(pane, &format!("{id}:preview")), preview),
@@ -2611,7 +2634,7 @@ fn plan_card(
                 .text_size(px(TEXT))
                 .hover(|style| style.bg(t.accent))
                 .child(if expanded { "Collapse plan" } else { "Expand plan" })
-                .on_click(toggle(this, key.clone())),
+                .on_click(toggle(this, pane, key.clone())),
         )
     });
     let card = v_flex()
@@ -2741,7 +2764,7 @@ fn work_row(work: &WorkRow, pane: ChatPane, this: &WeakEntity<Workspace>, t: &To
                     muted,
                     hover_timestamp(this, format!("time:{}", work.id), created_at, t, cx),
                 ))
-                .on_click(toggle(this, group.clone()))
+                .on_click(toggle(this, pane, group.clone()))
                 .into_any_element()
         }
         WorkRowKind::Details { entries } => v_flex()
@@ -2786,7 +2809,7 @@ fn work_row(work: &WorkRow, pane: ChatPane, this: &WeakEntity<Workspace>, t: &To
                             muted,
                             None,
                         ))
-                        .on_click(toggle(this, group.clone())),
+                        .on_click(toggle(this, pane, group.clone())),
                 )
                 .into_any_element()
         }
@@ -2797,7 +2820,7 @@ fn work_row(work: &WorkRow, pane: ChatPane, this: &WeakEntity<Workspace>, t: &To
                 Some(group) => focusable(row.id(ElementId::Name(work.id.clone())), t)
                     .cursor_pointer()
                     .child(line)
-                    .on_click(toggle(this, group.clone()))
+                    .on_click(toggle(this, pane, group.clone()))
                     .into_any_element(),
                 None => row.child(line).into_any_element(),
             }
@@ -3194,7 +3217,10 @@ fn single_entry(
     let line = work_line(entry.icon(), color, label_text, label_color, Some(trailing.into_any_element()));
     let row = row.id(ElementId::Name(entry.id.clone())).child(line).children(details);
     if expandable {
-        focusable(row, t).cursor_pointer().on_click(toggle(this, timeline::entry_key(&entry.id))).into_any_element()
+        focusable(row, t)
+            .cursor_pointer()
+            .on_click(toggle(this, pane, timeline::entry_key(&entry.id)))
+            .into_any_element()
     } else {
         row.into_any_element()
     }
@@ -3238,7 +3264,7 @@ fn detail_entry(
             ),
         ))
         .children(details)
-        .when(expandable, |row| focusable(row, t).on_click(toggle(this, timeline::entry_key(&entry.id))))
+        .when(expandable, |row| focusable(row, t).on_click(toggle(this, pane, timeline::entry_key(&entry.id))))
         .into_any_element()
 }
 

@@ -4,7 +4,7 @@
 //! approvals and question card, and a plain-text composer; Bring back hands its last reply to
 //! the main thread's next message.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
@@ -60,6 +60,8 @@ pub(super) struct SideChatView {
     state: ThreadState,
     pub(super) rows: Rc<[Row]>,
     cache: timeline::EntryCache,
+    /// The work groups, folds and entries open here; the main timeline opens its own.
+    pub(super) expanded: HashSet<SharedString>,
     pub(super) scroller: Entity<MessageScrollerState>,
     composer: Entity<TextareaState>,
     /// Tracked so typing only re-renders when Send and Stop trade places.
@@ -463,6 +465,7 @@ impl Workspace {
             state: ThreadState::default(),
             rows: Rc::default(),
             cache: timeline::EntryCache::default(),
+            expanded: HashSet::default(),
             scroller,
             composer,
             empty,
@@ -482,7 +485,7 @@ impl Workspace {
         let options = timeline::RowOptions { visibility: self.tool_call_visibility(), usage_limit_run: None };
         let Some(view) = self.side_chat.view.as_mut() else { return };
         let mut rows = match view.state.projection.as_ref() {
-            Some(projection) => timeline::rows(projection, &self.expanded, &options, &mut view.cache),
+            Some(projection) => timeline::rows(projection, &view.expanded, &options, &mut view.cache),
             None => Vec::new(),
         };
         for row in &mut rows {
