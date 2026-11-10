@@ -298,6 +298,51 @@ impl Terminals {
         true
     }
 
+    /// Mounted drawers follow the server's terminal list (`PersistentThreadTerminalDrawer`), each
+    /// for the environment that reported its thread's terminals.
+    fn reconcile(&mut self, shown: Option<&DrawerKey>) {
+        if self.summaries.is_none() {
+            return;
+        }
+        // The shown thread's view while it still falls back to an older build's drawer.
+        let fallback = shown.filter(|key| !self.drawers.contains_key(key));
+        let keys: Vec<DrawerKey> = self.drawers.keys().cloned().collect();
+        for key in keys {
+            // An unreported thread's list is empty, which never changes a drawer.
+            let Some(reporter) = self.summary_environments.get(&key.thread_id) else { continue };
+            let owner = DrawerKey::new(reporter, &key.thread_id);
+            let open = self.drawers[&key].open;
+            let reconciled = match key.env {
+                Some(_) => key == owner && (open || shown == Some(&key)),
+                // An older build's drawer stands in for the reporter's until a change adopts it.
+                None => match fallback.filter(|viewer| viewer.thread_id == key.thread_id) {
+                    Some(viewer) => *viewer == owner,
+                    None => open && !self.drawers.contains_key(&owner),
+                },
+            };
+            if !reconciled {
+                continue;
+            }
+            // A panel tab's terminals stay out of the drawer.
+            let in_panel = |id: &str| {
+                self.panel.values().any(|g| g.thread_id == key.thread_id && g.terminal_ids.iter().any(|t| t == id))
+            };
+            let ids: Vec<String> = self
+                .summaries(&key.thread_id)
+                .iter()
+                .filter(|s| !in_panel(&s.terminal_id))
+                .map(|s| s.terminal_id.clone())
+                .collect();
+            let Some(drawer) = self.drawers.get_mut(&key) else { continue };
+            let before = key.env.is_none().then(|| drawer.clone());
+            drawer.reconcile(&ids);
+            if before.is_some_and(|before| before != *drawer) {
+                self.adopt(&owner);
+            }
+        }
+        self.drawers_changed = true;
+    }
+
     /// The thread id the draft in `project_id` launches with, if its terminal drawer used one.
     pub(super) fn take_draft_thread(&mut self, project_id: &str) -> Option<String> {
         self.draft_threads.remove(project_id)
@@ -512,40 +557,9 @@ impl Workspace {
         task
     }
 
-    /// Mounted drawers follow the server's terminal list (`PersistentThreadTerminalDrawer`).
     fn reconcile_terminals(&mut self) {
         let shown = self.shown_drawer_key();
-        if let Some(shown) = &shown {
-            self.terminals.adopt(shown);
-        }
-        let Some(all) = &self.terminals.summaries else { return };
-        for (key, drawer) in &mut self.terminals.drawers {
-            if !drawer.open && shown.as_ref() != Some(key) {
-                continue;
-            }
-            // Another environment's same-id thread reported this list.
-            let reporter = self.terminals.summary_environments.get(&key.thread_id);
-            if key.env.as_deref().is_some_and(|env| reporter.is_some_and(|r| r.as_ref() != env)) {
-                continue;
-            }
-            let thread_id = &key.thread_id;
-            // A panel tab's terminals stay out of the drawer.
-            let in_panel = |id: &str| {
-                self.terminals
-                    .panel
-                    .values()
-                    .any(|g| g.thread_id == *thread_id && g.terminal_ids.iter().any(|t| t == id))
-            };
-            let ids: Vec<String> = all
-                .get(thread_id)
-                .into_iter()
-                .flatten()
-                .filter(|s| !in_panel(&s.terminal_id))
-                .map(|s| s.terminal_id.clone())
-                .collect();
-            drawer.reconcile(&ids);
-        }
-        self.terminals.drawers_changed = true;
+        self.terminals.reconcile(shown.as_ref());
     }
 
     /// `toggleTerminalVisibility`.
@@ -892,8 +906,9 @@ impl Workspace {
             SessionEvent::Exited => {}
             SessionEvent::Activated => {
                 self.activate_panel_terminal(thread_id, terminal_id, cx);
-                if let Some(drawer) = self.terminals.drawer_mut(key)
-                    && drawer.active_id != terminal_id
+                // Focusing the active terminal again leaves an older build's drawer unadopted.
+                if self.terminals.drawer_ref(key).is_some_and(|d| d.active_id != terminal_id)
+                    && let Some(drawer) = self.terminals.drawer_mut(key)
                 {
                     drawer.set_active(terminal_id);
                     cx.notify();
@@ -1659,6 +1674,28 @@ mod tests {
         assert!(terminals.drawer_ref(&a).is_none(), "b owns it now");
         assert!(terminals.remove_drawer(&b));
         assert!(terminals.drawers.is_empty());
+    }
+
+    #[test]
+    fn an_older_builds_drawer_is_adopted_only_by_a_reconcile_that_changes_it() {
+        let legacy = DrawerKey { env: None, thread_id: "t".to_owned() };
+        let (a, b) = (DrawerKey::new("a", "t"), DrawerKey::new("b", "t"));
+        let mut terminals = Terminals::default();
+        let saved: DrawerLayout =
+            serde_json::from_value(json!({"terminalOpen": false, "terminalHeight": 300})).unwrap();
+        terminals.drawers.insert(legacy.clone(), saved.restored());
+        let summary = json!({"threadId": "t", "terminalId": "term-1", "hasRunningSubprocess": false, "label": ""});
+        terminals.apply_metadata(&"b".into(), &json!({"type": "snapshot", "terminals": [summary]}));
+
+        terminals.reconcile(Some(&a));
+        assert!(terminals.drawers.contains_key(&legacy), "a viewed it without changing it");
+        assert!(!terminals.remove_drawer(&a));
+        assert_eq!(terminals.drawer_ref(&b).map(|d| d.height), Some(300.), "still b's fallback");
+
+        terminals.reconcile(Some(&b));
+        assert!(!terminals.drawers.contains_key(&legacy));
+        let adopted = terminals.drawer_ref(&b).map(|d| (d.height, d.terminal_ids.clone()));
+        assert_eq!(adopted, Some((300., vec!["term-1".to_owned()])));
     }
 
     #[test]
