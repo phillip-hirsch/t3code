@@ -274,8 +274,7 @@ impl TaskEditor {
         let context = WebhookContext::new(client.clone(), &environment, &workspace, cx);
         self.webhook.update(cx, |fields, cx| fields.set_context(context, cx));
         let cwd = projects.iter().find(|p| p.id == self.draft.project_id).map(|p| p.workspace_root.clone());
-        let worktree_client = client.clone();
-        self.worktree = cx.new(|cx| NewWorktreeMode::new(worktree_client, cwd, None, window, cx));
+        self.worktree = cx.new(|cx| NewWorktreeMode::new(client, cwd, None, window, cx));
         self.environment = environment;
         cx.notify();
     }
