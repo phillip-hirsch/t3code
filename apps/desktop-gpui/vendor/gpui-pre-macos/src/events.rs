@@ -1,8 +1,8 @@
 use gpui::{
     Capslock, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton,
-    MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent, MouseUpEvent,
-    NavigationDirection, PinchEvent, Pixels, PlatformInput, PressureStage, ScrollDelta,
-    ScrollEvent, ScrollSource, TouchPhase, point, px,
+    MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent, MouseUpEvent, NativeKey,
+    NativeKeyCode, NavigationDirection, PinchEvent, Pixels, PlatformInput, PressureStage,
+    ScrollDelta, ScrollEvent, ScrollSource, TouchPhase, point, px,
 };
 
 use crate::{
@@ -108,11 +108,12 @@ fn read_modifiers(native_event: &NSEvent) -> Modifiers {
     }
 }
 
-/// The input, and for a key event its `keyCode`.
+/// The input, and for a key event its `keyCode` and its layout's character with no modifiers.
+/// Mac keyboards have no Num Lock (Clear sits in its place), so none is reported.
 pub(crate) unsafe fn platform_input_from_native(
     native_event: *mut AnyObject,
     window_height: Option<Pixels>,
-) -> Option<(PlatformInput, Option<CGKeyCode>)> {
+) -> Option<(PlatformInput, NativeKey)> {
     unsafe {
         let native_event = native_event.cast::<NSEvent>().as_ref()?;
         let event_type = native_event.r#type();
@@ -126,8 +127,11 @@ pub(crate) unsafe fn platform_input_from_native(
             _ => {}
         }
 
-        let key_code = matches!(event_type, NSEventType::KeyDown | NSEventType::KeyUp)
-            .then(|| native_event.keyCode());
+        let mut native_key = NativeKey {
+            code: matches!(event_type, NSEventType::KeyDown | NSEventType::KeyUp)
+                .then(|| NativeKeyCode::Mac(native_event.keyCode())),
+            ..NativeKey::default()
+        };
         let input = match event_type {
             NSEventType::FlagsChanged => {
                 Some(PlatformInput::ModifiersChanged(ModifiersChangedEvent {
@@ -139,14 +143,20 @@ pub(crate) unsafe fn platform_input_from_native(
                     },
                 }))
             }
-            NSEventType::KeyDown => Some(PlatformInput::KeyDown(KeyDownEvent {
-                keystroke: parse_keystroke(native_event),
-                is_held: native_event.isARepeat(),
-                prefer_character_input: false,
-            })),
-            NSEventType::KeyUp => Some(PlatformInput::KeyUp(KeyUpEvent {
-                keystroke: parse_keystroke(native_event),
-            })),
+            NSEventType::KeyDown => {
+                let (keystroke, unshifted) = parse_keystroke(native_event);
+                native_key.unshifted = unshifted;
+                Some(PlatformInput::KeyDown(KeyDownEvent {
+                    keystroke,
+                    is_held: native_event.isARepeat(),
+                    prefer_character_input: false,
+                }))
+            }
+            NSEventType::KeyUp => {
+                let (keystroke, unshifted) = parse_keystroke(native_event);
+                native_key.unshifted = unshifted;
+                Some(PlatformInput::KeyUp(KeyUpEvent { keystroke }))
+            }
             NSEventType::LeftMouseDown
             | NSEventType::RightMouseDown
             | NSEventType::OtherMouseDown => {
@@ -338,16 +348,18 @@ pub(crate) unsafe fn platform_input_from_native(
             }),
             _ => None,
         };
-        input.map(|input| (input, key_code))
+        input.map(|input| (input, native_key))
     }
 }
 
-fn parse_keystroke(native_event: &NSEvent) -> Keystroke {
+/// The keystroke, and the character its key types with no modifiers on the current layout.
+fn parse_keystroke(native_event: &NSEvent) -> (Keystroke, Option<char>) {
     let characters = unsafe {
         let characters: *mut AnyObject = msg_send![native_event, charactersIgnoringModifiers];
         characters.to_str().to_string()
     };
     let mut key_char = None;
+    let mut unshifted = None;
     let first_char = characters.chars().next().map(|ch| u32::from(ch as u16));
     let modifiers = native_event.modifierFlags();
 
@@ -436,6 +448,10 @@ fn parse_keystroke(native_event: &NSEvent) -> Keystroke {
             //
             let mut chars_ignoring_modifiers =
                 chars_for_modified_key(native_event.keyCode(), NO_MOD);
+            let mut layout_chars = chars_ignoring_modifiers.chars();
+            unshifted = layout_chars
+                .next()
+                .filter(|c| !c.is_control() && layout_chars.next().is_none());
             let mut chars_with_shift = chars_for_modified_key(native_event.keyCode(), SHIFT_MOD);
             let always_use_cmd_layout = always_use_command_layout();
 
@@ -485,7 +501,7 @@ fn parse_keystroke(native_event: &NSEvent) -> Keystroke {
         }
     };
 
-    Keystroke {
+    let keystroke = Keystroke {
         modifiers: Modifiers {
             control,
             alt,
@@ -495,7 +511,8 @@ fn parse_keystroke(native_event: &NSEvent) -> Keystroke {
         },
         key,
         key_char,
-    }
+    };
+    (keystroke, unshifted)
 }
 
 fn always_use_command_layout() -> bool {

@@ -5,7 +5,7 @@
 
 use std::borrow::Cow;
 
-use gpui_kit::{Keystroke, NativeKeyCode};
+use gpui_kit::{Keystroke, NativeKey, NativeKeyCode};
 use libghostty_vt::key::Key;
 
 use super::core::{Core, KeyAction as Press, KeyInput, Locks, Modifiers};
@@ -26,18 +26,31 @@ enum KeyId {
 pub(super) struct PhysicalKey {
     id: KeyId,
     code: Key,
+    /// `getLayoutMap().get(event.code)`: what the key types unmodified on the current layout.
+    layout: Option<char>,
 }
 
 impl PhysicalKey {
-    /// The key of a keystroke and the platform's code for it (`Window::native_key`).
-    pub fn of(keystroke: &Keystroke, native: Option<NativeKeyCode>) -> Self {
-        let code = key_codes::key_code(&keystroke.key, native);
-        let id = match native {
+    /// The key of a keystroke and what the platform said about it (`Window::native_key`).
+    pub fn of(keystroke: &Keystroke, native: NativeKey) -> Self {
+        let code = key_codes::key_code(&keystroke.key, native.code);
+        let id = match native.code {
             Some(native) => KeyId::Native(native),
             None if code != Key::Unidentified => KeyId::Code(code),
             None => KeyId::Name(keystroke.key.clone()),
         };
-        Self { id, code }
+        Self { id, code, layout: native.unshifted }
+    }
+
+    /// `ghosttyUnshiftedCodepoint`: the layout's character for a key that names one; without
+    /// it, the guess from the key's name, unless Shift's US-table guess is another key (German
+    /// Shift+8 types `(`, which US types with 9).
+    fn unshifted(&self, input: &KeyInput<'_>) -> Option<char> {
+        if let Some(c) = self.layout.filter(|_| input.text.is_some()) {
+            return Some(c);
+        }
+        let fits = |c: char| c.is_alphabetic() || key_codes::from_name(c.encode_utf8(&mut [0; 4])) == self.code;
+        input.unshifted.filter(|&c| !input.mods.shift || fits(c))
     }
 }
 
@@ -112,11 +125,7 @@ impl Keyboard {
     /// or the input handler types the text, so IME and dead keys work. The program hears the
     /// release either way.
     pub fn press(&mut self, core: &mut Core, key: &PhysicalKey, input: KeyInput<'_>) -> Option<String> {
-        // The US table's guess at Shift's unshifted character, where the key shows it wrong
-        // (German Shift+8 types `(`, which US types with 9), would report another key.
-        let fits = |c: char| c.is_alphabetic() || key_codes::from_name(c.encode_utf8(&mut [0; 4])) == key.code;
-        let unshifted = input.unshifted.filter(|&c| !input.mods.shift || fits(c));
-        let input = KeyInput { code: key.code, unshifted, ..input };
+        let input = KeyInput { code: key.code, unshifted: key.unshifted(&input), ..input };
         let data = core.encode_key(&input);
         if data.is_empty() {
             return None;
@@ -140,7 +149,8 @@ impl Keyboard {
         if self.preedit > 0 {
             return None;
         }
-        let data = core.encode_key(&KeyInput { code, locks, ..key_input(keystroke, Press::Release, mac) });
+        let input = key_input(keystroke, Press::Release, mac);
+        let data = core.encode_key(&KeyInput { code, locks, unshifted: key.unshifted(&input), ..input });
         (!data.is_empty()).then_some(data)
     }
 }
@@ -385,11 +395,17 @@ mod tests {
         native: Option<NativeKeyCode>,
         /// `Window::capslock` and `NativeKey::num_lock`.
         locks: Locks,
+        /// `NativeKey::unshifted`, the layout's character for the key.
+        layout: Option<char>,
     }
 
     impl Platform {
         fn key(native: NativeKeyCode) -> Self {
             Self { native: Some(native), mac: matches!(native, NativeKeyCode::Mac(_)), ..Self::default() }
+        }
+
+        fn physical(self, keystroke: &Keystroke) -> PhysicalKey {
+            PhysicalKey::of(keystroke, NativeKey { code: self.native, unshifted: self.layout, ..NativeKey::default() })
         }
     }
 
@@ -400,7 +416,7 @@ mod tests {
         keystroke: &Keystroke,
         platform: Platform,
     ) -> Option<String> {
-        let key = PhysicalKey::of(keystroke, platform.native);
+        let key = platform.physical(keystroke);
         keyboard.forget_missed_release(&key, false);
         if keyboard.composing(keystroke, platform.character_input) {
             return None;
@@ -419,7 +435,7 @@ mod tests {
         keystroke: &Keystroke,
         platform: Platform,
     ) -> Option<String> {
-        keyboard.release(core, keystroke, &PhysicalKey::of(keystroke, platform.native), platform.locks, platform.mac)
+        keyboard.release(core, keystroke, &platform.physical(keystroke), platform.locks, platform.mac)
     }
 
     fn released(keyboard: &mut Keyboard, core: &mut Core, keystroke: &Keystroke) -> Option<String> {
@@ -567,21 +583,33 @@ mod tests {
         use NativeKeyCode::{Mac, Windows, Xkb};
         let mut core = core(80, 24);
         core.write(b"\x1b[>15u");
-        // German Shift+7 types `/`; Shift let go first, the key comes up as `7`. Without the
-        // layout's map (`getLayoutMap`) the press is the typed text, as on the web without one.
+        // German Shift+7 types `/`; Shift let go first, the key comes up as `7`. The platform's
+        // layout character for the key (`getLayoutMap`) is its unshifted codepoint, so the
+        // press is the key `7` with `/` as its shifted alternate, as in Electron.
+        let slash = with_held_shift(&typed("/", Some("/")), true);
+        let seven = typed("7", Some("7"));
         for native in [Windows(0x08), Xkb(16), Mac(0x1a)] {
-            let platform = Platform::key(native);
+            let platform = Platform { layout: Some('7'), ..Platform::key(native) };
             let mut keyboard = Keyboard::default();
-            let slash = with_held_shift(&typed("/", Some("/")), true);
-            assert_eq!(pressed_as(&mut keyboard, &mut core, &slash, platform), None, "{native:?}");
-            let seven = typed("7", Some("7"));
+            let press = pressed_as(&mut keyboard, &mut core, &slash, platform);
+            assert_eq!(press.as_deref(), Some("\x1b[55:47;2u"), "{native:?}");
             let release = released_as(&mut keyboard, &mut core, &seven, platform);
             assert_eq!(release.as_deref(), Some("\x1b[55;1:3u"), "{native:?}");
         }
-        // German Shift+8 types `(`, which US types with 9: the key is not 9.
+        // Without a layout character the shifted symbol's key is unknown, as on the web without
+        // a layout map: the press is the typed text, and the release still the key.
+        let mut keyboard = Keyboard::default();
+        assert_eq!(pressed_as(&mut keyboard, &mut core, &slash, Platform::key(Windows(0x08))), None);
+        let release = released_as(&mut keyboard, &mut core, &seven, Platform::key(Windows(0x08)));
+        assert_eq!(release.as_deref(), Some("\x1b[55;1:3u"));
+        // German Shift+8 types `(`, which US types with 9: the US table's guess is not used.
         let paren = with_held_shift(&typed("(", Some("(")), true);
+        let german_eight = Platform { layout: Some('8'), ..Platform::key(Windows(0x09)) };
+        assert_eq!(sent_as(&mut core, &paren, german_eight).as_deref(), Some("\x1b[56:40;2u"));
         assert_eq!(sent_as(&mut core, &paren, Platform::key(Windows(0x09))), None);
-        assert_eq!(sent_as(&mut core, &paren, Platform::key(Windows(0x0a))).as_deref(), Some("\x1b[57:40;2u"), "US 9");
+        let us_nine = Platform { layout: Some('9'), ..Platform::key(Windows(0x0a)) };
+        assert_eq!(sent_as(&mut core, &paren, us_nine).as_deref(), Some("\x1b[57:40;2u"), "US 9");
+        assert_eq!(sent_as(&mut core, &paren, Platform::key(Windows(0x0a))).as_deref(), Some("\x1b[57:40;2u"));
     }
 
     #[test]

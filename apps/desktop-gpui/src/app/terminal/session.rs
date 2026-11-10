@@ -641,7 +641,7 @@ impl TerminalSession {
         }
         let keystroke = &keys::with_held_shift(&event.keystroke, window.modifiers().shift);
         let native = window.native_key();
-        let key = keys::PhysicalKey::of(keystroke, native.code);
+        let key = keys::PhysicalKey::of(keystroke, native);
         self.keyboard.forget_missed_release(&key, event.is_held);
         if self.keyboard.composing(keystroke, event.prefer_character_input) {
             return;
@@ -685,7 +685,7 @@ impl TerminalSession {
     fn key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = keys::with_held_shift(&event.keystroke, window.modifiers().shift);
         let native = window.native_key();
-        let key = keys::PhysicalKey::of(&keystroke, native.code);
+        let key = keys::PhysicalKey::of(&keystroke, native);
         let locks = locks(window, native);
         if let Some(data) = self.keyboard.release(&mut self.core, &keystroke, &key, locks, cfg!(target_os = "macos")) {
             self.send_input(&data, cx);

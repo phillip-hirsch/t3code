@@ -722,6 +722,9 @@ pub struct NativeKey {
     pub code: Option<NativeKeyCode>,
     /// Whether Num Lock was on, when the platform reports it.
     pub num_lock: Option<bool>,
+    /// The character the key types without modifiers on the current layout (a browser's
+    /// keyboard layout map), when the platform reports one.
+    pub unshifted: Option<char>,
 }
 
 impl AsKeystroke for Keystroke {

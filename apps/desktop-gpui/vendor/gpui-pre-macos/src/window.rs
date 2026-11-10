@@ -11,11 +11,10 @@ use gpui::{
     AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, CursorStyle, ExternalDragPayload,
     ExternalPaths, FileDropEvent, ForegroundExecutor, FrameRequestSource, KeyDownEvent, Keystroke,
     Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    NativeKey, NativeKeyCode, Pixels, PlatformAtlas, PlatformDisplay, PlatformFrameSignal,
-    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel,
-    RequestFrameOptions, SharedString, Size, SystemWindowTab, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind, WindowParams,
-    WindowVisibility, point, px, size,
+    NativeKey, Pixels, PlatformAtlas, PlatformDisplay, PlatformFrameSignal, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
+    SharedString, Size, SystemWindowTab, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControlArea, WindowKind, WindowParams, WindowVisibility, point, px, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -2715,14 +2714,10 @@ extern "C" fn handle_key_event(
     let window_height = lock.content_size().height;
     let event = unsafe { platform_input_from_native(native_event, Some(window_height)) };
 
-    let Some((event, key_code)) = event else {
+    let Some((event, native_key)) = event else {
         return Bool::NO;
     };
-    // Mac keyboards have no Num Lock (Clear sits in its place), so the platform reports none.
-    lock.native_key = NativeKey {
-        code: key_code.map(NativeKeyCode::Mac),
-        num_lock: None,
-    };
+    lock.native_key = native_key;
 
     let run_callback = |event: PlatformInput| -> Bool {
         let mut callback = window_state.as_ref().lock().event_callback.take();

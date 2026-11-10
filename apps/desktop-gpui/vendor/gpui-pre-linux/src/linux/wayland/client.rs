@@ -90,8 +90,8 @@ use super::{
 use crate::linux::{
     DOUBLE_CLICK_INTERVAL, LinuxCommon, LinuxKeyboardLayout, PIPE_READ_TIMEOUT, SCROLL_LINES,
     capslock_from_xkb, cursor_style_to_icon_names, get_xkb_compose_state, is_within_click_distance,
-    keystroke_from_xkb, keystroke_underlying_dead_key, modifiers_from_xkb, new_xkb_context,
-    num_lock_from_xkb, open_uri_internal, read_fd_with_timeout, reveal_path_internal,
+    keystroke_from_xkb, keystroke_underlying_dead_key, modifiers_from_xkb, native_key_from_xkb,
+    new_xkb_context, open_uri_internal, read_fd_with_timeout, reveal_path_internal,
     wayland::{
         clipboard::{Clipboard, DataOffer, FILE_LIST_MIME_TYPE, TEXT_MIME_TYPES},
         cursor::Cursor,
@@ -105,9 +105,9 @@ use gpui::{
     AnyWindowHandle, Bounds, Capslock, CursorStyle, DevicePixels, ExternalDragPayload,
     FileDragPaths, FileDropEvent, ForegroundExecutor, GraphicalEnvironment, KeyDownEvent,
     KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
-    MouseExitEvent, MouseMoveEvent, MouseUpEvent, NativeKey, NativeKeyCode, NavigationDirection,
-    Pixels, PlatformDisplay, PlatformFrameSignal, PlatformInput, PlatformKeyboardLayout,
-    PlatformWindow, Point, ScrollDelta, ScrollEvent, ScrollSource, SharedString, Size, TouchPhase,
+    MouseExitEvent, MouseMoveEvent, MouseUpEvent, NativeKey, NavigationDirection, Pixels,
+    PlatformDisplay, PlatformFrameSignal, PlatformInput, PlatformKeyboardLayout, PlatformWindow,
+    Point, ScrollDelta, ScrollEvent, ScrollSource, SharedString, Size, TouchPhase,
     WindowButtonLayout, WindowKind, WindowParams, point, px, size,
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext};
@@ -2181,10 +2181,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                 let keymap_state = state.keymap_state.as_ref().unwrap();
                 let keycode = Keycode::from(key + MIN_KEYCODE);
                 let keysym = keymap_state.key_get_one_sym(keycode);
-                let native_key = NativeKey {
-                    code: Some(NativeKeyCode::Xkb(key + MIN_KEYCODE)),
-                    num_lock: Some(num_lock_from_xkb(keymap_state)),
-                };
+                let native_key = native_key_from_xkb(keymap_state, keycode);
 
                 match key_state {
                     wl_keyboard::KeyState::Pressed if !keysym.is_modifier_key() => {

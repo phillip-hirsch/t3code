@@ -1568,6 +1568,7 @@ where
             state.last_native_key.set(NativeKey {
                 code: native_key_code(lparam),
                 num_lock,
+                unshifted: layout_char(vkey),
             });
             Some(f(keystroke.0, keystroke.1))
         }

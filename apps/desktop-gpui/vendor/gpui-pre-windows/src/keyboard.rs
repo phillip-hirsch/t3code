@@ -159,6 +159,16 @@ pub(crate) fn get_keystroke_key(
     }
 }
 
+/// The character the key types without modifiers on the current layout, in lower case like a
+/// browser's keyboard layout map (`MAPVK_VK_TO_CHAR` reports letters in upper case).
+pub(crate) fn layout_char(vkey: VIRTUAL_KEY) -> Option<char> {
+    let key = get_key_from_vkey(vkey)?;
+    let mut chars = key.chars().flat_map(char::to_lowercase);
+    chars
+        .next()
+        .filter(|c| !c.is_control() && chars.next().is_none())
+}
+
 fn get_key_from_vkey(vkey: VIRTUAL_KEY) -> Option<String> {
     let key_data = unsafe { MapVirtualKeyW(vkey.0 as u32, MAPVK_VK_TO_CHAR) };
     if key_data == 0 {

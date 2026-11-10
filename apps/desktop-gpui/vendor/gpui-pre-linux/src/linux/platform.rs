@@ -1662,9 +1662,24 @@ pub(super) fn capslock_from_xkb(keymap_state: &State) -> gpui::Capslock {
     gpui::Capslock { on }
 }
 
+/// The key event's keycode, Num Lock (`Mod2`), and the character at level 0 of the key's
+/// layout, which is what a browser's keyboard layout map holds for it.
 #[cfg(any(feature = "wayland", feature = "x11"))]
-pub(super) fn num_lock_from_xkb(keymap_state: &State) -> bool {
-    keymap_state.mod_name_is_active(xkb::MOD_NAME_NUM, xkb::STATE_MODS_EFFECTIVE)
+pub(super) fn native_key_from_xkb(keymap_state: &State, keycode: Keycode) -> gpui::NativeKey {
+    let layout = keymap_state.key_get_layout(keycode);
+    let unshifted = keymap_state
+        .get_keymap()
+        .key_get_syms_by_level(keycode, layout, 0)
+        .first()
+        .and_then(|&sym| char::from_u32(xkb::keysym_to_utf32(sym)))
+        .filter(|c| !c.is_control());
+    gpui::NativeKey {
+        code: Some(gpui::NativeKeyCode::Xkb(keycode.raw())),
+        num_lock: Some(
+            keymap_state.mod_name_is_active(xkb::MOD_NAME_NUM, xkb::STATE_MODS_EFFECTIVE),
+        ),
+        unshifted,
+    }
 }
 
 /// Resolve a Linux `dev_t` to PCI vendor/device IDs via sysfs, returning a

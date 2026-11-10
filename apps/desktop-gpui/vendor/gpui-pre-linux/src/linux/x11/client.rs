@@ -6,7 +6,7 @@ use calloop::{
 };
 use collections::HashMap;
 use core::str;
-use gpui::{Capslock, GraphicalEnvironment, NativeKey, NativeKeyCode};
+use gpui::{Capslock, GraphicalEnvironment, NativeKey};
 use gpui_util::ResultExt as _;
 use http_client::Url;
 use log::Level;
@@ -51,7 +51,7 @@ use super::{
 use crate::linux::{
     DEFAULT_CURSOR_ICON_NAME, capslock_from_xkb, cursor_style_to_icon_names, get_xkb_compose_state,
     is_within_click_distance, keystroke_from_xkb, keystroke_underlying_dead_key,
-    log_cursor_icon_warning, modifiers_from_xkb, new_xkb_context, num_lock_from_xkb,
+    log_cursor_icon_warning, modifiers_from_xkb, native_key_from_xkb, new_xkb_context,
     open_uri_internal,
     platform::{DOUBLE_CLICK_INTERVAL, SCROLL_LINES},
     reveal_path_internal,
@@ -1163,10 +1163,7 @@ impl X11Client {
                     if keysym.is_modifier_key() {
                         return Some(());
                     }
-                    state.native_key = NativeKey {
-                        code: Some(NativeKeyCode::Xkb(u32::from(event.detail))),
-                        num_lock: Some(num_lock_from_xkb(&key_event_state)),
-                    };
+                    state.native_key = native_key_from_xkb(&key_event_state, code);
 
                     if let Some(mut compose_state) = state.compose_state.take() {
                         compose_state.feed(keysym);
@@ -1230,10 +1227,7 @@ impl X11Client {
                     if keysym.is_modifier_key() {
                         return Some(());
                     }
-                    state.native_key = NativeKey {
-                        code: Some(NativeKeyCode::Xkb(u32::from(event.detail))),
-                        num_lock: Some(num_lock_from_xkb(&key_event_state)),
-                    };
+                    state.native_key = native_key_from_xkb(&key_event_state, code);
 
                     keystroke
                 };
