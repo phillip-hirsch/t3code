@@ -1,6 +1,7 @@
-//! Unsent drafts outlive a restart (`composerDraftStore`'s `persist`): every draft's and
-//! thread's prompt, its attachments, the terminal context its chips name and an explicit model
-//! or permissions pick, with each draft's identity and the draft each project opens.
+//! Unsent drafts outlive a restart (`composerDraftStore`'s `persist`): every draft's, thread's
+//! and side chat's prompt (keyed by environment and thread, as side chats are threads), its
+//! attachments, the terminal context its chips name and an explicit model or permissions pick,
+//! with each draft's identity and the draft each project opens.
 //!
 //! Kept on this device in `<T3 home>/userdata/composer-drafts/drafts.json`, attachment bytes in
 //! `attachments/` beside it (as the prompt stash keeps them), written off the UI thread a moment
@@ -22,6 +23,7 @@ use serde_json::Value;
 use super::attachments::Attachment;
 use super::composer::{ComposerDraft, ComposerSelection};
 use super::draft_sessions::{DraftId, DraftSessions, SavedSession};
+use super::side_chat::ChatPane;
 use super::{Target, Workspace};
 use crate::composer_context::ContextRecords;
 use crate::model::ModelSelection;
@@ -95,6 +97,9 @@ struct SavedDraft {
     model_selection: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     runtime_mode: Option<String>,
+    /// The thread is a side chat, whose prompt its tab's composer keeps.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    side_chat: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -115,6 +120,7 @@ struct Live<'a> {
     attachments: &'a [Attachment],
     records: Option<&'a ContextRecords>,
     selection: Option<&'a ComposerSelection>,
+    side_chat: bool,
 }
 
 /// What a save writes: the document, and the bytes of every attachment it names by file name.
@@ -166,6 +172,7 @@ fn snapshot(mut drafts: Vec<Live<'_>>, sessions: &DraftSessions) -> (DraftFile, 
                 records: live.records.map(|records| records.referenced(live.prompt)).unwrap_or_default(),
                 model_selection: model,
                 runtime_mode,
+                side_chat: live.side_chat,
             })
         })
         .collect();
@@ -354,6 +361,14 @@ impl Workspace {
                     Target::Thread { env: environment_id.clone().into(), id: thread_id.clone() }
                 }
             };
+            if saved.side_chat {
+                if let Target::Thread { env, id } = &target
+                    && self.side_chat.restore_prompt(env, id, saved.prompt)
+                {
+                    unverified.push(target);
+                }
+                continue;
+            }
             if self.target.as_ref() == Some(&target) || self.composer_drafts.contains_key(&target) {
                 continue;
             }
@@ -405,8 +420,9 @@ impl Workspace {
         for target in &gone {
             self.composer_drafts.remove(target);
             self.composer_selections.remove(target);
-            if let Some(draft) = target.draft_id() {
-                self.drafts.forget(draft);
+            match target {
+                Target::Draft { draft, .. } => self.drafts.forget(draft),
+                Target::Thread { env, id } => self.side_chat.forget_draft(env, id),
             }
         }
         self.drafts_changed(cx);
@@ -474,7 +490,8 @@ impl Workspace {
     }
 
     /// Every target's composer: the set-aside ones, and the one on screen, whose editor holds a
-    /// question's answer or a queued message's edit while the target's own prompt waits.
+    /// question's answer or a queued message's edit while the target's own prompt waits; then
+    /// each side chat's.
     fn draft_snapshot(&self, cx: &App) -> (DraftFile, Vec<(String, Bytes)>) {
         let live_selection =
             (self.model_override.is_some() || self.runtime_mode_override.is_some()).then(|| ComposerSelection {
@@ -482,6 +499,8 @@ impl Workspace {
                 explicit: self.model_explicit,
                 runtime_mode: self.runtime_mode_override.clone(),
             });
+        let side_editor = self.pane_composer(ChatPane::Side).map(|composer| composer.read(cx).value().to_string());
+        let side_chats = self.side_chat.prompts(side_editor.as_deref());
         let editor;
         let set_aside = self.target.as_ref().and_then(|target| self.set_aside_prompt_ref(target));
         let (live_prompt, live_attachments, live_records): (&str, &[Attachment], Option<&ContextRecords>) =
@@ -500,6 +519,7 @@ impl Workspace {
                 attachments: live_attachments,
                 records: live_records,
                 selection: live_selection.as_ref(),
+                side_chat: false,
             });
         }
         let others = self.composer_drafts.keys().chain(self.composer_selections.keys());
@@ -513,7 +533,10 @@ impl Workspace {
                 None => ("", &[][..], None),
             };
             let selection = self.composer_selections.get(target);
-            drafts.push(Live { target, prompt, attachments, records, selection });
+            drafts.push(Live { target, prompt, attachments, records, selection, side_chat: false });
+        }
+        for (target, prompt) in &side_chats {
+            drafts.push(Live { target, prompt, attachments: &[], records: None, selection: None, side_chat: true });
         }
         snapshot(drafts, &self.drafts)
     }
@@ -536,7 +559,7 @@ mod tests {
     }
 
     fn live<'a>(target: &'a Target, prompt: &'a str, attachments: &'a [Attachment]) -> Live<'a> {
-        Live { target, prompt, attachments, records: None, selection: None }
+        Live { target, prompt, attachments, records: None, selection: None, side_chat: false }
     }
 
     fn thread(id: &str) -> Target {
@@ -567,9 +590,11 @@ mod tests {
         let mut records = ContextRecords::default();
         records.extend([record.clone(), unreferenced]);
         let prompt = format!("fix it {}", crate::composer_text::context_link("terminal", "terminal_1", "ls"));
+        let side_chat = Target::Thread { env: "remote".into(), id: "t1".into() };
         let drafts = vec![
             Live { records: Some(&records), ..live(&open, &prompt, &[]) },
             Live { selection: Some(&selection), ..live(&draft, "draft text", &attachments) },
+            Live { side_chat: true, ..live(&side_chat, "side question", &[]) },
         ];
         let (file, blobs) = snapshot(drafts, &sessions);
         let dir = scratch_dir("round-trip");
@@ -580,8 +605,11 @@ mod tests {
         assert_eq!(loaded.file, file);
         assert_eq!(loaded.blobs.get("img-1").map(Vec::as_slice), Some(&[1u8, 2, 3][..]));
         let restored = &loaded.file.drafts;
-        assert_eq!(restored.len(), 2);
-        let (draft_entry, thread_entry) = (&restored[1], &restored[0]);
+        assert_eq!(restored.len(), 3);
+        let (draft_entry, thread_entry, side_entry) = (&restored[1], &restored[0], &restored[2]);
+        assert_eq!(side_entry.target, SavedTarget::of(&side_chat), "a side chat is keyed by its environment");
+        assert!(side_entry.side_chat && !thread_entry.side_chat && !draft_entry.side_chat);
+        assert_eq!(side_entry.prompt, "side question");
         assert_eq!(thread_entry.records, [record]);
         assert_eq!(draft_entry.target, SavedTarget::of(&draft));
         assert_eq!(draft_entry.model_selection, Some(json!({"instanceId": "codex", "model": "gpt"})));
@@ -591,6 +619,20 @@ mod tests {
         assert_eq!(next.restore(loaded.file.sessions), std::slice::from_ref(&id));
         assert_eq!(next.of_project(&ScopedId::new("local", "web")), Some(&id));
         assert_eq!(next.thread_id(&id), Some(thread_id.as_str()), "its terminals' thread comes back with it");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_saved_before_side_chats_were_kept_still_loads() {
+        let dir = scratch_dir("before-side-chats");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = json!({"kind": "thread", "environmentId": "local", "threadId": "t1"});
+        let document = json!({"version": 1, "drafts": [{"target": target, "prompt": "kept"}], "sessions": []});
+        std::fs::write(dir.join(FILE), document.to_string()).unwrap();
+        let loaded = load(&dir);
+        assert!(!loaded.read_only);
+        let [draft] = loaded.file.drafts.as_slice() else { panic!("one draft") };
+        assert_eq!((draft.prompt.as_str(), draft.side_chat), ("kept", false));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -633,6 +675,7 @@ mod tests {
                 records: Vec::new(),
                 model_selection: None,
                 runtime_mode: None,
+                side_chat: false,
             }],
             sessions: Vec::new(),
         };

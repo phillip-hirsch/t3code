@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 
 use super::attachments::QuestionDraft;
 use super::composer::merge_prompt;
-use super::draft_holder::PromptHolder;
+use super::draft_holder::{PromptHolder, own_prompt};
 use super::queue::QueueUi;
 use super::right_panel::Surface;
 use super::titlebar::icon;
@@ -221,6 +221,47 @@ impl SideChats {
                 self.drafts.insert(key, SideDraft::Prompt(own));
             }
         }
+    }
+
+    /// Each side chat's own unsent text for the draft store, wherever it waits: set aside by a
+    /// queued message's edit, parked under a question card, or in its composer (`editor` is the
+    /// text of the one on screen).
+    pub(super) fn prompts(&self, editor: Option<&str>) -> Vec<(Target, String)> {
+        let view = self.view_key();
+        let editing = self.queues.iter().filter(|(_, queue)| queue.edit_draft().is_some()).map(|(key, _)| key);
+        let keys: HashSet<&Key> = self.drafts.keys().chain(editing).chain(view.as_ref()).collect();
+        let prompt = |key: &Key| {
+            let edit = self.queues.get(key).and_then(QueueUi::edit_draft).map(|(prompt, ..)| prompt.as_str());
+            let (question, text) = match self.view.as_ref().filter(|_| view.as_ref() == Some(key)) {
+                Some(view) => (view.question.as_ref(), editor.unwrap_or_default()),
+                None => match self.drafts.get(key) {
+                    Some(SideDraft::Question(question)) => (Some(&**question), ""),
+                    Some(SideDraft::Prompt(text)) => (None, text.as_str()),
+                    None => (None, ""),
+                },
+            };
+            own_prompt(edit, question, text).to_owned()
+        };
+        (keys.into_iter())
+            .map(|key| (Target::Thread { env: key.0.clone(), id: key.1.clone() }, prompt(key)))
+            .filter(|(_, prompt)| !prompt.is_empty())
+            .collect()
+    }
+
+    /// A side chat's text saved before a restart, kept until its tab shows. One that shows or
+    /// keeps text already keeps its own. Whether it was put back.
+    pub(super) fn restore_prompt(&mut self, env: &SharedString, thread_id: &str, prompt: String) -> bool {
+        let key = (env.clone(), thread_id.to_owned());
+        if prompt.is_empty() || self.view_key().as_ref() == Some(&key) || self.drafts.contains_key(&key) {
+            return false;
+        }
+        self.drafts.insert(key, SideDraft::Prompt(prompt));
+        true
+    }
+
+    /// Drops the text a side chat keeps off screen, once its environment no longer lists it.
+    pub(super) fn forget_draft(&mut self, env: &SharedString, thread_id: &str) {
+        self.drafts.remove(&(env.clone(), thread_id.to_owned()));
     }
 
     fn view_key(&self) -> Option<Key> {
@@ -562,6 +603,7 @@ impl Workspace {
                 InputEvent::Change => {
                     this.save_custom_answer(ChatPane::Side, cx);
                     this.drop_orphan_citation_comment(cx);
+                    this.drafts_changed(cx);
                     let empty = composer.read(cx).value().trim().is_empty();
                     if let Some(view) = this.side_chat.view.as_mut().filter(|view| view.empty != empty) {
                         view.empty = empty;
@@ -723,6 +765,7 @@ impl Workspace {
     /// composer, set aside under an open question or queued message's edit, or kept until its tab
     /// shows again.
     fn give_back_side_chat(&mut self, key: Key, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.drafts_changed(cx);
         let Some(view) = self.side_chat.view.as_mut().filter(|view| view.is(&key.0, &key.1)) else {
             self.side_chat.give_back(key, text);
             return;
@@ -1272,6 +1315,7 @@ impl Workspace {
                     state.set_placeholder(placeholder, window, cx);
                     state.set_value(super::citations::citation_content(&text), window, cx);
                 });
+                self.drafts_changed(cx);
                 cx.notify();
             }
         }
@@ -1579,6 +1623,56 @@ mod tests {
         side_chats.end_left_edit(&key.0, &key.1, "asked");
         let (text, card) = side_chats.drafts.remove(&key).expect("kept").restore();
         assert_eq!((text.as_str(), card.expect("the card comes back").prompt.as_str()), ("typed", "own"));
+    }
+
+    #[test]
+    fn each_side_chats_own_text_is_saved_wherever_it_waits_and_comes_back_by_environment() {
+        let key = |env: &str, id: &str| (SharedString::from(env), id.to_owned());
+        let edit = |id: &str| {
+            let mut queue = QueueUi::default();
+            let own = ("own".to_owned(), Vec::new(), ContextRecords::default());
+            queue.resume_edit(super::super::queue::QueueEdit::test(id, "a", own));
+            queue
+        };
+        let mut side_chats = SideChats::default();
+        side_chats.drafts.insert(key("a", "side"), SideDraft::Prompt("typed in a".into()));
+        side_chats.drafts.insert(key("b", "side"), SideDraft::Prompt("typed in b".into()));
+        side_chats.drafts.insert(key("a", "asking"), SideDraft::Question(Box::new(answered_card())));
+        side_chats.drafts.insert(key("a", "editing"), SideDraft::Prompt("the edit's text".into()));
+        side_chats.queues.insert(key("a", "editing"), edit("e1"));
+        let mut card = answered_card();
+        card.prompt = "the edit's text".into();
+        side_chats.drafts.insert(key("a", "asked mid-edit"), SideDraft::Question(Box::new(card)));
+        side_chats.queues.insert(key("a", "asked mid-edit"), edit("e2"));
+        // Left mid-edit with an empty editor: only the edit keeps its own text.
+        side_chats.queues.insert(key("a", "emptied"), edit("e3"));
+        side_chats.queues.insert(key("a", "idle"), QueueUi::default());
+        let prompts: HashMap<Target, String> = side_chats.prompts(None).into_iter().collect();
+        let thread = |env: &str, id: &str| Target::Thread { env: env.into(), id: id.into() };
+        let expected = [
+            (thread("a", "side"), "typed in a"),
+            (thread("b", "side"), "typed in b"),
+            (thread("a", "asking"), "parked prompt"),
+            (thread("a", "editing"), "own"),
+            (thread("a", "asked mid-edit"), "own"),
+            (thread("a", "emptied"), "own"),
+        ];
+        assert_eq!(prompts, expected.into_iter().map(|(target, text)| (target, text.to_owned())).collect());
+
+        let mut restarted = SideChats::default();
+        restarted.drafts.insert(key("a", "side"), SideDraft::Prompt("typed since".into()));
+        for (target, text) in prompts {
+            let Target::Thread { env, id } = target else { unreachable!() };
+            restarted.restore_prompt(&env, &id, text);
+        }
+        assert!(!restarted.restore_prompt(&"a".into(), "blank", String::new()));
+        restarted.forget_draft(&"a".into(), "emptied");
+        let mut restored = |env: &str, id: &str| restarted.drafts.remove(&key(env, id)).map(|d| d.restore().0);
+        assert_eq!(restored("a", "side").as_deref(), Some("typed since"), "a side chat's newer text keeps its own");
+        assert_eq!(restored("b", "side").as_deref(), Some("typed in b"));
+        assert_eq!(restored("a", "asking").as_deref(), Some("parked prompt"), "the card comes back on its request");
+        assert_eq!(restored("a", "editing").as_deref(), Some("own"));
+        assert_eq!(restored("a", "emptied"), None, "its environment no longer lists it");
     }
 
     #[test]
