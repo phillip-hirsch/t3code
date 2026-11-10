@@ -6,6 +6,8 @@
 
 use super::*;
 use crate::app::Target;
+use crate::app::draft_holder::DraftMut;
+use crate::composer_context::ContextRecords;
 use crate::model::ProjectShell;
 use crate::pull_request_checkout::Prepared;
 use crate::pull_request_detail::{CheckoutMode, CheckoutRequest};
@@ -204,15 +206,18 @@ impl Workspace {
     }
 
     /// Adds a handoff to the composer on screen (`writeHandoffToComposer`): its prompt after the
-    /// text, its records beside the draft's, and a chip for each record the text lacks. `false`
-    /// while a question card holds the editor, whose answer takes no context.
+    /// text, its records beside the draft's, and a chip for each record the text lacks. While a
+    /// question card holds the editor, whose answer takes no context, it joins the content the
+    /// card parked, as the web writes to the draft store. `false` with no composer on screen.
     fn write_pr_task(&mut self, task: &logic::Handoff, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.question.is_some() || self.target.is_none() {
-            return false;
+        let Some(target) = self.target.clone() else { return false };
+        if let Some(parked) = self.parked_editor_content(&target) {
+            append_handoff_to(parked, task);
+            cx.notify();
+            return true;
         }
         let existing = self.composer.read(cx).value().to_string();
-        let held: Vec<Value> =
-            self.context.records.iter().filter(|r| r["kind"] == crate::review_comment::KIND).cloned().collect();
+        let held = review_comments(&self.context.records);
         let next = logic::append_handoff(&existing, &held, task);
         let text = crate::composer_context::ensure_references(&next.prompt, &next.comments);
         // The records go in first, so the chips the new text renders keep them.
@@ -225,18 +230,19 @@ impl Workspace {
     }
 
     /// `startAsk`: a new thread that knows which pull request is meant. `keep_guide` shows the
-    /// guide beside it again when it is asked from there.
+    /// guide beside it again when it is asked from there. `false` when the task went nowhere.
     pub(super) fn start_pr_ask(
         &mut self,
         task: logic::Handoff,
         keep_guide: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        let Some(panel) = self.pull_requests.panel.as_ref() else { return };
-        let (Some(detail), reference) = (panel.detail.clone(), panel.reference.clone()) else { return };
+    ) -> bool {
+        let Some(panel) = self.pull_requests.panel.as_ref() else { return false };
+        let (Some(detail), reference) = (panel.detail.clone(), panel.reference.clone()) else { return false };
         if self.pr_handoff_busy() {
-            return;
+            toast_error(window, cx, "Could not ask yet", "A checkout is being prepared. Try again once it finishes.");
+            return false;
         }
         let term = logic::terminology(&detail.provider).0;
         let description = if task.prompt.is_empty() {
@@ -245,15 +251,16 @@ impl Workspace {
             "The question is in the composer. Read it over, then send.".to_owned()
         };
         if self.pr_attaches_to_composer() {
-            if self.write_pr_task(&task, window, cx) {
+            let written = self.write_pr_task(&task, window, cx);
+            if written {
                 window.push_notification(Notification::success(description).title("Added to the composer"), cx);
             }
-            return;
+            return written;
         }
         let project = self.pr_acting_project(&detail);
         if !self.shell.projects.iter().any(|p| project.names(p)) {
             toast_error(window, cx, "Could not open a thread", "Try again from the project, or open a thread first.");
-            return;
+            return false;
         }
         let env = project.environment_id.clone();
         self.start_draft_in(env.clone(), project.project_id.clone(), window, cx);
@@ -261,12 +268,13 @@ impl Workspace {
             if *e == env && *p == project.project_id);
         if !opened || !self.write_pr_task(&task, window, cx) {
             toast_error(window, cx, "Could not open a thread", "Try again from the project, or open a thread first.");
-            return;
+            return false;
         }
         if keep_guide {
             self.open_surface(crate::app::right_panel::Surface::PullRequest(reference), window, cx);
         }
         window.push_notification(Notification::success(description).title("Asked in a thread"), cx);
+        true
     }
 
     /// `startHandoff` from the panel: a checkout of the shown pull request with a thread on it.
@@ -458,7 +466,9 @@ impl Workspace {
         let threads = panel.activity.as_ref().map_or(&[][..], |a| a.review_threads.as_slice());
         let subject = logic::HandoffSubject::of(&detail);
         let Some(comment) = logic::chat_comment(&subject, chat, threads) else { return };
-        let held: Vec<Value> = self.context.records.iter().cloned().collect();
+        let parked = self.target.as_ref().and_then(|target| self.parked_editor_content_ref(target));
+        let held: Vec<Value> =
+            parked.map_or(&self.context.records, |(_, _, records)| records).iter().cloned().collect();
         let task = logic::chat_handoff(&subject, comment, &held);
         if self.write_pr_task(&task, window, cx) {
             window.push_notification(Notification::success("").title("Added to the composer"), cx);
@@ -472,7 +482,8 @@ impl Workspace {
     }
 
     /// Picked lines (`comment`, their `review-comment` record) and a request about them, for an
-    /// agent (`addSelectionToAgent`); `keep_guide` when they were picked in the guide.
+    /// agent (`addSelectionToAgent`); `keep_guide` when they were picked in the guide. `false`
+    /// when they went nowhere.
     pub(super) fn add_pr_selection_to_agent(
         &mut self,
         comment: Value,
@@ -480,10 +491,10 @@ impl Workspace {
         keep_guide: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        let Some(detail) = self.pull_requests.panel.as_ref().and_then(|p| p.detail.clone()) else { return };
+    ) -> bool {
+        let Some(detail) = self.pull_requests.panel.as_ref().and_then(|p| p.detail.clone()) else { return false };
         let task = logic::selection_handoff(&logic::HandoffSubject::of(&detail), comment, request);
-        self.start_pr_ask(task, keep_guide, window, cx);
+        self.start_pr_ask(task, keep_guide, window, cx)
     }
 
     /// `PullRequestCheckoutMenu`: "Check out" with its two places.
@@ -561,9 +572,37 @@ impl Workspace {
     }
 }
 
+/// The `review-comment` records among `records`, the ones a handoff may bring again.
+fn review_comments(records: &ContextRecords) -> Vec<Value> {
+    records.iter().filter(|r| r["kind"] == crate::review_comment::KIND).cloned().collect()
+}
+
+/// [`Workspace::write_pr_task`] into content the editor doesn't show.
+fn append_handoff_to((prompt, _, records): DraftMut<'_>, task: &logic::Handoff) {
+    let next = logic::append_handoff(prompt, &review_comments(records), task);
+    *prompt = crate::composer_context::ensure_references(&next.prompt, &next.comments);
+    records.extend(next.comments);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_handoff_under_a_question_joins_the_prompt_the_card_parked() {
+        let question = serde_json::from_value(json!({"id": "a", "header": "H", "question": "?", "options": []}));
+        let mut card = crate::app::attachments::QuestionDraft::new("r".into(), vec![question.unwrap()]).unwrap();
+        card.prompt = "mine".into();
+        let id =
+            crate::composer_context::kind_scoped_id(crate::review_comment::KIND, "pull-request-selection:a.rs:3:4");
+        let comment = json!({"kind": crate::review_comment::KIND, "contextId": id, "label": "a.rs:3"});
+        let task = logic::Handoff { prompt: "Why this?".into(), comments: vec![comment] };
+        append_handoff_to(card.prompt_mut(), &task);
+        assert!(card.prompt.starts_with("mine\n\nWhy this?"), "{}", card.prompt);
+        assert_eq!(card.prompt_records.referenced(&card.prompt).len(), 1, "its chip and record");
+        append_handoff_to(card.prompt_mut(), &task);
+        assert_eq!(card.prompt.matches("Why this?").count(), 1, "the same handoff again adds nothing");
+    }
 
     #[test]
     fn a_checkout_needs_write_access_and_a_worktree_needs_operate_too() {
