@@ -565,7 +565,7 @@ mod tests {
         assert!(on(&annotation, &records, &mut on_screen, &mut drafts), "the screenshot joins its annotation");
         assert!(!on("annotation deleted", &records, &mut on_screen, &mut drafts));
         assert!(!on(&annotation, &none, &mut on_screen, &mut drafts), "only an annotation that owns it");
-        drafts.insert(a.clone(), ComposerDraft::Prompt(annotation.clone(), Vec::new(), records));
+        drafts.insert(a.clone(), ComposerDraft::Prompt(annotation, Vec::new(), records));
         assert!(
             import_slot(&a, "image_n2", (Some(&b), "", &none, &mut on_screen), &mut drafts).is_some(),
             "a set-aside draft's annotation keeps it too"
