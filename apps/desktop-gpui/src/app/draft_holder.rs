@@ -62,6 +62,15 @@ pub(super) struct EditorDraft {
     pub(super) edit: Option<String>,
 }
 
+/// `removeDraftThreadReferences` with a destination: whatever the launched `draft`'s composer
+/// holds moves to its `thread`, which the draft store keeps (a launched draft's it drops).
+/// Whether it held anything.
+fn carry_composer(drafts: &mut HashMap<Target, ComposerDraft>, draft: &Target, thread: &Target) -> bool {
+    let Some(composer) = drafts.remove(draft) else { return false };
+    drafts.insert(thread.clone(), composer);
+    true
+}
+
 fn parked(question: &QuestionDraft) -> DraftRef<'_> {
     (question.prompt.as_str(), question.prompt_attachments.as_slice(), &question.prompt_records)
 }
@@ -278,6 +287,25 @@ impl Workspace {
         }
     }
 
+    /// `draft` launched `thread`: what it held since its send, set aside once it left the screen,
+    /// goes with the thread, into the editor when the thread is on screen.
+    pub(super) fn carry_launched_composer(
+        &mut self,
+        draft: &Target,
+        thread: &Target,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !carry_composer(&mut self.composer_drafts, draft, thread) {
+            return;
+        }
+        if self.target.as_ref() == Some(thread) {
+            self.restore_composer(window, cx);
+        }
+        self.drafts_changed(cx);
+        self.notify_sidebar(cx);
+    }
+
     /// What the editor's content belongs to now.
     pub(super) fn editor_draft(&self) -> Option<EditorDraft> {
         let target = self.target.clone()?;
@@ -378,6 +406,33 @@ mod tests {
         assert_eq!(draft.edit_content_mut("edit").map(|(text, ..)| text.clone()).as_deref(), Some("edited"));
         let ComposerDraft::Question(card) = draft.end_edit() else { panic!("the card stays") };
         assert_eq!(card.prompt, "own", "the card parks the thread's own prompt once the edit ends");
+    }
+
+    #[test]
+    fn a_launched_drafts_composer_moves_to_its_thread_whatever_it_holds() {
+        let draft =
+            Target::draft("local".into(), "p".into(), super::super::draft_sessions::DraftId::from_saved("d".into()));
+        let thread = Target::Thread { env: "local".into(), id: "t".into() };
+        let other = Target::Thread { env: "local".into(), id: "other".into() };
+        let image = Attachment::restored_as("img".into(), "image", "a.png".into(), "image/png".into(), vec![1]);
+        let mut kept = records();
+        kept.insert(serde_json::json!({"kind": "terminal", "contextId": "terminal_1", "text": "ls"}));
+        let mut drafts = HashMap::from([
+            (draft.clone(), left_mid_edit(ComposerDraft::Prompt("typed while launching".into(), vec![image], kept))),
+            (other.clone(), ComposerDraft::Prompt("untouched".into(), Vec::new(), records())),
+        ]);
+
+        assert!(carry_composer(&mut drafts, &draft, &thread));
+        assert!(!drafts.contains_key(&draft), "the launched draft keeps nothing the draft store drops");
+        let carried = drafts.get_mut(&thread).expect("the thread holds what the draft held");
+        assert_eq!(carried.content(), ("own", 0), "the prompt the edit set aside came along");
+        let (text, attachments, records) = carried.edit_content_mut("edit").expect("the edit stays open");
+        assert_eq!((text.as_str(), attachments.len()), ("typed while launching", 1));
+        assert!(records.get("terminal_1").is_some(), "its chips' records came along");
+        assert_eq!(drafts.get(&other).map(ComposerDraft::content), Some(("untouched", 0)));
+
+        assert!(!carry_composer(&mut drafts, &draft, &thread), "a draft holding nothing moves nothing");
+        assert!(drafts.contains_key(&thread));
     }
 
     #[test]

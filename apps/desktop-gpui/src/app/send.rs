@@ -436,6 +436,7 @@ impl Workspace {
                             this.disarm_fresh_session(&origin, fresh_arm);
                         }
                         this.record_prompt_sent(window, cx);
+                        let mut launched = None;
                         if let Some((thread_id, _)) = &new_thread_id {
                             // The launched draft's picks went with it, and its project's next draft is new.
                             this.composer_selections.remove(&origin);
@@ -445,6 +446,7 @@ impl Workspace {
                                 this.drafts.promote(draft, thread.clone());
                                 this.retarget_closed_views(&origin, &thread);
                                 this.carry_draft_panel(&origin, &thread);
+                                launched = Some(thread);
                             }
                             this.drafts_changed(cx);
                         }
@@ -473,6 +475,10 @@ impl Workspace {
                                 }
                             }
                             _ => {}
+                        }
+                        // Leaving the draft set its content aside; what was typed meanwhile goes too.
+                        if let Some(thread) = launched {
+                            this.carry_launched_composer(&origin, &thread, window, cx);
                         }
                     }
                     Err(error) => {
