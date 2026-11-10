@@ -442,10 +442,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let reference = format!("/{}/{}_{})", file.kind, file.kind, file.local_id);
+        let context_id = format!("{}_{}", file.kind, file.local_id);
         let text = self.composer.read(cx).value().to_string();
-        let on_screen = (self.target.as_ref(), text.as_str(), &mut self.attachments);
-        let Some(slot) = import_slot(origin, &reference, on_screen, &mut self.composer_drafts) else { return };
+        let on_screen = (self.target.as_ref(), text.as_str(), &self.context.records, &mut self.attachments);
+        let Some(slot) = import_slot(origin, &context_id, on_screen, &mut self.composer_drafts) else { return };
         if slot.len() >= MAX_ATTACHMENTS {
             return import_failed(&file.name, "The attachment limit has been reached.", window, cx);
         }
@@ -455,21 +455,35 @@ impl Workspace {
     }
 }
 
-/// The attachments of `origin`'s draft, on screen or set aside, while its text still holds
-/// `reference`; `None` once the chip is gone.
+/// The attachments of `origin`'s draft, on screen or set aside, while it still wants attachment
+/// `context_id`; `None` once the chip is gone.
 fn import_slot<'a>(
     origin: &Target,
-    reference: &str,
-    (active, text, attachments): (Option<&Target>, &str, &'a mut Vec<Attachment>),
+    context_id: &str,
+    (active, text, records, attachments): (Option<&Target>, &str, &ContextRecords, &'a mut Vec<Attachment>),
     drafts: &'a mut std::collections::HashMap<Target, ComposerDraft>,
 ) -> Option<&'a mut Vec<Attachment>> {
     if active == Some(origin) {
-        return text.contains(reference).then_some(attachments);
+        return wants_attachment(text, records, context_id).then_some(attachments);
     }
     match drafts.get_mut(origin) {
-        Some(ComposerDraft::Prompt(prompt, kept, _)) if prompt.contains(reference) => Some(kept),
+        Some(ComposerDraft::Prompt(prompt, kept, records)) if wants_attachment(prompt, records, context_id) => {
+            Some(kept)
+        }
         _ => None,
     }
+}
+
+/// Whether `text` still references attachment `context_id`: its own chip, or the chip of an
+/// annotation that owns it as its screenshot, which has no chip of its own.
+fn wants_attachment(text: &str, records: &ContextRecords, context_id: &str) -> bool {
+    let live = composer_context::referenced_ids(text);
+    live.contains(&context_id)
+        || records.iter().any(|record| {
+            record["kind"] == "preview-annotation"
+                && record["screenshotContextId"] == context_id
+                && record["contextId"].as_str().is_some_and(|id| live.contains(&id))
+        })
 }
 
 /// What a pasted attachment record becomes once its bytes arrive.
@@ -551,36 +565,42 @@ mod tests {
     fn pasted_bytes_land_in_the_draft_the_paste_went_to() {
         let (a, b) =
             (Target::Thread { env: "e".into(), id: "a".into() }, Target::Thread { env: "e".into(), id: "b".into() });
-        let reference = "/file/file_l1)";
+        let link = composer_text::context_link("file", "file_l1", "x");
+        let none = ContextRecords::default();
         let mut drafts = std::collections::HashMap::from([(
             a.clone(),
-            ComposerDraft::Prompt(
-                format!("see [x](t3-context://v1{reference} "),
-                Vec::new(),
-                ContextRecords::default(),
-            ),
+            ComposerDraft::Prompt(format!("see {link} "), Vec::new(), ContextRecords::default()),
         )]);
         let mut on_screen = Vec::new();
         // The user moved from a to b while the bytes downloaded.
-        let slot = import_slot(&a, reference, (Some(&b), "b's text", &mut on_screen), &mut drafts).unwrap();
+        let slot = import_slot(&a, "file_l1", (Some(&b), "b's text", &none, &mut on_screen), &mut drafts).unwrap();
         slot.push(Attachment::restored_as("l1".into(), "file", "x".into(), "text/plain".into(), vec![1]));
         assert!(on_screen.is_empty(), "nothing lands in the draft on screen");
         let Some(ComposerDraft::Prompt(_, kept, _)) = drafts.get(&a) else { panic!() };
         assert_eq!(kept.len(), 1);
 
-        assert!(import_slot(&b, reference, (Some(&b), "chip deleted", &mut on_screen), &mut drafts).is_none());
+        assert!(import_slot(&b, "file_l1", (Some(&b), "chip deleted", &none, &mut on_screen), &mut drafts).is_none());
+        assert!(import_slot(&b, "file_l1", (Some(&b), &link, &none, &mut on_screen), &mut drafts).is_some());
         assert!(
-            import_slot(
-                &b,
-                reference,
-                (Some(&b), &format!("[x](t3-context://v1{reference}"), &mut on_screen),
-                &mut drafts
-            )
-            .is_some()
-        );
-        assert!(
-            import_slot(&b, reference, (Some(&a), "", &mut on_screen), &mut drafts).is_none(),
+            import_slot(&b, "file_l1", (Some(&a), "", &none, &mut on_screen), &mut drafts).is_none(),
             "a draft left with nothing"
+        );
+
+        // An annotation's screenshot has no chip of its own; the annotation's chip keeps it wanted.
+        let annotation = composer_text::context_link("preview-annotation", "preview-annotation_p1", "Button");
+        let mut records = ContextRecords::default();
+        records.insert(json!({"version": 1, "kind": "preview-annotation", "contextId": "preview-annotation_p1",
+            "label": "Button", "screenshotContextId": "image_n2"}));
+        let on = |text: &str, records: &ContextRecords, on_screen: &mut Vec<Attachment>, drafts: &mut _| {
+            import_slot(&b, "image_n2", (Some(&b), text, records, on_screen), drafts).is_some()
+        };
+        assert!(on(&annotation, &records, &mut on_screen, &mut drafts), "the screenshot joins its annotation");
+        assert!(!on("annotation deleted", &records, &mut on_screen, &mut drafts));
+        assert!(!on(&annotation, &none, &mut on_screen, &mut drafts), "only an annotation that owns it");
+        drafts.insert(a.clone(), ComposerDraft::Prompt(annotation.clone(), Vec::new(), records));
+        assert!(
+            import_slot(&a, "image_n2", (Some(&b), "", &none, &mut on_screen), &mut drafts).is_some(),
+            "a set-aside draft's annotation keeps it too"
         );
     }
 
