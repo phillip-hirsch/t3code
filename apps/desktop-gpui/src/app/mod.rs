@@ -952,6 +952,7 @@ impl Workspace {
                     return;
                 }
                 this.refresh_rows(cx);
+                this.refresh_workspace_images(cx);
                 // Another client may have moved the thread to a provider with other skills.
                 this.sync_chip_provider(cx);
                 this.refresh_thread_find(cx);

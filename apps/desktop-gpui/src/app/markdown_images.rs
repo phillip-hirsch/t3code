@@ -47,6 +47,21 @@ struct Slot {
     main: bool,
     side: bool,
     generation: u64,
+    /// The workspace mutation a workspace file was read at; `None` for a source that cannot change.
+    revision: Option<Revision>,
+    /// How to load it again, for a source an environment serves.
+    reload: Option<Reload>,
+}
+
+/// `workspaceMutationId`: the thread's last settled file-writing item and newest turn completion.
+pub(super) type Revision = (Option<String>, Option<String>);
+
+/// A load to start again: an image a markdown or tool row (by its view key) shows.
+#[derive(Clone, Debug)]
+pub(super) struct Reload {
+    key: SharedString,
+    destination: String,
+    source: Source,
 }
 
 /// The load a new slot started, which fills that slot and no later one at its destination.
@@ -76,28 +91,52 @@ impl ImageCache {
     /// [`Self::claim`] for an image `pane` shows, which it then holds until it releases: the
     /// load to start, or `None` when the cache has already seen it.
     pub(super) fn claim_for(&self, pane: ChatPane, destination: &str) -> Option<Claim> {
+        self.claim_with(pane, destination, None, None)
+    }
+
+    /// [`Self::claim_for`] for a source read at `revision`, as the web keys a workspace file's
+    /// URL by it: a slot read at another revision loads again, keeping its image meanwhile.
+    fn claim_with(
+        &self,
+        pane: ChatPane,
+        destination: &str,
+        revision: Option<&Revision>,
+        reload: Option<Reload>,
+    ) -> Option<Claim> {
         let mut cache = self.0.lock().ok()?;
         cache.side_claimed |= pane == ChatPane::Side;
         let (main, side) = (pane == ChatPane::Main, pane == ChatPane::Side);
+        let generation = cache.next;
         if let Some(slot) = cache.slots.get_mut(destination) {
             slot.main |= main;
             slot.side |= side;
-            return None;
+            if revision.is_none() || slot.revision.as_ref() == revision {
+                return None;
+            }
+            slot.revision = revision.cloned();
+            slot.generation = generation;
+        } else {
+            let revision = revision.cloned();
+            cache.slots.insert(destination.to_owned(), Slot { image: None, main, side, generation, revision, reload });
         }
-        let generation = cache.next;
         cache.next += 1;
-        cache.slots.insert(destination.to_owned(), Slot { image: None, main, side, generation });
         Some(Claim { destination: destination.to_owned(), generation })
     }
 
+    /// The workspace files read before `revision`, to load again.
+    fn stale(&self, revision: &Revision) -> Vec<Reload> {
+        let Ok(cache) = self.0.lock() else { return Vec::new() };
+        let stale = cache.slots.values().filter(|slot| slot.revision.as_ref().is_some_and(|r| r != revision));
+        stale.filter_map(|slot| slot.reload.clone()).collect()
+    }
+
     /// Fills the slot `claim` started; a load whose slot was released, or claimed again since,
-    /// keeps nothing.
-    pub(super) fn fill(&self, claim: Claim, image: Arc<Image>) {
-        if let Ok(mut cache) = self.0.lock()
-            && let Some(slot) = cache.slots.get_mut(&claim.destination).filter(|s| s.generation == claim.generation)
-        {
-            slot.image = Some(image);
-        }
+    /// keeps nothing. The row that first showed a reloaded image, to remeasure too.
+    pub(super) fn fill(&self, claim: Claim, image: Arc<Image>) -> Option<SharedString> {
+        let mut cache = self.0.lock().ok()?;
+        let slot = cache.slots.get_mut(&claim.destination).filter(|s| s.generation == claim.generation)?;
+        slot.image = Some(image);
+        Some(slot.reload.as_ref()?.key.clone())
     }
 
     /// Fills a slot [`Self::claim`] started.
@@ -135,7 +174,7 @@ impl ImageCache {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) enum Source {
     Direct(String),
     Data(ImageFormat, Vec<u8>),
@@ -363,12 +402,29 @@ impl Workspace {
         self.load_sources(key, sources, cx);
     }
 
+    /// Loads again the workspace images read before the open thread's latest workspace
+    /// mutation, as the web mints a new URL for each `workspaceMutationId`.
+    pub(super) fn refresh_workspace_images(&mut self, cx: &mut Context<Self>) {
+        let stale = self.markdown_images.stale(&self.current_workspace_mutation());
+        self.reload_images(stale, cx);
+    }
+
+    fn reload_images(&mut self, reloads: Vec<Reload>, cx: &mut Context<Self>) {
+        for Reload { key, destination, source } in reloads {
+            self.load_sources(&key, vec![(destination, source)], cx);
+        }
+    }
+
     fn load_sources(&mut self, key: &SharedString, sources: Vec<(String, Source)>, cx: &mut Context<Self>) {
         let thread_id = self.thread.as_ref().map(|t| t.id.clone());
         let cache = self.markdown_images.clone();
         let pane = view_pane(key).0;
+        let revision = self.current_workspace_mutation();
         for (destination, source) in sources {
-            let Some(claim) = cache.claim_for(pane, &destination) else { continue };
+            let revision = matches!(source, Source::WorkspaceFile(_)).then_some(&revision);
+            let reload =
+                revision.map(|_| Reload { key: key.clone(), destination: destination.clone(), source: source.clone() });
+            let Some(claim) = cache.claim_with(pane, &destination, revision, reload) else { continue };
             let resource = match &source {
                 Source::WorkspaceFile(path) => {
                     thread_id.as_ref().map(|id| json!({"_tag": "media-file", "threadId": id, "path": path}))
@@ -424,11 +480,14 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(image) = image else { return };
-        cache.fill(claim, image);
+        let first_row = cache.fill(claim, image);
         if !cache.same(&self.markdown_images) {
             return;
         }
         self.remeasure_item_rows(key, cx);
+        if let Some(first_row) = first_row.filter(|first| first != key) {
+            self.remeasure_item_rows(&first_row, cx);
+        }
         cx.notify();
     }
 }
@@ -648,6 +707,34 @@ mod tests {
         assert!(cache.get("late.png").is_none(), "an obsolete load fills a newer claim");
         cache.fill(again, png());
         assert!(cache.get("late.png").is_some());
+    }
+
+    #[test]
+    fn a_workspace_file_loads_again_after_a_workspace_mutation() {
+        let png = || Arc::new(Image::from_bytes(ImageFormat::Png, BLANK.bytes().to_vec()));
+        let cache = ImageCache::default();
+        let (before, after): (Revision, Revision) = ((Some("edit-1".into()), None), (Some("edit-2".into()), None));
+        let reload = || {
+            let source = Source::WorkspaceFile("/repo/plot.png".into());
+            Some(Reload { key: "main:reply".into(), destination: "plot.png".into(), source })
+        };
+        let first = cache.claim_with(ChatPane::Main, "plot.png", Some(&before), reload()).unwrap();
+        let old = png();
+        cache.fill(first.clone(), old.clone());
+        assert!(cache.claim_with(ChatPane::Main, "plot.png", Some(&before), reload()).is_none());
+        assert!(cache.stale(&before).is_empty());
+        let web = cache.claim_for(ChatPane::Main, "https://x.dev/a.png").unwrap();
+        cache.fill(web, png());
+        let stale: Vec<_> = cache.stale(&after).into_iter().map(|r| r.destination).collect();
+        assert_eq!(stale, ["plot.png"], "only the workspace file reloads");
+        let again = cache.claim_with(ChatPane::Main, "plot.png", Some(&after), reload()).unwrap();
+        assert!(cache.stale(&after).is_empty());
+        assert!(Arc::ptr_eq(&cache.get("plot.png").unwrap(), &old), "the old image shows while it reloads");
+        cache.fill(first, png());
+        assert!(Arc::ptr_eq(&cache.get("plot.png").unwrap(), &old), "the earlier read keeps nothing");
+        let new = png();
+        cache.fill(again, new.clone());
+        assert!(Arc::ptr_eq(&cache.get("plot.png").unwrap(), &new));
     }
 
     #[test]
