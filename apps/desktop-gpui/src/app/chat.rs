@@ -47,6 +47,8 @@ impl Workspace {
         let t = *theme::tokens(cx);
         let (lane, _) = self.chat_layout(window);
         match (&self.target, &self.thread) {
+            // Home stays empty until the first-run gate decides (`FirstRunGate`'s pending state).
+            (None, _) if self.onboarding.pending() => div().into_any_element(),
             // `IndexDraftLanding`: with no project the home asks what to work on, once every
             // environment's shell has loaded, since a pending one can't prove there is none.
             (None, _) if !self.shell.projects.iter().any(|p| p.archived_at.is_none()) => {

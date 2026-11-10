@@ -26,10 +26,18 @@ impl Workspace {
             .id("chat-header")
             .h(TITLEBAR_HEIGHT)
             .flex_none()
-            .pl(if self.sidebar_open.docked() { px(20.) } else { titlebar::collapsed_content_left(window) })
+            .pl(if self.sidebar_open.docked() && !self.welcome_open() {
+                px(20.)
+            } else {
+                titlebar::collapsed_content_left(window)
+            })
             .pr(if panel_open { px(20.) } else { controls_inset })
             .bg(tokens.background);
         let header = titlebar::drag_region(header);
+        // The Welcome page keeps only a strip the window moves by (`WorkspacePageHeader electron`).
+        if self.welcome_open() {
+            return header;
+        }
         if let Some(page) = self.page.filter(|page| !page.is_modal()) {
             return header.child(div().text_sm().font_medium().text_color(tokens.foreground).child(page.title()));
         }

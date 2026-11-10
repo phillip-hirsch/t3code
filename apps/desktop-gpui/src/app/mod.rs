@@ -62,6 +62,7 @@ pub mod menu;
 mod message_actions;
 mod minimap;
 mod model_picker;
+mod onboarding;
 mod pages;
 mod palette;
 mod palette_actions;
@@ -286,8 +287,9 @@ pub struct Workspace {
     /// The composer's "Run on" picker and each draft's machine choice.
     host: host_picker::HostUi,
     _connection_task: Task<()>,
-    /// The launch landing ran (once, after the first shell snapshot).
+    /// The launch landing ran (once, after the first shell snapshot and the first-run decision).
     landed: bool,
+    onboarding: onboarding::Onboarding,
     /// A page covering the chat in the main column.
     page: Option<pages::Page>,
     pull_requests: pages::PullRequestsState,
@@ -501,6 +503,7 @@ impl Workspace {
             host: host_picker::HostUi::new(cx),
             _connection_task: Self::connect(window, cx),
             landed: false,
+            onboarding: onboarding::Onboarding::new(&client_settings),
             page: None,
             pull_requests: pages::PullRequestsState::new(window, cx),
             usage: pages::UsageState::new(&client_settings.values),
@@ -819,19 +822,25 @@ impl Workspace {
     }
 
     /// Electron always opens the index route, which starts a draft in the most
-    /// recently active project (`IndexDraftLanding`); this is that landing.
+    /// recently active project (`IndexDraftLanding`); this is that landing, once the first-run
+    /// gate decided. A fresh workspace gets the Welcome page instead.
     fn land(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.landed || !self.primary_environment().is_some_and(|id| self.shell.has_snapshot(id)) {
-            return;
+        self.follow_first_run(cx);
+        if !self.landed {
+            if self.onboarding.pending() || !self.primary_environment().is_some_and(|id| self.shell.has_snapshot(id)) {
+                return;
+            }
+            self.landed = true;
+            if self.target.is_none()
+                && !self.welcome_owns_home()
+                && let Some(project_id) =
+                    crate::inbox::most_recent_project(&self.shell.projects, &self.shell.threads).map(|p| p.id.clone())
+            {
+                self.start_draft(project_id, window, cx);
+            }
         }
-        self.landed = true;
-        if self.target.is_some() {
-            return;
-        }
-        if let Some(project_id) =
-            crate::inbox::most_recent_project(&self.shell.projects, &self.shell.threads).map(|p| p.id.clone())
-        {
-            self.start_draft(project_id, window, cx);
+        if self.welcome_owns_home() {
+            self.show_welcome(cx);
         }
     }
 
@@ -1212,6 +1221,9 @@ impl Render for Workspace {
         if self.client_settings.read_failed {
             return self.render_settings_recovery(window, cx);
         }
+        if self.onboarding.stalled() {
+            return self.render_connection_recovery(window, cx);
+        }
         if self.sidebar_open.fit(window.viewport_size().width) {
             self.notify_sidebar(cx);
         }
@@ -1310,7 +1322,10 @@ impl Render for Workspace {
             .child(
                 h_flex()
                     .size_full()
-                    .when(self.sidebar_open.docked(), |el| el.child(self.render_cached_sidebar()))
+                    // Setup starts with an empty workspace, so the Welcome page has no thread list.
+                    .when(self.sidebar_open.docked() && !self.welcome_open(), |el| {
+                        el.child(self.render_cached_sidebar())
+                    })
                     .child(
                         v_flex()
                             .flex_1()

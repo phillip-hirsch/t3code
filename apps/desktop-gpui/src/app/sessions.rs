@@ -274,6 +274,8 @@ impl Workspace {
                     this.sync_keymap(cx);
                     this.show_reload_toast(window, cx);
                     this.check_chatgpt_welcome(window, cx);
+                    // The first-run gate waits on the primary's config too.
+                    this.land(window, cx);
                 }
                 // Its thread tag filter may have changed.
                 this.retract_hidden_alerts(window, cx);
@@ -290,6 +292,9 @@ impl Workspace {
             self.subscribe_previews(&environment_id, &client, window, cx),
             self.subscribe_device_state(environment_id.clone(), &client, window, cx),
         ];
+        if primary {
+            streams.push(self.subscribe_lifecycle(&client, window, cx));
+        }
         if let Some(endpoint) = self.session(&environment_id).and_then(|s| s.endpoint.clone()) {
             let id = environment_id.clone();
             streams.push(check_session(endpoint, cx, move |this, grants, cx| {

@@ -436,6 +436,8 @@ impl Workspace {
         let areas = match self.page {
             // Usage is a modal with no areas of its own.
             Some(page) if page.is_modal() => return Vec::new(),
+            // The Welcome page has no sidebar.
+            Some(pages::Page::Welcome) => return Vec::new(),
             Some(pages::Page::PullRequests) => {
                 let list = !self.pull_request_panel_maximized();
                 vec![sidebar, (Area::Content, list), (Area::Panel, self.pull_request_panel_shown())]

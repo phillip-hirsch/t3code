@@ -291,6 +291,17 @@ impl ClientSettings {
         self.save_or_warn();
     }
 
+    /// [`Self::apply`], keeping the old values when the file can't be written.
+    pub fn try_apply(&mut self, patch: &Map<String, Value>) -> std::io::Result<()> {
+        let previous = self.values.clone();
+        self.values.apply(patch);
+        let saved = self.save();
+        if saved.is_err() {
+            self.values = previous;
+        }
+        saved
+    }
+
     fn document(&self) -> Value {
         let mut document = self.values.as_map().clone();
         document.insert(THEME_KEY.into(), self.theme.id().into());

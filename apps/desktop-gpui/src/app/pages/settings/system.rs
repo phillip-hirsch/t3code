@@ -265,6 +265,20 @@ impl Workspace {
                 .render(&t)
                 .into_any_element(),
         );
+        if self.primary_environment().is_some() {
+            let open = Button::new("about-welcome-page")
+                .outline()
+                .small()
+                .label("Open")
+                .on_click(cx.listener(|this, _, window, cx| this.open_welcome(window, cx)));
+            app.push(
+                RowFrame::new("Welcome page")
+                    .description(text("See your agents, import projects, and set up your phone."))
+                    .control(open)
+                    .render(&t)
+                    .into_any_element(),
+            );
+        }
         let privacy = match organization.filter(|_| policy.pointer("/limits/telemetry") == Some(&Value::Bool(false))) {
             Some(organization) => format!("How we handle your data. {organization} turned off anonymous usage data."),
             None => "How we handle your data, including the anonymous usage data T3 Code collects.".to_owned(),

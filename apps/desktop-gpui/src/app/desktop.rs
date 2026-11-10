@@ -132,6 +132,11 @@ impl Workspace {
 
     /// A later launch's arguments (`second-instance`), once [`super::main_window::ensure`]
     /// brought this window forward: its app links open here.
+    /// Links wait for the launch landing; setup must not take their place.
+    pub(super) fn has_pending_links(&self) -> bool {
+        !self.desktop.pending_links.is_empty()
+    }
+
     pub(super) fn receive_launch(&mut self, args: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
         self.desktop.pending_links.extend(args.iter().filter_map(|arg| links::parse_app_link(arg)));
         self.open_pending_links(window, cx);

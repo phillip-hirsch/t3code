@@ -22,7 +22,7 @@ mod pairing;
 mod routes;
 mod saved;
 mod secrets;
-pub(super) mod ui;
+pub(in crate::app) mod ui;
 
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
