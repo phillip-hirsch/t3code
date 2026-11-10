@@ -153,7 +153,8 @@ impl Render for SeparatePreview {
             let available = (f32::from(available.width), f32::from(available.height));
             preview::fit_viewport(viewport, available, zoom)
         });
-        let look = (zoom * f64::from(fit.map_or(1., |(_, scale)| scale)), self.look.appearance);
+        let appearance = super::page_appearance(self.look.appearance, crate::theme::tokens(cx).dark);
+        let look = (zoom * f64::from(fit.map_or(1., |(_, scale)| scale)), appearance);
         if self.applied.is_none_or(|(zoom, appearance)| (zoom - look.0).abs() > 1e-6 || appearance != look.1) {
             let view = self.view.read(cx);
             let _ = view.set_zoom(look.0);

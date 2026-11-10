@@ -1269,6 +1269,7 @@ impl Workspace {
                 }
             }
             let appearance = session.and_then(|s| s.color_scheme).unwrap_or(tab.defaults.1);
+            let appearance = page_appearance(appearance, crate::theme::tokens(cx).dark);
             if theme_change(&mut tab.appearance, scale.is_some(), appearance) {
                 let _ = view.set_theme(wry_theme(appearance));
             }
@@ -1752,6 +1753,22 @@ fn theme_change(applied: &mut Option<Appearance>, shown: bool, appearance: Appea
     applied.replace(appearance) != Some(appearance)
 }
 
+/// The scheme a tab's view takes. GTK 3 never reads the desktop's, so on Linux System is the
+/// app's own appearance (Electron's `nativeTheme` follows the app theme), resolved here so a
+/// change to it re-applies.
+fn page_appearance(appearance: Appearance, app_dark: bool) -> Appearance {
+    match appearance {
+        Appearance::System if cfg!(target_os = "linux") => {
+            if app_dark {
+                Appearance::Dark
+            } else {
+                Appearance::Light
+            }
+        }
+        appearance => appearance,
+    }
+}
+
 /// The native view's colour scheme for a tab's.
 fn wry_theme(appearance: Appearance) -> wry::Theme {
     match appearance {
@@ -1900,6 +1917,19 @@ mod tests {
         // tab applies its own again when it returns.
         assert!(!theme_change(&mut applied, false, Appearance::Light));
         assert_eq!(theme_change(&mut applied, true, Appearance::Light), cfg!(target_os = "linux"));
+        // GTK never reads the desktop's scheme, so on Linux System is the app's appearance, and a
+        // change to it reaches a shown tab.
+        let system = |dark| page_appearance(Appearance::System, dark);
+        let resolved = if cfg!(target_os = "linux") {
+            (Appearance::Light, Appearance::Dark)
+        } else {
+            (Appearance::System, Appearance::System)
+        };
+        assert_eq!((system(false), system(true)), resolved);
+        assert_eq!(page_appearance(Appearance::Light, true), Appearance::Light);
+        let mut applied = None;
+        assert!(theme_change(&mut applied, true, system(false)));
+        assert_eq!(theme_change(&mut applied, true, system(true)), cfg!(target_os = "linux"));
     }
 
     #[test]
