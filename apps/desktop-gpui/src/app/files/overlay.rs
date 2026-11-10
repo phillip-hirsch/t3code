@@ -5,15 +5,16 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui_kit::assets::IconName;
+use gpui_kit::base::FocusTrapElement as _;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, ElementId, Entity, Focusable as _, FontWeight, InteractiveElement as _,
-    IntoElement, KeyDownEvent, ListAlignment, ListState, ParentElement as _, ScrollStrategy, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Task, UniformListScrollHandle, Window, div, list,
-    prelude::FluentBuilder as _, px, uniform_list,
+    AnyElement, AppContext as _, Context, ElementId, Entity, FocusHandle, Focusable as _, FontWeight,
+    InteractiveElement as _, IntoElement, KeyDownEvent, ListAlignment, ListState, ParentElement as _, ScrollStrategy,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, UniformListScrollHandle, Window,
+    div, list, prelude::FluentBuilder as _, px, uniform_list,
 };
 use serde_json::json;
 
@@ -68,6 +69,8 @@ struct Search {
 pub(in crate::app) struct FileOverlay {
     pub(in crate::app) mode: OverlayMode,
     input: Entity<InputState>,
+    /// The dialog's focus trap: Tab and Shift+Tab cycle inside it, as the palette's do.
+    trap: FocusHandle,
     /// The palette's query when it opened this; Esc restores it.
     parent_query: Option<String>,
     target: Option<ProjectTarget>,
@@ -151,10 +154,11 @@ impl Workspace {
                 this.run_file_search(cx);
             }
         });
+        let trap = cx.focus_handle();
         if target.is_some() {
             input.update(cx, |input, cx| input.focus(window, cx));
         } else {
-            self.focus.focus(window, cx);
+            trap.focus(window, cx);
         }
         let endpoint = target.as_ref().and_then(|t| self.env_endpoint(&t.checkout.env).cloned());
         let (access, access_task) = match endpoint {
@@ -177,6 +181,7 @@ impl Workspace {
         self.files.overlay = Some(FileOverlay {
             mode,
             input,
+            trap,
             parent_query,
             target,
             access,
@@ -488,6 +493,7 @@ impl Workspace {
             .child(hint(&["Enter"], "Open file"))
             .child(hint(&["Esc"], "Back"));
         let height = window.viewport_size().height;
+        let trap = overlay.trap.clone();
         let panel = v_flex()
             .id("file-overlay")
             .w_full()
@@ -509,7 +515,8 @@ impl Workspace {
             )
             .child(input_row)
             .child(div().flex_1().min_h_0().flex().flex_col().child(body))
-            .child(footer);
+            .child(footer)
+            .focus_trap("file-overlay-trap", &trap);
         Some(
             div()
                 .id("file-overlay-backdrop")
