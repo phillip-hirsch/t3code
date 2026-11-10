@@ -73,6 +73,12 @@ fn normal_zoom(zoom: f64) -> f64 {
     if zoom.is_finite() && zoom > 0. { zoom } else { 1. }
 }
 
+/// `resolveBrowserLayoutZoomFactor`: GPUI px per page CSS px, so the interface zoom
+/// (`Window::ui_scale`) leaves the page at its own zoom.
+pub(super) fn layout_zoom(page_zoom: f64, ui_scale: f32) -> f64 {
+    normal_zoom(page_zoom) / normal_zoom(f64::from(ui_scale))
+}
+
 /// `resizeFreeformViewport`: `start` moved by a pointer `delta` (host px at `zoom`) on `direction`,
 /// a locked `ratio` resolving from the axis that changed most.
 fn resize(start: (f64, f64), delta: (f64, f64), zoom: f64, direction: Direction, ratio: Option<f64>) -> (f64, f64) {

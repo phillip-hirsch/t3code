@@ -1,7 +1,7 @@
 //! `BrowserDeviceToolbar`: over a fixed viewport, the device select, the editable width and height,
 //! the aspect-ratio lock, rotate, and closing back to Fill.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
@@ -28,9 +28,9 @@ pub(super) struct DeviceToolbar {
     width: Entity<InputState>,
     height: Entity<InputState>,
     focus: FocusHandle,
-    /// Tabs whose aspect ratio is locked (`aspectRatioLocked`), and those with a resize in flight.
+    /// Tabs whose aspect ratio is locked (`aspectRatioLocked`).
     locked: HashSet<TabRef>,
-    pending: HashSet<TabRef>,
+    pending: ResizeQueue,
     pub(super) menu_open: bool,
     _subscriptions: [Subscription; 3],
 }
@@ -60,7 +60,7 @@ impl DeviceToolbar {
             height,
             focus,
             locked: HashSet::new(),
-            pending: HashSet::new(),
+            pending: ResizeQueue::default(),
             menu_open: false,
             _subscriptions: subscriptions,
         }
@@ -75,7 +75,44 @@ impl DeviceToolbar {
 
     /// Whether `tab` has a `preview.resize` in flight.
     pub(super) fn resizing(&self, tab: &TabRef) -> bool {
-        self.pending.contains(tab)
+        self.pending.busy(tab)
+    }
+}
+
+/// A `preview.resize` and the aspect lock it sets once it lands.
+type Resize = (Viewport, Option<bool>);
+
+/// `queueBrowserViewportCommit`: one `preview.resize` in flight per tab, later ones in order after it.
+#[derive(Default)]
+struct ResizeQueue(HashMap<TabRef, VecDeque<Resize>>);
+
+impl ResizeQueue {
+    fn busy(&self, tab: &TabRef) -> bool {
+        self.0.contains_key(tab)
+    }
+
+    /// `resize` to send now, or none while one is in flight for `tab`.
+    fn push(&mut self, tab: &TabRef, resize: Resize) -> Option<Resize> {
+        if let Some(waiting) = self.0.get_mut(tab) {
+            waiting.push_back(resize);
+            return None;
+        }
+        self.0.insert(tab.clone(), VecDeque::new());
+        Some(resize)
+    }
+
+    /// Drops `tab`'s requests: none of them can be sent.
+    fn clear(&mut self, tab: &TabRef) {
+        self.0.remove(tab);
+    }
+
+    /// `tab`'s request landed: the next one to send, or none once the tab is idle.
+    fn finish(&mut self, tab: &TabRef) -> Option<Resize> {
+        let next = self.0.get_mut(tab)?.pop_front();
+        if next.is_none() {
+            self.0.remove(tab);
+        }
+        next
     }
 }
 
@@ -133,8 +170,9 @@ impl Workspace {
         }
     }
 
-    /// `commitBrowserViewportChange`: `preview.resize`, one at a time per tab (the toolbar is
-    /// disabled meanwhile). `lock` sets the aspect lock once it lands, as `commitViewportAndAspectRatio`.
+    /// `commitBrowserViewportChange`: `preview.resize`, one at a time per tab in the order asked
+    /// (the toolbar is disabled meanwhile). `lock` sets the aspect lock once it lands, as
+    /// `commitViewportAndAspectRatio`.
     pub(super) fn resize_viewport(
         &mut self,
         tab: TabRef,
@@ -142,17 +180,21 @@ impl Workspace {
         lock: Option<bool>,
         cx: &mut Context<Self>,
     ) {
-        if self.preview.toolbar.pending.contains(&tab) {
-            return;
+        if let Some(resize) = self.preview.toolbar.pending.push(&tab, (viewport, lock)) {
+            self.send_viewport_resize(tab, resize, cx);
         }
-        let Some(client) = self.env_client(&tab.thread.environment) else { return };
-        self.preview.toolbar.pending.insert(tab.clone());
+    }
+
+    fn send_viewport_resize(&mut self, tab: TabRef, (viewport, lock): Resize, cx: &mut Context<Self>) {
+        let Some(client) = self.env_client(&tab.thread.environment) else {
+            self.preview.toolbar.pending.clear(&tab);
+            self.settle_viewport_resize(&tab);
+            return;
+        };
         let input = json!({"threadId": tab.thread.thread_id, "tabId": tab.tab_id, "viewport": viewport.to_json()});
         cx.spawn(async move |this, cx| {
             let result = client.request("preview.resize", input).await;
             let _ = this.update(cx, |this, cx| {
-                this.preview.toolbar.pending.remove(&tab);
-                this.settle_viewport_resize(&tab);
                 let session = result.map_err(|e| e.to_string()).and_then(|value| {
                     serde_json::from_value::<Session>(value)
                         .map_err(|e| format!("Unexpected preview.resize result: {e}"))
@@ -176,6 +218,12 @@ impl Workspace {
                     }
                     Err(error) => this.error = Some(format!("Unable to resize browser viewport: {error}").into()),
                 }
+                // Only the last request's landing shows the setting again, so an earlier one can't
+                // undo the size a later one shows.
+                match this.preview.toolbar.pending.finish(&tab) {
+                    Some(next) => this.send_viewport_resize(tab, next, cx),
+                    None => this.settle_viewport_resize(&tab),
+                }
                 cx.notify();
             });
         })
@@ -183,7 +231,7 @@ impl Workspace {
     }
 
     /// The More menu's "Show device toolbar" / "Hide device toolbar" (`handleToggleDeviceToolbar`).
-    pub(super) fn toggle_device_toolbar(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn toggle_device_toolbar(&mut self, window: &Window, cx: &mut Context<Self>) {
         let Some(tab) = self.active_tab() else { return };
         let Some(session) = self.preview.threads.session(&tab) else { return };
         let next = if session.viewport == Viewport::Fill {
@@ -191,7 +239,8 @@ impl Workspace {
                 serde::Deserialize::deserialize(self.client_settings.values.get("browserDefaultViewport"))
                     .unwrap_or_default();
             let panel = self.preview.panel_area.as_ref().filter(|(shown, _)| *shown == tab).map(|(_, size)| *size);
-            viewport::toolbar_viewport(&default, panel, self.tab_look(&tab, session).0)
+            let zoom = viewport::layout_zoom(self.tab_look(&tab, session).0, window.ui_scale());
+            viewport::toolbar_viewport(&default, panel, zoom)
         } else {
             Viewport::Fill
         };
@@ -217,7 +266,7 @@ impl Workspace {
         }
         let locked = toolbar.locked.contains(tab);
         let ratio = locked.then(|| f64::from(size.0) / f64::from(size.1.max(1)));
-        let pending = toolbar.pending.contains(tab);
+        let pending = toolbar.pending.busy(tab);
         let shown = toolbar.draft.clone().unwrap_or_else(|| Draft::seeded(size));
         for (field, text) in [(&toolbar.width, &shown.width), (&toolbar.height, &shown.height)] {
             if field.read(cx).value().as_ref() != text.as_str() {
@@ -373,5 +422,31 @@ impl Workspace {
             .child(rotate)
             .child(div().ml_auto().flex_none().child(close))
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::preview::ThreadRef;
+
+    #[test]
+    fn a_resize_sent_while_one_is_in_flight_follows_it_in_order() {
+        let size = |width| Viewport::Freeform { width, height: 600 };
+        let tab = ThreadRef::new("env-a", "thread").tab("tab");
+        // The same ids on another environment are another tab.
+        let other = ThreadRef::new("env-b", "thread").tab("tab");
+        let mut queue = ResizeQueue::default();
+        assert_eq!(queue.push(&tab, (size(400), None)), Some((size(400), None)));
+        assert_eq!(queue.push(&tab, (size(500), None)), None);
+        assert_eq!(queue.push(&tab, (Viewport::Fill, Some(false))), None);
+        assert_eq!(queue.push(&other, (size(700), None)), Some((size(700), None)));
+        assert!(queue.busy(&tab));
+        assert_eq!(queue.finish(&tab), Some((size(500), None)));
+        assert!(queue.busy(&tab), "the next request is in flight");
+        assert_eq!(queue.finish(&tab), Some((Viewport::Fill, Some(false))));
+        assert_eq!(queue.finish(&tab), None);
+        assert!(!queue.busy(&tab));
+        assert!(queue.busy(&other));
     }
 }

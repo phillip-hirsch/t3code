@@ -24,11 +24,13 @@ pub(super) struct ViewportResize {
     /// One tab stop per handle, in [`HANDLES`] order.
     focus: [FocusHandle; 5],
     active: Option<Active>,
+    /// The tab whose handles this frame drew.
+    drawn: Option<TabRef>,
 }
 
 impl ViewportResize {
     pub(super) fn new(cx: &mut Context<Workspace>) -> Self {
-        Self { focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)), active: None }
+        Self { focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)), active: None, drawn: None }
     }
 }
 
@@ -114,7 +116,7 @@ impl Workspace {
     /// `zoom` is the page's layout zoom and `setting` the tab's own viewport.
     #[expect(clippy::too_many_arguments, reason = "the layout the handles sit in")]
     pub(super) fn render_resize_handles(
-        &self,
+        &mut self,
         tab: &TabRef,
         setting: &Viewport,
         size: (f32, f32),
@@ -125,6 +127,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let t = *theme::tokens(cx);
+        self.preview.resize.drawn = Some(tab.clone());
         let resize = &self.preview.resize;
         let active = resize.active.as_ref().filter(|a| a.tab == *tab);
         let mut handles: Vec<AnyElement> = HANDLES
@@ -210,7 +213,7 @@ impl Workspace {
                     window.set_window_cursor_style(cursor(direction));
                     window.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
                         if phase == DispatchPhase::Capture {
-                            let _ = view.update(cx, |this, cx| this.drag_viewport(e.position, cx));
+                            let _ = view.update(cx, |this, cx| this.drag_viewport(e, cx));
                         }
                     });
                     window.on_mouse_event(move |e: &MouseUpEvent, phase, _, cx| {
@@ -253,15 +256,34 @@ impl Workspace {
         cx.notify();
     }
 
-    fn drag_viewport(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
-        let Some(active) = self.preview.resize.active.as_mut() else { return };
+    fn drag_viewport(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let resize = &mut self.preview.resize;
+        let Some(active) = resize.active.as_mut() else { return };
         let Some(drag) = active.drag else { return };
+        // The release went somewhere this window didn't see: the drag ends like a `pointercancel`.
+        if event.pressed_button != Some(MouseButton::Left) {
+            resize.active = None;
+            cx.notify();
+            return;
+        }
+        let position = event.position;
         let pointer = (f32::from(position.x - drag.origin.x), f32::from(position.y - drag.origin.y));
         let size =
             viewport::resize_from_rail(drag.start, pointer, drag.available, drag.zoom, active.direction, drag.ratio);
         if size != active.size {
             active.size = size;
             cx.notify();
+        }
+    }
+
+    /// A drag or arrow-key resize whose handles this frame didn't draw ends without committing,
+    /// as the web's unmount does. Runs after the panel renders.
+    pub(super) fn end_undrawn_viewport_resize(&mut self) {
+        let resize = &mut self.preview.resize;
+        let drawn = resize.drawn.take();
+        let interacting = resize.active.as_ref().is_some_and(|a| a.drag.is_some() || a.commit.is_some());
+        if interacting && resize.active.as_ref().map(|a| &a.tab) != drawn.as_ref() {
+            resize.active = None;
         }
     }
 

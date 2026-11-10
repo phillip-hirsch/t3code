@@ -15,6 +15,7 @@ use gpui_kit::{
 };
 
 use super::mini_layout::{self, Composer, Direction, Frame, GAP, Obstacles, Position, Size};
+use super::viewport;
 use super::{Surface, Workspace, icon_button};
 use crate::preview::{self, ThreadRef};
 use crate::theme;
@@ -146,13 +147,13 @@ impl Workspace {
     }
 
     /// The aspect the frame keeps: an agent tab's streamed viewport, else the tab's own size.
-    fn mini_source(&self, thread: &ThreadRef, mini: &MiniPlayer, session: &preview::Session) -> Size {
+    fn mini_source(&self, thread: &ThreadRef, mini: &MiniPlayer, session: &preview::Session, ui_scale: f32) -> Size {
         let tab = thread.tab(&mini.tab_id);
         let streamed = session.server_hosted().then(|| self.stream_viewport(&tab)).flatten();
         if let Some((width, height)) = streamed.filter(|(w, h)| *w > 0. && *h > 0.) {
             return Size { width: f64::from(width), height: f64::from(height) };
         }
-        let (zoom, _) = self.tab_look(&tab, session);
+        let zoom = viewport::layout_zoom(self.tab_look(&tab, session).0, ui_scale);
         mini_layout::source_size(session.viewport.size(), mini.fitted, zoom)
     }
 
@@ -184,10 +185,15 @@ impl Workspace {
 
     /// `handlePointerMove`: a move clamps into the canvas; a resize keeps the aspect ratio. The
     /// layout clears the composer when it next draws, without changing what is stored.
-    fn mini_gesture_move(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+    fn mini_gesture_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
         let ui = &mut self.preview.mini;
+        // A release the player didn't see ends the gesture where it is.
+        if event.pressed_button != Some(MouseButton::Left) {
+            ui.gesture = None;
+            return;
+        }
         let (Some(gesture), Some(canvas)) = (ui.gesture.as_mut(), ui.canvas) else { return };
-        let delta = delta(gesture.pointer, position);
+        let delta = delta(gesture.pointer, event.position);
         if !gesture.moved && delta.x.hypot(delta.y) < SLOP {
             return;
         }
@@ -259,7 +265,7 @@ impl Workspace {
         }
         let session = self.preview.threads.session(&tab)?.clone();
         let tokens = *theme::tokens(cx);
-        let source = self.mini_source(&thread, &mini, &session);
+        let source = self.mini_source(&thread, &mini, &session, window.ui_scale());
         let obstacles = self.mini_obstacles(window);
         let frame = self.preview.mini.canvas.map(|canvas| {
             let container = Size {
@@ -454,7 +460,7 @@ impl Workspace {
             .rounded(radius)
             .occlude()
             .on_drag_move(cx.listener(|this, event: &DragMoveEvent<MiniDrag>, _, cx| {
-                this.mini_gesture_move(event.event.position, cx);
+                this.mini_gesture_move(&event.event, cx);
             }))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.preview.mini.gesture = None))
             .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, _, _| this.preview.mini.gesture = None))

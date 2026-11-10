@@ -1198,6 +1198,7 @@ impl Workspace {
     /// panel and the mini player recorded what they draw. It only calls into a view on a change.
     pub(super) fn sync_preview_views(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_page_chords(cx);
+        self.end_undrawn_viewport_resize();
         let covered = self.browser_covered(window, cx);
         self.retain_server_streams(covered, window, cx);
         self.sync_annotation(window, cx);
@@ -1225,8 +1226,8 @@ impl Workspace {
             let view = tab.view.read(cx);
             if let Some(scale) = scale {
                 // Electron's app zoom leaves previews at their own zoom (`reapplyZoom`).
-                let zoom = session.and_then(|s| s.zoom_factor).unwrap_or(tab.defaults.0) * f64::from(scale)
-                    / f64::from(window.ui_scale());
+                let page_zoom = session.and_then(|s| s.zoom_factor).unwrap_or(tab.defaults.0);
+                let zoom = viewport::layout_zoom(page_zoom, window.ui_scale()) * f64::from(scale);
                 if (tab.zoom - zoom).abs() > 1e-6 {
                     tab.zoom = zoom;
                     let _ = view.set_zoom(zoom);
@@ -1324,7 +1325,7 @@ impl Workspace {
             available
         };
         // The page draws at its zoom over the interface's (`resolveBrowserLayoutZoomFactor`).
-        let zoom = session.as_ref().map_or(1., |s| self.tab_look(tab, s).0) / f64::from(window.ui_scale());
+        let zoom = viewport::layout_zoom(session.as_ref().map_or(1., |s| self.tab_look(tab, s).0), window.ui_scale());
         let fixed = setting.size().map(|size| preview::fit_viewport(size, area, zoom));
         let separated = self.separated(tab);
         // A separated tab counts as shown, so a pick in it lasts; its window draws the page.
@@ -1598,7 +1599,9 @@ impl Workspace {
                 // The viewport's size and presets are in the device toolbar this shows.
                 let toolbar = if fill { "Show device toolbar" } else { "Hide device toolbar" };
                 menu = menu.item(PopupMenuItem::new(toolbar).disabled(!has_page && !server).on_click(
-                    window.listener_for(&view, |this, _: &ClickEvent, _, cx| this.toggle_device_toolbar(cx)),
+                    window.listener_for(&view, |this, _: &ClickEvent, window, cx| {
+                        this.toggle_device_toolbar(window, cx);
+                    }),
                 ));
                 menu = menu.separator().label("Appearance");
                 for option in Appearance::ALL {
