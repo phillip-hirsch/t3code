@@ -51,6 +51,9 @@ pub(super) use cookie_import::{ImportOutcome, ImportTarget, cookie_import_denial
 
 gpui_kit::actions!(preview, [TogglePreview]);
 
+/// The grant a client needs to show and control an environment's browser tabs.
+const PREVIEW_OPERATE: &str = "preview:operate";
+
 /// The inline chrome row: `h-7` plus its `mb-3`.
 const CHROME_ROW: f32 = 28. + 12.;
 
@@ -437,9 +440,15 @@ impl Workspace {
         }
     }
 
-    /// `browserAvailable`: a thread to host tabs for.
+    /// `canOperatePreview && browserAvailable`: a thread to host tabs for, on an environment
+    /// that lets this client control its previews.
     pub(super) fn browser_available(&self) -> bool {
-        self.preview_thread_id().is_some()
+        self.preview_thread().is_some_and(|thread| self.can_operate_preview(&thread.environment))
+    }
+
+    /// `useEnvironmentScope(…, preview:operate)`: a pending or failed session check grants nothing.
+    pub(super) fn can_operate_preview(&self, environment: &str) -> bool {
+        self.env_grants(environment, PREVIEW_OPERATE)
     }
 
     /// A browser tab's label (`surfaceTitle`): the page title, else its host, else "Browser".
@@ -624,7 +633,9 @@ impl Workspace {
     /// thread's focused tab, else opens a new one.
     /// `preview.refresh` / `focusUrl` / `zoomIn` / `zoomOut` / `resetZoom` on the panel's browser tab.
     pub(super) fn preview_command(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab) = self.active_tab() else { return };
+        let Some(tab) = self.active_tab().filter(|tab| self.can_operate_preview(&tab.thread.environment)) else {
+            return;
+        };
         let Some(session) = self.preview.threads.session(&tab) else { return };
         let (zoom, _) = self.tab_look(&tab, session);
         let zoom_to = |direction| json!({"zoomFactor": preview::step_zoom(zoom, direction)});
@@ -645,6 +656,9 @@ impl Workspace {
         let Some(thread) = self.preview_thread() else { return };
         if matches!(self.active_surface(), Some(Surface::Browser(_))) {
             return self.close_right_panel(cx);
+        }
+        if !self.can_operate_preview(&thread.environment) {
+            return;
         }
         match self.active_session(&thread).map(|s| s.tab_id.clone()) {
             Some(tab) => self.open_surface(Surface::Browser(tab), window, cx),
@@ -714,6 +728,12 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.can_operate_preview(&thread.environment) {
+            if let Some(url) = url.as_deref().filter(|_| external_fallback) {
+                cx.open_url(url);
+            }
+            return;
+        }
         let Some(client) = self.env_client(&thread.environment) else { return };
         let profile = profile.unwrap_or_else(|| preview::default_profile_id(&self.client_settings.values));
         let mut input = json!({"threadId": thread.thread_id, "profileId": profile});
@@ -768,6 +788,9 @@ impl Workspace {
         cx: &mut Context<Self>,
         opened: impl FnOnce(&mut Self, Result<String, String>, &mut Window, &mut Context<Self>) + 'static,
     ) {
+        if !self.can_operate_preview(&thread.environment) {
+            return opened(self, Err("This client has no preview access there.".into()), window, cx);
+        }
         let Some(client) = self.env_client(&thread.environment) else {
             return opened(self, Err("The environment is not connected.".into()), window, cx);
         };
@@ -819,7 +842,9 @@ impl Workspace {
             hosted.shown = false;
             let _ = hosted.view.read(cx).set_visible(false);
         }
-        if let Some(client) = self.env_client(&tab.thread.environment) {
+        // Without preview access the server keeps the session until an authorized close.
+        let granted = self.can_operate_preview(&tab.thread.environment);
+        if let Some(client) = self.env_client(&tab.thread.environment).filter(|_| granted) {
             let input = json!({"threadId": tab.thread.thread_id, "tabId": tab.tab_id});
             cx.spawn_in(window, async move |this, cx| {
                 let result = client.request("preview.close", input).await;
@@ -871,6 +896,9 @@ impl Workspace {
 
     /// `navigateToResolvedUrl`: the active tab loads `url`, or a new tab opens on it.
     fn navigate_preview(&mut self, thread: ThreadRef, url: String, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_operate_preview(&thread.environment) {
+            return;
+        }
         let Some((tab, server)) = self.active_session(&thread).map(|s| (thread.tab(&s.tab_id), s.server_hosted()))
         else {
             return self.open_preview_tab(thread, Some(url), window, cx);
@@ -1154,7 +1182,9 @@ impl Workspace {
 
     /// `preview.adjust` / `preview.resize`; the returned snapshot updates the tab.
     fn adjust_preview(&mut self, method: &'static str, change: Value, cx: &mut Context<Self>) {
-        let Some(tab) = self.active_tab() else { return };
+        let Some(tab) = self.active_tab().filter(|tab| self.can_operate_preview(&tab.thread.environment)) else {
+            return;
+        };
         let Some(client) = self.env_client(&tab.thread.environment) else { return };
         let mut input = json!({"threadId": tab.thread.thread_id, "tabId": tab.tab_id});
         if let (Some(input), Value::Object(change)) = (input.as_object_mut(), change) {
@@ -1177,6 +1207,9 @@ impl Workspace {
 
     /// `handleRefresh`: an agent tab reloads over its stream, this client's own tab in its view.
     pub(super) fn refresh_preview_tab(&self, tab: &TabRef, cx: &App) {
+        if !self.can_operate_preview(&tab.thread.environment) {
+            return;
+        }
         if self.preview.threads.session(tab).is_some_and(Session::server_hosted) {
             self.send_server_input(tab, json!({"type": "reload"}));
         } else if let Some(hosted) = self.preview.tabs.get(tab) {
@@ -1198,6 +1231,7 @@ impl Workspace {
     /// panel and the mini player recorded what they draw. It only calls into a view on a change.
     pub(super) fn sync_preview_views(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_page_chords(cx);
+        self.drop_unauthorized_views(window, cx);
         self.end_undrawn_viewport_resize();
         let covered = self.browser_covered(window, cx);
         self.retain_server_streams(covered, window, cx);
@@ -1208,7 +1242,7 @@ impl Workspace {
             |tab: &TabRef| [&panel, &mini].into_iter().flatten().find(|(id, _)| id == tab).map(|(_, scale)| *scale);
         // A shown tab's page appears once it has a URL to load.
         for (tab, _) in [&panel, &mini].into_iter().flatten() {
-            if self.preview.tabs.contains_key(tab) {
+            if self.preview.tabs.contains_key(tab) || !self.can_operate_preview(&tab.thread.environment) {
                 continue;
             }
             let url = self.preview.threads.session(tab).filter(|s| !s.server_hosted()).and_then(|s| s.nav_status.url());
@@ -1245,6 +1279,25 @@ impl Workspace {
         }
     }
 
+    /// `AuthorizedBrowserWebview`: a tab's page, and any separate window, goes once its
+    /// environment no longer lets this client control previews.
+    fn drop_unauthorized_views(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let denied: Vec<TabRef> = self
+            .preview
+            .tabs
+            .keys()
+            .filter(|tab| !self.can_operate_preview(&tab.thread.environment))
+            .cloned()
+            .collect();
+        if denied.is_empty() {
+            return;
+        }
+        for tab in &denied {
+            self.preview.tabs.remove(tab);
+        }
+        self.prune_separate_windows(window, cx);
+    }
+
     /// The Browser surface: the chrome row over the tab's page.
     pub(super) fn render_browser_surface(
         &mut self,
@@ -1255,6 +1308,24 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let tokens = *theme::tokens(cx);
+        // `PreviewPanel` without `preview:operate`: a notice in place of the chrome and the page.
+        if !self.can_operate_preview(&thread.environment) {
+            return v_flex()
+                .flex_1()
+                .min_h_0()
+                .items_center()
+                .justify_center()
+                .p_8()
+                .child(
+                    div()
+                        .max_w(px(384.))
+                        .text_sm()
+                        .text_center()
+                        .text_color(tokens.muted_foreground)
+                        .child("Pair this client again with preview access to control browser previews."),
+                )
+                .into_any_element();
+        }
         let available =
             (width - 1., f32::from(window.viewport_size().height) - f32::from(TITLEBAR_HEIGHT) - CHROME_ROW);
         v_flex()

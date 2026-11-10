@@ -180,6 +180,9 @@ impl Workspace {
         lock: Option<bool>,
         cx: &mut Context<Self>,
     ) {
+        if !self.can_operate_preview(&tab.thread.environment) {
+            return;
+        }
         if let Some(resize) = self.preview.toolbar.pending.push(&tab, (viewport, lock)) {
             self.send_viewport_resize(tab, resize, cx);
         }

@@ -257,7 +257,8 @@ impl Workspace {
     }
 
     fn render_mini_player(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let thread = self.preview_thread()?;
+        // `shownPreviewMiniPlayer`: a browser tab floats only with preview access.
+        let thread = self.preview_thread().filter(|thread| self.can_operate_preview(&thread.environment))?;
         let mini = self.preview.floating.get(&thread)?.clone();
         let tab = thread.tab(&mini.tab_id);
         if self.page.is_some() || self.active_surface() == Some(&Surface::Browser(tab.tab_id.clone())) {
