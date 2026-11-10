@@ -757,11 +757,12 @@ impl Workspace {
         }
     }
 
-    /// `environment` (re)connected: the pages and apps that could not load there load again, as
-    /// the web's asset URL queries run again once their connection settles.
+    /// `environment` (re)connected: the pages, apps and chat images that could not load there load
+    /// again, as the web's asset URL queries run again once their connection settles.
     pub(super) fn retry_failed_embeds(&mut self, environment: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.html_pages.forget_failed(environment);
         self.retry_failed_mcp_apps(environment, window, cx);
+        self.retry_failed_images(environment, cx);
         cx.notify();
     }
 
