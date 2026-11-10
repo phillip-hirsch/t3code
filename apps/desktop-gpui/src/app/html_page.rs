@@ -6,6 +6,7 @@
 //! button need the reader's activation, as the web's frame does.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -16,7 +17,7 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, Context, FocusHandle, Image, InteractiveElement as _, IntoElement as _, KeyDownEvent,
+    AnyElement, App, Context, FocusHandle, Image, InteractiveElement as _, IntoElement as _, KeyDownEvent,
     ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Task, Window, div, px,
 };
 use serde_json::{Value, json};
@@ -27,6 +28,7 @@ use super::image_viewer::{Reference, ViewerImage};
 use super::mermaid::css_color;
 use super::side_chat::{ChatPane, PaneOwner};
 use crate::theme::Tokens;
+use crate::themes::ThemeColors;
 use crate::timeline::{self, PAGE_MAX_HEIGHT, PAGE_MIN_HEIGHT, PageSize, clamp_page_height};
 
 /// `HTML_RENDER_COLUMN_WIDTH`.
@@ -130,6 +132,8 @@ fn page_message(body: &str) -> Option<PageMessage> {
 
 /// Forwards the page's bridge (`HtmlRenderDocument`'s message listener): its height always, the
 /// rest with the activation it carries, and answers a link request the way the web does.
+/// `t3Bridge(kind, message)` keeps the app's latest message of a kind (the theme, the shortcuts)
+/// and posts it to the page now and on each load, as the web's frame does on `onLoad`.
 const PAGE_SCRIPT: &str = "(()=>{const f=document.getElementById('f'),x=document.getElementById('x');\
 const post=(m)=>window.ipc.postMessage(JSON.stringify(m));\
 addEventListener('message',(e)=>{if(e.source!==f.contentWindow)return;const d=e.data;\
@@ -140,7 +144,105 @@ f.contentWindow.postMessage({jsonrpc:'2.0',id:d.id,result:{}},'*');\
 try{post({type:'page',active,data:d});}catch(_){}});\
 if(x)x.addEventListener('click',(e)=>{if(e.isTrusted)post({type:'expand'});});\
 window.t3Zoom=(z)=>{document.getElementById('t3-embed').style.zoom=z;};\
-window.t3Scheme=(s)=>{f.style.colorScheme=s;document.querySelector('meta[name=color-scheme]').content=s;};})();";
+window.t3Scheme=(s)=>{f.style.colorScheme=s;document.querySelector('meta[name=color-scheme]').content=s;};\
+const M={},send=(k)=>{const w=f.contentWindow;if(w&&M[k])w.postMessage(M[k],'*');};\
+f.addEventListener('load',()=>Object.keys(M).forEach(send));window.t3Bridge=(k,m)=>{M[k]=m;send(k);};})();";
+
+/// `htmlRenderTheme`: the palette's roles as the page's variables (`--accent` is the brand color,
+/// not the hover surface), and the fixed status and chart colors.
+fn page_theme(dark: bool, c: &ThemeColors, (sans, mono): (String, String)) -> Value {
+    let (fixed, chart) = if dark {
+        (
+            [("--success-foreground", "#34d399"), ("--info-foreground", "#60a5fa")],
+            ["#2dd4bf", "#fbbf24", "#c084fc", "#fb7185", "#a3e635"],
+        )
+    } else {
+        (
+            [("--success-foreground", "#047857"), ("--info-foreground", "#1d4ed8")],
+            ["#0d9488", "#d97706", "#9333ea", "#e11d48", "#65a30d"],
+        )
+    };
+    let roles = [
+        ("--background", c.canvas),
+        ("--foreground", c.text),
+        ("--muted", c.muted),
+        ("--muted-foreground", c.muted_foreground),
+        ("--card", c.surface),
+        ("--card-foreground", c.text),
+        ("--popover", c.surface_overlay),
+        ("--popover-foreground", c.text),
+        ("--secondary", c.secondary),
+        ("--secondary-foreground", c.secondary_foreground),
+        ("--border", c.border),
+        ("--input", c.input),
+        ("--ring", c.focus),
+        ("--primary", c.message_action),
+        ("--primary-foreground", c.message_action_foreground),
+        ("--accent", c.accent),
+        ("--accent-foreground", c.accent_foreground),
+        ("--accent-surface", c.accent_surface),
+        ("--accent-surface-foreground", c.accent_surface_foreground),
+        ("--destructive", c.error),
+        ("--destructive-foreground", c.error_foreground),
+        ("--destructive-surface", c.error_surface),
+        ("--warning", c.warning),
+        ("--warning-foreground", c.warning_foreground),
+        ("--warning-surface", c.warning_surface),
+        ("--code-background", c.code_background),
+        ("--code-foreground", c.code_foreground),
+        ("--chart-1", c.accent),
+    ];
+    let mut variables: serde_json::Map<String, Value> =
+        roles.into_iter().map(|(name, color)| (name.to_owned(), css_color(color).into())).collect();
+    let fixed = [("--success", "#10b981"), ("--info", "#3b82f6")].into_iter().chain(fixed);
+    variables.extend(fixed.map(|(name, color)| (name.to_owned(), color.into())));
+    variables.extend(chart.into_iter().enumerate().map(|(i, color)| (format!("--chart-{}", i + 2), color.into())));
+    variables.insert("--radius".into(), "0.625rem".into());
+    variables.insert("--font-sans".into(), sans.into());
+    variables.insert("--font-mono".into(), mono.into());
+    json!({"appearance": if dark { "dark" } else { "light" }, "variables": variables})
+}
+
+/// `encodeURIComponent`.
+fn encode_uri_component(text: &str) -> String {
+    let mut encoded = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&byte) {
+            encoded.push(char::from(byte));
+        } else {
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+
+/// `value` as a script literal that can't close the `<script>` it sits in.
+fn script_json(value: &Value) -> String {
+    value.to_string().replace('<', "\\u003c")
+}
+
+/// A page's theme as the bridge sends it: `htmlRenderThemeFragment` on the first load, then
+/// `htmlRenderThemeMessage` whenever it changes. Without a palette it is empty, leaving the page
+/// its own default theme.
+#[derive(Debug, Default)]
+struct PageTheme {
+    fragment: String,
+    script: String,
+}
+
+impl PageTheme {
+    fn new(theme: &Value) -> Self {
+        let message = json!({
+            "jsonrpc": "2.0",
+            "method": "ui/notifications/host-context-changed",
+            "params": {"theme": theme["appearance"], "styles": {"variables": theme["variables"]}},
+        });
+        Self {
+            fragment: format!("#t3-theme={}", encode_uri_component(&theme.to_string())),
+            script: format!("window.t3Bridge&&t3Bridge('theme',{});", script_json(&message)),
+        }
+    }
+}
 
 /// Lucide's `Maximize2`.
 const EXPAND_ICON: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" \
@@ -180,9 +282,11 @@ impl ShellLook {
 /// The embed's shell: the page in its sandboxed frame (`sandbox="allow-scripts allow-forms"`, never
 /// `allow-same-origin`, so it stays out of the app's session), and inline, the hover-revealed
 /// "Open full screen" button over its top-right corner. Full screen scrolls when zoomed past 100%.
-fn page_shell(url: &str, title: &str, look: &ShellLook, inline: bool) -> String {
+/// The page loads with the theme's fragment, and `bridge` scripts seed what the shell posts it.
+fn page_shell(url: &str, title: &str, look: &ShellLook, inline: bool, theme: &PageTheme, bridge: &str) -> String {
     let scheme = if look.dark { "dark" } else { "light" };
-    let src = escape_attribute(url.split('#').next().unwrap_or(url));
+    let src = escape_attribute(&format!("{}{}", url.split('#').next().unwrap_or(url), theme.fragment));
+    let bridge = format!("{}{bridge}", theme.script);
     let title = escape_attribute(title);
     let ShellLook { background, glass, border, icon, hover_border, ring, .. } = look;
     let (button, overflow) = if inline {
@@ -206,7 +310,7 @@ fn page_shell(url: &str, title: &str, look: &ShellLook, inline: bool) -> String 
          body:hover #x,#x:focus-visible{{opacity:1}}#x:hover{{border-color:{hover_border}}}\
          #x:focus-visible{{outline:2px solid {ring};outline-offset:1px}}</style></head>\
          <body><div id=\"t3-embed\"><iframe id=\"f\" src=\"{src}\" title=\"{title}\" sandbox=\"allow-scripts allow-forms\" \
-         allow=\"fullscreen\"></iframe>{button}</div><script>{FRAME_SCRIPT}{PAGE_SCRIPT}</script></body></html>"
+         allow=\"fullscreen\"></iframe>{button}</div><script>{FRAME_SCRIPT}{PAGE_SCRIPT}{bridge}</script></body></html>"
     )
 }
 
@@ -226,6 +330,8 @@ struct Page {
     /// The live page's height, once it reports one.
     content_height: Option<f32>,
     dark: bool,
+    /// The theme the page was last sent.
+    theme: Option<Rc<PageTheme>>,
     /// The frame this page last drew in.
     used: u64,
     _task: Option<Task<()>>,
@@ -239,6 +345,7 @@ struct Dialog {
     embed: Option<EmbedView>,
     zoom: f32,
     dark: bool,
+    theme: Option<Rc<PageTheme>>,
     focus: FocusHandle,
     close_focus: FocusHandle,
     restore: Option<FocusHandle>,
@@ -246,10 +353,15 @@ struct Dialog {
     _messages: Option<Task<()>>,
 }
 
+/// What a page's theme is built from: the palette, whether it is dark, and the fonts.
+type ThemeStamp = (bool, ThemeColors, &'static str, &'static str);
+
 #[derive(Default)]
 pub(super) struct HtmlPages {
     pages: HashMap<PageKey, Page>,
     dialog: Option<Dialog>,
+    /// The theme pages show now, rebuilt only when what it is built from changes.
+    theme: Option<(ThemeStamp, Rc<PageTheme>)>,
 }
 
 /// Where a shell's report came from.
@@ -294,6 +406,21 @@ fn page_row(row: &timeline::Row, attachment_id: &SharedString) -> bool {
 }
 
 impl Workspace {
+    /// `useHtmlRenderTheme`: the active palette and fonts as the page theme.
+    fn page_theme_now(&mut self, cx: &App) -> Rc<PageTheme> {
+        let tokens = crate::theme::tokens(cx);
+        let Some((dark, colors)) = crate::theme::palette(cx) else { return Rc::default() };
+        let stamp = (dark, *colors, tokens.fonts.sans, tokens.fonts.mono);
+        match &self.html_pages.theme {
+            Some((current, theme)) if *current == stamp => theme.clone(),
+            _ => {
+                let theme = Rc::new(PageTheme::new(&page_theme(dark, colors, super::mcp_app::font_stacks(tokens))));
+                self.html_pages.theme = Some((stamp, theme.clone()));
+                theme
+            }
+        }
+    }
+
     fn page_key(&self, pane: ChatPane, embed: &timeline::Embed) -> Option<PageKey> {
         Some(PageKey { owner: self.pane_owner(pane)?, attachment: embed.attachment_id.clone() })
     }
@@ -349,6 +476,7 @@ impl Workspace {
             failed: false,
             content_height: None,
             dark: look.dark,
+            theme: None,
             used: self.embeds.frame(),
             _task: None,
             _messages: None,
@@ -365,9 +493,11 @@ impl Workspace {
             let minted = mint_page_url(client, base, attachment, file_name).await;
             let _ = this.update_in(cx, |this, window, cx| match minted {
                 Some((url, expires)) => {
+                    let theme = this.page_theme_now(cx);
                     let Some(page) = this.html_pages.pages.get_mut(&request) else { return };
                     page.url = Some((url.clone(), expires));
-                    let shell = page_shell(&url, &title, &look, true);
+                    page.theme = Some(theme.clone());
+                    let shell = page_shell(&url, &title, &look, true, &theme, "");
                     this.build_page_view(Origin::Inline(request), shell, look.dark, window, cx);
                 }
                 None => this.html_page_failed(&request, cx),
@@ -612,6 +742,7 @@ impl Workspace {
             embed: None,
             zoom: 1.,
             dark: look.dark,
+            theme: None,
             focus: cx.focus_handle(),
             close_focus,
             restore,
@@ -626,7 +757,8 @@ impl Workspace {
             .filter(|(_, expires)| expires - now_ms() > MIN_URL_LIFE_MS);
         let title = embed.title.to_string();
         if let Some((url, _)) = fresh {
-            self.build_page_view(Origin::Dialog(key), page_shell(&url, &title, &look, false), look.dark, window, cx);
+            let shell = self.dialog_shell(&url, &title, &look, cx);
+            self.build_page_view(Origin::Dialog(key), shell, look.dark, window, cx);
             cx.notify();
             return;
         }
@@ -645,7 +777,7 @@ impl Workspace {
                 }
                 match minted {
                     Some((url, _)) => {
-                        let shell = page_shell(&url, &title, &look, false);
+                        let shell = this.dialog_shell(&url, &title, &look, cx);
                         this.build_page_view(Origin::Dialog(key), shell, look.dark, window, cx);
                     }
                     None => {
@@ -659,6 +791,15 @@ impl Workspace {
             dialog._task = Some(task);
         }
         cx.notify();
+    }
+
+    /// The full screen shell for `url`, in the theme the dialog now records.
+    fn dialog_shell(&mut self, url: &str, title: &str, look: &ShellLook, cx: &App) -> String {
+        let theme = self.page_theme_now(cx);
+        if let Some(dialog) = self.html_pages.dialog.as_mut() {
+            dialog.theme = Some(theme.clone());
+        }
+        page_shell(url, title, look, false, &theme, "")
     }
 
     fn close_html_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -688,20 +829,29 @@ impl Workspace {
         for key in left {
             self.html_pages.pages.remove(&key);
         }
+        if self.html_pages.pages.is_empty() && self.html_pages.dialog.is_none() {
+            return;
+        }
         let dark = crate::theme::tokens(cx).dark;
         let scheme = if dark { "window.t3Scheme&&t3Scheme('dark')" } else { "window.t3Scheme&&t3Scheme('light')" };
         let theme = if dark { wry::Theme::Dark } else { wry::Theme::Light };
+        let page_theme = self.page_theme_now(cx);
         let pages = &mut self.html_pages;
-        let views = pages
-            .pages
-            .values_mut()
-            .map(|page| (&mut page.dark, page.embed.as_ref()))
-            .chain(pages.dialog.as_mut().map(|dialog| (&mut dialog.dark, dialog.embed.as_ref())));
-        for (shown_dark, embed) in views {
-            if let Some(embed) = embed.filter(|_| *shown_dark != dark) {
+        let views =
+            pages.pages.values_mut().map(|page| (&mut page.dark, &mut page.theme, page.embed.as_ref())).chain(
+                pages.dialog.as_mut().map(|dialog| (&mut dialog.dark, &mut dialog.theme, dialog.embed.as_ref())),
+            );
+        for (shown_dark, shown_theme, embed) in views {
+            let Some(embed) = embed else { continue };
+            if *shown_dark != dark {
                 *shown_dark = dark;
                 let _ = embed.webview(cx).set_theme(theme);
                 let _ = embed.raw(cx).evaluate_script(scheme);
+            }
+            // `htmlRenderThemeMessage` on a theme change, as the web's frame posts it.
+            if shown_theme.as_ref().is_none_or(|shown| !Rc::ptr_eq(shown, &page_theme)) {
+                *shown_theme = Some(page_theme.clone());
+                let _ = embed.raw(cx).evaluate_script(&page_theme.script);
             }
         }
         if pages.pages.len() > KEPT_PAGES {
@@ -910,9 +1060,8 @@ mod tests {
         assert_eq!(page_message("nope"), None);
     }
 
-    #[test]
-    fn the_shell_sandboxes_the_page_without_its_fragment() {
-        let look = ShellLook {
+    fn look() -> ShellLook {
+        ShellLook {
             dark: true,
             background: "#000".into(),
             glass: "#111".into(),
@@ -920,12 +1069,52 @@ mod tests {
             icon: "#333".into(),
             hover_border: "#444".into(),
             ring: "#555".into(),
-        };
-        let inline = page_shell("http://h/a?x=1&y=\"2\"#t3-theme=x", "A <b>", &look, true);
-        assert!(inline.contains("src=\"http://h/a?x=1&amp;y=&quot;2&quot;\" title=\"A &lt;b>\""));
+        }
+    }
+
+    #[test]
+    fn the_shell_sandboxes_the_page_with_the_apps_theme_fragment() {
+        let theme = PageTheme { fragment: "#t3-theme=%7B%7D".into(), script: "t3Bridge('theme',{});".into() };
+        let inline = page_shell("http://h/a?x=1&y=\"2\"#t3-theme=x", "A <b>", &look(), true, &theme, "");
+        assert!(inline.contains("src=\"http://h/a?x=1&amp;y=&quot;2&quot;#t3-theme=%7B%7D\" title=\"A &lt;b>\""));
         assert!(inline.contains("sandbox=\"allow-scripts allow-forms\"") && !inline.contains("allow-same-origin"));
         assert!(inline.contains("aria-label=\"Open full screen\"") && inline.contains("content=\"dark\""));
-        let full = page_shell("http://h/a", "A", &look, false);
+        assert!(inline.contains("t3Bridge('theme',{});</script>"));
+        let full = page_shell("http://h/a", "A", &look(), false, &PageTheme::default(), "");
         assert!(!full.contains("id=\"x\"") && full.contains("html,body{overflow:auto}"));
+    }
+
+    #[test]
+    fn pages_take_the_palette_like_html_render_theme() {
+        let colors = ThemeColors::from_roles(crate::themes::standard_roles(true), None).unwrap();
+        let fonts = ("\"Inter\", sans-serif".to_owned(), "monospace".to_owned());
+        let theme = page_theme(true, &colors, fonts);
+        let variables = &theme["variables"];
+        assert_eq!(theme["appearance"], "dark");
+        assert_eq!(variables["--background"], "#000000", "the standard dark canvas");
+        assert_eq!(variables["--primary"], css_color(colors.message_action).as_str());
+        assert_eq!(variables["--accent"], css_color(colors.accent).as_str(), "the brand, not the hover surface");
+        assert_eq!(variables["--chart-1"], variables["--accent"]);
+        assert_eq!(variables["--accent-surface"], css_color(colors.accent_surface).as_str());
+        assert_eq!((&variables["--success"], &variables["--chart-6"]), (&json!("#10b981"), &json!("#a3e635")));
+        assert_eq!(variables["--font-sans"], "\"Inter\", sans-serif");
+        assert_eq!(variables.as_object().map(serde_json::Map::len), Some(40));
+
+        let page = PageTheme::new(&json!({"appearance": "light", "variables": {"--font-sans": "A </script> & b"}}));
+        assert_eq!(
+            page.fragment,
+            "#t3-theme=%7B%22appearance%22%3A%22light%22%2C%22variables%22%3A%7B%22--font-sans%22%3A%22A%20%3C%2Fscript%3E%20%26%20b%22%7D%7D"
+        );
+        let message = page.script.strip_prefix("window.t3Bridge&&t3Bridge('theme',").and_then(|s| s.strip_suffix(");"));
+        let message = message.unwrap();
+        assert!(!message.contains('<'), "the script can't be closed early");
+        assert_eq!(
+            serde_json::from_str::<Value>(message).unwrap(),
+            json!({
+                "jsonrpc": "2.0",
+                "method": "ui/notifications/host-context-changed",
+                "params": {"theme": "light", "styles": {"variables": {"--font-sans": "A </script> & b"}}},
+            })
+        );
     }
 }

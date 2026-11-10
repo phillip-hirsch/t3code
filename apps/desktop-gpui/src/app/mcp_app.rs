@@ -109,9 +109,7 @@ fn app_shell(url: &str, app: &AppReference, nonce: &str, dark: bool, background:
 /// `htmlRenderTheme`'s variables, which `mcpAppStyleVariables` renames for the app.
 fn theme_variables(t: &Tokens) -> Vec<(&'static str, String)> {
     let surface = if t.dark { 0.16 } else { 0.08 };
-    let font = |name: &str, fallback: &str| {
-        if name.is_empty() { fallback.to_owned() } else { format!("\"{name}\", {fallback}") }
-    };
+    let (sans, mono) = font_stacks(t);
     vec![
         ("--background", css_color(t.background)),
         ("--foreground", css_color(t.foreground)),
@@ -130,9 +128,17 @@ fn theme_variables(t: &Tokens) -> Vec<(&'static str, String)> {
         ("--info", css_color(t.info)),
         ("--info-foreground", css_color(t.info_foreground)),
         ("--radius", "0.625rem".to_owned()),
-        ("--font-sans", font(t.fonts.sans, DEFAULT_SANS)),
-        ("--font-mono", font(t.fonts.mono, DEFAULT_MONO)),
+        ("--font-sans", sans),
+        ("--font-mono", mono),
     ]
+}
+
+/// `--font-sans` and `--font-mono` for a page (`appearanceFontStack` over `HTML_RENDER_DEFAULT_FONTS`).
+pub(super) fn font_stacks(t: &Tokens) -> (String, String) {
+    let font = |name: &str, fallback: &str| {
+        if name.is_empty() { fallback.to_owned() } else { format!("\"{name}\", {fallback}") }
+    };
+    (font(t.fonts.sans, DEFAULT_SANS), font(t.fonts.mono, DEFAULT_MONO))
 }
 
 /// What the theme variables are read from, compared each frame without allocating.
