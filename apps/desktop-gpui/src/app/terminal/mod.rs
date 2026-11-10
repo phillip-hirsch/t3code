@@ -330,6 +330,11 @@ impl Terminals {
     }
 
     /// The thread id `draft` launches with, if its terminal drawer used one.
+    pub(super) fn draft_thread(&self, draft: &DraftId) -> Option<String> {
+        self.draft_threads.get(draft).cloned()
+    }
+
+    /// `draft` launched: its terminals and panel tabs now belong to the thread.
     pub(super) fn take_draft_thread(&mut self, draft: &DraftId) -> Option<String> {
         self.draft_threads.remove(draft)
     }
