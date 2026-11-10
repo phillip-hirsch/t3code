@@ -326,7 +326,7 @@ impl Workspace {
                 let group: SharedString = format!("preview-recent-{}", entry.url).into();
                 let (open, remove) = (entry.url.clone(), entry.url.clone());
                 let history_thread = thread.clone();
-                let ring = focus_ring(tokens);
+                let ring = super::super::chat::inset_ring(tokens.ring);
                 focusable(h_flex().id(ElementId::Name(group.clone())), tokens)
                     .group(group.clone())
                     .relative()
@@ -697,12 +697,7 @@ impl Workspace {
 
 /// A `<button>` row: a Tab stop that Enter and Space click, with `focus-visible:ring-2 ring-inset ring-ring`.
 fn focusable(element: gpui_kit::Stateful<gpui_kit::Div>, tokens: &Tokens) -> gpui_kit::Stateful<gpui_kit::Div> {
-    let ring = focus_ring(tokens);
-    element.tab_index(0).focus_visible(move |s| s.shadow(vec![ring]))
-}
-
-fn focus_ring(tokens: &Tokens) -> gpui_kit::BoxShadow {
-    gpui_kit::BoxShadow::new(px(0.), px(0.), tokens.ring).spread_radius(px(2.)).inset()
+    super::super::chat::ringed_tab_stop(element, tokens.ring)
 }
 
 /// `formatRelativeElapsed`.

@@ -63,9 +63,7 @@ pub(in crate::app::pages::settings) fn status_dot(
 /// A fold's trigger as a tab stop that Enter and Space toggle, with the web's
 /// `focus-visible:ring-2 ring-inset`.
 pub(super) fn fold_trigger(el: Stateful<Div>, ring: Hsla) -> Stateful<Div> {
-    el.rounded(px(6.)).tab_index(0).focus_visible(move |style| {
-        style.shadow(vec![gpui_kit::BoxShadow::new(px(0.), px(0.), ring).spread_radius(px(2.)).inset()])
-    })
+    crate::app::chat::ringed_tab_stop(el.rounded(px(6.)), ring)
 }
 
 /// A link or toggle as a tab stop that Enter and Space click, with `focus-visible:ring-2`.

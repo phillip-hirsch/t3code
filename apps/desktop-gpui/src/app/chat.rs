@@ -1030,12 +1030,25 @@ fn alpha(color: Hsla, factor: f32) -> Hsla {
 /// A `<button>`, or a `role="button"` row: a tab stop that Enter and Space click, with
 /// `focus-visible:ring-2 ring-inset ring-ring/70`, an inset shadow so nothing moves.
 pub(super) fn focusable(element: gpui_kit::Stateful<gpui_kit::Div>, t: &Tokens) -> gpui_kit::Stateful<gpui_kit::Div> {
-    let ring = focus_ring(t);
-    element.tab_index(0).focus_visible(move |style| style.shadow(vec![ring]))
+    ringed_tab_stop(element, alpha(t.ring, 0.7))
 }
 
 pub(super) fn focus_ring(t: &Tokens) -> gpui_kit::BoxShadow {
-    gpui_kit::BoxShadow::new(px(0.), px(0.), alpha(t.ring, 0.7)).spread_radius(px(2.)).inset()
+    inset_ring(alpha(t.ring, 0.7))
+}
+
+/// [`focusable`] with `ring` as the ring's color (`focus-visible:ring-2 ring-inset`).
+pub(super) fn ringed_tab_stop(
+    element: gpui_kit::Stateful<gpui_kit::Div>,
+    ring: Hsla,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
+    let ring = inset_ring(ring);
+    element.tab_index(0).focus_visible(move |style| style.shadow(vec![ring]))
+}
+
+/// `ring-2 ring-inset` in `ring`: an inset shadow, so nothing moves.
+pub(super) fn inset_ring(ring: Hsla) -> gpui_kit::BoxShadow {
+    gpui_kit::BoxShadow::new(px(0.), px(0.), ring).spread_radius(px(2.)).inset()
 }
 
 fn toggle(
