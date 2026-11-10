@@ -324,7 +324,7 @@ impl Workspace {
         }
         let command = json!({"type": "thread.model-selection.set", "commandId": super::new_id(), "threadId": id,
             "modelSelection": pick.to_json()});
-        let Some(client) = self.command_client(&command) else { return };
+        let Some(client) = self.env_client(env) else { return };
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("orchestration.dispatchCommand", command).await;
             let _ = this.update_in(cx, |this, window, cx| match result {
