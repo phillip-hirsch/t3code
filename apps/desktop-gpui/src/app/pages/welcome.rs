@@ -105,7 +105,8 @@ pub(in crate::app) struct WelcomeState {
     /// Each visit and each Codex choice bump it; a save that finishes after another moves nothing.
     codex_choice: u64,
     /// "Use existing CLI" opens this instance's terminal once Codex has checked the CLI.
-    cli_terminal_for: Option<String>,
+    /// Kept with the choice that asked, so only that choice's failed save takes it back.
+    cli_terminal_for: Option<(String, u64)>,
     terminal: Option<SetupTerminal>,
     terminal_generation: u64,
     importing: bool,
@@ -147,6 +148,19 @@ impl WelcomeState {
             self.codex_choice += 1;
         }
         self.codex_setup = instance;
+    }
+
+    /// A choice on `instance_id`'s Codex card, returning its generation. "Use existing CLI" asks for
+    /// the CLI's terminal and ChatGPT takes that back (`onUseCliChange`).
+    fn choose_codex_mode(&mut self, instance_id: &str, managed: bool) -> u64 {
+        self.codex_choice += 1;
+        self.cli_terminal_for = (!managed).then(|| (instance_id.to_owned(), self.codex_choice));
+        self.codex_choice
+    }
+
+    /// A save that failed takes back the terminal its own choice asked for, not a later one's.
+    fn codex_save_failed(&mut self, choice: u64, instance_id: &str) {
+        self.cli_terminal_for.take_if(|(id, asked)| id == instance_id && *asked == choice);
     }
 
     /// Whether choice `choice` on `instance_id`'s card is still the latest and no other card shows.
@@ -311,6 +325,7 @@ impl Workspace {
                 || welcome.reviewing
                 || welcome.codex_setup.is_some()
                 || welcome.more_open.is_some()
+                || welcome.cli_terminal_for.is_some()
             {
                 self.welcome_close_terminal(cx);
                 let welcome = &mut self.welcome;
@@ -347,7 +362,7 @@ impl Workspace {
                 || logic::agent_state(listed, settings) == AgentState::Checking;
             (open, (welcome.last_codex.as_ref() != Some(listed)).then(|| listed.clone()))
         });
-        let cli = welcome.cli_terminal_for.as_deref().and_then(find).and_then(|provider| {
+        let cli = welcome.cli_terminal_for.as_ref().and_then(|(id, _)| find(id)).and_then(|provider| {
             let step = logic::cli_terminal_step(provider, settings);
             (step != CliStep::Wait).then(|| (step, provider.clone()))
         });
@@ -506,7 +521,7 @@ impl Workspace {
     /// Codex's card: "Continue with ChatGPT" (`managed`) or "Use existing CLI" (`existing`). Signing
     /// in with ChatGPT continues on the instance's Settings page, where its runtime installs.
     fn welcome_codex_mode(&mut self, instance_id: String, managed: bool, window: &mut Window, cx: &mut Context<Self>) {
-        self.welcome.codex_choice += 1;
+        let choice = self.welcome.choose_codex_mode(&instance_id, managed);
         let Some(environment) = self.welcome_environment() else { return };
         let Some(info) = self.env_info(&environment) else { return };
         let Some(provider) = info.providers_json.iter().find(|p| logic::instance_id(p) == instance_id) else { return };
@@ -516,9 +531,6 @@ impl Workspace {
         let mode = if managed { "managed" } else { "existing" };
         let unchanged =
             instance.pointer("/config/setupMode").and_then(Value::as_str) == Some(mode) && provider["enabled"] == true;
-        if !managed {
-            self.welcome.cli_terminal_for = Some(instance_id.clone());
-        }
         if unchanged || !self.env_grants(&environment, PROVIDERS_MANAGE) {
             if managed {
                 self.open_provider_settings(environment, instance_id, cx);
@@ -532,7 +544,6 @@ impl Workspace {
         instance["config"] = config;
         let id = instance_id.clone();
         let target = environment.clone();
-        let choice = self.welcome.codex_choice;
         self.welcome_upsert_instance(
             environment,
             instance_id,
@@ -543,7 +554,7 @@ impl Workspace {
                     && this.settings.is_none()
                     && this.welcome.codex_choice_stands(choice, &id);
                 if !saved {
-                    this.welcome.cli_terminal_for = None;
+                    this.welcome.codex_save_failed(choice, &id);
                 } else if managed && current {
                     this.open_provider_settings(target, id, cx);
                 }
@@ -1927,5 +1938,21 @@ mod tests {
         welcome.show_codex_setup(Some("b".to_owned()));
         welcome.show_codex_setup(None);
         assert!(!welcome.codex_choice_stands(choice, "b"), "the user closed it");
+    }
+
+    #[test]
+    fn chatgpt_takes_back_the_cli_terminal_and_only_its_own_failed_save_does() {
+        let mut welcome = WelcomeState::default();
+        let cli = welcome.choose_codex_mode("a", false);
+        assert_eq!(welcome.cli_terminal_for, Some(("a".to_owned(), cli)));
+        let chatgpt = welcome.choose_codex_mode("a", true);
+        assert_eq!(welcome.cli_terminal_for, None, "ChatGPT cancels the pending CLI terminal");
+
+        let again = welcome.choose_codex_mode("a", false);
+        welcome.codex_save_failed(cli, "a");
+        welcome.codex_save_failed(chatgpt, "a");
+        assert_eq!(welcome.cli_terminal_for, Some(("a".to_owned(), again)), "older saves failing keep the newer ask");
+        welcome.codex_save_failed(again, "a");
+        assert_eq!(welcome.cli_terminal_for, None);
     }
 }
