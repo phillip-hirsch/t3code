@@ -151,6 +151,8 @@ pub(super) struct WriteState {
     replies: HashMap<String, Entity<TextareaState>>,
     editing: Option<Editing>,
     saving: bool,
+    /// The title's own save, apart from the description's and comments' (`PullRequestTitleEditor`).
+    title_saving: bool,
     /// Conversations whose resolve or reply is in flight, each on its own like the web's cards.
     thread_pending: HashSet<String>,
     /// Reactions pressed and not yet read back, by subject and content.
@@ -1466,7 +1468,7 @@ impl Workspace {
     fn save_pr_title(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let current = self.pull_requests.panel.as_ref().and_then(|p| p.detail.as_ref()).map(|d| d.title.clone());
         let Some(mut payload) = self.pr_ref_json() else { return };
-        let Some(write) = self.pr_write().filter(|w| !w.saving) else { return };
+        let Some(write) = self.pr_write().filter(|w| !w.title_saving) else { return };
         let Some(input) = write.title.clone() else { return };
         let title = input.read(cx).value().trim().to_owned();
         if title.is_empty() || Some(&title) == current.as_ref() {
@@ -1474,7 +1476,7 @@ impl Workspace {
             cx.notify();
             return;
         }
-        write.saving = true;
+        write.title_saving = true;
         payload["title"] = json!(title);
         self.run_pr_write(
             "pullRequests.update",
@@ -1486,7 +1488,7 @@ impl Workspace {
             // A refused title stays in the editor to try again.
             |this, key, ok, _, _| {
                 if let Some(write) = this.pr_write_of(key) {
-                    write.saving = false;
+                    write.title_saving = false;
                     if ok {
                         write.title = None;
                     }
@@ -1496,7 +1498,7 @@ impl Workspace {
     }
 
     fn cancel_pr_title_edit(&mut self, cx: &mut Context<Self>) {
-        if let Some(write) = self.pr_write().filter(|w| !w.saving) {
+        if let Some(write) = self.pr_write().filter(|w| !w.title_saving) {
             write.title = None;
             cx.notify();
         }
@@ -1508,7 +1510,7 @@ impl Workspace {
         let writable = self.pr_panel_writable(&panel.reference.key());
         let write = &panel.write;
         let input = write.title.as_ref()?;
-        let saving = write.saving;
+        let saving = write.title_saving;
         let empty = input.read(cx).value().trim().is_empty();
         Some(
             v_flex()
