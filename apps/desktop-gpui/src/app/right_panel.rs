@@ -100,6 +100,8 @@ pub(super) enum Surface {
     Browser(String),
     Files,
     File(String),
+    /// A file sent with a message (`attachment:<id>`), which needs no workspace.
+    Attachment(super::files::AttachmentFile),
     /// A side chat's tab, by its thread id.
     SideChat(String),
     /// A pull request in the detail panel.
@@ -195,6 +197,12 @@ impl PanelState {
         }
         self.open = true;
         self.active = Some(surface);
+    }
+
+    /// `openAttachment`: like a file, an attachment's tab replaces the standalone Files tree.
+    fn open_attachment(&mut self, file: super::files::AttachmentFile) {
+        self.surfaces.retain(|s| *s != Surface::Files);
+        self.upsert(Surface::Attachment(file));
     }
 
     /// `navigateFolder`: `source` turns into the folder (the root is the Files tree), or with
@@ -870,6 +878,22 @@ impl Workspace {
         self.page = None;
         if let Some(panel) = self.user_panel_state() {
             panel.open_file(path);
+        }
+        self.sync_active_browser(window, cx);
+        cx.notify();
+    }
+
+    /// `openAttachment`: an uploaded attachment's tab on the open target's panel.
+    #[expect(dead_code, reason = "the timeline's file chips (timeline-1-D1) and Reopen Closed Tab open it")]
+    pub(super) fn open_attachment(
+        &mut self,
+        file: super::files::AttachmentFile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.page = None;
+        if let Some(panel) = self.user_panel_state() {
+            panel.open_attachment(file);
         }
         self.sync_active_browser(window, cx);
         cx.notify();
@@ -1584,6 +1608,7 @@ impl Workspace {
             }
             (Some(Surface::Files), _) => self.render_files_surface(None, width, window, cx),
             (Some(Surface::File(path)), _) => self.render_files_surface(Some(path.clone()), width, window, cx),
+            (Some(Surface::Attachment(file)), _) => self.render_attachment_surface(file, width, window, cx),
             (Some(Surface::SideChat(thread_id)), _) => self.render_side_chat_surface(thread_id, width, window, cx),
             (Some(Surface::PullRequest(reference)), _) => self.render_pull_request_surface(reference, window, cx),
             (Some(Surface::PullRequests), _) => self.render_linked_pull_requests(cx),
@@ -1949,6 +1974,14 @@ impl Workspace {
                     Icon::empty().path(asset).size(px(12.)).text_color(color).into_any_element()
                 })
             }
+            Surface::Attachment(file) => (
+                format!("attachment:{}", file.id).into(),
+                { file.name.rsplit(['/', '\\']).next().unwrap_or(&file.name).to_owned().into() },
+                {
+                    let (asset, color) = crate::file_icons::file_icon(&file.name, self.dark_theme(cx));
+                    Icon::empty().path(asset).size(px(12.)).text_color(color).into_any_element()
+                },
+            ),
             Surface::SideChat(thread_id) => {
                 let (title, state) = self.side_chat_tab(thread_id);
                 // Static dots: a side chat tab can stay open for a whole run.
@@ -3384,6 +3417,28 @@ mod tests {
         panel.navigate_folder(&Surface::Files, "src/a.rs", false);
         assert_eq!(panel.surfaces, [Surface::Diff, file("src/a.rs")], "an open target is focused, not duplicated");
         assert_eq!(panel.active, Some(file("src/a.rs")));
+    }
+
+    #[test]
+    fn attachments_open_as_their_own_tabs_without_a_workspace() {
+        use crate::app::files::AttachmentFile;
+        let file = || AttachmentFile { id: "a1".into(), name: "notes.txt".into(), mime: "text/plain".into(), size: 3 };
+        let mut panel = PanelState::default();
+        panel.upsert(Surface::Files);
+        panel.open_file("notes.txt".into());
+        panel.upsert(Surface::Files);
+        panel.open_attachment(file());
+        assert_eq!(
+            panel.surfaces,
+            [Surface::File("notes.txt".into()), Surface::Attachment(file())],
+            "an attachment is not the workspace file of its name, and replaces the standalone tree"
+        );
+        panel.upsert(Surface::Diff);
+        panel.open_attachment(file());
+        assert_eq!(panel.surfaces.len(), 3, "reopening an attachment focuses its tab");
+        assert_eq!(panel.active, Some(Surface::Attachment(file())));
+        panel.close(&Surface::Attachment(file()));
+        assert_eq!(panel.surfaces, [Surface::File("notes.txt".into()), Surface::Diff]);
     }
 
     #[test]

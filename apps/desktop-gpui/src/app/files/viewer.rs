@@ -8,10 +8,9 @@ use std::io::Read as _;
 
 use gpui_kit::{AppContext as _, Context, Hsla, Window};
 use serde::Serialize;
-use serde_json::Value;
 
 use super::FileKey;
-use super::document::{css_hex, mint_asset_url};
+use super::document::css_hex;
 use crate::app::Workspace;
 use crate::theme::Tokens;
 
@@ -248,12 +247,11 @@ impl Workspace {
         self.build_view(key, builder, None, window, cx);
     }
 
-    /// What signs the file's URL: the environment's current connection and the resource the
-    /// viewer opened with.
-    fn viewer_source(&self, key: &FileKey) -> Option<(crate::rpc::RpcClient, String, Value)> {
-        let resource = self.files.documents.viewer_resource(key)?.clone();
-        let (client, endpoint) = self.file_connection(key)?;
-        Some((client, endpoint.http_base, resource))
+    /// How the file is read: signed with the environment's current connection and the resource
+    /// the viewer opened with, or a draft's bytes.
+    fn viewer_source(&self, key: &FileKey) -> Option<super::asset::Fetch> {
+        let resource = self.files.documents.viewer_resource(key).cloned();
+        self.file_fetch(key, resource, false)
     }
 
     /// The theme for `key`'s page as it is built, which later frames compare against.
@@ -275,14 +273,14 @@ impl Workspace {
 /// The file's bytes and the `fileRevision` they were signed at, or the message the page shows.
 async fn fetch_document(
     spec: &ViewerSpec,
-    source: Option<(crate::rpc::RpcClient, String, Value)>,
+    source: Option<super::asset::Fetch>,
 ) -> Result<(Vec<u8>, Option<String>), String> {
-    let (client, http_base, resource) = source.ok_or(spec.unsigned)?;
-    let (url, revision) = mint_asset_url(client, http_base, resource).await.map_err(|_| spec.unsigned)?;
-    match super::asset::fetch_bounded(url, spec.limit, spec.too_large).await {
-        Ok(bytes) => Ok((bytes, revision)),
-        Err(error) if error == spec.too_large => Err(error),
-        Err(error) => Err(spec.unavailable.map_or(error, str::to_owned)),
+    use super::asset::FetchError;
+    match source.ok_or(spec.unsigned)?.read(spec.limit, spec.too_large).await {
+        Ok(read) => Ok(read),
+        Err(FetchError::Unsigned) => Err(spec.unsigned.to_owned()),
+        Err(FetchError::Failed(error)) if error == spec.too_large => Err(error),
+        Err(FetchError::Failed(error)) => Err(spec.unavailable.map_or(error, str::to_owned)),
     }
 }
 

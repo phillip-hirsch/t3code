@@ -160,7 +160,7 @@ mod tests {
     use crate::app::files::Checkout;
 
     fn key(path: &str) -> FileKey {
-        FileKey { checkout: Checkout { env: "env".into(), cwd: "/repo".into() }, path: path.into() }
+        FileKey::new(Checkout { env: "env".into(), cwd: "/repo".into() }, path.into())
     }
 
     fn view(page: u32) -> ViewerMessage {
@@ -206,7 +206,7 @@ mod tests {
             Some(&PdfPosition { page: 2, offset: 12.5, zoom: None, left: 0., width: Some(600.), ratios: vec![1.5] })
         );
         // The same path on another checkout is another file.
-        let other = FileKey { checkout: Checkout { env: "other".into(), cwd: "/repo".into() }, path: "a.pdf".into() };
+        let other = FileKey::new(Checkout { env: "other".into(), cwd: "/repo".into() }, "a.pdf".into());
         assert_eq!(positions.get(&other), None);
 
         for index in 0..MAX_POSITIONS {

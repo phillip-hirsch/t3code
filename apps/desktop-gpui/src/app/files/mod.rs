@@ -4,6 +4,7 @@
 
 mod archive;
 mod asset;
+mod attachment;
 mod chrome;
 mod crumbs;
 mod database;
@@ -24,6 +25,7 @@ use std::collections::HashMap;
 
 use gpui_kit::{Entity, SharedString};
 
+pub(super) use attachment::AttachmentFile;
 pub(super) use logic::is_image;
 pub(super) use overlay::{FileOverlay, OverlayMode};
 pub(super) use tree::MentionDrag;
@@ -42,6 +44,36 @@ pub(super) struct Checkout {
 pub(super) struct FileKey {
     pub checkout: Checkout,
     pub path: String,
+    pub origin: Origin,
+}
+
+impl FileKey {
+    /// `path` in the checkout.
+    pub(super) fn new(checkout: Checkout, path: String) -> Self {
+        Self { checkout, path, origin: Origin::Workspace }
+    }
+
+    pub(super) fn in_workspace(&self) -> bool {
+        self.origin == Origin::Workspace
+    }
+}
+
+/// Where a previewed file's bytes come from. An attachment's key holds no checkout path: its
+/// `path` is the name its viewers read the kind from (`attachment::preview_path`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) enum Origin {
+    Workspace,
+    /// An uploaded attachment on the key's environment, read through its `attachment` asset.
+    Attachment {
+        id: SharedString,
+        name: SharedString,
+        mime: SharedString,
+        size: u64,
+    },
+    /// A draft's attachment, by its local id: its bytes are on this machine.
+    Draft {
+        local_id: SharedString,
+    },
 }
 
 /// `useActiveProjectTarget`: the open thread's or draft's checkout and project.
@@ -71,6 +103,11 @@ pub(super) struct FilesState {
     html_source: bool,
     table_source: bool,
     mermaid_source: bool,
+    /// Attachment previews showing their source: each starts rendered (`AttachmentFilePreview`'s
+    /// own `rendered` state), apart from the preferences above.
+    attachment_source: std::collections::HashSet<FileKey>,
+    /// Files whose Save file is fetching them (`saving`).
+    saving: std::collections::HashSet<FileKey>,
     /// PDFs, Office files, rendered HTML and media in native views, and PDF reading positions.
     documents: document::Documents,
     /// Parsed documents and archives.

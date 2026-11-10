@@ -120,6 +120,20 @@ fn media_adopt_script(url: &str) -> String {
 const MEDIA_PAUSE_SCRIPT: &str = "window.t3Media&&window.t3Media.pause()";
 
 impl Documents {
+    /// Records that `key`'s view is on screen this frame: in the panel, or a draft's in its dialog.
+    fn mark_drawn(&mut self, key: &FileKey) {
+        if matches!(key.origin, super::Origin::Draft { .. }) {
+            self.dialog = Some((key.clone(), self.frame));
+        } else {
+            self.drawn = Some(key.clone());
+        }
+    }
+
+    /// The draft document a dialog drew last frame, if it is still open.
+    fn dialog_view(&self, dialog_open: bool) -> Option<&FileKey> {
+        self.dialog.as_ref().filter(|(_, frame)| dialog_open && frame + 1 >= self.frame).map(|(key, _)| key)
+    }
+
     /// Drops `key`'s view, so its next draw builds it again.
     pub(super) fn forget(&mut self, key: &FileKey) {
         self.views.remove(key);
@@ -131,9 +145,9 @@ impl Documents {
     }
 
     /// Marks `key`'s viewer page as starting, with the resource it reads and its listeners.
-    pub(super) fn begin_viewer(&mut self, key: &FileKey, resource: Value, tasks: Vec<Task<()>>) {
+    pub(super) fn begin_viewer(&mut self, key: &FileKey, resource: Option<Value>, tasks: Vec<Task<()>>) {
         if let Some(doc) = self.views.get_mut(key) {
-            doc.resource = Some(resource);
+            doc.resource = resource;
             doc._viewer = tasks;
             doc._task = Some(Task::ready(()));
         }
@@ -176,6 +190,9 @@ pub(super) struct Documents {
     views: HashMap<FileKey, DocView>,
     /// The document drawn this frame.
     drawn: Option<FileKey>,
+    /// The draft attachment's document its preview dialog drew, and when. Dialogs draw after the
+    /// workspace syncs its views, so this one shows from the next frame while the dialog stays.
+    dialog: Option<(FileKey, u64)>,
     frame: u64,
     /// PDF reading positions, kept after a viewer closes.
     pub(super) pdf_positions: super::pdf::Positions,
@@ -300,6 +317,8 @@ fn mermaid_page(source: &str, colors: &DiagramColors) -> String {
 
 const FONT_MAX_BYTES: u64 = 10 * 1024 * 1024;
 const FONT_UNSUPPORTED: &str = "The font is damaged or unsupported.";
+const FONT_TOO_LARGE: &str = "Font previews are limited to 10 MB.";
+
 const FONT_SCHEME: &str = "t3font";
 /// wry serves a custom protocol at `http://<name>.localhost` on Windows and `<name>://localhost` elsewhere.
 #[cfg(windows)]
@@ -371,15 +390,19 @@ pub(super) async fn mint_asset_url(
 impl Workspace {
     /// `workspaceAssetResource`: a draft reads `draft-workspace-file`; a thread reads `kind`
     /// inside the workspace, else the host `media-file`.
-    pub(super) fn asset_resource(&self, key: &FileKey, kind: &'static str) -> Value {
+    /// An attachment reads its `attachment` asset, `None` for a draft not uploaded yet.
+    pub(super) fn asset_resource(&self, key: &FileKey, kind: &'static str) -> Option<Value> {
+        if !key.in_workspace() {
+            return self.attachment_resource(key, false);
+        }
         let absolute = logic::absolute_path(&key.checkout.cwd, &key.path);
-        match &self.target {
+        Some(match &self.target {
             Some(Target::Thread { id: thread_id, .. }) => {
                 let inside = !logic::is_host_path(&key.path);
                 json!({"_tag": if inside { kind } else { "media-file" }, "threadId": thread_id, "path": absolute})
             }
             _ => json!({"_tag": "draft-workspace-file", "cwd": key.checkout.cwd, "path": absolute}),
-        }
+        })
     }
 
     /// The document's view, built on first draw and reloaded when a workspace mutation gives
@@ -392,9 +415,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let tokens = *crate::theme::tokens(cx);
-        let mutation = self.files.mutation.clone();
+        let mutation = self.key_mutation(key);
         let documents = &mut self.files.documents;
-        documents.drawn = Some(key.clone());
+        documents.mark_drawn(key);
         let state = documents.views.entry(key.clone()).or_insert_with(|| DocView::new(kind, mutation.clone(), 0));
         if state.view.is_none() && state._task.is_none() && state.failed.is_none() {
             match viewer_of(kind) {
@@ -417,11 +440,11 @@ impl Workspace {
             (None, Some(error)) if kind == FileKind::Font => {
                 super::chrome::no_preview(format!("{error} Save it to open in another app."), &tokens)
             }
-            (None, Some(_)) if kind == FileKind::Video => {
+            (None, Some(_)) if kind == FileKind::Video && key.in_workspace() => {
                 let url = state.url.clone();
                 self.render_video_failure(key, url, menu, &tokens, cx)
             }
-            (None, Some(_)) if kind == FileKind::Audio => {
+            (None, Some(_)) if matches!(kind, FileKind::Audio | FileKind::Video) => {
                 let retry = key.clone();
                 let button = super::chrome::retry_button("document-retry", &tokens).on_click(cx.listener(
                     move |this, _, _, cx| {
@@ -429,7 +452,8 @@ impl Workspace {
                         cx.notify();
                     },
                 ));
-                super::chrome::failure("Unable to load audio.", Some(button), &tokens)
+                let message = if kind == FileKind::Audio { "Unable to load audio." } else { "Unable to load video." };
+                super::chrome::failure(message, Some(button), &tokens)
             }
             (None, Some(_)) => {
                 let retry = key.clone();
@@ -470,7 +494,7 @@ impl Workspace {
         }
     }
 
-    fn document_resource(&self, key: &FileKey, kind: FileKind) -> Value {
+    fn document_resource(&self, key: &FileKey, kind: FileKind) -> Option<Value> {
         self.asset_resource(key, if kind == FileKind::Html { "workspace-file" } else { "media-file" })
     }
 
@@ -568,6 +592,8 @@ impl Workspace {
                 state.failed = Some("playback".into());
                 cx.notify();
             }
+            // An attachment's video has no `MediaActions` menu (`AttachmentFilePreview`).
+            MediaMessage::Menu { .. } if !key.in_workspace() => {}
             MediaMessage::Menu { x, y } => {
                 let Some(view) = &state.view else { return };
                 let origin = view.read(cx).bounds().origin;
@@ -578,8 +604,16 @@ impl Workspace {
     }
 
     fn start_document(&mut self, key: FileKey, kind: FileKind, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((client, endpoint)) = self.file_connection(&key) else { return };
-        let resource = self.document_resource(&key, kind);
+        // A draft's font is on this machine; every other page loads a signed URL.
+        let local = self.draft_bytes(&key).filter(|_| kind == FileKind::Font);
+        let fetch = match local {
+            Some(bytes) => super::asset::Fetch::Local(bytes),
+            None => {
+                let Some((client, endpoint)) = self.file_connection(&key) else { return };
+                let Some(resource) = self.document_resource(&key, kind) else { return };
+                super::asset::Fetch::Signed { client, http_base: endpoint.http_base, resource }
+            }
+        };
         let tokens = *crate::theme::tokens(cx);
         let (background, dark) = (css_hex(tokens.background), self.dark_theme(cx));
         let foreground = css_hex(tokens.foreground);
@@ -605,18 +639,28 @@ impl Workspace {
             })
         });
         let task = cx.spawn_in(window, async move |this, cx| {
-            let minted =
-                mint_asset_url(client, endpoint.http_base, resource).await.map_err(|e| logic::error_message(&e));
-            let font = match (&minted, kind) {
-                (Ok((url, _)), FileKind::Font) => Some(
-                    super::asset::fetch_bounded(url.clone(), FONT_MAX_BYTES, "Font previews are limited to 10 MB.")
-                        .await
-                        .and_then(|bytes| {
-                            font_mime(&bytes).map(|mime| (bytes, mime)).ok_or_else(|| FONT_UNSUPPORTED.to_owned())
-                        }),
-                ),
-                _ => None,
+            let (minted, font) = match fetch {
+                super::asset::Fetch::Local(bytes) => {
+                    let font = super::asset::Fetch::Local(bytes).read(FONT_MAX_BYTES, FONT_TOO_LARGE).await;
+                    (Ok((String::new(), None)), Some(font.map(|(bytes, _)| bytes).map_err(|error| error.to_string())))
+                }
+                super::asset::Fetch::Signed { client, http_base, resource } => {
+                    let minted =
+                        mint_asset_url(client, http_base, resource).await.map_err(|e| logic::error_message(&e));
+                    let font = match (&minted, kind) {
+                        (Ok((url, _)), FileKind::Font) => {
+                            Some(super::asset::fetch_bounded(url.clone(), FONT_MAX_BYTES, FONT_TOO_LARGE).await)
+                        }
+                        _ => None,
+                    };
+                    (minted, font)
+                }
             };
+            let font = font.map(|read| {
+                read.and_then(|bytes| {
+                    font_mime(&bytes).map(|mime| (bytes, mime)).ok_or_else(|| FONT_UNSUPPORTED.to_owned())
+                })
+            });
             let prepared = match (minted, font) {
                 (Ok(_), Some(Err(error))) | (Err(error), _) => Err(error),
                 (Ok((url, revision)), font) => {
@@ -726,9 +770,9 @@ impl Workspace {
     ) -> AnyElement {
         let tokens = *crate::theme::tokens(cx);
         let dark = self.dark_theme(cx);
-        let mutation = self.files.mutation.clone();
+        let mutation = self.key_mutation(key);
         let documents = &mut self.files.documents;
-        documents.drawn = Some(key.clone());
+        documents.mark_drawn(key);
         if let Some(source) = source {
             documents.views.remove(key);
             let colors = DiagramColors {
@@ -776,7 +820,7 @@ impl Workspace {
             return;
         }
         let Some((client, endpoint)) = self.file_connection(&key) else { return };
-        let resource = self.document_resource(&key, kind);
+        let Some(resource) = self.document_resource(&key, kind) else { return };
         let tokens = *crate::theme::tokens(cx);
         let (background, dark) = (css_hex(tokens.background), self.dark_theme(cx));
         let request_key = key.clone();
@@ -816,12 +860,17 @@ impl Workspace {
     /// drew; like the browser's views, a GPUI overlay hides it. Views not drawn lately close.
     pub(in crate::app) fn sync_document_views(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let covered = self.browser_covered(window, cx);
+        let dialog_open = window.has_active_dialog(cx);
+        let menu_open = self.files.menu_open;
         let documents = &mut self.files.documents;
         documents.frame += 1;
         let frame = documents.frame;
         let drawn = documents.drawn.take();
+        let dialog = documents.dialog_view(dialog_open).cloned();
         for (key, doc) in &mut documents.views {
-            let drawn = drawn.as_ref() == Some(key);
+            let in_dialog = dialog.as_ref() == Some(key);
+            let in_panel = drawn.as_ref() == Some(key);
+            let drawn = in_panel || in_dialog;
             if drawn {
                 doc.used = frame;
             }
@@ -830,7 +879,8 @@ impl Workspace {
                 let _ = view.read(cx).raw().evaluate_script(MEDIA_PAUSE_SCRIPT);
             }
             doc.drawn = drawn;
-            let shown = drawn && !covered;
+            // The dialog covers the panel, but its own document sits on top of it.
+            let shown = (in_panel && !covered) || (in_dialog && !menu_open);
             if let Some(view) = doc.view.as_ref().filter(|_| doc.shown != shown) {
                 doc.shown = shown;
                 let _ = view.read(cx).set_visible(shown);
@@ -848,7 +898,7 @@ impl Workspace {
     pub(super) fn open_file_in_browser(&mut self, key: &FileKey, window: &mut Window, cx: &mut Context<Self>) {
         let Some((client, endpoint)) = self.file_connection(key) else { return };
         let Some(thread_id) = self.preview_thread_id().map(str::to_owned) else { return };
-        let resource = self.asset_resource(key, "workspace-file");
+        let Some(resource) = self.asset_resource(key, "workspace-file") else { return };
         cx.spawn_in(window, async move |this, cx| match mint_asset_url(client, endpoint.http_base, resource).await {
             Ok((url, _)) => {
                 let _ = this.update_in(cx, |this, window, cx| this.open_preview_tab(thread_id, Some(url), window, cx));

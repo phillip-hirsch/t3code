@@ -119,7 +119,92 @@ pub(super) async fn fetch_bounded(url: String, limit: u64, too_large: &'static s
         .map_err(|error| error.to_string())?
 }
 
+/// Where a file's bytes are read from.
+pub(super) enum Fetch {
+    /// Signed by `assets.createUrl` on the file's environment, then read over HTTP.
+    Signed { client: crate::rpc::RpcClient, http_base: String, resource: Value },
+    /// A draft attachment's bytes, already on this machine.
+    Local(bytes::Bytes),
+}
+
+/// Why a [`Fetch`] read nothing: the URL could not be signed, or the read failed with a message.
+#[derive(Debug, PartialEq)]
+pub(super) enum FetchError {
+    Unsigned,
+    Failed(String),
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsigned => f.write_str("Reconnect to the environment and try again."),
+            Self::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
+impl Fetch {
+    /// The bytes, refused past `limit` with `too_large`, and the `fileRevision` they were signed at.
+    pub(super) async fn read(
+        self,
+        limit: u64,
+        too_large: &'static str,
+    ) -> Result<(Vec<u8>, Option<String>), FetchError> {
+        match self {
+            Self::Local(bytes) if bytes.len() as u64 > limit => Err(FetchError::Failed(too_large.to_owned())),
+            Self::Local(bytes) => Ok((bytes.to_vec(), None)),
+            Self::Signed { client, http_base, resource } => {
+                let (url, revision) =
+                    document::mint_asset_url(client, http_base, resource).await.map_err(|_| FetchError::Unsigned)?;
+                let bytes = fetch_bounded(url, limit, too_large).await.map_err(FetchError::Failed)?;
+                Ok((bytes, revision))
+            }
+        }
+    }
+
+    /// At most the first `limit` bytes (`Range: bytes=0-…`, as `AttachmentFilePreview` asks).
+    pub(super) async fn head(self, limit: usize) -> Result<Vec<u8>, FetchError> {
+        let url = match self {
+            Self::Local(bytes) => return Ok(bytes[..bytes.len().min(limit)].to_vec()),
+            Self::Signed { client, http_base, resource } => {
+                document::mint_asset_url(client, http_base, resource).await.map_err(|_| FetchError::Unsigned)?.0
+            }
+        };
+        let failed = || FetchError::Failed("The file could not be loaded. Reconnect and try again.".to_owned());
+        crate::runtime()
+            .spawn(async move {
+                let range = format!("bytes=0-{}", limit.saturating_sub(1));
+                let mut response = http().get(url).header(reqwest::header::RANGE, range).send().await.ok()?;
+                if !response.status().is_success() {
+                    return None;
+                }
+                let mut body = Vec::new();
+                while body.len() < limit {
+                    let Some(chunk) = response.chunk().await.ok()? else { break };
+                    body.extend_from_slice(&chunk[..chunk.len().min(limit - body.len())]);
+                }
+                Some(body)
+            })
+            .await
+            .ok()
+            .flatten()
+            .ok_or_else(failed)
+    }
+}
+
 impl Workspace {
+    /// How `key`'s bytes are read: a workspace file through `workspace` (its asset for this read),
+    /// an uploaded attachment through its `attachment` asset (`download` for Save file), a
+    /// draft's from memory. `None` while the file's environment is not connected.
+    pub(super) fn file_fetch(&self, key: &FileKey, workspace: Option<Value>, download: bool) -> Option<Fetch> {
+        if let Some(bytes) = self.draft_bytes(key) {
+            return Some(Fetch::Local(bytes));
+        }
+        let resource = if key.in_workspace() { workspace? } else { self.attachment_resource(key, download)? };
+        let (client, endpoint) = self.file_connection(key)?;
+        Some(Fetch::Signed { client, http_base: endpoint.http_base, resource })
+    }
+
     /// The resource a document reads: a draft's `draft-workspace-file`, else the thread's
     /// `media-file` (an attachment download for files without a viewer).
     fn document_asset(&self, key: &FileKey, attachment: bool) -> Value {
@@ -138,21 +223,17 @@ impl Workspace {
 
     fn load_asset(&mut self, key: &FileKey, kind: FileKind, window: &mut Window, cx: &mut Context<Self>) {
         let Some((limit, too_large)) = read_limit(kind) else { return };
-        let Some((client, endpoint)) = self.file_connection(key) else { return };
-        let resource = self.document_asset(key, false);
+        let Some(fetch) = self.file_fetch(key, Some(self.document_asset(key, false)), false) else { return };
         let request_key = key.clone();
         let name = logic::file_name(&key.path).to_owned();
         let task = cx.spawn_in(window, async move |this, cx| {
-            let fetched = match document::mint_asset_url(client, endpoint.http_base, resource).await {
-                Ok((url, _)) => fetch_bounded(url, limit, too_large).await,
-                Err(_) => Err("Reconnect to the environment and try again.".to_owned()),
-            };
-            let parsed = match fetched {
-                Ok(bytes) => {
+            let parsed = match fetch.read(limit, too_large).await {
+                Err(FetchError::Unsigned) => Err("Reconnect to the environment and try again.".to_owned()),
+                Err(FetchError::Failed(error)) => Err(error),
+                Ok((bytes, _)) => {
                     let size = bytes.len() as u64;
                     cx.background_executor().spawn(async move { parse(kind, &name, &bytes).map(|p| (p, size)) }).await
                 }
-                Err(error) => Err(error),
             };
             let _ = this.update_in(cx, |this, _window, cx| {
                 let mut first_rows = false;
@@ -180,7 +261,7 @@ impl Workspace {
         });
         self.files.assets.states.insert(
             key.clone(),
-            AssetState { load: AssetLoad::Loading, mutation: self.files.mutation.clone(), _task: Some(task) },
+            AssetState { load: AssetLoad::Loading, mutation: self.key_mutation(key), _task: Some(task) },
         );
     }
 
@@ -194,22 +275,37 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((client, endpoint)) = self.file_connection(key) else { return };
-        let resource = self.document_asset(key, true);
+        let Some(fetch) = self.file_fetch(key, Some(self.document_asset(key, true)), true) else {
+            let error = Notification::error("Reconnect to the environment and try again.").title(failure);
+            return window.push_notification(error, cx);
+        };
         let directory = std::env::home_dir().map(|home| home.join("Downloads")).unwrap_or_default();
-        let picked = cx.prompt_for_new_path(&directory, Some(logic::file_name(&key.path)));
-        cx.spawn_in(window, async move |_, cx| {
+        let name = match &key.origin {
+            super::Origin::Attachment { name, .. } => name.to_string(),
+            super::Origin::Draft { .. } | super::Origin::Workspace => {
+                self.draft_name(key).unwrap_or_else(|| logic::file_name(&key.path).to_owned())
+            }
+        };
+        let picked = cx.prompt_for_new_path(&directory, Some(&name));
+        let saving = key.clone();
+        cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(path))) = picked.await else { return };
-            let written = match document::mint_asset_url(client, endpoint.http_base, resource).await {
-                Ok((url, _)) => match fetch_bounded(url, u64::MAX, "").await {
-                    Ok(bytes) => {
-                        let write = async move { std::fs::write(&path, bytes).map_err(|error| error.to_string()) };
-                        cx.background_executor().spawn(write).await
-                    }
-                    Err(error) => Err(error),
-                },
-                Err(_) => Err("Reconnect to the environment and try again.".to_owned()),
+            let _ = this.update(cx, |this, cx| {
+                this.files.saving.insert(saving.clone());
+                cx.notify();
+            });
+            let written = match fetch.read(u64::MAX, "").await {
+                Ok((bytes, _)) => {
+                    let write = async move { std::fs::write(&path, bytes).map_err(|error| error.to_string()) };
+                    cx.background_executor().spawn(write).await
+                }
+                Err(FetchError::Failed(error)) => Err(error),
+                Err(FetchError::Unsigned) => Err("Reconnect to the environment and try again.".to_owned()),
             };
+            let _ = this.update(cx, |this, cx| {
+                this.files.saving.remove(&saving);
+                cx.notify();
+            });
             let _ = cx.update(|window, cx| match written {
                 Err(error) => window.push_notification(Notification::error(error).title(failure), cx),
                 Ok(()) => {
@@ -231,11 +327,6 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let tokens = *crate::theme::tokens(cx);
-        let mutation = self.files.mutation.clone();
-        let stale = self.files.assets.states.get(key).is_none_or(|state| state.mutation != mutation);
-        if stale && read_limit(kind).is_some() {
-            self.load_asset(key, kind, window, cx);
-        }
         let name = logic::file_name(&key.path).to_owned();
         let save_key = key.clone();
         let header = h_flex()
@@ -276,7 +367,7 @@ impl Workspace {
         v_flex().flex_1().min_h_0().overflow_hidden().child(header).child(body).into_any_element()
     }
 
-    fn render_asset_body(
+    pub(super) fn render_asset_body(
         &mut self,
         key: &FileKey,
         kind: FileKind,
@@ -286,6 +377,11 @@ impl Workspace {
     ) -> AnyElement {
         if kind == FileKind::Font || matches!(kind, FileKind::Office(office) if office != Office::Ipynb) {
             return self.render_document(key, kind, window, cx);
+        }
+        let mutation = self.key_mutation(key);
+        let stale = self.files.assets.states.get(key).is_none_or(|state| state.mutation != mutation);
+        if stale && read_limit(kind).is_some() {
+            self.load_asset(key, kind, window, cx);
         }
         if read_limit(kind).is_none() {
             let extension = logic::file_name(&key.path)

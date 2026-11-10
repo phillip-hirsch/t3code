@@ -52,7 +52,7 @@ impl Workspace {
     ) -> Option<bool> {
         let Some(Surface::File(path)) = self.active_surface().cloned() else { return None };
         let checkout = self.project_target()?.checkout;
-        let (absolute, file_manager) = self.file_open_in_target(&FileKey { checkout, path });
+        let (absolute, file_manager) = self.file_open_in_target(&FileKey::new(checkout, path));
         Some(self.open_file_in_preferred_editor(absolute, file_manager, window, cx))
     }
 

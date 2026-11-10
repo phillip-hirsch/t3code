@@ -123,6 +123,15 @@ impl Attachment {
         self.image.clone()
     }
 
+    /// The finished upload's environment and attachment id; `Err` holds why an upload failed.
+    pub(super) fn uploaded(&self) -> Option<Result<(&SharedString, &str), &str>> {
+        match (&self.upload, &self.upload_env) {
+            (Upload::Ready(id), Some(env)) => Some(Ok((env, id))),
+            (Upload::Failed(reason), _) => Some(Err(reason)),
+            _ => None,
+        }
+    }
+
     /// Starts a new upload to `environment`, handing back a finished one (with the
     /// environment that holds it) for deletion.
     fn begin_upload(&mut self, environment: Option<SharedString>) -> Option<(SharedString, String)> {
