@@ -17,7 +17,7 @@ mod session;
 pub(in crate::app) use self::grid::TerminalTheme;
 pub(in crate::app) use self::panel::StoredGroup;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -146,6 +146,8 @@ pub(super) struct Terminals {
     /// By environment, then thread, in server order; `None` until the first snapshot. Thread ids
     /// repeat across environments, and each environment's stream reports only its own.
     summaries: Option<HashMap<String, HashMap<String, Vec<Summary>>>>,
+    /// Environments whose current metadata stream has sent its snapshot.
+    listed_now: HashSet<String>,
     /// The terminal to focus once it mounts, by drawer: another thread's request never lands.
     focus_pending: Option<(DrawerKey, String)>,
     /// Right-panel terminal tabs, by surface id. A change sets `panel_changed`, so the panel layout
@@ -394,12 +396,31 @@ impl Terminals {
         layout::terminal_label(terminal_id, summary.map(|s| s.label.as_str()))
     }
 
+    /// A terminal id no drawer, panel tab or server session of the thread uses yet. Until a
+    /// readable environment's current stream lists its terminals, the id gets a UUID suffix so it
+    /// cannot land on an unseen session (`allocateTerminalId`).
+    fn next_id(&self, key: &DrawerKey, readable: bool) -> String {
+        let drawer_ids = self.drawer_ref(key).map(|d| d.terminal_ids.clone()).unwrap_or_default();
+        let panel_ids = self.panel_ids(key);
+        let known = self.summaries(key).iter().map(|s| s.terminal_id.as_str());
+        let listed = readable && key.env.as_deref().is_some_and(|env| self.listed_now.contains(env));
+        let suffix = (!listed).then(super::new_id);
+        let taken = known.chain(drawer_ids.iter().map(String::as_str)).chain(panel_ids.iter().map(String::as_str));
+        layout::next_terminal_id(taken, suffix.as_deref())
+    }
+
+    /// `environment`'s metadata stream (re)started: its old list may miss terminals made since.
+    fn metadata_restarted(&mut self, environment: &str) {
+        self.listed_now.remove(environment);
+    }
+
     /// Applies one element of `environment`'s `subscribeTerminalMetadata`; a snapshot replaces
     /// only that environment's threads.
     fn apply_metadata(&mut self, environment: &SharedString, event: &Value) {
         let all = self.summaries.get_or_insert_default().entry(environment.to_string()).or_default();
         match event["type"].as_str() {
             Some("snapshot") => {
+                self.listed_now.insert(environment.to_string());
                 all.clear();
                 for (thread_id, summary) in
                     event["terminals"].as_array().into_iter().flatten().filter_map(Summary::parse)
@@ -551,6 +572,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<()> {
+        self.terminals.metadata_restarted(&environment);
         let stream = client.stream("subscribeTerminalMetadata", json!({}));
         let apply_environment = environment.clone();
         let task = Self::pump(
@@ -692,17 +714,9 @@ impl Workspace {
         self.open_terminal_session(key, terminal_id, launch, then_write, cx)
     }
 
-    /// A terminal id no drawer, panel tab or server session of the thread uses yet.
     fn next_terminal_id(&self, key: &DrawerKey) -> String {
-        let drawer_ids = self.terminals.drawer_ref(key).map(|d| d.terminal_ids.clone()).unwrap_or_default();
-        let panel_ids = self.terminals.panel_ids(key);
-        let known = self.terminals.summaries(key).iter().map(|s| s.terminal_id.as_str());
-        // Until its environment lists its terminals, a fresh id cannot collide with an unseen one.
-        let listed =
-            key.env.as_deref().is_some_and(|env| self.terminals.summaries.iter().any(|all| all.contains_key(env)));
-        let suffix = (!listed).then(super::new_id);
-        let taken = known.chain(drawer_ids.iter().map(String::as_str)).chain(panel_ids.iter().map(String::as_str));
-        layout::next_terminal_id(taken, suffix.as_deref())
+        let readable = key.env.as_deref().is_some_and(|env| self.env_grants(env, "terminal:read"));
+        self.terminals.next_id(key, readable)
     }
 
     /// `terminal.open` (then an optional write) for a terminal already placed; resolves to
@@ -1756,6 +1770,24 @@ mod tests {
         assert_eq!(terminals.summaries(&a).iter().map(|s| s.cwd.as_str()).collect::<Vec<_>>(), ["/term-1", "/term-3"]);
         assert_eq!(terminals.drawer_reuse(&b).as_deref(), Some("term-2"));
         assert_eq!(terminals.sole_reporter("t"), None, "two environments list it");
+    }
+
+    #[test]
+    fn new_ids_avoid_unseen_sessions_until_a_readable_current_snapshot() {
+        let key = DrawerKey::new("env", "t");
+        let snapshot = json!({"type": "snapshot", "terminals": [{"threadId": "t", "terminalId": "term-1", "hasRunningSubprocess": false, "label": ""}]});
+        let unique = |id: String, number: &str| id.strip_prefix(number).is_some_and(|rest| rest.len() == 37);
+        let mut terminals = Terminals::default();
+        assert!(unique(terminals.next_id(&key, true), "term-1"), "nothing listed yet");
+        terminals.apply_metadata(&"env".into(), &snapshot);
+        assert_eq!(terminals.next_id(&key, true), "term-2");
+        assert!(unique(terminals.next_id(&key, false), "term-2"), "without terminal:read");
+        terminals.metadata_restarted("env");
+        assert!(unique(terminals.next_id(&key, true), "term-2"), "a reconnect's list is not in yet");
+        terminals.apply_metadata(&"other".into(), &snapshot);
+        assert!(unique(terminals.next_id(&key, true), "term-2"), "another environment's list");
+        terminals.apply_metadata(&"env".into(), &snapshot);
+        assert_eq!(terminals.next_id(&key, true), "term-2");
     }
 
     #[test]
