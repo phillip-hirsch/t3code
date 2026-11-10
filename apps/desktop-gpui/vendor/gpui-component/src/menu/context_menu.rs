@@ -6,12 +6,33 @@ use std::{
 use gpui::{
     Anchor, AnyElement, App, Bounds, Context, DismissEvent, Element, ElementId, Entity,
     FocusHandle, Focusable, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId,
-    InteractiveElement, IntoElement, LayoutId, LongPressEvent, MouseButton, MouseDownEvent,
-    ParentElement, Pixels, Point, Position, Style, StyleRefinement, Styled, Subscription,
-    TouchPhase, Window, anchored, deferred, div, px,
+    InteractiveElement, IntoElement, Keystroke, LayoutId, LongPressEvent, MouseButton,
+    MouseDownEvent, ParentElement, Pixels, Point, Position, Style, StyleRefinement, Styled,
+    Subscription, TouchPhase, Window, anchored, canvas, deferred, div, px,
 };
 
 use crate::{input::AnyInputState, menu::PopupMenu, root::WindowState};
+
+/// The keys that open the focused element's context menu, as a browser's
+/// `contextmenu` event does: the ContextMenu (Apps) key, or Shift+F10.
+pub fn opens_context_menu(keystroke: &Keystroke) -> bool {
+    let modifiers = &keystroke.modifiers;
+    if modifiers.control || modifiers.alt || modifiers.platform || modifiers.function {
+        return false;
+    }
+    match keystroke.key.as_str() {
+        "menu" => true,
+        "f10" => modifiers.shift,
+        _ => false,
+    }
+}
+
+/// What a trigger's keyboard opener needs from its last frame.
+struct KeyboardTarget {
+    shared_state: std::rc::Weak<RefCell<ContextMenuSharedState>>,
+    builder: Option<Rc<MenuBuilder>>,
+    bounds: Bounds<Pixels>,
+}
 
 /// A extension trait for adding a context menu to an element.
 pub trait ContextMenuExt: InteractiveElement + ParentElement + Styled {
@@ -19,6 +40,9 @@ pub trait ContextMenuExt: InteractiveElement + ParentElement + Styled {
     ///
     /// This will changed the element to be `relative` positioned, and add a child `ContextMenu` element.
     /// Because the `ContextMenu` element is positioned `absolute`, it will not affect the layout of the parent element.
+    ///
+    /// The menu also opens from the keyboard ([`opens_context_menu`]) while focus is on the
+    /// element or inside it, below its lower-left corner; closing it returns focus.
     #[track_caller]
     fn context_menu(
         mut self,
@@ -36,7 +60,54 @@ pub trait ContextMenuExt: InteractiveElement + ParentElement + Styled {
             .clone()
             .map(|id| ElementId::Name(format!("context-menu-{:?}", id).into()))
             .unwrap_or_else(|| ElementId::CodeLocation(*caller));
-        ContextMenu::new(id, self).menu(f)
+        let keyboard: Rc<RefCell<Option<KeyboardTarget>>> = Rc::default();
+        let target = keyboard.clone();
+        let element = self.on_key_down(move |event, window, cx| {
+            if !opens_context_menu(&event.keystroke) {
+                return;
+            }
+            let target = target.borrow();
+            let Some((shared_state, target)) = target
+                .as_ref()
+                .and_then(|target| Some((target.shared_state.upgrade()?, target)))
+            else {
+                return;
+            };
+            cx.stop_propagation();
+            open_menu_at_bounds(&shared_state, &target.builder, target.bounds, window, cx);
+        });
+        let mut menu = ContextMenu::new(id, element).menu(f);
+        menu.keyboard = Some(keyboard);
+        menu
+    }
+
+    /// Opens a menu the element builds itself (a right-click handler of its own) from the
+    /// keyboard, as [`ContextMenuExt::context_menu`] does: `open` gets the element's lower-left
+    /// corner while focus is on the element or inside it.
+    fn on_context_menu_key(
+        self,
+        open: impl Fn(Point<Pixels>, &mut Window, &mut App) + 'static,
+    ) -> Self
+    where
+        Self: Sized,
+    {
+        let bounds: Rc<Cell<Option<Bounds<Pixels>>>> = Rc::default();
+        let measured = bounds.clone();
+        self.child(
+            canvas(move |bounds, _, _| measured.set(Some(bounds)), |_, _, _, _| {})
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+        )
+        .on_key_down(move |event, window, cx| {
+            if !opens_context_menu(&event.keystroke) {
+                return;
+            }
+            let Some(bounds) = bounds.get() else { return };
+            cx.stop_propagation();
+            open(bounds.bottom_left(), window, cx);
+        })
     }
 }
 
@@ -50,6 +121,8 @@ pub struct ContextMenu<E: ParentElement + Styled + Sized> {
     // This is not in use, just for style refinement forwarding.
     _ignore_style: StyleRefinement,
     anchor: Anchor,
+    /// Filled each prepaint for the element's keyboard opener (`ContextMenuExt::context_menu`).
+    keyboard: Option<Rc<RefCell<Option<KeyboardTarget>>>>,
 }
 
 impl<E: ParentElement + Styled> ContextMenu<E> {
@@ -61,6 +134,7 @@ impl<E: ParentElement + Styled> ContextMenu<E> {
             menu: None,
             anchor: Anchor::TopLeft,
             _ignore_style: StyleRefinement::default(),
+            keyboard: None,
         }
     }
 
@@ -125,6 +199,9 @@ struct ContextMenuSharedState {
     selection_input: Option<AnyInputState>,
     open: bool,
     position: Point<Pixels>,
+    /// The bounds of the trigger the keyboard opened the menu from, which alone draws it: the
+    /// menu sits below the trigger, outside it, where a press position would be.
+    keyboard_bounds: Option<Bounds<Pixels>>,
     /// Registered on this element's dispatch node every frame and never
     /// focused, so the menu can resolve its shortcut hints against the
     /// trigger's key contexts on the frame it opens: GPUI looks a handle up in
@@ -156,6 +233,7 @@ impl Default for ContextMenuState {
                 selection_input: None,
                 open: false,
                 position: Default::default(),
+                keyboard_bounds: None,
                 trigger_focus_handle: None,
                 _subscription: None,
             })),
@@ -354,8 +432,21 @@ impl<E: ParentElement + Styled + IntoElement + 'static> Element for ContextMenu<
         {
             window.set_focus_handle(trigger_focus, cx);
         }
-        let position = request_layout.shared_state.borrow().position;
-        request_layout.draws_menu.set(bounds.contains(&position));
+        let (position, keyboard_bounds) = {
+            let shared_state = request_layout.shared_state.borrow();
+            (shared_state.position, shared_state.keyboard_bounds)
+        };
+        request_layout.draws_menu.set(match keyboard_bounds {
+            Some(opened_from) => opened_from == bounds,
+            None => bounds.contains(&position),
+        });
+        if let Some(keyboard) = &self.keyboard {
+            *keyboard.borrow_mut() = Some(KeyboardTarget {
+                shared_state: Rc::downgrade(&request_layout.shared_state),
+                builder: self.menu.clone(),
+                bounds,
+            });
+        }
         if let Some(element) = &mut request_layout.element {
             element.prepaint(window, cx);
         }
@@ -414,6 +505,18 @@ impl<E: ParentElement + Styled + IntoElement + 'static> Element for ContextMenu<
 
 type MenuBuilder = dyn Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu;
 
+/// Builds the menu and shows it below the lower-left corner of the trigger at `bounds`.
+fn open_menu_at_bounds(
+    shared_state: &Rc<RefCell<ContextMenuSharedState>>,
+    builder: &Option<Rc<MenuBuilder>>,
+    bounds: Bounds<Pixels>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    open_menu(shared_state, builder, bounds.bottom_left(), window, cx);
+    shared_state.borrow_mut().keyboard_bounds = Some(bounds);
+}
+
 /// Builds the menu and shows it at `position`.
 fn open_menu(
     shared_state: &Rc<RefCell<ContextMenuSharedState>>,
@@ -455,6 +558,7 @@ fn open_menu(
         shared_state.selection_input = None;
         shared_state._subscription = None;
         shared_state.position = position;
+        shared_state.keyboard_bounds = None;
         shared_state.open = true;
     }
 

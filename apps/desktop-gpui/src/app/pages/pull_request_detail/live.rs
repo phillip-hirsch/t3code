@@ -678,6 +678,7 @@ impl Workspace {
                 let (close, middle, activate) = (reference.clone(), reference.clone(), reference.clone());
                 let (menu, dragged, onto) = (reference.clone(), reference.clone(), reference.clone());
                 let (close_key, activate_key) = (reference.clone(), reference.clone());
+                let (key_menu, key_view) = (reference.clone(), cx.weak_entity());
                 let [close_focus, title_focus] = self.pull_requests.tab_focus[&key].clone();
                 let close_visible = keyboard && close_focus.is_focused(window);
                 let (accent, foreground, muted) = (t.accent, t.foreground, t.muted);
@@ -769,6 +770,11 @@ impl Workspace {
                             this.open_pr_tab_menu(menu.clone(), event.position, window, cx);
                         }),
                     )
+                    // From the tab's title or close button, which take focus.
+                    .on_context_menu_key(move |position, window, cx| {
+                        let menu = key_menu.clone();
+                        let _ = key_view.update(cx, |this, cx| this.open_pr_tab_menu(menu, position, window, cx));
+                    })
                     .on_drag(TabDrag(dragged), |_, _, _, cx| cx.new(|_| Empty))
                     .drag_over::<TabDrag>(move |style, _, _, _| style.bg(Hsla { a: accent.a * 0.6, ..accent }))
                     .on_drop(cx.listener(move |this, drag: &TabDrag, _, cx| this.move_pr_tab(&drag.0, &onto, cx)))

@@ -26,7 +26,7 @@ use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as
 use gpui_kit::component::diff::{
     Diff, DiffChangeIndicator, DiffEvent, DiffFile, DiffHunkSeparator, DiffMode, DiffState,
 };
-use gpui_kit::component::menu::{DropdownMenu as _, MenuMetrics, PopupMenu, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, MenuMetrics, PopupMenu, PopupMenuItem};
 use gpui_kit::component::theme::Theme;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Selectable as _, Sizable as _, h_flex, v_flex};
@@ -2316,6 +2316,7 @@ impl Workspace {
         let (close, activate, middle, menu_surface) =
             (surface.clone(), surface.clone(), surface.clone(), surface.clone());
         let title_activate = surface.clone();
+        let (key_view, key_surface) = (cx.weak_entity(), surface.clone());
         // `group-focus-visible/close`: a keyboard-focused close button shows its X.
         let close_focus = window
             .use_keyed_state(ElementId::Name(format!("{group}:close-focus").into()), cx, |_, cx| {
@@ -2423,6 +2424,10 @@ impl Workspace {
                     this.open_tab_menu(&menu_surface, event.position, window, cx);
                 }),
             )
+            // From the tab's title or close button, which take focus.
+            .on_context_menu_key(move |position, window, cx| {
+                let _ = key_view.update(cx, |this, cx| this.open_tab_menu(&key_surface, position, window, cx));
+            })
             .into_any_element()
     }
 

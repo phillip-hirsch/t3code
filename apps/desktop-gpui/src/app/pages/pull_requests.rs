@@ -1773,8 +1773,8 @@ fn pull_request_row(
     let conflict_label = format!("Conflicts with {}", entry.base_branch);
     let url = entry.url.clone();
     let open_label = logic::open_on_host_label(&entry.provider);
-    let number = div()
-        .id(ElementId::Name(id("number").into()))
+    // A tab stop, so the keyboard opens its menu (`contextmenu` on the focused number).
+    let number = crate::app::chat::focusable(div().id(ElementId::Name(id("number").into())), t)
         .flex_none()
         .font_family(t.fonts.mono)
         .text_xs()

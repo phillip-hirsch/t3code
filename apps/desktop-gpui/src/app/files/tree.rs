@@ -2,6 +2,7 @@
 //! (`projects.listEntries`), a search box finds paths anywhere (`projects.searchEntries`), and a
 //! right click offers the editors, Copy mention and Add to chat.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::time::Duration;
@@ -95,6 +96,8 @@ pub(super) struct TreeState {
     /// Keyboard focus and the row it is on (the web tree's roving focus).
     focus: FocusHandle,
     focused: Option<String>,
+    /// Where the focused row last drew, so the keyboard opens its menu below it.
+    focused_bounds: Rc<Cell<Option<gpui_kit::Bounds<gpui_kit::Pixels>>>>,
     reveal: Reveal,
     mutation: Option<(Option<String>, Option<String>)>,
     _subscription: Subscription,
@@ -232,6 +235,7 @@ impl Workspace {
                 scroll: UniformListScrollHandle::new(),
                 focus: cx.focus_handle().tab_stop(true),
                 focused: None,
+                focused_bounds: Rc::default(),
                 reveal: Reveal::default(),
                 mutation: None,
                 _subscription: subscription,
@@ -641,6 +645,11 @@ impl Workspace {
                     .flex_col()
                     .on_key_down(cx.listener(move |this, event: &gpui_kit::KeyDownEvent, window, cx| {
                         let keystroke = &event.keystroke;
+                        if gpui_kit::component::menu::opens_context_menu(keystroke) {
+                            this.open_focused_row_menu(&keys_key, window, cx);
+                            cx.stop_propagation();
+                            return;
+                        }
                         if keystroke.modifiers.modified() {
                             return;
                         }
@@ -703,6 +712,15 @@ impl Workspace {
         true
     }
 
+    /// The menu key or Shift+F10: the focused row's menu, below the row as the web's
+    /// `contextmenu` on a focused tree item.
+    fn open_focused_row_menu(&mut self, root: &Checkout, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tree) = self.tree(root) else { return };
+        let (Some(path), Some(bounds)) = (tree.focused.clone(), tree.focused_bounds.get()) else { return };
+        let menu = self.tree_context_menu(root, &path, cx);
+        self.open_chat_menu(None, bounds.bottom_left(), window, cx, menu);
+    }
+
     fn open_tree_file(&mut self, root: &Checkout, path: &str, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tree) = self.tree(root) {
             tree.reveal.from_tree = Some(path.to_owned());
@@ -735,6 +753,7 @@ impl Workspace {
         let ignored = gpui_kit::rgb(if tokens.dark { 0x4a4a4e } else { 0xadadb1 });
         let (click_key, click_row) = (root.clone(), row.clone());
         let menu = self.tree_context_menu(root, &row.path, cx);
+        let measured = focused.then(|| self.tree(root).map(|tree| tree.focused_bounds.clone())).flatten();
         h_flex()
             .id(ElementId::Name(format!("files-row:{}", row.path).into()))
             .h(px(ROW_HEIGHT))
@@ -777,6 +796,13 @@ impl Workspace {
                     .when(row.ignored, |el| el.opacity(0.5)),
             )
             .child(div().min_w_0().truncate().child(row.label.clone()))
+            .children(measured.map(|measured| {
+                gpui_kit::canvas(move |bounds, _, _| measured.set(Some(bounds)), |_, (), _, _| {})
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+            }))
             .context_menu(menu)
             .into_any_element()
     }

@@ -697,6 +697,20 @@ gpui-base) adds `mixed`, exposed as `aria-checked="mixed"` like the web's mixed 
 `src/menu/dropdown_menu.rs` adds `DropdownMenuPopover::open`, passed to its `Popover` as
 `Popover::open` is, so a caller can hold the open state with `on_open_change`.
 
+**Context menus open from the keyboard.** The web opens a focused element's context menu with
+the ContextMenu key or Shift+F10 (a browser's keyboard `contextmenu`). 0.9.0's `ContextMenuExt`
+opens only on a right click or a long press. `src/menu/context_menu.rs`:
+
+- `opens_context_menu` is that key test (re-exported from `src/menu/mod.rs`).
+- `ContextMenuExt::context_menu` adds a key-down listener on the trigger, so with focus on it or
+  inside it those keys open the menu below its lower-left corner. Each prepaint hands the
+  listener the trigger's bounds and menu state (`KeyboardTarget`); `keyboard_bounds` makes the
+  trigger that opened it draw the menu, which sits outside its bounds. Focus returns on dismiss,
+  as for a right click.
+- `ContextMenuExt::on_context_menu_key` does the same for a menu the element builds itself
+  (its own right-click handler): it measures the element with a `canvas` child and calls back
+  with the lower-left corner.
+
 **Text views pass link styling and hover through.** `src/text/compat.rs`: `TextView::link_underline`
 and `TextView::on_link_hover` forward to gpui-base's (see its "Links can drop their underline" and
 "Links report hover"); `src/text/mod.rs` re-exports `LinkHover`.

@@ -9,6 +9,7 @@ use anyhow::Context as _;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Editor, EditorState, InputEvent, Position};
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::{TextView, TextViewState};
@@ -1031,9 +1032,10 @@ impl Workspace {
                     let tooltip: SharedString = logic::absolute_path(&key.checkout.cwd, &key.path).into();
                     let menu_key = key.clone();
                     let menu_image = ready.clone();
+                    let (keyboard_key, keyboard_image, view) = (key.clone(), ready.clone(), cx.weak_entity());
                     let failed = ready.is_none();
-                    div()
-                        .id("workspace-image")
+                    // A tab stop, so the keyboard opens the image's menu (`MediaActions`).
+                    crate::app::chat::focusable(div().id("workspace-image"), tokens)
                         .flex_1()
                         .min_h_0()
                         .flex()
@@ -1049,6 +1051,13 @@ impl Workspace {
                                 this.open_media_menu(&menu_key, kind, image, event.position, window, cx);
                             }),
                         )
+                        .on_context_menu_key(move |position, window, cx| {
+                            let image = keyboard_image.clone();
+                            let _ = view.update(cx, |this, cx| {
+                                let kind = super::media::MediaKind::Image;
+                                this.open_media_menu(&keyboard_key, kind, image, position, window, cx);
+                            });
+                        })
                         .child(match ready {
                             Some(image) => self.render_preview_image(key, image, tokens, cx),
                             None => div()

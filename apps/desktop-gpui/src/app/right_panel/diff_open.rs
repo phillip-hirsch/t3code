@@ -3,6 +3,7 @@
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::diff::{DiffFile, DiffFileStatus, DiffState};
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -201,6 +202,7 @@ pub(super) fn header(
     let copy = copy_path_button(&path, &view, tokens, window, cx);
     let (open_path, menu_path, fold_path, fold_view) = (path.clone(), path.clone(), path, view.clone());
     let menu_view = view.clone();
+    let (key_view, key_path) = (view.clone(), menu_path.clone());
     // `[data-title]:hover`: the code foreground mixed 16% toward primary.
     let hover = tokens.foreground.blend(tokens.primary.opacity(0.16));
     let muted = tokens.muted_foreground;
@@ -215,8 +217,8 @@ pub(super) fn header(
             fold_view.update(cx, |this, cx| this.fold_diff_file(&fold_path, !collapsed, cx));
         })
         .child(
-            div()
-                .id("diff-file-title")
+            // A tab stop, so Enter opens the file and the keyboard opens its menu.
+            super::super::chat::focusable(div().id("diff-file-title"), tokens)
                 .min_w_0()
                 .truncate()
                 .font_weight(gpui_kit::FontWeight::MEDIUM)
@@ -230,6 +232,9 @@ pub(super) fn header(
                     cx.stop_propagation();
                     menu_view
                         .update(cx, |this, cx| this.open_changed_file_menu(&menu_path, event.position, window, cx));
+                })
+                .on_context_menu_key(move |position, window, cx| {
+                    key_view.update(cx, |this, cx| this.open_changed_file_menu(&key_path, position, window, cx));
                 })
                 .child(name),
         )

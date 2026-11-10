@@ -8,6 +8,7 @@ use std::fmt::Write as _;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
@@ -453,7 +454,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let name = logic::file_name(&key.path).to_owned();
-        let (retry, menu_key) = (key.clone(), key.clone());
+        let (retry, menu_key, keyboard_key) = (key.clone(), key.clone(), key.clone());
+        let view = cx.weak_entity();
         let label =
             if name.is_empty() { "Video unavailable".to_owned() } else { format!("Video unavailable · {name}") };
         let open = url.filter(|url| url.starts_with("http:") || url.starts_with("https:")).map(|url| {
@@ -496,6 +498,12 @@ impl Workspace {
                             this.open_media_menu(&menu_key, MediaKind::Video, None, event.position, window, cx);
                         }),
                     )
+                    // Retry and Open in browser take focus; the menu opens from them too.
+                    .on_context_menu_key(move |position, window, cx| {
+                        let _ = view.update(cx, |this, cx| {
+                            this.open_media_menu(&keyboard_key, MediaKind::Video, None, position, window, cx);
+                        });
+                    })
                     .child(
                         h_flex()
                             .gap(px(6.))

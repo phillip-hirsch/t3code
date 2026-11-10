@@ -4,7 +4,7 @@
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::ButtonVariants as _;
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::text::{MarkdownNode, MarkdownParseContext, MarkdownPlugin};
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
@@ -1008,6 +1008,17 @@ impl MarkdownPlugin for FileChips {
         let (path, line) = (chip.path.clone(), chip.line);
         let (open, menu) = (self.workspace.clone(), self.workspace.clone());
         let (menu_path, pane) = (path.clone(), Some(self.pane));
+        let open_menu = std::rc::Rc::new(move |position: Point<Pixels>, window: &mut Window, cx: &mut App| {
+            let _ = menu.update(cx, |w, cx| {
+                let target = file_links::resolve_target(&menu_path, w.git_cwd().as_deref());
+                if let Some(target) = target {
+                    w.with_workspace_match(&menu_path, target, window, cx, move |w, target, window, cx| {
+                        w.open_file_menu(target, pane, position, window, cx);
+                    });
+                }
+            });
+        });
+        let key_menu = open_menu.clone();
         let tooltip: SharedString = path.clone().into();
         let element = super::chat::focusable(
             h_flex().id(SharedString::from(format!("file-chip:{path}"))),
@@ -1028,16 +1039,9 @@ impl MarkdownPlugin for FileChips {
         })
         .on_mouse_down(gpui_kit::MouseButton::Right, move |event, window, cx| {
             cx.stop_propagation();
-            let position = event.position;
-            let _ = menu.update(cx, |w, cx| {
-                let target = file_links::resolve_target(&menu_path, w.git_cwd().as_deref());
-                if let Some(target) = target {
-                    w.with_workspace_match(&menu_path, target, window, cx, move |w, target, window, cx| {
-                        w.open_file_menu(target, pane, position, window, cx);
-                    });
-                }
-            });
-        });
+            open_menu(event.position, window, cx);
+        })
+        .on_context_menu_key(move |position, window, cx| key_menu(position, window, cx));
         // The link's text flows before the chip as plain prose; only the chip opens the file.
         if chip.after_text { element.ml(px(4.)).into_any_element() } else { element.into_any_element() }
     }

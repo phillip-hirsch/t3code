@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -432,6 +433,7 @@ fn tree_row(
             let (asset, color) = crate::file_icons::file_icon(path, tokens.dark);
             let (open_this, open_run, open_path) = (this.clone(), run.clone(), path.clone());
             let (menu_this, menu_path) = (this.clone(), path.clone());
+            let (key_this, key_path) = (this.clone(), path.clone());
             row(ElementId::Name(format!("changed-file-{run}-{path}").into()))
                 .when(has_directory_nodes || depth > 0, |el| el.child(div().size(px(14.)).flex_none()))
                 .child(Icon::empty().path(asset).with_size(px(14.)).text_color(color))
@@ -454,6 +456,9 @@ fn tree_row(
                     cx.stop_propagation();
                     let _ =
                         menu_this.update(cx, |w, cx| w.open_changed_file_menu(&menu_path, event.position, window, cx));
+                })
+                .on_context_menu_key(move |position, window, cx| {
+                    let _ = key_this.update(cx, |w, cx| w.open_changed_file_menu(&key_path, position, window, cx));
                 })
                 .into_any_element()
         }

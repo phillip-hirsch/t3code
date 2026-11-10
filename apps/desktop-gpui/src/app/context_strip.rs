@@ -106,6 +106,8 @@ pub(super) struct DraftWorkspaceState {
     branch_pages: RefSearch,
     /// The picker row Enter picks (`autoHighlight`); `None` until a search or the arrows set one.
     branch_highlight: Option<usize>,
+    /// Where the highlighted row last drew, so the keyboard opens its menu below it.
+    branch_highlight_bounds: std::rc::Rc<std::cell::Cell<Option<gpui_kit::Bounds<gpui_kit::Pixels>>>>,
     branch_scroll: ScrollHandle,
     /// "Start from remote" in the picker's footer, which Tab reaches from the search.
     origin_focus: Option<gpui_kit::FocusHandle>,
@@ -300,6 +302,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.draft_workspace.branch_open && gpui_kit::component::menu::opens_context_menu(keystroke) {
+            return self.open_highlighted_branch_menu(window, cx);
+        }
         if !self.draft_workspace.branch_open || keystroke.modifiers.modified() {
             return false;
         }
@@ -928,8 +933,8 @@ impl Workspace {
         // A started thread keeps its workspace (`resolveLockedWorkspaceLabel`).
         let worktree = self.git_cwd() != self.target_project().map(|p| p.workspace_root.clone());
         let (icon, label) = if worktree { (Lucide::FolderGit, "Worktree") } else { (Lucide::Folder, "Local checkout") };
-        let locked = h_flex()
-            .id("env-mode-locked")
+        // A tab stop, so the keyboard opens its Copy full path menu.
+        let locked = super::chat::focusable(h_flex().id("env-mode-locked"), t)
             .min_w_0()
             .h(px(24.))
             .px(px(7.))
@@ -1135,6 +1140,20 @@ impl Workspace {
         }
     }
 
+    /// The menu key or Shift+F10 in the picker: the highlighted ref's Copy branch name menu,
+    /// below its row, as a right click on it opens.
+    fn open_highlighted_branch_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let state = &self.draft_workspace;
+        let (Some(index), Some(bounds)) = (state.branch_highlight, state.branch_highlight_bounds.get()) else {
+            return false;
+        };
+        let Some(BranchItem::Ref(item)) = self.branch_items().into_iter().nth(index) else { return false };
+        let name = item["name"].as_str().unwrap_or_default().to_owned();
+        let menu = copy_menu("Copy branch name", "Branch name copied", name);
+        self.open_chat_menu(None, bounds.bottom_left(), window, cx, menu);
+        true
+    }
+
     fn render_branch_popover(
         &self,
         selected: Option<&str>,
@@ -1145,6 +1164,7 @@ impl Workspace {
         let items = self.branch_items();
         let grants = self.branch_grants();
         let highlight = self.draft_workspace.branch_highlight;
+        let highlight_bounds = self.draft_workspace.branch_highlight_bounds.clone();
         let empty = items.is_empty();
         let rows = items.into_iter().enumerate().map(|(index, item)| {
             let highlighted = highlight == Some(index);
@@ -1225,6 +1245,16 @@ impl Workspace {
                 }))
                 .when(enabled, |el| {
                     el.on_click(cx.listener(move |this, _, window, cx| this.select_branch(pick.clone(), window, cx)))
+                })
+                .when(highlighted, |el| {
+                    let measured = highlight_bounds.clone();
+                    el.child(
+                        gpui_kit::canvas(move |bounds, _, _| measured.set(Some(bounds)), |_, (), _, _| {})
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full(),
+                    )
                 })
                 .context_menu(copy_menu("Copy branch name", "Branch name copied", copy))
                 .into_any_element()

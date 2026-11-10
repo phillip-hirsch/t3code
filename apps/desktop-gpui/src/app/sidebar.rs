@@ -1290,8 +1290,7 @@ impl Workspace {
         if rows.is_empty() || modifiers.control || modifiers.alt || modifiers.platform {
             return;
         }
-        let key = event.keystroke.key.as_str();
-        if key == "menu" || (modifiers.shift && key == "f10") {
+        if gpui_kit::component::menu::opens_context_menu(&event.keystroke) {
             self.open_row_menu_from_key(window, cx);
             cx.stop_propagation();
             return;
@@ -2917,6 +2916,16 @@ fn row_probe(active: bool, selected: bool, cx: &App) -> Option<AnyElement> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_menus_open_from_the_menu_key_or_shift_f10() {
+        let opens = |text: &'static str| {
+            gpui_kit::component::menu::opens_context_menu(&gpui_kit::Keystroke::parse(text).unwrap())
+        };
+        assert!(opens("menu") && opens("shift-menu") && opens("shift-f10"));
+        assert!(!opens("f10"), "plain F10 is the menu bar's");
+        assert!(!opens("ctrl-shift-f10") && !opens("alt-menu") && !opens("cmd-shift-f10"));
+    }
 
     #[test]
     fn the_brand_row_widens_the_sidebar_past_macos_traffic_lights() {

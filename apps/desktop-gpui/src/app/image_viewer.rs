@@ -485,7 +485,7 @@ impl Workspace {
             "0" if image_focused && plain => {
                 self.zoom_viewer(|zoom, fitted, stage| zoom.set(1., None, fitted, stage), cx);
             }
-            "menu" | "f10" if image_focused && (keystroke.key == "menu" || modifiers.shift) => {
+            "menu" | "f10" if image_focused && gpui_kit::component::menu::opens_context_menu(keystroke) => {
                 let Some(bounds) = bounds else { return };
                 self.open_viewer_menu(bounds.bottom_left(), window, cx);
             }

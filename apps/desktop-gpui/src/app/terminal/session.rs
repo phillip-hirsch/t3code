@@ -729,6 +729,11 @@ impl TerminalSession {
             return;
         }
         let keystroke = &keys::with_held_shift(&event.keystroke, window.modifiers().shift);
+        // The ContextMenu key opens the terminal's menu: the web's xterm leaves it to the
+        // browser. Shift+F10 is the shell's, as xterm encodes it.
+        if keystroke.key == "menu" && gpui_kit::component::menu::opens_context_menu(keystroke) {
+            return;
+        }
         let modifiers = &keystroke.modifiers;
         // `beforeKey: (event) => event.key !== "Tab"`: Tab leaves a sign-in terminal.
         if self.wire == Wire::Events
