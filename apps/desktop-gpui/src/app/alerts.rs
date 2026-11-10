@@ -76,7 +76,7 @@ impl Workspace {
     }
 
     /// The tags each environment's thread tag filter hides, for the environments that hide any.
-    fn hidden_thread_tags(&self) -> HashMap<&str, Vec<String>> {
+    pub(super) fn hidden_thread_tags(&self) -> HashMap<&str, Vec<String>> {
         self.sessions
             .iter()
             .filter_map(|s| Some((s.id.as_deref()?, crate::model::hidden_thread_tags(&s.server_info.settings)?)))
