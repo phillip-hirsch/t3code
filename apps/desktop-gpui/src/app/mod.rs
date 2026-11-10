@@ -27,6 +27,7 @@ use crate::runtime;
 use crate::timeline::{self, Row};
 
 mod alerts;
+mod app_activation;
 mod attachment_preview;
 mod attachments;
 mod banners;
@@ -297,6 +298,8 @@ pub struct Workspace {
     history: pages::History,
     /// Trackpad history swipes and their edge indicator.
     swipe: history_swipe::SwipeState,
+    /// `t3 app` requests waiting for the primary environment.
+    activation: app_activation::ActivationQueue,
     devices: crate::device::Devices,
     /// The server's keybindings `keymap` was merged from; see [`keymap`].
     installed_keybindings: Rc<[crate::keybindings::Rule]>,
@@ -507,6 +510,7 @@ impl Workspace {
             client_settings,
             history: pages::History::default(),
             swipe: Default::default(),
+            activation: Default::default(),
             devices: Default::default(),
             installed_keybindings: Rc::default(),
             keymap: Rc::from(crate::keybindings::merge_with_defaults(&[])),

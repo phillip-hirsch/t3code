@@ -137,9 +137,10 @@ impl Workspace {
         self.open_pending_links(window, cx);
     }
 
-    /// Opens queued links once the server has listed its projects; the shell's first
-    /// snapshot calls this again.
+    /// Opens queued links and `t3 app` requests once the server has listed its projects; the
+    /// shell's snapshots call this again.
     pub(super) fn open_pending_links(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.process_activations(window, cx);
         if !self.landed || self.client().is_none() {
             return;
         }

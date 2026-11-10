@@ -114,8 +114,9 @@ win32job = "2"
 resvg = { version = "0.46", default-features = false, features = ["text", "system-fonts"] }
 
 [target.'cfg(unix)'.dependencies]
-# SIGTERM for the local server on quit (`backend::LocalServer::stop`), through nix's safe `kill`.
-nix = { version = "0.31", default-features = false, features = ["signal"] }
+# SIGTERM for the local server on quit (`backend::LocalServer::stop`), through nix's safe `kill`;
+# `getuid` for the app control socket's folder (`desktop::app_control`).
+nix = { version = "0.31", default-features = false, features = ["signal", "user"] }
 
 [target.'cfg(not(windows))'.dependencies]
 # The OS keyring that holds `secure_storage`'s key.
