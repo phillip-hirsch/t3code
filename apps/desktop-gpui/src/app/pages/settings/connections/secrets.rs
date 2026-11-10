@@ -5,20 +5,19 @@ use std::collections::HashSet;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, ElementId, Entity, FontWeight, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, WeakEntity,
-    Window, div, px,
+    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div,
+    px,
 };
 use serde_json::{Value, json};
 
 use super::super::widgets::{RowFrame, section_with_action, settings_section};
+use super::SettingsWriter;
 use super::logic::{self, PROVIDERS_MANAGE, SETTINGS_WRITE, SecretProviderDraft};
 use super::ui::{self, Size, Variant, WebButton, text_sm, text_xs};
-use super::{error_toast, update_settings};
 use crate::app::Workspace;
 use crate::app::pages::settings::widgets::SettingsView;
 use crate::settings::scope::ScopeKind;
@@ -48,7 +47,7 @@ impl Workspace {
         } else if connected {
             let project_scoped = matches!(view.scope.kind, ScopeKind::Project { .. });
             let host =
-                SecretsHost { workspace: cx.entity().downgrade(), environment: self.settings_environment(), label };
+                SettingsWriter { workspace: cx.entity().downgrade(), environment: self.settings_environment(), label };
             self.secret_providers(&state, host, project_scoped, cx, &t)
         } else {
             message_section(
@@ -62,7 +61,7 @@ impl Workspace {
     fn secret_providers(
         &self,
         state: &Entity<SecretsState>,
-        host: SecretsHost,
+        host: SettingsWriter,
         project_scoped: bool,
         cx: &App,
         t: &Tokens,
@@ -193,7 +192,14 @@ fn redacted_account(state: &Entity<SecretsState>, id: &str, account: &str, revea
 }
 
 /// `RemoveSecretProviderButton`; `uses` are what reads from the provider and will be unset.
-fn confirm_remove(host: SecretsHost, id: String, label: String, uses: Vec<String>, window: &mut Window, cx: &mut App) {
+fn confirm_remove(
+    host: SettingsWriter,
+    id: String,
+    label: String,
+    uses: Vec<String>,
+    window: &mut Window,
+    cx: &mut App,
+) {
     window.open_alert_dialog(cx, move |dialog, _, cx| {
         let (host, id) = (host.clone(), id.clone());
         let t = theme::tokens(cx);
@@ -233,36 +239,6 @@ fn confirm_remove(host: SecretsHost, id: String, label: String, uses: Vec<String
     });
 }
 
-/// The environment a secrets dialog opened on, whose socket and grants are read when it saves:
-/// a dialog can stay open through a reconnect.
-#[derive(Clone)]
-struct SecretsHost {
-    workspace: WeakEntity<Workspace>,
-    environment: Option<SharedString>,
-    label: String,
-}
-
-impl SecretsHost {
-    /// `useUpdateEnvironmentSettings`: a session without `scopes` there saves nothing.
-    fn save(&self, patch: Value, scopes: &[&str], window: &mut Window, cx: &mut App) {
-        let Some(workspace) = self.workspace.upgrade() else { return };
-        let workspace = workspace.read(cx);
-        let environment = self.environment.as_deref().unwrap_or_default();
-        if !scopes.iter().all(|scope| workspace.env_grants(environment, scope)) {
-            let reason = format!("This connection lacks permission to change settings on {}.", self.label);
-            return window.push_notification(Notification::warning(reason).title("Setting not saved"), cx);
-        }
-        let client = workspace.env_client(environment);
-        window
-            .spawn(cx, async move |cx| {
-                if let Err(error) = update_settings(client, patch).await {
-                    let _ = cx.update(|window, cx| error_toast(window, cx, "Could not update settings", error));
-                }
-            })
-            .detach();
-    }
-}
-
 /// The add/edit dialog's form (`SecretProviderDialog`); one per open, so each starts fresh.
 struct ProviderForm {
     name: Entity<InputState>,
@@ -271,7 +247,7 @@ struct ProviderForm {
     /// The provider being edited: its id and stored config.
     editing: Option<(String, Value)>,
     submitted: bool,
-    host: SecretsHost,
+    host: SettingsWriter,
     _subscriptions: [Subscription; 2],
 }
 
@@ -345,7 +321,7 @@ impl Render for ProviderForm {
 }
 
 fn open_provider_dialog(
-    host: SecretsHost,
+    host: SettingsWriter,
     existing_ids: Vec<String>,
     editing: Option<(String, Value)>,
     window: &mut Window,

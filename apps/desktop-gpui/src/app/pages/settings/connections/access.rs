@@ -30,7 +30,7 @@ use super::logic::{
 };
 use super::pairing::{self, AdvertisedEndpoint, Qr};
 use super::ui::{self, Size, Variant, WebButton, text_2xs, text_sm, text_xs};
-use super::{SessionLoad, auth_request, error_toast, success_toast, update_settings};
+use super::{SessionLoad, SettingsWriter, auth_request, error_toast, success_toast};
 use crate::app::Workspace;
 use crate::app::pages::settings::widgets::SettingsView;
 use crate::app::sidebar::now_ms;
@@ -372,7 +372,7 @@ impl Workspace {
             }
         }
         rows.push(permissions_details(state, s, self.settings_auth(), self.settings_client().is_some(), t));
-        let more = self.icon_menu().into_any_element();
+        let more = self.icon_menu(cx).into_any_element();
         let icon = ui::glyph(logic::machine_icon(self.settings_info().machine_kind()), 16., t.foreground);
         section_with_action(
             "connections-environment",
@@ -383,26 +383,22 @@ impl Workspace {
         )
     }
 
-    /// The "…" menu with its Icon submenu (`EnvironmentIconMenu`).
-    fn icon_menu(&self) -> impl IntoElement {
-        let config = &self.settings_info().config;
-        let lock = if !config.is_object() {
-            Some("Connect to this environment to change its icon.")
-        } else if !self.settings_grants(SETTINGS_WRITE) {
-            Some("Your session on this environment cannot change its settings.")
-        } else {
-            None
+    /// The "…" menu with its Icon submenu (`EnvironmentIconMenu`). It keeps the environment and
+    /// reads its config and grants when it opens, and again when an icon is picked.
+    fn icon_menu(&self, cx: &Context<Self>) -> impl IntoElement {
+        let writer = SettingsWriter {
+            workspace: cx.entity().downgrade(),
+            environment: self.settings_environment(),
+            label: self.environment_label().unwrap_or("this environment").to_owned(),
         };
-        let machine = config.pointer("/environment/platform/machine").and_then(Value::as_str).map(str::to_owned);
-        let resolved = self.settings_info().machine_kind().to_owned();
-        let client = self.settings_client();
         Button::new("settings-access-more")
             .ghost()
             .xsmall()
             .icon(IconName::Ellipsis)
             .tooltip("More actions for this machine")
             .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |menu, window, cx| {
-                let (machine, resolved, client) = (machine.clone(), resolved.clone(), client.clone());
+                let Some((lock, machine, resolved)) = icon_choice(&writer, cx) else { return menu };
+                let writer = writer.clone();
                 let icon = gpui_kit::component::Icon::default().path(logic::machine_icon(&resolved));
                 menu.submenu_with_icon(Some(icon), "Icon", window, cx, move |mut menu, _, _| {
                     if let Some(lock) = lock {
@@ -413,7 +409,7 @@ impl Workspace {
                         let note = (*kind == detected).then(|| if machine.is_some() { "detected" } else { "default" });
                         let patch =
                             json!({ "environmentIcon": if *kind == detected { Value::Null } else { json!(kind) } });
-                        let client = client.clone();
+                        let writer = writer.clone();
                         menu = menu.item(
                             PopupMenuItem::element(move |_, cx| {
                                 let t = theme::tokens(cx);
@@ -429,16 +425,9 @@ impl Workspace {
                             .checked(resolved == *kind)
                             .disabled(lock.is_some())
                             .on_click(move |_, window, cx| {
-                                let (client, patch) = (client.clone(), patch.clone());
-                                window
-                                    .spawn(cx, async move |cx| {
-                                        if let Err(error) = update_settings(client, patch).await {
-                                            let _ = cx.update(|window, cx| {
-                                                error_toast(window, cx, "Could not update settings", error);
-                                            });
-                                        }
-                                    })
-                                    .detach();
+                                if icon_choice(&writer, cx).is_some_and(|(lock, ..)| lock.is_none()) {
+                                    writer.save(patch.clone(), &[SETTINGS_WRITE], window, cx);
+                                }
                             }),
                         );
                     }
@@ -608,6 +597,28 @@ impl Workspace {
         let _ = t;
         h_flex().gap(px(8.)).child(use_in_another_app).child(revoke_others).child(create).into_any_element()
     }
+}
+
+/// The icon menu's environment as it is now: `resolveEnvironmentIconPickerLock`, the detected
+/// machine and the resolved icon. `None` once the workspace is gone.
+fn icon_choice(writer: &SettingsWriter, cx: &App) -> Option<(Option<&'static str>, Option<String>, String)> {
+    let workspace = writer.workspace.upgrade()?;
+    let workspace = workspace.read(cx);
+    let environment = writer.environment.as_deref();
+    let info = environment.and_then(|id| workspace.session(id)).map(|session| &session.server_info);
+    let lock = if !info.is_some_and(|info| info.config.is_object()) {
+        Some("Connect to this environment to change its icon.")
+    } else if !environment.is_some_and(|id| workspace.env_grants(id, SETTINGS_WRITE)) {
+        Some("Your session on this environment cannot change its settings.")
+    } else {
+        None
+    };
+    let machine = info
+        .and_then(|info| info.config.pointer("/environment/platform/machine"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let resolved = info.map_or("server", |info| info.machine_kind()).to_owned();
+    Some((lock, machine, resolved))
 }
 
 /// `ManagedByOrganization`.
