@@ -10,8 +10,8 @@ use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, ElementId, Entity, FontWeight, InteractiveElement as _, IntoElement,
-    KeyDownEvent, ListAlignment, ListState, ParentElement as _, ScrollStrategy, SharedString,
+    AnyElement, AppContext as _, Context, ElementId, Entity, Focusable as _, FontWeight, InteractiveElement as _,
+    IntoElement, KeyDownEvent, ListAlignment, ListState, ParentElement as _, ScrollStrategy, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, UniformListScrollHandle, Window, div, list,
     prelude::FluentBuilder as _, px, uniform_list,
 };
@@ -380,8 +380,11 @@ impl Workspace {
             OverlayMode::Files => overlay.picks.len(),
             OverlayMode::Content => overlay.matches.len(),
         };
+        // The web's input owns the list keys; a focused option toggle takes Enter itself.
+        let in_input = overlay.input.focus_handle(cx).is_focused(window);
         match event.keystroke.key.as_str() {
             "escape" => self.file_overlay_back(window, cx),
+            "up" | "down" | "enter" if !in_input => return,
             "up" | "down" if count > 0 => {
                 overlay.highlight = if event.keystroke.key == "down" {
                     (overlay.highlight + 1) % count
@@ -587,6 +590,7 @@ impl Workspace {
                       option: fn(&mut FileOverlay) -> &mut bool| {
             div()
                 .id(id)
+                .when(enabled, |el| crate::app::chat::focusable(el, tokens))
                 .h(px(24.))
                 .min_w(px(28.))
                 .px(px(6.))
