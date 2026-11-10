@@ -150,13 +150,11 @@ impl Workspace {
         if !evidence.hydrated {
             return;
         }
-        // The web opens the app without a primary server; this app's primary is its own server,
-        // so until it answers the decision waits, without the timeout.
-        if !evidence.enabled && !evidence.completed {
+        let local_off = matches!(self.connection, super::Connection::Off);
+        let Some((decision, persist)) = first_run::decide(local_off, &evidence) else {
             self.onboarding._timeout = None;
             return;
-        }
-        let (decision, persist) = first_run::resolve(&evidence);
+        };
         let gate = self.onboarding.gate.evidence(decision);
         self.onboarding.gate = gate;
         if gate.decision != Decision::Wizard && persist && !evidence.completed {
