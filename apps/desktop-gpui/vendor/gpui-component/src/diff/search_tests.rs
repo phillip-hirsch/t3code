@@ -143,6 +143,47 @@ fn matches_follow_the_unified_order_and_the_panel_toggles() {
 }
 
 #[test]
+fn regex_classes_boundaries_and_case_follow_javascript() {
+    let patch = "diff --git a/u.txt b/u.txt\n--- a/u.txt\n+++ b/u.txt\n@@ -1 +1,3 @@\n-x\n+éfooé foo\n+٣3 a\u{85}b\n+sſS kK\u{212A}\n";
+    let files = DiffFile::parse(patch).unwrap();
+    let find = |query: &str, options: SearchOptions| {
+        collect_matches(&files, query, options)
+            .into_iter()
+            .map(|found| (found.line, found.range))
+            .collect::<Vec<_>>()
+    };
+    let regex = SearchOptions {
+        regex: true,
+        ..SearchOptions::default()
+    };
+    // `\w`, `\d` and `\b` are ASCII; `\s` is JavaScript's set, which leaves out U+0085.
+    assert_eq!(find(r"\bfoo\b", regex), [(0, 2..5), (0, 8..11)]);
+    assert_eq!(find(r"\Bfoo", regex), []);
+    assert_eq!(find(r"\d+", regex), [(1, 2..3)]);
+    assert_eq!(find(r"\s", regex), [(0, 7..8), (1, 3..4), (2, 4..5)]);
+    assert_eq!(find(r"[\w-]+o", regex), [(0, 2..5), (0, 8..11)]);
+    // Ignoring case folds `é` with `É` but never `ſ` with `s` or the Kelvin sign with `k`.
+    let any_case = SearchOptions::default();
+    assert_eq!(find("s", any_case), [(2, 0..1), (2, 3..4)]);
+    assert_eq!(find("ſ", any_case), [(2, 1..3)]);
+    assert_eq!(find("k", any_case), [(2, 5..6), (2, 6..7)]);
+    assert_eq!(
+        find("[a-z]+", regex),
+        [
+            (0, 0..1),
+            (0, 2..5),
+            (0, 8..11),
+            (1, 4..5),
+            (1, 7..8),
+            (2, 0..1),
+            (2, 3..4),
+            (2, 5..7)
+        ]
+    );
+    assert_eq!(find("FOOÉ", any_case), [(0, 2..7)]);
+}
+
+#[test]
 fn steps_wrap_at_both_ends() {
     assert_eq!(step(None, 3, true), Some(0));
     assert_eq!(step(None, 3, false), Some(2));
