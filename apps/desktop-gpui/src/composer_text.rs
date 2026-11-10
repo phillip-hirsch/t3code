@@ -217,8 +217,9 @@ pub fn context_reference_ids(text: &str) -> Vec<String> {
 }
 
 /// `removeInlineContextReference`: the byte ranges that remove every reference to chip `id` from
-/// `text`, chip or not, each with one neighbouring space (the one after it, else the one before),
-/// last first so they can be applied in order.
+/// `text`, chip or not, in the order to apply them. Like the web it works last reference first on
+/// the text as it shrinks: each takes the space after it, else the one before it, and when the
+/// removals end at the end of the text, trailing whitespace goes too.
 pub fn context_reference_removals(text: &str, id: &str) -> Vec<Range<usize>> {
     let mut found: Vec<Range<usize>> = Vec::new();
     if !text.contains(CONTEXT_PREFIX) {
@@ -226,27 +227,43 @@ pub fn context_reference_removals(text: &str, id: &str) -> Vec<Range<usize>> {
     }
     let mut at = 0;
     while let Some(open) = text[at..].find('[') {
-        let start = at + open;
-        match parse_context_link(&text[start..]).filter(|(_, chip)| !chip.label().contains('\n')) {
+        let bracket = at + open;
+        // An image reference is `![…](…)`: its `!` belongs to it.
+        let bang = (bracket > at && text[..bracket].ends_with('!')).then(|| bracket - 1);
+        let (start, parsed) = match bang.and_then(|s| parse_context_link(&text[s..]).map(|p| (s, p))) {
+            Some((s, p)) => (s, Some(p)),
+            None => (bracket, parse_context_link(&text[bracket..])),
+        };
+        match parsed.filter(|(_, chip)| !chip.label().contains('\n')) {
             Some((len, chip)) => {
-                let end = start + len;
                 if chip.id() == id {
-                    let range = if text[end..].starts_with(' ') {
-                        start..end + 1
-                    } else if text[..start].ends_with(' ') {
-                        start - 1..end
-                    } else {
-                        start..end
-                    };
-                    found.push(range);
+                    found.push(start..start + len);
                 }
-                at = end;
+                at = start + len;
             }
-            None => at = start + 1,
+            None => at = bracket + 1,
         }
     }
-    found.reverse();
-    found
+    let mut result = text.to_owned();
+    let mut cursor = result.len();
+    let mut removals = Vec::with_capacity(found.len() + 1);
+    for Range { mut start, mut end } in found.into_iter().rev() {
+        if result[end..].starts_with(' ') {
+            end += 1;
+        } else if result[..start].ends_with(' ') {
+            start -= 1;
+        }
+        result.replace_range(start..end, "");
+        removals.push(start..end);
+        cursor = start;
+    }
+    if !removals.is_empty() && cursor >= result.len() {
+        let trimmed = result.trim_end().len();
+        if trimmed < result.len() {
+            removals.push(trimmed..result.len());
+        }
+    }
+    removals
 }
 
 /// The file links and known skills in `text` that render as chips: each must
@@ -859,18 +876,23 @@ mod tests {
         assert_eq!(context_reference_ids(refs), ["context:image/img_1"]);
         let glued = "x[T](t3-context://v1/thread/a)[T](t3-context://v1/thread/a) [a\nb](t3-context://v1/file/f)";
         assert_eq!(context_reference_ids(glued), ["context:thread/a"], "once each; a label holds no newline");
-        // Removing an attachment takes every reference with it, with one neighbouring space.
-        let both = "a [I](t3-context://v1/image/img_1) b\n```\n[I](t3-context://v1/image/img_1)\n```";
-        let removals = context_reference_removals(both, "context:image/img_1");
-        assert_eq!(removals, [41..73, 2..35], "fenced too, last first");
-        let mut left = both.to_owned();
-        for range in removals {
-            left.replace_range(range, "");
-        }
-        assert_eq!(left, "a b\n```\n\n```");
-        let at_end = context_reference_removals("x [I](t3-context://v1/image/img_1)", "context:image/img_1");
-        assert_eq!(at_end, vec![1..34], "the space before it when none follows");
-        assert!(context_reference_removals(both, "context:image/other").is_empty());
+        // Removing an attachment takes every reference with it (`removeInlineContextReference`).
+        let remove = |text: &str, id: &str| {
+            let mut left = text.to_owned();
+            for range in context_reference_removals(text, id) {
+                left.replace_range(range, "");
+            }
+            left
+        };
+        let image = "context:image/img_1";
+        let link = "[I](t3-context://v1/image/img_1)";
+        assert_eq!(remove(&format!("a {link} b\n```\n{link}\n```"), image), "a b\n```\n\n```", "fenced too");
+        assert_eq!(remove(&format!("```\n{link} {link}KEEP\n```"), image), "```\nKEEP\n```", "one shared space");
+        assert_eq!(remove(&format!("see !{link} now"), image), "see now", "an image's `!` is its own");
+        assert_eq!(remove(&format!("x {link}"), image), "x", "the space before it when none follows");
+        assert_eq!(remove(&format!("x  {link}"), image), "x", "ending the text trims what trails");
+        assert_eq!(remove(&format!("{link} x  "), image), "x  ", "but only then");
+        assert!(context_reference_removals(&format!("a {link}"), "context:image/other").is_empty());
         let (stale, fresh) = remount_chips(&fenced, false, &[], skill, codex_model);
         assert_eq!((stale, fresh.len()), (vec![], 2), "skills and models too");
 
