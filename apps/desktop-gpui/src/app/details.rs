@@ -1496,9 +1496,14 @@ impl Workspace {
                     .justify_center()
                     .rounded(px(6.))
                     .text_color(tokens.error)
-                    .when(!stopping, |el| el.invisible().group_hover(split.clone(), gpui_kit::Styled::visible))
-                    .when(!busy, |el| el.cursor_pointer().hover(move |style| style.bg(hover)))
-                    .when(busy && !stopping, |el| el.opacity(0.64)),
+                    // `opacity-0` keeps it a tab stop, unlike `invisible`; focus shows it like hover.
+                    .when(!stopping, |el| {
+                        let shown = if busy { 0.64 } else { 1. };
+                        el.opacity(0.)
+                            .group_hover(split.clone(), move |style| style.opacity(shown))
+                            .focus(move |style| style.opacity(shown))
+                    })
+                    .when(!busy, |el| el.cursor_pointer().hover(move |style| style.bg(hover))),
                 colors,
             )
             .child(if stopping {
