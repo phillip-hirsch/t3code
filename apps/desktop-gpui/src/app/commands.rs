@@ -488,7 +488,11 @@ impl Workspace {
 
     /// `moveWorkspaceFocus`: F6 moves focus to the next shown area; dialogs keep it.
     pub(super) fn move_workspace_focus(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.palette.is_some() || self.sidebar_open.sheet() || window.has_active_dialog(cx) {
+        if self.palette.is_some()
+            || self.sidebar_open.sheet()
+            || self.right_panel_sheet(window)
+            || window.has_active_dialog(cx)
+        {
             return;
         }
         let shown = self.shown_areas(window);

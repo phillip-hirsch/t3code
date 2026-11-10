@@ -11,6 +11,7 @@ mod diff_base;
 mod diff_load;
 mod diff_open;
 mod diff_tree;
+mod sheet;
 mod stored;
 mod writer;
 
@@ -442,6 +443,13 @@ pub(super) struct RightPanel {
     pending_reveal: Option<((Target, DiffScope), SharedString)>,
     toolbar_focus: DiffToolbarFocus,
     tree_pane: diff_tree::TreePane,
+    /// The window width at the last render, for work that runs outside one.
+    viewport_width: f32,
+    /// The narrow-window sheet's focus: what had it when the sheet opened, the sheet's trap, and
+    /// an opening whose focus move waits for the sheet's first frame.
+    sheet_focus: super::sidebar_sheet::SheetFocus<FocusHandle>,
+    sheet_trap: FocusHandle,
+    sheet_entering: bool,
     _diff_events: Subscription,
 }
 
@@ -501,6 +509,10 @@ impl RightPanel {
             pending_reveal: None,
             toolbar_focus: DiffToolbarFocus::new(cx),
             tree_pane: diff_tree::TreePane::new(cx),
+            viewport_width: f32::INFINITY,
+            sheet_focus: Default::default(),
+            sheet_trap: cx.focus_handle(),
+            sheet_entering: false,
             _diff_events: diff_events,
         }
     }
@@ -602,12 +614,20 @@ impl Workspace {
             return None;
         }
         let viewport = f32::from(window.viewport_size().width);
+        if self.right_panel_sheet(window) {
+            return Some(sheet::sheet_width(viewport));
+        }
         let sidebar = if self.sidebar_open.docked() { f32::from(self.sidebar_width()) } else { 0. };
         if self.right_panel_maximized() {
             return Some(panel_row(viewport, sidebar));
         }
         let width = self.panel_state().and_then(|panel| panel.width).unwrap_or(DEFAULT_WIDTH);
         Some(clamp_width(width, viewport, panel_row(viewport, sidebar)))
+    }
+
+    /// The width the open panel takes from the row beside the chat; a sheet takes none.
+    pub(super) fn right_panel_docked_width(&self, window: &Window) -> Option<f32> {
+        self.right_panel_width(window).filter(|_| !self.right_panel_sheet(window))
     }
 
     /// `rightPanelMaximized`: only an open panel counts as maximized.
@@ -1105,7 +1125,7 @@ impl Workspace {
         });
         let offer = match &newly {
             // A thread with pull requests offers those instead of its turn diffs.
-            Some(run) if self.client_settings.values.bool("proactivePanelsEnabled") && !pull_requests => {
+            Some(run) if self.proactive_panels_enabled() && !pull_requests => {
                 let checkpoint = projection.checkpoints.iter().rev().find(|c| c.run_id.as_ref() == Some(run));
                 turn_diff_offer(checkpoint, self.vcs.status.as_ref().map(|status| status.local.is_repo))
             }
@@ -1144,9 +1164,8 @@ impl Workspace {
             0 => linked.as_ref().map(|r| format!("{}:{}#{}", r.project_id, r.repository.to_lowercase(), r.number)),
             _ => Some(visible.join("\n")),
         };
-        let eligible = self.client_settings.values.bool("proactivePanelsEnabled")
-            && key.is_some()
-            && observation.target_key.as_ref() != Some(&key);
+        let eligible =
+            self.proactive_panels_enabled() && key.is_some() && observation.target_key.as_ref() != Some(&key);
         observation.target_key = Some(key.clone());
         let revision = observation.revision;
         let Some(target) = self.thread_target(thread_id) else { return false };
@@ -1597,6 +1616,8 @@ impl Workspace {
 
     pub(super) fn render_right_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         self.persist_panel_layout(cx);
+        self.right_panel.viewport_width = f32::from(window.viewport_size().width);
+        self.sync_right_panel_sheet_focus(window, cx);
         let git_diff_shown = self.git_diff_shown();
         if git_diff_shown && !self.right_panel.git_diff_shown {
             self.revalidate_diff();
@@ -1623,6 +1644,7 @@ impl Workspace {
             self.request_visible_patches(cx);
         }
         let tokens = *theme::tokens(cx);
+        let sheet = self.right_panel_sheet(window);
         let panel = self.panel_state().cloned().unwrap_or_default();
         // A newly active tab, or a new tab, can sit outside the scrolled strip.
         let active_index = panel.active.as_ref().and_then(|active| panel.surfaces.iter().position(|s| s == active));
@@ -1707,10 +1729,11 @@ impl Workspace {
                     // `COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS`: maximized past a hidden sidebar, clear its toggle.
                     let inset = (panel.maximized && !self.sidebar_open.docked())
                         .then(|| super::titlebar::collapsed_content_left(window));
-                    self.render_tab_bar(&panel, inset, &tokens, window, cx)
+                    self.render_tab_bar(&panel, inset, sheet, &tokens, window, cx)
                 })
                 .child(div().flex_1().min_h_0().flex().flex_col().child(content))
-                .child(deferred(handle).with_priority(1))
+                // The sheet keeps its fixed width (`mode="sheet"` has no resize handle).
+                .when(!sheet, |el| el.child(deferred(handle).with_priority(1)))
                 .children(self.right_panel.tab_menu.as_ref().map(|(menu, position, _)| {
                     deferred(
                         gpui_kit::anchored().position(*position).snap_to_window_with_margin(px(8.)).child(menu.clone()),
@@ -1853,6 +1876,7 @@ impl Workspace {
         &self,
         panel: &PanelState,
         left_inset: Option<Pixels>,
+        sheet: bool,
         tokens: &Tokens,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1877,11 +1901,18 @@ impl Workspace {
             .flex_none()
             .min_w_0()
             .pl(left_inset.unwrap_or(px(8.)))
-            .pr(reserve)
+            .pr(if sheet { px(12.) } else { reserve })
             .gap_1();
+        // Only the inline panel owns the titlebar row (`ownsDesktopTitleBar`); the sheet carries
+        // the layout controls at its right end (`layoutControls`).
+        let (tab_bar, layout_controls) = if sheet {
+            (tab_bar, Some(self.render_sheet_layout_controls(window, cx)))
+        } else {
+            (super::titlebar::drag_region(tab_bar), None)
+        };
         // The open "+" menu has focus; its letters bubble up here (gpui-kit menus bind only arrows,
         // Enter and Escape).
-        super::titlebar::drag_region(tab_bar)
+        tab_bar
             .when(add_menu_open, |el| el.on_key_down(cx.listener(Self::add_surface_for_key)))
             .child(
                 h_flex()
@@ -1984,6 +2015,7 @@ impl Workspace {
                         cx.notify();
                     })),
             )
+            .when_some(layout_controls, |el, controls| el.child(div().flex_1()).child(controls))
     }
 
     /// A tab (`h-6 rounded-md pl-1.5 pr-2 text-xs`), its icon turning into a close button on hover

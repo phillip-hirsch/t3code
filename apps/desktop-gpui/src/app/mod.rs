@@ -1234,6 +1234,8 @@ impl Render for Workspace {
         self.sync_load_balancing(cx);
         self.sync_automations(window, cx);
         let right_panel = self.render_right_panel(window, cx);
+        let (right_panel, right_panel_sheet) =
+            if self.right_panel_sheet(window) { (None, right_panel) } else { (right_panel, None) };
         let mini_player = self.render_preview_mini_player(window, cx);
         self.sync_preview_views(window, cx);
         self.sync_document_views(window, cx);
@@ -1285,6 +1287,11 @@ impl Render for Workspace {
                 if event.keystroke.key == "escape" && this.sidebar_open.sheet() {
                     this.sidebar_open.close_sheet();
                     cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
+                if event.keystroke.key == "escape" && this.palette.is_none() && this.right_panel_sheet(window) {
+                    this.close_right_panel(cx);
                     cx.stop_propagation();
                     return;
                 }
@@ -1371,6 +1378,7 @@ impl Render for Workspace {
                             .map(|panel| div().h_full().flex_none().mr(titlebar::RIGHT_RESIZE_INSET).child(panel)),
                     ),
             )
+            .children(right_panel_sheet.map(|panel| self.render_right_panel_sheet(panel, window, cx)))
             // The panel toggles stay above the sheet, as the web's `z-50` titlebar controls do.
             .children(self.render_sidebar_sheet(window, cx))
             .child(self.render_titlebar_overlay(window, cx))
