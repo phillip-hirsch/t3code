@@ -65,6 +65,8 @@ pub(in crate::app) struct CodeTab {
     viewed: Option<HashMap<String, String>>,
     viewed_truncated: bool,
     viewed_error: Option<String>,
+    /// The `filesViewed` read in flight; a newer one replaces it, so an older answer never lands last.
+    _viewed_read: Option<Task<()>>,
     /// Ticks pressed here, shown until the host's answer is read again.
     pressed: HashMap<String, bool>,
     last_viewed: Option<String>,
@@ -73,7 +75,8 @@ pub(in crate::app) struct CodeTab {
     toggled: HashSet<String>,
     /// Later replies read with `pullRequests.threadComments`, by thread.
     pages: HashMap<String, (Vec<ThreadComment>, Option<String>)>,
-    loading_more: Option<String>,
+    /// Threads whose next comments page is being read, each on its own like the web's cards.
+    loading_more: HashSet<String>,
     tree: DiffTree,
     /// The width of the row the tree shares with the diff, as last laid out.
     row_width: Rc<Cell<Option<f32>>>,
@@ -101,12 +104,13 @@ impl CodeTab {
             viewed: None,
             viewed_truncated: false,
             viewed_error: None,
+            _viewed_read: None,
             pressed: HashMap::new(),
             last_viewed: None,
             orphans_open: false,
             toggled: HashSet::new(),
             pages: HashMap::new(),
-            loading_more: None,
+            loading_more: HashSet::new(),
             tree: DiffTree::new(cx),
             row_width: Rc::default(),
         }
@@ -542,7 +546,7 @@ impl Workspace {
         let Some(client) = self.pull_request_client() else { return };
         let Some(panel) = self.pull_requests.panel.as_ref() else { return };
         let (key, input) = (panel.reference.key(), panel.reference.to_json());
-        cx.spawn(async move |this, cx| {
+        let read = cx.spawn(async move |this, cx| {
             let result = client.request("pullRequests.filesViewed", input).await;
             let _ = this.update(cx, |this, cx| {
                 let Some(code) = this.pr_panel(&key).and_then(|p| p.code.as_mut()) else { return };
@@ -564,8 +568,10 @@ impl Workspace {
                 }
                 cx.notify();
             });
-        })
-        .detach();
+        });
+        if let Some(code) = self.pr_code() {
+            code._viewed_read = Some(read);
+        }
     }
 
     /// A Viewed tick: shift extends it over the files since the last one; a viewed file folds.
@@ -629,15 +635,14 @@ impl Workspace {
         input["threadId"] = json!(thread_id);
         input["cursor"] = json!(cursor);
         let Some(code) = panel.code.as_mut() else { return };
-        if code.loading_more.is_some() {
+        if !code.loading_more.insert(thread_id.clone()) {
             return;
         }
-        code.loading_more = Some(thread_id.clone());
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("pullRequests.threadComments", input).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 let Some(code) = this.pr_panel(&key).and_then(|p| p.code.as_mut()) else { return };
-                code.loading_more = None;
+                code.loading_more.remove(&thread_id);
                 let page = result.ok().and_then(|value| {
                     let comments: Vec<ThreadComment> = serde_json::from_value(value["comments"].clone()).ok()?;
                     Some((comments, value["nextCursor"].as_str().map(str::to_owned)))
@@ -1433,7 +1438,7 @@ impl Workspace {
         };
         let count = thread.comment_count.unwrap_or(comments.len());
         let expanded = thread.is_resolved == code.toggled.contains(&thread.id);
-        let loading_more = code.loading_more.as_deref() == Some(thread.id.as_str());
+        let loading_more = code.loading_more.contains(&thread.id);
         let id = thread.id.clone();
         let success = t.success_foreground;
         let chat = comments

@@ -107,6 +107,8 @@ pub(super) struct SidebarState {
     /// Each local checkout's current branch, read when a hover card opens, by environment and
     /// workspace root.
     checkout_branches: HashMap<SharedString, HashMap<String, String>>,
+    /// The branch read in flight per checkout; a newer read replaces it, so an older one never lands last.
+    checkout_reads: HashMap<(SharedString, String), Task<()>>,
     filter: Option<filter::FilterMenu>,
     filter_closed_at: Option<std::time::Instant>,
     /// The search result Up/Down or the pointer picked; `None` paints none.
@@ -230,6 +232,7 @@ impl SidebarState {
             open_draft_preview: None,
             provider_pill: Default::default(),
             checkout_branches: HashMap::new(),
+            checkout_reads: HashMap::new(),
             filter: None,
             filter_closed_at: None,
             search_highlight: None,
@@ -1103,8 +1106,9 @@ impl Workspace {
             return;
         };
         let Some(client) = self.env_client(&key.env) else { return };
+        let checkout = (key.env.clone(), cwd.clone());
         let env = key.env.clone();
-        cx.spawn(async move |this, cx| {
+        let read = cx.spawn(async move |this, cx| {
             let Ok(status) = client.request("vcs.refreshStatus", json!({"cwd": cwd})).await else { return };
             let Some(branch) = status["refName"].as_str().map(str::to_owned) else { return };
             let _ = this.update(cx, |this, cx| {
@@ -1114,8 +1118,8 @@ impl Workspace {
                     this.notify_sidebar(cx);
                 }
             });
-        })
-        .detach();
+        });
+        self.sidebar.checkout_reads.insert(checkout, read);
     }
 
     /// The row's hover card, drawn to the right of the row (`SidebarThreadTooltip`).

@@ -115,6 +115,8 @@ struct Picker {
     kind: PickerKind,
     search: Entity<InputState>,
     candidates: Option<Result<Value, String>>,
+    /// The candidates read in flight; a newer read replaces it, so an older answer never lands last.
+    _candidates: Option<Task<()>>,
     pending: Option<String>,
     /// The reviewer query once typing settles.
     debounced: String,
@@ -122,6 +124,8 @@ struct Picker {
     /// The host's answers past the first page, by query (`reviewerSearch`), and those in flight.
     searches: HashMap<String, Result<Value, String>>,
     searching: HashSet<String>,
+    /// Bumped when a pick makes the searches stale, so one still in flight is dropped.
+    searches_epoch: u64,
     /// The candidate the arrow keys rest on, which Enter picks; the first after each keystroke.
     highlight: Option<usize>,
     scroll: ScrollHandle,
@@ -1723,11 +1727,13 @@ impl Workspace {
                 kind,
                 search,
                 candidates: None,
+                _candidates: None,
                 pending: None,
                 debounced: String::new(),
                 _debounce: None,
                 searches: HashMap::new(),
                 searching: HashSet::new(),
+                searches_epoch: 0,
                 highlight: Some(0),
                 scroll: ScrollHandle::new(),
             });
@@ -1746,7 +1752,7 @@ impl Workspace {
         } else {
             "pullRequests.labelCandidates"
         };
-        cx.spawn(async move |this, cx| {
+        let read = cx.spawn(async move |this, cx| {
             let result = client.request(method, input).await;
             let _ = this.update(cx, |this, cx| {
                 let Some(picker) = this.pr_panel(&key).and_then(|p| p.write.picker.as_mut()).filter(|p| p.kind == kind)
@@ -1757,8 +1763,10 @@ impl Workspace {
                 this.search_pr_reviewers(&key, cx);
                 cx.notify();
             });
-        })
-        .detach();
+        });
+        if let Some(picker) = self.pr_write().and_then(|w| w.picker.as_mut()).filter(|p| p.kind == kind) {
+            picker._candidates = Some(read);
+        }
         cx.notify();
     }
 
@@ -1800,10 +1808,14 @@ impl Workspace {
             return;
         }
         input["query"] = json!(query);
+        let epoch = picker.searches_epoch;
         cx.spawn(async move |this, cx| {
             let result = client.request("pullRequests.reviewerCandidates", input).await;
             let _ = this.update(cx, |this, cx| {
                 let Some(picker) = this.pr_write_of(&key).and_then(|w| w.picker.as_mut()) else { return };
+                if picker.searches_epoch != epoch {
+                    return;
+                }
                 picker.searching.remove(&query);
                 picker.searches.insert(query, result.map_err(|error| list_logic::error_message(&error)));
                 cx.notify();
@@ -1858,6 +1870,8 @@ impl Workspace {
                 // what was typed, so the one on screen is read again too.
                 if let Some(picker) = this.pr_write_of(key).and_then(|w| w.picker.as_mut()) {
                     picker.searches.clear();
+                    picker.searching.clear();
+                    picker.searches_epoch += 1;
                 }
                 this.read_pr_picker_candidates(kind, cx);
             }
