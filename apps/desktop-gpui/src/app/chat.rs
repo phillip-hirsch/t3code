@@ -1063,17 +1063,17 @@ pub(super) fn render_row(
                 top_right: *grouped_with_previous,
                 bottom_right: layout.media_above_text || *grouped_with_next,
             };
-            let media = attachments::media_block(id, &layout, corners, this, &t, window, cx);
+            let view = view_key(pane, id);
+            let media = attachments::media_block(&view, &layout, corners, this, &t, window, cx);
             let (media_above, media_inside) = if layout.media_above_text { (media, None) } else { (None, media) };
             let inside: Vec<AnyElement> = media_inside
                 .into_iter()
-                .chain(attachments::audio_block(id, &layout, this, &t))
-                .chain(layout.file_cards_only.then(|| attachments::file_cards(id, &layout, this, &t)))
-                .chain(attachments::file_list(id, &layout, this, &t).filter(|_| !layout.file_cards_only))
+                .chain(attachments::audio_block(&view, &layout, this, &t))
+                .chain(layout.file_cards_only.then(|| attachments::file_cards(&view, &layout, this, &t)))
+                .chain(attachments::file_list(&view, &layout, this, &t).filter(|_| !layout.file_cards_only))
                 .collect();
-            let body = (!layout.file_cards_only && !layout.audio_only && !text.trim().is_empty()).then(|| {
-                markdown_with(this, view_key(pane, id), text, MarkdownKind::User, None, Some(content), &t, cx)
-            });
+            let body = (!layout.file_cards_only && !layout.audio_only && !text.trim().is_empty())
+                .then(|| markdown_with(this, view.clone(), text, MarkdownKind::User, None, Some(content), &t, cx));
             let bare = layout.media_only || layout.file_cards_only || layout.audio_only;
             user_row(
                 id,
