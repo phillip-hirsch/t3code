@@ -1966,6 +1966,19 @@ impl InnerWebView {
     Ok(())
   }
 
+  pub fn reparent_as_child(&self, parent: &impl HasWindowHandle) -> Result<()> {
+    let parent = match parent.window_handle()?.as_raw() {
+      RawWindowHandle::Win32(parent) => parent.hwnd.get(),
+      _ => return Err(Error::UnsupportedWindowHandle),
+    };
+    self.reparent(parent)?;
+    // `reparent` keeps a child's old parent, which `focus_parent` and `bounds` still use.
+    if self.is_child {
+      *self.parent.borrow_mut() = HWND(parent as _);
+    }
+    Ok(())
+  }
+
   pub fn print(&self) -> Result<()> {
     self.eval(
       "window.print()",

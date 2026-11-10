@@ -76,6 +76,9 @@ pub struct WebView {
     /// The window-relative origin that page clicks are forwarded to GPUI from.
     #[cfg(target_os = "linux")]
     origin: Rc<Cell<gpui::Point<Pixels>>>,
+    /// The window the view is in, which page clicks are forwarded to.
+    #[cfg(target_os = "linux")]
+    window: Rc<Cell<gpui::AnyWindowHandle>>,
 }
 
 impl Drop for WebView {
@@ -104,7 +107,9 @@ impl WebView {
         #[cfg(target_os = "linux")]
         let origin = Rc::new(Cell::new(gpui::Point::default()));
         #[cfg(target_os = "linux")]
-        linux::forward_mouse_down(&webview, origin.clone(), window, cx);
+        let window_handle = Rc::new(Cell::new(window.window_handle()));
+        #[cfg(target_os = "linux")]
+        linux::forward_mouse_down(&webview, origin.clone(), window_handle.clone(), cx);
         #[cfg(target_os = "linux")]
         linux::match_scale_factor(&webview, window.scale_factor(), 1.0);
         #[cfg(not(any(all(feature = "gpui-fast", target_os = "macos"), target_os = "linux")))]
@@ -125,7 +130,30 @@ impl WebView {
             scale_factor: Cell::new(window.scale_factor()),
             #[cfg(target_os = "linux")]
             origin,
+            #[cfg(target_os = "linux")]
+            window: window_handle,
         }
+    }
+
+    /// Move the native view into another window of the application, keeping its page. It is
+    /// laid out there the next time that window draws it.
+    ///
+    /// On Linux the window must run on X11, as for [`WebView::build`]. A view in a window
+    /// composition surface (the `gpui-fast` feature) cannot move.
+    pub fn move_to_window(&self, window: &Window) -> wry::Result<()> {
+        #[cfg(all(feature = "gpui-fast", any(target_os = "macos", target_os = "linux")))]
+        if self.composition.is_some() {
+            return Err(wry::Error::UnsupportedWindowHandle);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.webview
+                .reparent_as_child(&linux::X11Parent::new(window)?)?;
+            self.window.set(window.window_handle());
+        }
+        #[cfg(not(target_os = "linux"))]
+        self.webview.reparent_as_child(window)?;
+        Ok(())
     }
 
     /// Build a webview as a child of `window`, performing the platform setup Wry requires.

@@ -2184,6 +2184,17 @@ impl WebView {
   pub fn focus_parent(&self) -> Result<()> {
     self.webview.focus_parent()
   }
+
+  /// Moves a webview built with [`WebViewBuilder::build_as_child`] into `parent`, another window
+  /// of the same kind, keeping its page. Its bounds stay relative to its parent, so set them again.
+  ///
+  /// ## Platform-specific:
+  ///
+  /// - **Linux**: X11 only; `parent` must be an Xlib or XCB window.
+  #[cfg(any(target_os = "windows", target_os = "macos", gtk))]
+  pub fn reparent_as_child<W: HasWindowHandle>(&self, parent: &W) -> Result<()> {
+    self.webview.reparent_as_child(parent)
+  }
 }
 
 /// An event describing drag and drop operations on the webview.
