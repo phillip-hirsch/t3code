@@ -17,7 +17,7 @@ use super::super::widgets::select_trigger;
 use super::error_toast;
 use super::ui::{fold_trigger, text_sm, text_xs};
 use crate::app::Workspace;
-use crate::environments::Presented;
+use crate::environments::{Presented, Route};
 use crate::pull_request_routing::{self as routing, PERMISSIONS, Permission};
 use crate::theme::{self, Tokens};
 
@@ -27,15 +27,14 @@ const SECTION: &str = "pull-request-routing";
 struct Machine {
     id: String,
     label: String,
-    /// Where this device reaches it; `None` until the primary's server is up.
-    http_base: Option<String>,
+    /// What a grant is keyed to; `None` until the primary's server is up, or for a saved
+    /// route that cannot be keyed.
+    connection_key: Option<String>,
+    /// `isLocal`: reached over loopback.
+    local: bool,
+    /// The row's subtitle: the route the connection runs over, else the first saved one.
+    address: Option<String>,
     primary: bool,
-}
-
-impl Machine {
-    fn connection_key(&self) -> Option<String> {
-        routing::connection_key(self.primary, &self.id, self.http_base.as_deref()?)
-    }
 }
 
 impl Workspace {
@@ -44,10 +43,13 @@ impl Workspace {
     fn routing_machines(&self, cx: &App) -> Vec<Machine> {
         let mut machines = Vec::new();
         if let Some(id) = self.primary_environment() {
+            let http_base = self.sessions()[0].endpoint.as_ref().map(|endpoint| endpoint.http_base.as_str());
             machines.push(Machine {
                 id: id.to_string(),
                 label: self.primary_info().environment_label.clone().unwrap_or_else(|| id.to_string()),
-                http_base: self.sessions()[0].endpoint.as_ref().map(|endpoint| endpoint.http_base.clone()),
+                connection_key: http_base.and_then(|http_base| routing::connection_key(true, id, http_base)),
+                local: http_base.is_some_and(routing::is_local),
+                address: None,
                 primary: true,
             });
         }
@@ -59,17 +61,14 @@ impl Workspace {
             if !environment.enabled || unsupported || saved.is_primary(&environment.environment_id) {
                 continue;
             }
-            // The bearer route the connection runs over, else the first saved one; an SSH-only
-            // machine has no bearer target to grant.
             let active = saved.session(&environment.environment_id).and_then(|session| session.active_route());
-            let route = active
-                .and_then(|id| environment.route(id))
-                .filter(|route| route.http_base().is_some())
-                .or_else(|| environment.routes.iter().find(|route| route.http_base().is_some()));
+            let shown = active.and_then(|id| environment.route(id)).or_else(|| environment.routes.first());
             machines.push(Machine {
                 id: environment.environment_id.clone(),
                 label: environment.label.clone(),
-                http_base: route.and_then(|route| route.http_base()).map(str::to_owned),
+                connection_key: routing::saved_connection_key(&environment.environment_id, &environment.routes),
+                local: environment.routes.first().and_then(|route| route.http_base()).is_some_and(routing::is_local),
+                address: shown.map(Route::address_text),
                 primary: false,
             });
         }
@@ -85,11 +84,10 @@ impl Workspace {
             .into_iter()
             .filter_map(|machine| {
                 let session = self.session(&machine.id)?;
-                let http_base = machine.http_base.as_deref()?;
                 Some(routing::Member {
                     transport: session.client.clone()?,
-                    local: routing::is_local(http_base),
-                    permission: routing::permission_for(machine.connection_key().as_deref(), grants),
+                    local: machine.local,
+                    permission: routing::permission_for(machine.connection_key.as_deref(), grants),
                     checks: session.server_info.capability("pullRequestChecks"),
                     environment_id: machine.id,
                 })
@@ -111,7 +109,7 @@ impl Workspace {
         let rows: Vec<(Machine, Option<String>, Permission)> = machines
             .into_iter()
             .map(|machine| {
-                let key = machine.connection_key();
+                let key = machine.connection_key.clone();
                 let permission = routing::permission_for(key.as_deref(), grants);
                 (machine, key, permission)
             })
@@ -174,7 +172,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let trigger_id = SharedString::from(format!("pull-request-routing-{}", machine.id));
-        let subtitle = if machine.primary { Some("This machine".to_owned()) } else { machine.http_base.clone() };
+        let subtitle = if machine.primary { Some("This machine".to_owned()) } else { machine.address.clone() };
         let view = cx.entity();
         let disabled = !editable || key.is_none();
         let id = machine.id.clone();
@@ -186,9 +184,9 @@ impl Workspace {
                     menu = menu.item(PopupMenuItem::new(label).checked(value == permission).on_click(
                         move |_, window, cx| {
                             view.update(cx, |this, cx| {
-                                // The machine's route now: the menu can outlive a reconnect.
+                                // The machine's routes now: the menu can outlive an edit to them.
                                 let machine = this.routing_machines(cx).into_iter().find(|m| m.id == id);
-                                let Some(key) = machine.and_then(|m| m.connection_key()) else { return };
+                                let Some(key) = machine.and_then(|m| m.connection_key) else { return };
                                 this.set_pull_request_routing(id.clone(), key, value, window, cx);
                             });
                         },
