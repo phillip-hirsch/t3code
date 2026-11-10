@@ -470,7 +470,7 @@ impl Workspace {
     }
 
     fn decline_link(&mut self, card: &RequestCard, host: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.env_client(host).filter(|_| self.manages_access(host)) else { return };
+        let Some(client) = self.access_client(host) else { return };
         let id = card.item_id.clone();
         if !self.requests.busy.insert(id.clone()) {
             return;
@@ -849,7 +849,6 @@ struct LinkDialog {
     workspace: WeakEntity<Workspace>,
     /// The environment the request was made in, which the link is made from.
     host: SharedString,
-    client: Option<RpcClient>,
     /// `peerLinks.list` on the host, for the machines it links to already.
     links: Vec<Value>,
     /// `None` until the user picks; until then the hint's best match is picked.
@@ -892,6 +891,11 @@ impl LinkDialog {
             return None;
         }
         self.workspace.upgrade()?.read(cx).mint_endpoint(environment_id)
+    }
+
+    /// The host's socket now, while this session may answer link requests there.
+    fn host_client(&self, cx: &App) -> Option<RpcClient> {
+        self.workspace.upgrade()?.read(cx).access_client(&self.host)
     }
 
     fn ready(&self, plan: &LinkPlan, cx: &App) -> bool {
@@ -937,8 +941,7 @@ impl LinkDialog {
     }
 
     fn submit(&mut self, plan: &LinkPlan, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.client.clone() else { return };
-        if self.busy || !self.ready(plan, cx) {
+        if self.busy || !self.ready(plan, cx) || self.host_client(cx).is_none() {
             return;
         }
         let mint = (!plan.use_existing).then(|| self.mint_endpoint(plan, cx)).flatten();
@@ -977,7 +980,12 @@ impl LinkDialog {
                 });
                 return;
             };
-            let result = client.request("peerLinks.answerRequest", input).await;
+            // Minting can outlast the connection the dialog opened on.
+            let Ok(client) = this.update(cx, |this, cx| this.host_client(cx)) else { return };
+            let result = match client {
+                Some(client) => client.request("peerLinks.answerRequest", input).await,
+                None => Err(RpcError::Disconnected("no connection that manages access on the host".into())),
+            };
             let _ = this.update_in(cx, |this, window, cx| {
                 this.busy = false;
                 match result {
@@ -1360,7 +1368,6 @@ fn open_link_dialog(
 ) {
     let Some(entity) = workspace.upgrade() else { return };
     let RequestKind::Link { url, requested_access, .. } = &card.kind else { return };
-    let client = entity.read(cx).env_client(&host);
     let address = cx.new(|cx| {
         let state = InputState::new(window, cx).placeholder("https://machine.tailnet.ts.net");
         match url {
@@ -1394,7 +1401,6 @@ fn open_link_dialog(
             card: card.clone(),
             workspace: workspace.clone(),
             host: host.clone(),
-            client: client.clone(),
             links: Vec::new(),
             choice: None,
             address,
@@ -1408,7 +1414,7 @@ fn open_link_dialog(
         }
     });
     // The machines the host links to already are answered with that link.
-    if let Some(client) = client {
+    if let Some(client) = entity.read(cx).env_client(&host) {
         let weak = dialog.downgrade();
         cx.spawn(async move |cx| {
             let Ok(links) = client.request("peerLinks.list", json!({})).await else { return };
