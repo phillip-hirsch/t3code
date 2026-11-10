@@ -232,6 +232,9 @@ impl Workspace {
             window.dispatch_action(Box::new(input::Paste), cx);
             return;
         }
+        if !self.question_takes_text(super::side_chat::ChatPane::Main) {
+            return;
+        }
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()).filter(|text| !text.is_empty()) else {
             return;
         };

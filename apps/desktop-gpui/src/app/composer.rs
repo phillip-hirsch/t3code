@@ -798,7 +798,10 @@ impl Workspace {
         let Some(digit) = option_digit(keystroke) else { return false };
         // The web skips keys aimed at any text field; here that is any focus but the workspace's own
         // (composer, find bar, side chat, terminal, preview), and an open palette or dialog.
-        let resting = self.focus.is_focused(window) || window.focused(cx).is_none();
+        // A disabled composer is no text field, though it keeps the focus it had.
+        let disabled =
+            !self.question_takes_text(ChatPane::Main) && self.composer.read(cx).focus_handle(cx).is_focused(window);
+        let resting = self.focus.is_focused(window) || window.focused(cx).is_none() || disabled;
         if !resting || self.palette.is_some() || window.has_active_dialog(cx) {
             return false;
         }
@@ -1227,7 +1230,8 @@ impl Workspace {
             .text_size(px(t.fonts.prompt_size))
             .line_height(px(t.fonts.prompt_size * PROMPT_LEADING))
             .mx(px(-4.))
-            .disabled(self.target.is_none())
+            // A choice-only question, or one whose answer is on its way, takes no typing.
+            .disabled(self.target.is_none() || !self.question_takes_text(ChatPane::Main))
             .readonly(saving)
             .token(move |token, _, _| {
                 let records =

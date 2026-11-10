@@ -1034,6 +1034,7 @@ This permanently clears its conversation history."
                     .flex_1()
                     .font_family(t.fonts.composer)
                     .text_size(px(t.fonts.prompt_size))
+                    .disabled(!self.question_takes_text(ChatPane::Side))
                     .readonly(saving)
                     // Cite is the one chip a side chat's plain-text composer takes.
                     .token(move |token, _, _| super::citations::citation_token(token, &t_chip))

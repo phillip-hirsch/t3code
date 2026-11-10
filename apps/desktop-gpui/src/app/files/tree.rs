@@ -897,6 +897,12 @@ impl Workspace {
 
     /// Add to chat: the file's mention at the end of the composer, after a space.
     pub(in crate::app) fn add_file_to_chat(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.question_takes_text(crate::app::side_chat::ChatPane::Main) {
+            let notification =
+                Notification::error("The chat isn't ready to accept input right now.").title("Unable to add to chat");
+            window.push_notification(notification, cx);
+            return;
+        }
         let chip = Chip::File { path: path.to_owned() };
         let link = composer_text::file_link(path);
         self.composer.update(cx, |state, cx| {
