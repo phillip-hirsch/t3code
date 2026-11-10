@@ -238,6 +238,8 @@ pub struct Workspace {
     prompt_history: Option<crate::composer_text::HistoryPosition>,
     /// The editor's chip ids after the last edit, to notice deleted attachment chips.
     chip_ids: Vec<String>,
+    /// A chip catch-up the composer refused during an IME composition.
+    chip_sync_pending: Option<composer::ChipSync>,
     /// The provider instance the composer's and messages' skill chips last resolved against.
     chip_provider: Option<String>,
     /// The composer's Markdown styling, made the first time `composerRichTextEnabled` paints.
@@ -466,6 +468,7 @@ impl Workspace {
             prompt_stash: Default::default(),
             prompt_history: None,
             chip_ids: Vec::new(),
+            chip_sync_pending: None,
             chip_provider: None,
             composer_marks: None,
             ctrl_held: false,

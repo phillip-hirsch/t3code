@@ -112,6 +112,31 @@ pub(super) enum ChipSync {
     Remount,
 }
 
+/// The catch-up to run now: `sync`, or the wider one still waiting in `pending`.
+fn take_chip_sync(pending: &mut Option<ChipSync>, sync: ChipSync) -> ChipSync {
+    pending.take().map_or(sync, |waiting| waiting.max(sync))
+}
+
+/// Whether the editor took a catch-up. One it refused during an IME composition waits in
+/// `pending` for the change that ends the composition.
+fn settle_chip_sync(
+    pending: &mut Option<ChipSync>,
+    sync: ChipSync,
+    result: Result<(), gpui_kit::base::input::InlineTokenError>,
+) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(gpui_kit::base::input::InlineTokenError::CompositionActive) => {
+            *pending = Some(sync);
+            false
+        }
+        Err(error) => {
+            log::warn!("composer chips not reconciled: {error:?}");
+            false
+        }
+    }
+}
+
 /// Records `now` as the provider chips resolve against; whether it differs from the one before.
 fn note_provider(seen: &mut Option<String>, now: Option<&str>) -> bool {
     if seen.as_deref() == now {
@@ -173,7 +198,8 @@ impl Workspace {
         let restored = adds_chip(&self.chip_ids, &chips);
         let previous = std::mem::replace(&mut self.chip_ids, chips);
         self.sync_attachment_chips(&previous, cx);
-        if restored {
+        // A catch-up refused while an IME composition was active runs once a change ends it.
+        if restored || self.chip_sync_pending.is_some() {
             self.reconcile_composer_chips(ChipSync::Restored, cx);
         }
         self.sync_trigger(cx);
@@ -253,6 +279,7 @@ impl Workspace {
             };
         }
         self.chip_ids = content.tokens().iter().map(|s| s.token().id().to_string()).collect();
+        self.chip_sync_pending = None;
         // `set_value` clears the undo history that could bring a deleted chip back.
         self.release_retained_attachments(cx);
         self.composer.update(cx, |composer, cx| composer.set_value(content, window, cx));
@@ -286,6 +313,7 @@ impl Workspace {
     /// history and keeping the selection; `sync` says which chips may change. Attachments keep
     /// their records: like the web's, a send reads their references from the text.
     pub(super) fn reconcile_composer_chips(&mut self, sync: ChipSync, cx: &mut Context<Self>) {
+        let sync = take_chip_sync(&mut self.chip_sync_pending, sync);
         let state = self.composer.read(cx);
         let (text, spans) = (state.value(), state.tokens().to_vec());
         if sync != ChipSync::Remount
@@ -326,13 +354,12 @@ impl Workspace {
                 Err(_) => content,
             };
         }
-        self.chip_ids = content.tokens().iter().map(|s| s.token().id().to_string()).collect();
-        self.composer.update(cx, |composer, cx| {
-            if let Err(error) = composer.retokenize(content, cx) {
-                log::warn!("composer chips not reconciled: {error:?}");
-            }
-        });
-        self.sync_composer_marks(cx);
+        let result = self.composer.update(cx, |composer, cx| composer.retokenize(content, cx));
+        if settle_chip_sync(&mut self.chip_sync_pending, sync, result) {
+            let state = self.composer.read(cx);
+            self.chip_ids = state.tokens().iter().map(|s| s.token().id().to_string()).collect();
+            self.sync_composer_marks(cx);
+        }
     }
 
     /// Pasted file links, known skills and models, and context links arrive as chips (`handlePaste`);
@@ -2396,6 +2423,24 @@ mod tests {
         assert_eq!(seen.as_deref(), Some("claudeAgent"));
         assert!(note_provider(&mut seen, None), "its provider went");
         assert!(!note_provider(&mut seen, None));
+    }
+
+    #[test]
+    fn a_chip_catch_up_refused_mid_composition_runs_once_it_ends() {
+        use gpui_kit::base::input::InlineTokenError::{CompositionActive, TextMismatch};
+        let mut pending = None;
+        let sync = take_chip_sync(&mut pending, ChipSync::Remount);
+        assert!(!settle_chip_sync(&mut pending, sync, Err(CompositionActive)), "rich text turned on mid-composition");
+        assert_eq!(pending, Some(ChipSync::Remount));
+        let sync = take_chip_sync(&mut pending, ChipSync::Lists);
+        assert_eq!(sync, ChipSync::Remount, "a narrower catch-up still runs the waiting one");
+        assert!(!settle_chip_sync(&mut pending, sync, Err(CompositionActive)), "still composing");
+        let sync = take_chip_sync(&mut pending, ChipSync::Restored);
+        assert!(settle_chip_sync(&mut pending, sync, Ok(())), "the commit's change runs it");
+        assert_eq!((sync, pending), (ChipSync::Remount, None));
+        let sync = take_chip_sync(&mut pending, ChipSync::Lists);
+        assert!(!settle_chip_sync(&mut pending, sync, Err(TextMismatch)));
+        assert_eq!(pending, None, "only a composition defers one");
     }
 
     #[test]
