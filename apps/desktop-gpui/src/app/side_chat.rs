@@ -996,7 +996,9 @@ This permanently clears its conversation history."
             None => self.render_side_primary_action(view, running, operate, stop(cx), cx),
         };
         let (t_chip, chip_view) = (*t, cx.weak_entity());
+        let saving = self.pane_queue_edit(ChatPane::Side) == Some(true);
         let composer = h_flex()
+            .relative()
             .mx_2()
             .mb_2()
             .when(question.is_none(), gpui_kit::Styled::mt_2)
@@ -1014,6 +1016,7 @@ This permanently clears its conversation history."
                     .flex_1()
                     .font_family(t.fonts.composer)
                     .text_size(px(t.fonts.prompt_size))
+                    .readonly(saving)
                     // Cite is the one chip a side chat's plain-text composer takes.
                     .token(move |token, _, _| super::citations::citation_token(token, &t_chip))
                     .on_token_click(move |event, window, cx| {
@@ -1023,7 +1026,8 @@ This permanently clears its conversation history."
                         });
                     }),
             )
-            .child(button);
+            .child(button)
+            .when(saving, |el| el.child(super::composer::inert_cover("side-chat-composer-inert")));
         v_flex()
             .flex_1()
             .min_h_0()

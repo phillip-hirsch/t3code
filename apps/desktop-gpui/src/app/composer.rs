@@ -1213,6 +1213,8 @@ impl Workspace {
                 })
                 .collect(),
         );
+        // The web's composer host turns `inert` while a queued edit saves.
+        let saving = self.saving_queue_edit();
         let editor = Textarea::new(&self.composer)
             .appearance(false)
             .xsmall()
@@ -1221,6 +1223,7 @@ impl Workspace {
             .line_height(px(t.fonts.prompt_size * PROMPT_LEADING))
             .mx(px(-4.))
             .disabled(self.target.is_none())
+            .readonly(saving)
             .token(move |token, _, _| {
                 let records =
                     ChipRecords { pull_requests: &pull_requests, held: &held, machines: &machines, models: &models };
@@ -1293,7 +1296,7 @@ impl Workspace {
                     .border_color(t.primary.opacity(0.7))
             })
             .on_drop(cx.listener(|this, drag: &super::files::MentionDrag, window, cx| {
-                if this.target.is_some() {
+                if this.target.is_some() && !this.saving_queue_edit() {
                     this.add_file_to_chat(&drag.path, window, cx);
                     this.focus_composer(window, cx);
                 }
@@ -1342,7 +1345,8 @@ impl Workspace {
                         div().px(px(16.)).pb(px(8.)).text_xs().line_height(px(16.)).text_color(t.error).child(error)
                     }))
                     .child(self.render_footer(window, &t, cx))
-            });
+            })
+            .when(saving, |el| el.child(inert_cover("composer-inert")));
         // The draft hero centers the bare stack; under a thread the overlay keeps `sm:pt-2`.
         let top = if matches!(self.target, Some(Target::Draft { .. })) { 0. } else { 8. };
         div().w_full().flex_none().pt(px(top)).pl(px(lane.left)).pr(px(lane.right)).pb(px(20.)).child(
@@ -2152,6 +2156,11 @@ pub(super) fn question_submit(
 }
 
 /// `ComposerBanner.Root variant="info"` in the top drawer, its bottom tucked under the composer.
+/// `inert` over a composer card: it takes the pointer, so nothing under it is clicked or selected.
+pub(super) fn inert_cover(id: &'static str) -> gpui_kit::Stateful<gpui_kit::Div> {
+    div().id(id).absolute().inset_0().block_mouse_except_scroll()
+}
+
 pub(super) fn top_drawer(content: impl IntoElement, joined: bool, t: &Tokens) -> AnyElement {
     let outline = t.composer_outline();
     div()

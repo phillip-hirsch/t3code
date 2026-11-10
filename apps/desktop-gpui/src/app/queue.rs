@@ -409,6 +409,8 @@ impl Workspace {
         if let Some(edit) = self.queue_ui_mut(pane).and_then(|ui| ui.edit.as_mut()) {
             edit.saving = true;
         }
+        // The web's composer turns `inert` while it saves, which drops focus from inside it.
+        window.blur(cx);
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("orchestration.dispatchCommand", command).await;
