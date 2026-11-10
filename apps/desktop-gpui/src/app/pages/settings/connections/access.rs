@@ -166,7 +166,9 @@ enum Revoke {
     Others,
 }
 
-fn revoke(state: &Entity<AccessState>, endpoint: Option<Endpoint>, target: Revoke, window: &mut Window, cx: &mut App) {
+/// Sends one revocation through the environment's address now, while this session has
+/// `access:write` there; the button can outlive a reconnect or a narrowed session.
+fn revoke(state: &Entity<AccessState>, host: &AccessHost, target: Revoke, window: &mut Window, cx: &mut App) {
     let (path, body, title, fallback) = match &target {
         Revoke::Link(id) => (
             "/api/auth/pairing-links/revoke",
@@ -187,6 +189,9 @@ fn revoke(state: &Entity<AccessState>, endpoint: Option<Endpoint>, target: Revok
             "Failed to revoke other clients.",
         ),
     };
+    let Some(endpoint) = host.endpoint(&[], cx) else {
+        return error_toast(window, cx, title, "This connection can no longer manage access on this environment.");
+    };
     state.update(cx, |state, cx| {
         match &target {
             Revoke::Link(id) => state.revoking_link = Some(id.clone()),
@@ -199,7 +204,7 @@ fn revoke(state: &Entity<AccessState>, endpoint: Option<Endpoint>, target: Revok
     let state = state.downgrade();
     window
         .spawn(cx, async move |cx| {
-            let result = auth_request(endpoint, path, Some(body)).await;
+            let result = auth_request(Some(endpoint), path, Some(body)).await;
             let _ = cx.update(|window, cx| {
                 let _ = state.update(cx, |state, cx| {
                     match &target {
@@ -446,14 +451,13 @@ impl Workspace {
             snapshot.sorted_links().into_iter().filter(|l| logic::ms(&l.expires_at) > now).collect();
         let sessions = snapshot.sorted_sessions();
         let open = s.clients_open;
-        let endpoint = self.settings_endpoint().cloned();
+        let host = AccessHost { workspace: cx.entity().downgrade(), environment: self.settings_environment() };
         let local = self.desktop.exposure.as_ref().filter(|_| self.access_is_primary() && !self.environment_remote);
         let targets = ShareTargets {
             endpoints: local.map(pairing::desktop_endpoints).unwrap_or_default(),
             endpoint_url: local.and_then(|view| view.exposure.endpoint_url.clone()),
         };
-        let link_row =
-            |link: &PairingLink| pairing_link_row(state, s, link, can_write, endpoint.clone(), &targets, now, t);
+        let link_row = |link: &PairingLink| pairing_link_row(state, s, link, can_write, &host, &targets, now, t);
 
         let toggle = {
             let state = state.clone();
@@ -502,11 +506,7 @@ impl Workspace {
                 );
             }
             body.extend(links.iter().map(|link| link_row(link)));
-            body.extend(
-                sessions
-                    .iter()
-                    .map(|session| client_session_row(state, s, session, can_write, endpoint.clone(), now, t)),
-            );
+            body.extend(sessions.iter().map(|session| client_session_row(state, s, session, can_write, &host, now, t)));
             if links.is_empty() && sessions.is_empty() && s.access.is_some() {
                 body.push(
                     ui::item_row(
@@ -548,7 +548,7 @@ impl Workspace {
         t: &Tokens,
     ) -> AnyElement {
         let environment = self.settings_environment();
-        let host = LinkIssuer { workspace: workspace.clone(), environment: environment.clone() };
+        let host = AccessHost { workspace: workspace.clone(), environment: environment.clone() };
         let use_in_another_app = WebButton::new("use-in-another-app", "Use in another app (MCP)")
             .icon(IconName::Plug)
             .on_click(move |_, window, cx| {
@@ -556,7 +556,6 @@ impl Workspace {
                     this.open_use_in_another_app(environment.as_deref(), window, cx);
                 });
             });
-        let endpoint = self.settings_endpoint().cloned();
         // Unknown sessions keep the button on, as the web does without a snapshot.
         let others =
             !can_read || s.access_error.is_some() || s.access.as_ref().is_none_or(AccessSnapshot::has_other_clients);
@@ -568,7 +567,8 @@ impl Workspace {
         .disabled(s.revoking_others || !others)
         .on_click({
             let state = state.clone();
-            move |_, window, cx| revoke(&state, endpoint.clone(), Revoke::Others, window, cx)
+            let host = host.clone();
+            move |_, window, cx| revoke(&state, &host, Revoke::Others, window, cx)
         });
         let denial = logic::remote_clients_denial(&self.settings_info().managed_policy);
         let delegatable: Vec<String> = self
@@ -778,7 +778,7 @@ fn pairing_link_row(
     s: &AccessState,
     link: &PairingLink,
     can_revoke: bool,
-    endpoint: Option<Endpoint>,
+    host: &AccessHost,
     targets: &ShareTargets,
     now: i64,
     t: &Tokens,
@@ -857,8 +857,8 @@ fn pairing_link_row(
             .variant(Variant::DestructiveOutline)
             .disabled(!can_revoke || revoking)
             .on_click({
-                let (state, id) = (state.clone(), id.clone());
-                move |_, window, cx| revoke(&state, endpoint.clone(), Revoke::Link(id.clone()), window, cx)
+                let (state, id, host) = (state.clone(), id.clone(), host.clone());
+                move |_, window, cx| revoke(&state, &host, Revoke::Link(id.clone()), window, cx)
             }),
         );
     let panel = match (share, credential) {
@@ -1021,7 +1021,7 @@ fn client_session_row(
     s: &AccessState,
     session: &ClientSession,
     can_revoke: bool,
-    endpoint: Option<Endpoint>,
+    host: &AccessHost,
     now: i64,
     t: &Tokens,
 ) -> AnyElement {
@@ -1073,8 +1073,8 @@ fn client_session_row(
         .variant(Variant::DestructiveOutline)
         .disabled(!can_revoke || revoking)
         .on_click({
-            let (state, id) = (state.clone(), id.clone());
-            move |_, window, cx| revoke(&state, endpoint.clone(), Revoke::Client(id.clone()), window, cx)
+            let (state, id, host) = (state.clone(), id.clone(), host.clone());
+            move |_, window, cx| revoke(&state, &host, Revoke::Client(id.clone()), window, cx)
         })
         .into_any_element()
     });
@@ -1091,18 +1091,18 @@ struct CreateLinkForm {
     delegatable: Vec<String>,
     busy: bool,
     access: WeakEntity<AccessState>,
-    host: LinkIssuer,
+    host: AccessHost,
 }
 
-/// The environment a "Create pairing link" dialog opened on, read again when it creates: the
-/// dialog can stay open through a reconnect.
+/// The environment the access page shows, read again when a link is created or access is
+/// revoked: the dialog or button can outlive a reconnect.
 #[derive(Clone)]
-struct LinkIssuer {
+struct AccessHost {
     workspace: WeakEntity<Workspace>,
     environment: Option<SharedString>,
 }
 
-impl LinkIssuer {
+impl AccessHost {
     /// The environment's address now, while this session may issue `scopes` there.
     fn endpoint(&self, scopes: &[String], cx: &App) -> Option<Endpoint> {
         let workspace = self.workspace.upgrade()?;
@@ -1277,7 +1277,7 @@ impl Render for CreateLinkForm {
 
 fn open_create_link_dialog(
     access: WeakEntity<AccessState>,
-    host: LinkIssuer,
+    host: AccessHost,
     delegatable: Vec<String>,
     window: &mut Window,
     cx: &mut App,
