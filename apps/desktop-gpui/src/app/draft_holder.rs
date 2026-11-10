@@ -71,6 +71,12 @@ fn carry_composer(drafts: &mut HashMap<Target, ComposerDraft>, draft: &Target, t
     true
 }
 
+/// A pane's own prompt among what can hold it: set aside by a queued message's edit, else parked
+/// by a question card, else the editor's text (the edit outranks the card, as in [`PromptHolder::of`]).
+pub(super) fn own_prompt<'a>(edit: Option<&'a str>, question: Option<&'a QuestionDraft>, editor: &'a str) -> &'a str {
+    edit.or(question.map(|question| question.prompt.as_str())).unwrap_or(editor)
+}
+
 fn parked(question: &QuestionDraft) -> DraftRef<'_> {
     (question.prompt.as_str(), question.prompt_attachments.as_slice(), &question.prompt_records)
 }
