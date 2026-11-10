@@ -21,9 +21,14 @@ use crate::theme;
 
 /// `pillInset` at the frame's 12px radius.
 const PILL_INSET: f32 = 8.;
-/// The handle's `size-3`, and the pill's `h-8` with its two `icon-xs` buttons.
+/// The handle's `size-3`, and the pill's `h-8`.
 const HANDLE: f32 = 12.;
-const PILL: (f32, f32) = (56., 32.);
+const PILL_HEIGHT: f32 = 32.;
+
+/// The pill's width with `buttons` 24px `icon-xs` buttons 2px apart, in its `p-0.5` and border.
+fn pill_width(buttons: u8) -> f32 {
+    26. * f32::from(buttons) + 4.
+}
 /// `HANDLE_TAP_SLOP_PX`: a press moves the player only once it travels this far.
 const SLOP: f64 = 6.;
 
@@ -58,6 +63,8 @@ struct Shown {
     tab_id: String,
     frame: Frame,
     source: Size,
+    /// The open pill's width.
+    pill: f32,
 }
 
 pub(super) struct MiniPlayerUi {
@@ -88,11 +95,11 @@ impl MiniPlayerUi {
 
 /// Whether `local` (in the frame) is on the handle, or, while the pill is open, on the pill or
 /// the corner the page reports, so the pill stays open over the area that opened it.
-fn on_handle(local: Position, frame_width: f64, open: bool) -> bool {
+fn on_handle(local: Position, frame_width: f64, open: bool, pill: f32) -> bool {
     let inset = f64::from(PILL_INSET);
     let (width, height) = if open {
         let corner = frame_width * 0.12;
-        (corner.max(inset + f64::from(PILL.0)), corner.max(inset + f64::from(PILL.1)))
+        (corner.max(inset + f64::from(pill)), corner.max(inset + f64::from(PILL_HEIGHT)))
     } else {
         (inset + f64::from(HANDLE), inset + f64::from(HANDLE))
     };
@@ -218,7 +225,7 @@ impl Workspace {
             x: f64::from(f32::from(position.x - canvas.origin.x)) - shown.frame.x,
             y: f64::from(f32::from(position.y - canvas.origin.y)) - shown.frame.y,
         };
-        let hovered = on_handle(local, shown.frame.width, ui.hovered || ui.corner);
+        let hovered = on_handle(local, shown.frame.width, ui.hovered || ui.corner, shown.pill);
         if hovered != ui.hovered || (!hovered && ui.corner) {
             ui.hovered = hovered;
             ui.corner = false;
@@ -285,11 +292,16 @@ impl Workspace {
         let Some(frame) = frame.filter(|frame| frame.width > 0. && frame.height > 0.) else {
             return Some(measure.into_any_element());
         };
-        self.preview.mini.shown = Some(Shown { thread: thread.clone(), tab_id: mini.tab_id.clone(), frame, source });
+        let server = session.server_hosted();
+        // A tab this client hosts can also pop into its separate window.
+        let pill = pill_width(if server { 2 } else { 3 });
+        self.preview.mini.shown =
+            Some(Shown { thread: thread.clone(), tab_id: mini.tab_id.clone(), frame, source, pill });
         let open = self.preview.mini.hovered
             || self.preview.mini.corner
             || self.preview.mini.handle.contains_focused(window, cx);
-        let server = session.server_hosted();
+        let separated = self.separated(&tab);
+        let has_view = self.preview.tabs.contains_key(&tab);
         // An agent's tab streams here as in the panel, with its control bar below the page.
         let content = if server {
             v_flex()
@@ -299,6 +311,7 @@ impl Workspace {
         } else {
             let hosted = self.preview.tabs.get(&tab).map(|hosted| hosted.view.clone());
             match hosted {
+                Some(_) if separated => self.render_separated(&tab, true, &tokens, cx),
                 // The pill draws where the view would cover it.
                 Some(_) if open => div().into_any_element(),
                 Some(view) => {
@@ -369,6 +382,22 @@ impl Workspace {
                         this.open_surface(Surface::Browser(expand_tab.clone()), window, cx);
                     })),
             )
+            .when(!server, |pill| {
+                let (label, tooltip) = if separated {
+                    ("Close popped-out preview", "Close separate window")
+                } else {
+                    ("Pop preview into separate window", "Pop into separate window")
+                };
+                let button = icon_button("mini-separate", IconName::PictureInPicture2, has_view, &tokens, cx)
+                    .tooltip(tooltip)
+                    .accessibility_label(label);
+                let button = if separated { super::pressed(button, tokens.foreground, &tokens, cx) } else { button };
+                pill.child(button.when(has_view, |el| {
+                    el.on_click(cx.listener(move |this, _, window, cx| {
+                        this.toggle_separate_window(tab.clone(), window, cx);
+                    }))
+                }))
+            })
             .child(
                 icon_button("mini-close", IconName::X, true, &tokens, cx).tooltip("Close floating preview").on_click(
                     cx.listener(move |this, _, _, cx| {
@@ -447,7 +476,7 @@ fn h_pill(tokens: &theme::Tokens) -> gpui_kit::Div {
         .absolute()
         .right_0()
         .top_0()
-        .h(px(PILL.1))
+        .h(px(PILL_HEIGHT))
         .items_center()
         .gap(px(2.))
         .p(px(2.))
@@ -466,16 +495,22 @@ mod tests {
     #[test]
     fn the_handle_zone_grows_to_the_pill_and_the_page_corner_while_open() {
         let at = |x: f64, y: f64| Position { x, y };
+        let (two, three) = (pill_width(2), pill_width(3));
+        assert_eq!((two, three), (56., 82.));
         // A 320px frame: the 12px handle sits 8px in from its top-right corner.
-        assert!(on_handle(at(305., 10.), 320., false), "on the handle");
-        assert!(!on_handle(at(270., 10.), 320., false), "left of the handle");
-        assert!(!on_handle(at(305., 30.), 320., false), "below the handle");
-        assert!(on_handle(at(270., 30.), 320., true), "on the open pill");
-        assert!(!on_handle(at(240., 30.), 320., true), "left of the open pill");
-        assert!(!on_handle(at(305., 45.), 320., true), "below the open pill");
+        assert!(on_handle(at(305., 10.), 320., false, two), "on the handle");
+        assert!(!on_handle(at(270., 10.), 320., false, two), "left of the handle");
+        assert!(!on_handle(at(305., 30.), 320., false, two), "below the handle");
+        assert!(on_handle(at(270., 30.), 320., true, two), "on the open pill");
+        assert!(!on_handle(at(240., 30.), 320., true, two), "left of the open pill");
+        assert!(!on_handle(at(305., 45.), 320., true, two), "below the open pill");
+        // A tab this client hosts has a third button, so its open pill reaches further left.
+        assert!(on_handle(at(240., 30.), 320., true, three), "on the wider pill");
+        assert!(!on_handle(at(225., 30.), 320., true, three), "left of the wider pill");
+        assert!(!on_handle(at(240., 10.), 320., false, three), "the closed handle stays small");
         // A wide frame keeps the pill open over the whole corner the page reports.
-        assert!(on_handle(at(1000. - 110., 110.), 1000., true), "in the page's corner");
-        assert!(!on_handle(at(1000. - 110., 130.), 1000., true), "past it");
-        assert!(!on_handle(at(330., 10.), 320., true), "outside the frame");
+        assert!(on_handle(at(1000. - 110., 110.), 1000., true, two), "in the page's corner");
+        assert!(!on_handle(at(1000. - 110., 130.), 1000., true, two), "past it");
+        assert!(!on_handle(at(330., 10.), 320., true, two), "outside the frame");
     }
 }

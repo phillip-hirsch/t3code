@@ -39,6 +39,7 @@ mod empty;
 mod mini_layout;
 mod mini_player;
 mod profiles;
+mod separate;
 mod server;
 mod viewport;
 
@@ -120,6 +121,8 @@ pub(super) struct PreviewState {
     /// The tab each thread's mini player floats, and where (`previewMiniPlayerStore`).
     floating: HashMap<ThreadRef, mini_player::MiniPlayer>,
     mini: mini_player::MiniPlayerUi,
+    /// Tabs whose page is in its separate window.
+    separate: HashMap<TabRef, separate::Separate>,
     toolbar: device_toolbar::DeviceToolbar,
     /// The page area the panel last drew a tab in: "Show device toolbar" sizes to it, and a
     /// fill tab floated from it keeps its layout.
@@ -173,6 +176,7 @@ impl PreviewState {
             starting: HashMap::new(),
             floating: HashMap::new(),
             mini: mini_player::MiniPlayerUi::new(cx),
+            separate: HashMap::new(),
             toolbar: device_toolbar::DeviceToolbar::new(window, cx),
             panel_area: None,
             reveals: Vec::new(),
@@ -234,6 +238,17 @@ fn icon_button(id: impl Into<gpui_kit::ElementId>, icon: IconName, enabled: bool
         .rounded(px(6.))
         .icon(Icon::new(icon).size(px(14.)))
         .disabled(!enabled)
+}
+
+/// An [`icon_button`] for a state that is on: `variant="secondary"`, its icon in `icon`.
+fn pressed(button: Button, icon: gpui_kit::Hsla, tokens: &Tokens, cx: &App) -> Button {
+    button.custom(
+        ButtonCustomVariant::new(cx)
+            .color(tokens.secondary)
+            .foreground(icon)
+            .hover(tokens.secondary)
+            .active(tokens.secondary),
+    )
 }
 
 /// The menu's Zoom row (`closeOnClick={false}`): its buttons step the active tab's zoom, read
@@ -505,6 +520,7 @@ impl Workspace {
         for (thread, tabs) in &loaded {
             self.reconcile_browser_surfaces(thread, &tabs.iter().map(String::as_str).collect::<Vec<_>>());
         }
+        self.prune_separate_windows(window, cx);
         self.sync_address(window, cx);
         cx.notify();
     }
@@ -709,6 +725,7 @@ impl Workspace {
 
     /// `closePreviewSession`.
     pub(super) fn close_preview_tab(&mut self, tab: TabRef, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_separate_window(&tab, window, cx);
         let closing = self.preview.threads.entry(&tab.thread).begin_close(&tab.tab_id);
         // The page stays alive, hidden, until the server confirms the close.
         let mut hosted = self.preview.tabs.remove(&tab);
@@ -1052,6 +1069,10 @@ impl Workspace {
             }
         }
         for (key, tab) in &mut self.preview.tabs {
+            // The separate window draws its tab's page.
+            if self.preview.separate.contains_key(key) {
+                continue;
+            }
             let scale = shown(key);
             let session = self.preview.threads.session(key);
             let view = tab.view.read(cx);
@@ -1064,11 +1085,7 @@ impl Workspace {
                 let appearance = session.and_then(|s| s.color_scheme).unwrap_or(tab.defaults.1);
                 if tab.appearance != Some(appearance) {
                     tab.appearance = Some(appearance);
-                    let _ = view.set_theme(match appearance {
-                        Appearance::System => wry::Theme::Auto,
-                        Appearance::Light => wry::Theme::Light,
-                        Appearance::Dark => wry::Theme::Dark,
-                    });
+                    let _ = view.set_theme(wry_theme(appearance));
                 }
             }
             if tab.shown != scale.is_some() {
@@ -1148,7 +1165,10 @@ impl Workspace {
             available
         };
         let fixed = setting.size().map(|size| preview::fit_viewport(size, area));
-        self.preview.panel_view = Some((tab.clone(), fixed.map_or(1., |(_, scale)| scale)));
+        let separated = self.separated(tab);
+        if !separated {
+            self.preview.panel_view = Some((tab.clone(), fixed.map_or(1., |(_, scale)| scale)));
+        }
         let Some(view) = view else {
             let blank = session.as_ref().is_none_or(|s| matches!(s.nav_status, NavStatus::Idle));
             return div()
@@ -1160,6 +1180,7 @@ impl Workspace {
         // A menu open over the page hides it, since the native view would cover the menu.
         let hidden = self.preview.menu_open || self.preview.toolbar.menu_open;
         let page = match fixed {
+            _ if separated => div().flex_1().min_h_0().child(self.render_separated(tab, false, &tokens, cx)),
             Some(((width, height), _)) => div()
                 .flex_1()
                 .min_h_0()
@@ -1308,16 +1329,8 @@ impl Workspace {
                 let label = if floating { "Close floating preview" } else { "Float preview over chat" };
                 let thread = thread.clone();
                 icon_button("preview-float", IconName::PictureInPicture2, enabled, tokens, cx)
-                    // `variant="secondary"` with a primary icon while floating.
-                    .when(floating, |el| {
-                        el.custom(
-                            ButtonCustomVariant::new(cx)
-                                .color(tokens.secondary)
-                                .foreground(tokens.primary)
-                                .hover(tokens.secondary)
-                                .active(tokens.secondary),
-                        )
-                    })
+                    // A primary icon while floating.
+                    .when(floating, |el| pressed(el, tokens.primary, tokens, cx))
                     .tooltip(label)
                     .when(enabled, |el| {
                         el.on_click(cx.listener(move |this, _, _, cx| {
@@ -1354,7 +1367,9 @@ impl Workspace {
         let server = session.server_hosted();
         let move_label = self.move_tab_label(thread, session);
         let moving = (thread.clone(), session.clone());
-        let (_, appearance) = self.tab_look(&thread.tab(&session.tab_id), session);
+        let separate_tab = thread.tab(&session.tab_id);
+        let separated = self.separated(&separate_tab);
+        let (_, appearance) = self.tab_look(&separate_tab, session);
         let fill = session.viewport.size().is_none();
         let view = cx.entity();
         trigger
@@ -1382,6 +1397,15 @@ impl Workspace {
                             this.with_active_view(cx, wry::WebView::open_devtools);
                         }),
                     ));
+                    let label =
+                        if separated { "Close separate preview window" } else { "Open separate preview window" };
+                    let tab = separate_tab.clone();
+                    menu = menu.item(PopupMenuItem::new(label).disabled(!has_page).on_click(window.listener_for(
+                        &view,
+                        move |this, _: &ClickEvent, window, cx| {
+                            this.toggle_separate_window(tab.clone(), window, cx);
+                        },
+                    )));
                 }
                 if let Some(label) = move_label.clone() {
                     let moving = moving.clone();
@@ -1455,6 +1479,15 @@ impl Workspace {
     fn active_zoom(&self) -> f64 {
         let Some(tab) = self.active_tab() else { return 1. };
         self.preview.threads.session(&tab).map_or(1., |session| self.tab_look(&tab, session).0)
+    }
+}
+
+/// The native view's colour scheme for a tab's.
+fn wry_theme(appearance: Appearance) -> wry::Theme {
+    match appearance {
+        Appearance::System => wry::Theme::Auto,
+        Appearance::Light => wry::Theme::Light,
+        Appearance::Dark => wry::Theme::Dark,
     }
 }
 
