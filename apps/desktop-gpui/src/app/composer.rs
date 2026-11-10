@@ -886,6 +886,11 @@ impl Workspace {
         }
     }
 
+    pub(super) fn cancel_question_advances(&mut self) {
+        self.set_question_advance(ChatPane::Main, None);
+        self.set_question_advance(ChatPane::Side, None);
+    }
+
     /// Opens a fresh draft when the pane's first pending question changes. The editor
     /// then holds the question's answer, and the prompt waits in the draft
     /// until the last question closes.

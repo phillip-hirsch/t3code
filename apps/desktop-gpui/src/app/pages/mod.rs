@@ -133,7 +133,11 @@ impl Workspace {
     }
 
     /// Arriving on a page from elsewhere: the Pull requests page takes focus (`startWorkspaceFocus`).
+    /// A page that replaces the chat unmounts its question cards, and with them their auto-advance.
     fn page_entered(&mut self, page: Page) {
+        if !page.is_modal() {
+            self.cancel_question_advances();
+        }
         if page == Page::PullRequests {
             self.pull_requests.focus_on_render = true;
         }
