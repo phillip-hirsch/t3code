@@ -347,7 +347,7 @@ impl Terminals {
     /// Where `key`'s terminals and panel tabs belong: the unsent draft that launches with its
     /// thread, else that thread on its environment.
     fn owner(&self, drafts: &DraftSessions, key: &DrawerKey) -> Option<Target> {
-        match drafts.launching_with(&key.thread_id) {
+        match drafts.launching_with(key.env.as_deref(), &key.thread_id) {
             Some(draft) => drafts.target(draft),
             None => Some(Target::Thread { env: key.env.clone()?.into(), id: key.thread_id.clone() }),
         }

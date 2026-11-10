@@ -100,10 +100,14 @@ impl DraftSessions {
         Some((id, assigned))
     }
 
-    /// The unsent draft whose thread launches with `thread_id`.
-    pub(super) fn launching_with(&self, thread_id: &str) -> Option<&DraftId> {
+    /// The unsent draft on `env` whose thread launches with `thread_id`; `None` for `env` is a
+    /// legacy key that names no environment, matched by the thread id alone.
+    pub(super) fn launching_with(&self, env: Option<&str>, thread_id: &str) -> Option<&DraftId> {
         let mut live = self.sessions.iter().filter(|(_, session)| !session.promoted);
-        live.find(|(_, session)| session.thread_id.as_deref() == Some(thread_id)).map(|(draft, _)| draft)
+        live.find(|(_, session)| {
+            session.thread_id.as_deref() == Some(thread_id) && env.is_none_or(|env| session.project.env == env)
+        })
+        .map(|(draft, _)| draft)
     }
 
     /// The workspace picks `draft` made for its project.
@@ -413,18 +417,20 @@ mod tests {
         let (id, assigned) = drafts.reserve_thread(&draft).unwrap();
         assert!(assigned);
         assert_eq!(drafts.reserve_thread(&draft), Some((id.clone(), false)), "a send reuses the terminals' id");
-        assert_eq!(drafts.launching_with(&id), Some(&draft));
+        assert_eq!(drafts.launching_with(Some("local"), &id), Some(&draft));
+        assert_eq!(drafts.launching_with(Some("remote"), &id), None, "another environment's thread with that id");
+        assert_eq!(drafts.launching_with(None, &id), Some(&draft), "a legacy key names no environment");
 
         let mut next = DraftSessions::default();
         next.restore(drafts.saved(|_| false));
         assert_eq!(next.thread_id(&draft), Some(id.as_str()), "it outlives a restart with the draft");
-        assert_eq!(next.launching_with(&id), Some(&draft));
+        assert_eq!(next.launching_with(Some("local"), &id), Some(&draft));
 
         drafts.promote(&draft);
-        assert_eq!(drafts.launching_with(&id), None, "the launched thread owns it now");
+        assert_eq!(drafts.launching_with(Some("local"), &id), None, "the launched thread owns it now");
         assert_eq!(drafts.reserve_thread(&draft), None, "a launched draft takes no new thread");
         next.forget(&draft);
-        assert_eq!(next.launching_with(&id), None);
+        assert_eq!(next.launching_with(Some("local"), &id), None);
         assert_eq!(drafts.reserve_thread(&DraftId::for_test("gone")), None);
     }
 
