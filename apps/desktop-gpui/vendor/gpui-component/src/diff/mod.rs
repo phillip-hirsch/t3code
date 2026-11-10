@@ -4,6 +4,7 @@
 mod conflict;
 mod decoration;
 mod document;
+mod js_regex;
 mod parser;
 #[cfg(test)]
 mod parser_tests;

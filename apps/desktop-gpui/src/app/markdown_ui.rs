@@ -32,14 +32,21 @@ const SKILL_SCHEME: &str = "t3-skill:";
 pub(super) struct ChatMenu {
     view: Entity<PopupMenu>,
     position: Point<Pixels>,
-    /// The pane and thread whose timeline opened it: it closes once they go, as unmounting does.
-    owner: Option<PaneOwner>,
+    /// What opened it: it closes once that goes, as unmounting does.
+    owner: MenuOwner,
     _dismiss: Subscription,
+}
+
+enum MenuOwner {
+    /// The pane and thread whose timeline opened it.
+    Pane(PaneOwner),
+    /// Anything else opens it for the target on screen.
+    Target(Option<super::Target>),
 }
 
 impl Workspace {
     /// Opens `build`'s menu at `position` (window coordinates) until it dismisses, or until the
-    /// thread `pane` shows (if a timeline's chip opened it) leaves that pane.
+    /// thread `pane` shows (if a timeline's chip opened it) leaves that pane, else the target does.
     pub(super) fn open_chat_menu(
         &mut self,
         pane: Option<ChatPane>,
@@ -58,15 +65,20 @@ impl Workspace {
             }
             cx.notify();
         });
-        let owner = pane.and_then(|pane| self.pane_owner(pane));
+        let owner = pane
+            .and_then(|pane| self.pane_owner(pane))
+            .map_or_else(|| MenuOwner::Target(self.target.clone()), MenuOwner::Pane);
         self.chat_menu = Some(ChatMenu { view, position, owner, _dismiss: dismiss });
         cx.notify();
     }
 
     /// Closes the timeline's link hover and chat menu once the pane and thread they belong to go.
     pub(super) fn release_left_chat_overlays(&mut self) {
-        let menu_owner = self.chat_menu.as_ref().and_then(|menu| menu.owner.as_ref());
-        if menu_owner.is_some_and(|owner| !self.owner_shown(owner)) {
+        let left = self.chat_menu.as_ref().is_some_and(|menu| match &menu.owner {
+            MenuOwner::Pane(owner) => !self.owner_shown(owner),
+            MenuOwner::Target(target) => self.target != *target,
+        });
+        if left {
             self.chat_menu = None;
         }
         self.release_left_link_hover();
@@ -346,17 +358,19 @@ impl Workspace {
             );
             return;
         };
-        self.shell_open(json!({"cwd": target, "editor": editor}), "Unable to open file", window, cx);
+        let input = json!({"cwd": target, "editor": editor});
+        self.shell_open(self.client(), input, "Unable to open file", window, cx);
     }
 
     fn shell_open(
         &mut self,
+        client: Option<crate::rpc::RpcClient>,
         input: serde_json::Value,
         failure: &'static str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.client() else { return };
+        let Some(client) = client else { return };
         cx.spawn_in(window, async move |_, cx| {
             if let Err(error) = client.request("shell.openInEditor", input).await {
                 let _ = cx.update(|window, cx| {
@@ -417,28 +431,36 @@ impl Workspace {
             }
             _ => "Open in editor".into(),
         };
-        let can_open = self.preferred_editor().is_some();
-        let in_browser = self.can_open_file_in_browser(&target);
+        // The file belongs to the environment and thread on screen now, whatever shows at the click.
+        let (editor, client) = (self.preferred_editor().map(str::to_owned), self.client());
+        let in_browser = self.can_open_file_in_browser(&target).then(|| self.preview_thread()).flatten();
         let reveal = self.reveal_label();
         let view = cx.weak_entity();
         self.open_chat_menu(pane, position, window, cx, move |mut menu, _, _| {
-            if can_open {
-                let (view, target) = (view.clone(), target.clone());
+            if let Some(editor) = editor {
+                let (view, client) = (view.clone(), client.clone());
+                let input = json!({"cwd": target, "editor": editor});
                 menu = menu.item(PopupMenuItem::new(open_label.clone()).on_click(move |_, window, cx| {
-                    let _ = view.update(cx, |w, cx| w.open_file_link(&target, window, cx));
+                    let (client, input) = (client.clone(), input.clone());
+                    let _ = view.update(cx, |w, cx| w.shell_open(client, input, "Unable to open file", window, cx));
                 }));
             }
-            if in_browser {
+            if let Some(thread) = in_browser {
                 let (view, path) = (view.clone(), without_position(&target).to_owned());
                 menu = menu.item(PopupMenuItem::new("Open in integrated browser").on_click(move |_, window, cx| {
-                    let _ = view.update(cx, |w, cx| w.open_host_file_in_browser(&path, window, cx));
+                    let _ = view.update(cx, |w, cx| {
+                        if w.preview_thread().as_ref() == Some(&thread) {
+                            w.open_host_file_in_browser(&path, window, cx);
+                        }
+                    });
                 }));
             }
             if let Some(label) = reveal {
-                let (view, path) = (view.clone(), without_position(&target).to_owned());
+                let (view, client) = (view.clone(), client.clone());
+                let input = json!({"cwd": without_position(&target), "editor": "file-manager", "reveal": true});
                 menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
-                    let input = json!({"cwd": path, "editor": "file-manager", "reveal": true});
-                    let _ = view.update(cx, |w, cx| w.shell_open(input, "Unable to reveal file", window, cx));
+                    let (client, input) = (client.clone(), input.clone());
+                    let _ = view.update(cx, |w, cx| w.shell_open(client, input, "Unable to reveal file", window, cx));
                 }));
             }
             let copy = |value: String, title: &'static str| {
