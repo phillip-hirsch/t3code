@@ -76,6 +76,10 @@ pub struct WebView {
     /// The window-relative origin that page clicks are forwarded to GPUI from.
     #[cfg(target_os = "linux")]
     origin: Rc<Cell<gpui::Point<Pixels>>>,
+    /// t3code: the window's interface scale (`Window::ui_scale`) the bounds and page zoom
+    /// were last given in. Linux's device-pixel bounds and scale matching already include it.
+    #[cfg(not(target_os = "linux"))]
+    ui_scale: Cell<f32>,
 }
 
 impl Drop for WebView {
@@ -107,8 +111,12 @@ impl WebView {
         linux::forward_mouse_down(&webview, origin.clone(), window, cx);
         #[cfg(target_os = "linux")]
         linux::match_scale_factor(&webview, window.scale_factor(), 1.0);
-        #[cfg(not(any(all(feature = "gpui-fast", target_os = "macos"), target_os = "linux")))]
-        let _ = window;
+        #[cfg(not(target_os = "linux"))]
+        let ui_scale = window.ui_scale();
+        #[cfg(not(target_os = "linux"))]
+        if ui_scale != 1.0 {
+            let _ = webview.zoom(f64::from(ui_scale));
+        }
 
         Self {
             focus_handle: cx.focus_handle(),
@@ -125,6 +133,8 @@ impl WebView {
             scale_factor: Cell::new(window.scale_factor()),
             #[cfg(target_os = "linux")]
             origin,
+            #[cfg(not(target_os = "linux"))]
+            ui_scale: Cell::new(ui_scale),
         }
     }
 
@@ -206,17 +216,21 @@ impl WebView {
         #[cfg(target_os = "linux")]
         let rect = linux::device_bounds(document, self.scale_factor.get());
         #[cfg(not(target_os = "linux"))]
-        let rect = Rect {
-            position: wry::dpi::LogicalPosition::new(
-                f64::from(document.origin.x),
-                f64::from(document.origin.y),
-            )
-            .into(),
-            size: wry::dpi::LogicalSize::new(
-                f64::from(document.size.width),
-                f64::from(document.size.height),
-            )
-            .into(),
+        let rect = {
+            // t3code: the platform's logical pixels are GPUI's times the interface scale.
+            let scale = f64::from(self.ui_scale.get());
+            Rect {
+                position: wry::dpi::LogicalPosition::new(
+                    f64::from(document.origin.x) * scale,
+                    f64::from(document.origin.y) * scale,
+                )
+                .into(),
+                size: wry::dpi::LogicalSize::new(
+                    f64::from(document.size.width) * scale,
+                    f64::from(document.size.height) * scale,
+                )
+                .into(),
+            }
         };
         self.set_bounds(rect)?;
         self.set_native_visible(true)?;
@@ -310,8 +324,10 @@ impl WebView {
         // GTK's integer one, so the page zoom is applied on top of it.
         #[cfg(target_os = "linux")]
         linux::match_scale_factor(&self.webview, self.scale_factor.get(), zoom);
+        // t3code: a CSS pixel draws as one GPUI pixel at every interface scale, as on Linux.
         #[cfg(not(target_os = "linux"))]
-        self.webview.zoom(zoom)?;
+        self.webview
+            .zoom(zoom * f64::from(self.ui_scale.get()))?;
         Ok(())
     }
 
@@ -448,6 +464,12 @@ impl Element for WebViewElement {
         #[cfg(target_os = "linux")]
         if parent.scale_factor.replace(window.scale_factor()) != window.scale_factor() {
             linux::match_scale_factor(&parent.webview, window.scale_factor(), parent.zoom.get());
+        }
+        #[cfg(not(target_os = "linux"))]
+        if parent.ui_scale.replace(window.ui_scale()) != window.ui_scale() {
+            let _ = parent
+                .webview
+                .zoom(parent.zoom.get() * f64::from(window.ui_scale()));
         }
         #[cfg(target_os = "linux")]
         parent.origin.set(bounds.origin);

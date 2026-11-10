@@ -972,7 +972,9 @@ impl Workspace {
             let session = self.preview.threads.get(&tab.thread_id).and_then(|p| p.get(tab_id));
             let view = tab.view.read(cx);
             if let Some(scale) = scale {
-                let zoom = session.and_then(|s| s.zoom_factor).unwrap_or(tab.defaults.0) * f64::from(scale);
+                // Electron's app zoom leaves previews at their own zoom (`reapplyZoom`).
+                let zoom = session.and_then(|s| s.zoom_factor).unwrap_or(tab.defaults.0) * f64::from(scale)
+                    / f64::from(window.ui_scale());
                 if (tab.zoom - zoom).abs() > 1e-6 {
                     tab.zoom = zoom;
                     let _ = view.set_zoom(zoom);

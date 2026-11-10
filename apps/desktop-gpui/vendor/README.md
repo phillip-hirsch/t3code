@@ -95,6 +95,23 @@ registered for the current focus, because Windows `WM_CHAR` and IME callbacks re
 handler without checking focus. Pointer events are untouched. Tests:
 `focus_next_skips_an_inert_subtree`, `cached_view_replay_recomputes_inertness`.
 
+**The interface can scale like a page zoom.** Electron's View menu zoom (and Ctrl+wheel) scales
+the whole page; 0.3.11 has only the display's scale factor, and `rem_size` scales nothing drawn
+in `px`. The patch adds `Window::set_ui_scale`: the window's logical pixels become the
+platform's divided by the scale, so everything draws larger or smaller and stays crisp. Window
+bounds and sizes stay in the platform's units. Files:
+
+- `src/window.rs`: the `ui_scale` field, `ui_scale`/`set_ui_scale`; `bounds_changed` multiplies
+  the scale factor by it and divides the viewport and pointer by it; the platform input callback
+  scales each event (`PlatformInput::scaled_down`) before `dispatch_event`, so events GPUI
+  synthesizes in window units aren't scaled twice; `insets` and `visual_viewport_bounds` divide,
+  and `show_window_menu`, `set_client_inset`, `set_client_corner_radii`, `set_input_region` and
+  the IME position multiply. Accessibility bounds already go out in device pixels.
+- `src/interactive.rs`: `PlatformInput::scaled_down`, positions and pixel scroll deltas.
+- `src/platform.rs`: `PlatformInputHandler`'s bounds and points the platform asks about.
+- `src/geometry.rs`: `Pixels::scale_down`.
+- Test in `window.rs`: `ui_scale_scales_the_interface_against_the_platform_window`.
+
 The crate's tests need `--features test-support`; run them from a scratch copy outside this
 repository (`cargo test --features test-support --lib`). The copy needs the published crate's
 missing pieces: put it two levels below a folder whose `assets/fonts/ibm-plex-sans` and
@@ -133,6 +150,19 @@ so saved bounds include no shadow. The app keeps its resize edges for that case
 (`render_resize_edges` in `src/app/titlebar.rs`). Files:
 
 - `src/linux/x11/window.rs`: `request_decorations`, `window_decorations` and `set_client_inset`.
+
+## gpui-webview 0.9.0
+
+The native WebView the app embeds in GPUI's layout (the preview browser, HTML pages, MCP apps,
+media and Mermaid).
+
+**Native views follow the interface scale.** With gpui-pre's `Window::set_ui_scale` (above), a
+GPUI pixel is no longer a platform logical pixel. 0.9.0 already places Linux views in device
+pixels and matches their page zoom to GPUI's scale factor, but on Windows and macOS it passed
+GPUI's pixels to wry as logical ones, so a zoomed window misplaced its pages. The patch, in
+`src/lib.rs`, multiplies those bounds by the scale and the page zoom by it too, so a CSS pixel
+draws as one GPUI pixel on every platform (its `ui_scale` field, kept current in `prepaint`). The
+preview divides its own zoom by the scale, since Electron's app zoom leaves previews alone.
 
 ## gpui-base 0.9.0
 
