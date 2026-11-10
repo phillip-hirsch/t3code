@@ -71,15 +71,100 @@ impl<'a> AttachmentLists<'a> {
         lists.extend(self.question.into_iter().flat_map(QuestionDraft::lists).map(|list| (None, list)));
         lists.extend(self.queue_edit.map(|list| (None, list.as_mut_slice())));
         for (target, draft) in self.drafts.iter_mut() {
-            match draft {
-                ComposerDraft::Prompt(_, kept, _) => lists.push((Some(target), kept.as_mut_slice())),
-                ComposerDraft::Question(question) => lists.extend(question.lists().map(|list| (Some(target), list))),
-            }
+            lists.extend(draft.lists().into_iter().map(|list| (Some(target), list)));
         }
         lists
             .into_iter()
             .flat_map(|(target, attachments)| attachments.iter_mut().map(move |attachment| (target, attachment)))
             .find(|(_, attachment)| attachment.local_id() == local_id)
+    }
+}
+
+impl ComposerDraft {
+    /// The target's own prompt: the one a card parked, or the one a queued message's edit set aside.
+    pub(super) fn own_prompt_mut(&mut self) -> DraftMut<'_> {
+        match self {
+            Self::Prompt(prompt, kept, records) => (prompt, kept, records),
+            Self::Question(question) => question.prompt_mut(),
+            Self::QueueEdit(edit, _) => edit.saved_mut(),
+        }
+    }
+
+    pub(super) fn own_prompt(&self) -> DraftRef<'_> {
+        match self {
+            Self::Prompt(prompt, kept, records) => (prompt.as_str(), kept.as_slice(), records),
+            Self::Question(question) => parked(question),
+            Self::QueueEdit(edit, _) => {
+                let (prompt, kept, records) = edit.saved();
+                (prompt.as_str(), kept.as_slice(), records)
+            }
+        }
+    }
+
+    /// What the editor shows once the target is back on screen: a queued message's edit's
+    /// composer, else the draft itself.
+    pub(super) fn editor_mut(&mut self) -> &mut ComposerDraft {
+        match self {
+            Self::QueueEdit(_, editor) => editor.editor_mut(),
+            draft => draft,
+        }
+    }
+
+    pub(super) fn editor(&self) -> &ComposerDraft {
+        match self {
+            Self::QueueEdit(_, editor) => editor.editor(),
+            draft => draft,
+        }
+    }
+
+    /// The content of the queued message's edit begun as `id` that the target was left in: its
+    /// prompt, or the edit's text a card parked.
+    pub(super) fn edit_content_mut(&mut self, id: &str) -> Option<DraftMut<'_>> {
+        match self {
+            Self::QueueEdit(edit, editor) if edit.id() == id => Some(editor.own_prompt_mut()),
+            _ => None,
+        }
+    }
+
+    /// Ends a queued message's edit left open, as its cancel does: the editor gets the target's
+    /// own prompt back, or the card it showed parks it.
+    pub(super) fn end_edit(self) -> ComposerDraft {
+        let Self::QueueEdit(edit, editor) = self else { return self };
+        match *editor {
+            Self::Question(mut question) => {
+                question.set_parked(edit.into_saved());
+                Self::Question(question)
+            }
+            _ => {
+                let (prompt, kept, records) = edit.into_saved();
+                Self::Prompt(prompt, kept, records)
+            }
+        }
+    }
+
+    fn lists(&mut self) -> Vec<&mut [Attachment]> {
+        match self {
+            Self::Prompt(_, kept, _) => vec![kept.as_mut_slice()],
+            Self::Question(question) => question.lists().collect(),
+            Self::QueueEdit(edit, editor) => {
+                let mut lists = vec![edit.saved_mut().1.as_mut_slice()];
+                lists.extend(editor.lists());
+                lists
+            }
+        }
+    }
+
+    /// Every attachment it keeps for the prompt, to let their uploads go.
+    pub(super) fn into_attachments(self) -> Vec<Attachment> {
+        match self {
+            Self::Prompt(_, attachments, _) => attachments,
+            Self::Question(question) => question.prompt_attachments,
+            Self::QueueEdit(edit, editor) => {
+                let mut attachments = edit.into_saved().1;
+                attachments.extend(editor.into_attachments());
+                attachments
+            }
+        }
     }
 }
 
@@ -98,14 +183,9 @@ impl Workspace {
     pub(super) fn set_aside_prompt(&mut self, target: &Target) -> Option<DraftMut<'_>> {
         match self.prompt_holder(target) {
             PromptHolder::Editor => None,
-            PromptHolder::QueueEdit => {
-                self.queue.edit_draft_mut().map(|(prompt, kept, records)| (prompt, kept, records))
-            }
+            PromptHolder::QueueEdit => self.queue.edit_draft_mut(),
             PromptHolder::Question => self.question.as_mut().map(QuestionDraft::prompt_mut),
-            PromptHolder::OffScreen => match self.composer_drafts.get_mut(target)? {
-                ComposerDraft::Prompt(prompt, kept, records) => Some((prompt, kept, records)),
-                ComposerDraft::Question(question) => Some(question.prompt_mut()),
-            },
+            PromptHolder::OffScreen => self.composer_drafts.get_mut(target).map(ComposerDraft::own_prompt_mut),
         }
     }
 
@@ -117,10 +197,7 @@ impl Workspace {
                 self.queue.edit_draft().map(|(prompt, kept, records)| (prompt.as_str(), kept.as_slice(), records))
             }
             PromptHolder::Question => self.question.as_ref().map(parked),
-            PromptHolder::OffScreen => match self.composer_drafts.get(target)? {
-                ComposerDraft::Prompt(prompt, kept, records) => Some((prompt.as_str(), kept.as_slice(), records)),
-                ComposerDraft::Question(question) => Some(parked(question)),
-            },
+            PromptHolder::OffScreen => self.composer_drafts.get(target).map(ComposerDraft::own_prompt),
         }
     }
 
@@ -131,20 +208,21 @@ impl Workspace {
             return self.set_aside_prompt(target).into_iter().collect();
         }
         let parked = self.question.as_mut().map(QuestionDraft::prompt_mut);
-        let saved = self.queue.edit_draft_mut().map(|(prompt, kept, records)| (prompt, kept, records));
+        let saved = self.queue.edit_draft_mut();
         parked.into_iter().chain(saved).collect()
     }
 
     /// Where `draft`'s content waits once the editor no longer shows it: the prompt set aside
-    /// (see [`Self::set_aside_prompt`]), or the edit's text a question card parked; `None` once
-    /// its edit ended.
+    /// (see [`Self::set_aside_prompt`]), the edit's text a question card parked, or the edit left
+    /// open in its target's draft; `None` once its edit ended.
     pub(super) fn left_draft_mut(&mut self, draft: &EditorDraft) -> Option<DraftMut<'_>> {
         match &draft.edit {
             None => self.set_aside_prompt(&draft.target),
             Some(_) if self.editor_draft().as_ref() == Some(draft) => {
                 self.question.as_mut().map(QuestionDraft::prompt_mut)
             }
-            Some(_) => None,
+            Some(_) if self.target.as_ref() == Some(&draft.target) => None,
+            Some(edit) => self.composer_drafts.get_mut(&draft.target)?.edit_content_mut(edit),
         }
     }
 
@@ -197,6 +275,7 @@ impl Workspace {
 
 #[cfg(test)]
 mod tests {
+    use super::super::queue::QueueEdit;
     use super::*;
 
     #[test]
@@ -208,5 +287,41 @@ mod tests {
         assert_eq!(holder(true, true, false), QueueEdit);
         assert_eq!(holder(true, true, true), QueueEdit, "a card asked during an edit parked the edit's text");
         assert_eq!(holder(false, true, true), OffScreen);
+    }
+
+    fn records() -> ContextRecords {
+        ContextRecords::default()
+    }
+
+    /// A thread left mid-edit: its own prompt `own` set aside in the edit `edit`, over `editor`.
+    fn left_mid_edit(editor: ComposerDraft) -> ComposerDraft {
+        let edit = QueueEdit::test("edit", "e", ("own".into(), Vec::new(), records()));
+        ComposerDraft::QueueEdit(Box::new(edit), Box::new(editor))
+    }
+
+    #[test]
+    fn a_thread_left_mid_edit_keeps_the_edit_and_its_own_prompt() {
+        let mut draft = left_mid_edit(ComposerDraft::Prompt("edited".into(), Vec::new(), records()));
+        assert_eq!(draft.content(), ("own", 0), "its sidebar row and saved draft are its own prompt");
+        assert_eq!(draft.own_prompt_mut().0, "own");
+        assert_eq!(draft.edit_content_mut("edit").map(|(text, ..)| text.clone()).as_deref(), Some("edited"));
+        assert!(draft.edit_content_mut("a later edit").is_none());
+        let ComposerDraft::Prompt(text, ..) = draft.end_edit() else { panic!("the edit's composer was a prompt") };
+        assert_eq!(text, "own", "a save landing while away gives the composer back its own prompt");
+    }
+
+    #[test]
+    fn a_thread_left_mid_edit_under_a_question_keeps_the_edits_text_parked() {
+        let question = |id: &str| -> crate::requests::Question {
+            serde_json::from_value(serde_json::json!({"id": id, "header": "H", "question": "?", "options": []}))
+                .unwrap()
+        };
+        let mut card = QuestionDraft::new("r".into(), vec![question("a")]).unwrap();
+        card.prompt = "edited".into();
+        let mut draft = left_mid_edit(ComposerDraft::Question(card));
+        assert_eq!(draft.content(), ("own", 0));
+        assert_eq!(draft.edit_content_mut("edit").map(|(text, ..)| text.clone()).as_deref(), Some("edited"));
+        let ComposerDraft::Question(card) = draft.end_edit() else { panic!("the card stays") };
+        assert_eq!(card.prompt, "own", "the card parks the thread's own prompt once the edit ends");
     }
 }

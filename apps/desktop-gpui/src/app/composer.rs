@@ -24,6 +24,7 @@ use serde_json::{Value, json};
 use super::attachments::{Attachment, QuestionDraft};
 use super::composer_fit::{ControlsWidths, ModeFit, resolve_mode_fit};
 use super::context_strip::PermissionsForm;
+use super::queue::QueueEdit;
 use super::send::Intent;
 use super::side_chat::ChatPane;
 use super::{Target, Workspace, new_id};
@@ -158,6 +159,9 @@ pub(super) enum ComposerDraft {
     Prompt(String, Vec<Attachment>, ContextRecords),
     /// An open question card; its prompt is the one it set aside.
     Question(QuestionDraft),
+    /// A queued message's edit left open: the composer as it was, while the target's own prompt
+    /// waits in the edit.
+    QueueEdit(Box<QueueEdit>, Box<ComposerDraft>),
 }
 
 impl ComposerDraft {
@@ -165,12 +169,15 @@ impl ComposerDraft {
         ComposerDraft::Prompt(String::new(), Vec::new(), ContextRecords::default())
     }
 
-    /// Its prompt and attachment count.
+    /// A prompt with nothing in it, which needs no keeping.
+    pub(super) fn is_empty(&self) -> bool {
+        matches!(self, Self::Prompt(prompt, attachments, _) if prompt.is_empty() && attachments.is_empty())
+    }
+
+    /// Its own prompt and attachment count.
     pub(super) fn content(&self) -> (&str, usize) {
-        match self {
-            Self::Prompt(prompt, attachments, _) => (prompt, attachments.len()),
-            Self::Question(question) => (&question.prompt, question.prompt_attachments.len()),
-        }
+        let (prompt, attachments, _) = self.own_prompt();
+        (prompt, attachments.len())
     }
 
     /// `composerDraftHasUserContent`.
@@ -432,30 +439,28 @@ impl Workspace {
         let attachments = std::mem::take(&mut self.attachments);
         let records = self.take_context_records();
         let commented = self.stash_citation_comment(cx);
-        // A queued message's edit ends here, taking its text; the thread keeps its own draft.
-        let draft = match (self.question.take(), self.take_queue_edit_draft()) {
-            (Some(mut question), own) => {
+        let draft = match self.question.take() {
+            Some(mut question) => {
                 question.park(attachments);
-                // The card parked the edit's text.
-                if let Some(own) = own {
-                    question.set_parked(own);
-                }
                 ComposerDraft::Question(question)
             }
-            (None, Some((prompt, attachments, records))) => ComposerDraft::Prompt(prompt, attachments, records),
-            (None, None) => ComposerDraft::Prompt(
+            None => ComposerDraft::Prompt(
                 commented.unwrap_or_else(|| self.composer.read(cx).value().to_string()),
                 attachments,
                 records,
             ),
+        };
+        // A queued message's edit stays open with the composer it holds, the thread's own draft in it.
+        let draft = match self.queue.park_edit() {
+            Some(edit) => ComposerDraft::QueueEdit(Box::new(edit), Box::new(draft)),
+            None => draft,
         };
         self.prompt_history = None;
         self.menu = Default::default();
         self.composer_ui.rich.picker = None;
         self.prompt_stash.open = false;
         self.picker.dismiss();
-        if matches!(&draft, ComposerDraft::Prompt(prompt, attachments, _) if prompt.is_empty() && attachments.is_empty())
-        {
+        if draft.is_empty() {
             self.composer_drafts.remove(&target);
         } else {
             self.composer_drafts.insert(target, draft);
@@ -518,7 +523,17 @@ impl Workspace {
         self.typing_guard.reset();
         self._typing_idle = None;
         self.sync_typing_guard(window, cx);
-        match self.target.as_ref().and_then(|target| self.composer_drafts.remove(target)) {
+        let draft = self.target.as_ref().and_then(|target| self.composer_drafts.remove(target));
+        self.restore_editor(draft, window, cx);
+    }
+
+    /// Puts a draft that was set aside back in the editor.
+    fn restore_editor(&mut self, draft: Option<ComposerDraft>, window: &mut Window, cx: &mut Context<Self>) {
+        match draft {
+            Some(ComposerDraft::QueueEdit(edit, editor)) => {
+                self.queue.resume_edit(*edit);
+                self.restore_editor(Some(*editor), window, cx);
+            }
             Some(ComposerDraft::Question(mut question)) => {
                 self.attachments = question.unpark();
                 self.question = Some(question);

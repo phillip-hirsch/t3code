@@ -228,17 +228,11 @@ impl Workspace {
             }
         };
         let uploads: Vec<String> = files.iter().map(|file| file.local_id().to_owned()).collect();
-        match self.composer_drafts.entry(origin).or_insert_with(ComposerDraft::empty) {
-            ComposerDraft::Prompt(prompt, attachments, _) => {
-                merge(prompt);
-                attachments.extend(files);
-            }
-            // An open question holds the editor; its prompt waits for it to close.
-            ComposerDraft::Question(question) => {
-                merge(&mut question.prompt);
-                question.prompt_attachments.extend(files);
-            }
-        }
+        // An open question or queued message's edit holds the editor; the prompt waits beside it.
+        let (prompt, attachments, _) =
+            self.composer_drafts.entry(origin).or_insert_with(ComposerDraft::empty).own_prompt_mut();
+        merge(prompt);
+        attachments.extend(files);
         if here {
             self.restore_composer(window, cx);
             self.focus_composer(window, cx);

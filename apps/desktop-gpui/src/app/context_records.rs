@@ -112,12 +112,12 @@ impl Workspace {
             self.insert_chip_at_caret(&chip, link.clone(), window, cx);
             return Some(link);
         }
-        match self.composer_drafts.entry(target.clone()).or_insert_with(ComposerDraft::empty) {
+        match self.composer_drafts.entry(target.clone()).or_insert_with(ComposerDraft::empty).editor_mut() {
             ComposerDraft::Prompt(prompt, _, records) => {
                 records.insert(record);
                 append_chip(prompt, &link);
             }
-            ComposerDraft::Question(_) => return None,
+            ComposerDraft::Question(_) | ComposerDraft::QueueEdit(..) => return None,
         }
         cx.notify();
         Some(link)
@@ -128,7 +128,7 @@ impl Workspace {
         if self.target.as_ref() == Some(target) {
             return self.question.is_none();
         }
-        matches!(self.composer_drafts.get(target), Some(ComposerDraft::Prompt(..)))
+        matches!(self.composer_drafts.get(target).map(ComposerDraft::editor), Some(ComposerDraft::Prompt(..)))
     }
 
     /// The records of `target`'s prompt, wherever it waits (see `draft_holder`).

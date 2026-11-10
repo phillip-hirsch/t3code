@@ -15,7 +15,9 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
-use super::attachments::{ATTACHMENT_ONLY_PROMPT, Attachment, MAX_ATTACHMENTS};
+use super::attachments::{ATTACHMENT_ONLY_PROMPT, MAX_ATTACHMENTS};
+use super::composer::ComposerDraft;
+use super::draft_holder::{Draft, DraftMut};
 use super::side_chat::ChatPane;
 use super::{Target, Workspace, new_id};
 use crate::composer_context::ContextRecords;
@@ -50,8 +52,44 @@ pub(super) struct QueueEdit {
     removed_attachment: bool,
     /// The message's context records as queued; a save keeps them (`keptRecords`).
     records: Vec<Value>,
-    saved: (String, Vec<Attachment>, ContextRecords),
+    saved: Draft,
     saving: bool,
+}
+
+impl QueueEdit {
+    pub(super) fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The draft it set aside; see `draft_holder`.
+    pub(super) fn saved(&self) -> &Draft {
+        &self.saved
+    }
+
+    pub(super) fn saved_mut(&mut self) -> DraftMut<'_> {
+        let (prompt, kept, records) = &mut self.saved;
+        (prompt, kept, records)
+    }
+
+    pub(super) fn into_saved(self) -> Draft {
+        self.saved
+    }
+
+    #[cfg(test)]
+    pub(super) fn test(id: &str, env: &str, saved: Draft) -> Self {
+        Self {
+            id: id.into(),
+            env: env.to_owned().into(),
+            thread_id: "t".into(),
+            run_id: "r".into(),
+            original: String::new(),
+            attachments: Vec::new(),
+            removed_attachment: false,
+            records: Vec::new(),
+            saved,
+            saving: false,
+        }
+    }
 }
 
 /// The rows after the timeline: each shown queued message, then "Show all N queued".
@@ -72,8 +110,20 @@ pub(crate) fn rows(state: &QueueState, show_all: bool) -> Vec<Row> {
 
 impl QueueUi {
     /// Ends an edit, handing back the draft it set aside.
-    pub(super) fn take_edit_draft(&mut self) -> Option<(String, Vec<Attachment>, ContextRecords)> {
-        self.edit.take().map(|edit| edit.saved)
+    pub(super) fn take_edit_draft(&mut self) -> Option<Draft> {
+        self.edit.take().map(QueueEdit::into_saved)
+    }
+
+    /// The open edit, set aside with its thread's composer while another target shows; the web
+    /// keeps edits by thread (`queuedRunEdits`), so one outlives navigation.
+    pub(super) fn park_edit(&mut self) -> Option<QueueEdit> {
+        self.edit.take()
+    }
+
+    /// An edit set aside by [`Self::park_edit`], open again as its thread shows.
+    pub(super) fn resume_edit(&mut self, edit: QueueEdit) {
+        self.edit = Some(edit);
+        self.show_all = true;
     }
 
     /// The edit begun as `id`, unless it ended or another began since.
@@ -82,12 +132,12 @@ impl QueueUi {
     }
 
     /// The draft an open edit set aside; see `draft_holder`.
-    pub(super) fn edit_draft_mut(&mut self) -> Option<&mut (String, Vec<Attachment>, ContextRecords)> {
-        self.edit.as_mut().map(|edit| &mut edit.saved)
+    pub(super) fn edit_draft_mut(&mut self) -> Option<DraftMut<'_>> {
+        self.edit.as_mut().map(QueueEdit::saved_mut)
     }
 
-    pub(super) fn edit_draft(&self) -> Option<&(String, Vec<Attachment>, ContextRecords)> {
-        self.edit.as_ref().map(|edit| &edit.saved)
+    pub(super) fn edit_draft(&self) -> Option<&Draft> {
+        self.edit.as_ref().map(QueueEdit::saved)
     }
 
     /// The open edit's own id, which changes with each begin.
@@ -149,11 +199,6 @@ impl Workspace {
 
     pub(super) fn saving_queue_edit(&self) -> bool {
         self.queue.edit.as_ref().is_some_and(|edit| edit.saving)
-    }
-
-    /// The thread's draft, while a queued message holds the composer; see `stash_composer`.
-    pub(super) fn take_queue_edit_draft(&mut self) -> Option<(String, Vec<Attachment>, ContextRecords)> {
-        self.queue.take_edit_draft()
     }
 
     /// A queued message open in the pane's composer: whether its save is in flight.
@@ -368,26 +413,67 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("orchestration.dispatchCommand", command).await;
             let _ = this.update_in(cx, |this, window, cx| {
-                // The edit was cancelled, begun again, or its pane moved on while this save ran.
-                let current = this.queue_ui_of(pane, &env, &thread_id).and_then(|ui| ui.begun_edit(&id));
-                match (result, current) {
-                    (Ok(_), Some(_)) => this.cancel_queue_edit(pane, window, cx),
-                    (Err(error), current) => {
+                // The edit was cancelled or begun again while this save ran, or its pane moved on and
+                // left it open in its chat's draft.
+                let shown = this.pane_shows(pane, &env, &thread_id)
+                    && this.queue_ui_mut(pane).and_then(|ui| ui.begun_edit(&id)).is_some();
+                match result {
+                    Ok(_) if shown => this.cancel_queue_edit(pane, window, cx),
+                    Ok(_) => this.end_left_edit(pane, &env, &thread_id, &id),
+                    Err(error) => {
                         log::warn!("saving the edited queued message: {error}");
-                        let shown = current.is_some();
-                        if let Some(edit) = current {
+                        if let Some(edit) = this.begun_edit_of(pane, &env, &thread_id, &id) {
                             edit.saving = false;
                         }
                         if shown {
                             this.error = Some("Could not save the edited queued message.".into());
                         }
                     }
-                    (Ok(_), None) => {}
                 }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// The edit begun as `id` on the pane's chat `(env, thread_id)`, on screen or left open in
+    /// that chat's draft.
+    fn begun_edit_of(
+        &mut self,
+        pane: ChatPane,
+        env: &SharedString,
+        thread_id: &str,
+        id: &str,
+    ) -> Option<&mut QueueEdit> {
+        if pane == ChatPane::Side || self.queue.begun_edit(id).is_some() {
+            return self.queue_ui_of(pane, env, thread_id)?.begun_edit(id);
+        }
+        let target = Target::Thread { env: env.clone(), id: thread_id.to_owned() };
+        match self.composer_drafts.get_mut(&target)? {
+            ComposerDraft::QueueEdit(edit, _) if edit.id == id => Some(edit),
+            _ => None,
+        }
+    }
+
+    /// A save that lands after its chat was left ends the edit there, as the web's does wherever
+    /// the user is: the chat's draft gets its own prompt back.
+    fn end_left_edit(&mut self, pane: ChatPane, env: &SharedString, thread_id: &str, id: &str) {
+        if pane == ChatPane::Side {
+            self.side_chat.end_left_edit(env, thread_id, id);
+            return;
+        }
+        let target = Target::Thread { env: env.clone(), id: thread_id.to_owned() };
+        if let Some(draft) = self.composer_drafts.remove(&target) {
+            let draft = match draft {
+                ComposerDraft::QueueEdit(edit, editor) if edit.id == id => {
+                    ComposerDraft::QueueEdit(edit, editor).end_edit()
+                }
+                draft => draft,
+            };
+            if !draft.is_empty() {
+                self.composer_drafts.insert(target, draft);
+            }
+        }
     }
 
     /// Drops one of the edited message's attachments; the save sends the rest.
@@ -432,11 +518,13 @@ impl Workspace {
                 let remove = super::attachments::overlay_button(
                     ElementId::Name(format!("queued-attachment-{id}").into()),
                     IconName::X,
-                )
-                .right(px(4.))
-                .top(px(4.))
-                .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
-                .on_click(cx.listener(move |this, _, _, cx| this.remove_queued_attachment(&id, cx)));
+                );
+                // The overlay variant's `focus-visible:ring-white`.
+                let remove = super::chat::ringed_tab_stop(remove, gpui_kit::white())
+                    .right(px(4.))
+                    .top(px(4.))
+                    .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+                    .on_click(cx.listener(move |this, _, _, cx| this.remove_queued_attachment(&id, cx)));
                 Some(
                     div()
                         .relative()
@@ -724,8 +812,12 @@ pub(super) fn toggle_row(
     let this = this.clone();
     let label = if expanded { "Show fewer".to_owned() } else { format!("Show all {total} queued") };
     let chevron = if expanded { IconName::ChevronUp } else { IconName::ChevronDown };
+    // `InlineButton`'s `focus-visible:outline-2 outline-ring`.
+    let outline = gpui_kit::BoxShadow::new(px(0.), px(0.), t.ring).spread_radius(px(2.));
     let button = h_flex()
         .id("queue-toggle")
+        .tab_index(0)
+        .focus_visible(move |s| s.shadow(vec![outline]))
         .gap(px(4.))
         .cursor_pointer()
         .text_xs()
@@ -740,7 +832,8 @@ pub(super) fn toggle_row(
     h_flex().w_full().justify_end().pr(px(4.)).pb(px(16.)).child(button).into_any_element()
 }
 
-/// `Button size="xs" variant="ghost-muted"` with an optional leading icon.
+/// `Button size="xs" variant="ghost-muted"` with an optional leading icon; unless disabled, a
+/// tab stop that Enter and Space click (`focus-visible:ring-2 ring-inset ring-ring`).
 fn text_button(
     id: String,
     icon: Option<IconName>,
@@ -763,12 +856,14 @@ fn text_button(
             if disabled {
                 el.opacity(0.64)
             } else {
-                el.cursor_pointer().hover(|s| s.bg(t.accent).text_color(t.foreground))
+                super::chat::ringed_tab_stop(el, t.ring)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(t.accent).text_color(t.foreground))
             }
         })
 }
 
-/// `Button size="icon-xs" variant="ghost-muted"`.
+/// `Button size="icon-xs" variant="ghost-muted"`, a tab stop unless disabled.
 fn icon_button(id: String, icon: IconName, disabled: bool, t: &Tokens) -> gpui_kit::Stateful<gpui_kit::Div> {
     div()
         .id(ElementId::Name(id.into()))
@@ -784,7 +879,9 @@ fn icon_button(id: String, icon: IconName, disabled: bool, t: &Tokens) -> gpui_k
             if disabled {
                 el.opacity(0.64)
             } else {
-                el.cursor_pointer().hover(|s| s.bg(t.accent).text_color(t.foreground))
+                super::chat::ringed_tab_stop(el, t.ring)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(t.accent).text_color(t.foreground))
             }
         })
 }
@@ -863,18 +960,7 @@ mod tests {
 
     #[test]
     fn a_save_landing_after_the_edit_began_again_finds_no_edit() {
-        let edit = |id: &str, env: &str| QueueEdit {
-            id: id.into(),
-            env: env.to_owned().into(),
-            thread_id: "t".into(),
-            run_id: "r".into(),
-            original: String::new(),
-            attachments: Vec::new(),
-            removed_attachment: false,
-            records: Vec::new(),
-            saved: Default::default(),
-            saving: false,
-        };
+        let edit = |id: &str, env: &str| QueueEdit::test(id, env, Draft::default());
         let mut ui = QueueUi { edit: Some(edit("first", "a")), ..Default::default() };
         assert!(ui.begun_edit("first").is_some());
         // The same run, edited again on another environment's same-id thread.

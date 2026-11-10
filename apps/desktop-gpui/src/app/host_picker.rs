@@ -324,6 +324,7 @@ impl Workspace {
         self.drafts.assign(crate::model::ScopedId::new(env.clone(), project_id.as_str()), &draft);
         let to = Target::draft(env, project_id, draft);
         carry(&mut self.host.selections, &from, &to);
+        self.carry_draft_panel(&from, &to);
         self.target = Some(to);
         self.sync_draft_workspace(cx);
         self.sync_attachment_uploads(cx);

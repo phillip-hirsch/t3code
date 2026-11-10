@@ -50,11 +50,7 @@ impl Workspace {
                 self.release_upload(&attachment, cx);
             }
         }
-        let attachments = match self.composer_drafts.remove(target) {
-            Some(ComposerDraft::Prompt(_, attachments, _)) => attachments,
-            Some(ComposerDraft::Question(question)) => question.prompt_attachments,
-            None => Vec::new(),
-        };
+        let attachments = self.composer_drafts.remove(target).map(ComposerDraft::into_attachments).unwrap_or_default();
         for attachment in &attachments {
             self.release_upload(attachment, cx);
         }

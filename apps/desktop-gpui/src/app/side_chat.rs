@@ -100,8 +100,8 @@ pub(super) struct SideChats {
     deleting: HashSet<Key>,
     /// What side chats not on screen keep of their composer. Ids repeat across environments.
     drafts: HashMap<Key, SideDraft>,
-    /// Each side chat's queue controls: what is in flight and the edit open, which outlive a
-    /// view rebuilt on reconnect.
+    /// Each side chat's queue controls: what is in flight and the edit open, which outlive its
+    /// view; `drafts` keeps an open edit's composer.
     queues: HashMap<Key, QueueUi>,
     /// The parent composer's model pick for a side chat that started without a question; its
     /// first message runs on it (`setModelSelection` on the side chat's draft).
@@ -119,21 +119,12 @@ enum SideDraft {
 }
 
 impl SideDraft {
-    /// What a released view keeps: its open question, else its composer's text. A queued
-    /// message's edit that `ended` gives back the side chat's own text it set aside, in place of
-    /// the edit's text in the composer or parked under the question.
-    fn kept(question: Option<QuestionDraft>, text: String, ended: Option<String>) -> Option<Self> {
+    /// What a released view keeps: its open question, else its composer's text. While a queued
+    /// message's edit is open that is the edit's, and the side chat's own text waits in the edit.
+    fn kept(question: Option<QuestionDraft>, text: String) -> Option<Self> {
         match question {
-            Some(mut question) => {
-                if let Some(own) = ended {
-                    question.set_parked((own, Vec::new(), ContextRecords::default()));
-                }
-                Some(Self::Question(Box::new(question)))
-            }
-            None => {
-                let text = ended.unwrap_or(text);
-                (!text.is_empty()).then_some(Self::Prompt(text))
-            }
+            Some(question) => Some(Self::Question(Box::new(question))),
+            None => (!text.is_empty()).then_some(Self::Prompt(text)),
         }
     }
 
@@ -180,8 +171,13 @@ impl SideChats {
         }
     }
 
-    /// A failed send's text, back with the side chat's saved draft ahead of anything kept since.
+    /// A failed send's text, back with the side chat's saved draft ahead of anything kept since:
+    /// beside the queued message's edit left open, or in the composer it kept.
     fn give_back(&mut self, key: Key, text: String) {
+        if let Some((prompt, ..)) = self.queues.get_mut(&key).and_then(QueueUi::edit_draft_mut) {
+            *prompt = merge_prompt(text, prompt);
+            return;
+        }
         match self.drafts.entry(key).or_insert_with(|| SideDraft::Prompt(String::new())) {
             SideDraft::Prompt(prompt) => *prompt = merge_prompt(text, prompt),
             SideDraft::Question(question) => question.prompt = merge_prompt(text, &question.prompt),
@@ -189,8 +185,8 @@ impl SideChats {
     }
 
     /// Releases the view on screen, keeping its unsent text for when it shows again, and says
-    /// which chat it showed. A queued message's edit ends unless `next` shows the same chat
-    /// again (a reconnect); the side chat keeps its own draft.
+    /// which chat it showed. A queued message's edit stays open in the chat's queue, as the web
+    /// keeps edits by thread.
     fn release_view(&mut self, next: Option<&Key>, cx: &App) -> Option<Key> {
         let mut view = self.view.take()?;
         let key = (view.env, view.thread_id);
@@ -199,20 +195,32 @@ impl SideChats {
             Some(_) => String::new(),
             None => view.composer.read(cx).value().to_string(),
         };
-        let mut ended = None;
-        if next != Some(&key)
-            && let Some(queue) = self.queues.get_mut(&key)
-        {
-            ended = queue.take_edit_draft().map(|(own, ..)| own);
-            if queue.idle() {
-                self.queues.remove(&key);
-            }
+        if next != Some(&key) && self.queues.get(&key).is_some_and(QueueUi::idle) {
+            self.queues.remove(&key);
         }
-        match SideDraft::kept(question, text, ended) {
+        match SideDraft::kept(question, text) {
             Some(draft) => self.drafts.insert(key.clone(), draft),
             None => self.drafts.remove(&key),
         };
         Some(key)
+    }
+
+    /// A save that lands after the side chat's tab was left ends its edit begun as `id`: the kept
+    /// composer gets the side chat's own text back, or the card it showed parks it.
+    pub(super) fn end_left_edit(&mut self, env: &SharedString, thread_id: &str, id: &str) {
+        let key = (env.clone(), thread_id.to_owned());
+        let Some(queue) = self.queues.get_mut(&key).filter(|queue| queue.edit_id() == Some(id)) else { return };
+        let Some((own, ..)) = queue.take_edit_draft() else { return };
+        match self.drafts.remove(&key) {
+            Some(SideDraft::Question(mut question)) => {
+                question.set_parked((own, Vec::new(), ContextRecords::default()));
+                self.drafts.insert(key, SideDraft::Question(question));
+            }
+            _ if own.is_empty() => {}
+            _ => {
+                self.drafts.insert(key, SideDraft::Prompt(own));
+            }
+        }
     }
 
     fn view_key(&self) -> Option<Key> {
@@ -1509,25 +1517,43 @@ mod tests {
     }
 
     #[test]
-    fn a_side_chat_left_mid_edit_keeps_its_own_text_not_the_edits() {
-        // A question asked during the edit parked the edit's text.
+    fn a_side_chat_left_mid_edit_keeps_the_edit_and_its_own_text_beside_it() {
+        let key = (SharedString::from("e"), "side".to_owned());
+        let own = || ("own".to_owned(), Vec::new(), ContextRecords::default());
+        let mut side_chats = SideChats::default();
+        let mut queue = QueueUi::default();
+        queue.resume_edit(super::super::queue::QueueEdit::test("edit", "e", own()));
+        side_chats.queues.insert(key.clone(), queue);
+        // The editor showed the edit's text when the tab was left.
+        side_chats.drafts.insert(key.clone(), SideDraft::kept(None, "edit".into()).expect("kept"));
+        side_chats.give_back(key.clone(), "failed".into());
+        let saved = |side_chats: &SideChats| side_chats.queues[&key].edit_draft().map(|(text, ..)| text.clone());
+        assert_eq!(saved(&side_chats).as_deref(), Some("failed\n\nown"), "a failed send joins its own text");
+        side_chats.end_left_edit(&key.0, &key.1, "a later edit");
+        assert!(saved(&side_chats).is_some(), "a save for another edit leaves this one");
+        side_chats.end_left_edit(&key.0, &key.1, "edit");
+        assert!(saved(&side_chats).is_none());
+        let restored = side_chats.drafts.remove(&key).map(|draft| draft.restore().0);
+        assert_eq!(restored.as_deref(), Some("failed\n\nown"), "its save ended it: the tab shows its own text");
+        // Under a question the card parked the edit's text; it parks the side chat's own once the edit ends.
         let mut card = answered_card();
         card.prompt = "edit".into();
-        let (text, card) = SideDraft::kept(Some(card), String::new(), Some("own".into())).expect("kept").restore();
+        let mut queue = QueueUi::default();
+        queue.resume_edit(super::super::queue::QueueEdit::test("asked", "e", own()));
+        side_chats.queues.insert(key.clone(), queue);
+        side_chats.drafts.insert(key.clone(), SideDraft::kept(Some(card), String::new()).expect("kept"));
+        side_chats.end_left_edit(&key.0, &key.1, "asked");
+        let (text, card) = side_chats.drafts.remove(&key).expect("kept").restore();
         assert_eq!((text.as_str(), card.expect("the card comes back").prompt.as_str()), ("typed", "own"));
-        let kept = SideDraft::kept(None, "edit".into(), Some("own".into())).map(|draft| draft.restore().0);
-        assert_eq!(kept.as_deref(), Some("own"));
-        let rebuilt = SideDraft::kept(None, "edit".into(), None).map(|draft| draft.restore().0);
-        assert_eq!(rebuilt.as_deref(), Some("edit"), "a reconnect keeps the edit, and its text in the composer");
     }
 
     #[test]
     fn a_released_side_chat_keeps_its_question_answers_and_progress() {
-        let (text, card) = SideDraft::kept(Some(answered_card()), String::new(), None).expect("kept").restore();
+        let (text, card) = SideDraft::kept(Some(answered_card()), String::new()).expect("kept").restore();
         assert_eq!(text, "typed", "the editor shows the question on screen's typed answer");
         let card = card.expect("the card comes back");
         assert_eq!((card.index, card.prompt.as_str()), (1, "parked prompt"));
         assert_eq!(card.drafts["a"].selected, ["Red"]);
-        assert_eq!(SideDraft::kept(None, String::new(), None).map(|draft| draft.restore().0), None);
+        assert_eq!(SideDraft::kept(None, String::new()).map(|draft| draft.restore().0), None);
     }
 }
