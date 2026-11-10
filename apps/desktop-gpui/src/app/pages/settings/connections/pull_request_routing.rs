@@ -58,10 +58,17 @@ impl Workspace {
             if !environment.enabled || unsupported || saved.is_primary(&environment.environment_id) {
                 continue;
             }
+            // The bearer route the connection runs over, else the first saved one; an SSH-only
+            // machine has no bearer target to grant.
+            let active = saved.session(&environment.environment_id).and_then(|session| session.active_route());
+            let route = active
+                .and_then(|id| environment.route(id))
+                .filter(|route| route.http_base().is_some())
+                .or_else(|| environment.routes.iter().find(|route| route.http_base().is_some()));
             machines.push(Machine {
                 id: environment.environment_id.clone(),
                 label: environment.label.clone(),
-                http_base: Some(environment.http_base.clone()),
+                http_base: route.and_then(|route| route.http_base()).map(str::to_owned),
                 primary: false,
             });
         }

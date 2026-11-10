@@ -420,7 +420,7 @@ async fn exchange_token(http_base: &str, bootstrap_token: &str) -> Result<String
 
 /// The server does not watch its parent on Windows; a kill-on-close job ends it with us.
 #[cfg(windows)]
-fn contain(child: &Child) -> Option<win32job::Job> {
+pub(crate) fn contain(child: &Child) -> Option<win32job::Job> {
     let handle = child.raw_handle()?;
     let mut limits = win32job::ExtendedLimitInfo::new();
     limits.limit_kill_on_job_close();

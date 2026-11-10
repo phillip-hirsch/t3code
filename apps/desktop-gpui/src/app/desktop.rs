@@ -149,6 +149,11 @@ impl Workspace {
 
     /// A later launch's arguments (`second-instance`), once [`super::main_window::ensure`]
     /// brought this window forward: its app links open here.
+    /// Links wait for the launch landing; setup must not take their place.
+    pub(super) fn has_pending_links(&self) -> bool {
+        !self.desktop.pending_links.is_empty()
+    }
+
     pub(super) fn receive_launch(&mut self, args: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
         self.desktop.pending_links.extend(args.iter().filter_map(|arg| links::parse_app_link(arg)));
         self.open_pending_links(window, cx);
@@ -279,12 +284,12 @@ impl Workspace {
                 return;
             }
             let catalog = saved.read_with(cx, |saved, _| saved.environments().to_vec());
-            let paired = crate::runtime().spawn(crate::environments::pair(host, code, catalog)).await;
+            let paired = crate::runtime().spawn(crate::environments::pair(host, code, catalog, None)).await;
             let paired = paired.unwrap_or_else(|error| Err(error.to_string()));
             let saving = match paired {
                 // The workspace's own environment is already here.
                 Ok(paired) if primary.as_deref() == Some(paired.environment_id.as_str()) => None,
-                Ok(paired) => Some(saved.update(cx, |saved, cx| saved.add(paired, cx))),
+                Ok(paired) => Some(saved.update(cx, |saved, cx| saved.register(paired, true, cx))),
                 Err(error) => {
                     let _ = this.update_in(cx, |_, window, cx| fail(&error, window, cx));
                     return;

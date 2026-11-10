@@ -5,7 +5,7 @@
 pub(in crate::app) mod agents;
 mod chat;
 pub(in crate::app) mod code;
-mod connections;
+pub(in crate::app) mod connections;
 pub(in crate::app) use connections::check_filesystem_read;
 pub(in crate::app) use connections::check_scope;
 pub(in crate::app) use connections::logic::{machine_icon, one_password_account};
@@ -22,7 +22,10 @@ mod model_select;
 
 mod providers;
 mod row_layout;
-pub(in crate::app) use providers::{chatgpt_usage_button, idle_compaction, redacted_email, uses_chatgpt_sharing};
+pub(in crate::app) use providers::{
+    ModeChange, chatgpt_usage_button, codex_setup_managed, idle_compaction, provider_summary, redacted_email,
+    uses_chatgpt_sharing, with_setup_mode,
+};
 pub(in crate::app) use widgets::device_only;
 mod search;
 pub(in crate::app) mod secret_source;

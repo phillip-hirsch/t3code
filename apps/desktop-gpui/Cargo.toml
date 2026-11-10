@@ -76,6 +76,8 @@ markup5ever_rcdom = "0.3"
 rav1e = { version = "0.8", default-features = false, features = ["threading"] }
 # The types of files sent to an agent browser page's file picker; GPUI already builds this crate.
 mime_guess = "2"
+# Pairing links' QR codes, drawn as quads (no image or SVG renderer).
+qrcode = { version = "0.14", default-features = false }
 raw-window-handle = "0.6"
 rodio = { version = "0.23", default-features = false, features = ["playback", "mp3"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "form", "rustls"] }

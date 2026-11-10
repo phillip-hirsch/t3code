@@ -161,7 +161,7 @@ fn driver_allowed(policy: &Value, driver: &str) -> bool {
 }
 
 /// `managedInstanceLocks(...).configKeys` and its reason, when the policy pins any of `driver`'s config.
-fn config_locks(policy: &Value, driver: &str) -> Option<(HashSet<String>, SharedString)> {
+pub(super) fn config_locks(policy: &Value, driver: &str) -> Option<(HashSet<String>, SharedString)> {
     let paths = policy.pointer(&format!("/limits/providers/lockedInstanceFields/{driver}"))?.as_array()?;
     if paths.is_empty() {
         return None;
@@ -632,8 +632,8 @@ pub(super) struct AddProviderWizard {
     workspace: WeakEntity<Workspace>,
     /// The settings environment at open: the provider is added there.
     scope: Option<SharedString>,
-    /// The Providers page, which selects the new instance (`onCreated`).
-    page: Entity<super::ProvidersPage>,
+    /// The Providers page, which selects the new instance (`onCreated`); `None` from the Welcome page.
+    page: Option<Entity<super::ProvidersPage>>,
     step: usize,
     driver: &'static Driver,
     identity: HashMap<&'static str, Identity>,
@@ -669,7 +669,7 @@ impl AddProviderWizard {
     fn new(
         workspace: Entity<Workspace>,
         scope: Option<SharedString>,
-        page: Entity<super::ProvidersPage>,
+        page: Option<Entity<super::ProvidersPage>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -993,10 +993,19 @@ impl AddProviderWizard {
                     return notify_error(window, cx, "Could not add provider instance", rpc_message(&error));
                 }
                 let selected = instance_id.clone();
-                this.page.update(cx, |page, cx| {
-                    page.selected = Some(selected);
-                    cx.notify();
-                });
+                match &this.page {
+                    Some(page) => page.update(cx, |page, cx| {
+                        page.selected = Some(selected);
+                        cx.notify();
+                    }),
+                    // The Welcome page lists the new agent once its status is read.
+                    None => {
+                        if let Some(client) = this.client(cx) {
+                            let refresh = async move { client.request("server.refreshProviders", json!({})).await };
+                            cx.background_spawn(refresh).detach();
+                        }
+                    }
+                }
                 if then_sign_in {
                     this.step = 2;
                     this.watch_auth(instance_id.clone(), window, cx);
@@ -1651,10 +1660,37 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (workspace, scope) = (cx.entity(), self.settings_environment());
+        let scope = self.settings_environment();
+        self.open_add_provider_wizard(scope, Some(page), false, window, cx);
+    }
+
+    /// The Welcome page's ACP Registry "Browse": the wizard on `scope` with every driver shown
+    /// (`showMoreProviders`).
+    pub(in crate::app) fn open_add_agent_dialog(
+        &mut self,
+        scope: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_add_provider_wizard(Some(scope), None, true, window, cx);
+    }
+
+    fn open_add_provider_wizard(
+        &mut self,
+        scope: Option<SharedString>,
+        page: Option<Entity<super::ProvidersPage>>,
+        show_more: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = cx.entity();
         // The wizard reads the workspace, which this call is still updating.
         window.defer(cx, move |window, cx| {
-            let wizard = cx.new(|cx| AddProviderWizard::new(workspace, scope, page, window, cx));
+            let wizard = cx.new(|cx| {
+                let mut wizard = AddProviderWizard::new(workspace, scope, page, window, cx);
+                wizard.show_more = show_more;
+                wizard
+            });
             window.open_dialog(cx, move |dialog, _, _| {
                 dialog.entrance(DialogEntrance::None).p_0().w(px(768.)).centered().child(wizard.clone())
             });

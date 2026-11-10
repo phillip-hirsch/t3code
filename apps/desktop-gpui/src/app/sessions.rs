@@ -304,6 +304,8 @@ impl Workspace {
                     this.sync_keymap(cx);
                     this.show_reload_toast(window, cx);
                     this.check_chatgpt_welcome(window, cx);
+                    // The first-run gate waits on the primary's config too.
+                    this.land(window, cx);
                 }
                 // Its thread tag filter may have changed.
                 this.retract_hidden_alerts(window, cx);
@@ -324,6 +326,9 @@ impl Workspace {
         ];
         if !config_known {
             streams.push(self.subscribe_shell_without_config(environment_id.clone(), window, cx));
+        }
+        if primary {
+            streams.push(self.subscribe_lifecycle(&client, window, cx));
         }
         if let Some(endpoint) = self.session(&environment_id).and_then(|s| s.endpoint.clone()) {
             let id = environment_id.clone();
@@ -459,10 +464,10 @@ impl Workspace {
                 continue;
             }
             let id: SharedString = environment.environment_id.clone().into();
-            let socket =
-                saved.session(&environment.environment_id).and_then(|s| Some((s.client.clone()?, s.generation)));
+            let session = saved.session(&environment.environment_id);
+            let socket = session.and_then(|s| Some((s.client.clone()?, s.generation)));
             listed.push(id.clone());
-            connections.push((id, socket, environment.endpoint()));
+            connections.push((id, socket, session.and_then(|s| s.endpoint.clone())));
         }
         let mut started = Vec::new();
         let mut closed = false;

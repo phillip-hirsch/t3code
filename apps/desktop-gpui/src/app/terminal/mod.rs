@@ -30,7 +30,7 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use self::layout::{DrawerLayout, Place, Split};
-use self::session::{Launch, SessionEvent, TerminalSession};
+pub(in crate::app) use self::session::{Launch, SessionEvent, TerminalSession};
 use super::draft_sessions::DraftId;
 use super::titlebar::icon;
 use super::{Target, Workspace};
@@ -348,8 +348,8 @@ impl Workspace {
         Some(Launch {
             cwd: worktree_path.clone().unwrap_or_else(|| project.workspace_root.clone()),
             worktree_path,
-            project_root: project.workspace_root.clone(),
-            stop_on_settle: None,
+            project_root: Some(project.workspace_root.clone()),
+            ..Launch::default()
         })
     }
 
@@ -396,6 +396,7 @@ impl Workspace {
                 pane.session.update(cx, |session, cx| session.attach(client.clone(), cx));
             }
         }
+        self.reattach_setup_terminal(&environment, client, cx);
         task
     }
 
@@ -794,15 +795,18 @@ impl Workspace {
                     None => cx.open_url(url),
                 }
             }
-            SessionEvent::OpenPath(path) => match self.preferred_editor_id() {
-                Some(editor) => {
-                    self.open_path_in_editor(path.clone(), editor, false, "Unable to open path".into(), window, cx);
+            SessionEvent::OpenPath(path) => match self.preferred_editor_id().zip(self.active_environment().cloned()) {
+                Some((editor, environment)) => {
+                    let failure = "Unable to open path".to_owned();
+                    self.open_path_in_editor(&environment, path.clone(), editor, false, failure, window, cx);
                 }
                 None => {
                     self.error = Some("No editor is available to open this path.".into());
                     cx.notify();
                 }
             },
+            // Only a sink session sends these, and drawer panes are never sinks.
+            SessionEvent::Input(_) | SessionEvent::Resize { .. } => {}
         }
     }
 

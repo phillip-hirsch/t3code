@@ -20,6 +20,7 @@ use super::git::{self, GitRequest, QuickKind};
 use super::titlebar::{RIGHT_RESIZE_INSET, TITLEBAR_HEIGHT, icon};
 use super::{Target, Workspace, new_id};
 use crate::model::{DelegatedFrom, ProjectScript, ThreadShell, TokenUsage, UsageLimits};
+use crate::remote_open::RemoteOpenState;
 use crate::theme::{self, Tokens};
 use crate::thread_details;
 
@@ -133,6 +134,17 @@ pub(super) fn editor_label(id: &str) -> &str {
         "zed" => "Zed",
         "antigravity" => "Antigravity",
         "idea" => "IntelliJ IDEA",
+        "aqua" => "Aqua",
+        "clion" => "CLion",
+        "datagrip" => "DataGrip",
+        "dataspell" => "DataSpell",
+        "goland" => "GoLand",
+        "phpstorm" => "PhpStorm",
+        "pycharm" => "PyCharm",
+        "rider" => "Rider",
+        "rubymine" => "RubyMine",
+        "rustrover" => "RustRover",
+        "webstorm" => "WebStorm",
         "file-manager" if cfg!(target_os = "macos") => "Finder",
         "file-manager" if cfg!(target_os = "windows") => "File Explorer",
         "file-manager" => "Files",
@@ -519,13 +531,22 @@ impl Workspace {
             .or_else(|| available.first().map(String::as_str))
     }
 
+    /// `shouldShowOpenInPicker`: a project on the desktop's own environment or a remote one.
+    fn open_in_row_shows(&self, cx: &mut Context<Self>) -> Option<SharedString> {
+        let project = self.target_project()?;
+        let environment = self.active_environment()?.clone();
+        let shows = !project.workspace_root.is_empty()
+            && (self.primary_environment() == Some(&environment)
+                || self.remote_open_state(&environment, cx) != RemoteOpenState::LocalExec);
+        shows.then_some(environment)
+    }
+
     /// `OpenInPicker` in panel mode: the row opens the preferred editor, the chevron picks it.
     fn open_in_row(&self, tokens: &Tokens, colors: &CardColors, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let project = self.target_project()?;
-        if project.workspace_root.is_empty() {
-            return None;
-        }
-        let preferred = self.preferred_editor().map(str::to_owned);
+        let environment = self.open_in_row_shows(cx)?;
+        let open_in = self.open_in(&environment, cx);
+        let (can_open, host_denied) = (open_in.can_open(), open_in.host_denied);
+        let preferred = open_in.preferred.clone();
         let label: SharedString = match &preferred {
             Some(editor) => format!("Open in {}", editor_label(editor)).into(),
             None => "Open in editor".into(),
@@ -538,47 +559,44 @@ impl Workspace {
                 .into_any_element(),
         };
         let view = cx.entity();
-        let editors = self.server_info().available_editors.clone();
-        let current = preferred.clone();
         let menu_tokens = *tokens;
         let build = move |mut menu: PopupMenu, window: &mut Window, _: &mut Context<PopupMenu>| {
-            if editors.is_empty() {
-                return menu.item(PopupMenuItem::new("No installed editors found").disabled(true));
-            }
-            for editor in &editors {
+            for editor in open_in.listed() {
                 let picked = editor.clone();
                 let label = SharedString::from(editor_label(editor).to_owned());
-                let checked = current.as_deref() == Some(editor.as_str());
+                let checked = open_in.preferred.as_deref() == Some(editor.as_str());
                 let item_editor = editor.clone();
                 menu = menu.item(
                     PopupMenuItem::element(move |_, _| {
                         h_flex().gap_2().child(editor_icon(&item_editor, &menu_tokens)).child(label.clone())
                     })
                     .checked(checked)
+                    .disabled(!can_open)
                     .on_click(window.listener_for(&view, move |this, _, _, cx| {
                         this.preferred_editor = Some(picked.clone());
                         cx.notify();
                     })),
                 );
             }
-            menu
+            open_in.menu_notes(menu)
         };
-        let enabled = preferred.is_some() && self.git_cwd().is_some();
+        let enabled = preferred.is_some() && can_open && self.git_cwd().is_some();
         Some(
             split_row("details-open-in", colors, cx)
                 .child(
                     split_primary("details-open-in-primary", colors, enabled, cx)
                         .child(leading)
                         .child(div().min_w_0().truncate().child(label))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if let Some(editor) = preferred.clone() {
-                                this.open_in_editor(editor, cx);
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if enabled {
+                                this.open_workspace_in_preferred_editor(window, cx);
                             }
                         })),
                 )
                 .child(split_hairline("details-open-in", colors))
                 .child(
                     split_menu("details-open-in-menu", tokens, colors, cx)
+                        .disabled(host_denied)
                         .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, cx| {
                             build(menu.min_w(px(264.)), window, cx)
                         }),
@@ -593,27 +611,17 @@ impl Workspace {
         if let Some(opened) = self.open_favorite_in_file_surface(window, cx) {
             return opened;
         }
-        if self.target_project().is_none_or(|project| project.workspace_root.is_empty()) {
-            return false;
-        }
-        let Some(editor) = self.preferred_editor().map(str::to_owned) else { return false };
-        self.open_in_editor(editor, cx);
-        true
+        self.open_workspace_in_preferred_editor(window, cx)
     }
 
-    /// `shell.openInEditor` on the thread's workspace.
-    fn open_in_editor(&mut self, editor: String, cx: &mut Context<Self>) {
-        let (Some(client), Some(cwd)) = (self.client(), self.git_cwd()) else { return };
-        self.preferred_editor = Some(editor.clone());
-        cx.spawn(async move |this, cx| {
-            if let Err(error) = client.request("shell.openInEditor", json!({"cwd": cwd, "editor": editor})).await {
-                let _ = this.update(cx, |this, cx| {
-                    this.error = Some(format!("Couldn't open the editor: {error}").into());
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
+    /// The Open in row's primary action: the thread's workspace in the preferred editor, on its
+    /// host or, for a remote environment, in this machine's editor. Returns whether it opened.
+    fn open_workspace_in_preferred_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let (Some(environment), Some(cwd)) = (self.open_in_row_shows(cx), self.git_cwd()) else { return false };
+        let open_in = self.open_in(&environment, cx);
+        let can_open = open_in.can_open();
+        let Some(editor) = open_in.preferred.filter(|_| can_open) else { return false };
+        self.open_in_editor_at(&environment, cwd, false, editor, false, window, cx)
     }
 
     /// `ProjectScriptsControl` in panel mode: run the primary script, pick, import or add one from

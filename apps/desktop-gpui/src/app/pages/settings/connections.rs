@@ -12,15 +12,19 @@
 //! section is on screen, like the web's mounted component.
 
 mod access;
+mod add_environment;
 mod environments;
 mod exposure;
+pub(in crate::app) mod linking;
 mod load_balancing;
-pub(super) mod logic;
+pub(in crate::app) mod logic;
+mod pairing;
 mod pull_request_routing;
+mod routes;
 mod saved;
 pub(super) use saved::empty_media;
 mod secrets;
-pub(super) mod ui;
+pub(in crate::app) mod ui;
 
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;

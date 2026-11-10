@@ -757,17 +757,21 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// What the file tab's Open in opens: the absolute path, and whether the file manager reveals it
-    /// (`revealsInFileManager`: a read file, not a folder).
-    pub(super) fn file_open_in_target(&self, key: &FileKey) -> (String, super::open_in::FileManager) {
+    /// What the file tab's Open in opens: the absolute path, whether it was read as a file, and
+    /// whether the file manager reveals it (`revealsInFileManager`: a settled read, not a folder).
+    pub(super) fn file_open_in_target(&self, key: &FileKey) -> super::open_in::FileOpenTarget {
         let state = self.files.previews.get(key);
-        let read_file = state.is_some_and(|s| !matches!(s.load, Load::Loading | Load::Folder));
-        let file_manager = if read_file && self.server_info().config["shellRevealInFileManager"] == true {
-            super::open_in::FileManager::Reveal
-        } else {
-            super::open_in::FileManager::Open
-        };
-        (logic::absolute_path(&key.checkout.cwd, &key.path), file_manager)
+        let settled = state.is_some_and(|s| !matches!(s.load, Load::Loading | Load::Folder));
+        let reveals =
+            self.env_info(&key.checkout.env).is_some_and(|info| info.config["shellRevealInFileManager"] == true);
+        let file_manager =
+            if settled && reveals { super::open_in::FileManager::Reveal } else { super::open_in::FileManager::Open };
+        super::open_in::FileOpenTarget {
+            environment: key.checkout.env.clone(),
+            absolute: logic::absolute_path(&key.checkout.cwd, &key.path),
+            is_file: state.is_some_and(|s| !matches!(s.load, Load::Loading | Load::Folder | Load::Failed { .. })),
+            file_manager,
+        }
     }
 
     /// The crumbs, then Open in, the rendered toggle, word wrap and the explorer toggle.
@@ -859,8 +863,7 @@ impl Workspace {
         let open_in_browser =
             !folder && matches!(kind, logic::FileKind::Html | logic::FileKind::Pdf) && self.browser_available();
         let wrap = state.and_then(|s| s.wrap).unwrap_or_else(|| self.client_settings.values.bool("wordWrap"));
-        let (absolute, file_manager) = self.file_open_in_target(key);
-        let open_in = self.render_file_open_in(absolute, file_manager, tokens, cx);
+        let open_in = self.render_file_open_in(self.file_open_in_target(key), tokens, cx);
         h_flex()
             .flex_none()
             .h(px(28.))
@@ -868,7 +871,7 @@ impl Workspace {
             .gap(px(8.))
             .px(px(12.))
             .child(h_flex().min_w_0().flex_1().justify_end().overflow_hidden().child(trail))
-            .child(open_in)
+            .children(open_in)
             .when_some(mode, |el, mode| {
                 let icon = match (rendered, mode) {
                     (true, _) => IconName::CodeXml,

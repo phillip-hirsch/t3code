@@ -1,11 +1,12 @@
 //! The file surface's compact `OpenInPicker`: the preferred editor's button opens the file, and
-//! the chevron picks the preferred editor.
+//! the chevron picks the preferred editor. A remote environment's file opens in this machine's
+//! editor over SSH (`crate::app::remote_open`).
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{Icon, h_flex};
+use gpui_kit::component::{Disableable as _, Icon, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     Anchor, AnyElement, Context, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
@@ -16,6 +17,7 @@ use super::FileKey;
 use crate::app::Workspace;
 use crate::app::details::{editor_icon, editor_label};
 use crate::app::right_panel::Surface;
+use crate::remote_open::RemoteOpenState;
 use crate::theme::Tokens;
 
 /// What the file manager does with a file (`revealFileManager`).
@@ -26,21 +28,30 @@ pub(super) enum FileManager {
     Reveal,
 }
 
+/// What the file tab's Open in opens.
+#[derive(Clone)]
+pub(super) struct FileOpenTarget {
+    pub environment: SharedString,
+    pub absolute: String,
+    /// `file.isFile`: a read file, which remote VS Code links open as a file.
+    pub is_file: bool,
+    pub file_manager: FileManager,
+}
+
 impl Workspace {
-    /// The Open in button: the file in the preferred editor. Returns whether there was one.
+    /// The Open in button: the file in the preferred editor. Returns whether it opened.
     fn open_file_in_preferred_editor(
         &mut self,
-        absolute: String,
-        file_manager: FileManager,
+        target: FileOpenTarget,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(editor) = self.preferred_editor_id() else { return false };
-        let title = format!("Could not open in {}", editor_label(&editor));
-        let reveal = file_manager == FileManager::Reveal && editor == "file-manager";
-        self.preferred_editor = Some(editor.clone());
-        self.open_path_in_editor(absolute, editor, reveal, title, window, cx);
-        true
+        let open_in = self.open_in(&target.environment, cx);
+        let can_open = open_in.can_open();
+        let Some(editor) = open_in.preferred.filter(|_| can_open) else { return false };
+        let reveal = target.file_manager == FileManager::Reveal && editor == "file-manager";
+        let FileOpenTarget { environment, absolute, is_file, .. } = target;
+        self.open_in_editor_at(&environment, absolute, is_file, editor, reveal, window, cx)
     }
 
     /// `editor.openFavorite` while a file tab shows: it presses that tab's Open in button
@@ -52,32 +63,38 @@ impl Workspace {
     ) -> Option<bool> {
         let Some(Surface::File(path)) = self.active_surface().cloned() else { return None };
         let checkout = self.project_target()?.checkout;
-        let (absolute, file_manager) = self.file_open_in_target(&FileKey::new(checkout, path));
-        Some(self.open_file_in_preferred_editor(absolute, file_manager, window, cx))
+        let target = self.file_open_in_target(&FileKey::new(checkout, path));
+        Some(self.file_open_in_shows(&target.environment, cx) && self.open_file_in_preferred_editor(target, window, cx))
+    }
+
+    /// The tab shows Open in for the desktop's own environment and for a remote one.
+    fn file_open_in_shows(&self, environment: &str, cx: &mut Context<Self>) -> bool {
+        self.primary_environment().is_some_and(|primary| primary.as_ref() == environment)
+            || self.remote_open_state(environment, cx) != RemoteOpenState::LocalExec
     }
 
     pub(super) fn render_file_open_in(
         &self,
-        absolute: String,
-        file_manager: FileManager,
+        target: FileOpenTarget,
         tokens: &Tokens,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let editors = self.server_info().available_editors.clone();
-        let preferred = self.preferred_editor_id();
+    ) -> Option<AnyElement> {
+        if !self.file_open_in_shows(&target.environment, cx) {
+            return None;
+        }
+        let open_in = self.open_in(&target.environment, cx);
+        let (can_open, host_denied) = (open_in.can_open(), open_in.host_denied);
+        let preferred = open_in.preferred.clone();
         let shortcut = self.shortcut_label("editor.openFavorite");
         let view = cx.entity();
         let view_for_menu = view.clone();
         let menu_tokens = *tokens;
-        let current = preferred.clone();
         let build = move |mut menu: PopupMenu, window: &mut Window, _: &mut Context<PopupMenu>| {
-            if editors.is_empty() {
-                return menu.item(PopupMenuItem::new("No installed editors found").disabled(true));
-            }
-            for editor in &editors {
+            for editor in open_in.listed() {
                 let (picked, item_editor) = (editor.clone(), editor.clone());
                 let label = SharedString::from(editor_label(editor).to_owned());
-                let shortcut = shortcut.clone().filter(|_| current.as_deref() == Some(editor.as_str()));
+                let current = open_in.preferred.as_deref() == Some(editor.as_str());
+                let shortcut = shortcut.clone().filter(|_| current);
                 menu = menu.item(
                     PopupMenuItem::element(move |_, _| {
                         h_flex()
@@ -91,6 +108,7 @@ impl Workspace {
                                     .map(|s| div().text_xs().text_color(menu_tokens.muted_foreground).child(s)),
                             )
                     })
+                    .disabled(!can_open)
                     .on_click(window.listener_for(
                         &view,
                         move |this: &mut Workspace, _, _, cx| {
@@ -100,10 +118,10 @@ impl Workspace {
                     )),
                 );
             }
-            menu
+            open_in.menu_notes(menu)
         };
         let border = tokens.input;
-        let enabled = preferred.is_some();
+        let enabled = preferred.is_some() && can_open;
         let primary = div()
             .id("file-open-in")
             .h_full()
@@ -118,34 +136,37 @@ impl Workspace {
             })
             .tooltip(|window, cx| Tooltip::new("Open file in preferred editor").build(window, cx))
             .on_click(cx.listener(move |this, _, window, cx| {
-                this.open_file_in_preferred_editor(absolute.clone(), file_manager, window, cx);
+                this.open_file_in_preferred_editor(target.clone(), window, cx);
             }));
-        h_flex()
-            .flex_none()
-            .h(px(24.))
-            .rounded(px(6.))
-            .border_1()
-            .border_color(border)
-            .overflow_hidden()
-            .text_color(tokens.foreground)
-            .child(primary)
-            .child(div().w(px(1.)).h_full().bg(border))
-            .child(
-                Button::new("file-open-in-menu")
-                    .custom(
-                        ButtonCustomVariant::new(cx)
-                            .foreground(tokens.foreground)
-                            .hover(tokens.accent)
-                            .active(tokens.accent),
-                    )
-                    .w(px(22.))
-                    .h_full()
-                    .rounded(px(0.))
-                    .icon(Icon::new(IconName::ChevronDown).size(px(16.)))
-                    .tooltip("Choose editor")
-                    .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, cx| build(menu, window, cx))
-                    .on_open_change(super::menu_open_change(view_for_menu)),
-            )
-            .into_any_element()
+        Some(
+            h_flex()
+                .flex_none()
+                .h(px(24.))
+                .rounded(px(6.))
+                .border_1()
+                .border_color(border)
+                .overflow_hidden()
+                .text_color(tokens.foreground)
+                .child(primary)
+                .child(div().w(px(1.)).h_full().bg(border))
+                .child(
+                    Button::new("file-open-in-menu")
+                        .custom(
+                            ButtonCustomVariant::new(cx)
+                                .foreground(tokens.foreground)
+                                .hover(tokens.accent)
+                                .active(tokens.accent),
+                        )
+                        .w(px(22.))
+                        .h_full()
+                        .rounded(px(0.))
+                        .icon(Icon::new(IconName::ChevronDown).size(px(16.)))
+                        .tooltip("Choose editor")
+                        .disabled(host_denied)
+                        .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, cx| build(menu, window, cx))
+                        .on_open_change(super::menu_open_change(view_for_menu)),
+                )
+                .into_any_element(),
+        )
     }
 }

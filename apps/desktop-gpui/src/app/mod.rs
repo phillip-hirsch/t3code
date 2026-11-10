@@ -79,6 +79,7 @@ mod mermaid;
 mod message_actions;
 mod minimap;
 mod model_picker;
+mod onboarding;
 mod pages;
 mod palette;
 mod palette_actions;
@@ -90,6 +91,7 @@ mod prompt_stash;
 mod queue;
 mod quit;
 mod recovery;
+mod remote_open;
 mod request_cards;
 mod review_comments;
 mod right_panel;
@@ -100,6 +102,7 @@ mod sidebar;
 mod sidebar_sheet;
 mod snap_shot;
 mod source_control;
+mod ssh_prompt;
 mod subagents;
 mod terminal;
 mod theme_editor;
@@ -321,6 +324,8 @@ pub struct Workspace {
     automations: details::automations::AutomationsWatch,
     /// The editor "Open in" launches, once picked.
     preferred_editor: Option<String>,
+    /// This machine's editors that open remote paths, for remote environments' Open in.
+    remote_editors: remote_open::RemoteEditors,
     right_panel: right_panel::RightPanel,
     /// The thread title's menu and inline rename.
     title: thread_menu::TitleState,
@@ -328,8 +333,9 @@ pub struct Workspace {
     /// The composer's "Run on" picker and each draft's machine choice.
     host: host_picker::HostUi,
     _connection_task: Task<()>,
-    /// The launch landing ran (once, after the first shell snapshot).
+    /// The launch landing ran (once, after the first shell snapshot and the first-run decision).
     landed: bool,
+    onboarding: onboarding::Onboarding,
     /// A page covering the chat in the main column.
     page: Option<pages::Page>,
     pull_requests: pages::PullRequestsState,
@@ -569,12 +575,14 @@ impl Workspace {
             servers: Default::default(),
             automations: Default::default(),
             preferred_editor: None,
+            remote_editors: Default::default(),
             right_panel: right_panel::RightPanel::new(cx),
             title: thread_menu::TitleState::new(cx),
             share_header: Default::default(),
             host: host_picker::HostUi::new(cx),
             _connection_task: Self::connect(window, cx),
             landed: false,
+            onboarding: onboarding::Onboarding::new(&client_settings),
             page: None,
             pull_requests: pages::PullRequestsState::new(window, cx),
             usage: pages::UsageState::new(&client_settings.values),
@@ -639,6 +647,7 @@ impl Workspace {
         workspace.sync_saved_sessions(window, cx);
         workspace.start_theme_feed(window, cx);
         workspace.load_drafts(window, cx);
+        ssh_prompt::listen(window, cx);
         workspace
     }
 
@@ -909,22 +918,28 @@ impl Workspace {
     }
 
     /// Electron always opens the index route, which starts a draft in the most
-    /// recently active project (`IndexDraftLanding`); this is that landing. It waits for the
-    /// saved drafts, so it opens the project's own.
+    /// recently active project (`IndexDraftLanding`); this is that landing, once the first-run
+    /// gate decided. It waits for the saved drafts, so it opens the project's own. A fresh
+    /// workspace gets the Welcome page instead.
     fn land(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let ready =
-            self.draft_store.restored() && self.primary_environment().is_some_and(|id| self.shell.has_snapshot(id));
-        if self.landed || !ready {
-            return;
+        self.follow_first_run(cx);
+        if !self.landed {
+            let ready =
+                self.draft_store.restored() && self.primary_environment().is_some_and(|id| self.shell.has_snapshot(id));
+            if self.onboarding.pending() || !ready {
+                return;
+            }
+            self.landed = true;
+            if self.target.is_none()
+                && !self.welcome_owns_home()
+                && let Some(project_id) =
+                    crate::inbox::most_recent_project(&self.shell.projects, &self.shell.threads).map(|p| p.id.clone())
+            {
+                self.start_draft(project_id, window, cx);
+            }
         }
-        self.landed = true;
-        if self.target.is_some() {
-            return;
-        }
-        if let Some(project_id) =
-            crate::inbox::most_recent_project(&self.shell.projects, &self.shell.threads).map(|p| p.id.clone())
-        {
-            self.start_draft(project_id, window, cx);
+        if self.welcome_owns_home() {
+            self.show_welcome(cx);
         }
     }
 
@@ -1355,6 +1370,9 @@ impl Render for Workspace {
         if self.client_settings.read_failed {
             return self.render_settings_recovery(window, cx);
         }
+        if self.onboarding.stalled() {
+            return self.render_connection_recovery(window, cx);
+        }
         if self.sidebar_open.fit(window.viewport_size().width) {
             self.notify_sidebar(cx);
         }
@@ -1362,6 +1380,7 @@ impl Render for Workspace {
         self.sync_error_scope();
         self.sync_saved_connection_banner(cx);
         self.sync_sheet_focus(window, cx);
+        self.sync_welcome(window, cx);
         self.sidebar.fit_window(window);
         // Widening to the inline layout closes the popover, as the web does.
         if self.details_inline(window) {
@@ -1475,7 +1494,10 @@ impl Render for Workspace {
             .child(
                 h_flex()
                     .size_full()
-                    .when(self.sidebar_open.docked(), |el| el.child(self.render_cached_sidebar(cx)))
+                    // Setup starts with an empty workspace, so the Welcome page has no thread list.
+                    .when(self.sidebar_open.docked() && !self.welcome_open(), |el| {
+                        el.child(self.render_cached_sidebar(cx))
+                    })
                     // The main content (`sidebar-inset`), which the history swipe indicator edges.
                     .child(
                         h_flex()

@@ -1158,6 +1158,11 @@ impl ShellState {
         self.cursors.get(environment_id).is_some_and(|cursor| cursor.has_snapshot)
     }
 
+    /// `environmentShell` status `live`: this environment's subscription caught up with its server.
+    pub fn is_live(&self, environment_id: &str) -> bool {
+        self.cursors.get(environment_id).is_some_and(|cursor| cursor.live)
+    }
+
     /// Some environment's subscription caught up with its server.
     pub fn live(&self) -> bool {
         self.cursors.values().any(|cursor| cursor.live)

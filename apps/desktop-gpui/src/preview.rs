@@ -926,7 +926,7 @@ pub fn resolve_address(input: &str, search_template: &str) -> Result<String, &'s
 }
 
 /// JavaScript's `encodeURIComponent`.
-fn encode_uri_component(input: &str) -> String {
+pub(crate) fn encode_uri_component(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for byte in input.bytes() {
         if byte.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&byte) {

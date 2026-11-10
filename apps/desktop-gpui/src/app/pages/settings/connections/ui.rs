@@ -71,7 +71,7 @@ pub(super) fn glyph(path: &'static str, size: f32, color: Hsla) -> AnyElement {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(in crate::app::pages::settings) enum Variant {
+pub(in crate::app) enum Variant {
     Primary,
     Outline,
     DestructiveOutline,
@@ -81,7 +81,7 @@ pub(in crate::app::pages::settings) enum Variant {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(in crate::app::pages::settings) enum Size {
+pub(in crate::app) enum Size {
     /// `size="xs"`: 24px tall, text-xs.
     Xs,
     /// The default 32px button, used in dialog footers.
@@ -92,10 +92,14 @@ type ClickHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 
 /// `Button` from `ui/button.tsx` for the variants and sizes these sections use.
 #[derive(IntoElement)]
-pub(in crate::app::pages::settings) struct WebButton {
+pub(in crate::app) struct WebButton {
     id: ElementId,
     label: SharedString,
     icon: Option<gpui_kit::assets::IconName>,
+    /// An icon outside gpui-kit's catalog, by asset path.
+    icon_path: Option<&'static str>,
+    /// An icon after the label, such as a fold's chevron.
+    trailing_icon: Option<gpui_kit::assets::IconName>,
     variant: Variant,
     size: Size,
     disabled: bool,
@@ -109,6 +113,8 @@ impl WebButton {
             id: id.into(),
             label: label.into(),
             icon: None,
+            icon_path: None,
+            trailing_icon: None,
             variant: Variant::Outline,
             size: Size::Xs,
             disabled: false,
@@ -129,6 +135,16 @@ impl WebButton {
 
     pub fn icon(mut self, icon: gpui_kit::assets::IconName) -> Self {
         self.icon = Some(icon);
+        self
+    }
+
+    pub fn icon_path(mut self, path: &'static str) -> Self {
+        self.icon_path = Some(path);
+        self
+    }
+
+    pub fn trailing_icon(mut self, icon: gpui_kit::assets::IconName) -> Self {
+        self.trailing_icon = Some(icon);
         self
     }
 
@@ -191,14 +207,21 @@ impl RenderOnce for WebButton {
             Size::Xs => text_xs(base),
             Size::Default => text_sm(base),
         };
-        base.when_some(self.icon, |el, icon| el.child(Icon::new(icon).size(px(icon_size)))).child(self.label).map(
-            |el| match (self.disabled, self.on_click) {
+        base.when_some(self.icon, |el, icon| el.child(Icon::new(icon).size(px(icon_size))))
+            .when_some(self.icon_path, |el, path| el.child(Icon::empty().path(path).size(px(icon_size))))
+            .child(self.label)
+            .when_some(self.trailing_icon, |el, icon| el.child(Icon::new(icon).size(px(icon_size))))
+            .map(|el| match (self.disabled, self.on_click) {
                 (true, _) | (_, None) => el.opacity(0.64),
+                // A tab stop that Enter and Space click, with `focus-visible:ring-2`.
                 (false, Some(handler)) => el
                     .cursor_pointer()
                     .hover(move |style| style.bg(hover_bg).border_color(hover_border))
+                    .tab_index(0)
+                    .focus_visible(move |style| {
+                        style.shadow(vec![gpui_kit::BoxShadow::new(px(0.), px(0.), t.ring).spread_radius(px(2.))])
+                    })
                     .on_click(move |event, window, cx| handler(event, window, cx)),
-            },
-        )
+            })
     }
 }

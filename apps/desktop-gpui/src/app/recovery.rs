@@ -1,4 +1,5 @@
-//! `FirstRunRecovery` for a `client-settings.json` that exists but can't be read.
+//! `FirstRunRecovery`: for a `client-settings.json` that exists but can't be read, and for a
+//! first-run decision the server never let the app make.
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::Button;
@@ -11,13 +12,35 @@ impl Workspace {
     /// The whole window while `client-settings.json` can't be read; the window still moves,
     /// resizes and closes as usual.
     pub(super) fn render_settings_recovery(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let t = *crate::theme::tokens(cx);
         let retry = Button::new("retry-client-settings")
             .outline()
             .small()
             .icon(IconName::RefreshCw)
             .label("Retry")
             .on_click(cx.listener(|this, _, window, cx| this.retry_client_settings(window, cx)));
+        self.render_recovery("Could not read settings", "Your saved settings could not be loaded.", retry, window, cx)
+    }
+
+    /// The whole window while the first-run gate is stalled; Reload starts its evidence over.
+    pub(super) fn render_connection_recovery(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let reload = Button::new("reload-first-run")
+            .outline()
+            .small()
+            .icon(IconName::RefreshCw)
+            .label("Reload")
+            .on_click(cx.listener(|this, _, window, cx| this.reload_first_run(window, cx)));
+        self.render_recovery("Still connecting", "T3 Code could not confirm this workspace.", reload, window, cx)
+    }
+
+    fn render_recovery(
+        &self,
+        title: &'static str,
+        description: &'static str,
+        action: Button,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let t = *crate::theme::tokens(cx);
         div()
             .size_full()
             .relative()
@@ -32,21 +55,9 @@ impl Workspace {
                     .max_w(px(384.))
                     .items_center()
                     .text_center()
-                    .child(
-                        div()
-                            .text_lg()
-                            .line_height(px(28.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Could not read settings"),
-                    )
-                    .child(
-                        div()
-                            .mt(px(8.))
-                            .text_sm()
-                            .text_color(t.muted_foreground)
-                            .child("Your saved settings could not be loaded."),
-                    )
-                    .child(div().mt(px(20.)).child(retry)),
+                    .child(div().text_lg().line_height(px(28.)).font_weight(FontWeight::SEMIBOLD).child(title))
+                    .child(div().mt(px(8.)).text_sm().text_color(t.muted_foreground).child(description))
+                    .child(div().mt(px(20.)).child(action)),
             )
             .child(titlebar::drag_region(div().absolute().top_0().left_0().right_0().h(titlebar::TITLEBAR_HEIGHT)))
             .child(self.render_caption_overlay(window, cx))
@@ -66,6 +77,8 @@ impl Workspace {
                 settings.values.get(super::details::DETAILS_VISIBILITY_KEY),
             );
             self.client_settings = settings;
+            // The first-run gate waited for these settings, which say whether setup was finished.
+            self.land(window, cx);
         }
         cx.notify();
     }

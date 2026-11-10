@@ -190,6 +190,10 @@ impl Workspace {
     }
 
     pub(super) fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        // The Welcome page has no sidebar, and a hidden one would still save the toggle.
+        if self.welcome_open() {
+            return;
+        }
         if let (Some(docked), Some(path)) = (self.sidebar_open.toggle(), docked_path()) {
             write_docked(&path, docked);
         }
@@ -201,7 +205,7 @@ impl Workspace {
     /// Electron sizes the sheet to its content: `SIDEBAR_WIDTH_MOBILE` puts `--spacing(3)` in an
     /// inline style, where it is invalid, so the popup's width falls back to `auto`.
     pub(super) fn render_sidebar_sheet(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.sidebar_open.sheet() {
+        if !self.sidebar_open.sheet() || self.welcome_open() {
             return None;
         }
         let sheet = AnyView::from(self.sidebar_view.clone());
