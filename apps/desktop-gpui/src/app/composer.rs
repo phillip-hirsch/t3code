@@ -110,6 +110,12 @@ fn note_provider(seen: &mut Option<String>, now: Option<&str>) -> bool {
     true
 }
 
+/// Whether `now` holds a chip `before` did not, counting each occurrence of an id.
+fn adds_chip(before: &[String], now: &[String]) -> bool {
+    let count = |ids: &[String], id: &String| ids.iter().filter(|other| *other == id).count();
+    now.iter().any(|id| count(now, id) > count(before, id))
+}
+
 /// A failed message first, then whatever was typed after it.
 fn merge_prompt(failed: String, newer: &str) -> String {
     if newer.trim().is_empty() { failed } else { format!("{failed}\n\n{newer}") }
@@ -153,7 +159,7 @@ impl Workspace {
         }
         let chips: Vec<String> = state.tokens().iter().map(|s| s.token().id().to_string()).collect();
         // A chip an undo or redo brings back may name a skill or model that has gone since.
-        let restored = chips.iter().any(|id| !self.chip_ids.contains(id));
+        let restored = adds_chip(&self.chip_ids, &chips);
         let previous = std::mem::replace(&mut self.chip_ids, chips);
         self.sync_attachment_chips(&previous, cx);
         if restored {
@@ -2375,6 +2381,16 @@ mod tests {
         assert_eq!(seen.as_deref(), Some("claudeAgent"));
         assert!(note_provider(&mut seen, None), "its provider went");
         assert!(!note_provider(&mut seen, None));
+    }
+
+    #[test]
+    fn an_undo_that_brings_back_a_chip_is_noticed() {
+        let ids = |ids: &[&str]| ids.iter().map(|id| (*id).to_owned()).collect::<Vec<_>>();
+        let gpt = "model:codex/gpt-6.1";
+        assert!(adds_chip(&ids(&["skill:review"]), &ids(&["skill:review", gpt])));
+        assert!(adds_chip(&ids(&[gpt]), &ids(&[gpt, gpt])), "a second chip for one model");
+        assert!(!adds_chip(&ids(&[gpt, gpt]), &ids(&[gpt])));
+        assert!(!adds_chip(&ids(&[gpt, "skill:review"]), &ids(&["skill:review", gpt])));
     }
 
     #[test]
