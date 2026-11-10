@@ -778,6 +778,7 @@ impl Workspace {
         let (click_key, click_row) = (root.clone(), row.clone());
         let menu = self.tree_context_menu(root, &row.path, cx);
         let measured = focused.then(|| self.tree(root).map(|tree| tree.focused_bounds.clone())).flatten();
+        let mention_path = self.tree_mention_path(root, &row.path);
         h_flex()
             .id(ElementId::Name(format!("files-row:{}", row.path).into()))
             .h(px(ROW_HEIGHT))
@@ -795,7 +796,7 @@ impl Workspace {
             .when(selected, |el| el.bg(fg.opacity(0.12)))
             .when(!selected, |el| el.hover(move |s| s.bg(fg.opacity(0.07))))
             // A drag never counts as the click that would open the row.
-            .on_drag(MentionDrag { path: row.path.clone() }, {
+            .on_drag(MentionDrag { path: mention_path }, {
                 let label = SharedString::from(row.label.clone());
                 move |_, _, _, cx| cx.new(|_| MentionDragPreview(label.clone()))
             })
@@ -848,11 +849,9 @@ impl Workspace {
                 self.server_info().platform_os.as_deref(),
             )
         });
-        let (cwd, environment) = (root.cwd.as_str(), root.env.clone());
-        let absolute = logic::absolute_path(cwd, path);
-        // A host folder's rows are mentioned by their host paths.
-        let host = self.project_target().is_none_or(|target| target.checkout.cwd != cwd);
-        let mention_path = if host { absolute.clone() } else { path.to_owned() };
+        let environment = root.env.clone();
+        let absolute = logic::absolute_path(&root.cwd, path);
+        let mention_path = self.tree_mention_path(root, path);
         move |mut menu, window, cx| {
             super::track_menu(&view, cx);
             let open_in = |editor: String, reveal: bool, title: String| {
@@ -917,6 +916,11 @@ impl Workspace {
                 },
             )))
         }
+    }
+
+    /// The path a row's mention carries: a host folder's rows by their host paths, as opening them.
+    fn tree_mention_path(&self, root: &Checkout, path: &str) -> String {
+        if self.is_host_tree(root) { logic::absolute_path(&root.cwd, path) } else { path.to_owned() }
     }
 
     /// Add to chat: the file's mention at the end of the composer, after a space.
