@@ -110,6 +110,9 @@ fn step_highlight(len: usize, current: Option<usize>, down: bool) -> Option<usiz
     }
 }
 
+/// The checkout a ref list answers: its environment and cwd.
+type RefsSource = (Option<SharedString>, String);
+
 #[derive(Default)]
 pub(in crate::app) struct BasePicker {
     open: bool,
@@ -118,6 +121,8 @@ pub(in crate::app) struct BasePicker {
     highlight: Option<usize>,
     list_scroll: ScrollHandle,
     search: Option<Entity<InputState>>,
+    /// The checkout `local` and `remote` came from; another checkout's refs never show.
+    source: Option<RefsSource>,
     local: Vec<Ref>,
     remote: Vec<Ref>,
     loading: bool,
@@ -125,7 +130,19 @@ pub(in crate::app) struct BasePicker {
     _search_changes: Option<Subscription>,
 }
 
+impl BasePicker {
+    /// The refs loaded for `source`'s checkout; none while only another checkout's are loaded.
+    fn refs(&self, source: Option<&RefsSource>) -> (&[Ref], &[Ref]) {
+        if source.is_some() && self.source.as_ref() == source { (&self.local, &self.remote) } else { (&[], &[]) }
+    }
+}
+
 impl Workspace {
+    /// The checkout the picker lists refs of: the active environment and the git cwd.
+    fn base_refs_source(&self) -> Option<RefsSource> {
+        Some((self.active_environment().cloned(), self.git_cwd()?))
+    }
+
     /// The base ref picked for the open thread's branch diff (`selectBranchBaseRef`).
     pub(super) fn diff_base_ref(&self) -> Option<&str> {
         self.right_panel.base_refs.get(self.target.as_ref()?).map(String::as_str)
@@ -171,7 +188,8 @@ impl Workspace {
 
     /// `vcs.listRefs` twice, local and remote, for the query (the head branch is left out).
     fn fetch_base_refs(&mut self, cx: &mut Context<Self>) {
-        let (Some(client), Some(cwd)) = (self.client(), self.git_cwd()) else { return };
+        let (Some(client), Some(source)) = (self.client(), self.base_refs_source()) else { return };
+        let cwd = source.1.clone();
         let query = self.right_panel.base_picker.query.clone();
         let input = |kind: &str| {
             let mut input = json!({"cwd": cwd, "includeMatchingRemoteRefs": true, "refKind": kind, "limit": 100});
@@ -197,7 +215,7 @@ impl Workspace {
             let (local, remote) = (parse(local), parse(remote));
             let _ = this.update(cx, |this, cx| {
                 let picker = &mut this.right_panel.base_picker;
-                (picker.local, picker.remote, picker.loading) = (local, remote, false);
+                (picker.source, picker.local, picker.remote, picker.loading) = (Some(source), local, remote, false);
                 cx.notify();
             });
         }));
@@ -279,8 +297,9 @@ impl Workspace {
     /// The rows the picker lists for `head`, Automatic (`None`) first while nothing is searched.
     fn base_ref_items(&self, head: &str) -> (bool, Vec<Choice>) {
         let picker = &self.right_panel.base_picker;
-        let local: Vec<Ref> = picker.local.iter().filter(|r| r.name != head).cloned().collect();
-        let shown = choices(&local, &picker.remote).into_iter().filter(|c| matches(c, &picker.query)).collect();
+        let (local, remote) = picker.refs(self.base_refs_source().as_ref());
+        let local: Vec<Ref> = local.iter().filter(|r| r.name != head).cloned().collect();
+        let shown = choices(&local, remote).into_iter().filter(|c| matches(c, &picker.query)).collect();
         (picker.query.is_empty(), shown)
     }
 
@@ -486,5 +505,20 @@ mod tests {
         assert_eq!(step_highlight(3, None, false), Some(2));
         assert_eq!(step_highlight(3, Some(0), false), None);
         assert_eq!(step_highlight(0, None, true), None);
+    }
+
+    #[test]
+    fn refs_show_only_for_the_checkout_they_came_from() {
+        let source = |env: &str, cwd: &str| (Some(SharedString::from(env.to_owned())), cwd.to_owned());
+        let picker = BasePicker {
+            source: Some(source("a", "/repo")),
+            local: vec![local("main")],
+            remote: vec![remote("origin/main", "origin")],
+            ..Default::default()
+        };
+        assert_eq!(picker.refs(Some(&source("a", "/repo"))).0, [local("main")]);
+        for other in [Some(source("b", "/repo")), Some(source("a", "/other")), None] {
+            assert_eq!(picker.refs(other.as_ref()), (&[][..], &[][..]));
+        }
     }
 }
