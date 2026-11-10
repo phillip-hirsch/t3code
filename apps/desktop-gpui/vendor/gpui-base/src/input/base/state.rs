@@ -5017,6 +5017,13 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         }
         if new_text.is_empty() {
             self.undo_manager.commit_transaction();
+            // An empty preedit cancels the composition and clears the mark, so a
+            // later `unmark_text` cannot report it: report the cancel here. The
+            // text is back to what it was, so no edit batch goes out; the next
+            // one still spans from the pre-composition text.
+            if !starts_composition && self.emit_events {
+                cx.emit(InputEvent::Change);
+            }
         }
         cx.notify();
     }
@@ -9353,6 +9360,16 @@ mod tests {
             });
         });
         assert_eq!(changes.get(), 3, "a commit followed by unmark is one change");
+
+        cx.update(|window, cx| {
+            input.update(cx, |s, cx| {
+                // Cancelled through an empty preedit; the unmark that follows adds nothing.
+                s.replace_and_mark_text_in_range(None, "z", Some(1..1), window, cx);
+                s.replace_and_mark_text_in_range(None, "", None, window, cx);
+                s.unmark_text(window, cx);
+            });
+        });
+        assert_eq!(changes.get(), 4, "an empty-preedit cancel is reported once");
     }
 
     #[gpui::test]

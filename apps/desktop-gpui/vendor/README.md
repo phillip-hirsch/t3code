@@ -251,7 +251,9 @@ composition is active, so the composer waits for the change that ends it. Marked
 `InputEvent::Change`, and 0.9.0's `unmark_text` (a cancelled composition, or one left as typed)
 emitted none either, so the wait outlasted the composition. The patch, in
 `src/input/base/state.rs`: `unmark_text` emits a change when it ends a composition still marked;
-after a commit, which already emitted one, it does not. Test there:
+after a commit, which already emitted one, it does not. An empty preedit (the other way a
+composition is cancelled) clears the mark itself, so `replace_and_mark_text_in_range` emits the
+change there, without an edit batch since the text is back to what it was. Test there:
 `test_composition_cancel_via_unmark_does_not_leak`.
 
 **Code block actions span the top row.** The web's code block header puts the language on the
