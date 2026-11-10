@@ -1267,11 +1267,10 @@ impl Workspace {
                     tab.zoom = zoom;
                     let _ = view.set_zoom(zoom);
                 }
-                let appearance = session.and_then(|s| s.color_scheme).unwrap_or(tab.defaults.1);
-                if tab.appearance != Some(appearance) {
-                    tab.appearance = Some(appearance);
-                    let _ = view.set_theme(wry_theme(appearance));
-                }
+            }
+            let appearance = session.and_then(|s| s.color_scheme).unwrap_or(tab.defaults.1);
+            if theme_change(&mut tab.appearance, scale.is_some(), appearance) {
+                let _ = view.set_theme(wry_theme(appearance));
             }
             if tab.shown != scale.is_some() {
                 tab.shown = scale.is_some();
@@ -1738,6 +1737,20 @@ impl Workspace {
     }
 }
 
+/// Whether a tab's view takes `appearance` now, given what it last `applied`. On Linux
+/// gpui-webview sets GTK's process-wide dark preference, which the tabs shown meanwhile change,
+/// so a hidden tab forgets what it applied.
+fn theme_change(applied: &mut Option<Appearance>, shown: bool, appearance: Appearance) -> bool {
+    if !shown {
+        #[cfg(target_os = "linux")]
+        {
+            *applied = None;
+        }
+        return false;
+    }
+    applied.replace(appearance) != Some(appearance)
+}
+
 /// The native view's colour scheme for a tab's.
 fn wry_theme(appearance: Appearance) -> wry::Theme {
     match appearance {
@@ -1874,6 +1887,19 @@ fn page_builder<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shown_tab_takes_its_colour_scheme_once() {
+        let mut applied = None;
+        assert!(!theme_change(&mut applied, false, Appearance::Dark), "a hidden tab waits");
+        assert!(theme_change(&mut applied, true, Appearance::Dark));
+        assert!(!theme_change(&mut applied, true, Appearance::Dark));
+        assert!(theme_change(&mut applied, true, Appearance::Light));
+        // Another tab shows meanwhile. On Linux it changed GTK's process-wide preference, so this
+        // tab applies its own again when it returns.
+        assert!(!theme_change(&mut applied, false, Appearance::Light));
+        assert_eq!(theme_change(&mut applied, true, Appearance::Light), cfg!(target_os = "linux"));
+    }
 
     #[test]
     fn a_page_is_rebuilt_where_it_is() {
