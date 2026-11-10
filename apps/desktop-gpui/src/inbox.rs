@@ -9,7 +9,7 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 
-use crate::model::{ProjectShell, ThreadShell};
+use crate::model::{ProjectShell, ScopedId, ThreadRef, ThreadShell};
 use crate::timestamp::parse_ms;
 
 fn ms(value: Option<&str>) -> Option<i64> {
@@ -141,20 +141,26 @@ pub enum ChildRequest {
     Input,
 }
 
-/// `pendingSubagentRequestsByThread` in `client-runtime/src/state/threadShell.ts`.
-pub fn child_requests(threads: &[ThreadShell]) -> HashMap<&str, ChildRequest> {
-    let mut requests: HashMap<&str, ChildRequest> = HashMap::new();
-    let by_id: HashMap<&str, &ThreadShell> = threads.iter().map(|t| (t.id.as_str(), t)).collect();
+/// What each thread's children ask, by the parent's environment and id.
+pub type ChildRequests<'a> = HashMap<ThreadRef<'a>, ChildRequest>;
+
+/// `pendingSubagentRequestsByThread` in `client-runtime/src/state/threadShell.ts`. A child's
+/// parent lives on the child's environment.
+pub fn child_requests(threads: &[ThreadShell]) -> ChildRequests<'_> {
+    let mut requests: ChildRequests = HashMap::new();
+    let by_ref: HashMap<ThreadRef, &ThreadShell> =
+        threads.iter().map(|t| ((t.environment_id.as_ref(), t.id.as_str()), t)).collect();
     for child in threads {
         let Some(kind) = child.pending_runtime_request.as_ref().map(|r| r.kind.as_str()) else { continue };
         let Some(parent_id) = child.lineage.parent_thread_id.as_deref() else { continue };
         if kind == "auth_refresh" {
             continue;
         }
+        let env: &str = &child.environment_id;
         if child.lineage.side_chat == Some(true) {
             let request = if kind == "user_input" { ChildRequest::Input } else { ChildRequest::Approval };
-            if requests.get(parent_id) != Some(&ChildRequest::Approval) {
-                requests.insert(parent_id, request);
+            if requests.get(&(env, parent_id)) != Some(&ChildRequest::Approval) {
+                requests.insert((env, parent_id), request);
             }
             continue;
         }
@@ -171,8 +177,8 @@ pub fn child_requests(threads: &[ThreadShell]) -> HashMap<&str, ChildRequest> {
         let mut next = Some(parent_id);
         while let Some(id) = next.filter(|id| !seen.contains(id)) {
             seen.push(id);
-            requests.insert(id, ChildRequest::Approval);
-            next = by_id.get(id).and_then(|parent| {
+            requests.insert((env, id), ChildRequest::Approval);
+            next = by_ref.get(&(env, id)).and_then(|parent| {
                 let chained = parent.lineage.relationship_to_parent.as_deref() == Some("subagent")
                     || parent.lineage.side_chat == Some(true);
                 chained.then_some(parent.lineage.parent_thread_id.as_deref()).flatten()
@@ -183,8 +189,8 @@ pub fn child_requests(threads: &[ThreadShell]) -> HashMap<&str, ChildRequest> {
 }
 
 /// `childThreadInputsAtom`: the subagents and side chats under `parent`, at any depth,
-/// that ask the user something (`subagentRequest`, `sideChatRequest`).
-pub fn child_thread_inputs<'a>(threads: &'a [ThreadShell], parent: &str) -> Vec<&'a ThreadShell> {
+/// on `env`, that ask the user something (`subagentRequest`, `sideChatRequest`).
+pub fn child_thread_inputs<'a>(threads: &'a [ThreadShell], env: &str, parent: &str) -> Vec<&'a ThreadShell> {
     let is_child = |t: &ThreadShell| {
         t.lineage.relationship_to_parent.as_deref() == Some("subagent") || t.lineage.side_chat == Some(true)
     };
@@ -198,7 +204,8 @@ pub fn child_thread_inputs<'a>(threads: &'a [ThreadShell], parent: &str) -> Vec<
     let mut pending = vec![parent];
     let mut inputs = Vec::new();
     while let Some(id) = pending.pop() {
-        for child in threads.iter().filter(|t| t.lineage.parent_thread_id.as_deref() == Some(id) && is_child(t)) {
+        let children = threads.iter().filter(|t| t.environment_id == env && is_child(t));
+        for child in children.filter(|t| t.lineage.parent_thread_id.as_deref() == Some(id)) {
             if seen.contains(&child.id.as_str()) {
                 continue;
             }
@@ -220,8 +227,8 @@ pub struct Facts<'a> {
 }
 
 impl<'a> Facts<'a> {
-    pub fn new(thread: &'a ThreadShell, requests: &HashMap<&str, ChildRequest>) -> Self {
-        Self { thread, child_request: requests.get(thread.id.as_str()).copied() }
+    pub fn new(thread: &'a ThreadShell, requests: &ChildRequests) -> Self {
+        Self { thread, child_request: requests.get(&(thread.environment_id.as_ref(), thread.id.as_str())).copied() }
     }
 
     /// `shellRuntime(...)?.status`; `None` before the thread ever ran.
@@ -672,9 +679,9 @@ const WORKING_EXIT_GRACE_MS: i64 = 2_000;
 /// to the inbox so the Active list sorts it by that time.
 #[derive(Default)]
 pub struct ReturnTracker {
-    /// Threads that read as working, keyed by id. Only these carry state.
-    working: HashMap<String, Hold>,
-    returns: HashMap<String, i64>,
+    /// Threads that read as working, keyed by environment and id. Only these carry state.
+    working: HashMap<ScopedId, Hold>,
+    returns: HashMap<ScopedId, i64>,
 }
 
 struct Hold {
@@ -693,27 +700,29 @@ fn placement(t: &ThreadShell) -> u64 {
 
 impl ReturnTracker {
     /// Updates the holds for the current shells at `now`.
-    pub fn observe(&mut self, threads: &[ThreadShell], requests: &HashMap<&str, ChildRequest>, now: i64) {
+    pub fn observe(&mut self, threads: &[ThreadShell], requests: &ChildRequests, now: i64) {
         let (mut working, mut returns) = (0, 0);
         for thread in threads {
-            self.observe_one(Facts::new(thread, requests), now);
-            working += usize::from(self.working.contains_key(thread.id.as_str()));
-            returns += usize::from(self.returns.contains_key(thread.id.as_str()));
+            let key = ScopedId::of_thread(thread);
+            self.observe_one(&key, Facts::new(thread, requests), now);
+            working += usize::from(self.working.contains_key(&key));
+            returns += usize::from(self.returns.contains_key(&key));
         }
         // Forget threads that left the shell.
         if working < self.working.len() || returns < self.returns.len() {
-            let present: HashSet<&str> = threads.iter().map(|t| t.id.as_str()).collect();
-            self.working.retain(|id, _| present.contains(id.as_str()));
-            self.returns.retain(|id, _| present.contains(id.as_str()));
+            let present: HashSet<ThreadRef> =
+                threads.iter().map(|t| (t.environment_id.as_ref(), t.id.as_str())).collect();
+            self.working.retain(|key, _| present.contains(&key.pair()));
+            self.returns.retain(|key, _| present.contains(&key.pair()));
         }
     }
 
-    fn observe_one(&mut self, facts: Facts, now: i64) {
+    fn observe_one(&mut self, key: &ScopedId, facts: Facts, now: i64) {
         let thread = facts.thread;
         let actual = facts.is_working();
-        let Some(hold) = self.working.get_mut(thread.id.as_str()) else {
+        let Some(hold) = self.working.get_mut(key) else {
             if actual {
-                self.working.insert(thread.id.clone(), Hold { deadline: None, placement: placement(thread) });
+                self.working.insert(key.clone(), Hold { deadline: None, placement: placement(thread) });
             }
             return;
         };
@@ -736,17 +745,17 @@ impl ReturnTracker {
         }
         // A grace that ran out returned the thread at its deadline, as the web's timer does.
         let returned = hold.deadline.filter(|d| *d <= now).unwrap_or(now);
-        self.working.remove(thread.id.as_str());
-        self.returns.insert(thread.id.clone(), returned);
+        self.working.remove(key);
+        self.returns.insert(key.clone(), returned);
     }
 
     /// Working, or held on the Working shelf, as of the last [`Self::observe`].
-    pub fn is_working(&self, thread_id: &str) -> bool {
-        self.working.contains_key(thread_id)
+    pub fn is_working(&self, (env, id): ThreadRef) -> bool {
+        self.working.contains_key(&ScopedId::new(env.to_owned(), id))
     }
 
-    pub fn returned_at(&self, thread_id: &str) -> Option<i64> {
-        self.returns.get(thread_id).copied()
+    pub fn returned_at(&self, (env, id): ThreadRef) -> Option<i64> {
+        self.returns.get(&ScopedId::new(env.to_owned(), id)).copied()
     }
 
     /// When the next hold expires; the caller observes again then.
@@ -787,7 +796,7 @@ pub fn partition<'a>(
             &mut sections.settled
         } else if thread.pinned_at.is_some() {
             &mut sections.pinned
-        } else if working_shelf && returns.is_working(&thread.id) {
+        } else if working_shelf && returns.is_working((&thread.environment_id, &thread.id)) {
             &mut sections.working
         } else {
             &mut sections.active
@@ -805,7 +814,7 @@ pub fn partition<'a>(
         sections.active.sort_by_cached_key(|f| (Reverse(f.send_timestamp()), id(f)));
     } else if working_shelf {
         sections.active.sort_by_cached_key(|f| {
-            let returned = returns.returned_at(id(f)).unwrap_or(0);
+            let returned = returns.returned_at((&f.thread.environment_id, id(f))).unwrap_or(0);
             (Reverse(f.return_timestamp().max(returned)), id(f))
         });
     } else {
@@ -1459,7 +1468,7 @@ mod tests {
             thread("child", value)
         };
         let parent = thread("parent", json!({"latestRunId": "r", "status": "running"}));
-        let flagged = |child: ThreadShell| child_requests(&[parent.clone(), child]).get("parent").copied();
+        let flagged = |child: ThreadShell| child_requests(&[parent.clone(), child]).get(&("", "parent")).copied();
         // Older servers omit the activity run, so the run status decides.
         assert_eq!(flagged(child(json!({"status": "running"}))), Some(ChildRequest::Approval));
         assert_eq!(flagged(child(json!({"status": "idle"}))), None);
@@ -1476,6 +1485,16 @@ mod tests {
         let sections = partition(&threads, now(), true, false, &mut ReturnTracker::default(), |_| true);
         assert_eq!(ids(&sections.active), ["parent"]);
         assert_eq!(sections.active[0].status(), Status::Approval);
+
+        // Another environment's thread with the parent's id is not the one asked.
+        let mut elsewhere = parent.clone();
+        elsewhere.environment_id = "remote".into();
+        let threads = vec![parent.clone(), elsewhere.clone(), child(json!({"status": "running"}))];
+        let requests = child_requests(&threads);
+        assert_eq!(Facts::new(&parent, &requests).child_request, Some(ChildRequest::Approval));
+        assert_eq!(Facts::new(&elsewhere, &requests).child_request, None);
+        assert_eq!(child_thread_inputs(&threads, "", "parent").len(), 1);
+        assert!(child_thread_inputs(&threads, "remote", "parent").is_empty());
     }
 
     fn running(id: &str, working: bool, extra: Value) -> ThreadShell {
@@ -1493,18 +1512,35 @@ mod tests {
     fn a_thread_that_stops_working_is_held_then_stamped_at_its_deadline() {
         let mut tracker = ReturnTracker::default();
         observe(&mut tracker, &[running("a", true, json!({})), running("b", false, json!({}))], 10_000);
-        assert_eq!(tracker.returned_at("a"), None, "never stamped on the first observation");
+        assert_eq!(tracker.returned_at(("", "a")), None, "never stamped on the first observation");
         observe(&mut tracker, &[running("a", false, json!({})), running("b", false, json!({}))], 10_000);
-        assert!(tracker.is_working("a") && !tracker.is_working("b"));
+        assert!(tracker.is_working(("", "a")) && !tracker.is_working(("", "b")));
         assert_eq!(tracker.next_deadline(), Some(12_000));
         observe(&mut tracker, &[running("a", false, json!({}))], 11_999);
-        assert!(tracker.is_working("a"));
+        assert!(tracker.is_working(("", "a")));
         // The clock wakes a little late; the return still reads as the deadline.
         observe(&mut tracker, &[running("a", false, json!({}))], 12_005);
-        assert!(!tracker.is_working("a"));
-        assert_eq!(tracker.returned_at("a"), Some(12_000));
-        assert_eq!(tracker.returned_at("b"), None);
+        assert!(!tracker.is_working(("", "a")));
+        assert_eq!(tracker.returned_at(("", "a")), Some(12_000));
+        assert_eq!(tracker.returned_at(("", "b")), None);
         assert_eq!(tracker.next_deadline(), None);
+    }
+
+    #[test]
+    fn a_hold_belongs_to_its_environments_thread() {
+        let mut tracker = ReturnTracker::default();
+        let on = |env: &str, working: bool| {
+            let mut thread = running("a", working, json!({}));
+            thread.environment_id = env.to_owned().into();
+            thread
+        };
+        observe(&mut tracker, &[on("local", true), on("remote", false)], 10_000);
+        assert!(tracker.is_working(("local", "a")));
+        assert!(!tracker.is_working(("remote", "a")), "the other environment's thread never worked");
+        observe(&mut tracker, &[on("local", false), on("remote", false)], 10_000);
+        observe(&mut tracker, &[on("local", false), on("remote", false)], 12_000);
+        assert_eq!(tracker.returned_at(("local", "a")), Some(12_000));
+        assert_eq!(tracker.returned_at(("remote", "a")), None);
     }
 
     #[test]
@@ -1515,10 +1551,10 @@ mod tests {
         observe(&mut tracker, std::slice::from_ref(&idle), 10_000);
         observe(&mut tracker, std::slice::from_ref(&busy), 11_500);
         observe(&mut tracker, &[busy], 12_500);
-        assert_eq!(tracker.returned_at("a"), None);
+        assert_eq!(tracker.returned_at(("", "a")), None);
         observe(&mut tracker, std::slice::from_ref(&idle), 12_500);
         observe(&mut tracker, &[idle], 14_500);
-        assert_eq!(tracker.returned_at("a"), Some(14_500));
+        assert_eq!(tracker.returned_at(("", "a")), Some(14_500));
     }
 
     #[test]
@@ -1539,8 +1575,8 @@ mod tests {
             observe(&mut tracker, &[running("a", true, json!({}))], 10_000);
             observe(&mut tracker, &[running("a", false, json!({}))], 10_000);
             observe(&mut tracker, &[running("a", false, change.clone())], 10_000);
-            assert!(!tracker.is_working("a"), "{change}");
-            assert_eq!(tracker.returned_at("a"), Some(10_000), "{change}");
+            assert!(!tracker.is_working(("", "a")), "{change}");
+            assert_eq!(tracker.returned_at(("", "a")), Some(10_000), "{change}");
             assert_eq!(tracker.next_deadline(), None, "{change}");
         }
     }
@@ -1554,7 +1590,7 @@ mod tests {
         observe(&mut tracker, &[a.clone(), running("b", true, json!({}))], 10_000);
         observe(&mut tracker, &[a.clone(), b.clone()], 10_500);
         observe(&mut tracker, &[a.clone(), b.clone()], 12_000);
-        assert_eq!((tracker.returned_at("a"), tracker.returned_at("b")), (Some(12_000), None));
+        assert_eq!((tracker.returned_at(("", "a")), tracker.returned_at(("", "b"))), (Some(12_000), None));
         let threads = [a, b];
         let sections = partition(&threads, 12_500, true, false, &mut tracker, |_| true);
         assert_eq!(ids(&sections.active), ["b", "a"]);
@@ -1563,7 +1599,7 @@ mod tests {
 
         observe(&mut tracker, &[running("c", true, json!({}))], 13_000);
         observe(&mut tracker, &[], 13_000);
-        assert_eq!((tracker.returned_at("a"), tracker.next_deadline()), (None, None));
+        assert_eq!((tracker.returned_at(("", "a")), tracker.next_deadline()), (None, None));
     }
 
     #[test]

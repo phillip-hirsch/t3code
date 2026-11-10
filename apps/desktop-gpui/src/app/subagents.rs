@@ -51,18 +51,19 @@ struct ChildApproval {
 impl Workspace {
     /// Reads the pending approvals of each child that asks for one; the shell only says that it does.
     pub(super) fn sync_child_approvals(&mut self, cx: &mut Context<Self>) {
-        let parent = match &self.target {
-            Some(Target::Thread { id, .. }) => id.clone(),
+        let (env, parent) = match &self.target {
+            Some(Target::Thread { env, id }) => (env.clone(), id.clone()),
             _ => {
                 self.subagents.approvals.clear();
                 return;
             }
         };
-        let children: Vec<(String, String, String)> = crate::inbox::child_thread_inputs(&self.shell.threads, &parent)
-            .into_iter()
-            .filter(|child| thread_now::has_pending_approval(child))
-            .map(|child| (child.id.clone(), child.title.clone(), format!("{}:{}", child.id, child.updated_at)))
-            .collect();
+        let children: Vec<(String, String, String)> =
+            crate::inbox::child_thread_inputs(&self.shell.threads, &env, &parent)
+                .into_iter()
+                .filter(|child| thread_now::has_pending_approval(child))
+                .map(|child| (child.id.clone(), child.title.clone(), format!("{}:{}", child.id, child.updated_at)))
+                .collect();
         let before = self.subagents.approvals.len();
         self.subagents.approvals.retain(|entry| children.iter().any(|(id, ..)| *id == entry.thread_id));
         let mut changed = before != self.subagents.approvals.len();

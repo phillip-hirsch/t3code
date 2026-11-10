@@ -80,7 +80,7 @@ impl Workspace {
         // The interrupt path also accepts a completed run while its provider still has background work.
         let tasks = if working { &[][..] } else { &shell.pending_background_tasks[..] };
         let stop = stop.filter(|stop| !stop.background || !tasks.is_empty());
-        let children = inbox::child_thread_inputs(&self.shell.threads, thread_id);
+        let children = inbox::child_thread_inputs(&self.shell.threads, &shell.environment_id, thread_id);
         let parent_awaiting = shell.pending_runtime_request.is_some() || !projection.pending_approvals().is_empty();
         let child_input = (!children.is_empty() && !parent_awaiting).then(|| NowLine::ChildInput {
             title: thread_now::child_inputs_title(&children).into(),

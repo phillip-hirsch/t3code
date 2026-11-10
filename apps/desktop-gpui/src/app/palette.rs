@@ -1738,7 +1738,7 @@ impl Workspace {
         &self,
         row: &Row,
         query: &str,
-        requests: &std::collections::HashMap<&str, inbox::ChildRequest>,
+        requests: &inbox::ChildRequests,
         tokens: &Tokens,
         cx: &mut Context<Self>,
     ) -> ThreadSlots {

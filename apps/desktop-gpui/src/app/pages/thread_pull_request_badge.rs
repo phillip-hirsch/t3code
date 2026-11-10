@@ -20,7 +20,7 @@ use super::super::Workspace;
 use super::super::right_panel::Surface;
 use super::super::sidebar::guest_foreground;
 use super::pull_requests::tone;
-use crate::inbox::{ChildRequest, Facts, Pill};
+use crate::inbox::{Facts, Pill};
 use crate::model::ThreadShell;
 use crate::pull_request_detail::Reference;
 use crate::pull_requests::{Entry, State};
@@ -477,7 +477,7 @@ impl Workspace {
     pub(in crate::app) fn render_thread_leading_status(
         &self,
         thread: &ThreadShell,
-        requests: &HashMap<&str, ChildRequest>,
+        requests: &crate::inbox::ChildRequests,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let t = *theme::tokens(cx);
