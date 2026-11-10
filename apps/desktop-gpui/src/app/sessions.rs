@@ -444,6 +444,8 @@ impl Workspace {
             self.retract_hidden_alerts(window, cx);
             self.notify_sidebar(cx);
         }
+        // A launch that waited on the paired computers decides now.
+        self.land(window, cx);
         cx.notify();
     }
 

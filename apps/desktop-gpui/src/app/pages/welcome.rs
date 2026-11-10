@@ -232,35 +232,34 @@ impl Workspace {
     }
 
     /// `FirstRunGate` at launch, once the primary workspace is known: a fresh install opens the
-    /// page when nothing else was asked for; a workspace already in use counts as set up.
+    /// page when nothing else was asked for; a workspace already in use counts as set up. `None`
+    /// while it cannot decide yet, else whether it opened the page.
     pub(in crate::app) fn check_first_run(
         &mut self,
         may_open: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> bool {
+    ) -> Option<bool> {
         if self.client_settings.read_failed {
-            return false;
+            return Some(false);
         }
         let saved = self.saved_environments.read(cx);
-        // Until the paired computers are read, nothing is decided either way.
-        if saved.loading() {
-            return false;
-        }
-        let linked = saved.environments().iter().any(|e| !saved.is_primary(&e.environment_id));
+        let linked =
+            (!saved.loading()).then(|| saved.environments().iter().any(|e| !saved.is_primary(&e.environment_id)));
         let completed = !self.client_settings.values.get("onboardingCompletedAt").is_null();
         match logic::first_run(completed, linked, self.shell.projects.len(), self.shell.threads.len()) {
+            logic::FirstRun::Pending => None,
             logic::FirstRun::App { persist } => {
                 if persist {
                     self.complete_onboarding();
                 }
-                false
+                Some(false)
             }
             logic::FirstRun::Welcome if may_open => {
                 self.open_welcome(window, cx);
-                true
+                Some(true)
             }
-            logic::FirstRun::Welcome => false,
+            logic::FirstRun::Welcome => Some(false),
         }
     }
 

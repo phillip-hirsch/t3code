@@ -822,10 +822,12 @@ impl Workspace {
         if self.landed || !self.primary_environment().is_some_and(|id| self.shell.has_snapshot(id)) {
             return;
         }
-        self.landed = true;
         // Setup opens by itself only where the index route would land, so a link still opens.
         let home = self.target.is_none() && self.page.is_none() && self.settings.is_none();
-        if self.check_first_run(home, window, cx) || self.target.is_some() {
+        // Undecided, it lands once the paired computers are read (`sync_saved_sessions`).
+        let Some(opened) = self.check_first_run(home, window, cx) else { return };
+        self.landed = true;
+        if opened || self.target.is_some() {
             return;
         }
         if let Some(project_id) =

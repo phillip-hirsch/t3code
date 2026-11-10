@@ -30,18 +30,20 @@ pub enum FirstRun {
         persist: bool,
     },
     Welcome,
+    /// Undecided until the paired computers are read; the web's gate stays `pending`.
+    Pending,
 }
 
 /// Setup shows only on a fresh install: never completed, no linked computers, and an empty
 /// workspace. This client's own server never creates a cwd bootstrap project, so any project or
-/// thread is the user's. A non-empty workspace counts as setup done.
-pub fn first_run(completed: bool, linked_environments: bool, projects: usize, threads: usize) -> FirstRun {
-    if completed {
-        FirstRun::App { persist: false }
-    } else if linked_environments || projects > 0 || threads > 0 {
-        FirstRun::App { persist: true }
-    } else {
-        FirstRun::Welcome
+/// thread is the user's. A non-empty workspace counts as setup done. `linked_environments` is
+/// `None` while the paired computers are still being read.
+pub fn first_run(completed: bool, linked_environments: Option<bool>, projects: usize, threads: usize) -> FirstRun {
+    match (completed, linked_environments) {
+        (true, _) => FirstRun::App { persist: false },
+        (false, None) => FirstRun::Pending,
+        (false, Some(linked)) if linked || projects > 0 || threads > 0 => FirstRun::App { persist: true },
+        (false, Some(_)) => FirstRun::Welcome,
     }
 }
 
@@ -681,11 +683,14 @@ mod tests {
 
     #[test]
     fn only_a_fresh_install_opens_setup() {
-        assert_eq!(first_run(false, false, 0, 0), FirstRun::Welcome);
-        assert_eq!(first_run(true, false, 0, 0), FirstRun::App { persist: false });
-        assert_eq!(first_run(false, false, 1, 0), FirstRun::App { persist: true });
-        assert_eq!(first_run(false, false, 0, 2), FirstRun::App { persist: true });
-        assert_eq!(first_run(false, true, 0, 0), FirstRun::App { persist: true }, "a linked computer is setup done");
+        assert_eq!(first_run(false, Some(false), 0, 0), FirstRun::Welcome);
+        assert_eq!(first_run(true, Some(false), 0, 0), FirstRun::App { persist: false });
+        assert_eq!(first_run(false, Some(false), 1, 0), FirstRun::App { persist: true });
+        assert_eq!(first_run(false, Some(false), 0, 2), FirstRun::App { persist: true });
+        let linked = first_run(false, Some(true), 0, 0);
+        assert_eq!(linked, FirstRun::App { persist: true }, "a linked computer is setup done");
+        assert_eq!(first_run(false, None, 0, 0), FirstRun::Pending, "it waits for the paired computers");
+        assert_eq!(first_run(true, None, 0, 0), FirstRun::App { persist: false }, "a finished setup does not");
     }
 
     #[test]
