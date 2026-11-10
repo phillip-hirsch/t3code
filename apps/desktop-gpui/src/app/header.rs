@@ -2,6 +2,7 @@
 //! doubles as the window's drag region (`ChatView.tsx` header + `ChatHeader.tsx`).
 
 use gpui_kit::component::input::Input;
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Sizable as _, StyledExt as _, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -90,6 +91,7 @@ impl Workspace {
                 .hover(|style| style.text_color(tokens.foreground))
                 .children(focus_ring(focus, window, tokens.ring))
                 .on_mouse_down(MouseButton::Right, Self::header_context_menu(cx))
+                .on_context_menu_key(Self::header_context_menu_key(cx))
         };
         let [project_focus, parent_focus, _] = &self.title.crumbs;
         let separator = || div().flex_none().text_color(tokens.muted_foreground).child("/");
@@ -187,6 +189,17 @@ impl Workspace {
         })
     }
 
+    /// The menu key or Shift+F10 on a focused crumb or the title: the same menu, below it, as
+    /// the browser's `contextmenu` event reaches `onContextMenu` from the keyboard.
+    fn header_context_menu_key(
+        cx: &mut Context<Self>,
+    ) -> impl Fn(gpui_kit::Point<gpui_kit::Pixels>, &mut Window, &mut gpui_kit::App) + 'static {
+        let view = cx.weak_entity();
+        move |position, window, cx| {
+            let _ = view.update(cx, |this, cx| this.context_click_header(position, window, cx));
+        }
+    }
+
     /// The server thread's title: a menu on click (after the double-click interval), rename on double-click.
     fn render_title_button(
         &self,
@@ -248,6 +261,7 @@ impl Workspace {
                 }
             }))
             .on_mouse_down(MouseButton::Right, Self::header_context_menu(cx))
+            .on_context_menu_key(Self::header_context_menu_key(cx))
             // Mouse-down, like the panel toggles: the drag region swallows the release.
             .on_mouse_down(
                 MouseButton::Left,
