@@ -184,6 +184,34 @@ fn regex_classes_boundaries_and_case_follow_javascript() {
 }
 
 #[test]
+fn regex_character_classes_follow_javascript() {
+    let patch = "diff --git a/c.txt b/c.txt\n--- a/c.txt\n+++ b/c.txt\n@@ -0,0 +1 @@\n+[a]&~-b\n";
+    let files = DiffFile::parse(patch).unwrap();
+    let find = |query: &str| {
+        collect_matches(
+            &files,
+            query,
+            SearchOptions {
+                regex: true,
+                ..SearchOptions::default()
+            },
+        )
+        .into_iter()
+        .map(|found| found.range)
+        .collect::<Vec<_>>()
+    };
+    // Classes do not nest: `[` is a literal inside one, and `]` ends it.
+    assert_eq!(find("[[]"), [0..1]);
+    assert_eq!(find("[[a]]"), [1..3]);
+    assert_eq!(find("[^]+"), [0..7], "`[^]` is any character");
+    assert!(find("[]").is_empty(), "`[]` is no character");
+    // `&&` and `~~` are no set operations.
+    assert_eq!(find("[a&&b]"), [1..2, 3..4, 6..7]);
+    assert_eq!(find("[a~~b]"), [1..2, 4..5, 6..7]);
+    assert_eq!(find(r"[\w-]+"), [1..2, 5..7]);
+}
+
+#[test]
 fn steps_wrap_at_both_ends() {
     assert_eq!(step(None, 3, true), Some(0));
     assert_eq!(step(None, 3, false), Some(2));

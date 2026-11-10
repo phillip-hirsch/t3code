@@ -35,11 +35,14 @@ pub(crate) fn unfold(text: &str) -> Cow<'_, str> {
     }
 }
 
+/// JavaScript's `[^]` and `[]`: any character, newlines included, and none.
+const ANY: &str = r"[\x{0}-\x{10FFFF}]";
+const NOTHING: &str = r"[^\x{0}-\x{10FFFF}]";
+
 /// `pattern` (JavaScript syntax) written for `fancy_regex` with JavaScript's `\w \W \d \D \s \S \b
-/// \B`. Classes nest as `fancy_regex` reads them, so the escapes are found where it finds them.
+/// \B` and character classes.
 pub(crate) fn translate(pattern: &str) -> String {
     let mut out = String::with_capacity(pattern.len());
-    let mut depth = 0_usize;
     let mut chars = pattern.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
@@ -48,38 +51,92 @@ pub(crate) fn translate(pattern: &str) -> String {
                     out.push('\\');
                     break;
                 };
-                match (escaped, depth) {
-                    ('w', _) => out.push_str(WORD),
-                    ('W', _) => out.push_str(NOT_WORD),
-                    ('d', _) => out.push_str(DIGIT),
-                    ('D', _) => out.push_str(NOT_DIGIT),
-                    ('s', _) => out.push_str(SPACE),
-                    ('S', _) => out.push_str(NOT_SPACE),
-                    ('b', 0) => out.push_str(BOUNDARY),
-                    ('B', 0) => out.push_str(NOT_BOUNDARY),
-                    (escaped, _) => {
-                        out.push('\\');
-                        out.push(unfold_char(escaped));
-                    }
+                match escaped {
+                    'b' => out.push_str(BOUNDARY),
+                    'B' => out.push_str(NOT_BOUNDARY),
+                    escaped => out.push_str(ClassAtom::escape(escaped).pattern()),
                 }
             }
-            '[' => {
-                depth += 1;
-                out.push('[');
-                // `[^` and a `]` right after the opening are part of the class.
-                if let Some(negated) = chars.next_if_eq(&'^') {
-                    out.push(negated);
-                }
-                if let Some(bracket) = chars.next_if_eq(&']') {
-                    out.push(bracket);
-                }
-            }
-            ']' if depth > 0 => {
-                depth -= 1;
-                out.push(']');
-            }
+            '[' => translate_class(&mut chars, &mut out),
             c => out.push(unfold_char(c)),
         }
     }
     out
+}
+
+/// One item of a JavaScript class, written for `fancy_regex`.
+enum ClassAtom {
+    /// A character, or a piece of an escape such as `\x41` that `fancy_regex` reads as JavaScript does.
+    Char(String),
+    /// `\w`, `\d`, `\s` and their negations.
+    Set(&'static str),
+    /// An unescaped `-`: a range's, or a literal one.
+    Dash,
+}
+
+impl ClassAtom {
+    fn escape(escaped: char) -> Self {
+        match escaped {
+            'w' => Self::Set(WORD),
+            'W' => Self::Set(NOT_WORD),
+            'd' => Self::Set(DIGIT),
+            'D' => Self::Set(NOT_DIGIT),
+            's' => Self::Set(SPACE),
+            'S' => Self::Set(NOT_SPACE),
+            escaped => Self::Char(format!("\\{}", unfold_char(escaped))),
+        }
+    }
+
+    fn pattern(&self) -> &str {
+        match self {
+            Self::Char(text) => text,
+            Self::Set(set) => set,
+            Self::Dash => r"\-",
+        }
+    }
+}
+
+/// A class after its `[`. JavaScript's classes neither nest nor have set operations, so `[`, `&`,
+/// `~` and a `-` outside a range, which `fancy_regex` reads as syntax there, are escaped.
+fn translate_class(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, out: &mut String) {
+    let negated = chars.next_if_eq(&'^').is_some();
+    if chars.next_if_eq(&']').is_some() {
+        out.push_str(if negated { ANY } else { NOTHING });
+        return;
+    }
+    let mut atoms = Vec::new();
+    let mut closed = false;
+    while let Some(c) = chars.next() {
+        atoms.push(match c {
+            ']' => {
+                closed = true;
+                break;
+            }
+            '\\' => chars.next().map_or_else(|| ClassAtom::Char("\\".to_owned()), ClassAtom::escape),
+            '-' => ClassAtom::Dash,
+            '[' | '&' | '~' => ClassAtom::Char(format!("\\{c}")),
+            c => ClassAtom::Char(unfold_char(c).to_string()),
+        });
+    }
+    out.push('[');
+    if negated {
+        out.push('^');
+    }
+    let mut ix = 0;
+    while ix < atoms.len() {
+        out.push_str(atoms[ix].pattern());
+        if let (Some(ClassAtom::Dash), Some(high)) = (atoms.get(ix + 1), atoms.get(ix + 2)) {
+            // A `\w`-like escape on either side makes the `-` a literal (Annex B).
+            let range = !matches!(atoms[ix], ClassAtom::Set(_)) && !matches!(high, ClassAtom::Set(_));
+            out.push_str(if range { "-" } else { r"\-" });
+            out.push_str(high.pattern());
+            ix += 3;
+        } else {
+            ix += 1;
+        }
+    }
+    // An unterminated class stays so, and `fancy_regex` rejects it as JavaScript does.
+    if closed {
+        out.push(']');
+    }
 }
