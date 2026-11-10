@@ -606,6 +606,17 @@ menu is unchanged. Files:
 
 - `src/menu/popup_menu.rs`: the `item_text` field and builder, read in `render_item` and `render`.
 
+**A menu row can hold a second item.** The web's diff Commits menu puts each commit's SHA link,
+its own `DropdownMenuItem`, on the commit's row, so the arrow keys reach it after the commit.
+0.9.0 draws one item per row. The patch adds `PopupMenuItem::inline` for element items: an inline
+item draws at the end of the previous item's row and stays its own stop for the arrow keys, and
+the row highlights as one while either item is hovered or selected. Files:
+
+- `src/menu/popup_menu.rs`: the `inline` field and builder, `render_rows` (which `render` uses in
+  place of one `render_item` per item), `row_of` for scrolling the selection into view, and
+  `render_item`'s `in_row`.
+- `src/menu/menu_item.rs`: `MenuItemElement::in_row`, which leaves the highlight to the row.
+
 **Inputs grow below the web's `sm` breakpoint.** The web's `Input` and `Textarea` are 0.25rem taller
 with 1rem text in a window narrower than 640px (`h-9 sm:h-8`, `text-base sm:text-sm`). 0.9.0 sizes
 an input the same at every width. Files:

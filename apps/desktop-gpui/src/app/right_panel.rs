@@ -2634,7 +2634,7 @@ impl Workspace {
             DiffScope::Commit(sha) => {
                 let url = identity.as_ref().and_then(|identity| commit_link::commit_url(identity, sha));
                 let focus = Some(self.right_panel.commit_link_focus.clone());
-                Some(commit_sha_link("diff-commit-sha", sha, url, &view, None, focus, tokens))
+                Some(commit_sha_link("diff-commit-sha", sha, url, &view, focus, tokens))
             }
             _ => None,
         };
@@ -2703,7 +2703,7 @@ impl Workspace {
                 let (commits, scope, commit_view) = (commits.clone(), menu_scope.clone(), view.clone());
                 let identity = menu_identity.clone();
                 let source = commits_source.clone();
-                menu.submenu("Commits", window, cx, move |mut menu, window, cx| {
+                menu.submenu("Commits", window, cx, move |mut menu, window, _| {
                     let list = match &commits {
                         None => return menu.item(PopupMenuItem::new("Loading commits...").disabled(true)),
                         Some(Err(error)) => return menu.item(PopupMenuItem::new(error.clone()).disabled(true)),
@@ -2713,7 +2713,6 @@ impl Workspace {
                         Some(Ok(list)) => list,
                     };
                     let now = crate::timestamp::now_ms();
-                    let popup = cx.entity().downgrade();
                     for commit in &list.commits {
                         let value = DiffScope::Commit(commit.sha.clone());
                         let source = source.clone();
@@ -2726,14 +2725,7 @@ impl Workspace {
                             .map(|at| crate::timestamp::relative_label(now - at))
                             .unwrap_or_default()
                             .into();
-                        let row = CommitRow {
-                            subject: commit.subject.clone().into(),
-                            time,
-                            sha: commit.sha.clone(),
-                            url,
-                            view: commit_view.clone(),
-                            menu: popup.clone(),
-                        };
+                        let row = CommitRow { subject: commit.subject.clone().into(), time, sha: commit.sha.clone() };
                         menu =
                             menu.item(PopupMenuItem::element(move |_, cx| row.render(cx)).checked(checked).on_click(
                                 window.listener_for(&commit_view, move |this, _, _, cx| {
@@ -2743,6 +2735,31 @@ impl Workspace {
                                     }
                                 }),
                             ));
+                        // Its own arrow-key stop after the commit; it opens without picking the commit.
+                        let sha = commit.sha.clone();
+                        let link = match url {
+                            Some(url) => {
+                                let tip = SharedString::from(url.clone());
+                                PopupMenuItem::element(move |_, cx| {
+                                    let id = ElementId::Name(format!("diff-commit-link:{sha}").into());
+                                    let tip = tip.clone();
+                                    commit_sha(id, &sha, true, theme::tokens(cx))
+                                        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                                })
+                                .on_click(window.listener_for(
+                                    &commit_view,
+                                    move |this, event, window, cx| {
+                                        this.open_link(&url, event, window, cx);
+                                    },
+                                ))
+                            }
+                            None => PopupMenuItem::element(move |_, cx| {
+                                let id = ElementId::Name(format!("diff-commit-sha:{sha}").into());
+                                commit_sha(id, &sha, false, theme::tokens(cx))
+                            })
+                            .disabled(true),
+                        };
+                        menu = menu.item(link.inline());
                     }
                     if list.truncated {
                         let label = format!("Showing latest {} commits", list.commits.len());
@@ -3474,24 +3491,19 @@ fn wait_for_measure(width: Pixels, waited: &std::cell::Cell<bool>) -> bool {
 
 /// A 28px ghost icon toggle (`Toggle variant="ghost" size="sm"` / `Button size="icon-sm"`).
 /// A commit's short SHA (`font-mono text-xs text-muted-foreground`), underlined as a link to
-/// its host's page when it has one; the link opens without picking the commit, and closes
-/// `menu` when it sits in one. With `focus`, it is a Tab stop that Enter opens.
+/// its host's page when it has one. With `focus`, it is a Tab stop that Enter opens.
 fn commit_sha_link(
     id: impl Into<ElementId>,
     sha: &str,
     url: Option<String>,
     view: &Entity<Workspace>,
-    menu: Option<gpui_kit::WeakEntity<PopupMenu>>,
     focus: Option<FocusHandle>,
     tokens: &Tokens,
 ) -> AnyElement {
-    let short: SharedString = sha.chars().take(7).collect::<String>().into();
-    let base =
-        div().id(id.into()).flex_none().font_family(tokens.fonts.mono).text_xs().text_color(tokens.muted_foreground);
-    let Some(url) = url else { return base.child(short).into_any_element() };
+    let base = commit_sha(id, sha, url.is_some(), tokens);
+    let Some(url) = url else { return base.into_any_element() };
     let (view, tip, ring) = (view.clone(), SharedString::from(url.clone()), tokens.ring);
-    base.underline()
-        .cursor_pointer()
+    base.cursor_pointer()
         .when_some(focus, |el, focus| {
             // The ring sits outside the text without moving it.
             el.track_focus(&focus)
@@ -3501,57 +3513,48 @@ fn commit_sha_link(
                 .border_color(gpui_kit::transparent_black())
                 .focus_visible(move |s| s.border_color(ring))
         })
-        .child(short)
         .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
         .on_click(move |event, window, cx| {
             cx.stop_propagation();
             view.update(cx, |this, cx| this.open_link(&url, event, window, cx));
-            if let Some(menu) = menu.as_ref().and_then(gpui_kit::WeakEntity::upgrade) {
-                cx.defer(move |cx| menu.update(cx, |_, cx| cx.emit(DismissEvent)));
-            }
         })
         .into_any_element()
 }
 
-/// A Commits menu row: the subject (with its tooltip), how long ago, and the SHA link.
+/// The short SHA's text, underlined when it links to the host's page.
+fn commit_sha(id: impl Into<ElementId>, sha: &str, linked: bool, tokens: &Tokens) -> gpui_kit::Stateful<gpui_kit::Div> {
+    let short: SharedString = sha.chars().take(7).collect::<String>().into();
+    div()
+        .id(id.into())
+        .flex_none()
+        .font_family(tokens.fonts.mono)
+        .text_xs()
+        .text_color(tokens.muted_foreground)
+        .when(linked, gpui_kit::Styled::underline)
+        .child(short)
+}
+
+/// A Commits menu row: the subject (with its tooltip) and how long ago. Its SHA follows on the
+/// same row as a menu item of its own, like the web's link `DropdownMenuItem`.
 #[derive(Clone)]
 struct CommitRow {
     subject: SharedString,
     time: SharedString,
     sha: String,
-    url: Option<String>,
-    view: Entity<Workspace>,
-    menu: gpui_kit::WeakEntity<PopupMenu>,
 }
 
 impl CommitRow {
     fn render(&self, cx: &App) -> AnyElement {
         let tokens = theme::tokens(cx);
         let subject = self.subject.clone();
-        let link = commit_sha_link(
-            ElementId::Name(format!("diff-commit-link:{}", self.sha).into()),
-            &self.sha,
-            self.url.clone(),
-            &self.view,
-            Some(self.menu.clone()),
-            None,
-            tokens,
-        );
         h_flex()
+            .id(ElementId::Name(format!("diff-commit-row:{}", self.sha).into()))
             .w_full()
             .min_w_0()
             .gap_3()
-            .child(
-                h_flex()
-                    .id(ElementId::Name(format!("diff-commit-row:{}", self.sha).into()))
-                    .flex_1()
-                    .min_w_0()
-                    .gap_3()
-                    .child(div().flex_1().min_w_0().truncate().child(self.subject.clone()))
-                    .child(div().flex_none().text_xs().text_color(tokens.muted_foreground).child(self.time.clone()))
-                    .tooltip(move |window, cx| Tooltip::new(subject.clone()).build(window, cx)),
-            )
-            .child(div().flex_none().px_2().child(link))
+            .child(div().flex_1().min_w_0().truncate().child(self.subject.clone()))
+            .child(div().flex_none().text_xs().text_color(tokens.muted_foreground).child(self.time.clone()))
+            .tooltip(move |window, cx| Tooltip::new(subject.clone()).build(window, cx))
             .into_any_element()
     }
 }
