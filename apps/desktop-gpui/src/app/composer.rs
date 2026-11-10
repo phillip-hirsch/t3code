@@ -1014,19 +1014,22 @@ impl Workspace {
         if responding || !self.pane_can_operate(pane) {
             return;
         }
+        let shown = self.pane_thread(pane);
         let Some(draft) = self.question_mut(pane) else { return };
         let question = &draft.questions[draft.index];
         let next = requests::toggle(question, draft.drafts.get(&question.id), &value);
         let advance = !question.multi_select;
         draft.drafts.insert(question.id.clone(), next);
-        let at = (draft.request_id.clone(), draft.index);
+        // Request ids repeat across environments, so the pane's thread is part of where it was.
+        let at = (shown, draft.request_id.clone(), draft.index);
         self.set_pane_text(pane, String::new(), window, cx);
         cx.notify();
         if advance {
             cx.spawn_in(window, async move |this, cx| {
                 cx.background_executor().timer(AUTO_ADVANCE).await;
                 let _ = this.update_in(cx, |this, window, cx| {
-                    if this.question(pane).is_some_and(|q| (q.request_id.clone(), q.index) == at) {
+                    let now = this.question(pane).map(|q| (this.pane_thread(pane), q.request_id.clone(), q.index));
+                    if now.as_ref() == Some(&at) {
                         this.advance_question(pane, window, cx);
                     }
                 });
