@@ -1749,21 +1749,24 @@ impl Workspace {
             },
         );
 
-        let stored_text: Option<ModelSelection> =
-            serde::Deserialize::deserialize(view.value("textGenerationModelSelection")).ok();
-        let writer: Option<ModelSelection> =
-            serde::Deserialize::deserialize(view.value("sourceControlWriterModelSelection")).ok();
+        // The models resolve on the settings environment's target, against that environment's
+        // providers and settings.
+        let environment = self.settings_environment();
+        let target = settings_target(&view.targets, environment.as_deref());
+        let project_id = target.and_then(|target| target.project_id.as_deref());
+        let selection = |key: &str| -> Option<ModelSelection> {
+            let value = target.map_or_else(|| view.value(key), |target| target.settings.get(key));
+            serde::Deserialize::deserialize(value).ok()
+        };
+        let stored_text = selection("textGenerationModelSelection");
+        let writer = selection("sourceControlWriterModelSelection");
         // Text generators may write source control text, but never review guides.
-        let generators = self.text_generation_targets(
-            self.settings_environment().as_ref(),
-            &[writer.as_ref(), stored_text.as_ref()],
-            cx,
-        );
+        let generators =
+            self.text_generation_targets(environment.as_ref(), &[writer.as_ref(), stored_text.as_ref()], cx);
         self.refresh_picker_extra("writer-model", &generators);
         let generator_config = |id: &str| self.settings_info().settings.get("textGenerators").get(id).cloned();
         let providers = &self.settings_info().providers;
         let configured = self.settings_info().settings.get("textGenerators");
-        let project_id = view.targets.first().and_then(|target| target.project_id.as_deref());
         let writer_providers = project_writers(
             writing_providers(providers, configured, &generators),
             &self.settings_info().settings,
@@ -1778,8 +1781,7 @@ impl Workspace {
         let can_dedicate = default_selection.as_ref().is_some_and(|s| runs(&writer_providers, s));
         let guides = view.bool("reviewGuidesEnabled");
         let guide_control = (guides && connected).then(|| {
-            let guide: Option<ModelSelection> =
-                serde::Deserialize::deserialize(view.value("reviewGuideModelSelection")).ok();
+            let guide = selection("reviewGuideModelSelection");
             let mixed = view.mixed(&["reviewGuideModelSelection"]);
             let guide_selection = review_guide_selection(
                 &self.settings_info().settings,
@@ -2184,6 +2186,11 @@ fn review_guide_selection(
     resolve_text_generation(guide.or(writer).or(text), &agents)
 }
 
+/// `useSettingsScope().target`: the target on the settings environment, else the first.
+fn settings_target<'t>(targets: &'t [scope::Target], environment: Option<&str>) -> Option<&'t scope::Target> {
+    targets.iter().find(|t| Some(t.environment_id.as_str()) == environment).or(targets.first())
+}
+
 /// `styleFieldMixed`: the selected targets differ in one writing-style field.
 fn style_field_mixed(targets: &[crate::settings::scope::Target], field: &str) -> bool {
     let value =
@@ -2249,6 +2256,21 @@ mod tests {
         };
         assert_eq!(writers(None), ["codex", "claudeAgent", "gen"]);
         assert_eq!(writers(Some("p")), ["claudeAgent", "gen"]);
+
+        // A grouped scope lists the remote checkout first; the settings environment's own is used.
+        let target = |environment: &str, project: &str| scope::Target {
+            environment_id: environment.into(),
+            project_id: Some(project.into()),
+            settings: settings.clone(),
+            sources: Default::default(),
+        };
+        let targets = [target("remote", "r"), target("primary", "p")];
+        let project = |environment| settings_target(&targets, environment).and_then(|t| t.project_id.as_deref());
+        assert_eq!(project(Some("primary")), Some("p"));
+        assert_eq!(guide(project(Some("primary")), [None, Some(&generator), None]).as_deref(), Some("claudeAgent"));
+        assert_eq!(writers(project(Some("primary"))), ["claudeAgent", "gen"]);
+        assert_eq!(project(Some("elsewhere")), Some("r"), "else the first target");
+        assert_eq!(project(None), Some("r"));
     }
 
     #[test]
