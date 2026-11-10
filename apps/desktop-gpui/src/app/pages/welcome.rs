@@ -139,6 +139,20 @@ impl WelcomeState {
             }
         }));
     }
+
+    /// Opens `instance`'s Codex setup card, or closes it; a choice made on another card lapses,
+    /// as the web's card, keyed by instance, drops its own.
+    fn show_codex_setup(&mut self, instance: Option<String>) {
+        if self.codex_setup != instance {
+            self.codex_choice += 1;
+        }
+        self.codex_setup = instance;
+    }
+
+    /// Whether choice `choice` on `instance_id`'s card is still the latest and no other card shows.
+    fn codex_choice_stands(&self, choice: u64, instance_id: &str) -> bool {
+        self.codex_choice == choice && self.codex_setup.as_deref().is_none_or(|open| open == instance_id)
+    }
 }
 
 /// The project list as the page reads it now.
@@ -525,8 +539,9 @@ impl Workspace {
             instance,
             "Could not save Codex setup".into(),
             move |this, saved, _, cx| {
-                let current =
-                    this.page == Some(Page::Welcome) && this.settings.is_none() && this.welcome.codex_choice == choice;
+                let current = this.page == Some(Page::Welcome)
+                    && this.settings.is_none()
+                    && this.welcome.codex_choice_stands(choice, &id);
                 if !saved {
                     this.welcome.cli_terminal_for = None;
                 } else if managed && current {
@@ -1249,7 +1264,7 @@ impl Workspace {
                 .accessibility_label(format!("Set up: {name}"))
                 .toggled(open)
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.welcome.codex_setup = if open { None } else { Some(id.clone()) };
+                    this.welcome.show_codex_setup((!open).then(|| id.clone()));
                     cx.notify();
                 }))
                 .into_any_element();
@@ -1885,4 +1900,32 @@ fn agent_row(provider: &Value, state: AgentState, action: AnyElement, compact: b
         )
         .child(div().flex_none().child(status))
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_codex_choice_lapses_once_another_card_opens_or_the_card_closes() {
+        let mut welcome = WelcomeState::default();
+        welcome.show_codex_setup(Some("a".to_owned()));
+        welcome.codex_choice += 1;
+        let choice = welcome.codex_choice;
+        assert!(welcome.codex_choice_stands(choice, "a"));
+        welcome.show_codex_setup(Some("a".to_owned()));
+        assert!(welcome.codex_choice_stands(choice, "a"), "the same card again keeps the choice");
+        welcome.show_codex_setup(Some("b".to_owned()));
+        assert!(!welcome.codex_choice_stands(choice, "a"));
+
+        welcome.codex_choice += 1;
+        let choice = welcome.codex_choice;
+        assert!(!welcome.codex_choice_stands(choice, "a"), "another instance's card is open");
+        // The status the save brings can close the card; its own choice still lands.
+        welcome.codex_setup = None;
+        assert!(welcome.codex_choice_stands(choice, "b"));
+        welcome.show_codex_setup(Some("b".to_owned()));
+        welcome.show_codex_setup(None);
+        assert!(!welcome.codex_choice_stands(choice, "b"), "the user closed it");
+    }
 }
