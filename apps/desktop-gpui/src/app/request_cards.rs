@@ -39,16 +39,49 @@ const ACCESS: [(&str, &str); 5] = [
 
 #[derive(Default)]
 pub(super) struct RequestUi {
-    secrets: HashMap<SharedString, (Entity<InputState>, Subscription)>,
+    secrets: HashMap<RequestKey, (Entity<InputState>, Subscription)>,
     /// The secret provider each card reads its answer from; absent, the typed value is saved.
-    sources: HashMap<SharedString, SharedString>,
-    references: HashMap<SharedString, (Entity<InputState>, Subscription)>,
-    busy: HashSet<SharedString>,
-    errors: HashMap<SharedString, SharedString>,
+    sources: HashMap<RequestKey, SharedString>,
+    references: HashMap<RequestKey, (Entity<InputState>, Subscription)>,
+    busy: HashSet<RequestKey>,
+    errors: HashMap<RequestKey, SharedString>,
     /// The timeline card whose input has focus, and that input's focus.
-    focused: Option<(SharedString, FocusHandle)>,
+    focused: Option<(RequestKey, FocusHandle)>,
     /// A focused input whose card went away; focus it held returns to the composer.
     lost: Option<FocusHandle>,
+}
+
+impl RequestUi {
+    /// Drops what cards no longer shown typed or failed with, so it never reaches another card.
+    fn retain_shown(&mut self, shown: impl Fn(&RequestKey) -> bool) {
+        self.secrets.retain(|key, _| shown(key));
+        self.references.retain(|key, _| shown(key));
+        self.sources.retain(|key, _| shown(key));
+        self.errors.retain(|key, _| shown(key));
+        if self.focused.as_ref().is_some_and(|(key, _)| !shown(key)) {
+            self.lost = self.focused.take().map(|(_, focus)| focus);
+        }
+    }
+}
+
+/// One card on one environment: thread and item ids can repeat across environments.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct RequestKey {
+    env: SharedString,
+    thread: SharedString,
+    item: SharedString,
+}
+
+impl RequestKey {
+    fn new(env: SharedString, card: &RequestCard) -> Self {
+        Self { env, thread: card.thread_id.clone(), item: card.item_id.clone() }
+    }
+
+    fn shown_in(&self, rows: &[timeline::Row]) -> bool {
+        rows.iter().any(
+            |row| matches!(row, timeline::Row::Request(card) if card.item_id == self.item && card.thread_id == self.thread),
+        )
+    }
 }
 
 /// A configured secret provider a pending card can read its answer from (`SecretRequestSource`).
@@ -293,21 +326,17 @@ impl Workspace {
     /// Drops typed secrets and errors of requests no longer shown: answered elsewhere,
     /// declined or deleted, the typed value must not outlive its card.
     pub(super) fn prune_requests(&mut self) {
-        let side = self.side_chat.view.as_ref().map(|view| view.rows.clone());
-        let shown = |id: &SharedString| {
-            self.rows
-                .iter()
-                .chain(side.iter().flat_map(|rows| rows.iter()))
-                .any(|row| matches!(row, crate::timeline::Row::Request(card) if card.item_id == *id))
-        };
-        let ui = &mut self.requests;
-        ui.secrets.retain(|id, _| shown(id));
-        ui.references.retain(|id, _| shown(id));
-        ui.sources.retain(|id, _| shown(id));
-        ui.errors.retain(|id, _| shown(id));
-        if ui.focused.as_ref().is_some_and(|(id, _)| !shown(id)) {
-            ui.lost = ui.focused.take().map(|(_, focus)| focus);
-        }
+        let mut requests = std::mem::take(&mut self.requests);
+        requests.retain_shown(|key| self.request_shown(key));
+        self.requests = requests;
+    }
+
+    /// Whether either pane shows `key`'s card on its environment.
+    fn request_shown(&self, key: &RequestKey) -> bool {
+        self.in_timeline(key)
+            || self.side_chat.view.as_ref().is_some_and(|view| {
+                self.pane_thread(ChatPane::Side).is_some_and(|(env, _)| env == key.env) && key.shown_in(&view.rows)
+            })
     }
 
     /// `workspaceFocus` recovery: focus that dropped with an answered or ended timeline card,
@@ -319,24 +348,30 @@ impl Workspace {
     }
 
     /// Tracks which timeline card's input has focus; a side-chat card keeps its own.
-    fn request_input_focus(&mut self, card: &RequestCard, input: &Entity<InputState>, event: &InputEvent, cx: &App) {
+    fn request_input_focus(&mut self, key: &RequestKey, input: &Entity<InputState>, event: &InputEvent, cx: &App) {
         match event {
-            InputEvent::Focus if self.in_timeline(card) => {
-                self.requests.focused = Some((card.item_id.clone(), input.read(cx).focus_handle(cx)));
+            InputEvent::Focus if self.in_timeline(key) => {
+                self.requests.focused = Some((key.clone(), input.read(cx).focus_handle(cx)));
             }
-            InputEvent::Blur if self.requests.focused.as_ref().is_some_and(|(id, _)| *id == card.item_id) => {
+            InputEvent::Blur if self.requests.focused.as_ref().is_some_and(|(focused, _)| focused == key) => {
                 self.requests.focused = None;
             }
             _ => {}
         }
     }
 
-    fn in_timeline(&self, card: &RequestCard) -> bool {
-        self.rows.iter().any(|row| matches!(row, timeline::Row::Request(shown) if shown.item_id == card.item_id))
+    fn in_timeline(&self, key: &RequestKey) -> bool {
+        self.pane_thread(ChatPane::Main).is_some_and(|(env, _)| env == key.env) && key.shown_in(&self.rows)
     }
 
-    fn secret_input(&mut self, card: &RequestCard, window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
-        if let Some((input, _)) = self.requests.secrets.get(&card.item_id) {
+    fn secret_input(
+        &mut self,
+        card: &RequestCard,
+        key: &RequestKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<InputState> {
+        if let Some((input, _)) = self.requests.secrets.get(key) {
             return input.clone();
         }
         let placeholder = match &card.kind {
@@ -344,99 +379,101 @@ impl Workspace {
             _ => "Paste the secret".into(),
         };
         let input = cx.new(|cx| InputState::new(window, cx).masked(true).placeholder(placeholder));
-        let id = card.item_id.clone();
-        let card = card.clone();
-        let subscription =
-            cx.subscribe_in(&input, window, move |this, input, event: &InputEvent, window, cx| match event {
-                InputEvent::PressEnter { .. } => this.answer_secret(&card, true, window, cx),
+        let subscription = cx.subscribe_in(&input, window, {
+            let key = key.clone();
+            move |this, input, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { .. } => this.answer_secret(&key, true, window, cx),
                 InputEvent::Change => cx.notify(),
-                _ => this.request_input_focus(&card, input, event, cx),
-            });
-        self.requests.secrets.insert(id, (input.clone(), subscription));
+                _ => this.request_input_focus(&key, input, event, cx),
+            }
+        });
+        self.requests.secrets.insert(key.clone(), (input.clone(), subscription));
         input
     }
 
-    /// The secret providers this environment's cards can read from.
-    fn secret_sources(&self) -> Vec<SecretSource> {
+    /// The secret providers `env`'s cards can read from (`useSecretRequestSources`).
+    fn secret_sources(&self, env: &str) -> Vec<SecretSource> {
         if !super::pages::settings::secrets_enabled() {
             return Vec::new();
         }
-        let info = self.server_info();
+        let Some(info) = self.env_info(env) else { return Vec::new() };
         secret_sources(info.config["secretRequestReferences"] == true, info.settings.get("secretProviders"))
     }
 
-    fn reference_input(
-        &mut self,
-        card: &RequestCard,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Entity<InputState> {
-        if let Some((input, _)) = self.requests.references.get(&card.item_id) {
+    fn reference_input(&mut self, key: &RequestKey, window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
+        if let Some((input, _)) = self.requests.references.get(key) {
             return input.clone();
         }
         let input = cx.new(|cx| InputState::new(window, cx).placeholder(REFERENCE_PLACEHOLDER));
-        let id = card.item_id.clone();
-        let card = card.clone();
-        let subscription =
-            cx.subscribe_in(&input, window, move |this, input, event: &InputEvent, window, cx| match event {
-                InputEvent::PressEnter { .. } => this.answer_secret(&card, true, window, cx),
+        let subscription = cx.subscribe_in(&input, window, {
+            let key = key.clone();
+            move |this, input, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { .. } => this.answer_secret(&key, true, window, cx),
                 InputEvent::Change => {
-                    this.requests.errors.remove(&card.item_id);
+                    this.requests.errors.remove(&key);
                     cx.notify();
                 }
-                _ => this.request_input_focus(&card, input, event, cx),
-            });
-        self.requests.references.insert(id, (input.clone(), subscription));
+                _ => this.request_input_focus(&key, input, event, cx),
+            }
+        });
+        self.requests.references.insert(key.clone(), (input.clone(), subscription));
         input
     }
 
-    fn set_secret_source(&mut self, item_id: &SharedString, source: Option<SharedString>, cx: &mut Context<Self>) {
+    fn set_secret_source(&mut self, key: &RequestKey, source: Option<SharedString>, cx: &mut Context<Self>) {
         match source {
-            Some(source) => self.requests.sources.insert(item_id.clone(), source),
-            None => self.requests.sources.remove(item_id),
+            Some(source) => self.requests.sources.insert(key.clone(), source),
+            None => self.requests.sources.remove(key),
         };
-        self.requests.errors.remove(item_id);
+        self.requests.errors.remove(key);
         cx.notify();
     }
 
     /// A timeline card's controls disable once it is answered, so focus goes on to the composer
     /// (`workspaceFocus` recovering a finished conversation prompt). A side-chat card keeps its own.
-    fn leave_answered_card(&mut self, card: &RequestCard, window: &mut Window, cx: &mut Context<Self>) {
-        if self.in_timeline(card) {
+    fn leave_answered_card(&mut self, key: &RequestKey, window: &mut Window, cx: &mut Context<Self>) {
+        if self.in_timeline(key) {
             self.focus_composer(window, cx);
         }
     }
 
-    /// `secrets.answerRequest`: save the typed value, read it from a secret provider, or decline.
-    fn answer_secret(&mut self, card: &RequestCard, save: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
-        let id = card.item_id.clone();
-        if self.requests.busy.contains(&id) {
+    /// A late answer's failure, shown only while its card still is.
+    fn request_failed(&mut self, key: RequestKey, message: SharedString) {
+        if self.request_shown(&key) {
+            self.requests.errors.insert(key, message);
+        }
+    }
+
+    /// `secrets.answerRequest` on the card's environment: save the typed value, read it from a
+    /// secret provider, or decline.
+    fn answer_secret(&mut self, key: &RequestKey, save: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(client) = self.env_client(&key.env) else { return };
+        if self.requests.busy.contains(key) {
             return;
         }
         let source = self
             .requests
             .sources
-            .get(&id)
+            .get(key)
             .cloned()
-            .filter(|source| self.secret_sources().iter().any(|candidate| &candidate.id == source));
+            .filter(|source| self.secret_sources(&key.env).iter().any(|candidate| &candidate.id == source));
         let answer = match (save, source) {
             (false, _) => json!({"type": "decline"}),
             (true, Some(source)) => {
-                let Some((input, _)) = self.requests.references.get(&id) else { return };
+                let Some((input, _)) = self.requests.references.get(key) else { return };
                 let text = input.read(cx).value().to_string();
                 if text.trim().is_empty() {
                     return;
                 }
                 let Some(reference) = secret_reference(&source, &text) else {
-                    self.requests.errors.insert(id, INVALID_REFERENCE.into());
+                    self.requests.errors.insert(key.clone(), INVALID_REFERENCE.into());
                     cx.notify();
                     return;
                 };
                 json!({"type": "reference", "reference": reference})
             }
             (true, None) => {
-                let Some((input, _)) = self.requests.secrets.get(&id) else { return };
+                let Some((input, _)) = self.requests.secrets.get(key) else { return };
                 let secret = input.read(cx).value().trim().to_owned();
                 if secret.is_empty() {
                     return;
@@ -444,24 +481,23 @@ impl Workspace {
                 json!({"type": "save", "secret": secret})
             }
         };
-        let input = json!({"threadId": card.thread_id, "turnItemId": id, "answer": answer});
-        self.requests.busy.insert(id.clone());
-        self.requests.errors.remove(&id);
-        self.leave_answered_card(card, window, cx);
+        let input = json!({"threadId": key.thread, "turnItemId": key.item, "answer": answer});
+        self.requests.busy.insert(key.clone());
+        self.requests.errors.remove(key);
+        self.leave_answered_card(key, window, cx);
         cx.notify();
+        let key = key.clone();
         cx.spawn(async move |this, cx| {
             let result = client.request("secrets.answerRequest", input).await;
             let _ = this.update(cx, |this, cx| {
-                this.requests.busy.remove(&id);
+                this.requests.busy.remove(&key);
                 match result {
                     // The row turns into its answered line once the item updates.
                     Ok(_) => {
-                        this.requests.secrets.remove(&id);
-                        this.requests.references.remove(&id);
+                        this.requests.secrets.remove(&key);
+                        this.requests.references.remove(&key);
                     }
-                    Err(error) => {
-                        this.requests.errors.insert(id, failure_message(&error, &SECRET_TAGS));
-                    }
+                    Err(error) => this.request_failed(key, failure_message(&error, &SECRET_TAGS)),
                 }
                 cx.notify();
             });
@@ -469,22 +505,22 @@ impl Workspace {
         .detach();
     }
 
-    fn decline_link(&mut self, card: &RequestCard, host: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.access_client(host) else { return };
-        let id = card.item_id.clone();
-        if !self.requests.busy.insert(id.clone()) {
+    fn decline_link(&mut self, key: &RequestKey, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(client) = self.access_client(&key.env) else { return };
+        if !self.requests.busy.insert(key.clone()) {
             return;
         }
-        self.requests.errors.remove(&id);
-        self.leave_answered_card(card, window, cx);
+        self.requests.errors.remove(key);
+        self.leave_answered_card(key, window, cx);
         cx.notify();
-        let input = json!({"threadId": card.thread_id, "turnItemId": id, "answer": {"type": "decline"}});
+        let input = json!({"threadId": key.thread, "turnItemId": key.item, "answer": {"type": "decline"}});
+        let key = key.clone();
         cx.spawn(async move |this, cx| {
             let result = client.request("peerLinks.answerRequest", input).await;
             let _ = this.update(cx, |this, cx| {
-                this.requests.busy.remove(&id);
+                this.requests.busy.remove(&key);
                 if let Err(error) = result {
-                    this.requests.errors.insert(id, failure_message(&error, &LINK_TAGS));
+                    this.request_failed(key, failure_message(&error, &LINK_TAGS));
                 }
                 cx.notify();
             });
@@ -503,24 +539,23 @@ pub(super) fn request_row(
     cx: &mut App,
 ) -> AnyElement {
     let Some(workspace) = this.upgrade() else { return div().into_any_element() };
+    // Thread ids can repeat across environments, so the pane names the request's environment.
+    let Some((env, _)) = workspace.read(cx).pane_thread(pane) else { return div().into_any_element() };
+    let key = RequestKey::new(env, card);
     let body = match &card.kind {
         RequestKind::Secret { label, url, file, .. } => {
             let (input, sources) = workspace.update(cx, |w, cx| {
-                let sources = w.secret_sources();
-                let source = w.requests.sources.get(&card.item_id).filter(|id| sources.iter().any(|s| &s.id == *id));
+                let sources = w.secret_sources(&key.env);
+                let source = w.requests.sources.get(&key).filter(|id| sources.iter().any(|s| &s.id == *id));
                 let input = match source {
-                    Some(_) => w.reference_input(card, window, cx),
-                    None => w.secret_input(card, window, cx),
+                    Some(_) => w.reference_input(&key, window, cx),
+                    None => w.secret_input(card, &key, window, cx),
                 };
                 (input, sources)
             });
-            secret_card(card, label, url.as_ref(), *file, &input, &sources, &workspace, t, cx)
+            secret_card(card, &key, label, url.as_ref(), *file, &input, &sources, &workspace, t, cx)
         }
-        RequestKind::Link { .. } => {
-            // Thread ids can repeat across environments, so the pane names the request's host.
-            let host = workspace.read(cx).pane_thread(pane).map(|(host, _)| host);
-            link_card(card, host, &workspace, t, cx)
-        }
+        RequestKind::Link { .. } => link_card(card, &key, &workspace, t, cx),
     };
     super::chat::lane(8., body).into_any_element()
 }
@@ -539,6 +574,7 @@ fn card_frame(t: &Tokens) -> gpui_kit::Div {
 #[expect(clippy::too_many_arguments, reason = "one card's parts, passed once from request_row")]
 fn secret_card(
     card: &Rc<RequestCard>,
+    key: &RequestKey,
     label: &SharedString,
     url: Option<&SharedString>,
     file: bool,
@@ -549,17 +585,17 @@ fn secret_card(
     cx: &mut App,
 ) -> AnyElement {
     let state = workspace.read(cx);
-    let busy = state.requests.busy.contains(&card.item_id);
-    let source = state.requests.sources.get(&card.item_id).and_then(|id| sources.iter().find(|s| &s.id == id));
-    let picker = (!sources.is_empty()).then(|| source_picker(card, label, source, sources, workspace));
-    let error = state.requests.errors.get(&card.item_id).cloned();
+    let busy = state.requests.busy.contains(key);
+    let source = state.requests.sources.get(key).and_then(|id| sources.iter().find(|s| &s.id == id));
+    let picker = (!sources.is_empty()).then(|| source_picker(key, label, source, sources, workspace));
+    let error = state.requests.errors.get(key).cloned();
     let empty = input.read(cx).value().trim().is_empty();
     let privacy = if file {
         "Kept out of chat, in a private file this agent's commands can read for 24 hours"
     } else {
         "Stored securely, never shown to the agent"
     };
-    let (save_card, decline_card) = (card.clone(), card.clone());
+    let (save_key, decline_key) = (key.clone(), key.clone());
     let (save_view, decline_view) = (workspace.downgrade(), workspace.downgrade());
     card_frame(t)
         .child(
@@ -598,7 +634,7 @@ fn secret_card(
                 .child(div().flex_1().min_w_0().child(Input::new(input).disabled(busy)))
                 .child(Button::new("secret-save").primary().label("Save securely").disabled(busy || empty).on_click(
                     move |_, window, cx| {
-                        let _ = save_view.update(cx, |w, cx| w.answer_secret(&save_card, true, window, cx));
+                        let _ = save_view.update(cx, |w, cx| w.answer_secret(&save_key, true, window, cx));
                     },
                 )),
         )
@@ -625,7 +661,7 @@ fn secret_card(
                         .label("Decline")
                         .disabled(busy)
                         .on_click(move |_, window, cx| {
-                            let _ = decline_view.update(cx, |w, cx| w.answer_secret(&decline_card, false, window, cx));
+                            let _ = decline_view.update(cx, |w, cx| w.answer_secret(&decline_key, false, window, cx));
                         }),
                 ),
         )
@@ -634,13 +670,13 @@ fn secret_card(
 
 /// `SecretSourceSelect`: where the answer comes from, the typed value or a secret provider.
 fn source_picker(
-    card: &Rc<RequestCard>,
+    key: &RequestKey,
     label: &SharedString,
     source: Option<&SecretSource>,
     sources: &[SecretSource],
     workspace: &Entity<Workspace>,
 ) -> AnyElement {
-    let (view, item_id) = (workspace.downgrade(), card.item_id.clone());
+    let (view, key) = (workspace.downgrade(), key.clone());
     super::pages::settings::source_select(
         "secret-source".into(),
         label,
@@ -648,7 +684,7 @@ fn source_picker(
         sources,
         false,
         move |source, _, cx| {
-            let _ = view.update(cx, |w, cx| w.set_secret_source(&item_id, source, cx));
+            let _ = view.update(cx, |w, cx| w.set_secret_source(&key, source, cx));
         },
     )
     .into_any_element()
@@ -656,25 +692,24 @@ fn source_picker(
 
 fn link_card(
     card: &Rc<RequestCard>,
-    host: Option<SharedString>,
+    key: &RequestKey,
     workspace: &Entity<Workspace>,
     t: &Tokens,
     cx: &mut App,
 ) -> AnyElement {
     let state = workspace.read(cx);
-    let busy = state.requests.busy.contains(&card.item_id);
-    let error = state.requests.errors.get(&card.item_id).cloned();
-    let answerable = host.filter(|host| state.manages_access(host));
+    let busy = state.requests.busy.contains(key);
+    let error = state.requests.errors.get(key).cloned();
+    let answerable = state.manages_access(&key.env).then(|| key.env.clone());
     let RequestKind::Link { label, url, .. } = &card.kind else { return div().into_any_element() };
     let title = if card.picks_machine() {
         "Link a machine to this environment".to_owned()
     } else {
         format!("Link {} to this environment", card.link_target())
     };
-    let (decline_card, review_card, view) = (card.clone(), card.clone(), workspace.downgrade());
+    let (decline_key, review_card, view) = (key.clone(), card.clone(), workspace.downgrade());
     let review_view = view.clone();
     let actions = if let Some(host) = answerable {
-        let decline_host = host.clone();
         h_flex()
             .min_w_0()
             .justify_end()
@@ -687,7 +722,7 @@ fn link_card(
                     .label("Decline")
                     .disabled(busy)
                     .on_click(move |_, window, cx| {
-                        let _ = view.update(cx, |w, cx| w.decline_link(&decline_card, &decline_host, window, cx));
+                        let _ = view.update(cx, |w, cx| w.decline_link(&decline_key, window, cx));
                     }),
             )
             .child(
@@ -1466,6 +1501,18 @@ mod tests {
         });
         assert_eq!(secret_sources(true, &providers), [SecretSource { id: "work".into(), label: "Work".into() }]);
         assert!(secret_sources(false, &providers).is_empty(), "older servers drop references");
+    }
+
+    #[test]
+    fn a_request_keeps_its_state_on_its_own_environment() {
+        let card = link_request(None, None, None);
+        let (a, b) = (RequestKey::new("a".into(), &card), RequestKey::new("b".into(), &card));
+        assert_ne!(a, b, "the same thread and item on two environments are two cards");
+        let mut ui = RequestUi::default();
+        ui.sources.insert(a.clone(), "work".into());
+        ui.errors.insert(a, "Could not answer the request. Try again.".into());
+        ui.retain_shown(|key| *key == b);
+        assert!(ui.sources.is_empty() && ui.errors.is_empty(), "B's card starts without A's answer");
     }
 
     fn link_request(environment_id: Option<&str>, url: Option<&str>, label: Option<&str>) -> RequestCard {

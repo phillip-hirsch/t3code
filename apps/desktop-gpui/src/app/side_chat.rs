@@ -503,6 +503,7 @@ impl Workspace {
             }
         });
         self.sync_details(cx);
+        self.prune_requests();
         cx.notify();
     }
 
