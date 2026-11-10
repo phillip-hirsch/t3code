@@ -88,6 +88,16 @@ impl DraftWorkspace {
         self.start_from_origin
     }
 
+    /// The launch's `workspaceStrategy` for `choice`, reading what the draft's controls had not loaded.
+    pub async fn resolve_strategy(&self, client: &RpcClient, choice: &WorkspaceChoice) -> Result<Value, String> {
+        let mode = match choice.mode {
+            Some(mode) => mode,
+            None => self.default_mode(client).await,
+        };
+        let refs = list_refs(client, &self.workspace_root).await?;
+        launch_strategy(mode, choice, &refs, choice.start_from_origin.unwrap_or(self.start_from_origin))
+    }
+
     /// `applyProjectFile` + `resolveNewThreadEnvMode`.
     fn env_mode(&self, project_file: Option<EnvMode>) -> EnvMode {
         // Unset everywhere, t3.json decides, then "local"; either way it is not the environment's choice.

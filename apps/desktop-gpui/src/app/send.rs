@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use super::attachments::ATTACHMENT_ONLY_PROMPT;
 use super::{Target, Workspace, draft_title, new_id};
 use crate::model::{ModelSelection, ThreadProjection};
-use crate::new_thread::{self, DraftWorkspace};
+use crate::new_thread::DraftWorkspace;
 use crate::queue::QueuedMessage;
 use crate::timeline::Row;
 
@@ -341,14 +341,16 @@ impl Workspace {
                     Some(Ok(strategy)) => Some(strategy),
                     None => None,
                 };
-                // Still loading the workspace controls: resolve it the same way at send.
+                // Still loading the workspace controls: resolve it the same way at send, with the draft's picks.
                 let workspace = strategy.is_none().then(|| {
                     let project = self.shell.projects.iter().find(|p| p.environment_id == env && p.id == project_id)?;
                     let has_threads = self.shell.project_has_threads(project);
-                    Some((
-                        DraftWorkspace::new(self.server_info(), project, has_threads),
-                        project.workspace_root.clone(),
-                    ))
+                    let choice = if self.draft_workspace.is_for(Some(&origin)) {
+                        self.draft_workspace.choice.clone()
+                    } else {
+                        self.drafts.workspace(&draft)
+                    };
+                    Some((DraftWorkspace::new(self.server_info(), project, has_threads), choice))
                 });
                 // The draft's terminals and any opened while the launch is pending share its thread; a
                 // failed launch sends again with it.
@@ -412,12 +414,8 @@ impl Workspace {
                 result = client.request("orchestration.dispatchCommand", command).await.map_err(|e| e.to_string());
             }
             if result.is_ok() && !text_is_feedback {
-                if let Some((workspace, root)) = workspace {
-                    let mode = workspace.default_mode(&client).await;
-                    let choice = new_thread::WorkspaceChoice::default();
-                    match new_thread::list_refs(&client, &root).await.and_then(|refs| {
-                        new_thread::launch_strategy(mode, &choice, &refs, workspace.start_from_origin())
-                    }) {
+                if let Some((workspace, choice)) = workspace {
+                    match workspace.resolve_strategy(&client, &choice).await {
                         Ok(strategy) => payload["workspaceStrategy"] = strategy,
                         Err(error) => result = Err(error),
                     }

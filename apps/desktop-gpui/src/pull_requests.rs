@@ -417,8 +417,18 @@ fn normalize(value: &str) -> Option<String> {
     (!trimmed.is_empty()).then_some(trimmed)
 }
 
+/// `pullRequestViewerKey`: one host can be signed in as different people on different machines.
+fn viewer_key(environment_id: &str, host: &str) -> String {
+    format!("{environment_id} {host}")
+}
+
+/// `pullRequestEntryViewer`: the row's machine's viewer, else an unmerged answer's by host.
 pub fn viewer_for<'a>(entry: &Entry, viewers: &'a HashMap<String, String>) -> Option<&'a str> {
-    viewers.get(&entry.host).map(String::as_str).filter(|viewer| !viewer.trim().is_empty())
+    viewers
+        .get(&viewer_key(&entry.environment_id, &entry.host))
+        .or_else(|| viewers.get(&entry.host))
+        .map(String::as_str)
+        .filter(|viewer| !viewer.trim().is_empty())
 }
 
 fn authored_by_viewer(entry: &Entry, viewers: &HashMap<String, String>) -> bool {
@@ -950,7 +960,7 @@ pub fn merge_lists(answers: Vec<(String, ListResult)>) -> ListResult {
     let mut merged = ListResult::default();
     for (environment_id, answer) in answers {
         for (host, login) in answer.viewers {
-            merged.viewers.entry(host).or_insert(login);
+            merged.viewers.insert(viewer_key(&environment_id, &host), login);
         }
         for provider in answer.providers {
             match merged.providers.iter_mut().find(|held| held.host == provider.host) {
@@ -1157,6 +1167,25 @@ mod tests {
         assert_eq!(merged.entries.iter().map(|e| e.environment_id.as_str()).collect::<Vec<_>>(), ["b", "a"]);
         assert_eq!(merged.next_cursors, *json!({"a": {"github.com": "c1"}}).as_object().unwrap());
         assert_eq!(merged.providers.len(), 1);
+    }
+
+    #[test]
+    fn each_machine_keeps_its_own_viewer_for_a_shared_host() {
+        let answer = |environment: &str, login: &str| {
+            let row = entry(1, json!({"author": {"login": "bob"}}));
+            let viewers = HashMap::from([("github.com".to_owned(), login.to_owned())]);
+            (environment.to_owned(), ListResult { entries: vec![row], viewers, ..Default::default() })
+        };
+        let merged = merge_lists(vec![answer("a", "alice"), answer("b", "bob")]);
+        let on = |environment: &str| merged.entries.iter().find(|e| e.environment_id == environment).unwrap();
+        assert_eq!(viewer_for(on("a"), &merged.viewers), Some("alice"));
+        assert_eq!(viewer_for(on("b"), &merged.viewers), Some("bob"));
+        let groups = group_by_involvement(merged.entries.clone(), &merged.viewers);
+        let authored: Vec<&str> = groups[0].entries.iter().map(|e| e.environment_id.as_str()).collect();
+        assert_eq!((groups[0].key, authored), ("authored", vec!["b"]));
+        // An unmerged answer still names its viewers by bare host.
+        let single = HashMap::from([("github.com".to_owned(), "carol".to_owned())]);
+        assert_eq!(viewer_for(on("a"), &single), Some("carol"));
     }
 
     #[test]
