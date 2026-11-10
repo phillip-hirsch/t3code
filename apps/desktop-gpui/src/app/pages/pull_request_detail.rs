@@ -470,6 +470,12 @@ impl Workspace {
         self.env_info(&reference.environment_id)
     }
 
+    /// `generateReviewGuide.permissionAtom`: writing a guide runs an agent on the pull request's
+    /// environment.
+    pub(super) fn can_write_pr_guide(&self, reference: &Reference) -> bool {
+        self.env_grants(&reference.environment_id, "orchestration:operate")
+    }
+
     fn review_guides_enabled(&self, reference: &Reference) -> bool {
         self.pull_request_info(reference).is_some_and(|info| info.settings.bool("reviewGuidesEnabled"))
     }
@@ -1479,6 +1485,7 @@ impl Workspace {
         let refreshing = panel.refreshing || panel.detail_loading;
         let guide_running = panel.guide_starting || panel.guide.as_ref().is_some_and(|g| g["run"]["_tag"] == "Running");
         let guide_written = panel.guide.as_ref().is_some_and(|g| !g["guide"].is_null());
+        let write_guide = guides && self.can_write_pr_guide(&panel.reference);
         let maintainer = logic::can_edit_maintainer_edits(detail)
             .then(|| (panel.maintainer_choice.or(detail.maintainer_can_modify) == Some(true), panel.maintainer_saving));
         let can_link = logic::parse_change_request_url(&detail.url).is_some();
@@ -1575,7 +1582,7 @@ impl Workspace {
                         .disabled(busy_handoff || !can_fix)
                         .on_click(on(super::super::Workspace::fix_pr_findings)),
                     );
-                if guides {
+                if write_guide {
                     let label = if guide_running {
                         "Writing guide..."
                     } else if guide_written {
@@ -2410,6 +2417,7 @@ impl Workspace {
         let result = panel.guide.clone().unwrap_or_default();
         let tour = panel.guide_tour.clone();
         let running = panel.guide_starting || result["run"]["_tag"] == "Running";
+        let can_write = self.can_write_pr_guide(&panel.reference);
         let current = result["currentHeadSha"].as_str();
         let failure = (result["run"]["_tag"] == "Failed" && result["run"]["headSha"].as_str() == current)
             .then(|| result["run"]["detail"].as_str().unwrap_or_default().to_owned());
@@ -2457,7 +2465,9 @@ impl Workspace {
                 .text_center()
                 .child(div().text_sm().font_weight(FontWeight::MEDIUM).text_color(t.foreground).child(title))
                 .child(div().max_w(px(448.)).text_xs().text_color(t.muted_foreground).child(description))
-                .child(write_button(if failure.is_some() { "Try again" } else { "Write guide" }, cx))
+                .when(can_write, |el| {
+                    el.child(write_button(if failure.is_some() { "Try again" } else { "Write guide" }, cx))
+                })
                 .children(failure.filter(|_| !running).map(|detail| failure_details(detail, t)))
                 .into_any_element();
         }
@@ -2482,7 +2492,7 @@ impl Workspace {
                 .text_xs()
                 .child(Icon::new(if running { Lucide::LoaderCircle } else { Lucide::TriangleAlert }).with_size(px(14.)))
                 .child(div().flex_1().min_w_0().child(text))
-                .when(!running, |el| el.child(write_button("Rewrite", cx)))
+                .when(!running && can_write, |el| el.child(write_button("Rewrite", cx)))
         });
         match tour {
             Some(Ok(guide)) => {
