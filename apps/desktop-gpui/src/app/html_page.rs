@@ -285,6 +285,10 @@ async fn mint_page_url(
     }
 }
 
+fn page_row(row: &timeline::Row, attachment_id: &SharedString) -> bool {
+    matches!(row, timeline::Row::Embed(embed) if embed.attachment_id == *attachment_id)
+}
+
 impl Workspace {
     fn page_key(&self, embed: &timeline::Embed) -> Option<PageKey> {
         Some((self.active_environment()?.clone(), embed.attachment_id.clone()))
@@ -510,7 +514,7 @@ impl Workspace {
                     }
                 }
             }
-            PageMessage::Image { src, name } => self.open_page_image(src, name, window, cx),
+            PageMessage::Image { src, name } => self.open_page_image(&origin, src, name, window, cx),
             PageMessage::Expand => {
                 if let Origin::Inline(key) = origin {
                     self.open_html_dialog(key, window, cx);
@@ -521,8 +525,7 @@ impl Workspace {
 
     /// Re-lays out the timeline row of the page `attachment_id`, whose height changed.
     pub(super) fn remeasure_page_row(&mut self, attachment_id: &SharedString, cx: &mut Context<Self>) {
-        let is_page =
-            |row: &timeline::Row| matches!(row, timeline::Row::Embed(embed) if embed.attachment_id == *attachment_id);
+        let is_page = |row: &timeline::Row| page_row(row, attachment_id);
         if let Some(index) = self.rows.iter().position(is_page) {
             self.scroller.update(cx, |scroller, cx| scroller.remeasure_items(index..index + 1, cx));
         }
@@ -535,8 +538,30 @@ impl Workspace {
     }
 
     /// An image the page asked to expand (`ExpandedImageDialog`): a published image's data URL, or
-    /// a web image, loaded and opened in the image viewer.
-    fn open_page_image(&mut self, src: String, name: String, window: &mut Window, cx: &mut Context<Self>) {
+    /// a web image, loaded and opened in the image viewer while the page's pane still shows its
+    /// thread (the viewer is per thread).
+    fn open_page_image(
+        &mut self,
+        origin: &Origin,
+        src: String,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pane = match origin {
+            Origin::Inline(key)
+                if !self.rows.iter().any(|row| page_row(row, &key.1))
+                    && self
+                        .side_chat
+                        .view
+                        .as_ref()
+                        .is_some_and(|side| side.rows.iter().any(|row| page_row(row, &key.1))) =>
+            {
+                ChatPane::Side
+            }
+            _ => ChatPane::Main,
+        };
+        let Some((env, thread_id)) = self.pane_thread(pane) else { return };
         cx.spawn_in(window, async move |this, cx| {
             let (image, reference) = if src.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("data:")) {
                 let image = super::markdown_images::data_url(&src)
@@ -547,6 +572,7 @@ impl Workspace {
                 (image, Some(Reference::Url(src)))
             };
             let _ = this.update_in(cx, |this, window, cx| match image {
+                _ if !this.pane_shows(pane, &env, &thread_id) => {}
                 Some(image) => {
                     let item = ViewerImage { image, name: name.into(), reference };
                     this.open_image_viewer(vec![item], 0, window, cx);
