@@ -76,6 +76,7 @@ impl Workspace {
             self.drop_deleted_draft(&Target::Thread { env: env.clone(), id: id.to_owned() }, cx);
             self.side_chat.forget(env, id);
         }
+        self.prune_requests();
         self.terminals.forget_thread(env, thread_id, cx);
         cx.notify();
     }

@@ -10,6 +10,7 @@ use super::logic::{ACCESS_WRITE, ORCHESTRATION_OPERATE, ORCHESTRATION_READ, SETT
 use super::ui::{self, text_xs};
 use crate::app::Workspace;
 use crate::backend::Endpoint;
+use crate::rpc::RpcClient;
 use crate::theme::Tokens;
 
 /// The machine choice for linking by an address typed in.
@@ -217,6 +218,12 @@ impl Workspace {
     /// `access:write` there: the grant that links, unlinks and answers link requests.
     pub(in crate::app) fn manages_access(&self, environment_id: &str) -> bool {
         self.env_grants(environment_id, ACCESS_WRITE)
+    }
+
+    /// `environment_id`'s socket now, while this session may change its links: read when a
+    /// request runs, since a dialog can stay open through a reconnect.
+    pub(in crate::app) fn access_client(&self, environment_id: &str) -> Option<RpcClient> {
+        self.env_client(environment_id).filter(|_| self.manages_access(environment_id))
     }
 
     /// Where this client can mint a pairing code on `environment_id`: connected there, with a

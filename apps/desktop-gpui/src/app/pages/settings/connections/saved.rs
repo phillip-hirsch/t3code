@@ -340,11 +340,17 @@ fn saved_row(
         }
         let toggle = {
             let (ui, id) = (ui.clone(), id.clone());
+            let ring = t.ring;
             h_flex()
                 .id(element_id("details"))
                 .gap(px(2.))
+                .rounded(px(2.))
                 .cursor_pointer()
                 .hover(|style| style.text_color(t.foreground))
+                .tab_index(0)
+                .focus_visible(move |style| {
+                    style.shadow(vec![gpui_kit::BoxShadow::new(px(0.), px(0.), ring).spread_radius(px(1.)).inset()])
+                })
                 .child("Details")
                 .child(ui::chevron(expanded, 12., t.muted_foreground))
                 .on_click(move |_, _, cx| toggle(&ui, &id, |ui| &mut ui.details, cx))
@@ -576,17 +582,22 @@ impl RenameForm {
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let label = self.label.read(cx).value().to_string();
         let saving = self.saved.update(cx, |saved, cx| saved.rename(&self.id, &label, cx));
-        cx.spawn_in(window, async move |this, cx| {
-            let result = finished(saving).await;
-            drop(this.update_in(cx, |this, window, cx| match result {
-                Ok(()) => window.close_dialog(cx),
-                Err(error) => {
-                    this.error = Some(error.into());
-                    cx.notify();
-                }
-            }));
-        })
-        .detach();
+        let form = cx.weak_entity();
+        window
+            .spawn(cx, async move |cx| {
+                let result = finished(saving).await;
+                drop(cx.update(|window, cx| match (result, form.upgrade()) {
+                    (Ok(()), Some(_)) => window.close_dialog(cx),
+                    (Ok(()), None) => {}
+                    (Err(error), Some(form)) => form.update(cx, |form, cx| {
+                        form.error = Some(error.into());
+                        cx.notify();
+                    }),
+                    // Closed while saving: the failure still has to surface.
+                    (Err(error), None) => error_toast(window, cx, "Could not rename the environment", error),
+                }));
+            })
+            .detach();
     }
 }
 

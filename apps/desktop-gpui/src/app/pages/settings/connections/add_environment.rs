@@ -47,6 +47,17 @@ async fn finished(saving: anyhow::Result<Saving>) -> Result<(), String> {
     }
 }
 
+fn added_toast(route: Option<&RouteTarget>, window: &mut Window, cx: &mut App) {
+    match route {
+        Some(route) => {
+            success_toast(window, cx, "Route added", format!("{} now has another way to connect.", route.label));
+        }
+        None => {
+            success_toast(window, cx, "Backend added", "The environment is saved and will reconnect on app startup.");
+        }
+    }
+}
+
 /// `formatDesktopSshConnectionError`.
 fn ssh_error_message(message: &str) -> String {
     match message.trim() {
@@ -405,23 +416,22 @@ impl AddForm {
             };
             drop(this.update_in(cx, |this, window, cx| {
                 this.busy = false;
-                match result {
-                    Ok(()) => {
-                        window.close_dialog(cx);
-                        let (title, description) = match &route {
-                            Some(route) => {
-                                ("Route added", format!("{} can now be reached over SSH {alias}.", route.label))
-                            }
-                            None => ("Environment connected", format!("{alias} is ready over an SSH-managed tunnel.")),
-                        };
-                        success_toast(window, cx, title, description);
-                    }
-                    Err(error) => {
-                        this.error = Some(ssh_error_message(&error).into());
-                        cx.notify();
-                    }
+                match &result {
+                    Ok(()) => window.close_dialog(cx),
+                    Err(error) => this.error = Some(ssh_error_message(error).into()),
                 }
+                cx.notify();
             }));
+            // The web confirms a connection even after its dialog closed; errors stay with the form.
+            if result.is_ok() {
+                drop(cx.update(|window, cx| {
+                    let (title, description) = match &route {
+                        Some(route) => ("Route added", format!("{} can now be reached over SSH {alias}.", route.label)),
+                        None => ("Environment connected", format!("{alias} is ready over an SSH-managed tunnel.")),
+                    };
+                    success_toast(window, cx, title, description);
+                }));
+            }
         })
         .detach();
     }
@@ -433,72 +443,59 @@ impl AddForm {
             Ok(fields) => fields,
             Err(message) => return self.fail(message.to_owned(), window, cx),
         };
-        if let Some((_, _, paired)) = self.unsaved.take().filter(|(h, c, _)| (h, c) == (&host, &code)) {
-            return self.save(host, code, paired, window, cx);
-        }
+        let retry = self.unsaved.take().filter(|(h, c, _)| (h, c) == (&host, &code)).map(|(_, _, paired)| paired);
         let Some(catalog) = self.saved.read_with(cx, |saved, _| saved.environments().to_vec()).ok() else { return };
-        let expected = self.route.as_ref().map(|route| route.environment_id.clone());
+        let (saved, primary, route) = (self.saved.clone(), self.primary_id.clone(), self.route.clone());
+        let expected = route.as_ref().map(|route| route.environment_id.clone());
+        let form = cx.weak_entity();
         self.busy = true;
         self.error = None;
         cx.notify();
-        cx.spawn_in(window, async move |this, cx| {
-            let pairing = environments::pair(host.clone(), code.clone(), catalog, expected);
-            let result = crate::runtime().spawn(pairing).await;
-            let result = result.unwrap_or_else(|error| Err(error.to_string()));
-            drop(this.update_in(cx, |this, window, cx| match result {
-                Ok(paired) => this.save(host, code, paired, window, cx),
-                Err(error) => this.fail(error, window, cx),
-            }));
-        })
-        .detach();
-    }
-
-    /// Saves a redeemed pairing; on failure the form stays open with the error, ready to retry.
-    fn save(
-        &mut self,
-        host: String,
-        code: String,
-        paired: SavedEnvironment,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.primary_id.as_deref() == Some(&paired.environment_id) {
-            // The workspace's own environment is already here (`register` skips platform entries).
-            return self.added(window, cx);
-        }
-        let known_address_only = self.route.is_none();
-        let saving = self.saved.update(cx, |saved, cx| saved.register(paired.clone(), known_address_only, cx));
-        self.busy = true;
-        cx.notify();
-        cx.spawn_in(window, async move |this, cx| {
-            let result = finished(saving).await;
-            drop(this.update_in(cx, |this, window, cx| match result {
-                Ok(()) => this.added(window, cx),
-                Err(error) => {
-                    this.unsaved = Some((host, code, paired));
-                    this.fail(error, window, cx);
-                }
-            }));
-        })
-        .detach();
+        // On the window, not the form: closing the dialog must not drop a pairing whose code is spent.
+        window
+            .spawn(cx, async move |cx| {
+                let paired = match retry {
+                    Some(paired) => Ok(paired),
+                    None => {
+                        let pairing = environments::pair(host.clone(), code.clone(), catalog, expected);
+                        crate::runtime().spawn(pairing).await.unwrap_or_else(|error| Err(error.to_string()))
+                    }
+                };
+                let (result, unsaved) = match paired {
+                    Err(error) => (Err(error), None),
+                    // The workspace's own environment is already here (`register` skips platform entries).
+                    Ok(paired) if primary.as_deref() == Some(paired.environment_id.as_str()) => (Ok(()), None),
+                    Ok(paired) => {
+                        let known_address_only = route.is_none();
+                        let saving =
+                            saved.update(cx, |saved, cx| saved.register(paired.clone(), known_address_only, cx));
+                        let result = finished(saving).await;
+                        let unsaved = result.is_err().then_some((host, code, paired));
+                        (result, unsaved)
+                    }
+                };
+                drop(cx.update(|window, cx| match form.upgrade() {
+                    Some(form) => form.update(cx, |form, cx| match result {
+                        Ok(()) => form.added(window, cx),
+                        Err(error) => {
+                            // A failed save keeps the spent pairing, so a resubmit retries only the save.
+                            form.unsaved = unsaved;
+                            form.fail(error, window, cx);
+                        }
+                    }),
+                    None => match result {
+                        Ok(()) => added_toast(route.as_ref(), window, cx),
+                        Err(error) => error_toast(window, cx, "Could not add backend", error),
+                    },
+                }));
+            })
+            .detach();
     }
 
     fn added(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.busy = false;
         window.close_dialog(cx);
-        match &self.route {
-            Some(route) => {
-                success_toast(window, cx, "Route added", format!("{} now has another way to connect.", route.label));
-            }
-            None => {
-                success_toast(
-                    window,
-                    cx,
-                    "Backend added",
-                    "The environment is saved and will reconnect on app startup.",
-                );
-            }
-        }
+        added_toast(self.route.as_ref(), window, cx);
     }
 
     fn fail(&mut self, message: String, window: &mut Window, cx: &mut Context<Self>) {

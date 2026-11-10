@@ -28,7 +28,7 @@ pub(in crate::app) mod ui;
 
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
-use gpui_kit::{AnyElement, App, Context, SharedString, Task, Window};
+use gpui_kit::{AnyElement, App, Context, SharedString, Task, WeakEntity, Window};
 use serde_json::{Value, json};
 
 use crate::app::Workspace;
@@ -119,6 +119,12 @@ pub(in crate::app) fn operates_terminals(load: &SessionLoad) -> bool {
 }
 
 impl Workspace {
+    /// `useEnvironmentScope` on the Settings environment: this client's current session there
+    /// grants `scope`. A pending or failed check grants nothing.
+    fn settings_grants(&self, scope: &str) -> bool {
+        self.settings_auth().is_some_and(|auth| auth.grants(scope))
+    }
+
     pub(super) fn render_settings_connections(
         &mut self,
         view: &SettingsView,
@@ -186,6 +192,36 @@ pub(super) async fn auth_request(
         }
     };
     crate::runtime().spawn(request).await.map_err(|error| error.to_string())?
+}
+
+/// The environment a dialog or menu opened on, whose socket and grants are read when it saves:
+/// either can stay open through a reconnect.
+#[derive(Clone)]
+struct SettingsWriter {
+    workspace: WeakEntity<Workspace>,
+    environment: Option<SharedString>,
+    label: String,
+}
+
+impl SettingsWriter {
+    /// `useUpdateEnvironmentSettings`: a session without `scopes` there saves nothing.
+    fn save(&self, patch: Value, scopes: &[&str], window: &mut Window, cx: &mut App) {
+        let Some(workspace) = self.workspace.upgrade() else { return };
+        let workspace = workspace.read(cx);
+        let environment = self.environment.as_deref().unwrap_or_default();
+        if !scopes.iter().all(|scope| workspace.env_grants(environment, scope)) {
+            let reason = format!("This connection lacks permission to change settings on {}.", self.label);
+            return window.push_notification(Notification::warning(reason).title("Setting not saved"), cx);
+        }
+        let client = workspace.env_client(environment);
+        window
+            .spawn(cx, async move |cx| {
+                if let Err(error) = update_settings(client, patch).await {
+                    let _ = cx.update(|window, cx| error_toast(window, cx, "Could not update settings", error));
+                }
+            })
+            .detach();
+    }
 }
 
 /// `server.updateSettings` with a plain environment-wide patch.

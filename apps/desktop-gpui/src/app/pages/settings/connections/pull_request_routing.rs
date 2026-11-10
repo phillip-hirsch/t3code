@@ -7,6 +7,7 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{Disableable as _, Icon, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, Context, ElementId, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _,
     SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
@@ -14,7 +15,7 @@ use gpui_kit::{
 
 use super::super::widgets::select_trigger;
 use super::error_toast;
-use super::ui::{text_sm, text_xs};
+use super::ui::{fold_trigger, text_sm, text_xs};
 use crate::app::Workspace;
 use crate::environments::Presented;
 use crate::pull_request_routing::{self as routing, PERMISSIONS, Permission};
@@ -125,6 +126,7 @@ impl Workspace {
             .py(px(8.))
             .gap(px(8.))
             .cursor_pointer()
+            .map(|el| fold_trigger(el, t.ring))
             .on_click(cx.listener(|this, _, _, cx| {
                 if !this.settings_ui.advanced_open.remove(SECTION) {
                     this.settings_ui.advanced_open.insert(SECTION);
@@ -180,11 +182,13 @@ impl Workspace {
             .disabled(disabled)
             .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |mut menu, _, _| {
                 for (value, label) in PERMISSIONS {
-                    let (view, id, key) = (view.clone(), id.clone(), key.clone());
+                    let (view, id) = (view.clone(), id.clone());
                     menu = menu.item(PopupMenuItem::new(label).checked(value == permission).on_click(
                         move |_, window, cx| {
-                            let Some(key) = key.clone() else { return };
                             view.update(cx, |this, cx| {
+                                // The machine's route now: the menu can outlive a reconnect.
+                                let machine = this.routing_machines(cx).into_iter().find(|m| m.id == id);
+                                let Some(key) = machine.and_then(|m| m.connection_key()) else { return };
                                 this.set_pull_request_routing(id.clone(), key, value, window, cx);
                             });
                         },

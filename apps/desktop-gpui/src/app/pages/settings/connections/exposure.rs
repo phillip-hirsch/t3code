@@ -10,11 +10,11 @@ use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::{Disableable as _, WindowExt as _, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement as _,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    AnyElement, App, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement as _,
+    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, WeakEntity, Window, div, px,
 };
 
-use super::logic::remote_clients_denial;
+use super::logic::{ENVIRONMENT_MAINTAIN, remote_clients_denial};
 use super::ui;
 use crate::app::Workspace;
 use crate::app::pages::settings::widgets::RowFrame;
@@ -150,9 +150,14 @@ impl Workspace {
                 "Restart and disable",
             )
         };
+        let workspace = cx.entity().downgrade();
         window.open_dialog(cx, move |dialog, _, _| {
+            let workspace = workspace.clone();
             let button =
                 Button::new("network-access-confirm").label(confirm).primary().on_click(move |_, window, cx| {
+                    if !maintains_primary(&workspace, cx) {
+                        return;
+                    }
                     window.close_dialog(cx);
                     let mode = if enable { ExposureMode::NetworkAccessible } else { ExposureMode::LocalOnly };
                     let desktop = cx.global_mut::<Desktop>();
@@ -171,7 +176,9 @@ impl Workspace {
     /// "Set up Tailscale HTTPS?", with the HTTPS port.
     fn confirm_tailscale_setup(&mut self, url: String, port: u16, window: &mut Window, cx: &mut Context<Self>) {
         let input: Entity<InputState> = cx.new(|cx| InputState::new(window, cx).default_value(port.to_string()));
+        let workspace = cx.entity().downgrade();
         window.open_dialog(cx, move |dialog, _, cx| {
+            let workspace = workspace.clone();
             let t = *crate::theme::tokens(cx);
             let text = input.read(cx).value();
             let parsed = exposure::parse_serve_port(&text);
@@ -185,7 +192,7 @@ impl Workspace {
             };
             let enable = Button::new("tailscale-enable").label("Enable").primary().disabled(parsed.is_none()).on_click(
                 move |_, window, cx| {
-                    let Some(port) = parsed else { return };
+                    let Some(port) = parsed.filter(|_| maintains_primary(&workspace, cx)) else { return };
                     window.close_dialog(cx);
                     let desktop = cx.global_mut::<Desktop>();
                     desktop.settings.tailscale_serve_enabled = true;
@@ -234,15 +241,21 @@ impl Workspace {
 
     /// "Disable Tailscale HTTPS?".
     fn confirm_tailscale_disable(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let workspace = cx.entity().downgrade();
         window.open_dialog(cx, move |dialog, _, _| {
-            let button =
-                Button::new("tailscale-disable").label("Restart and disable").danger().on_click(|_, window, cx| {
+            let workspace = workspace.clone();
+            let button = Button::new("tailscale-disable").label("Restart and disable").danger().on_click(
+                move |_, window, cx| {
+                    if !maintains_primary(&workspace, cx) {
+                        return;
+                    }
                     window.close_dialog(cx);
                     let desktop = cx.global_mut::<Desktop>();
                     desktop.settings.tailscale_serve_enabled = false;
                     desktop.settings.save();
                     cx.restart();
-                });
+                },
+            );
             dialog
                 .entrance(DialogEntrance::None)
                 .title("Disable Tailscale HTTPS?")
@@ -256,4 +269,13 @@ impl Workspace {
                 )
         });
     }
+}
+
+/// `readEnvironmentScope(primary, environment:maintain)`, read when a confirmed change runs: the
+/// dialog can outlive the session that opened it.
+fn maintains_primary(workspace: &WeakEntity<Workspace>, cx: &App) -> bool {
+    workspace.upgrade().is_some_and(|workspace| {
+        let workspace = workspace.read(cx);
+        workspace.primary_environment().is_some_and(|id| workspace.env_grants(id, ENVIRONMENT_MAINTAIN))
+    })
 }

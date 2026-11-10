@@ -18,31 +18,32 @@ use gpui_kit::component::{Disableable as _, Sizable as _, WindowExt as _, h_flex
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, ClipboardItem, Context, ElementId, Entity, FontWeight, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Task,
-    WeakEntity, Window, div, px,
+    IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
+    Task, WeakEntity, Window, div, px,
 };
 use serde_json::{Value, json};
 
 use super::super::widgets::{RowFrame, card, hairlines, section_with_action};
 use super::logic::{
     self, ACCESS_READ, ACCESS_WRITE, AccessSnapshot, ClientSession, ENVIRONMENT_MAINTAIN, PairingLink, SETTINGS_WRITE,
+    Session,
 };
 use super::pairing::{self, AdvertisedEndpoint, Qr};
 use super::ui::{self, Size, Variant, WebButton, text_2xs, text_sm, text_xs};
-use super::{SessionLoad, auth_request, check_session, error_toast, success_toast, update_settings};
+use super::{SessionLoad, SettingsWriter, auth_request, error_toast, success_toast};
 use crate::app::Workspace;
 use crate::app::pages::settings::widgets::SettingsView;
 use crate::app::sidebar::now_ms;
 use crate::backend::Endpoint;
-use crate::rpc::{RpcClient, StreamEvent};
+use crate::rpc::{RpcClient, SocketId, StreamEvent};
 use crate::settings::scope;
 use crate::theme::{self, Tokens};
 
 /// Everything the access page holds while it is open.
 #[derive(Default)]
 pub(super) struct AccessState {
-    started: bool,
-    session: SessionLoad,
+    /// The socket `subscribeAuthAccess` runs on; a new connection subscribes again.
+    subscribed_on: Option<SocketId>,
     /// `None` until `subscribeAuthAccess` sends its snapshot.
     access: Option<AccessSnapshot>,
     access_error: Option<SharedString>,
@@ -61,26 +62,25 @@ pub(super) struct AccessState {
     qr_codes: RefCell<HashMap<String, Option<Rc<Qr>>>>,
     clients_open: bool,
     permissions_open: bool,
-    _session_task: Option<Task<()>>,
     _stream_task: Option<Task<()>>,
     /// Repaints "Expires in …" once a second while a pairing link is live.
     _tick: Option<Task<()>>,
 }
 
 impl AccessState {
-    /// Starts the session check, then the access stream, once there is a connection.
-    fn start(&mut self, client: Option<RpcClient>, endpoint: Option<Endpoint>, cx: &mut Context<Self>) {
-        let (Some(client), Some(endpoint)) = (client, endpoint) else { return };
-        if self.started {
+    /// Subscribes on `reader`, the connection whose session may read access, once per socket;
+    /// `None` (no connection or no `access:read`) stops the stream.
+    fn sync(&mut self, reader: Option<RpcClient>, cx: &mut Context<Self>) {
+        let Some(client) = reader else {
+            self.subscribed_on = None;
+            self._stream_task = None;
             return;
+        };
+        let socket = client.socket_id();
+        if self.subscribed_on.as_ref() != Some(&socket) {
+            self.subscribed_on = Some(socket);
+            self.subscribe(client, cx);
         }
-        self.started = true;
-        self._session_task = Some(check_session(endpoint, cx, move |this, session, cx| {
-            if session.grants(ACCESS_READ) {
-                this.subscribe(client.clone(), cx);
-            }
-            this.session = session;
-        }));
     }
 
     fn subscribe(&mut self, client: RpcClient, cx: &mut Context<Self>) {
@@ -99,8 +99,6 @@ impl AccessState {
                             if let Err(error) = result {
                                 this.access_error = Some(error.to_string().into());
                             }
-                            // Resubscribe on the next connection.
-                            this.started = false;
                             true
                         }
                     };
@@ -140,10 +138,6 @@ impl AccessState {
         }));
     }
 
-    fn grants(&self, scope: &str) -> bool {
-        self.session.grants(scope)
-    }
-
     fn share_open(&self, link_id: &str) -> bool {
         self.share_open.get(link_id).copied().unwrap_or(self.newest_link.as_deref() == Some(link_id))
     }
@@ -172,7 +166,9 @@ enum Revoke {
     Others,
 }
 
-fn revoke(state: &Entity<AccessState>, endpoint: Option<Endpoint>, target: Revoke, window: &mut Window, cx: &mut App) {
+/// Sends one revocation through the environment's address now, while this session has
+/// `access:write` there; the button can outlive a reconnect or a narrowed session.
+fn revoke(state: &Entity<AccessState>, host: &AccessHost, target: Revoke, window: &mut Window, cx: &mut App) {
     let (path, body, title, fallback) = match &target {
         Revoke::Link(id) => (
             "/api/auth/pairing-links/revoke",
@@ -193,6 +189,9 @@ fn revoke(state: &Entity<AccessState>, endpoint: Option<Endpoint>, target: Revok
             "Failed to revoke other clients.",
         ),
     };
+    let Some(endpoint) = host.endpoint(&[], cx) else {
+        return error_toast(window, cx, title, "This connection can no longer manage access on this environment.");
+    };
     state.update(cx, |state, cx| {
         match &target {
             Revoke::Link(id) => state.revoking_link = Some(id.clone()),
@@ -205,7 +204,7 @@ fn revoke(state: &Entity<AccessState>, endpoint: Option<Endpoint>, target: Revok
     let state = state.downgrade();
     window
         .spawn(cx, async move |cx| {
-            let result = auth_request(endpoint, path, Some(body)).await;
+            let result = auth_request(Some(endpoint), path, Some(body)).await;
             let _ = cx.update(|window, cx| {
                 let _ = state.update(cx, |state, cx| {
                     match &target {
@@ -254,14 +253,13 @@ impl Workspace {
         // Keyed by environment, so pairing credentials and pending work never carry over.
         let key = format!("settings-access:{}", self.settings_environment().as_deref().unwrap_or_default());
         let state = window.use_keyed_state(SharedString::from(key), cx, |_, _| AccessState::default());
-        let (client, endpoint) = (self.settings_client(), self.settings_endpoint().cloned());
-        state.update(cx, |state, cx| state.start(client, endpoint, cx));
+        let reader = self.settings_client().filter(|_| self.settings_grants(ACCESS_READ));
+        state.update(cx, |state, cx| state.sync(reader, cx));
         let t = *theme::tokens(cx);
         let local_rows = if self.access_is_primary() { self.local_backend_rows(window, cx, &t) } else { None };
         let mut sections: Vec<AnyElement> = self.access_environment_picker(cx, &t).into_iter().collect();
-        sections.push(self.environment_card(&state, local_rows, window, cx, &t));
-        let s = state.read(cx);
-        if s.grants(ACCESS_READ) || s.grants(ACCESS_WRITE) {
+        sections.push(self.environment_card(&state, local_rows, cx, &t));
+        if self.settings_grants(ACCESS_READ) || self.settings_grants(ACCESS_WRITE) {
             sections.push(self.authorized_clients(&state, cx, &t));
         }
         self.settings_page("access", view, sections, cx)
@@ -344,8 +342,7 @@ impl Workspace {
         &self,
         state: &Entity<AccessState>,
         local_rows: Option<Vec<AnyElement>>,
-        window: &mut Window,
-        cx: &App,
+        cx: &Context<Self>,
         t: &Tokens,
     ) -> AnyElement {
         let s = state.read(cx);
@@ -362,7 +359,7 @@ impl Workspace {
                 .map(str::to_owned);
             rows.push(managed_notice(organization, support, t));
         }
-        if s.grants(ENVIRONMENT_MAINTAIN) {
+        if self.settings_grants(ENVIRONMENT_MAINTAIN) {
             let version = config.pointer("/environment/serverVersion").and_then(Value::as_str);
             let url = self.settings_endpoint().map(|e| e.http_base.as_str());
             let parts: Vec<&str> = [version, url].into_iter().flatten().collect();
@@ -376,11 +373,11 @@ impl Workspace {
             // A server this app started is exposed from here (`renderNetworkAccessRow`).
             match local_rows {
                 Some(local) => rows.extend(local),
-                None => rows.push(network_access_row(s, t)),
+                None => rows.push(network_access_row(self.settings_auth().and_then(SessionLoad::session), t)),
             }
         }
-        rows.push(permissions_details(state, s, self.settings_client().is_some(), t));
-        let more = self.icon_menu(s, window).into_any_element();
+        rows.push(permissions_details(state, s, self.settings_auth(), self.settings_client().is_some(), t));
+        let more = self.icon_menu(cx).into_any_element();
         let icon = ui::glyph(logic::machine_icon(self.settings_info().machine_kind()), 16., t.foreground);
         section_with_action(
             "connections-environment",
@@ -391,26 +388,22 @@ impl Workspace {
         )
     }
 
-    /// The "…" menu with its Icon submenu (`EnvironmentIconMenu`).
-    fn icon_menu(&self, s: &AccessState, _: &mut Window) -> impl IntoElement {
-        let config = &self.settings_info().config;
-        let lock = if !config.is_object() {
-            Some("Connect to this environment to change its icon.")
-        } else if !s.grants(SETTINGS_WRITE) {
-            Some("Your session on this environment cannot change its settings.")
-        } else {
-            None
+    /// The "…" menu with its Icon submenu (`EnvironmentIconMenu`). It keeps the environment and
+    /// reads its config and grants when it opens, and again when an icon is picked.
+    fn icon_menu(&self, cx: &Context<Self>) -> impl IntoElement {
+        let writer = SettingsWriter {
+            workspace: cx.entity().downgrade(),
+            environment: self.settings_environment(),
+            label: self.environment_label().unwrap_or("this environment").to_owned(),
         };
-        let machine = config.pointer("/environment/platform/machine").and_then(Value::as_str).map(str::to_owned);
-        let resolved = self.settings_info().machine_kind().to_owned();
-        let client = self.settings_client();
         Button::new("settings-access-more")
             .ghost()
             .xsmall()
             .icon(IconName::Ellipsis)
             .tooltip("More actions for this machine")
             .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |menu, window, cx| {
-                let (machine, resolved, client) = (machine.clone(), resolved.clone(), client.clone());
+                let Some((lock, machine, resolved)) = icon_choice(&writer, cx) else { return menu };
+                let writer = writer.clone();
                 let icon = gpui_kit::component::Icon::default().path(logic::machine_icon(&resolved));
                 menu.submenu_with_icon(Some(icon), "Icon", window, cx, move |mut menu, _, _| {
                     if let Some(lock) = lock {
@@ -421,7 +414,7 @@ impl Workspace {
                         let note = (*kind == detected).then(|| if machine.is_some() { "detected" } else { "default" });
                         let patch =
                             json!({ "environmentIcon": if *kind == detected { Value::Null } else { json!(kind) } });
-                        let client = client.clone();
+                        let writer = writer.clone();
                         menu = menu.item(
                             PopupMenuItem::element(move |_, cx| {
                                 let t = theme::tokens(cx);
@@ -437,16 +430,9 @@ impl Workspace {
                             .checked(resolved == *kind)
                             .disabled(lock.is_some())
                             .on_click(move |_, window, cx| {
-                                let (client, patch) = (client.clone(), patch.clone());
-                                window
-                                    .spawn(cx, async move |cx| {
-                                        if let Err(error) = update_settings(client, patch).await {
-                                            let _ = cx.update(|window, cx| {
-                                                error_toast(window, cx, "Could not update settings", error);
-                                            });
-                                        }
-                                    })
-                                    .detach();
+                                if icon_choice(&writer, cx).is_some_and(|(lock, ..)| lock.is_none()) {
+                                    writer.save(patch.clone(), &[SETTINGS_WRITE], window, cx);
+                                }
                             }),
                         );
                     }
@@ -458,21 +444,20 @@ impl Workspace {
     fn authorized_clients(&self, state: &Entity<AccessState>, cx: &Context<Self>, t: &Tokens) -> AnyElement {
         static EMPTY: AccessSnapshot = AccessSnapshot { pairing_links: Vec::new(), client_sessions: Vec::new() };
         let s = state.read(cx);
-        let (can_read, can_write) = (s.grants(ACCESS_READ), s.grants(ACCESS_WRITE));
+        let (can_read, can_write) = (self.settings_grants(ACCESS_READ), self.settings_grants(ACCESS_WRITE));
         let snapshot = s.access.as_ref().unwrap_or(&EMPTY);
         let now = now_ms();
         let links: Vec<&PairingLink> =
             snapshot.sorted_links().into_iter().filter(|l| logic::ms(&l.expires_at) > now).collect();
         let sessions = snapshot.sorted_sessions();
         let open = s.clients_open;
-        let endpoint = self.settings_endpoint().cloned();
+        let host = AccessHost { workspace: cx.entity().downgrade(), environment: self.settings_environment() };
         let local = self.desktop.exposure.as_ref().filter(|_| self.access_is_primary() && !self.environment_remote);
         let targets = ShareTargets {
             endpoints: local.map(pairing::desktop_endpoints).unwrap_or_default(),
             endpoint_url: local.and_then(|view| view.exposure.endpoint_url.clone()),
         };
-        let link_row =
-            |link: &PairingLink| pairing_link_row(state, s, link, can_write, endpoint.clone(), &targets, now, t);
+        let link_row = |link: &PairingLink| pairing_link_row(state, s, link, can_write, &host, &targets, now, t);
 
         let toggle = {
             let state = state.clone();
@@ -495,6 +480,7 @@ impl Workspace {
                     .py(px(8.))
                     .gap(px(8.))
                     .cursor_pointer()
+                    .map(|el| ui::fold_trigger(el, t.ring))
                     .on_click(toggle)
                     .child(ui::chevron(open, 16., t.muted_foreground))
                     .child(text_sm(div().flex_none().font_weight(FontWeight::MEDIUM)).child("Authorized clients"))
@@ -520,11 +506,7 @@ impl Workspace {
                 );
             }
             body.extend(links.iter().map(|link| link_row(link)));
-            body.extend(
-                sessions
-                    .iter()
-                    .map(|session| client_session_row(state, s, session, can_write, endpoint.clone(), now, t)),
-            );
+            body.extend(sessions.iter().map(|session| client_session_row(state, s, session, can_write, &host, now, t)));
             if links.is_empty() && sessions.is_empty() && s.access.is_some() {
                 body.push(
                     ui::item_row(
@@ -566,6 +548,7 @@ impl Workspace {
         t: &Tokens,
     ) -> AnyElement {
         let environment = self.settings_environment();
+        let host = AccessHost { workspace: workspace.clone(), environment: environment.clone() };
         let use_in_another_app = WebButton::new("use-in-another-app", "Use in another app (MCP)")
             .icon(IconName::Plug)
             .on_click(move |_, window, cx| {
@@ -573,7 +556,6 @@ impl Workspace {
                     this.open_use_in_another_app(environment.as_deref(), window, cx);
                 });
             });
-        let endpoint = self.settings_endpoint().cloned();
         // Unknown sessions keep the button on, as the web does without a snapshot.
         let others =
             !can_read || s.access_error.is_some() || s.access.as_ref().is_none_or(AccessSnapshot::has_other_clients);
@@ -584,14 +566,11 @@ impl Workspace {
         .variant(Variant::DestructiveOutline)
         .disabled(s.revoking_others || !others)
         .on_click({
-            let (state, endpoint) = (state.clone(), endpoint.clone());
-            move |_, window, cx| revoke(&state, endpoint.clone(), Revoke::Others, window, cx)
+            let state = state.clone();
+            let host = host.clone();
+            move |_, window, cx| revoke(&state, &host, Revoke::Others, window, cx)
         });
         let denial = logic::remote_clients_denial(&self.settings_info().managed_policy);
-        let delegatable: Vec<String> = match &s.session {
-            SessionLoad::Ready(session) => session.delegatable().to_vec(),
-            _ => Vec::new(),
-        };
         let create =
             WebButton::new("create-pairing-link", "Create link").variant(Variant::Primary).icon(IconName::Plus);
         let create = match denial {
@@ -605,7 +584,7 @@ impl Workspace {
                 let state = state.downgrade();
                 create
                     .on_click(move |_, window, cx| {
-                        open_create_link_dialog(state.clone(), endpoint.clone(), delegatable.clone(), window, cx);
+                        open_create_link_dialog(state.clone(), host.clone(), window, cx);
                     })
                     .into_any_element()
             }
@@ -613,6 +592,28 @@ impl Workspace {
         let _ = t;
         h_flex().gap(px(8.)).child(use_in_another_app).child(revoke_others).child(create).into_any_element()
     }
+}
+
+/// The icon menu's environment as it is now: `resolveEnvironmentIconPickerLock`, the detected
+/// machine and the resolved icon. `None` once the workspace is gone.
+fn icon_choice(writer: &SettingsWriter, cx: &App) -> Option<(Option<&'static str>, Option<String>, String)> {
+    let workspace = writer.workspace.upgrade()?;
+    let workspace = workspace.read(cx);
+    let environment = writer.environment.as_deref();
+    let info = environment.and_then(|id| workspace.session(id)).map(|session| &session.server_info);
+    let lock = if !info.is_some_and(|info| info.config.is_object()) {
+        Some("Connect to this environment to change its icon.")
+    } else if !environment.is_some_and(|id| workspace.env_grants(id, SETTINGS_WRITE)) {
+        Some("Your session on this environment cannot change its settings.")
+    } else {
+        None
+    };
+    let machine = info
+        .and_then(|info| info.config.pointer("/environment/platform/machine"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let resolved = info.map_or("server", |info| info.machine_kind()).to_owned();
+    Some((lock, machine, resolved))
 }
 
 /// `ManagedByOrganization`.
@@ -636,6 +637,7 @@ fn managed_notice(organization: &str, support: Option<String>, t: &Tokens) -> An
                                     .text_color(t.foreground)
                                     .underline()
                                     .cursor_pointer()
+                                    .map(|el| ui::tab_stop(el, t.ring))
                                     .on_click(move |_, _, cx| cx.open_url(&url))
                                     .child("Get help"),
                             )
@@ -646,11 +648,8 @@ fn managed_notice(organization: &str, support: Option<String>, t: &Tokens) -> An
 }
 
 /// `renderDisabledNetworkAccessRow`: exposure is decided where the server starts.
-fn network_access_row(s: &AccessState, t: &Tokens) -> AnyElement {
-    let policy = match &s.session {
-        SessionLoad::Ready(session) => session.policy.as_deref(),
-        _ => None,
-    };
+fn network_access_row(session: Option<&Session>, t: &Tokens) -> AnyElement {
+    let policy = session.and_then(|session| session.policy.as_deref());
     let description = match policy {
         Some("remote-reachable") => {
             "Remote access is already configured. Change network exposure where the server starts."
@@ -677,7 +676,13 @@ fn network_access_row(s: &AccessState, t: &Tokens) -> AnyElement {
 }
 
 /// The "Permissions" disclosure (`SessionPermissions`).
-fn permissions_details(state: &Entity<AccessState>, s: &AccessState, connected: bool, t: &Tokens) -> AnyElement {
+fn permissions_details(
+    state: &Entity<AccessState>,
+    s: &AccessState,
+    auth: Option<&SessionLoad>,
+    connected: bool,
+    t: &Tokens,
+) -> AnyElement {
     let open = s.permissions_open;
     let toggle = {
         let state = state.clone();
@@ -693,33 +698,40 @@ fn permissions_details(state: &Entity<AccessState>, s: &AccessState, connected: 
         .min_h(px(44.))
         .gap(px(8.))
         .cursor_pointer()
+        .map(|el| ui::fold_trigger(el, t.ring))
         .on_click(toggle)
         .child(text_sm(div().font_weight(FontWeight::MEDIUM)).child("Permissions"))
         .child(ui::chevron(open, 12., t.muted_foreground));
-    let body = open.then(|| match (&s.session, connected) {
-        (SessionLoad::Ready(session), true) if session.authenticated => text_xs(v_flex().gap(px(12.)).py(px(12.)))
-            .child(
-                div()
-                    .text_color(t.muted_foreground)
-                    .child("These permissions apply to this client\u{2019}s current connection."),
-            )
-            .child(div().flex().flex_wrap().gap_y(px(8.)).children(logic::SCOPE_OPTIONS.iter().map(
-                |(scope, title, _)| {
-                    let granted = session.grants(scope);
-                    // Two columns 24px apart (`sm:grid-cols-2 gap-x-6`).
-                    h_flex().w(gpui_kit::relative(0.5)).pr(px(12.)).justify_between().gap(px(12.)).child(*title).child(
-                        div().flex_none().text_color(t.muted_foreground).child(if granted {
-                            "Allowed"
-                        } else {
-                            "Not granted"
-                        }),
-                    )
-                },
-            )))
-            .into_any_element(),
+    let body = open.then(|| match (auth, connected) {
+        (Some(SessionLoad::Ready(session)), true) if session.authenticated => {
+            text_xs(v_flex().gap(px(12.)).py(px(12.)))
+                .child(
+                    div()
+                        .text_color(t.muted_foreground)
+                        .child("These permissions apply to this client\u{2019}s current connection."),
+                )
+                .child(div().flex().flex_wrap().gap_y(px(8.)).children(logic::SCOPE_OPTIONS.iter().map(
+                    |(scope, title, _)| {
+                        let granted = session.grants(scope);
+                        // Two columns 24px apart (`sm:grid-cols-2 gap-x-6`).
+                        h_flex()
+                            .w(gpui_kit::relative(0.5))
+                            .pr(px(12.))
+                            .justify_between()
+                            .gap(px(12.))
+                            .child(*title)
+                            .child(div().flex_none().text_color(t.muted_foreground).child(if granted {
+                                "Allowed"
+                            } else {
+                                "Not granted"
+                            }))
+                    },
+                )))
+                .into_any_element()
+        }
         (session, connected) => {
-            let failed = matches!(session, SessionLoad::Failed);
-            let rejected = matches!(session, SessionLoad::Ready(s) if !s.authenticated);
+            let failed = matches!(session, Some(SessionLoad::Failed));
+            let rejected = matches!(session, Some(SessionLoad::Ready(s)) if !s.authenticated);
             text_xs(div().py(px(12.)).text_color(t.muted_foreground))
                 .child(logic::permissions_unavailable_message(connected, failed, rejected))
                 .into_any_element()
@@ -761,7 +773,7 @@ fn pairing_link_row(
     s: &AccessState,
     link: &PairingLink,
     can_revoke: bool,
-    endpoint: Option<Endpoint>,
+    host: &AccessHost,
     targets: &ShareTargets,
     now: i64,
     t: &Tokens,
@@ -840,8 +852,8 @@ fn pairing_link_row(
             .variant(Variant::DestructiveOutline)
             .disabled(!can_revoke || revoking)
             .on_click({
-                let (state, id) = (state.clone(), id.clone());
-                move |_, window, cx| revoke(&state, endpoint.clone(), Revoke::Link(id.clone()), window, cx)
+                let (state, id, host) = (state.clone(), id.clone(), host.clone());
+                move |_, window, cx| revoke(&state, &host, Revoke::Link(id.clone()), window, cx)
             }),
         );
     let panel = match (share, credential) {
@@ -1004,7 +1016,7 @@ fn client_session_row(
     s: &AccessState,
     session: &ClientSession,
     can_revoke: bool,
-    endpoint: Option<Endpoint>,
+    host: &AccessHost,
     now: i64,
     t: &Tokens,
 ) -> AnyElement {
@@ -1056,8 +1068,8 @@ fn client_session_row(
         .variant(Variant::DestructiveOutline)
         .disabled(!can_revoke || revoking)
         .on_click({
-            let (state, id) = (state.clone(), id.clone());
-            move |_, window, cx| revoke(&state, endpoint.clone(), Revoke::Client(id.clone()), window, cx)
+            let (state, id, host) = (state.clone(), id.clone(), host.clone());
+            move |_, window, cx| revoke(&state, &host, Revoke::Client(id.clone()), window, cx)
         })
         .into_any_element()
     });
@@ -1071,28 +1083,57 @@ fn client_session_row(
 struct CreateLinkForm {
     label: Entity<InputState>,
     scopes: Vec<String>,
-    delegatable: Vec<String>,
     busy: bool,
     access: WeakEntity<AccessState>,
-    endpoint: Option<Endpoint>,
+    host: AccessHost,
+    _observe: Option<Subscription>,
+}
+
+/// The environment the access page shows, read again when a link is created or access is
+/// revoked: the dialog or button can outlive a reconnect.
+#[derive(Clone)]
+struct AccessHost {
+    workspace: WeakEntity<Workspace>,
+    environment: Option<SharedString>,
+}
+
+impl AccessHost {
+    /// The environment's address now, while this session may issue `scopes` there.
+    fn endpoint(&self, scopes: &[String], cx: &App) -> Option<Endpoint> {
+        let workspace = self.workspace.upgrade()?;
+        let workspace = workspace.read(cx);
+        let environment = self.environment.as_deref()?;
+        let grants = |scope: &str| workspace.env_grants(environment, scope);
+        (grants(ACCESS_WRITE) && scopes.iter().all(|scope| grants(scope)))
+            .then(|| workspace.env_endpoint(environment).cloned())
+            .flatten()
+    }
+
+    /// The scopes this session may hand on there now, as the web's live `delegatableScopes`.
+    fn delegatable(&self, cx: &App) -> Vec<String> {
+        let Some(workspace) = self.workspace.upgrade() else { return Vec::new() };
+        let auth = self.environment.as_deref().and_then(|environment| workspace.read(cx).env_auth(environment));
+        auth.and_then(SessionLoad::session).map(|session| session.delegatable().to_vec()).unwrap_or_default()
+    }
 }
 
 impl CreateLinkForm {
-    fn selected(&self) -> Vec<String> {
-        self.scopes.iter().filter(|s| self.delegatable.contains(s)).cloned().collect()
+    fn selected(&self, delegatable: &[String]) -> Vec<String> {
+        self.scopes.iter().filter(|s| delegatable.contains(s)).cloned().collect()
     }
 
     fn preset(&mut self, scopes: &[&str], cx: &mut Context<Self>) {
-        self.scopes =
-            scopes.iter().map(std::string::ToString::to_string).filter(|s| self.delegatable.contains(s)).collect();
+        let delegatable = self.host.delegatable(cx);
+        self.scopes = scopes.iter().map(std::string::ToString::to_string).filter(|s| delegatable.contains(s)).collect();
         cx.notify();
     }
 
     fn create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let scopes = self.selected();
-        if self.busy || scopes.is_empty() || !scopes.iter().all(|s| self.delegatable.contains(s)) {
+        let scopes = self.selected(&self.host.delegatable(cx));
+        if self.busy || scopes.is_empty() {
             return;
         }
+        let Some(endpoint) = self.host.endpoint(&scopes, cx) else { return };
         self.busy = true;
         cx.notify();
         let label = self.label.read(cx).value().trim().to_owned();
@@ -1100,34 +1141,41 @@ impl CreateLinkForm {
         if !label.is_empty() {
             body["label"] = label.into();
         }
-        let endpoint = self.endpoint.clone();
-        cx.spawn_in(window, async move |this, cx| {
-            let result = auth_request(endpoint, "/api/auth/pairing-token", Some(body)).await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.busy = false;
-                cx.notify();
-                match result {
-                    Ok(created) => {
-                        let (Some(id), Some(credential)) = (created["id"].as_str(), created["credential"].as_str())
-                        else {
-                            let message = "The environment sent no pairing credential.";
-                            return error_toast(window, cx, "Could not create pairing URL", message.to_owned());
-                        };
-                        let _ = this.access.update(cx, |access, cx| {
-                            access.credentials.insert(id.to_owned(), credential.to_owned());
-                            access.newest_link = Some(id.to_owned());
-                            cx.notify();
-                        });
-                        window.close_dialog(cx);
+        let (form, access) = (cx.weak_entity(), self.access.clone());
+        // On the window, not the form: the credential shows once, so a closed dialog must not drop it.
+        window
+            .spawn(cx, async move |cx| {
+                let result = auth_request(Some(endpoint), "/api/auth/pairing-token", Some(body)).await;
+                let created =
+                    result.and_then(|created| match (created["id"].as_str(), created["credential"].as_str()) {
+                        (Some(id), Some(credential)) => Ok((id.to_owned(), credential.to_owned())),
+                        _ => Err("The environment sent no pairing credential.".to_owned()),
+                    });
+                drop(cx.update(|window, cx| {
+                    let open = form.update(cx, |form, cx| {
+                        form.busy = false;
+                        cx.notify();
+                    });
+                    match created {
+                        Ok((id, credential)) => {
+                            drop(access.update(cx, |access, cx| {
+                                access.credentials.insert(id.clone(), credential);
+                                access.newest_link = Some(id);
+                                cx.notify();
+                            }));
+                            if open.is_ok() {
+                                window.close_dialog(cx);
+                            }
+                        }
+                        Err(error) => {
+                            let message =
+                                if error.is_empty() { "Failed to create pairing URL.".to_owned() } else { error };
+                            error_toast(window, cx, "Could not create pairing URL", message);
+                        }
                     }
-                    Err(error) => {
-                        let message = if error.is_empty() { "Failed to create pairing URL.".to_owned() } else { error };
-                        error_toast(window, cx, "Could not create pairing URL", message);
-                    }
-                }
-            });
-        })
-        .detach();
+                }));
+            })
+            .detach();
     }
 }
 
@@ -1135,8 +1183,9 @@ impl Render for CreateLinkForm {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *theme::tokens(cx);
         let busy = self.busy;
-        let selected = self.selected();
-        let options = logic::SCOPE_OPTIONS.iter().filter(|(scope, ..)| self.delegatable.iter().any(|d| d == scope));
+        let delegatable = self.host.delegatable(cx);
+        let selected = self.selected(&delegatable);
+        let options = logic::SCOPE_OPTIONS.iter().filter(|(scope, ..)| delegatable.iter().any(|d| d == scope));
         let warning = if selected.is_empty() {
             Some((t.error_foreground, "Select at least one permission."))
         } else if selected.iter().any(|s| s == ACCESS_WRITE) {
@@ -1190,22 +1239,23 @@ impl Render for CreateLinkForm {
                             .border_color(t.input)
                             .bg(t.muted.opacity(0.25))
                             .children(options.enumerate().map(|(index, (scope, title, description))| {
-                                let checked = self.scopes.iter().any(|s| s == scope);
-                                h_flex()
-                                    .id(ElementId::Name(format!("pairing-scope-{scope}").into()))
-                                    .items_start()
+                                // The row is the checkbox, as the web's <label> is: one tab stop
+                                // that a click, Enter or Space toggles once.
+                                Checkbox::new(ElementId::Name(format!("pairing-scope-{scope}").into()))
+                                    .checked(self.scopes.iter().any(|s| s == scope))
+                                    .disabled(busy)
+                                    .accessibility_label(*title)
+                                    .on_change(cx.listener(move |this, checked: &bool, _, cx| {
+                                        this.scopes = logic::toggle_scope(&this.scopes, scope, *checked);
+                                        cx.notify();
+                                    }))
+                                    .w_full()
                                     .gap(px(12.))
                                     .px(px(12.))
                                     .py(px(10.))
                                     .when(index > 0, |el| el.border_t_1().border_color(hairline))
                                     .hover(|style| style.bg(t.muted.opacity(0.4)))
-                                    .when(!busy, |el| {
-                                        el.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
-                                            this.scopes = logic::toggle_scope(&this.scopes, scope, !checked);
-                                            cx.notify();
-                                        }))
-                                    })
-                                    .child(div().mt(px(2.)).child(Checkbox::new(*scope).checked(checked).disabled(busy)))
+                                    .when(!busy, gpui_kit::Styled::cursor_pointer)
                                     .child(
                                         text_xs(v_flex().min_w_0())
                                             .child(div().font_weight(FontWeight::MEDIUM).child(*title))
@@ -1236,16 +1286,14 @@ impl Render for CreateLinkForm {
     }
 }
 
-fn open_create_link_dialog(
-    access: WeakEntity<AccessState>,
-    endpoint: Option<Endpoint>,
-    delegatable: Vec<String>,
-    window: &mut Window,
-    cx: &mut App,
-) {
+fn open_create_link_dialog(access: WeakEntity<AccessState>, host: AccessHost, window: &mut Window, cx: &mut App) {
     let label = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. Living room iPad"));
     label.update(cx, |input, cx| input.focus(window, cx));
     let scopes = logic::STANDARD_SCOPES.iter().map(std::string::ToString::to_string).collect();
-    let form = cx.new(|_| CreateLinkForm { label, scopes, delegatable, busy: false, access, endpoint });
+    let form = cx.new(|cx| {
+        // Re-filter the permissions when this session's grants there change, as the web's render does.
+        let observe = host.workspace.upgrade().map(|workspace| cx.observe(&workspace, |_, _, cx| cx.notify()));
+        CreateLinkForm { label, scopes, busy: false, access, host, _observe: observe }
+    });
     window.open_dialog(cx, move |dialog, _, _| dialog.title("Create pairing link").w(px(448.)).child(form.clone()));
 }

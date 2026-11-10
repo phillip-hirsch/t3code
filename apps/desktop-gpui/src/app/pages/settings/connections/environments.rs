@@ -21,28 +21,37 @@ use super::super::widgets::{RowFrame, section_with_action};
 use super::linking::{ANOTHER_ADDRESS, LinkableMachine, machine_badge, mint_link_code};
 use super::logic::{self, ACCESS_READ, ACCESS_WRITE, LinkTone};
 use super::ui::{self, Size, Variant, WebButton, text_sm, text_xs};
-use super::{SessionLoad, check_session, error_toast, success_toast};
+use super::{error_toast, success_toast};
 use crate::app::Workspace;
 use crate::app::pages::settings::widgets::SettingsView;
 use crate::app::sidebar::now_ms;
 use crate::backend::Endpoint;
-use crate::rpc::RpcClient;
+use crate::rpc::{RpcClient, RpcError, SocketId};
 use crate::theme::{self, Tokens};
 
 #[derive(Default)]
 pub(super) struct EnvironmentsState {
-    started: bool,
-    session: SessionLoad,
+    /// The socket `peerLinks.list` was read on; a new connection reads again.
+    loaded_on: Option<SocketId>,
     /// `peerLinks.list`: `None` while loading.
     links: Option<Result<Vec<Value>, String>>,
     forgetting: Option<String>,
-    _tasks: Vec<Task<()>>,
+    /// The latest listing; a newer one replaces it, so an older answer never lands.
+    _load: Option<Task<()>>,
 }
 
 impl EnvironmentsState {
+    /// Lists the links on `client`'s socket unless they were read there already.
+    fn sync_links(&mut self, client: RpcClient, cx: &mut Context<Self>) {
+        if self.loaded_on.as_ref() != Some(&client.socket_id()) {
+            self.load_links(Some(client), cx);
+        }
+    }
+
     fn load_links(&mut self, client: Option<RpcClient>, cx: &mut Context<Self>) {
         let Some(client) = client else { return };
-        self._tasks.push(cx.spawn(async move |this, cx| {
+        self.loaded_on = Some(client.socket_id());
+        self._load = Some(cx.spawn(async move |this, cx| {
             let result = client.request("peerLinks.list", json!({})).await;
             let _ = this.update(cx, |this, cx| {
                 this.links = Some(match result {
@@ -64,8 +73,8 @@ impl Workspace {
     ) -> AnyElement {
         let t = *theme::tokens(cx);
         let mut sections = vec![self.this_app_section(cx, &t), self.saved_environments_section(window, cx)];
-        // `usePeerLinkHosts`: connected hosts offering links whose session may read them.
-        let hosts: Vec<(SharedString, String, RpcClient, Endpoint)> = self
+        // `usePeerLinkHosts`: connected hosts offering links whose current session may read them.
+        let hosts: Vec<(SharedString, String, RpcClient)> = self
             .sessions
             .iter()
             .filter(|s| {
@@ -74,39 +83,27 @@ impl Workspace {
             .filter_map(|s| {
                 let id = s.id.clone()?;
                 let label = s.server_info.environment_label.clone().unwrap_or_else(|| id.to_string());
-                Some((id, label, s.client.clone()?, s.endpoint.clone()?))
+                Some((id, label, s.client.clone()?))
             })
+            .filter(|(id, ..)| self.env_grants(id, ACCESS_READ))
             .collect();
         let mut readable = Vec::new();
-        for (id, label, client, endpoint) in hosts {
+        for (id, label, client) in hosts {
             let key = SharedString::from(format!("settings-environments:{id}"));
             let state = window.use_keyed_state(key, cx, |_, _| EnvironmentsState::default());
-            if !state.read(cx).started {
-                let loader = client.clone();
-                state.update(cx, |state, cx| {
-                    state.started = true;
-                    state._tasks.push(check_session(endpoint, cx, move |this, session, cx| {
-                        if session.grants(ACCESS_READ) {
-                            this.load_links(Some(loader.clone()), cx);
-                        }
-                        this.session = session;
-                    }));
-                });
-            }
-            if state.read(cx).session.grants(ACCESS_READ) {
-                readable.push((id, label, client, state));
-            }
+            state.update(cx, |state, cx| state.sync_links(client, cx));
+            readable.push((id, label, state));
         }
         let multiple = readable.len() > 1;
         let workspace = cx.entity().downgrade();
-        for (index, (id, label, client, state)) in readable.into_iter().enumerate() {
+        for (index, (id, label, state)) in readable.into_iter().enumerate() {
             // The first is the search's "Linked environments" target; headings name their host
             // once there are several.
             let section_id: SharedString =
                 if index == 0 { "linked-environments".into() } else { format!("linked-environments-{id}").into() };
             let title =
                 if multiple { format!("Linked environments \u{b7} {label}") } else { "Linked environments".into() };
-            let host = LinkHost { workspace: workspace.clone(), id, client };
+            let host = LinkHost { workspace: workspace.clone(), id };
             sections.push(self.linked_environments(&state, host, section_id, title, cx, &t));
         }
         sections.extend(self.load_balancing_section(cx));
@@ -124,16 +121,16 @@ impl Workspace {
         t: &Tokens,
     ) -> AnyElement {
         let s = state.read(cx);
-        let can_link = s.session.grants(ACCESS_WRITE);
-        let client = Some(host.client.clone());
+        let can_link = self.env_grants(&host.id, ACCESS_WRITE);
+        let row_host = host.clone();
         let action = can_link.then(|| {
             let state = state.downgrade();
             WebButton::new("link-environment", "Link")
                 .variant(Variant::Primary)
                 .icon(IconName::Plus)
                 .on_click(move |_, window, cx| {
-                    let LinkHost { workspace, id, client } = host.clone();
-                    open_link_dialog(workspace, id, Some(client), state.clone(), window, cx);
+                    let LinkHost { workspace, id } = host.clone();
+                    open_link_dialog(workspace, id, state.clone(), window, cx);
                 })
                 .into_any_element()
         });
@@ -150,19 +147,30 @@ impl Workspace {
             ],
             Some(Ok(links)) => {
                 let now = now_ms();
-                links.iter().map(|link| linked_row(state, s, link, can_link, client.clone(), now, t)).collect()
+                links.iter().map(|link| linked_row(state, s, link, can_link, &row_host, now, t)).collect()
             }
         };
         section_with_action(id, title, action, rows, t)
     }
 }
 
-/// The environment a Link dialog links from.
+/// The environment a Link dialog links from, whose socket its requests read when they run.
 #[derive(Clone)]
 struct LinkHost {
     workspace: WeakEntity<Workspace>,
     id: SharedString,
-    client: RpcClient,
+}
+
+impl LinkHost {
+    /// The socket that links and unlinks, while this session may.
+    fn client(&self, cx: &App) -> Option<RpcClient> {
+        self.workspace.upgrade()?.read(cx).access_client(&self.id)
+    }
+
+    /// The socket that lists the links.
+    fn reader(&self, cx: &App) -> Option<RpcClient> {
+        self.workspace.upgrade()?.read(cx).env_client(&self.id)
+    }
 }
 
 fn linked_row(
@@ -170,7 +178,7 @@ fn linked_row(
     s: &EnvironmentsState,
     link: &Value,
     can_unlink: bool,
-    client: Option<RpcClient>,
+    host: &LinkHost,
     now: i64,
     t: &Tokens,
 ) -> AnyElement {
@@ -203,7 +211,7 @@ fn linked_row(
         .child(text_xs(div().truncate().text_color(t.muted_foreground.opacity(0.8))).child(urls.join(", ")));
     let busy = s.forgetting.as_ref() == Some(&id);
     let actions = can_unlink.then(|| {
-        let state = state.downgrade();
+        let (state, host) = (state.downgrade(), host.clone());
         WebButton::new(
             ElementId::Name(format!("linked-forget-{id}").into()),
             if busy { "Forgetting\u{2026}" } else { "Forget" },
@@ -211,7 +219,7 @@ fn linked_row(
         .variant(Variant::DestructiveOutline)
         .disabled(busy)
         .on_click(move |_, window, cx| {
-            confirm_forget(state.clone(), client.clone(), id.clone(), label.clone(), window, cx);
+            confirm_forget(state.clone(), host.clone(), id.clone(), label.clone(), window, cx);
         })
         .into_any_element()
     });
@@ -220,14 +228,14 @@ fn linked_row(
 
 fn confirm_forget(
     state: WeakEntity<EnvironmentsState>,
-    client: Option<RpcClient>,
+    host: LinkHost,
     id: String,
     label: String,
     window: &mut Window,
     cx: &mut App,
 ) {
     window.open_alert_dialog(cx, move |dialog, _, _| {
-        let (state, client, id, label) = (state.clone(), client.clone(), id.clone(), label.clone());
+        let (state, host, id, label) = (state.clone(), host.clone(), id.clone(), label.clone());
         dialog
             .title("Forget linked environment?")
             .description(format!(
@@ -237,8 +245,8 @@ fn confirm_forget(
             .ok_text("Forget")
             .ok_variant(gpui_kit::component::button::ButtonVariant::Danger)
             .on_ok(move |_, window, cx| {
-                let (state, client, id) = (state.clone(), client.clone(), id.clone());
-                let Some(rpc) = client.clone() else { return true };
+                let (state, host, id) = (state.clone(), host.clone(), id.clone());
+                let Some(rpc) = host.client(cx) else { return true };
                 let _ = state.update(cx, |s, cx| {
                     s.forgetting = Some(id.clone());
                     cx.notify();
@@ -247,6 +255,7 @@ fn confirm_forget(
                     .spawn(cx, async move |cx| {
                         let result = rpc.request("peerLinks.unlink", json!({ "environmentId": id })).await;
                         let _ = cx.update(|window, cx| {
+                            let client = host.reader(cx);
                             let _ = state.update(cx, |s, cx| {
                                 s.forgetting = None;
                                 s.load_links(client, cx);
@@ -315,7 +324,6 @@ struct LinkForm {
     busy: bool,
     /// Machines whose minting already failed, so the dialog asks for a code instead.
     mint_failed: HashSet<String>,
-    client: Option<RpcClient>,
     list: WeakEntity<EnvironmentsState>,
     _subscriptions: Vec<Subscription>,
 }
@@ -336,6 +344,10 @@ impl LinkForm {
         self.workspace.upgrade()?.read(cx).mint_endpoint(&machine.environment_id)
     }
 
+    fn host(&self) -> LinkHost {
+        LinkHost { workspace: self.workspace.clone(), id: self.host.clone() }
+    }
+
     fn ready(&self, plan: &LinkFormPlan, cx: &App) -> bool {
         plan.selected.is_some()
             && (!plan.needs_address || !self.address.read(cx).value().trim().is_empty())
@@ -354,9 +366,9 @@ impl LinkForm {
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.client.clone() else { return };
         let plan = link_form_plan(&self.machines(cx), self.choice.as_deref());
-        if self.busy || !self.ready(&plan, cx) {
+        let host = self.host();
+        if self.busy || !self.ready(&plan, cx) || host.client(cx).is_none() {
             return;
         }
         let mint = self.mint_endpoint(&plan, cx);
@@ -388,7 +400,12 @@ impl LinkForm {
                 });
                 return;
             };
-            let result = client.request("peerLinks.link", input).await;
+            // Minting can outlast the connection the dialog opened on.
+            let Ok(client) = this.update(cx, |_, cx| host.client(cx)) else { return };
+            let result = match client {
+                Some(client) => client.request("peerLinks.link", input).await,
+                None => Err(RpcError::Disconnected("no connection that manages access on the host".into())),
+            };
             let _ = this.update_in(cx, |this, window, cx| {
                 this.busy = false;
                 cx.notify();
@@ -396,7 +413,7 @@ impl LinkForm {
                     Ok(link) => {
                         let label = link["label"].as_str().unwrap_or_default();
                         success_toast(window, cx, format!("Linked {label}"), "");
-                        let client = this.client.clone();
+                        let client = host.reader(cx);
                         let _ = this.list.update(cx, |list, cx| list.load_links(client, cx));
                         window.close_dialog(cx);
                     }
@@ -561,7 +578,6 @@ impl Render for LinkForm {
 fn open_link_dialog(
     workspace: WeakEntity<Workspace>,
     host: SharedString,
-    client: Option<RpcClient>,
     list: WeakEntity<EnvironmentsState>,
     window: &mut Window,
     cx: &mut App,
@@ -603,7 +619,6 @@ fn open_link_dialog(
             access: "approval-required",
             busy: false,
             mint_failed: HashSet::new(),
-            client,
             list,
         }
     });
@@ -615,9 +630,14 @@ fn open_link_dialog(
     let description: SharedString = "Agents here can then launch, message and wait on threads there. It appears in that environment's Connections, where it can be revoked.".into();
     window.open_dialog(cx, move |dialog, _, cx| {
         let t = theme::tokens(cx);
+        // The web keeps it open while linking, so a result is never lost with the form.
+        let busy = form.read(cx).busy;
         dialog
             .title("Link an environment")
             .w(px(448.))
+            .close_button(!busy)
+            .keyboard(!busy)
+            .overlay_closable(!busy)
             .child(text_sm(div().mb(px(16.)).text_color(t.muted_foreground)).child(description.clone()))
             .child(form.clone())
     });

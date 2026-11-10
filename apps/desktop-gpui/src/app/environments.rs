@@ -549,6 +549,9 @@ impl SavedEnvironments {
             loop {
                 let attempt = failures + 1;
                 let entered = this.update(cx, |this, cx| {
+                    if let Some(saved) = this.get(&id) {
+                        follow_route_order(&mut environment, saved);
+                    }
                     this.update_session(&id, cx, |s| {
                         s.state =
                             ConnectionState { phase: Phase::Connecting, attempt, retry_at: None, ..s.state.clone() };
@@ -652,6 +655,15 @@ fn connection_signature(environment: &SavedEnvironment) -> (bool, Vec<(String, O
         .collect();
     routes.sort_by(|a, b| a.0.cmp(&b.0));
     (environment.enabled, routes)
+}
+
+/// Puts a running connection's routes in `saved`'s order, keeping their credentials: a new
+/// order reconnects nothing, but each attempt follows it. Routes `saved` lacks go last.
+fn follow_route_order(running: &mut SavedEnvironment, saved: &SavedEnvironment) {
+    let id = &running.environment_id;
+    running
+        .routes
+        .sort_by_key(|route| saved.routes.iter().position(|s| s.id(id) == route.id(id)).unwrap_or(usize::MAX));
 }
 
 /// The environments whose connection `current` changes from `previous`: switched, rerouted,
@@ -1133,7 +1145,14 @@ mod tests {
 
         let mut reordered = a.clone();
         reordered.routes.reverse();
-        assert!(changed_connections(Some(&before), &catalog(&[reordered])).is_empty());
+        assert!(changed_connections(Some(&before), &catalog(&[reordered.clone()])).is_empty());
+        // The connection still running follows it, keeping the SSH token it renewed.
+        let mut running = a.clone();
+        running.routes[1].credential = Credential::Token("refreshed".into());
+        follow_route_order(&mut running, &reordered);
+        let ids = |e: &SavedEnvironment| e.routes.iter().map(|r| r.id("a")).collect::<Vec<_>>();
+        assert_eq!(ids(&running), ids(&reordered));
+        assert_eq!(running.routes[0].credential, Credential::Token("refreshed".into()));
         let mut renewed = a.clone();
         renewed.routes[1].credential = Credential::Token("renewed".into());
         assert!(changed_connections(Some(&before), &catalog(&[renewed])).is_empty());

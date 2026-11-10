@@ -8,7 +8,7 @@ use gpui_kit::component::{Icon, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, ClickEvent, Div, ElementId, FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement,
-    RenderOnce, SharedString, StatefulInteractiveElement as _, Styled, Window, div, px, rgb, svg,
+    RenderOnce, SharedString, Stateful, StatefulInteractiveElement as _, Styled, Window, div, px, rgb, svg,
 };
 
 pub(super) fn text_xs<E: Styled>(el: E) -> E {
@@ -58,6 +58,21 @@ pub(in crate::app::pages::settings) fn status_dot(
         Some(tip) => frame.tooltip(tooltip(tip)).into_any_element(),
         None => frame.into_any_element(),
     }
+}
+
+/// A fold's trigger as a tab stop that Enter and Space toggle, with the web's
+/// `focus-visible:ring-2 ring-inset`.
+pub(super) fn fold_trigger(el: Stateful<Div>, ring: Hsla) -> Stateful<Div> {
+    el.rounded(px(6.)).tab_index(0).focus_visible(move |style| {
+        style.shadow(vec![gpui_kit::BoxShadow::new(px(0.), px(0.), ring).spread_radius(px(2.)).inset()])
+    })
+}
+
+/// A link or toggle as a tab stop that Enter and Space click, with `focus-visible:ring-2`.
+pub(super) fn tab_stop(el: Stateful<Div>, ring: Hsla) -> Stateful<Div> {
+    el.rounded(px(2.)).tab_index(0).focus_visible(move |style| {
+        style.shadow(vec![gpui_kit::BoxShadow::new(px(0.), px(0.), ring).spread_radius(px(2.))])
+    })
 }
 
 /// A chevron that points right when folded and down when open.

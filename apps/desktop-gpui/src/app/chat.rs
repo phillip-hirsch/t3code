@@ -1289,7 +1289,7 @@ pub(super) fn render_row(
             super::worktree_setup::setup_row(snapshot, *embedded, this, &t, cx)
         }
         Row::System(divider) => lane(8., system_divider(divider, this, &t)).into_any_element(),
-        Row::Request(card) => super::request_cards::request_row(card, this, &t, window, cx),
+        Row::Request(card) => super::request_cards::request_row(card, pane, this, &t, window, cx),
         Row::ModelSwitch { switch, .. } => {
             let label = this.upgrade().and_then(|workspace| {
                 crate::handoff::model_switch_label(&switch.0, &switch.1, &workspace.read(cx).server_info().providers)

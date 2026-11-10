@@ -127,6 +127,11 @@ impl Workspace {
         self.session(environment_id).is_some_and(|s| s.grants.grants(scope))
     }
 
+    /// This client's session check on the environment, rechecked on each connection.
+    pub(super) fn env_auth(&self, environment_id: &str) -> Option<&SessionLoad> {
+        Some(&self.session(environment_id)?.grants)
+    }
+
     /// `env_grants`, or `None` while the session check is pending or failing.
     pub(super) fn env_grant(&self, environment_id: &str, scope: &str) -> Option<bool> {
         Some(self.session(environment_id)?.grants.session()?.grants(scope))
@@ -671,6 +676,11 @@ impl Workspace {
     /// (with `env_client` and `env_info`).
     pub(super) fn settings_environment(&self) -> Option<SharedString> {
         self.settings_session()?.id.clone()
+    }
+
+    /// This client's session on the environment Settings reads, rechecked on each connection.
+    pub(super) fn settings_auth(&self) -> Option<&SessionLoad> {
+        Some(&self.settings_session()?.grants)
     }
 }
 

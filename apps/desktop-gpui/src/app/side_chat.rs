@@ -172,10 +172,10 @@ impl SideChats {
         }
     }
 
-    /// Releases the view on screen, keeping its unsent text for when it shows again. A queued
-    /// message's edit ends here; the side chat keeps its own draft.
-    fn release_view(&mut self, cx: &App) {
-        let Some(mut view) = self.view.take() else { return };
+    /// Releases the view on screen, keeping its unsent text for when it shows again, and says
+    /// which chat it showed. A queued message's edit ends here; the side chat keeps its own draft.
+    fn release_view(&mut self, cx: &App) -> Option<Key> {
+        let mut view = self.view.take()?;
         let question = view.question.take();
         let text = match (&question, view.queue.take_edit_draft()) {
             (Some(_), _) => String::new(),
@@ -184,9 +184,10 @@ impl SideChats {
         };
         let key = (view.env, view.thread_id);
         match SideDraft::kept(question, text) {
-            Some(draft) => self.drafts.insert(key, draft),
+            Some(draft) => self.drafts.insert(key.clone(), draft),
             None => self.drafts.remove(&key),
         };
+        Some(key)
     }
 }
 
@@ -479,10 +480,14 @@ impl Workspace {
             return;
         }
         self.stash_side_citation_comment(window, cx);
-        self.side_chat.release_view(cx);
+        // A chat that left takes its cards' typed answers; one resubscribing keeps them.
+        let released = self.side_chat.release_view(cx);
         self.markdown_images.release_side();
         self.diagrams.forget_sources(ChatPane::Side);
         self.sync_side_markdown();
+        if released.is_some_and(|(e, t)| env.as_ref() != Some(&e) || shown != Some(t.as_str())) {
+            self.prune_requests();
+        }
         let (Some(thread_id), Some(client), Some(env)) = (shown, client, env) else { return };
         let kept = self.side_chat.drafts.remove(&(env.clone(), thread_id.to_owned()));
         let (draft, question) = kept.map(SideDraft::restore).unwrap_or_default();
@@ -589,6 +594,7 @@ impl Workspace {
             }
         });
         self.sync_details(cx);
+        self.prune_requests();
         cx.notify();
     }
 
