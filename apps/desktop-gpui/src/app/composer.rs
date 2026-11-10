@@ -572,7 +572,7 @@ impl Workspace {
             return false;
         };
         let Some(bounds) = state.range_to_bounds(&selection) else { return false };
-        self.open_model_menu(&instance_id, &model, model_chip_menu_at(bounds), window, cx);
+        self.open_model_menu(&instance_id, &model, None, model_chip_menu_at(bounds), window, cx);
         true
     }
 
@@ -1242,7 +1242,8 @@ impl Workspace {
                 // `ModelMentionChip`: a click or Enter opens its details popover.
                 Some(Chip::Model { instance_id, model, .. }) => {
                     let at = model_chip_menu_at(event.bounds());
-                    let _ = chip_view.update(cx, |this, cx| this.open_model_menu(&instance_id, &model, at, window, cx));
+                    let _ = chip_view
+                        .update(cx, |this, cx| this.open_model_menu(&instance_id, &model, None, at, window, cx));
                 }
                 _ => {}
             })

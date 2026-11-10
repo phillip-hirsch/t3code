@@ -118,7 +118,7 @@ impl Workspace {
         } else {
             format!("{}/{path}", root.trim_end_matches('/'))
         };
-        self.open_file_menu(full, position, window, cx);
+        self.open_file_menu(full, None, position, window, cx);
     }
 }
 

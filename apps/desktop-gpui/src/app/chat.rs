@@ -2141,6 +2141,8 @@ fn markdown_view(
     let inline_code = inline_code_style(t);
     let t = *t;
     let (header_this, link_this, table_this, hover_this) = (this.clone(), this.clone(), this.clone(), this.clone());
+    // The view key names the pane whose timeline shows it, which owns what its links open.
+    let pane = view_pane(&key).0;
     let (table_key, message_key) = (key.clone(), key.clone());
     let templates = super::markdown_ui::ArtifactTemplates {
         workspace: this.clone(),
@@ -2220,12 +2222,13 @@ fn markdown_view(
                 message: message_key,
             })
         })
-        .plugin(super::markdown_ui::SkillChips { workspace: this.clone() })
-        .plugin(super::markdown_ui::CitationChips { workspace: this.clone() })
-        .plugin(super::markdown_ui::ModelChips { workspace: this.clone() })
+        .plugin(super::markdown_ui::SkillChips { workspace: this.clone(), pane })
+        .plugin(super::markdown_ui::CitationChips { workspace: this.clone(), pane })
+        .plugin(super::markdown_ui::ModelChips { workspace: this.clone(), pane })
         .plugin(super::markdown_ui::ThreadChips { workspace: this.clone() })
         .plugin(templates)
         .plugin(super::markdown_ui::FileChips {
+            pane,
             workspace: this.clone(),
             dark: t.dark,
             folder_color: t.sidebar.icon,
@@ -2235,7 +2238,7 @@ fn markdown_view(
         })
         .plugin(super::external_links::LinkMarks { workspace: this.clone() })
         .on_link_hover(move |hover, _, cx| {
-            let _ = hover_this.update(cx, |workspace, cx| workspace.link_hovered(hover, cx));
+            let _ = hover_this.update(cx, |workspace, cx| workspace.link_hovered(hover, pane, cx));
         })
         .on_link_click(move |url, event, window, cx| {
             let _ = link_this.update(cx, Workspace::close_link_hover);
@@ -2259,7 +2262,7 @@ fn markdown_view(
                             cx,
                             move |workspace, target, window, cx| {
                                 if right {
-                                    workspace.open_file_menu(target, position, window, cx);
+                                    workspace.open_file_menu(target, Some(pane), position, window, cx);
                                 } else if workspace.opens_file_link_in_browser(&target, secondary) {
                                     let path = super::markdown_ui::without_position(&target).to_owned();
                                     workspace.open_host_file_in_browser(&path, window, cx);
@@ -2273,8 +2276,9 @@ fn markdown_view(
                 }
             }
             if right {
-                let _ =
-                    link_this.update(cx, |workspace, cx| workspace.open_link_menu(url, event.position(), window, cx));
+                let _ = link_this.update(cx, |workspace, cx| {
+                    workspace.open_link_menu(url, Some(pane), event.position(), window, cx)
+                });
                 return;
             }
             let _ = link_this.update(cx, |workspace, cx| match crate::thread_links::parse(url) {

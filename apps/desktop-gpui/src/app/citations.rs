@@ -821,13 +821,14 @@ impl Workspace {
     pub(super) fn open_citation_menu(
         &mut self,
         citation: AssistantCitation,
+        pane: Option<ChatPane>,
         position: Point<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let t = *tokens(cx);
         let view = cx.weak_entity();
-        self.open_chat_menu(position, window, cx, move |menu, _, _| {
+        self.open_chat_menu(pane, position, window, cx, move |menu, _, _| {
             let (text, comment) = (citation.text.clone(), citation.comment.clone());
             menu.item(PopupMenuItem::element(move |_, _| quote_preview(&text, comment.as_deref(), &t)).disabled(true))
                 .separator()

@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use super::Workspace;
+use super::side_chat::{ChatPane, PaneOwner};
 use crate::artifact_templates::{Kind as TemplateKind, Template};
 use crate::file_links;
 use crate::theme::Tokens;
@@ -31,13 +32,17 @@ const SKILL_SCHEME: &str = "t3-skill:";
 pub(super) struct ChatMenu {
     view: Entity<PopupMenu>,
     position: Point<Pixels>,
+    /// The pane and thread whose timeline opened it: it closes once they go, as unmounting does.
+    owner: Option<PaneOwner>,
     _dismiss: Subscription,
 }
 
 impl Workspace {
-    /// Opens `build`'s menu at `position` (window coordinates) until it dismisses.
+    /// Opens `build`'s menu at `position` (window coordinates) until it dismisses, or until the
+    /// thread `pane` shows (if a timeline's chip opened it) leaves that pane.
     pub(super) fn open_chat_menu(
         &mut self,
+        pane: Option<ChatPane>,
         position: Point<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -53,8 +58,18 @@ impl Workspace {
             }
             cx.notify();
         });
-        self.chat_menu = Some(ChatMenu { view, position, _dismiss: dismiss });
+        let owner = pane.and_then(|pane| self.pane_owner(pane));
+        self.chat_menu = Some(ChatMenu { view, position, owner, _dismiss: dismiss });
         cx.notify();
+    }
+
+    /// Closes the timeline's link hover and chat menu once the pane and thread they belong to go.
+    pub(super) fn release_left_chat_overlays(&mut self) {
+        let menu_owner = self.chat_menu.as_ref().and_then(|menu| menu.owner.as_ref());
+        if menu_owner.is_some_and(|owner| !self.owner_shown(owner)) {
+            self.chat_menu = None;
+        }
+        self.release_left_link_hover();
     }
 
     pub(super) fn render_chat_menu(&self) -> Option<AnyElement> {
@@ -70,6 +85,7 @@ impl Workspace {
     pub(super) fn open_link_menu(
         &mut self,
         url: &str,
+        pane: Option<ChatPane>,
         position: Point<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -88,7 +104,7 @@ impl Workspace {
         });
         let view = cx.weak_entity();
         let url = url.to_owned();
-        self.open_chat_menu(position, window, cx, move |mut menu, _, _| {
+        self.open_chat_menu(pane, position, window, cx, move |mut menu, _, _| {
             if let Some((thread_id, linked)) = thread_link {
                 let (view, url) = (view.clone(), url.clone());
                 let label = if linked { "Unlink from thread" } else { "Link to thread" };
@@ -146,6 +162,7 @@ impl Workspace {
     pub(super) fn open_skill_menu(
         &mut self,
         name: &str,
+        pane: Option<ChatPane>,
         position: Point<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -159,7 +176,7 @@ impl Workspace {
         // The instructions open in the thread's file panel, on the machine the skill lives on.
         let path = skill.path.clone().filter(|p| !p.is_empty() && self.preview_thread_id().is_some());
         let view = cx.weak_entity();
-        self.open_chat_menu(position, window, cx, move |menu, _, _| {
+        self.open_chat_menu(pane, position, window, cx, move |menu, _, _| {
             let label = skill.label.clone();
             let menu = menu.item(
                 PopupMenuItem::element(move |_, _| {
@@ -226,6 +243,7 @@ impl Workspace {
         &mut self,
         instance_id: &str,
         model: &str,
+        pane: Option<ChatPane>,
         position: Point<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -233,7 +251,7 @@ impl Workspace {
         let Some(mention) = self.model_mention(instance_id, model) else { return };
         let source = crate::composer_text::model_mention(instance_id, model);
         let t = *crate::theme::tokens(cx);
-        self.open_chat_menu(position, window, cx, move |menu, _, _| {
+        self.open_chat_menu(pane, position, window, cx, move |menu, _, _| {
             menu.item(
                 PopupMenuItem::element(move |_, _| {
                     super::composer::model_mention_details(&mention, &source, &t).p(px(4.))
@@ -386,6 +404,7 @@ impl Workspace {
     pub(super) fn open_file_menu(
         &mut self,
         target: String,
+        pane: Option<ChatPane>,
         position: Point<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -403,7 +422,7 @@ impl Workspace {
         let in_browser = self.can_open_file_in_browser(&target);
         let reveal = self.reveal_label();
         let view = cx.weak_entity();
-        self.open_chat_menu(position, window, cx, move |mut menu, _, _| {
+        self.open_chat_menu(pane, position, window, cx, move |mut menu, _, _| {
             if can_open {
                 let (view, target) = (view.clone(), target.clone());
                 menu = menu.item(PopupMenuItem::new(open_label.clone()).on_click(move |_, window, cx| {
@@ -564,6 +583,8 @@ fn prose_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
 /// Draws `t3-skill:` links as the composer's skill chip; a click opens its popover.
 pub(super) struct SkillChips {
     pub workspace: WeakEntity<Workspace>,
+    /// The pane whose timeline draws them, which owns the popover they open.
+    pub pane: ChatPane,
 }
 
 impl MarkdownPlugin for SkillChips {
@@ -591,7 +612,7 @@ impl MarkdownPlugin for SkillChips {
 
     fn render(&self, node: &MarkdownNode, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let name = node.data::<String>().cloned().unwrap_or_default();
-        let workspace = self.workspace.clone();
+        let (workspace, pane) = (self.workspace.clone(), Some(self.pane));
         let tokens = crate::theme::tokens(cx);
         super::chat::focusable(h_flex().id(SharedString::from(format!("skill-chip:{name}"))), tokens)
             .gap(px(3.))
@@ -603,7 +624,7 @@ impl MarkdownPlugin for SkillChips {
             .child(node.as_text().to_owned())
             .on_click(move |event, window, cx| {
                 let position = event.position();
-                let _ = workspace.update(cx, |w, cx| w.open_skill_menu(&name, position, window, cx));
+                let _ = workspace.update(cx, |w, cx| w.open_skill_menu(&name, pane, position, window, cx));
             })
     }
 }
@@ -612,6 +633,7 @@ impl MarkdownPlugin for SkillChips {
 /// with Go to source. Copying keeps the citation's Markdown.
 pub(super) struct CitationChips {
     pub workspace: WeakEntity<Workspace>,
+    pub pane: ChatPane,
 }
 
 impl MarkdownPlugin for CitationChips {
@@ -635,7 +657,7 @@ impl MarkdownPlugin for CitationChips {
         let Some(citation) = node.data::<crate::assistant_citations::AssistantCitation>().cloned() else {
             return div().into_any_element();
         };
-        let workspace = self.workspace.clone();
+        let (workspace, pane) = (self.workspace.clone(), Some(self.pane));
         let id = format!("citation-chip:{}:{}:{}", citation.message_id, citation.start, citation.end);
         super::chat::focusable(h_flex().id(SharedString::from(id)), crate::theme::tokens(cx))
             .max_w_full()
@@ -648,7 +670,7 @@ impl MarkdownPlugin for CitationChips {
             .child(div().min_w_0().truncate().hover(gpui_kit::Styled::underline).child(node.as_text().to_owned()))
             .on_click(move |event, window, cx| {
                 let (citation, position) = (citation.clone(), event.position());
-                let _ = workspace.update(cx, |w, cx| w.open_citation_menu(citation, position, window, cx));
+                let _ = workspace.update(cx, |w, cx| w.open_citation_menu(citation, pane, position, window, cx));
             })
             .into_any_element()
     }
@@ -718,6 +740,7 @@ struct ModelChip {
 /// logo and the model's name; a click, Enter or Space opens its details.
 pub(super) struct ModelChips {
     pub workspace: WeakEntity<Workspace>,
+    pub pane: ChatPane,
 }
 
 impl MarkdownPlugin for ModelChips {
@@ -747,7 +770,7 @@ impl MarkdownPlugin for ModelChips {
     fn render(&self, node: &MarkdownNode, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let Some((chip, at)) = node.data::<(ModelChip, usize)>().cloned() else { return div().into_any_element() };
         let accent = super::composer::model_chip_accent(&chip.driver);
-        let workspace = self.workspace.clone();
+        let (workspace, pane) = (self.workspace.clone(), Some(self.pane));
         let id = format!("model-chip:{at}:{}/{}", chip.instance_id, chip.model);
         let focus = window
             .use_keyed_state(SharedString::from(format!("{id}:focus")), cx, |_, cx| cx.focus_handle().tab_stop(true))
@@ -771,7 +794,7 @@ impl MarkdownPlugin for ModelChips {
             .on_click(move |event, window, cx| {
                 let position = event.position();
                 let _ = workspace
-                    .update(cx, |w, cx| w.open_model_menu(&chip.instance_id, &chip.model, position, window, cx));
+                    .update(cx, |w, cx| w.open_model_menu(&chip.instance_id, &chip.model, pane, position, window, cx));
             })
             .into_any_element()
     }
@@ -816,6 +839,7 @@ fn file_link(text: &str, url: &str) -> Option<(file_links::FilePosition, Option<
 /// workspace); a right click opens the file menu.
 pub(super) struct FileChips {
     pub workspace: WeakEntity<Workspace>,
+    pub pane: ChatPane,
     pub dark: bool,
     /// `text-icon-muted`, the folder icon's color.
     pub folder_color: Hsla,
@@ -984,7 +1008,7 @@ impl MarkdownPlugin for FileChips {
         let ink = document_ink(asset).unwrap_or_else(|| rgb(0x0096af));
         let (path, line) = (chip.path.clone(), chip.line);
         let (open, menu) = (self.workspace.clone(), self.workspace.clone());
-        let menu_path = path.clone();
+        let (menu_path, pane) = (path.clone(), Some(self.pane));
         let tooltip: SharedString = path.clone().into();
         let element = super::chat::focusable(
             h_flex().id(SharedString::from(format!("file-chip:{path}"))),
@@ -1010,7 +1034,7 @@ impl MarkdownPlugin for FileChips {
                 let target = file_links::resolve_target(&menu_path, w.git_cwd().as_deref());
                 if let Some(target) = target {
                     w.with_workspace_match(&menu_path, target, window, cx, move |w, target, window, cx| {
-                        w.open_file_menu(target, position, window, cx);
+                        w.open_file_menu(target, pane, position, window, cx);
                     });
                 }
             });

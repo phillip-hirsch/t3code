@@ -684,7 +684,7 @@ impl ContextChips {
         let id = format!("context:{}:{}", self.message, reference.id);
         let label: SharedString = reference.label.clone().into();
         let Some(record) = record else { return unavailable(id, label, &t) };
-        let this = self.workspace.clone();
+        let (this, pane) = (self.workspace.clone(), view_pane(&self.message).0);
         match reference.kind.as_str() {
             "mention" => {
                 let path = text_of(record, "path").to_owned();
@@ -707,7 +707,7 @@ impl ContextChips {
                     .text_color(rgb(SKILL_INK))
                     .on_click(move |event, window, cx| {
                         let position = event.position();
-                        let _ = this.update(cx, |w, cx| w.open_skill_menu(&name, position, window, cx));
+                        let _ = this.update(cx, |w, cx| w.open_skill_menu(&name, Some(pane), position, window, cx));
                     })
                     .into_any_element()
             }
@@ -885,7 +885,7 @@ impl Workspace {
     ) {
         let cwd = self.git_cwd();
         let view = cx.weak_entity();
-        self.open_chat_menu(position, window, cx, move |menu: PopupMenu, _, _| {
+        self.open_chat_menu(Some(pane), position, window, cx, move |menu: PopupMenu, _, _| {
             menu.item(
                 PopupMenuItem::element(move |_, cx| {
                     let t = *crate::theme::tokens(cx);
