@@ -1346,7 +1346,7 @@ impl Workspace {
         colors: &CardColors,
         cx: &mut Context<Self>,
     ) -> Option<Section> {
-        let Some(Target::Thread { id, .. }) = &self.target else { return None };
+        let Some(Target::Thread { env, id }) = &self.target else { return None };
         let thread = self.shell.threads.iter().find(|thread| &thread.id == id)?;
         let Relationships { parent, active, previous, side_chats } = relationships;
         let can_detach = self
@@ -1386,12 +1386,26 @@ impl Workspace {
             section = section.child(self.delegated_from_row(from, thread, tokens, colors, cx));
         }
         if let Some(parent) = parent {
-            section =
-                section.child(self.relationship_row(parent, "icons/corner-left-up.svg", false, tokens, colors, cx));
+            section = section.child(self.relationship_row(
+                parent,
+                "icons/corner-left-up.svg",
+                false,
+                env,
+                tokens,
+                colors,
+                cx,
+            ));
         }
         if !active.is_empty() {
-            section =
-                section.child(self.lineage_list("details-active-agents", active, viewport_height, tokens, colors, cx));
+            section = section.child(self.lineage_list(
+                "details-active-agents",
+                active,
+                env,
+                viewport_height,
+                tokens,
+                colors,
+                cx,
+            ));
         }
         if !previous.is_empty() {
             let expanded = self.lineage_expanded.as_ref() == Some(id);
@@ -1429,6 +1443,7 @@ impl Workspace {
                 section = section.child(self.lineage_list(
                     "details-previous-agents-list",
                     previous,
+                    env,
                     viewport_height,
                     tokens,
                     colors,
@@ -1449,6 +1464,7 @@ impl Workspace {
         colors: &CardColors,
         cx: &mut Context<Self>,
     ) -> Option<Section> {
+        let Some(Target::Thread { env, .. }) = &self.target else { return None };
         let side_chats = &relationships.side_chats;
         if side_chats.is_empty() {
             return None;
@@ -1461,7 +1477,7 @@ impl Workspace {
         let section = v_flex().child(section_heading(heading, tokens)).children(
             side_chats
                 .iter()
-                .map(|row| self.relationship_row(row, "icons/messages-square.svg", true, tokens, colors, cx)),
+                .map(|row| self.relationship_row(row, "icons/messages-square.svg", true, env, tokens, colors, cx)),
         );
         // Left out of the density estimate (`fitting_height`).
         Some(Section { height: 0., element: section.into_any_element(), min_density: Density::Full })
@@ -1472,6 +1488,7 @@ impl Workspace {
         &self,
         id: &'static str,
         rows: &[Relative],
+        env: &SharedString,
         viewport_height: f32,
         tokens: &Tokens,
         colors: &CardColors,
@@ -1486,15 +1503,22 @@ impl Workspace {
             .id(id)
             .max_h(px(max))
             .overflow_y_scroll()
-            .children(rows.iter().map(|row| self.agent_row(row, tokens, colors, cx)))
+            .children(rows.iter().map(|row| self.agent_row(row, env, tokens, colors, cx)))
             .into_any_element()
     }
 
     /// A subagent's row, or a workflow's with its agents under it.
-    fn agent_row(&self, child: &Relative, tokens: &Tokens, colors: &CardColors, cx: &mut Context<Self>) -> AnyElement {
+    fn agent_row(
+        &self,
+        child: &Relative,
+        env: &SharedString,
+        tokens: &Tokens,
+        colors: &CardColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         match &child.workflow {
-            Some(group) => self.workflow_row(child, group, tokens, colors, cx),
-            None => self.relationship_row(child, "icons/bot.svg", false, tokens, colors, cx).into_any_element(),
+            Some(group) => self.workflow_row(child, group, env, tokens, colors, cx),
+            None => self.relationship_row(child, "icons/bot.svg", false, env, tokens, colors, cx).into_any_element(),
         }
     }
 
@@ -1504,6 +1528,7 @@ impl Workspace {
         &self,
         relative: &Relative,
         group: &WorkflowGroup,
+        env: &SharedString,
         tokens: &Tokens,
         colors: &CardColors,
         cx: &mut Context<Self>,
@@ -1551,7 +1576,7 @@ impl Workspace {
             }))
         });
         let has_stop = stop.is_some();
-        let thread_id = relative.thread_id.clone();
+        let (environment, thread_id) = (env.clone(), relative.thread_id.clone());
         let header = keyboard_button(
             h_flex()
                 .id(ElementId::Name(format!("details-workflow-open-{id}").into()))
@@ -1580,7 +1605,9 @@ impl Workspace {
                 .when(has_stop, |el| el.pr(px(24.)))
                 .child(relative.title.clone()),
         )
-        .on_click(cx.listener(move |this, _, window, cx| this.select_thread(thread_id.clone(), window, cx)));
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.select_thread_in(environment.clone(), thread_id.clone(), window, cx);
+        }));
         let toggle_id = id.clone();
         let chevron = focus_ring(
             div()
@@ -1630,12 +1657,12 @@ impl Workspace {
                 list = list.child(phase_header(id, phase, open, now, tokens, colors, cx));
                 if open {
                     for member in &phase.members {
-                        list = list.child(workflow_member_row(id, member, &group.driver, now, tokens, colors, cx));
+                        list = list.child(workflow_member_row(id, member, &group.driver, env, now, tokens, colors, cx));
                     }
                 }
             }
             for member in &group.unphased {
-                list = list.child(workflow_member_row(id, member, &group.driver, now, tokens, colors, cx));
+                list = list.child(workflow_member_row(id, member, &group.driver, env, now, tokens, colors, cx));
             }
             if group.phases.is_empty() && group.unphased.is_empty() {
                 list = list.child(
@@ -1659,6 +1686,7 @@ impl Workspace {
         relative: &Relative,
         path: &'static str,
         side_chat: bool,
+        env: &SharedString,
         tokens: &Tokens,
         colors: &CardColors,
         cx: &mut Context<Self>,
@@ -1695,6 +1723,7 @@ impl Workspace {
                 }))
         });
         let has_stop = stop.is_some();
+        let environment = env.clone();
         row(colors)
             .id(ElementId::Name(group.clone()))
             .group(group)
@@ -1718,7 +1747,7 @@ impl Workspace {
                 if side_chat {
                     this.open_surface(super::right_panel::Surface::SideChat(thread_id.clone()), window, cx);
                 } else {
-                    this.select_thread(thread_id.clone(), window, cx);
+                    this.select_thread_in(environment.clone(), thread_id.clone(), window, cx);
                 }
             }))
     }
@@ -2015,11 +2044,12 @@ fn phase_header(
 }
 
 /// `WorkflowMemberRow`: an agent of a workflow, its provider and status, opening its thread
-/// when it has one.
+/// on the workflow's environment when it has one.
 fn workflow_member_row(
     workflow_id: &str,
     member: &Member,
     driver: &str,
+    env: &SharedString,
     now: i64,
     tokens: &Tokens,
     colors: &CardColors,
@@ -2055,8 +2085,14 @@ fn workflow_member_row(
     let hover = colors.hover;
     let element = row(colors).id(id);
     let element = match member.child_thread_id.clone() {
-        Some(thread_id) => keyboard_button(element.cursor_pointer().hover(move |style| style.bg(hover)), colors)
-            .on_click(cx.listener(move |this, _, window, cx| this.select_thread(thread_id.clone(), window, cx))),
+        Some(thread_id) => {
+            let environment = env.clone();
+            keyboard_button(element.cursor_pointer().hover(move |style| style.bg(hover)), colors).on_click(cx.listener(
+                move |this, _, window, cx| {
+                    this.select_thread_in(environment.clone(), thread_id.clone(), window, cx);
+                },
+            ))
+        }
         None => element.opacity(0.64),
     };
     element.child(badge).child(div().flex_1().min_w_0().truncate().child(member.title.clone())).children(
