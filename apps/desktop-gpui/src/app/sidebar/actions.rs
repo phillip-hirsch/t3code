@@ -1102,6 +1102,10 @@ pub(super) async fn run_delete(
         };
         let Ok(agreed) = answer.await else { return Ok(false) };
         remove = agreed;
+        // `checkThreadOperations` again: the grant can go while the question is open.
+        if !this.read_with(cx, |this, _| this.can_operate(&environment)).unwrap_or(false) {
+            return Err(NOT_OPERATE.to_owned());
+        }
     }
     if has_runtime {
         stop_provider_sessions(&client, &thread_id).await;
