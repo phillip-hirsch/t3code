@@ -672,10 +672,17 @@ impl Workspace {
             .search
             .as_ref()
             .is_some_and(|search| gpui_kit::Focusable::focus_handle(search.read(cx), cx).is_focused(window));
-        // Shift+Enter adds from the list, never from the effort column.
-        match picker_keys(self.picker.effort_focus.filter(|_| !additive), effort_focused, search_focused) {
+        match picker_keys(self.picker.effort_focus, effort_focused, search_focused, additive) {
             PickerKeys::Effort(index) => return self.effort_key(index, keystroke, window, cx),
             PickerKeys::Search => {}
+            PickerKeys::Add => {
+                let current = self.picker_current();
+                let (rows, _) = self.picker_rows(current.as_ref());
+                if let Some(row) = self.picker.highlighted.and_then(|i| rows.into_iter().nth(i)) {
+                    self.pick_row(row.selection, true, window, cx);
+                }
+                return true;
+            }
             PickerKeys::Elsewhere if keystroke.key == "escape" => {
                 self.close_model_picker(window, cx);
                 return true;
@@ -684,12 +691,6 @@ impl Workspace {
         }
         let current = self.picker_current();
         let (rows, _) = self.picker_rows(current.as_ref());
-        if additive {
-            if let Some(row) = self.picker.highlighted.and_then(|i| rows.into_iter().nth(i)) {
-                self.pick_row(row.selection, true, window, cx);
-            }
-            return true;
-        }
         match keystroke.key.as_str() {
             "escape" => self.close_model_picker(window, cx),
             "down" | "up" if !rows.is_empty() => {
@@ -1810,11 +1811,14 @@ fn effort_stops(controls: &EffortControls, selection: &ModelSelection) -> Vec<Ef
 enum PickerKeys {
     Effort(usize),
     Search,
+    /// Shift+Enter: the highlighted model joins the ones a draft starts.
+    Add,
     Elsewhere,
 }
 
-fn picker_keys(effort_focus: Option<usize>, effort_focused: bool, search_focused: bool) -> PickerKeys {
+fn picker_keys(effort_focus: Option<usize>, effort_focused: bool, search_focused: bool, additive: bool) -> PickerKeys {
     match effort_focus {
+        _ if additive && (effort_focused || search_focused) => PickerKeys::Add,
         Some(index) if effort_focused => PickerKeys::Effort(index),
         _ if search_focused => PickerKeys::Search,
         _ => PickerKeys::Elsewhere,
@@ -2039,14 +2043,22 @@ mod tests {
         assert_eq!(effort_entry(&switches, false), None, "a pick lands only on levels");
         assert_eq!(effort_entry(&switches, true), Some(0), "ArrowRight takes any stop");
         assert_eq!(effort_entry(&[], true), None);
-        assert_eq!(picker_keys(Some(1), true, false), PickerKeys::Effort(1));
+        assert_eq!(picker_keys(Some(1), true, false, false), PickerKeys::Effort(1));
         assert_eq!(
-            picker_keys(Some(1), false, false),
+            picker_keys(Some(1), false, false, false),
             PickerKeys::Elsewhere,
             "Tab left the column for a footer segment"
         );
-        assert_eq!(picker_keys(None, false, false), PickerKeys::Elsewhere, "Tab left the search for a footer segment");
-        assert_eq!(picker_keys(Some(1), false, true), PickerKeys::Search);
+        assert_eq!(
+            picker_keys(None, false, false, false),
+            PickerKeys::Elsewhere,
+            "Tab left the search for a footer segment"
+        );
+        assert_eq!(picker_keys(Some(1), false, true, false), PickerKeys::Search);
+        // Shift+Enter adds the highlighted model from the search or the effort column.
+        assert_eq!(picker_keys(Some(1), true, false, true), PickerKeys::Add);
+        assert_eq!(picker_keys(None, false, true, true), PickerKeys::Add);
+        assert_eq!(picker_keys(None, false, false, true), PickerKeys::Elsewhere, "a footer segment keeps it");
     }
 
     #[test]
