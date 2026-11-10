@@ -1492,10 +1492,8 @@ impl Workspace {
             h_flex().p(px(2.)).rounded(px(8.)).bg(t.foreground.opacity(0.044)).children(segments.into_iter().map(
                 |(label, checked, option, value, description)| {
                     let bolt = matches!(label.as_str(), "Fast" | "Ultrafast").then(|| fast_bolt(label == "Ultrafast"));
-                    h_flex()
-                        .id(ElementId::Name(format!("speed-{label}").into()))
+                    footer_segment(h_flex().id(ElementId::Name(format!("speed-{label}").into())), t.ring)
                         .h(px(24.))
-                        .px(px(8.))
                         .gap(px(4.))
                         .rounded(px(6.))
                         .text_xs()
@@ -1519,10 +1517,8 @@ impl Workspace {
         let ultracode = ultracode.zip(current).map(|(descriptor, selection)| {
             let on = model_label::current_value(descriptor, selection) == Some(Value::Bool(true));
             h_flex().p(px(2.)).rounded(px(8.)).bg(t.foreground.opacity(0.044)).child(
-                h_flex()
-                    .id("ultracode")
+                footer_segment(h_flex().id("ultracode"), t.ring)
                     .h(px(24.))
-                    .px(px(8.))
                     .gap(px(4.))
                     .rounded(px(6.))
                     .text_xs()
@@ -1562,6 +1558,17 @@ impl Workspace {
 }
 
 /// `FastBolt`: one bolt for Fast, two overlapping for Ultrafast.
+/// `FOOTER_SEGMENT`'s keyboard half: a tab stop that Enter and Space press, with
+/// `focus-visible:ring-2 ring-inset` on an edge taken from its `px-2`, so nothing moves.
+fn footer_segment(element: gpui_kit::Stateful<gpui_kit::Div>, ring: Hsla) -> gpui_kit::Stateful<gpui_kit::Div> {
+    element
+        .tab_index(0)
+        .px(px(6.))
+        .border_2()
+        .border_color(gpui_kit::transparent_black())
+        .focus_visible(move |style| style.border_color(ring))
+}
+
 fn fast_bolt(ultra: bool) -> AnyElement {
     if !ultra {
         return Icon::new(Lucide::Zap).with_size(px(12.)).into_any_element();
