@@ -580,14 +580,16 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Expands a rendered diagram into the image viewer, on the page's background.
-    pub(super) fn expand_diagram(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+    /// Expands a rendered diagram into the image viewer, on the page's background; one in a chat
+    /// message (`key`, its view key) closes with its pane's thread.
+    fn expand_diagram(&mut self, key: Option<&str>, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         let Shown::Ready(rendered) = self.diagrams.shown(id) else { return };
         let background = css_color(crate::theme::tokens(cx).background);
         let svg = String::from_utf8_lossy(&rendered.image.bytes);
         let image = Arc::new(Image::from_bytes(ImageFormat::Svg, with_background(&svg, &background).into_bytes()));
         let item = ViewerImage { image, name: "Mermaid diagram".into(), reference: None };
-        self.open_image_viewer(vec![item], 0, window, cx);
+        let owner = key.and_then(|key| self.pane_owner(super::chat::view_pane(key).0));
+        self.open_owned_image_viewer(owner, vec![item], 0, window, cx);
     }
 
     fn toggle_diagram_source(&mut self, key: SharedString, at: usize, cx: &mut Context<Self>) {
@@ -648,9 +650,15 @@ pub(super) fn view_toggle(
 }
 
 /// A rendered diagram, fitted to its column and centered; a click, Enter or Space expands it.
-pub(super) fn diagram_button(this: &WeakEntity<Workspace>, id: u64, rendered: &Rendered, t: &Tokens) -> AnyElement {
+fn diagram_button(
+    this: &WeakEntity<Workspace>,
+    key: Option<&SharedString>,
+    id: u64,
+    rendered: &Rendered,
+    t: &Tokens,
+) -> AnyElement {
     let Size { width, height } = rendered.size;
-    let (this, ring) = (this.clone(), t.ring);
+    let (this, key, ring) = (this.clone(), key.cloned(), t.ring);
     div()
         .id("diagram")
         .tab_index(0)
@@ -661,7 +669,7 @@ pub(super) fn diagram_button(this: &WeakEntity<Workspace>, id: u64, rendered: &R
         .cursor_pointer()
         .focus_visible(move |style| style.border_color(ring))
         .on_click(move |_, window, cx| {
-            let _ = this.update(cx, |workspace, cx| workspace.expand_diagram(id, window, cx));
+            let _ = this.update(cx, |workspace, cx| workspace.expand_diagram(key.as_deref(), id, window, cx));
         })
         .child(v_flex().w_full().items_center().child(
             div().w(px(width)).max_w_full().aspect_ratio(width / height).child(img(rendered.image.clone()).size_full()),
@@ -705,8 +713,20 @@ pub(super) fn diagram_body(
     source: &SharedString,
     t: &Tokens,
 ) -> Option<AnyElement> {
+    diagram_body_in(this, None, id, shown, source, t)
+}
+
+/// [`diagram_body`] for the chat message under the view key `key`, if any.
+fn diagram_body_in(
+    this: &WeakEntity<Workspace>,
+    key: Option<&SharedString>,
+    id: u64,
+    shown: &Shown,
+    source: &SharedString,
+    t: &Tokens,
+) -> Option<AnyElement> {
     Some(match shown {
-        Shown::Ready(rendered) => diagram_button(this, id, rendered, t),
+        Shown::Ready(rendered) => diagram_button(this, key, id, rendered, t),
         Shown::Failed(message) => diagram_error(this, message, source.clone(), false, t),
         Shown::RendererFailed => diagram_error(this, RENDERER_FAILED, source.clone(), true, t),
         Shown::Refused => div().text_xs().text_color(t.muted_foreground).child(REFUSAL).into_any_element(),
@@ -747,7 +767,7 @@ pub(super) fn chat_diagram(
         .flatten()?;
     let copy = message_actions::code_copy_button(this, format!("code:{key}:{at:x}").into(), code.clone(), t, cx);
     // Suspense's fallback: the source, invisible, holds the block's height.
-    let body = diagram_body(this, id, &shown, &code, t).unwrap_or_else(|| {
+    let body = diagram_body_in(this, Some(key), id, &shown, &code, t).unwrap_or_else(|| {
         div()
             .invisible()
             .font_family(t.fonts.mono)
