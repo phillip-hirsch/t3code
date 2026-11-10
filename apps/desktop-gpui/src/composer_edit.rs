@@ -5,7 +5,7 @@
 
 use std::ops::Range;
 
-use crate::composer_markdown::{is_closing_fence, opening_fence};
+use crate::composer_markdown::{self as markdown, Block, Line, is_closing_fence, opening_fence};
 
 /// Replace each of `changes` (disjoint, ascending, in the text before the edit), then select
 /// `select`. Separate changes leave the chips between them in place.
@@ -474,6 +474,55 @@ pub fn code_tab(text: &str, selection: Range<usize>, outdent: bool) -> Option<Ed
     Some(Edit { changes: vec![(line_start..line_end, replacement)], select: from..to })
 }
 
+/// Backspace at the start of a rendered block (`unwrapCodeBlockAtStart`, and a list item,
+/// heading or quote lifted to a paragraph): the block's hidden syntax goes in one step, where
+/// one character would leave the rest of it showing.
+pub fn block_backspace(parsed: &markdown::Parsed, selection: &Range<usize>) -> Option<Edit> {
+    if !selection.is_empty() {
+        return None;
+    }
+    let caret = selection.start;
+    if let Some(prefix) = parsed.lines.iter().filter_map(Line::prefix).find(|prefix| prefix.end == caret) {
+        return Some(Edit::caret(prefix.clone(), String::new(), prefix.start));
+    }
+    let index = parsed.lines.iter().position(|line| line.range.start == caret && caret > 0)?;
+    let open = &parsed.lines[index - 1];
+    if !matches!(open.block, Block::FenceOpen { .. }) || !matches!(parsed.lines[index].block, Block::Code { .. }) {
+        return None;
+    }
+    // The code stays, as plain lines: the opening fence and the closing one go.
+    let mut changes = vec![(open.range.start..caret, String::new())];
+    if let Some(close) = parsed.lines[index..].iter().find(|line| matches!(line.block, Block::FenceClose)) {
+        changes.push((close.range.start - 1..close.range.end, String::new()));
+    }
+    Some(Edit { changes, select: open.range.start..open.range.start })
+}
+
+/// A task's checkbox pressed: its `[ ]` checked or `[x]` cleared, the caret left where it was.
+pub fn toggle_task(text: &str, check: usize, selection: Range<usize>) -> Option<Edit> {
+    let next = match text.as_bytes().get(check)? {
+        b' ' => "x",
+        b'x' | b'X' => " ",
+        _ => return None,
+    };
+    Some(Edit { changes: vec![(check..check + 1, next.to_owned())], select: selection })
+}
+
+/// A code block's language picked: its info string rewritten, the caret at the end of its
+/// code (`ComposerCodeBlockNodeView`'s `changeLanguage`).
+pub fn set_code_language(text: &str, parsed: &markdown::Parsed, open: usize, language: &str) -> Option<Edit> {
+    let index = parsed.lines.iter().position(|line| line.range.start == open)?;
+    let Block::FenceOpen { info, .. } = &parsed.lines[index].block else { return None };
+    let next = crate::composer_code::with_language(&text[info.clone()], language);
+    let code_end = parsed.lines[index + 1..]
+        .iter()
+        .take_while(|line| matches!(line.block, Block::Code { .. }))
+        .last()
+        .map_or(parsed.lines[index].range.end, |line| line.range.end);
+    let caret = code_end + next.len() - info.len();
+    Some(Edit::caret(info.clone(), next, caret))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -614,5 +663,53 @@ mod tests {
         let edit = code_tab(wide, 6..8, true).unwrap();
         assert_eq!((apply(wide, &edit), edit.select), ("```\n\u{e9}\n```".to_owned(), 4..6));
         assert_eq!(code_tab("- a", 3..3, false), None);
+    }
+
+    fn block_edit(text: &str, caret: usize) -> Option<(String, usize)> {
+        let parsed = crate::composer_markdown::parse(text, &[]);
+        let edit = block_backspace(&parsed, &(caret..caret))?;
+        Some((apply(text, &edit), edit.select.start))
+    }
+
+    #[test]
+    fn backspace_at_a_blocks_start_lifts_it_to_a_paragraph() {
+        assert_eq!(block_edit("a\n## Head", 5), Some(("a\nHead".to_owned(), 2)));
+        assert_eq!(block_edit("- [ ] task", 6), Some(("task".to_owned(), 0)));
+        assert_eq!(block_edit("x\n  1. item", 7), Some(("x\nitem".to_owned(), 2)));
+        assert_eq!(block_edit("> quote", 2), Some(("quote".to_owned(), 0)));
+        // Elsewhere Backspace deletes a character as usual.
+        assert_eq!(block_edit("## Head", 4), None);
+        assert_eq!(block_edit("plain", 3), None);
+        let parsed = crate::composer_markdown::parse("## Head", &[]);
+        assert_eq!(block_backspace(&parsed, &(1..3)), None, "a selection deletes itself");
+    }
+
+    #[test]
+    fn backspace_at_a_code_blocks_start_unwraps_its_code() {
+        assert_eq!(block_edit("a\n```rs\nlet x;\ny\n```\nb", 8), Some(("a\nlet x;\ny\nb".to_owned(), 2)));
+        assert_eq!(block_edit("```\ncode\n```", 4), Some(("code".to_owned(), 0)));
+        assert_eq!(block_edit("```\ncode", 4), Some(("code".to_owned(), 0)), "an unclosed block too");
+        assert_eq!(block_edit("```\ncode", 5), None);
+    }
+
+    #[test]
+    fn task_checkboxes_toggle_their_source() {
+        let text = "- [ ] a\n- [X] b";
+        let edit = toggle_task(text, 3, 0..0).unwrap();
+        assert_eq!(apply(text, &edit), "- [x] a\n- [X] b");
+        assert_eq!(apply(text, &toggle_task(text, 11, 0..0).unwrap()), "- [ ] a\n- [ ] b");
+        assert_eq!(toggle_task(text, 0, 0..0), None);
+    }
+
+    #[test]
+    fn picking_a_language_rewrites_the_fence_and_moves_to_the_codes_end() {
+        let text = "```rs title\nfn a() {}\n```";
+        let parsed = crate::composer_markdown::parse(text, &[]);
+        let edit = set_code_language(text, &parsed, 0, "python").unwrap();
+        assert_eq!(apply(text, &edit), "```python title\nfn a() {}\n```");
+        assert_eq!(edit.select, 25..25);
+        let edit = set_code_language(text, &parsed, 0, "").unwrap();
+        assert_eq!(apply(text, &edit), "```text title\nfn a() {}\n```");
+        assert_eq!(set_code_language(text, &parsed, 5, "go"), None);
     }
 }

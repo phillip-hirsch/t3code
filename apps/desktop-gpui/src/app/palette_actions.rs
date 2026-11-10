@@ -143,14 +143,7 @@ impl Workspace {
     pub(super) fn copy_prompt_link(&mut self, with_context: bool, window: &mut Window, cx: &mut Context<Self>) {
         let prompt = self.composer.read(cx).value().to_string();
         let link = if with_context {
-            let project_id = match &self.target {
-                Some(Target::Thread { id, .. }) => {
-                    self.shell.threads.iter().find(|t| &t.id == id).map(|t| &t.project_id)
-                }
-                Some(Target::Draft { project_id, .. }) => Some(project_id),
-                None => None,
-            };
-            let project = project_id.and_then(|id| self.shell.projects.iter().find(|p| &p.id == id));
+            let project = self.current_project();
             let repository = project.and_then(|p| p.repository_identity.as_ref()).and_then(github_repository);
             let selection = self.composer_model();
             let provider =
@@ -173,8 +166,8 @@ impl Workspace {
         if self.page == Some(super::pages::Page::PullRequests) {
             return open_panel.flatten().map(CopyTarget::PullRequest);
         }
-        let Some(Target::Thread { id, .. }) = &self.target else { return None };
-        let shell = self.shell.threads.iter().find(|t| &t.id == id);
+        let key = self.target.as_ref().and_then(Target::thread_key)?;
+        let (id, shell) = (&key.id, self.shell.thread(&key));
         let empty = Vec::new();
         let copy = crate::thread_pull_requests::reference_copy(
             open_panel.as_ref().map(Option::as_deref),
@@ -212,13 +205,14 @@ impl Workspace {
     /// "Restart agent session": detaches the thread's provider sessions, so the next message
     /// starts a fresh one, then refreshes the provider for its checkout.
     pub(super) fn restart_agent_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(Target::Thread { id: thread_id, .. }) = self.target.clone() else { return };
+        let Some(key) = self.target.as_ref().and_then(Target::thread_key) else { return };
+        let thread_id = key.id.clone();
         let Some(client) = self.client() else { return };
         let projection = self.thread.as_ref().and_then(|t| t.state.projection.as_ref());
         let sessions: Vec<String> =
             projection.map(|p| p.provider_sessions.iter().map(|s| s.id.clone()).collect()).unwrap_or_default();
-        let shell = self.shell.threads.iter().find(|t| t.id == thread_id);
-        let project = shell.and_then(|t| self.shell.projects.iter().find(|p| p.id == t.project_id));
+        let shell = self.shell.thread(&key);
+        let project = shell.and_then(|t| self.shell.project(&crate::model::ScopedId::thread_project(t)));
         let instance =
             shell.and_then(|t| t.provider_instance_id.clone()).or_else(|| self.composer_model().map(|s| s.instance_id));
         let cwd = shell.and_then(|t| t.worktree_path.clone()).or_else(|| project.map(|p| p.workspace_root.clone()));

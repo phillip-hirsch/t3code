@@ -9,7 +9,7 @@ pub use compat::{
 };
 pub use frontmatter::FrontmatterPlugin;
 pub use gpui_base::text::{
-    InlineElement, InlineRenderContext, MarkdownBlockParserFn, MarkdownBlockRenderFn,
+    InlineElement, InlineRenderContext, LinkHover, MarkdownBlockParserFn, MarkdownBlockRenderFn,
     MarkdownExtensions, MarkdownNode, MarkdownParseContext, MarkdownPlugin, RangeHighlight,
     RangeHighlightError, RenderedText, SelectionFormat, TableData, TextViewMotion, TextViewState,
     markdown_ast,

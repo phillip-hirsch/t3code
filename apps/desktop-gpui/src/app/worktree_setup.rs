@@ -204,7 +204,7 @@ fn stage_row(stage: &Stage, snapshot: &Snapshot, t: &Tokens) -> AnyElement {
                 .rounded(px(6.))
                 .border_1()
                 .border_color(if failed { t.error.opacity(0.2) } else { t.border })
-                .bg(if failed { t.error.opacity(0.08) } else { t.muted.opacity(0.3) })
+                .bg(if failed { t.error_surface } else { t.code_background })
                 .font_family(t.fonts.mono)
                 .text_size(px(11.))
                 .text_color(if failed { t.error_foreground } else { t.muted_foreground })

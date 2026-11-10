@@ -19,6 +19,9 @@ pub enum AppLink {
     Thread { environment_id: String, thread_id: String, query: String },
     /// `t3code://pair?pairingUrl=…`: adds a remote backend.
     Pair { pairing_url: String },
+    /// An ordinary `http(s)` page, or a `file:` web page, the OS opened with the app
+    /// (`DesktopWebLinks.receive`).
+    Web { url: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -101,6 +104,24 @@ pub fn parse_app_link(value: &str) -> Option<AppLink> {
         Some(rest) => thread(rest),
         None if url.query_pairs().any(|(key, _)| key == "prompt") => thread(url.path()),
         None => None,
+    }
+}
+
+/// What a URL macOS opened with the app (`open-url`, and `open-file` as a `file:` URL) is:
+/// an app link, else an ordinary web page (`isWebLink`) or an HTML file (`isWebPageFile`).
+pub fn parse_opened_url(value: &str) -> Option<AppLink> {
+    if let Some(link) = parse_app_link(value) {
+        return Some(link);
+    }
+    let url = Url::parse(value).ok()?;
+    let web_page_file = || {
+        let path = url.path().to_ascii_lowercase();
+        [".htm", ".html", ".xhtm", ".xhtml"].iter().any(|ext| path.ends_with(ext))
+    };
+    match url.scheme() {
+        "http" | "https" => Some(AppLink::Web { url: value.to_owned() }),
+        "file" if web_page_file() => Some(AppLink::Web { url: url.into() }),
+        _ => None,
     }
 }
 
@@ -380,6 +401,23 @@ mod tests {
         assert_eq!(parse_app_link("https://app.t3.codes/e/t"), None);
         assert_eq!(parse_app_link("https://example.com/new?prompt=a"), None);
         assert_eq!(parse_app_link("not a url"), None);
+    }
+
+    #[test]
+    fn opened_urls_take_app_links_first_then_web_pages_and_html_files() {
+        let web = |url: &str| Some(AppLink::Web { url: url.into() });
+        assert_eq!(
+            parse_opened_url("https://app.t3.codes/new?prompt=a"),
+            parse_app_link("https://app.t3.codes/new?prompt=a")
+        );
+        assert_eq!(parse_opened_url("t3code://new"), Some(AppLink::New { query: String::new() }));
+        assert_eq!(parse_opened_url("https://example.com/a?b#c"), web("https://example.com/a?b#c"));
+        assert_eq!(parse_opened_url("http://localhost:3000"), web("http://localhost:3000"));
+        assert_eq!(parse_opened_url("file:///Users/me/Page.HTML"), web("file:///Users/me/Page.HTML"));
+        assert_eq!(parse_opened_url("file:///tmp/a%20b.xhtml"), web("file:///tmp/a%20b.xhtml"));
+        assert_eq!(parse_opened_url("file:///tmp/notes.md"), None);
+        assert_eq!(parse_opened_url("ftp://example.com/a.html"), None);
+        assert_eq!(parse_opened_url("mailto:me@example.com"), None);
     }
 
     #[test]

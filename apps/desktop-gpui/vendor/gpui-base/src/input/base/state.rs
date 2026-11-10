@@ -579,6 +579,9 @@ pub struct InputBaseState<M: InputModeKind> {
     ///
     pub(super) enable_context_menu: bool,
 
+    /// Metadata for the clipboard entry `Copy` and `Cut` write, from the copied text.
+    copy_metadata: Option<Rc<dyn Fn(&str, &mut Window, &mut App) -> Option<String>>>,
+
     /// A flag to indicate if we are currently inserting a completion item.
     pub(super) completion_inserting: bool,
     pub(super) overlay_action_handler: Option<
@@ -1047,6 +1050,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             context_menu_handler: None,
             pending_context_menu: None,
             enable_context_menu: true,
+            copy_metadata: None,
             completion_inserting: false,
             overlay_action_handler: None,
             silent_replace_text: false,
@@ -1071,6 +1075,24 @@ impl<M: InputModeKind> InputBaseState<M> {
 
     pub fn set_context_menu_enabled(&mut self, enabled: bool) {
         self.enable_context_menu = enabled;
+    }
+
+    /// Attaches metadata to what `Copy` and `Cut` put on the clipboard: `f` gets the
+    /// copied text and returns the entry's metadata, or `None` for plain text.
+    pub fn set_copy_metadata(
+        &mut self,
+        f: impl Fn(&str, &mut Window, &mut App) -> Option<String> + 'static,
+    ) {
+        self.copy_metadata = Some(Rc::new(f));
+    }
+
+    /// The clipboard entry for copied `text`, with [`Self::set_copy_metadata`]'s metadata.
+    fn copied_item(&self, text: String, window: &mut Window, cx: &mut App) -> ClipboardItem {
+        let metadata = self.copy_metadata.clone().and_then(|f| f(&text, window, cx));
+        match metadata {
+            Some(metadata) => ClipboardItem::new_string_with_metadata(text, metadata),
+            None => ClipboardItem::new_string(text),
+        }
     }
 
     /// Set whether search UI allows replacement, default is true.
@@ -3166,14 +3188,15 @@ impl<M: InputModeKind> InputBaseState<M> {
             .collect()
     }
 
-    pub(super) fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn copy(&mut self, _: &Copy, window: &mut Window, cx: &mut Context<Self>) {
         if !self.is_copyable() {
             return;
         }
 
         let texts = self.selected_texts();
 
-        cx.write_to_clipboard(ClipboardItem::new_string(texts.join("\n")));
+        let item = self.copied_item(texts.join("\n"), window, cx);
+        cx.write_to_clipboard(item);
     }
 
     pub(super) fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
@@ -3183,7 +3206,8 @@ impl<M: InputModeKind> InputBaseState<M> {
 
         let texts = self.selected_texts();
 
-        cx.write_to_clipboard(ClipboardItem::new_string(texts.join("\n")));
+        let item = self.copied_item(texts.join("\n"), window, cx);
+        cx.write_to_clipboard(item);
 
         self.undo_manager.set_pending_intent(EditIntent::Atomic);
         self.replace_text_in_range_silent(None, "", window, cx);
@@ -10629,6 +10653,31 @@ mod tests {
                     assert_eq!(state.value(), "abcdef");
                     assert_eq!(state.selected_range(), 0..5);
                 }
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn test_copy_and_cut_carry_the_copy_metadata(cx: &mut TestAppContext) {
+        let view = InputView::build_textarea(cx, |state| state.default_value("one two"));
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        cx.update(|window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.set_selected_range(0..3, cx);
+                state.copy(&Copy, window, cx);
+                assert_eq!(cx.read_from_clipboard().unwrap().metadata(), None);
+                state.set_copy_metadata(|text, _, _| (text != "two").then(|| format!("[{text}]")));
+                state.copy(&Copy, window, cx);
+                let copied = cx.read_from_clipboard().unwrap();
+                assert_eq!(copied.text().as_deref(), Some("one"));
+                assert_eq!(copied.metadata().map(String::as_str), Some("[one]"));
+                state.cut(&Cut, window, cx);
+                let cut = cx.read_from_clipboard().unwrap();
+                assert_eq!(cut.metadata().map(String::as_str), Some("[one]"));
+                assert_eq!(state.value(), " two");
+                state.set_selected_range(1..4, cx);
+                state.copy(&Copy, window, cx);
+                assert_eq!(cx.read_from_clipboard().unwrap().metadata(), None);
             });
         });
     }

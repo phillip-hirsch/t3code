@@ -285,7 +285,7 @@ impl Workspace {
             return None;
         }
         let url = panel.detail.as_ref()?.url.clone();
-        let environment = self.project_environment(&panel.reference.project_id)?;
+        let environment = SharedString::from(panel.reference.environment_id.clone());
         let tip = format!(
             "Linked from {} {}. Search in the command palette.",
             linked.len(),
@@ -389,11 +389,8 @@ impl Workspace {
 
     /// The thread showing the pull request, when it lives on the pull request's environment, and
     /// whether it links it (`usePullRequestLinking().isLinked`).
-    pub(super) fn pr_current_thread(&self, project_id: &str, thread_id: &str, url: &str) -> Option<(String, bool)> {
-        let thread = self.shell.threads.iter().find(|t| t.id == thread_id)?;
-        if self.project_environment(&thread.project_id) != self.project_environment(project_id) {
-            return None;
-        }
+    pub(super) fn pr_current_thread(&self, environment_id: &str, thread_id: &str, url: &str) -> Option<(String, bool)> {
+        let thread = self.shell.threads.iter().find(|t| t.id == thread_id && t.environment_id == environment_id)?;
         Some((thread.id.clone(), crate::thread_pull_requests::links_url(&thread.pull_requests, url)))
     }
 

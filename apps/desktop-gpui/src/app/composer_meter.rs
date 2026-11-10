@@ -145,14 +145,7 @@ impl Workspace {
             })
             .or_else(|| projection.thread.model_selection.as_ref().map(|s| s.model.clone()));
         let compactable = provider.is_some_and(|p| p.slash_commands.iter().any(|c| c.name == "compact"));
-        let compact_blocked = !compactable
-            || projection.is_running()
-            || self.sending
-            || self.target_rewinding()
-            || !projection.pending_approvals().is_empty()
-            || !projection.pending_user_inputs().is_empty()
-            || self.has_plan_follow_up()
-            || !has_compactable_conversation(projection);
+        let compact_blocked = self.compact_unavailable(projection);
         let view = cx.entity();
         let tokens = *t;
         let close_delay = Duration::from_millis(if compactable { 150 } else { 0 });
@@ -314,6 +307,21 @@ impl Workspace {
         self.composer_ui.meter.close();
         cx.notify();
         true
+    }
+
+    /// `compactThreadUnavailable`: the open thread cannot compact now, by the button or before a send.
+    pub(super) fn compact_unavailable(&self, projection: &crate::model::ThreadProjection) -> bool {
+        let compactable =
+            self.composer_provider().is_some_and(|p| p.slash_commands.iter().any(|c| c.name == "compact"));
+        !compactable
+            || self.client().is_none()
+            || projection.is_running()
+            || self.sending
+            || self.target_rewinding()
+            || !projection.pending_approvals().is_empty()
+            || !projection.pending_user_inputs().is_empty()
+            || self.has_plan_follow_up()
+            || !has_compactable_conversation(projection)
     }
 
     /// `sendStandaloneCommand("/compact")`, after the thread takes the composer's mode.

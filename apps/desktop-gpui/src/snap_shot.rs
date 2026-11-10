@@ -6,6 +6,10 @@ use serde_json::{Value, json};
 
 use crate::keybindings::{self, Shortcut as Chord};
 
+pub mod setup;
+
+pub use setup::State;
+
 /// The platform a label or a shortcut is resolved for: `mod` is Cmd on macOS and Ctrl elsewhere,
 /// and each names its modifier keys its own way.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -364,54 +368,18 @@ fn hotkey_on(chord: &Chord, os: Os) -> Option<(u32, u32)> {
     Some((flags, vk))
 }
 
-/// `DesktopSnapShotState` as this client knows it: capture is always direct here.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct State {
-    pub shortcut_registered: bool,
-    pub shortcut_message: Option<String>,
-    /// Why the last capture failed; a later success clears it.
-    pub message: Option<String>,
-    /// The shortcut fired since it was registered.
-    pub shortcut_verified: bool,
-}
-
-/// `snapShotStatus` for direct capture.
-pub fn status(state: &State, enabled: bool) -> &'static str {
-    if !enabled {
-        "Turn this on to set up snapshots."
-    } else if state.message.is_some() {
-        "Capture needs attention"
-    } else if state.shortcut_verified {
-        "Ready to capture"
-    } else if state.shortcut_registered {
-        // A direct shortcut has no desktop label to confirm it by.
-        "Shortcut saved"
-    } else {
-        "Finish shortcut setup"
-    }
-}
-
-/// `snapShotShortcutStatus` for direct capture.
-pub fn shortcut_status(state: &State) -> Option<String> {
-    if state.shortcut_registered { Some("Shortcut saved.".into()) } else { state.shortcut_message.clone() }
-}
-
 /// `DesktopSnapShotError` messages the capture flow shows.
 #[cfg(any(windows, target_os = "macos"))]
 pub const WINDOW_UNAVAILABLE: &str = "The active window is not available for capture.";
 pub const CAPTURE_FAILED: &str = "Could not capture the active window.";
-#[cfg(any(windows, target_os = "macos"))]
 pub const TOO_LARGE: &str = "The captured window is too large to attach.";
 
-#[cfg(any(windows, target_os = "macos"))]
 /// `PROVIDER_SEND_TURN_MAX_IMAGE_BYTES`.
 pub const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 
-#[cfg(any(windows, target_os = "macos", test))]
 /// The capture's longest side stays within Electron's thumbnail bounds.
 pub const MAX_CAPTURE: (u32, u32) = (2_560, 1_600);
 
-#[cfg(any(windows, target_os = "macos", test))]
 /// The size a `width`×`height` capture scales down to so it fits [`MAX_CAPTURE`].
 #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a positive, rounded pixel size")]
 pub fn fit_capture(width: u32, height: u32) -> (u32, u32) {
@@ -678,22 +646,6 @@ mod tests {
             Shortcut::Pair(_) => None,
         };
         assert_eq!(mac, Some((0x8 | 0x4, 0x32)), "mod is Cmd on macOS");
-    }
-
-    #[test]
-    fn status_reads_like_the_web_for_direct_capture() {
-        let mut state = State::default();
-        assert_eq!(status(&state, false), "Turn this on to set up snapshots.");
-        assert_eq!(status(&state, true), "Finish shortcut setup");
-        state.shortcut_registered = true;
-        assert_eq!(status(&state, true), "Shortcut saved");
-        assert_eq!(shortcut_status(&state).as_deref(), Some("Shortcut saved."));
-        state.shortcut_verified = true;
-        assert_eq!(status(&state, true), "Ready to capture");
-        state.message = Some(CAPTURE_FAILED.into());
-        assert_eq!(status(&state, true), "Capture needs attention");
-        let failed = State { shortcut_message: Some("taken".into()), ..State::default() };
-        assert_eq!(shortcut_status(&failed).as_deref(), Some("taken"));
     }
 
     #[test]

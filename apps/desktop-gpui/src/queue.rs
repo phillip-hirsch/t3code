@@ -286,7 +286,7 @@ pub fn preview_text(text: &str, thumbnails: bool) -> String {
         }
     }
     out.push_str(rest);
-    out.trim().to_owned()
+    crate::assistant_citations::to_plain_text(&out).trim().to_owned()
 }
 
 /// The message an edit loads into the composer (`stripAttachmentOnlyBootstrapPrompt`).
@@ -422,6 +422,8 @@ run it";
         let image = "look ![shot.png](t3-context://image/image_1) here";
         assert_eq!(preview_text(image, false), "look shot.png here");
         assert_eq!(preview_text(image, true), "look  here", "the thumbnail stands for the image");
+        let cited = "about [Assistant quote](t3-citation://v1/e/t/m?text=the+quote&start=0&end=9&prefix=&suffix=) ";
+        assert_eq!(preview_text(cited, false), "about the quote", "a citation reads as its quote");
         assert_eq!(edit_text(ATTACHMENT_ONLY_PROMPT), "");
     }
 }

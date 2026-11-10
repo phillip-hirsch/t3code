@@ -161,7 +161,7 @@ fn driver_allowed(policy: &Value, driver: &str) -> bool {
 }
 
 /// `managedInstanceLocks(...).configKeys` and its reason, when the policy pins any of `driver`'s config.
-fn config_locks(policy: &Value, driver: &str) -> Option<(HashSet<String>, SharedString)> {
+pub(super) fn config_locks(policy: &Value, driver: &str) -> Option<(HashSet<String>, SharedString)> {
     let paths = policy.pointer(&format!("/limits/providers/lockedInstanceFields/{driver}"))?.as_array()?;
     if paths.is_empty() {
         return None;
@@ -243,6 +243,8 @@ pub(super) struct ConfigForm {
     divided: bool,
     /// Controls sit under their titles (`super::rows_stacked`).
     stacked: bool,
+    /// The secret providers a credential field can read from (`useSecretSources`).
+    pub(super) sources: Vec<crate::app::request_cards::SecretSource>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -269,6 +271,7 @@ impl ConfigForm {
             locks,
             divided,
             stacked: false,
+            sources: Vec::new(),
             _subscriptions: Vec::new(),
         };
         for field in driver.fields.iter().filter(|f| !matches!(f.control, Control::Select(_))) {
@@ -389,7 +392,20 @@ impl ConfigForm {
         self.publish(next, window, cx);
     }
 
-    fn render_control(&self, field: Field, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+    /// A committed secret reference, or `None` back to a typed value (`SecretSettingsControl`).
+    fn set_secret(&mut self, field: Field, secret: Option<Value>, window: &mut Window, cx: &mut Context<Self>) {
+        let next = match secret {
+            Some(secret) => {
+                let mut base = self.config.as_object().cloned().unwrap_or_default();
+                base.insert(field.key.into(), secret);
+                Some(Value::Object(base))
+            }
+            None => next_config(&self.config, &field, ""),
+        };
+        self.publish(next, window, cx);
+    }
+
+    fn render_control(&self, field: Field, t: &Tokens, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let locked = self.locks.as_ref().filter(|(keys, _)| keys.contains(field.key)).map(|(_, reason)| reason.clone());
         let id = |part: &str| ElementId::Name(format!("{}-{}{part}", self.id_prefix, field.key).into());
         let control = match field.control {
@@ -426,10 +442,32 @@ impl ConfigForm {
             _ => {
                 let input = self.inputs[field.key].clone();
                 let configured = field.secret && has_secret(&self.config, field.key);
+                let disabled = locked.is_some();
+                let value_field = || Input::new(&input).small().flex_1().disabled(disabled).into_any_element();
+                let value = if field.secret {
+                    let form = cx.entity().downgrade();
+                    crate::app::pages::settings::secret_source::secret_source_input(
+                        format!("{}-{}", self.id_prefix, field.key),
+                        field.label,
+                        self.config.get(field.key),
+                        &self.sources,
+                        disabled,
+                        value_field,
+                        move |secret, window, cx| {
+                            let _ = form.update(cx, |form, cx| form.set_secret(field, secret, window, cx));
+                        },
+                        window,
+                        cx,
+                    )
+                    .row()
+                } else {
+                    value_field()
+                };
                 h_flex()
                     .map(|el| if self.stacked { el.w_full() } else { el.w(px(224.)) })
+                    .items_start()
                     .gap(px(8.))
-                    .child(Input::new(&input).small().flex_1().disabled(locked.is_some()))
+                    .child(value)
                     .when(configured && locked.is_none(), |row| {
                         row.child(
                             Button::new(id("-clear"))
@@ -496,14 +534,14 @@ impl ConfigForm {
 }
 
 impl Render for ConfigForm {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *tokens(cx);
         let fields = visible_fields(self.driver, &self.config);
         let local = is_local_acp(self.driver.kind, &self.config);
         let rows = fields
             .into_iter()
             .map(|field| {
-                let control = self.render_control(field, &t, cx);
+                let control = self.render_control(field, &t, window, cx);
                 stackable_row(
                     SharedString::from(format!("{}-{}", self.id_prefix, field.key)),
                     field.label,
@@ -561,9 +599,11 @@ impl Workspace {
             },
         );
         let stacked = self.settings_ui.provider_rows_stacked;
+        let sources = self.settings_secret_sources();
         form.update(cx, |form, cx| {
-            if form.stacked != stacked {
+            if form.stacked != stacked || form.sources != sources {
                 form.stacked = stacked;
+                form.sources = sources;
                 cx.notify();
             }
             form.set_config(config, window, cx);
@@ -592,8 +632,8 @@ pub(super) struct AddProviderWizard {
     workspace: WeakEntity<Workspace>,
     /// The settings environment at open: the provider is added there.
     scope: Option<SharedString>,
-    /// The Providers page, which selects the new instance (`onCreated`).
-    page: Entity<super::ProvidersPage>,
+    /// The Providers page, which selects the new instance (`onCreated`); `None` from the Welcome page.
+    page: Option<Entity<super::ProvidersPage>>,
     step: usize,
     driver: &'static Driver,
     identity: HashMap<&'static str, Identity>,
@@ -629,7 +669,7 @@ impl AddProviderWizard {
     fn new(
         workspace: Entity<Workspace>,
         scope: Option<SharedString>,
-        page: Entity<super::ProvidersPage>,
+        page: Option<Entity<super::ProvidersPage>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -806,8 +846,14 @@ impl AddProviderWizard {
         }
         let config = self.config().clone();
         let locks = self.info(cx).and_then(|info| config_locks(&info.managed_policy, driver.kind));
+        let sources = (self.workspace.upgrade().zip(self.scope.as_ref()))
+            .map(|(workspace, scope)| workspace.read(cx).secret_sources_on(scope))
+            .unwrap_or_default();
         let form = cx.new(|cx| {
-            ConfigForm::new(driver, config, format!("add-provider-{}", driver.kind), locks, false, window, cx)
+            let mut form =
+                ConfigForm::new(driver, config, format!("add-provider-{}", driver.kind), locks, false, window, cx);
+            form.sources = sources;
+            form
         });
         self._subscriptions.push(cx.subscribe(&form, move |this, _, ConfigChanged(next), cx| {
             match next {
@@ -947,10 +993,19 @@ impl AddProviderWizard {
                     return notify_error(window, cx, "Could not add provider instance", rpc_message(&error));
                 }
                 let selected = instance_id.clone();
-                this.page.update(cx, |page, cx| {
-                    page.selected = Some(selected);
-                    cx.notify();
-                });
+                match &this.page {
+                    Some(page) => page.update(cx, |page, cx| {
+                        page.selected = Some(selected);
+                        cx.notify();
+                    }),
+                    // The Welcome page lists the new agent once its status is read.
+                    None => {
+                        if let Some(client) = this.client(cx) {
+                            let refresh = async move { client.request("server.refreshProviders", json!({})).await };
+                            cx.background_spawn(refresh).detach();
+                        }
+                    }
+                }
                 if then_sign_in {
                     this.step = 2;
                     this.watch_auth(instance_id.clone(), window, cx);
@@ -1605,10 +1660,37 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (workspace, scope) = (cx.entity(), self.settings_environment());
+        let scope = self.settings_environment();
+        self.open_add_provider_wizard(scope, Some(page), false, window, cx);
+    }
+
+    /// The Welcome page's ACP Registry "Browse": the wizard on `scope` with every driver shown
+    /// (`showMoreProviders`).
+    pub(in crate::app) fn open_add_agent_dialog(
+        &mut self,
+        scope: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_add_provider_wizard(Some(scope), None, true, window, cx);
+    }
+
+    fn open_add_provider_wizard(
+        &mut self,
+        scope: Option<SharedString>,
+        page: Option<Entity<super::ProvidersPage>>,
+        show_more: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = cx.entity();
         // The wizard reads the workspace, which this call is still updating.
         window.defer(cx, move |window, cx| {
-            let wizard = cx.new(|cx| AddProviderWizard::new(workspace, scope, page, window, cx));
+            let wizard = cx.new(|cx| {
+                let mut wizard = AddProviderWizard::new(workspace, scope, page, window, cx);
+                wizard.show_more = show_more;
+                wizard
+            });
             window.open_dialog(cx, move |dialog, _, _| {
                 dialog.entrance(DialogEntrance::None).p_0().w(px(768.)).centered().child(wizard.clone())
             });

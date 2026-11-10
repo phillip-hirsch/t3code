@@ -43,14 +43,12 @@ const LIGHT_PALETTE: [u32; 16] = [
 impl TerminalTheme {
     pub fn new(tokens: &Tokens) -> Self {
         let palette = if tokens.dark { DARK_PALETTE } else { LIGHT_PALETTE };
-        // `--terminal-cursor` and `--terminal-selection-background` (`index.css:1184-1227`).
-        let (cursor, selection) =
-            if tokens.dark { ((180, 203, 255), (180, 203, 255, 0.25)) } else { ((38, 56, 78), (37, 63, 99, 0.2)) };
+        let colors = tokens.terminal;
         Self {
-            background: tokens.background,
-            foreground: tokens.foreground,
-            cursor: rgb8(cursor.0, cursor.1, cursor.2, 1.),
-            selection: rgb8(selection.0, selection.1, selection.2, selection.3),
+            background: colors.background,
+            foreground: colors.foreground,
+            cursor: colors.cursor,
+            selection: colors.selection,
             palette: palette.map(|value| rgb(value).into()),
         }
     }

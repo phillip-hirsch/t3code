@@ -119,6 +119,64 @@ pub(crate) fn parse(source: &str, cx: &mut NodeContext) -> Result<ParsedDocument
     })
 }
 
+/// The parts of the first `<details>` element in `source`, an HTML fragment
+/// that may leave it unclosed: whether it is `open`, its summary, and the rest
+/// of its content.
+pub(super) fn parse_details(
+    source: &str,
+    cx: &mut NodeContext,
+) -> Option<(bool, Option<Paragraph>, Vec<BlockNode>)> {
+    fn find(node: &Rc<Node>) -> Option<Rc<Node>> {
+        if let NodeData::Element { ref name, .. } = node.data
+            && name.local == local_name!("details")
+        {
+            return Some(node.clone());
+        }
+        node.children.borrow().iter().find_map(find)
+    }
+
+    let bytes = cleanup_html(source);
+    let dom = parse_document(RcDom::default(), ParseOpts::default())
+        .from_utf8()
+        .read_from(&mut std::io::Cursor::new(bytes))
+        .ok()?;
+    let details = find(&dom.document)?;
+    let NodeData::Element { ref attrs, .. } = details.data else {
+        return None;
+    };
+    let open = attr_value(attrs, local_name!("open")).is_some();
+    let (summary, children) = details_parts(&details, cx);
+    Some((open, summary, children))
+}
+
+/// A `<details>` element's first `<summary>`, as inline text, and the blocks
+/// of everything else in it.
+fn details_parts(node: &Rc<Node>, cx: &mut NodeContext) -> (Option<Paragraph>, Vec<BlockNode>) {
+    let mut summary = None;
+    let mut children = vec![];
+    let mut paragraph = HtmlParagraph::default();
+    for child in node.children.borrow().iter() {
+        if summary.is_none()
+            && let NodeData::Element { ref name, .. } = child.data
+            && name.local == local_name!("summary")
+        {
+            consume_paragraph(&mut children, &mut paragraph);
+            let mut text = HtmlParagraph::default();
+            for inline in child.children.borrow().iter() {
+                parse_paragraph(&mut text, inline);
+            }
+            summary = Some(text.take());
+            continue;
+        }
+        if let Some(block) = parse_node(child, &mut paragraph, cx) {
+            consume_paragraph(&mut children, &mut paragraph);
+            children.push(block);
+        }
+    }
+    consume_paragraph(&mut children, &mut paragraph);
+    (summary, children)
+}
+
 fn cleanup_html(source: &str) -> Vec<u8> {
     let mut w = std::io::Cursor::new(vec![]);
     let mut r = std::io::Cursor::new(source);
@@ -652,6 +710,26 @@ fn parse_node(
                     children,
                     span: None,
                 })
+            }
+            local_name!("details") => {
+                let mut children = vec![];
+                consume_paragraph(&mut children, paragraph);
+                let (summary, content) = details_parts(node, cx);
+                let details = BlockNode::Details {
+                    summary: summary.unwrap_or_else(node::Paragraph::details_fallback),
+                    children: content,
+                    open: attr_value(attrs, local_name!("open")).is_some(),
+                    span: None,
+                };
+                if children.is_empty() {
+                    Some(details)
+                } else {
+                    children.push(details);
+                    Some(BlockNode::Root {
+                        children,
+                        span: None,
+                    })
+                }
             }
             local_name!("style") | local_name!("script") => None,
             _ => {

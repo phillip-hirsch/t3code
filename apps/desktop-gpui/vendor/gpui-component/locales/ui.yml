@@ -722,12 +722,34 @@ Diff:
     ru: "Строк вне патча: %{count}"
     zh-CN: "patch 中未包含 %{count} 行"
     zh-HK: "patch 中未包含 %{count} 行"
+  MoreContext:
+    en: "More unchanged context may be available"
   ExpandAbove:
     en: Show %{count} lines above
     pt-BR: "Mostrar %{count} linhas acima"
     ru: "Показать строки выше: %{count}"
     zh-CN: 显示上方 %{count} 行
     zh-HK: 顯示上方 %{count} 行
+  SearchPlaceholder:
+    en: Search
+  SearchMatchCase:
+    en: Match Case
+  SearchWholeWord:
+    en: Whole Word
+  SearchRegex:
+    en: Regexp
+  SearchPrevious:
+    en: Previous
+  SearchNext:
+    en: Next
+  SearchClose:
+    en: Close
+  SearchNoResults:
+    en: No results
+  SearchResults:
+    en: "%{count} results"
+  SearchMatchOf:
+    en: "%{index} of %{total}"
   ExpandBelow:
     en: Show %{count} lines below
     pt-BR: "Mostrar %{count} linhas abaixo"

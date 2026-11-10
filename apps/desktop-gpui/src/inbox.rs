@@ -413,6 +413,65 @@ impl<'a> Facts<'a> {
         parse_ms(visited).is_none_or(|visited| completed > visited)
     }
 
+    /// `resolveThreadStatusPill`: the palette's word for what the thread waits on or did last.
+    pub fn pill(&self) -> Option<Pill> {
+        let t = self.thread;
+        if self.has_pending_approvals() || self.child_request == Some(ChildRequest::Approval) {
+            return Some(Pill::PendingApproval);
+        }
+        if self.has_pending_user_input() || self.child_request == Some(ChildRequest::Input) {
+            return Some(Pill::AwaitingInput);
+        }
+        if t.pending_guest_message_count > 0 {
+            return Some(Pill::GuestRequest);
+        }
+        let runtime = self.runtime_status();
+        let blocked = t.blocked_on_thread_wait == Some(true);
+        if (runtime == Some("running") && !blocked) || runtime == Some("waiting") {
+            return Some(Pill::Working);
+        }
+        if matches!(runtime, Some("preparing" | "starting" | "queued")) {
+            return Some(Pill::Connecting);
+        }
+        // `backgroundWorkHoldsCompletion` parks the runtime as idle.
+        if (runtime == Some("running") && blocked) || self.holds_completion() {
+            return Some(Pill::Waiting);
+        }
+        if self.has_unseen_failure() {
+            return Some(Pill::Failed);
+        }
+        // `isLatestRunSettled`.
+        let run_settled =
+            self.latest_run_status().is_some_and(|status| !is_active_run(status)) && t.active_run_id != t.latest_run_id;
+        if !self.has_pending_user_input()
+            && t.interaction_mode.as_deref() == Some("plan")
+            && run_settled
+            && t.has_actionable_proposed_plan
+        {
+            return Some(Pill::PlanReady);
+        }
+        self.is_unread().then_some(Pill::Completed)
+    }
+
+    fn holds_completion(&self) -> bool {
+        self.thread
+            .pending_background_tasks
+            .iter()
+            .any(|task| task.awaited == Some(true) || matches!(task.kind.as_str(), "subagent" | "background_task"))
+    }
+
+    /// `hasUnseenFailure`: unlike a completion, an unopened thread's failure counts as unseen.
+    fn has_unseen_failure(&self) -> bool {
+        if self.latest_run_status() != Some("failed") {
+            return false;
+        }
+        let Some(visited) = self.thread.last_visited() else { return true };
+        match (ms(self.latest_run_completed_at()), parse_ms(visited)) {
+            (Some(completed), Some(visited)) => completed > visited,
+            _ => true,
+        }
+    }
+
     /// `resolveSidebarThreadStatus`.
     pub fn status(&self) -> Status {
         if self.has_pending_approvals() || self.child_request == Some(ChildRequest::Approval) {
@@ -535,6 +594,36 @@ pub enum Status {
     Failed,
     Limited,
     Ready,
+}
+
+/// `ThreadStatusPill`'s label.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pill {
+    PendingApproval,
+    AwaitingInput,
+    GuestRequest,
+    Working,
+    Connecting,
+    Waiting,
+    Failed,
+    PlanReady,
+    Completed,
+}
+
+impl Pill {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::PendingApproval => "Pending Approval",
+            Self::AwaitingInput => "Awaiting Input",
+            Self::GuestRequest => "Guest Request",
+            Self::Working => "Working",
+            Self::Connecting => "Connecting",
+            Self::Waiting => "Waiting",
+            Self::Failed => "Failed",
+            Self::PlanReady => "Plan Ready",
+            Self::Completed => "Completed",
+        }
+    }
 }
 
 /// `shouldRecedeSidebarThread`.
@@ -1321,6 +1410,45 @@ mod tests {
         ];
         let sections = partition(&threads, now(), false, false, &mut ReturnTracker::default(), |_| true);
         assert_eq!(ids(&sections.active), ["unsettled", "created", "old", "keyed-a", "keyed-b"]);
+    }
+
+    #[test]
+    fn the_status_pill_names_what_waits_first_then_the_run() {
+        let pill = |extra: Value| Facts::new(&thread("t", extra), &HashMap::new()).pill();
+        let visited = "2026-11-02T00:00:00.000Z";
+        assert_eq!(pill(json!({})), None);
+        let approval = json!({"latestRunId": "r", "status": "running", "pendingRuntimeRequest": {"kind": "command"}});
+        assert_eq!(pill(approval), Some(Pill::PendingApproval));
+        let question = json!({"pendingRuntimeRequest": {"kind": "user_input"}, "pendingGuestMessageCount": 1});
+        assert_eq!(pill(question), Some(Pill::AwaitingInput));
+        assert_eq!(pill(json!({"pendingGuestMessageCount": 1})), Some(Pill::GuestRequest));
+        assert_eq!(pill(json!({"latestRunId": "r", "status": "running"})), Some(Pill::Working));
+        assert_eq!(pill(json!({"latestRunId": "r", "status": "starting"})), Some(Pill::Connecting));
+        let blocked = json!({"latestRunId": "r", "status": "running", "blockedOnThreadWait": true});
+        assert_eq!(pill(blocked), Some(Pill::Waiting));
+        let parked =
+            json!({"latestRunId": "r", "status": "completed", "pendingBackgroundTasks": [{"kind": "subagent"}]});
+        assert_eq!(pill(parked), Some(Pill::Waiting));
+        // A failure counts before the thread is ever opened; a completion does not.
+        let failed = |visited_at: Option<&str>| {
+            json!({"latestRunId": "r", "status": "failed", "latestRunCompletedAt": "2026-11-03T00:00:00.000Z",
+                "lastVisitedAt": visited_at})
+        };
+        assert_eq!(pill(failed(None)), Some(Pill::Failed));
+        assert_eq!(pill(failed(Some(visited))), Some(Pill::Failed));
+        assert_eq!(pill(failed(Some("2026-11-04T00:00:00.000Z"))), None);
+        let done = |visited_at: Option<&str>| {
+            json!({"latestRunId": "r", "status": "completed", "latestRunCompletedAt": "2026-11-03T00:00:00.000Z",
+                "lastVisitedAt": visited_at})
+        };
+        assert_eq!(pill(done(None)), None);
+        assert_eq!(pill(done(Some(visited))), Some(Pill::Completed));
+        let plan = json!({"latestRunId": "r", "status": "completed", "interactionMode": "plan",
+            "hasActionableProposedPlan": true, "lastVisitedAt": "2026-11-04T00:00:00.000Z"});
+        assert_eq!(pill(plan.clone()), Some(Pill::PlanReady));
+        let mut active = plan;
+        active["activeRunId"] = json!("r");
+        assert_eq!(pill(active), None, "the plan's run is still the active one");
     }
 
     #[test]

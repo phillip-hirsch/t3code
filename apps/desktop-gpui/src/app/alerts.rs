@@ -76,7 +76,7 @@ impl Workspace {
     }
 
     /// The tags each environment's thread tag filter hides, for the environments that hide any.
-    fn hidden_thread_tags(&self) -> HashMap<&str, Vec<String>> {
+    pub(super) fn hidden_thread_tags(&self) -> HashMap<&str, Vec<String>> {
         self.sessions
             .iter()
             .filter_map(|s| Some((s.id.as_deref()?, crate::model::hidden_thread_tags(&s.server_info.settings)?)))
@@ -224,7 +224,7 @@ fn set_badge(window: &Window, count: usize) {
 }
 
 /// Plays an alert's sound off the UI thread; while one plays, the same sound again is dropped.
-fn play_sound(kind: Kind) {
+pub(super) fn play_sound(kind: Kind) {
     // Two independent timestamps, so a poisoned lock holds nothing half-updated.
     static PLAYING_UNTIL: Mutex<[Option<Instant>; 2]> = Mutex::new([None, None]);
     let playing_until = || PLAYING_UNTIL.lock().unwrap_or_else(PoisonError::into_inner);

@@ -69,6 +69,10 @@ pub fn resolve(mode: ExposureMode, port: u16, route: Option<Ipv4Addr>, host_over
 pub struct ExposureView {
     pub exposure: Exposure,
     pub tailscale: Option<TailscaleHttps>,
+    /// The server's port, which every advertised address shares.
+    pub port: u16,
+    /// This machine's tailnet addresses, while network access is on.
+    pub tailnet_ipv4: Vec<Ipv4Addr>,
 }
 
 /// What the server is started with: the bind host and Tailscale Serve.
@@ -101,10 +105,17 @@ pub struct TailscaleHttps {
     pub available: bool,
 }
 
-/// `resolveTailscaleMagicDnsAdvertisedEndpoint`: reads `tailscale status --json`, then probes
-/// the HTTPS URL when Serve is on. Blocking: run it off the UI thread. `None` when Tailscale is
-/// not running here.
-pub fn tailscale_https(serve_enabled: bool, serve_port: u16) -> Option<TailscaleHttps> {
+/// What `tailscale status --json` says about this machine: the HTTPS endpoint, probed when
+/// Serve is on (`resolveTailscaleMagicDnsAdvertisedEndpoint`), and its tailnet IPv4 addresses.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Tailscale {
+    pub https: Option<TailscaleHttps>,
+    pub ipv4: Vec<Ipv4Addr>,
+}
+
+/// Reads Tailscale's status. Blocking: run it off the UI thread. Empty when Tailscale is not
+/// running here.
+pub fn tailscale(serve_enabled: bool, serve_port: u16) -> Tailscale {
     let executable = if cfg!(windows) { "tailscale.exe" } else { "tailscale" };
     let mut command = std::process::Command::new(executable);
     // From Finder the app's own PATH is bare; look where the login shell would.
@@ -112,16 +123,34 @@ pub fn tailscale_https(serve_enabled: bool, serve_port: u16) -> Option<Tailscale
     if let Some(path) = crate::desktop::shell_env::search_path() {
         command.env("PATH", path);
     }
-    let output = command
+    let Ok(output) = command
         .args(["status", "--json"])
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .output()
-        .ok()?;
-    let name = magic_dns_name(&String::from_utf8_lossy(&output.stdout))?;
-    let url = tailscale_https_url(&name, serve_port);
-    let available = serve_enabled && probe(&url);
-    Some(TailscaleHttps { url, available })
+    else {
+        return Tailscale::default();
+    };
+    let status = String::from_utf8_lossy(&output.stdout);
+    let https = magic_dns_name(&status).map(|name| {
+        let url = tailscale_https_url(&name, serve_port);
+        let available = serve_enabled && probe(&url);
+        TailscaleHttps { url, available }
+    });
+    Tailscale { https, ipv4: tailnet_ipv4(&status) }
+}
+
+/// `parseTailscaleStatus`'s `tailnetIpv4Addresses`: `Self.TailscaleIPs` in Tailscale's range.
+pub fn tailnet_ipv4(status_json: &str) -> Vec<Ipv4Addr> {
+    let Ok(status) = serde_json::from_str::<serde_json::Value>(status_json) else { return Vec::new() };
+    let addresses = status.pointer("/Self/TailscaleIPs").and_then(serde_json::Value::as_array);
+    let mut ipv4 = Vec::new();
+    for address in addresses.into_iter().flatten().filter_map(|address| address.as_str()?.parse::<Ipv4Addr>().ok()) {
+        if is_tailscale_ipv4(address) && !ipv4.contains(&address) {
+            ipv4.push(address);
+        }
+    }
+    ipv4
 }
 
 /// `probeTailscaleHttpsEndpoint`.
@@ -180,6 +209,9 @@ mod tests {
         assert_eq!(tailscale_https_url("box.tail1.ts.net", 8443), "https://box.tail1.ts.net:8443/");
         assert_eq!(magic_dns_name(r#"{"Self":{"DNSName":"box.tail1.ts.net."}}"#).as_deref(), Some("box.tail1.ts.net"));
         assert_eq!(magic_dns_name(r#"{"Self":{"DNSName":""}}"#), None);
+        let status = r#"{"Self":{"TailscaleIPs":["100.101.2.3","fd7a:115c:a1e0::1","10.0.0.2"]}}"#;
+        assert_eq!(tailnet_ipv4(status), [Ipv4Addr::new(100, 101, 2, 3)]);
+        assert!(tailnet_ipv4("not json").is_empty());
         assert_eq!(parse_serve_port(" 8443 "), Some(8443));
         for bad in ["0", "65536", "-1", "4.5", ""] {
             assert_eq!(parse_serve_port(bad), None, "{bad}");

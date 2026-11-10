@@ -2147,9 +2147,16 @@ impl PlatformInputHandler {
             .ok();
     }
 
+    // t3code: the platform's side of these methods is in its own units, the window's logical
+    // pixels times the interface scale (`Window::set_ui_scale`).
     pub fn bounds_for_range(&mut self, range_utf16: Range<usize>) -> Option<Bounds<Pixels>> {
         self.cx
-            .update(|window, cx| self.handler.bounds_for_range(range_utf16, window, cx))
+            .update(|window, cx| {
+                let scale = window.ui_scale();
+                self.handler
+                    .bounds_for_range(range_utf16, window, cx)
+                    .map(|bounds| bounds.map(|v| v * scale))
+            })
             .ok()
             .flatten()
     }
@@ -2157,8 +2164,14 @@ impl PlatformInputHandler {
     pub fn selection_bounds_for_range(&mut self, range_utf16: Range<usize>) -> Vec<Bounds<Pixels>> {
         self.cx
             .update(|window, cx| {
-                self.handler
-                    .selection_bounds_for_range(range_utf16, window, cx)
+                let scale = window.ui_scale();
+                let mut bounds = self
+                    .handler
+                    .selection_bounds_for_range(range_utf16, window, cx);
+                for rect in &mut bounds {
+                    *rect = rect.map(|v| v * scale);
+                }
+                bounds
             })
             .unwrap_or_default()
     }
@@ -2226,7 +2239,10 @@ impl PlatformInputHandler {
     #[allow(unused)]
     pub fn character_index_for_point(&mut self, point: Point<Pixels>) -> Option<usize> {
         self.cx
-            .update(|window, cx| self.handler.character_index_for_point(point, window, cx))
+            .update(|window, cx| {
+                let point = point.map(|v| v.scale_down(window.ui_scale()));
+                self.handler.character_index_for_point(point, window, cx)
+            })
             .ok()
             .flatten()
     }
@@ -2244,7 +2260,12 @@ impl PlatformInputHandler {
     /// See [`InputHandler::element_bounds`].
     pub fn element_bounds(&mut self) -> Option<Bounds<Pixels>> {
         self.cx
-            .update(|window, cx| self.handler.element_bounds(window, cx))
+            .update(|window, cx| {
+                let scale = window.ui_scale();
+                self.handler
+                    .element_bounds(window, cx)
+                    .map(|bounds| bounds.map(|v| v * scale))
+            })
             .ok()
             .flatten()
     }

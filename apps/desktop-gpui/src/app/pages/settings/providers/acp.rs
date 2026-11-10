@@ -483,7 +483,7 @@ impl Render for AcpRegistrySearch {
                     .rounded(px(10.))
                     .border_1()
                     .border_color(t.error.opacity(0.32))
-                    .bg(t.error.opacity(0.04))
+                    .bg(t.error_surface)
                     .text_sm()
                     .text_color(t.error_foreground)
                     .child(error)

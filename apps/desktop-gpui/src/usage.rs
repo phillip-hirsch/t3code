@@ -236,11 +236,27 @@ pub struct ModelTotals {
     pub total_tokens: u64,
     pub records: u64,
     pub unpriced_records: u64,
+    /// Each unpriced record's share of the bucket's tokens.
+    pub unpriced_tokens: f64,
+    pub tokens: TokenTotals,
     pub cost_share: f64,
     pub token_share: f64,
 }
 
 impl ModelTotals {
+    /// `cacheHitRate`: cached input over all input, cache writes counting as misses; `None` without input.
+    pub fn cache_hit_rate(&self) -> Option<f64> {
+        let t = &self.tokens;
+        let input = sum([t.uncached_input_tokens, t.cached_input_tokens, t.cache_creation_tokens]);
+        (input > 0).then(|| t.cached_input_tokens as f64 / input as f64)
+    }
+
+    /// `costPerMillionTokens`: USD per million priced tokens, or `None` when none were priced.
+    pub fn cost_per_million(&self) -> Option<f64> {
+        let priced = self.total_tokens as f64 - self.unpriced_tokens;
+        (priced > 0. && !self.cost_unknown()).then(|| self.cost_usd / priced * 1_000_000.)
+    }
+
     /// Every record lacks rates, so the cost is unknown rather than zero.
     pub fn cost_unknown(&self) -> bool {
         self.records > 0 && self.unpriced_records >= self.records
@@ -390,6 +406,11 @@ pub fn combine(environments: Vec<EnvironmentUsage>) -> Option<(Summary, Vec<Cont
 }
 
 pub fn merge(summary: &Summary, hidden: &[String]) -> Merged {
+    merge_where(summary, hidden, |_| true)
+}
+
+/// [`merge`] over the buckets `keep` takes (`mergeAnsweredUsage`'s `keepBucket`), such as one model's.
+pub fn merge_where(summary: &Summary, hidden: &[String], keep: impl Fn(&Bucket) -> bool) -> Merged {
     fn provider_slot<'a>(providers: &'a mut Vec<ProviderTotals>, kind: &str) -> &'a mut ProviderTotals {
         let index = match providers.iter().position(|p| p.provider == kind) {
             Some(index) => index,
@@ -431,7 +452,7 @@ pub fn merge(summary: &Summary, hidden: &[String]) -> Merged {
         None => owned_providers.contains(&bucket.provider.as_str()),
         Some(path) => owned_sources.contains(&(bucket.provider.as_str(), path.as_str())),
     };
-    for bucket in summary.buckets.iter().filter(|b| owned(b)) {
+    for bucket in summary.buckets.iter().filter(|b| owned(b) && keep(b)) {
         let tokens = bucket.totals.total();
         merged.cost_usd += bucket.cost_usd;
         merged.cache_savings_usd += bucket.cache_savings_usd;
@@ -468,6 +489,14 @@ pub fn merge(summary: &Summary, hidden: &[String]) -> Merged {
         model.total_tokens = model.total_tokens.saturating_add(tokens);
         model.records = model.records.saturating_add(bucket.records);
         model.unpriced_records = model.unpriced_records.saturating_add(bucket.unpriced_records);
+        if bucket.records > 0 {
+            model.unpriced_tokens += tokens as f64 * bucket.unpriced_records as f64 / bucket.records as f64;
+        }
+        let totals = &mut model.tokens;
+        totals.uncached_input_tokens = totals.uncached_input_tokens.saturating_add(bucket.totals.uncached_input_tokens);
+        totals.cached_input_tokens = totals.cached_input_tokens.saturating_add(bucket.totals.cached_input_tokens);
+        totals.cache_creation_tokens = totals.cache_creation_tokens.saturating_add(bucket.totals.cache_creation_tokens);
+        totals.output_tokens = totals.output_tokens.saturating_add(bucket.totals.output_tokens);
         daily.entry(bucket.day.clone()).or_insert_with(|| Period { day: bucket.day.clone(), ..Period::default() }).add(
             &bucket.provider,
             bucket.cost_usd,
@@ -883,6 +912,11 @@ impl Pace {
     }
 }
 
+/// `paceOf`: one window's spend against its elapsed time.
+pub fn pace_of(window: &UsageWindow, now: i64) -> Option<Pace> {
+    elapsed_share(window, now).map(|elapsed| pace_of_shares(window.used_percent, elapsed))
+}
+
 fn pace_of_shares(used_percent: f64, elapsed: f64) -> Pace {
     let gap = used_percent - elapsed * 100.;
     if gap > 5. {
@@ -1201,6 +1235,231 @@ pub fn limit_accounts(environments: &[LimitEnvironment<'_>], hidden_drivers: &[&
     merged.into_iter().map(|m| m.account).collect()
 }
 
+/// `isUsageLimitsCommand`: a prompt that is only `/usage-limits`.
+pub fn is_usage_limits_command(prompt: &str) -> bool {
+    prompt.trim().eq_ignore_ascii_case("/usage-limits")
+}
+
+/// One usage-limit source (`UsageLimitSourceSnapshot`) as `config.usageLimitSources` lists it.
+struct HubSource {
+    id: String,
+    label: String,
+    accounts: Vec<HubAccount>,
+    error: Option<String>,
+}
+
+fn hub_sources(sources: &Value) -> Vec<HubSource> {
+    sources
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|source| HubSource {
+            id: source["id"].as_str().unwrap_or_default().to_owned(),
+            label: source["label"].as_str().unwrap_or_default().to_owned(),
+            accounts: source["accounts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|account| HubAccount::deserialize(account).ok())
+                .collect(),
+            error: source["error"].as_str().map(str::to_owned),
+        })
+        .collect()
+}
+
+/// `hubAccountName`: the account file's name without `.json`.
+fn hub_account_name(id: &str) -> &str {
+    let split = id.len().checked_sub(5).and_then(|at| Some((id.get(..at)?, id.get(at..)?)));
+    match split {
+        Some((name, suffix)) if suffix.eq_ignore_ascii_case(".json") => name,
+        _ => id,
+    }
+}
+
+/// `hasProviderUsageLimits`: Limits has something to show for this driver, so `/usage-limits` opens it.
+pub fn has_provider_usage_limits(driver: &str, providers: &[Provider], sources: &Value) -> bool {
+    providers.iter().any(|p| reports_limits(p) && p.driver == driver)
+        || hub_sources(sources)
+            .iter()
+            .any(|s| s.accounts.iter().any(|a| a.driver == driver) || (s.error.is_some() && s.accounts.is_empty()))
+}
+
+/// One account in the composer's usage-limits panel (`UsageLimitsReport["accounts"]`).
+#[derive(Clone, Debug)]
+pub struct ReportAccount {
+    pub id: String,
+    pub driver: String,
+    pub label: String,
+    pub plan: Option<String>,
+    /// Set for a provider signed in here; a hub account has none.
+    pub instance_id: Option<String>,
+    pub display_name: Option<String>,
+    pub accent_color: Option<String>,
+    /// The `provider.consumeResetCredit` input that spends its next credit.
+    pub reset_credit_input: Option<Value>,
+    pub limits: UsageLimits,
+}
+
+/// `UsageLimitsReport`: the selected provider's accounts and what could not be read.
+#[derive(Clone, Debug)]
+pub struct LimitsReport {
+    /// When the panel opened; its reset times count from here.
+    pub now: i64,
+    pub accounts: Vec<ReportAccount>,
+    pub notices: Vec<String>,
+}
+
+/// `Date.parse(a) > Date.parse(b)`: an unreadable time is never the fresher.
+fn fresher(a: &UsageLimits, b: &UsageLimits) -> bool {
+    let at = |limits: &UsageLimits| limits.checked_at.as_deref().and_then(parse_ms);
+    matches!((at(a), at(b)), (Some(a), Some(b)) if a > b)
+}
+
+/// `collectProviderUsageLimits`: the accounts of `instance_id`'s driver here, one per login, with
+/// the freshest reset credits a hub or another instance reports for it.
+pub fn provider_usage_limits(
+    instance_id: &str,
+    providers: &[Provider],
+    sources: &Value,
+    now: i64,
+) -> Option<LimitsReport> {
+    let selected = providers.iter().find(|p| p.instance_id == instance_id)?;
+    if !has_provider_usage_limits(&selected.driver, providers, sources) {
+        return None;
+    }
+    let sources = hub_sources(sources);
+    let mut workspaces: HashMap<String, Vec<String>> = HashMap::new();
+    let reports = providers
+        .iter()
+        .filter(|p| p.enabled)
+        .map(|p| {
+            (base_key(&p.driver, p.auth.email.as_deref(), p.usage_limits.as_ref()), p.auth.workspace_id.as_deref())
+        })
+        .chain(
+            sources
+                .iter()
+                .flat_map(|s| &s.accounts)
+                .map(|a| (base_key(&a.driver, a.email.as_deref(), Some(&a.usage_limits)), a.workspace_id.as_deref())),
+        );
+    for (base, workspace) in reports {
+        if let (Some(base), Some(workspace)) = (base, workspace) {
+            let known = workspaces.entry(base).or_default();
+            if !known.iter().any(|w| w == workspace) {
+                known.push(workspace.to_owned());
+            }
+        }
+    }
+    let provider_key = |p: &Provider| {
+        resolve_key(
+            base_key(&p.driver, p.auth.email.as_deref(), p.usage_limits.as_ref()),
+            p.auth.workspace_id.as_deref(),
+            &workspaces,
+        )
+    };
+    let hub_key = |a: &HubAccount| {
+        resolve_key(
+            base_key(&a.driver, a.email.as_deref(), Some(&a.usage_limits)),
+            a.workspace_id.as_deref(),
+            &workspaces,
+        )
+    };
+    // Per login: the provider whose usage shows, and the one with the freshest credits.
+    let mut native: Vec<(String, &Provider, Option<&Provider>)> = Vec::new();
+    for provider in providers.iter().filter(|p| reports_limits(p) && p.driver == selected.driver) {
+        let Some(limits) = provider.usage_limits.as_ref() else { continue };
+        let key = provider_key(provider).unwrap_or_else(|| format!("instance:{}", provider.instance_id));
+        let usable = limits_notice(limits).is_none();
+        let Some(entry) = native.iter_mut().find(|(seen, ..)| *seen == key) else {
+            native.push((key, provider, limits.reset_credits.is_some().then_some(provider)));
+            continue;
+        };
+        if let Some(previous) = entry.1.usage_limits.as_ref() {
+            let previous_usable = limits_notice(previous).is_none();
+            if (usable && !previous_usable) || (usable == previous_usable && fresher(limits, previous)) {
+                entry.1 = provider;
+            }
+        }
+        let credits_fresher = entry.2.and_then(|p| p.usage_limits.as_ref()).is_none_or(|seen| fresher(limits, seen));
+        if limits.reset_credits.is_some() && credits_fresher {
+            entry.2 = Some(provider);
+        }
+    }
+    let native_keys: Vec<String> = native
+        .iter()
+        .filter(|(_, p, _)| p.usage_limits.as_ref().is_some_and(|l| !l.windows.is_empty() && l.unavailable.is_none()))
+        .filter_map(|(_, p, _)| provider_key(p))
+        .collect();
+    let mut accounts = Vec::new();
+    for (_, provider, credits) in &native {
+        let Some(mut limits) = provider.usage_limits.clone() else { continue };
+        let key = provider_key(provider);
+        let mut hub_credits: Option<(&HubSource, &HubAccount)> = None;
+        for (source, account) in sources.iter().flat_map(|s| s.accounts.iter().map(move |a| (s, a))) {
+            let matches = key.is_some()
+                && hub_key(account) == key
+                && account.usage_limits.reset_credits.is_some()
+                && limits_notice(&account.usage_limits).is_none();
+            if matches && hub_credits.is_none_or(|(_, seen)| fresher(&account.usage_limits, &seen.usage_limits)) {
+                hub_credits = Some((source, account));
+            }
+        }
+        let own_credits = credits.and_then(|p| p.usage_limits.as_ref());
+        let show_hub = hub_credits.filter(|(_, hub)| own_credits.is_none_or(|own| fresher(&hub.usage_limits, own)));
+        let shown = match show_hub {
+            Some((_, hub)) => hub.usage_limits.reset_credits.clone(),
+            None => own_credits.and_then(|own| own.reset_credits.clone()),
+        };
+        if shown.is_some() {
+            limits.reset_credits = shown;
+        }
+        let hub_credit = hub_credits.and_then(|(source, account)| {
+            let credit = account.usage_limits.reset_credits.as_ref()?.next_credit_id.as_ref()?;
+            Some(json!({"sourceId": source.id, "accountId": account.id, "creditId": credit}))
+        });
+        let display_name = provider.display_name.as_deref().map(str::trim).filter(|n| !n.is_empty());
+        let credit_instance = credits.map_or(&provider.instance_id, |p| &p.instance_id);
+        accounts.push(ReportAccount {
+            id: provider.instance_id.clone(),
+            driver: provider.driver.clone(),
+            label: format!("{} [{}]", display_name.unwrap_or(&provider.driver), provider.instance_id),
+            plan: provider.auth.label.clone(),
+            instance_id: Some(provider.instance_id.clone()),
+            display_name: provider.display_name.clone(),
+            accent_color: provider.accent_color.clone(),
+            reset_credit_input: Some(hub_credit.unwrap_or_else(|| json!({"instanceId": credit_instance}))),
+            limits,
+        });
+    }
+    let mut notices = Vec::new();
+    for source in &sources {
+        let matching: Vec<&HubAccount> = source.accounts.iter().filter(|a| a.driver == selected.driver).collect();
+        for account in &matching {
+            if hub_key(account).is_some_and(|key| native_keys.contains(&key)) {
+                continue;
+            }
+            let credit = account.usage_limits.reset_credits.as_ref().and_then(|c| c.next_credit_id.as_ref());
+            accounts.push(ReportAccount {
+                id: format!("{}:{}", source.id, account.id),
+                driver: account.driver.clone(),
+                label: format!("{} · {}", source.label, hub_account_name(&account.id)),
+                plan: account.plan.clone(),
+                instance_id: None,
+                display_name: None,
+                accent_color: None,
+                reset_credit_input: credit
+                    .map(|credit| json!({"sourceId": source.id, "accountId": account.id, "creditId": credit})),
+                limits: account.usage_limits.clone(),
+            });
+        }
+        if let Some(error) = &source.error
+            && (!matching.is_empty() || source.accounts.is_empty())
+        {
+            notices.push(format!("{}: {error}", source.label));
+        }
+    }
+    Some(LimitsReport { now, accounts, notices })
+}
+
 /// `resetCreditsSummary`: "2 reset credits banked · next expires in 3d", or compact "2 banked · expires in 3d".
 pub fn reset_credits_summary(credits: &crate::model::ResetCredits, now: i64, compact: bool) -> String {
     let expires = credits.next_expires_at.as_deref().and_then(parse_ms).map(|at| format_duration(at - now));
@@ -1313,21 +1572,166 @@ pub fn parse_price_form(form: &[String; 4]) -> Option<Value> {
     Some(Value::Object(price))
 }
 
-/// `usagePriceCell`: the saved rate and the placeholder its cell shows.
-pub fn price_cell(prices: &Value, model: &str, field: usize) -> (String, &'static str) {
-    let price = prices.get(model).filter(|p| p.is_object());
-    let value = price.map(|p| price_form(Some(p))[field].clone());
-    let placeholder = match (&value, PRICE_FIELDS[field].2) {
-        (None, _) => "Automatic",
-        (Some(_), true) => "Input rate",
-        (Some(_), false) => "0.00",
-    };
-    (value.unwrap_or_default(), placeholder)
+/// `UsagePriceTarget`: one environment the price editor reads and writes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PriceTarget {
+    pub id: String,
+    pub label: String,
+    /// Its `usagePriceOverrides`; `None` until its settings load.
+    pub prices: Option<Value>,
+    /// Its `usageModelAliases`; `None` when its server cannot map models.
+    pub aliases: Option<Value>,
+    /// Why it cannot be written now ("Offline", "Read-only access").
+    pub unavailable: Option<String>,
 }
 
-/// `usageAliasCell`: the saved "Map to" model.
-pub fn alias_cell(aliases: &Value, model: &str) -> String {
-    aliases.get(model).and_then(Value::as_str).unwrap_or_default().to_owned()
+/// What a cell shows across the targets: the shared value, else blank over "Mixed" or "Unavailable".
+pub const MIXED: &str = "Mixed";
+pub const UNAVAILABLE: &str = "Unavailable";
+
+/// `usagePriceCell`: the rate every target saves for `model`, and the placeholder its cell shows.
+pub fn price_cell(targets: &[PriceTarget], model: &str, field: usize) -> (String, &'static str) {
+    if targets.iter().any(|t| t.prices.is_none()) {
+        return (String::new(), UNAVAILABLE);
+    }
+    let values: Vec<Option<String>> = targets
+        .iter()
+        .map(|t| {
+            let price = t.prices.as_ref().and_then(|prices| prices.get(model)).filter(|p| p.is_object());
+            price.map(|p| price_form(Some(p))[field].clone())
+        })
+        .collect();
+    let first = values.first().cloned().flatten();
+    if values.iter().any(|v| *v != values[0]) {
+        return (String::new(), MIXED);
+    }
+    let placeholder = match (values.first(), PRICE_FIELDS[field].2) {
+        (Some(None), _) => "Automatic",
+        (_, true) => "Input rate",
+        (_, false) => "0.00",
+    };
+    (first.unwrap_or_default(), placeholder)
+}
+
+/// `usageAliasCell`: the "Map to" model every target saves for `model`.
+pub fn alias_cell(targets: &[PriceTarget], model: &str) -> (String, &'static str) {
+    let Some(values) = targets
+        .iter()
+        .map(|t| Some(t.aliases.as_ref()?.get(model).and_then(Value::as_str).unwrap_or_default()))
+        .collect::<Option<Vec<&str>>>()
+    else {
+        return (String::new(), UNAVAILABLE);
+    };
+    match values.first() {
+        Some(first) if values.iter().any(|v| v != first) => (String::new(), MIXED),
+        first => (first.copied().unwrap_or_default().to_owned(), "None"),
+    }
+}
+
+/// The models some target prices or maps, sorted.
+pub fn custom_models(targets: &[PriceTarget]) -> Vec<String> {
+    let mut models: Vec<String> = targets
+        .iter()
+        .flat_map(|t| [&t.prices, &t.aliases])
+        .flat_map(|map| map.as_ref().and_then(Value::as_object).into_iter().flat_map(|m| m.keys().cloned()))
+        .collect();
+    models.sort();
+    models.dedup();
+    models
+}
+
+/// `usagePriceTableErrors`: each row's error on the targets that can take a write.
+pub fn price_table_errors(targets: &[PriceTarget], drafts: &[PriceDraft]) -> Vec<(usize, String)> {
+    let mut errors: Vec<(usize, String)> = Vec::new();
+    for target in targets.iter().filter(|t| t.unavailable.is_none()) {
+        let Some(prices) = &target.prices else { continue };
+        let aliases = target.aliases.as_ref().unwrap_or(&Value::Null);
+        for (index, error) in price_table_changes(prices, aliases, &target.label, drafts).err().unwrap_or_default() {
+            errors.retain(|(seen, _)| *seen != index);
+            errors.push((index, error));
+        }
+    }
+    errors.sort_by_key(|(index, _)| *index);
+    errors
+}
+
+/// `writeUsagePrices`' plan for one target: the `server.updateSettings` input, `None` when
+/// nothing changes there, or why it fails without a request. Mixed cells left alone keep the
+/// target's own rate.
+pub fn price_write(target: &PriceTarget, drafts: &[PriceDraft]) -> Result<Option<Value>, String> {
+    if let Some(unavailable) = &target.unavailable {
+        return Err(unavailable.clone());
+    }
+    let prices = target.prices.as_ref().unwrap_or(&Value::Null);
+    let aliases = target.aliases.as_ref().unwrap_or(&Value::Null);
+    let (prices, aliases) = price_table_changes(prices, aliases, &target.label, drafts)
+        .map_err(|errors| errors.into_iter().next().map(|(_, error)| error).unwrap_or_default())?;
+    if !aliases.is_empty() && target.aliases.is_none() {
+        return Err("Update server to map models".into());
+    }
+    let mut patch = serde_json::Map::new();
+    if !prices.is_empty() {
+        patch.insert("usagePriceOverrides".into(), Value::Object(prices));
+    }
+    if !aliases.is_empty() {
+        patch.insert("usageModelAliases".into(), Value::Object(aliases));
+    }
+    Ok((!patch.is_empty()).then(|| json!({"patch": patch})))
+}
+
+/// One destination's save, as the status list shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PriceSave {
+    Saving,
+    Saved,
+    Failed(String),
+}
+
+/// `SaveAttempt`: the drafts a save sent, where to, and how each destination settled.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PriceAttempt {
+    pub drafts: Vec<PriceDraft>,
+    /// `(id, label)`, in the order the list shows them.
+    pub destinations: Vec<(String, String)>,
+    pub results: Vec<(String, PriceSave)>,
+}
+
+impl PriceAttempt {
+    /// A save to `targets`; a retry keeps the first attempt's destinations and settled results.
+    pub fn start(previous: Option<Self>, retry: bool, drafts: Vec<PriceDraft>, targets: &[(String, String)]) -> Self {
+        let (destinations, mut results) = match previous.filter(|_| retry) {
+            Some(previous) => (previous.destinations, previous.results),
+            None => (targets.to_vec(), Vec::new()),
+        };
+        for (id, _) in targets {
+            results.retain(|(seen, _)| seen != id);
+            results.push((id.clone(), PriceSave::Saving));
+        }
+        Self { drafts, destinations, results }
+    }
+
+    pub fn status(&self, id: &str) -> Option<&PriceSave> {
+        self.results.iter().find(|(seen, _)| seen == id).map(|(_, status)| status)
+    }
+
+    pub fn record(&mut self, id: &str, status: PriceSave) {
+        if let Some(entry) = self.results.iter_mut().find(|(seen, _)| seen == id) {
+            entry.1 = status;
+        }
+    }
+
+    /// Destinations whose save failed, which a retry sends again.
+    pub fn failed(&self) -> Vec<(String, String)> {
+        self.destinations
+            .iter()
+            .filter(|(id, _)| matches!(self.status(id), Some(PriceSave::Failed(_))))
+            .cloned()
+            .collect()
+    }
+
+    pub fn settled(&self) -> bool {
+        !self.results.iter().any(|(_, status)| *status == PriceSave::Saving)
+    }
 }
 
 /// A settings patch: keys to their new values.
@@ -1811,6 +2215,19 @@ mod tests {
         let without_claude = merge(&summary, &["claude".to_string()]);
         assert_eq!((without_claude.cost_usd, without_claude.sessions), (1., 3));
 
+        // The model dialog's history: one model's buckets, and its derived rates.
+        let opus = merge_where(&summary, &[], |b| b.provider == "claude" && b.model == "opus");
+        assert_eq!((opus.cost_usd, opus.daily.len(), opus.models.len()), (4., 2, 1));
+        let mut model = opus.models[0].clone();
+        assert_eq!((model.tokens.output_tokens, model.tokens.uncached_input_tokens), (190, 20));
+        assert_eq!(model.cache_hit_rate(), Some(0.));
+        assert_eq!(model.cost_per_million(), Some(4. / 210. * 1_000_000.));
+        model.tokens.uncached_input_tokens = 0;
+        model.tokens.cached_input_tokens = 0;
+        assert_eq!(model.cache_hit_rate(), None, "no input, no rate");
+        model.unpriced_tokens = 210.;
+        assert_eq!(model.cost_per_million(), None, "nothing priced");
+
         let huge = self::summary(
             json!([
                 bucket("2026-10-01", "claude", "opus", 1., u64::MAX),
@@ -1934,8 +2351,72 @@ mod tests {
         assert_eq!(parse_rate(",5"), Some(0.5));
         assert_eq!(parse_rate("1e-3"), Some(0.001));
         assert_eq!(parse_rate("-1"), None);
-        assert_eq!(price_cell(&prices, "old", 2), (String::new(), "Input rate"));
-        assert_eq!(price_cell(&prices, "new", 0), (String::new(), "Automatic"));
+        let here = PriceTarget {
+            id: "a".into(),
+            label: "Here".into(),
+            prices: Some(prices),
+            aliases: Some(aliases),
+            unavailable: None,
+        };
+        assert_eq!(price_cell(std::slice::from_ref(&here), "old", 2), (String::new(), "Input rate"));
+        assert_eq!(price_cell(std::slice::from_ref(&here), "new", 0), (String::new(), "Automatic"));
+    }
+
+    fn price_target(id: &str, prices: Value, aliases: Option<Value>) -> PriceTarget {
+        PriceTarget { id: id.into(), label: id.to_uppercase(), prices: Some(prices), aliases, unavailable: None }
+    }
+
+    #[test]
+    fn prices_edit_several_environments_and_mixed_cells_keep_each_ones_rate() {
+        let rate = |input: u32| json!({"m": {"inputCostPerMillionTokens": input, "outputCostPerMillionTokens": 2}});
+        let targets = [price_target("a", rate(1), Some(json!({}))), price_target("b", rate(3), Some(json!({})))];
+        assert_eq!(price_cell(&targets, "m", 0), (String::new(), MIXED));
+        assert_eq!(price_cell(&targets, "m", 1), ("2".into(), "0.00"), "the same output rate shows");
+        assert_eq!(alias_cell(&targets, "m"), (String::new(), "None"));
+        assert_eq!(custom_models(&targets), ["m"]);
+        let mut offline = targets[1].clone();
+        offline.prices = None;
+        assert_eq!(price_cell(&[targets[0].clone(), offline], "m", 1), (String::new(), UNAVAILABLE));
+        let old_server = price_target("c", rate(1), None);
+        assert_eq!(alias_cell(&[targets[0].clone(), old_server.clone()], "m"), (String::new(), UNAVAILABLE));
+
+        // Only the output was edited: each environment keeps its own input rate.
+        let output =
+            PriceDraft { model: "m".into(), values: [None, Some("5".into()), None, None], ..PriceDraft::default() };
+        let patch = |target: &PriceTarget| price_write(target, std::slice::from_ref(&output)).unwrap().unwrap();
+        assert_eq!(patch(&targets[0])["patch"]["usagePriceOverrides"]["m"]["inputCostPerMillionTokens"], 1.);
+        assert_eq!(patch(&targets[1])["patch"]["usagePriceOverrides"]["m"]["inputCostPerMillionTokens"], 3.);
+        assert_eq!(patch(&targets[1])["patch"]["usagePriceOverrides"]["m"]["outputCostPerMillionTokens"], 5.);
+        let same = PriceDraft { values: [None, Some("2".into()), None, None], ..output.clone() };
+        assert_eq!(price_write(&targets[0], &[same]), Ok(None), "nothing changes there, so no request");
+        let mapped = PriceDraft { model: "n".into(), is_new: true, alias: Some("m".into()), ..PriceDraft::default() };
+        assert_eq!(price_write(&old_server, &[mapped]), Err("Update server to map models".into()));
+        let mut read_only = targets[0].clone();
+        read_only.unavailable = Some("Read-only access".into());
+        assert_eq!(price_write(&read_only, std::slice::from_ref(&output)), Err("Read-only access".into()));
+        let blank = PriceDraft { values: [Some(String::new()), None, None, None], ..output };
+        assert_eq!(
+            price_table_errors(&[targets[0].clone(), read_only], &[blank]),
+            [(0, "Input is required on A.".to_owned())],
+            "a target that cannot be written does not block the others"
+        );
+    }
+
+    #[test]
+    fn a_retry_resends_only_the_failed_destinations() {
+        let destinations = [("a".to_owned(), "A".to_owned()), ("b".to_owned(), "B".to_owned())];
+        let mut attempt = PriceAttempt::start(None, false, Vec::new(), &destinations);
+        assert!(!attempt.settled());
+        attempt.record("a", PriceSave::Saved);
+        attempt.record("b", PriceSave::Failed("Offline".into()));
+        assert!(attempt.settled());
+        let failed = attempt.failed();
+        assert_eq!(failed, [("b".to_owned(), "B".to_owned())]);
+        let retry = PriceAttempt::start(Some(attempt), true, Vec::new(), &failed);
+        assert_eq!(retry.destinations.len(), 2, "the list keeps every destination");
+        assert_eq!((retry.status("a"), retry.status("b")), (Some(&PriceSave::Saved), Some(&PriceSave::Saving)));
+        let fresh = PriceAttempt::start(Some(retry), false, Vec::new(), &destinations[..1]);
+        assert_eq!(fresh.destinations.len(), 1, "a new save starts over");
     }
 
     #[test]
@@ -2070,6 +2551,49 @@ mod tests {
             ["Down hub: Connection refused.", "Empty hub: No accounts reported.", "Codex hub: Stale."]
         );
         assert_eq!(limit_notices(&hubs, &["codex"]).len(), 2, "a hub of only hidden accounts says nothing");
+    }
+
+    #[test]
+    fn the_usage_limits_panel_reports_one_row_per_login_with_the_freshest_credits() {
+        let window = |used: u32| json!([{"id": "w", "kind": "session", "label": "5-hour", "usedPercent": used}]);
+        let mut fresh = provider("work", "codex", "me@x.dev", window(70));
+        fresh.usage_limits =
+            serde_json::from_value(json!({"checkedAt": "2026-11-05T03:00:00Z", "windows": window(70)})).unwrap();
+        let providers = vec![
+            provider("codex", "codex", "ME@x.dev", window(40)),
+            fresh,
+            provider("claude", "claudeAgent", "me@x.dev", window(10)),
+        ];
+        let hub = json!([{"id": "hub", "label": "Team hub", "error": "Partly stale.", "accounts": [
+            {"id": "me.json", "driver": "codex", "email": "me@x.dev", "usageLimits": {"checkedAt": "2026-11-05T01:00:00Z",
+                "windows": window(5), "resetCredits": {"availableCount": 2, "nextCreditId": "c1"}}},
+            {"id": "other.JSON", "driver": "codex", "usageLimits": {"checkedAt": "2026-11-05T01:00:00Z", "windows": window(5)}},
+            {"id": "c.json", "driver": "claudeAgent", "usageLimits": {"checkedAt": "2026-11-05T01:00:00Z", "windows": window(5)}},
+        ]}]);
+        let report = provider_usage_limits("codex", &providers, &hub, 7).unwrap();
+        let ids: Vec<&str> = report.accounts.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, ["work", "hub:other.JSON"], "one login on two instances, its hub copy folded in");
+        let me = &report.accounts[0];
+        assert_eq!(me.limits.windows[0].used_percent, 70., "the freshest read shows");
+        assert_eq!(me.limits.reset_credits.as_ref().map(|c| c.available_count), Some(2), "the hub's credits");
+        assert_eq!(
+            me.reset_credit_input,
+            Some(json!({"sourceId": "hub", "accountId": "me.json", "creditId": "c1"})),
+            "spent through the hub"
+        );
+        assert_eq!(report.accounts[1].label, "Team hub · other");
+        assert_eq!(report.accounts[1].reset_credit_input, None);
+        assert_eq!(report.notices, ["Team hub: Partly stale."]);
+        assert_eq!(report.now, 7);
+        assert!(provider_usage_limits("missing", &providers, &hub, 7).is_none());
+        let bare = vec![provider("pi", "pi", "me@x.dev", window(1))];
+        assert!(!has_provider_usage_limits("cursor", &bare, &Value::Null));
+        assert!(has_provider_usage_limits(
+            "cursor",
+            &bare,
+            &json!([{"id": "h", "label": "H", "accounts": [], "error": "down"}])
+        ));
+        assert!(is_usage_limits_command("  /Usage-Limits \n") && !is_usage_limits_command("/usage-limits now"));
     }
 
     #[test]

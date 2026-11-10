@@ -41,16 +41,16 @@ impl Workspace {
         }
         let saved = self.saved_environments.read(cx);
         for environment in saved.environments() {
-            let unsupported = saved
-                .session(&environment.environment_id)
-                .is_some_and(|s| s.state.presented() == crate::environments::Presented::Unsupported);
+            let session = saved.session(&environment.environment_id);
+            let unsupported =
+                session.is_some_and(|s| s.state.presented() == crate::environments::Presented::Unsupported);
             if !environment.enabled || unsupported || saved.is_primary(&environment.environment_id) {
                 continue;
             }
             machines.push(Machine {
                 id: environment.environment_id.clone(),
                 label: environment.label.clone(),
-                address: Some(environment.http_base.clone()),
+                address: Some(environment.transport_label(session.and_then(|s| s.active_route()))),
             });
         }
         machines

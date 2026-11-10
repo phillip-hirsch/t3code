@@ -41,6 +41,9 @@ use super::{
 
 const CHECK_SVG_LIGHT: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none"><path d="m3.25 8.25 3 3 6.5-7" stroke="white" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
 const CHECK_SVG_DARK: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none"><path d="m3.25 8.25 3 3 6.5-7" stroke="black" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
+// Lucide's chevrons; open turns the right one down (`data-panel-open:rotate-90`).
+const DETAILS_CHEVRON_RIGHT_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>"#;
+const DETAILS_CHEVRON_DOWN_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>"#;
 
 /// The block-level nodes.
 ///
@@ -64,6 +67,15 @@ pub enum BlockNode {
     },
     Blockquote {
         children: Vec<BlockNode>,
+        span: Option<Span>,
+    },
+    /// An HTML `<details>` disclosure: its `<summary>` always shows, its
+    /// children only while it is open. `open` is the `open` attribute, the
+    /// state before the reader toggles it.
+    Details {
+        summary: Paragraph,
+        children: Vec<BlockNode>,
+        open: bool,
         span: Option<Span>,
     },
     List {
@@ -436,6 +448,7 @@ impl BlockNode {
             BlockNode::Paragraph(paragraph) => paragraph.span,
             BlockNode::Heading { span, .. } => *span,
             BlockNode::Blockquote { span, .. } => *span,
+            BlockNode::Details { span, .. } => *span,
             BlockNode::List { span, .. } => *span,
             BlockNode::ListItem { span, .. } => *span,
             BlockNode::CodeBlock(code_block) => code_block.span,
@@ -477,6 +490,14 @@ impl BlockNode {
                     styles.merge(child.selection_styles());
                 }
             }
+            BlockNode::Details {
+                summary, children, ..
+            } => {
+                styles = summary.selection_styles();
+                for child in children {
+                    styles.merge(child.selection_styles());
+                }
+            }
             BlockNode::Paragraph(paragraph) => styles = paragraph.selection_styles(),
             BlockNode::Heading { children, .. } => styles = children.selection_styles(),
             BlockNode::Table(table) => {
@@ -512,6 +533,14 @@ impl BlockNode {
             | BlockNode::Blockquote { children, .. }
             | BlockNode::List { children, .. }
             | BlockNode::ListItem { children, .. } => {
+                for child in children {
+                    selected.merge(child.selected_source_range());
+                }
+            }
+            BlockNode::Details {
+                summary, children, ..
+            } => {
+                selected = summary.selected_source_range();
                 for child in children {
                     selected.merge(child.selected_source_range());
                 }
@@ -597,6 +626,27 @@ impl BlockNode {
             }
             BlockNode::ListItem { children, .. } => {
                 text.push_str(&Self::children_text(children, kind));
+            }
+            // The summary reads as a paragraph of its own; a closed panel's
+            // text is still the view's text, so find can count and reveal it.
+            BlockNode::Details {
+                summary, children, ..
+            } => {
+                let summary_text = match kind {
+                    BlockTextKind::All => summary.text(),
+                    BlockTextKind::Selected => summary.selected_text(),
+                    BlockTextKind::SelectedSource => summary.selected_source(),
+                };
+                let mut block_text = String::new();
+                if !summary_text.is_empty() {
+                    block_text.push_str(&summary_text);
+                    block_text.push('\n');
+                }
+                block_text.push_str(&Self::children_text(children, kind));
+                if !block_text.is_empty() {
+                    text.push_str(&block_text);
+                    text.push('\n');
+                }
             }
             BlockNode::Blockquote { children, .. } => {
                 let block_text = Self::children_text(children, kind);
@@ -720,6 +770,9 @@ impl BlockNode {
             | BlockNode::ListItem { children, .. } => {
                 children.iter().any(|child| child.has_selection())
             }
+            BlockNode::Details {
+                summary, children, ..
+            } => summary.has_selection() || children.iter().any(|child| child.has_selection()),
             BlockNode::Paragraph(paragraph) => paragraph.has_selection(),
             BlockNode::Heading { children, .. } => children.has_selection(),
             BlockNode::Table(table) => table.children.iter().any(|row| {
@@ -745,6 +798,14 @@ impl BlockNode {
             | BlockNode::Blockquote { children, .. }
             | BlockNode::List { children, .. }
             | BlockNode::ListItem { children, .. } => {
+                for child in children.iter() {
+                    child.clear_selection();
+                }
+            }
+            BlockNode::Details {
+                summary, children, ..
+            } => {
+                summary.clear_selection();
                 for child in children.iter() {
                     child.clear_selection();
                 }
@@ -1045,6 +1106,7 @@ fn set_leaf_key(state: &mut Arc<Mutex<InlineState>>, key: u64) {
         text,
         editor_key: Some(key),
         cleanup_senders: Vec::new(),
+        reported_hover: None,
         ..Default::default()
     }));
 }
@@ -1612,6 +1674,11 @@ impl PartialEq for Paragraph {
 }
 
 impl Paragraph {
+    /// A `<details>` summary when the element has none, as browsers label it.
+    pub(crate) fn details_fallback() -> Self {
+        Self::new("Details".to_string())
+    }
+
     pub(crate) fn new(text: String) -> Self {
         Self {
             span: None,
@@ -2575,6 +2642,18 @@ impl CodeBlock {
         cx: &mut App,
     ) -> AnyElement {
         let style = &node_cx.style;
+        let gap = if options.is_last {
+            rems(0.)
+        } else {
+            style.paragraph_gap()
+        };
+        if let Some(element) = node_cx
+            .code_block_renderer
+            .as_ref()
+            .and_then(|render| render(self, window, cx))
+        {
+            return gapped(element, gap);
+        }
         let leaf_key = self.span.map(|span| TextLeafKey::block(span.start));
         // The language sits quietly in the top-right corner, where custom
         // actions go instead when the caller provides them; the top padding
@@ -2686,14 +2765,7 @@ impl CodeBlock {
             }
         };
 
-        gapped(
-            block,
-            if options.is_last {
-                rems(0.)
-            } else {
-                style.paragraph_gap()
-            },
-        )
+        gapped(block, gap)
     }
 }
 
@@ -2706,10 +2778,12 @@ pub(crate) struct NodeContext {
     pub(crate) link_refs: HashMap<SharedString, LinkMark>,
     pub(crate) style: Arc<TextViewStyle>,
     pub(crate) code_block_actions: Option<Arc<CodeBlockActionsFn>>,
+    pub(crate) code_block_renderer: Option<Arc<super::text_view::CodeBlockRenderFn>>,
     pub(crate) code_block_highlighter: Option<Arc<CodeBlockHighlighterFn>>,
     pub(crate) table_actions: Option<Arc<TableActionsFn>>,
     pub(crate) image_source: Option<Arc<super::text_view::ImageSourceFn>>,
     pub(crate) link_click_handler: Option<Arc<LinkClickHandlerFn>>,
+    pub(crate) image_click_handler: Option<Arc<super::text_view::ImageClickHandlerFn>>,
     pub(crate) task_toggle_handler: Option<Arc<super::text_view::TaskToggleFn>>,
     pub(crate) markdown_extensions: Arc<MarkdownExtensions>,
     /// This frame's streamed fade-in, when any text is still fading.
@@ -2718,6 +2792,8 @@ pub(crate) struct NodeContext {
     pub(crate) range_highlights: Option<Arc<RangeHighlightFrame>>,
     /// The line being scrolled into view, when there is one.
     pub(crate) reveal: Option<RevealRequest>,
+    /// The open state of the view's `<details>` disclosures.
+    pub(crate) disclosures: Option<Disclosures>,
     /// The font size the text view inherits this frame, or zero when not
     /// resolved; read it through `body_font_size`.
     pub(crate) body_font_size: Pixels,
@@ -2756,6 +2832,47 @@ impl NodeContext {
     /// `start` and `end`, rebased to `start`.
     fn reveal_at(&self, key: Option<TextLeafKey>, start: usize, end: usize) -> Option<RevealAt> {
         self.reveal.as_ref()?.at(key, start, end)
+    }
+}
+
+/// Which of a view's `<details>` disclosures the reader opened or closed,
+/// keyed by the disclosure's source start, which stays put while text streams
+/// in after it. A disclosure the reader never toggled keeps its `open`
+/// attribute.
+#[derive(Clone, Debug)]
+pub(crate) struct Disclosures {
+    owner: gpui::EntityId,
+    toggled: Arc<Mutex<HashMap<usize, bool>>>,
+}
+
+impl Disclosures {
+    pub(crate) fn new(owner: gpui::EntityId) -> Self {
+        Self {
+            owner,
+            toggled: Arc::default(),
+        }
+    }
+
+    pub(crate) fn is_open(&self, key: usize, default: bool) -> bool {
+        self.toggled
+            .lock()
+            .ok()
+            .and_then(|toggled| toggled.get(&key).copied())
+            .unwrap_or(default)
+    }
+
+    pub(crate) fn open(&self, key: usize) {
+        if let Ok(mut toggled) = self.toggled.lock() {
+            toggled.insert(key, true);
+        }
+    }
+
+    fn toggle(&self, key: usize, default: bool, cx: &mut App) {
+        let open = !self.is_open(key, default);
+        if let Ok(mut toggled) = self.toggled.lock() {
+            toggled.insert(key, open);
+        }
+        cx.notify(self.owner);
     }
 }
 
@@ -2897,6 +3014,7 @@ impl Paragraph {
                 self.inline_flow_items(fade_key, fades, backgrounds, node_cx, cx),
                 node_cx.link_click_handler.clone(),
             )
+            .image_click_handler(node_cx.image_click_handler.clone())
             .editor_key(self.leaf_key())
             .into_any_element();
         }
@@ -2974,9 +3092,19 @@ impl Paragraph {
                     );
                 }
                 let link_click_handler = node_cx.link_click_handler.clone();
+                let element = img(node_cx.image_source(image)).id(ix);
+                let element = if image.link.is_none() {
+                    super::text_view::clickable_image(
+                        element,
+                        &image.url,
+                        node_cx.image_click_handler.as_ref(),
+                        cx,
+                    )
+                } else {
+                    element
+                };
                 child_nodes.push(
-                    img(node_cx.image_source(image))
-                        .id(ix)
+                    element
                         .object_fit(ObjectFit::Contain)
                         .max_w(relative(1.))
                         .when_some(image.width, |this, width| this.w(width))
@@ -3197,6 +3325,7 @@ impl Paragraph {
                 }
 
                 items.push(InlineFlowItem::Image {
+                    url: image.url.clone(),
                     source: node_cx.image_source(image),
                     link: image.link.clone(),
                     title: image.title(),
@@ -3642,6 +3771,24 @@ impl BlockNode {
                     .collect::<Vec<_>>()
                     .join("\n")
             }
+            BlockNode::Details {
+                summary,
+                children,
+                open,
+                ..
+            } => {
+                let content = children
+                    .iter()
+                    .map(|child| child.to_markdown())
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                format!(
+                    "<details{}>\n<summary>{}</summary>\n\n{}\n\n</details>",
+                    if *open { " open" } else { "" },
+                    summary.to_markdown().trim(),
+                    content
+                )
+            }
             BlockNode::List {
                 children,
                 ordered,
@@ -3833,6 +3980,107 @@ impl BlockNode {
             )
     }
 
+    /// A `<details>` disclosure: a summary row that opens and closes the
+    /// panel below it, between hairlines, like the web's `MarkdownDetails`.
+    fn render_details(
+        (summary, children, default_open, span): (&Paragraph, &[BlockNode], bool, Option<Span>),
+        options: NodeRenderOptions,
+        node_cx: &NodeContext,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        let key = span.map_or(options.ix, |span| span.start);
+        let disclosures = node_cx.disclosures.clone();
+        let expanded = disclosures
+            .as_ref()
+            .map_or(default_open, |disclosures| disclosures.is_open(key, default_open));
+        let id = block_element_id("details", span, options.ix);
+        let focus = window
+            .use_keyed_state(id.clone(), cx, |_, cx| cx.focus_handle())
+            .read(cx)
+            .clone();
+        let style = &node_cx.style;
+        let ring = gpui::BoxShadow::new(px(0.), px(0.), cx.theme().tokens.colors.ring)
+            .spread_radius(px(2.))
+            .inset();
+        let chevron_color = style.muted_foreground();
+        let (path, svg) = if expanded {
+            ("text-details-chevron-down", DETAILS_CHEVRON_DOWN_SVG)
+        } else {
+            ("text-details-chevron-right", DETAILS_CHEVRON_RIGHT_SVG)
+        };
+        let chevron = gpui::canvas(
+            |_, _, _| {},
+            move |bounds, _, window, cx| {
+                let _ = window.paint_svg(
+                    bounds,
+                    path.into(),
+                    Some(svg),
+                    gpui::TransformationMatrix::default(),
+                    chevron_color,
+                    cx,
+                );
+            },
+        )
+        .flex_none()
+        .size(rems(1.));
+        let trigger = h_flex()
+            .id(id)
+            .track_focus(&focus.tab_stop(true))
+            .w_full()
+            .gap(rems(0.5))
+            .py(rems(0.5))
+            .rounded(px(4.))
+            .text_size(rems(0.875))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(style.foreground())
+            .cursor_pointer()
+            .focus_visible(move |this| this.shadow(vec![ring]))
+            .on_click(move |_, _, cx| {
+                if let Some(disclosures) = &disclosures {
+                    disclosures.toggle(key, default_open, cx);
+                }
+            })
+            .child(chevron)
+            .child(
+                div().min_w_0().flex_1().child(summary.render(
+                    summary.span.map(|span| TextLeafKey::block(span.start)),
+                    node_cx,
+                    window,
+                    cx,
+                )),
+            );
+        let panel = expanded.then(|| {
+            let children_len = children.len();
+            div()
+                .w_full()
+                .pb(rems(0.75))
+                .pl(rems(1.5))
+                .text_color(style.foreground().opacity(0.9))
+                .children(children.iter().enumerate().map(|(index, child)| {
+                    let (is_first, prev) = flow_position(children, index);
+                    child.render_block(
+                        NodeRenderOptions {
+                            is_first,
+                            prev,
+                            ..options.is_last(index + 1 == children_len)
+                        },
+                        node_cx,
+                        window,
+                        cx,
+                    )
+                }))
+        });
+        div()
+            .w_full()
+            .min_w_0()
+            .border_y_1()
+            .border_color(style.border().opacity(0.6))
+            .child(trigger)
+            .children(panel)
+            .into_any_element()
+    }
+
     fn render_list_item(
         item: &BlockNode,
         ix: usize,
@@ -3953,6 +4201,7 @@ impl BlockNode {
                                 BlockNode::Root { .. }
                                 | BlockNode::Heading { .. }
                                 | BlockNode::Blockquote { .. }
+                                | BlockNode::Details { .. }
                                 | BlockNode::CodeBlock(_)
                                 | BlockNode::Custom { .. }
                                 | BlockNode::Table(_)
@@ -4449,6 +4698,21 @@ impl BlockNode {
                     .into_any_element(),
                 mb,
             ),
+            BlockNode::Details {
+                summary,
+                children,
+                open,
+                span,
+            } => gapped(
+                Self::render_details(
+                    (summary, children, *open, *span),
+                    options,
+                    node_cx,
+                    window,
+                    cx,
+                ),
+                mb,
+            ),
             BlockNode::List {
                 children,
                 ordered,
@@ -4473,7 +4737,11 @@ impl BlockNode {
                         if let BlockNode::ListItem { children, .. } = item {
                             after_block = matches!(
                                 children.last(),
-                                Some(BlockNode::List { .. } | BlockNode::Blockquote { .. })
+                                Some(
+                                    BlockNode::List { .. }
+                                        | BlockNode::Blockquote { .. }
+                                        | BlockNode::Details { .. }
+                                )
                             );
                         }
 

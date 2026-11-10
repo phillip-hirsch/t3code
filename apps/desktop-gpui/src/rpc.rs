@@ -165,7 +165,17 @@ impl RpcClient {
         self.commands.same_channel(&other.commands)
     }
 
+    /// A pull request request may be answered by another trusted machine (see
+    /// [`crate::pull_request_routing`]).
     pub async fn request(&self, tag: &str, payload: Value) -> Result<Value, RpcError> {
+        if crate::pull_request_routing::intercepts(tag) {
+            return crate::pull_request_routing::request(self, tag, payload).await;
+        }
+        self.request_direct(tag, payload).await
+    }
+
+    /// The request on this socket, never routed.
+    pub async fn request_direct(&self, tag: &str, payload: Value) -> Result<Value, RpcError> {
         let (tx, rx) = oneshot::channel();
         self.send(tag, payload, Pending::Unary(tx));
         rx.await.unwrap_or_else(|_| Err(RpcError::Disconnected("socket closed".into())))

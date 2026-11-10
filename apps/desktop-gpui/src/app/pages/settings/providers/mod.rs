@@ -7,7 +7,10 @@
 
 mod accent;
 mod accounts;
-pub(in crate::app) use accounts::{chatgpt_usage_button, redacted_email, uses_chatgpt_sharing};
+pub(in crate::app) use accounts::{
+    ModeChange, chatgpt_usage_button, codex_setup_managed, redacted_email, uses_chatgpt_sharing, with_setup_mode,
+};
+pub(in crate::app) use instances::summary as provider_summary;
 mod acp;
 mod add;
 mod codex_callback;
@@ -106,7 +109,7 @@ const HEALTH_KEY: &str = "providerHealthRefreshInterval";
 const HEALTH: usize = 1;
 
 /// `globalIdleCompaction`: the mode, or the legacy switch from before modes.
-fn idle_compaction<'a>(mode: &'a Value, legacy: &'a Value) -> &'a str {
+pub(in crate::app) fn idle_compaction<'a>(mode: &'a Value, legacy: &'a Value) -> &'a str {
     mode.as_str().unwrap_or(match legacy {
         Value::String(mode) => mode,
         Value::Bool(true) => "beforeCacheExpires",

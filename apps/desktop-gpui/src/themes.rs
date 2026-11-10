@@ -28,17 +28,33 @@ macro_rules! theme_colors {
     };
 }
 
+// The roles this client paints with (`html[data-theme-id]` in `index.css`). `textMuted`,
+// `accentForeground`, `updateSurface` and the terminal scrollbar roles are stored and edited, but
+// nothing on the web paints with them either; the search-match text roles color find results'
+// glyphs, which a native range highlight leaves alone.
 theme_colors! {
     canvas = "canvas",
+    chrome = "chrome",
+    toolbar = "toolbar",
+    toolbar_foreground = "toolbarForeground",
+    toolbar_border = "toolbarBorder",
+    toolbar_control = "toolbarControl",
+    toolbar_control_foreground = "toolbarControlForeground",
+    toolbar_control_hover = "toolbarControlHover",
     text = "text",
     surface = "surface",
+    surface_raised = "surfaceRaised",
     surface_overlay = "surfaceOverlay",
     secondary = "secondary",
+    secondary_foreground = "secondaryForeground",
     muted = "muted",
     muted_foreground = "mutedForeground",
+    placeholder = "placeholder",
     accent = "accent",
     accent_surface = "accentSurface",
+    accent_surface_foreground = "accentSurfaceForeground",
     message_surface = "messageSurface",
+    message_foreground = "messageForeground",
     message_action = "messageAction",
     message_action_foreground = "messageActionForeground",
     message_action_hover = "messageActionHover",
@@ -47,17 +63,30 @@ theme_colors! {
     focus = "focus",
     error = "error",
     error_foreground = "errorForeground",
+    error_surface = "errorSurface",
     warning = "warning",
     warning_foreground = "warningForeground",
+    warning_surface = "warningSurface",
+    update = "update",
+    update_foreground = "updateForeground",
     secondary_label = "secondaryLabel",
     icon_muted = "iconMuted",
+    code_background = "codeBackground",
+    code_foreground = "codeForeground",
+    search_match_background = "searchMatchBackground",
+    search_match_active_background = "searchMatchActiveBackground",
     sidebar = "sidebar",
     sidebar_foreground = "sidebarForeground",
     sidebar_muted_foreground = "sidebarMutedForeground",
+    sidebar_control_surface = "sidebarControlSurface",
     sidebar_row_hover = "sidebarRowHover",
     sidebar_row_active = "sidebarRowActive",
     sidebar_row_selected = "sidebarRowSelected",
     sidebar_border = "sidebarBorder",
+    terminal_background = "terminalBackground",
+    terminal_foreground = "terminalForeground",
+    terminal_cursor = "terminalCursor",
+    terminal_selection = "terminalSelection",
 }
 
 fn parse_color(value: &str) -> Option<Hsla> {
@@ -247,27 +276,52 @@ fn find_built_in(id: &str) -> Option<&'static ThemeDefinition> {
     built_in().iter().find(|theme| theme.id == id)
 }
 
-/// The saved themes (`t3code:themes:v1`). Clones share the list; edits return a new library.
+/// The saved themes (`t3code:themes:v1`) and the theme environment's published palettes
+/// (`environmentThemeDefinitionsAtom`), which are never saved. Clones share the lists; edits
+/// return a new library.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct Library(Arc<[ThemeDefinition]>);
+pub struct Library {
+    custom: Arc<[ThemeDefinition]>,
+    published: Arc<[ThemeDefinition]>,
+}
 
 impl Library {
     pub fn new(themes: Vec<ThemeDefinition>) -> Self {
-        Self(Arc::from(themes))
+        Self { custom: Arc::from(themes), published: Arc::default() }
+    }
+
+    fn with_custom(&self, themes: Vec<ThemeDefinition>) -> Self {
+        Self { custom: Arc::from(themes), published: self.published.clone() }
+    }
+
+    /// This library with `published` in place of its published palettes.
+    pub fn with_published(&self, published: Arc<[ThemeDefinition]>) -> Self {
+        Self { custom: self.custom.clone(), published }
     }
 
     pub fn custom(&self) -> &[ThemeDefinition] {
-        &self.0
+        &self.custom
     }
 
-    /// `getThemeDefinition`: built-ins win, then saved themes. `system`, `light` and `dark`
-    /// name the standard palette, not a theme.
+    pub fn published(&self) -> &Arc<[ThemeDefinition]> {
+        &self.published
+    }
+
+    /// The published palettes no saved theme shadows, as the library and palette list them.
+    pub fn published_cards(&self) -> impl Iterator<Item = &ThemeDefinition> {
+        self.published.iter().filter(|theme| self.custom_theme(&theme.id).is_none())
+    }
+
+    /// `getThemeDefinition`: built-ins win, then saved themes, then published ones. `system`,
+    /// `light` and `dark` name the standard palette, not a theme.
     pub fn find(&self, id: &str) -> Option<&ThemeDefinition> {
-        find_built_in(id).or_else(|| self.custom_theme(id))
+        find_built_in(id)
+            .or_else(|| self.custom_theme(id))
+            .or_else(|| self.published.iter().find(|theme| theme.id == id))
     }
 
     pub fn custom_theme(&self, id: &str) -> Option<&ThemeDefinition> {
-        self.0.iter().find(|theme| theme.id == id)
+        self.custom.iter().find(|theme| theme.id == id)
     }
 
     /// `installCustomTheme`.
@@ -275,12 +329,13 @@ impl Library {
         if is_reserved(&theme.id) {
             return Err(format!("The theme id \"{}\" is reserved.", theme.id));
         }
-        if self.find(&theme.id).is_some() {
+        // `installCustomTheme` checks only these, so a saved theme may shadow a published one.
+        if find_built_in(&theme.id).is_some() || self.custom_theme(&theme.id).is_some() {
             return Err(format!("A theme named \"{}\" is already installed.", theme.label));
         }
-        let mut themes = self.0.to_vec();
+        let mut themes = self.custom.to_vec();
         themes.push(theme);
-        Ok(Self::new(themes))
+        Ok(self.with_custom(themes))
     }
 
     /// `updateCustomTheme`.
@@ -288,17 +343,17 @@ impl Library {
         if is_reserved(&theme.id) {
             return Err(format!("The theme id \"{}\" is reserved.", theme.id));
         }
-        let Some(index) = self.0.iter().position(|existing| existing.id == theme.id) else {
+        let Some(index) = self.custom.iter().position(|existing| existing.id == theme.id) else {
             return Err(format!("The theme \"{}\" is not installed.", theme.label));
         };
-        let mut themes = self.0.to_vec();
+        let mut themes = self.custom.to_vec();
         themes[index] = theme;
-        Ok(Self::new(themes))
+        Ok(self.with_custom(themes))
     }
 
     /// `removeCustomThemes`.
     pub fn remove(&self, ids: &[String]) -> Self {
-        Self::new(self.0.iter().filter(|theme| !ids.contains(&theme.id)).cloned().collect())
+        self.with_custom(self.custom.iter().filter(|theme| !ids.contains(&theme.id)).cloned().collect())
     }
 
     /// `replaceCustomThemeCollection`: the collection's themes in place of its old ones.
@@ -311,13 +366,13 @@ impl Library {
         if let Some(conflict) = themes.iter().find(|theme| {
             is_reserved(&theme.id)
                 || find_built_in(&theme.id).is_some()
-                || self.0.iter().any(|existing| !in_collection(existing) && existing.id == theme.id)
+                || self.custom.iter().any(|existing| !in_collection(existing) && existing.id == theme.id)
         }) {
             return Err(format!("A theme named \"{}\" is already installed.", conflict.label));
         }
-        let mut next = Vec::with_capacity(self.0.len() + themes.len());
+        let mut next = Vec::with_capacity(self.custom.len() + themes.len());
         let mut replacement = Some(themes);
-        for theme in self.0.iter() {
+        for theme in self.custom.iter() {
             if !in_collection(theme) {
                 next.push(theme.clone());
             } else if let Some(themes) = replacement.take() {
@@ -325,7 +380,7 @@ impl Library {
             }
         }
         next.extend(replacement.into_iter().flatten());
-        Ok(Self::new(next))
+        Ok(self.with_custom(next))
     }
 }
 
@@ -417,6 +472,17 @@ impl ThemeChoice {
             Some(dark) => self.assign_half(dark, card),
             None => self.use_theme(card),
         }
+    }
+
+    /// `adoptDefaultTheme`: `setTheme`, and a one-appearance theme's appearance too, since it
+    /// takes effect only in that appearance. False when the theme does not resolve.
+    pub fn adopt(&mut self, id: &str) -> bool {
+        let Some(single) = self.library.find(id).map(ThemeDefinition::single_appearance) else { return false };
+        self.use_theme(Some(id.to_owned()));
+        if let Some(dark) = single {
+            self.mode = if dark { ThemePreference::Dark } else { ThemePreference::Light };
+        }
+        true
     }
 
     /// `handleConfirmRemoveTheme`: the pick once `removed` themes are gone. A removed base
@@ -572,6 +638,28 @@ mod tests {
         // Removing it clears the half it held.
         assert_eq!(picked.without(&["aurora".into()]).halves, ThemeHalves::default());
         assert!(library.remove(&["aurora".into()]).custom().is_empty());
+    }
+
+    #[test]
+    fn published_themes_resolve_after_saved_ones_and_survive_library_edits() {
+        let published = Library::default().with_published(Arc::from(vec![saved("aurora", true), saved("dusk", false)]));
+        assert_eq!(published.find("dusk").map(|theme| theme.dark), Some(false));
+        // A saved theme may take a published id and then wins resolution and the card.
+        let library = published.install(ThemeDefinition { label: "Mine".into(), ..saved("aurora", false) }).unwrap();
+        assert_eq!(library.find("aurora").map(|theme| theme.label.as_str()), Some("Mine"));
+        let cards: Vec<_> = library.published_cards().map(|theme| theme.id.as_str()).collect();
+        assert_eq!(cards, ["dusk"]);
+        assert_eq!(library.remove(&["aurora".into()]).published(), published.published(), "edits keep the feed");
+
+        let mut picked = ThemeChoice { library: published, ..Default::default() };
+        assert!(!picked.adopt("gone"));
+        picked.halves.light = Some("grove".into());
+        assert!(picked.adopt("dusk"));
+        assert_eq!((picked.mode, picked.base.as_deref()), (ThemePreference::Light, Some("dusk")));
+        assert_eq!(picked.halves, ThemeHalves::default(), "a whole theme replaces the mix");
+        picked.mode = ThemePreference::System;
+        assert!(picked.adopt("grove"));
+        assert_eq!(picked.mode, ThemePreference::System, "a two-appearance theme keeps the mode");
     }
 
     #[test]

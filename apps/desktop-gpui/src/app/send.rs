@@ -25,6 +25,8 @@ pub(super) struct PendingSend {
     text: SharedString,
     created_at: SharedString,
     queued: bool,
+    /// The sent attachments and context records, which the row shows until the thread does.
+    content: std::sync::Arc<crate::timeline::UserContent>,
 }
 
 impl PendingSend {
@@ -52,7 +54,7 @@ impl PendingSend {
         }
         Row::User {
             id: format!("optimistic:{}", self.message_id).into(),
-            text: self.text.clone(),
+            text: crate::user_message::without_bootstrap_prompt(&self.text).to_owned().into(),
             steer: None,
             grouped_with_previous: false,
             grouped_with_next: false,
@@ -60,6 +62,7 @@ impl PendingSend {
             created_at: self.created_at.clone(),
             revert: None,
             attribution: None,
+            content: self.content.clone(),
         }
     }
 }
@@ -166,6 +169,27 @@ impl ThreadMessage<'_> {
     }
 }
 
+/// The `/compact` a send into a stale session runs first (`idleCompaction: onReturn`).
+fn compact_before(thread_id: &str, model: Option<&ModelSelection>) -> Value {
+    let mut command = json!({
+        "type": "message.dispatch",
+        "commandId": new_id(),
+        "createdBy": "user",
+        "creationSource": "web",
+        "threadId": thread_id,
+        "messageId": new_id(),
+        "text": "/compact",
+        "attachments": [],
+        "idleCompaction": "onReturn",
+        "deliveryIntent": "auto",
+        "dispatchMode": {"type": "start_immediately"},
+    });
+    if let Some(model) = model {
+        command["modelSelection"] = model.to_json();
+    }
+    command
+}
+
 impl Workspace {
     /// `followUpBehavior`, except that a send declines a waiting approval, so it steers.
     pub(super) fn follow_up_behavior(&self) -> &str {
@@ -189,14 +213,21 @@ impl Workspace {
             return;
         }
         if self.question.is_some() {
-            self.advance_question(window, cx);
+            self.advance_question(super::side_chat::ChatPane::Main, window, cx);
             return;
         }
         if self.editing_queued() {
-            self.save_queue_edit(window, cx);
+            self.save_queue_edit(super::side_chat::ChatPane::Main, window, cx);
             return;
         }
         let text = self.composer.read(cx).value().trim().to_owned();
+        // `/usage-limits` alone opens the panel rather than reaching the provider.
+        if crate::usage::is_usage_limits_command(&text) && self.usage_limits_offered() {
+            if self.open_usage_limits(window, cx) {
+                self.set_composer_text("", window, cx);
+            }
+            return;
+        }
         let fresh_session = self.fresh_session_command_available();
         if fresh_session && !self.has_attachments() && super::fresh_session::is_clear_command(&text) {
             self.arm_fresh_session(cx);
@@ -219,6 +250,7 @@ impl Workspace {
             || self.sending
             || self.target_rewinding()
             || self.runtime_mode_ceiling().is_some()
+            || self.clone_send_block().is_some()
         {
             return;
         }
@@ -248,6 +280,8 @@ impl Workspace {
         let mut background = false;
         // Thread settings the message runs with, applied right before it.
         let mut settings_commands = Vec::new();
+        // A stale Claude session compacts first, then this message queues behind that run.
+        let mut compact_command = None;
         let mut sent_mode = None;
         let mut pending_send = None;
         let (method, mut payload, new_thread_id, workspace) = match target {
@@ -262,15 +296,19 @@ impl Workspace {
                 let projection = self.thread.as_ref().and_then(|t| t.state.projection.as_ref());
                 let running = projection.is_some_and(super::super::model::ThreadProjection::is_running);
                 let can_steer = !projection.is_some_and(super::super::model::ThreadProjection::is_compacting);
+                // Feedback answers an approval, so there is no turn to compact before.
+                let compacts = !text_is_feedback && self.compacts_before_send(&text, fresh_arm.is_some());
+                compact_command = compacts.then(|| compact_before(&thread_id, self.model_override.as_ref()));
                 let command = ThreadMessage {
                     thread_id: &thread_id,
                     text: message_text,
                     attachments,
                     context,
-                    // A fresh session starts its own turn, so it never steers into the running one.
+                    // A fresh session starts its own turn, so it never steers into the running one;
+                    // after a compaction the message waits for that run.
                     dispatch: dispatch_fields(
-                        running,
-                        fresh_arm.is_some() || queues(self.follow_up_behavior(), intent, can_steer),
+                        running || compacts,
+                        compacts || fresh_arm.is_some() || queues(self.follow_up_behavior(), intent, can_steer),
                     ),
                     model: self.model_override.as_ref(),
                     source_plan: follow_up
@@ -286,13 +324,18 @@ impl Workspace {
                     message_id: command["messageId"].as_str().unwrap_or_default().to_owned(),
                     text: command["text"].as_str().unwrap_or_default().to_owned().into(),
                     created_at: crate::timestamp::iso(crate::timestamp::now_ms()).unwrap_or_default().into(),
-                    queued: running && command.get("deliveryIntent").is_none(),
+                    queued: (running || compacts) && command.get("deliveryIntent").is_none(),
+                    content: std::sync::Arc::new(crate::timeline::UserContent::parse(&command)),
                 });
                 ("orchestration.dispatchCommand", command, None, None)
             }
-            Target::Draft { project_id, .. } => {
+            Target::Draft { project_id, draft, .. } => {
                 if let Some((title, description)) = self.load_balancing_send_block() {
                     window.push_notification(Notification::warning(description).title(title), cx);
+                    return;
+                }
+                if self.model_fanout().is_some() {
+                    self.submit_fanout(text, attachments, context, window, cx);
                     return;
                 }
                 let Some(model) = self.composer_model() else {
@@ -312,14 +355,16 @@ impl Workspace {
                 // Still loading the workspace controls: resolve it the same way at send.
                 let workspace = strategy.is_none().then(|| {
                     let project = self.shell.projects.iter().find(|p| p.id == project_id)?;
-                    let has_threads = self.shell.threads.iter().any(|t| t.project_id == project_id);
+                    let has_threads = self.shell.project_has_threads(project);
                     Some((
                         DraftWorkspace::new(self.server_info(), project, has_threads),
                         project.workspace_root.clone(),
                     ))
                 });
-                let thread_id = self.terminals.take_draft_thread(&project_id).unwrap_or_else(new_id);
-                let mut initial = json!({"messageId": new_id(), "text": message_text, "attachments": attachments});
+                let thread_id = self.terminals.take_draft_thread(&draft).unwrap_or_else(new_id);
+                let launched_message = new_id();
+                let mut initial =
+                    json!({"messageId": launched_message, "text": message_text, "attachments": attachments});
                 if let Some(context) = context {
                     initial["context"] = context;
                 }
@@ -337,14 +382,19 @@ impl Workspace {
                     "initialMessage": initial,
                 });
                 background = intent != Intent::Foreground;
-                ("orchestration.launchThread", input, Some(thread_id), workspace.flatten())
+                ("orchestration.launchThread", input, Some((thread_id, launched_message)), workspace.flatten())
             }
         };
         let new_draft_after = intent == Intent::AndNewThread && matches!(origin, Target::Thread { .. });
         let project_id = self.target_project().map(|p| p.id.clone());
         let sent_attachments = std::mem::take(&mut self.attachments);
+        let sent_records = self.take_context_records();
         let pending_id = pending_send.as_ref().map(|send| send.message_id.clone());
+        let started = pending_send.as_ref().filter(|send| !send.queued).map(|send| send.message_id.clone());
         self.pending_sends.extend(pending_send);
+        if let Some(message_id) = started {
+            self.anchor_new_turn(message_id.into(), cx);
+        }
         self.sending = true;
         self.set_composer_text("", window, cx);
         self.release_typing_hold(false, window, cx);
@@ -365,6 +415,11 @@ impl Workspace {
                     }
                 }
             }
+            if result.is_ok()
+                && let Some(command) = compact_command
+            {
+                result = client.request("orchestration.dispatchCommand", command).await.map_err(|e| e.to_string());
+            }
             if result.is_ok() && !text_is_feedback {
                 if let Some((workspace, root)) = workspace {
                     let mode = workspace.default_mode(&client).await;
@@ -384,6 +439,9 @@ impl Workspace {
                 this.sending = false;
                 match result {
                     Ok(_) => {
+                        if !text_is_feedback {
+                            this.clear_usage_limits_for(&origin);
+                        }
                         if fresh_arm.is_some() {
                             this.disarm_fresh_session(&origin, fresh_arm);
                         }
@@ -392,8 +450,12 @@ impl Workspace {
                         }
                         this.record_prompt_sent(window, cx);
                         if new_thread_id.is_some() {
-                            // The launched draft's picks went with it.
+                            // The launched draft's picks went with it, and its project's next draft is new.
                             this.composer_selections.remove(&origin);
+                            if let Some(draft) = origin.draft_id() {
+                                this.drafts.promote(draft);
+                            }
+                            this.drafts_changed(cx);
                         }
                         let here = this.target.as_ref() == Some(&origin);
                         match (new_thread_id, background) {
@@ -406,12 +468,13 @@ impl Workspace {
                                 }
                             }
                             // Follow the new thread only from the draft that launched it.
-                            (Some(thread_id), false) if here => {
+                            (Some((thread_id, message_id)), false) if here => {
                                 // The draft is used up; the project's next draft starts fresh.
                                 this.draft_workspace = Default::default();
                                 // It launched on the draft's environment; the shell may not list it yet.
                                 let environment = origin.environment().clone();
                                 this.select_thread_in(environment, thread_id, window, cx);
+                                this.anchor_new_turn(message_id.into(), cx);
                             }
                             _ if new_draft_after && here => {
                                 if let Some(project_id) = project_id {
@@ -425,11 +488,12 @@ impl Workspace {
                         this.pending_sends.retain(|send| Some(&send.message_id) != pending_id.as_ref());
                         this.set_error_for(&origin, error.into());
                         if !text.is_empty() {
+                            this.give_back_context_records(&origin, sent_records);
                             this.give_back_prompt(&origin, text, window, cx);
                         }
                         if this.target.as_ref() == Some(&origin) {
                             this.attachments.extend(sent_attachments);
-                        } else if let Some(ComposerDraft::Prompt(_, kept)) = this.composer_drafts.get_mut(&origin) {
+                        } else if let Some(ComposerDraft::Prompt(_, kept, _)) = this.composer_drafts.get_mut(&origin) {
                             kept.extend(sent_attachments);
                         }
                     }
@@ -501,8 +565,12 @@ impl Workspace {
             }
             let _ = this.update(cx, |this, cx| {
                 this.sending = false;
-                if let (Err(error), Some(origin)) = (result, &origin) {
-                    this.set_error_for(origin, format!("Could not resume thread. {error}").into());
+                match (result, &origin) {
+                    (Err(error), Some(origin)) => {
+                        this.set_error_for(origin, format!("Could not resume thread. {error}").into());
+                    }
+                    (Ok(_), Some(origin)) => this.clear_usage_limits_for(origin),
+                    (_, None) => {}
                 }
                 cx.notify();
             });
@@ -577,6 +645,24 @@ mod tests {
     }
 
     #[test]
+    fn compacting_first_runs_a_marked_compact_and_queues_the_message_behind_it() {
+        let model = ModelSelection { instance_id: "claude".into(), model: "opus".into(), options: None };
+        let mut compact = compact_before("t1", Some(&model));
+        let object = compact.as_object_mut().unwrap();
+        assert!(object.remove("commandId").is_some_and(|id| id.is_string()));
+        assert!(object.remove("messageId").is_some_and(|id| id.is_string()));
+        assert_eq!(
+            compact,
+            json!({
+                "type": "message.dispatch", "createdBy": "user", "creationSource": "web", "threadId": "t1",
+                "text": "/compact", "attachments": [], "idleCompaction": "onReturn", "deliveryIntent": "auto",
+                "dispatchMode": {"type": "start_immediately"}, "modelSelection": model.to_json(),
+            })
+        );
+        assert!(compact_before("t1", None).get("modelSelection").is_none());
+    }
+
+    #[test]
     fn a_sent_message_shows_until_its_thread_does() {
         let projection = |items: Value, runs: Value| {
             let projection = json!({"thread": {"id": "t", "title": "t"}, "runs": runs, "turnItems": items});
@@ -590,6 +676,7 @@ mod tests {
             text: "hi".into(),
             created_at: "now".into(),
             queued,
+            content: Default::default(),
         };
         let mut pending = vec![send("t", "m1", false), send("t", "m2", true), send("other", "m3", false)];
         let empty = projection(json!([]), json!([]));

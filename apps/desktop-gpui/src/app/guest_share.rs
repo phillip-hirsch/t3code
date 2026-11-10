@@ -63,13 +63,16 @@ impl Workspace {
     }
 
     /// `GuestShareDialog`: creates a one-use link to the thread and shows it to copy.
-    pub(super) fn open_guest_share(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.thread_client(thread_id) else { return };
-        let Some(environment) = self.shell.threads.iter().find(|t| t.id == thread_id).map(|t| t.environment_id.clone())
-        else {
-            return;
-        };
-        let open = matches!(&self.target, Some(Target::Thread { id, .. }) if id == thread_id);
+    pub(super) fn open_guest_share(
+        &mut self,
+        key: &crate::model::ScopedId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.env_client(&key.env) else { return };
+        let Some(environment) = self.shell.thread(key).map(|t| t.environment_id.clone()) else { return };
+        let thread_id = key.id.as_str();
+        let open = self.is_open_thread(key);
         let shared = open && self.open_projection().is_some_and(|p| p.thread.guest_share.is_some());
         let note =
             if shared { "A new link ends the current one." } else { "The link works once and expires in 24 hours." };
@@ -222,7 +225,18 @@ impl Workspace {
             .focus_visible(move |s| s.shadow(vec![ring]))
             .child("Stop sharing")
             .when(closing, |el| el.opacity(0.64))
-            .when(!closing, |el| el.cursor_pointer().hover(move |s| s.bg(accent).text_color(foreground)))
+            // A theme gives the chat header's buttons its toolbar controls (`[data-chat-header] [data-slot="button"]`).
+            .when(t.themed, |el| {
+                el.bg(t.toolbar.control)
+                    .border_1()
+                    .border_color(t.toolbar.border)
+                    .text_color(t.toolbar.control_foreground)
+            })
+            .when(!closing, |el| {
+                el.cursor_pointer().hover(move |s| {
+                    if t.themed { s.bg(t.toolbar.control_hover) } else { s.bg(accent).text_color(foreground) }
+                })
+            })
             .on_click(cx.listener(move |this, _, _, cx| this.stop_guest_share(&thread_id, cx)));
         Some(
             h_flex()

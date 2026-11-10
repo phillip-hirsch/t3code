@@ -530,7 +530,7 @@ impl Workspace {
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.refresh_tree(&refresh_key, cx);
                     if let Some(path) = &refresh_selected {
-                        let key = super::FileKey { checkout: refresh_key.clone(), path: path.clone() };
+                        let key = super::FileKey::new(refresh_key.clone(), path.clone());
                         this.refresh_selected_file(&key, window, cx);
                     }
                 })),
@@ -729,7 +729,7 @@ impl Workspace {
         // Pierre trees' `--trees-git-ignored-color` (`light-dark(#adadb1, #4a4a4e)`); its icon cell fades to half.
         let ignored = gpui_kit::rgb(if tokens.dark { 0x4a4a4e } else { 0xadadb1 });
         let (click_key, click_row) = (root.clone(), row.clone());
-        let menu = self.tree_context_menu(&root.cwd, &row.path, cx);
+        let menu = self.tree_context_menu(root, &row.path, cx);
         h_flex()
             .id(ElementId::Name(format!("files-row:{}", row.path).into()))
             .h(px(ROW_HEIGHT))
@@ -779,7 +779,7 @@ impl Workspace {
     /// The row's menu: Open, Reveal, Open with, then Copy mention and Add to chat.
     fn tree_context_menu(
         &self,
-        cwd: &str,
+        root: &Checkout,
         path: &str,
         cx: &mut Context<Self>,
     ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
@@ -793,6 +793,7 @@ impl Workspace {
                 self.server_info().platform_os.as_deref(),
             )
         });
+        let (cwd, environment) = (root.cwd.as_str(), root.env.clone());
         let absolute = logic::absolute_path(cwd, path);
         // A host folder's rows are mentioned by their host paths.
         let host = self.project_target().is_none_or(|target| target.checkout.cwd != cwd);
@@ -800,9 +801,10 @@ impl Workspace {
         move |mut menu, window, cx| {
             super::track_menu(&view, cx);
             let open_in = |editor: String, reveal: bool, title: String| {
-                let absolute = absolute.clone();
+                let (absolute, environment) = (absolute.clone(), environment.clone());
                 window.listener_for(&view, move |this: &mut Workspace, _, window, cx| {
-                    this.open_path_in_editor(absolute.clone(), editor.clone(), reveal, title.clone(), window, cx);
+                    let (path, editor, title) = (absolute.clone(), editor.clone(), title.clone());
+                    this.open_path_in_editor(&environment, path, editor, reveal, title, window, cx);
                 })
             };
             if file_manager {
@@ -824,15 +826,16 @@ impl Workspace {
                 let items: Vec<(String, String)> =
                     others.iter().map(|e| ((*e).clone(), crate::app::details::editor_label(e).to_owned())).collect();
                 let view = view.clone();
-                let absolute = absolute.clone();
+                let (absolute, environment) = (absolute.clone(), environment.clone());
                 menu = menu.submenu("Open with", window, cx, move |mut sub, window, _| {
                     for (editor, label) in &items {
-                        let (editor, absolute) = (editor.clone(), absolute.clone());
+                        let (editor, absolute, environment) = (editor.clone(), absolute.clone(), environment.clone());
                         let title = format!("Could not open in {label}");
                         sub = sub.item(PopupMenuItem::new(label.clone()).on_click(window.listener_for(
                             &view,
                             move |this: &mut Workspace, _, window, cx| {
                                 this.open_path_in_editor(
+                                    &environment,
                                     absolute.clone(),
                                     editor.clone(),
                                     false,
@@ -859,31 +862,6 @@ impl Workspace {
                 },
             )))
         }
-    }
-
-    /// `shell.openInEditor` on a path, with the web's failure toast.
-    pub(in crate::app) fn open_path_in_editor(
-        &mut self,
-        path: String,
-        editor: String,
-        reveal: bool,
-        failure: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(client) = self.client() else { return };
-        let mut input = json!({"cwd": path, "editor": editor});
-        if reveal {
-            input["reveal"] = true.into();
-        }
-        cx.spawn_in(window, async move |_, cx| {
-            if client.request("shell.openInEditor", input).await.is_err() {
-                let _ = cx.update(|window, cx| {
-                    window.push_notification(Notification::error(path.clone()).title(failure.clone()), cx);
-                });
-            }
-        })
-        .detach();
     }
 
     /// Add to chat: the file's mention at the end of the composer, after a space.

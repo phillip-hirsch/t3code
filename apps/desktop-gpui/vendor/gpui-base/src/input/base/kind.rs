@@ -27,6 +27,7 @@ use gpui::{Div, Entity, Stateful, Window};
 use ropey::Rope;
 
 use super::decorations::DecorationCollections;
+use super::presentation::TextPresentation;
 use super::lsp::{ContextMenuContent, HoverDefinition, InlineCompletion};
 use crate::input::{
     GutterDecoration, HighlightStyleResolver, InputEdit, InputHighlighter, OverviewRulerDecoration,
@@ -81,6 +82,12 @@ pub trait InputExtras: Default + 'static {
     /// Decoration ranges to paint, innermost collection first.
     fn decoration_layers(&self) -> Vec<&[TextDecoration]> {
         Vec::new()
+    }
+
+    /// What a textarea draws over its text, when there is any, and a number that changes
+    /// whenever it does.
+    fn presentation(&self) -> Option<(&TextPresentation, u64)> {
+        None
     }
 
     /// Geometric decorations intersecting visible, non-folded buffer spans.
@@ -371,6 +378,10 @@ impl InputModeKind for TextareaMode {
 
     fn reset_annotations(state: &mut InputBaseState<Self>) {
         state.extras.decorations.clear();
+        if !state.extras.presentation.is_empty() {
+            state.extras.presentation = TextPresentation::default();
+            state.extras.presentation_revision += 1;
+        }
     }
 
     fn adjust_annotations(
@@ -379,18 +390,29 @@ impl InputModeKind for TextareaMode {
         new_len: usize,
     ) {
         state.extras.decorations.adjust_for_edit(range, new_len);
+        if !state.extras.presentation.is_empty() {
+            state.extras.presentation.adjust_for_edit(range, new_len);
+            state.extras.presentation_revision += 1;
+        }
     }
 }
 
-/// What a textarea adds on top of the shared engine: the editor's text decorations.
+/// What a textarea adds on top of the shared engine: the editor's text decorations, and the
+/// presentation drawn over its text.
 #[derive(Default)]
 pub struct TextareaExtras {
     pub(crate) decorations: DecorationCollections,
+    pub(crate) presentation: TextPresentation,
+    pub(crate) presentation_revision: u64,
 }
 
 impl InputExtras for TextareaExtras {
     fn decoration_layers(&self) -> Vec<&[TextDecoration]> {
         self.decorations.iter().collect()
+    }
+
+    fn presentation(&self) -> Option<(&TextPresentation, u64)> {
+        (!self.presentation.is_empty()).then_some((&self.presentation, self.presentation_revision))
     }
 }
 // `EditorMode`'s implementation lives with the editor code, next to the

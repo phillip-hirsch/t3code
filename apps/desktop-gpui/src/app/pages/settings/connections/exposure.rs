@@ -109,11 +109,21 @@ impl Workspace {
         self.desktop.exposure_pending = true;
         let work = cx.background_executor().spawn(async move {
             let (exposure, serve_enabled, serve_port) = exposure::for_launch(&settings, port);
+            let accessible = exposure.mode == ExposureMode::NetworkAccessible;
             // Asking Tailscale can prompt on some systems, so only when exposure could use it.
-            let tailscale = (exposure.mode == ExposureMode::NetworkAccessible || serve_enabled)
-                .then(|| exposure::tailscale_https(serve_enabled, serve_port))
-                .flatten();
-            ExposureView { exposure, tailscale }
+            let status = if accessible || serve_enabled {
+                exposure::tailscale(serve_enabled, serve_port)
+            } else {
+                exposure::Tailscale::default()
+            };
+            let mut tailnet_ipv4 = if accessible { status.ipv4 } else { Vec::new() };
+            // The route can be a tailnet address Tailscale's status did not list.
+            if let Some(route) = exposure::route_ipv4().filter(|a| accessible && exposure::is_tailscale_ipv4(*a))
+                && !tailnet_ipv4.contains(&route)
+            {
+                tailnet_ipv4.push(route);
+            }
+            ExposureView { exposure, tailscale: status.https, port, tailnet_ipv4 }
         });
         self.desktop._exposure_task = Some(cx.spawn_in(window, async move |this, cx| {
             let view = work.await;

@@ -1,16 +1,21 @@
 //! Where the window is: a chat target, a page beside the chat (Pull requests,
 //! Usage), or the Settings modal on top, plus back/forward history over them.
 
+mod pull_request_checkout;
 mod pull_request_detail;
+pub(super) use pull_request_detail::{avatar as pr_avatar, state_glyph as pr_state_glyph};
 mod pull_request_surface;
 mod pull_requests;
 pub(super) mod settings;
+mod thread_card_pull_requests;
+mod thread_pull_request_badge;
 mod usage;
 
 use gpui_kit::{AnyElement, Context, SharedString, Window};
 
 pub(super) use pull_requests::PullRequestsState;
-pub(super) use usage::UsageState;
+pub(super) use thread_pull_request_badge::terminal_running_color;
+pub(super) use usage::{UsageLimitsPanel, UsageState};
 
 use super::{Target, Workspace};
 
@@ -26,6 +31,8 @@ pub(super) enum Page {
     Usage,
     /// An app link being opened (`/_chat/new`); its state is `DesktopShell::link_page`.
     Link,
+    /// First-run setup (`/welcome`), without the sidebar.
+    Welcome,
 }
 
 impl Page {
@@ -34,6 +41,7 @@ impl Page {
             Page::PullRequests => "Pull requests",
             Page::Usage => "Usage",
             Page::Link => "T3 Code",
+            Page::Welcome => "Welcome",
         }
     }
 
@@ -72,6 +80,11 @@ impl History {
         self.entries.truncate(self.index + 1);
         self.entries.push(location);
         self.index = self.entries.len() - 1;
+    }
+
+    /// `navigate({ replace: true })`: the current entry becomes `location`.
+    pub(super) fn replace(&mut self, location: Location) {
+        self.entries[self.index] = location;
     }
 
     pub(super) fn can_go_back(&self) -> bool {
@@ -131,7 +144,7 @@ impl Workspace {
         match self.page {
             Some(Page::PullRequests) => self.pull_requests_opened(cx),
             Some(Page::Usage) => self.usage_opened(cx),
-            Some(Page::Link) | None => {}
+            Some(Page::Link | Page::Welcome) | None => {}
         }
     }
 
@@ -168,6 +181,10 @@ impl Workspace {
     /// project (`IndexDraftLanding`), out of Settings or any page.
     pub(super) fn go_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings = None;
+        // Until setup is finished, home is the Welcome page (`FirstRunGate`).
+        if self.welcome_is_home() {
+            return self.open_page(Page::Welcome, cx);
+        }
         let recent = crate::inbox::most_recent_project(&self.shell.projects, &self.shell.threads);
         match recent.map(|p| p.id.clone()) {
             Some(project_id) => self.start_draft(project_id, window, cx),
@@ -198,7 +215,7 @@ impl Workspace {
         self.settings_ui.access_environment = None;
         match location {
             Location::Chat(Some(Target::Thread { id: thread_id, .. })) => self.select_thread(thread_id, window, cx),
-            Location::Chat(Some(Target::Draft { project_id, .. })) => self.start_draft(project_id, window, cx),
+            Location::Chat(Some(target @ Target::Draft { .. })) => self.open_draft_entry(target, window, cx),
             Location::Chat(None) => {}
             Location::Page(page) => {
                 self.page_entered(page);
@@ -220,6 +237,7 @@ impl Workspace {
             Page::PullRequests => Some(self.render_pull_requests(window, cx)),
             Page::Usage => None,
             Page::Link => Some(self.render_link_page(window, cx)),
+            Page::Welcome => Some(self.render_welcome(window, cx)),
         }
     }
 
@@ -234,7 +252,7 @@ mod tests {
     use super::*;
 
     fn draft(id: &str) -> Location {
-        Location::Chat(Some(Target::Draft { env: "e".into(), project_id: id.into() }))
+        Location::Chat(Some(Target::draft("e".into(), id.into(), crate::app::draft_sessions::DraftId::for_test(id))))
     }
 
     #[test]
@@ -253,5 +271,9 @@ mod tests {
         assert!(!history.can_go_forward(), "a new visit drops the forward entries");
         assert_eq!(history.step(-1), Some(draft("a")));
         assert_eq!(history.step(-5), None);
+        // A replaced entry is the one stepping back reaches.
+        history.replace(Location::Page(Page::Welcome));
+        assert_eq!(history.step(1), Some(Location::Settings("general".into())));
+        assert_eq!(history.step(-1), Some(Location::Page(Page::Welcome)));
     }
 }

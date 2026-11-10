@@ -37,11 +37,15 @@ use crate::rpc::{RpcClient, RpcError};
 use crate::theme::{self, FONT_MONO, Tokens};
 use crate::timestamp::parse_ms;
 
+mod app_access;
 pub(super) mod avatars;
+mod body;
 pub(super) mod breakdown;
 mod code;
+pub(super) use code::stored_file_tree_open;
 mod completions;
 mod guide;
+pub(super) mod guide_runs;
 mod handoff;
 mod header;
 pub(super) use header::checks_body;
@@ -55,8 +59,6 @@ const CONVERSATION_PAGE: usize = 10;
 /// How long an inline "Confirm …?" stays armed (`useInlineActionConfirm`).
 const CONFIRM_WINDOW: Duration = Duration::from_secs(3);
 const COPIED_WINDOW: Duration = Duration::from_millis(1600);
-/// A guide run takes minutes; its answer is read again at this pace while it runs.
-const GUIDE_POLL: Duration = Duration::from_secs(15);
 
 /// The thread whose right panel shows the pull request (`threadRef` beside `PullRequestDetailPanel`).
 #[derive(Clone, Debug)]
@@ -110,6 +112,10 @@ pub(in crate::app) struct Panel {
     copied: Option<&'static str>,
     _copied: Option<Task<()>>,
     markdown: HashMap<String, (String, Entity<TextViewState>, Subscription)>,
+    /// Bodies by their key, as split into prose and media (`splitPullRequestBody`).
+    bodies: HashMap<String, Rc<body::Body>>,
+    /// The bodies' images, loaded through the pull request's environment.
+    images: super::super::markdown_images::ImageCache,
     /// Markdown bodies whose code blocks scroll instead of wrapping (`MarkdownCodeBlock`'s wrap).
     code_nowrap: HashSet<gpui_kit::EntityId>,
     /// The description as last written from here (`DescriptionDraft`).
@@ -123,7 +129,9 @@ pub(in crate::app) struct Panel {
     guide_loading: bool,
     guide_error: Option<SharedString>,
     guide_starting: bool,
-    _guide_poll: Option<Task<()>>,
+    /// `sourceControl.appAccess` for the repository: what was asked, and its status once answered.
+    app_access: Option<(app_access::AppAccessQuery, Option<String>)>,
+    _app_access_read: Option<Task<()>>,
     code: Option<code::CodeTab>,
     write: write::WriteState,
     stack: Option<Rc<logic::Stack>>,
@@ -143,7 +151,7 @@ pub(in crate::app) struct Panel {
     /// The handoff being prepared, as the web keys it ("ask", "checkout:worktree", ...).
     handoff: Option<String>,
     /// The project a handoff runs in, picked from another environment's copy (`actingScope`).
-    acting: Option<String>,
+    acting: Option<handoff::ProjectScope>,
     /// The header's fold scrolled away.
     condensed: bool,
     guide_head: Option<String>,
@@ -152,6 +160,7 @@ pub(in crate::app) struct Panel {
     guide_rail_open: bool,
     guide_files_open: HashSet<String>,
     guide_diff: guide::GuideDiff,
+    guide_picking: Option<guide::Picking>,
 }
 
 impl Panel {
@@ -186,6 +195,8 @@ impl Panel {
             copied: None,
             _copied: None,
             markdown: HashMap::new(),
+            bodies: HashMap::new(),
+            images: Default::default(),
             code_nowrap: HashSet::new(),
             description_draft: None,
             summary_scroll: ScrollHandle::new(),
@@ -196,7 +207,8 @@ impl Panel {
             guide_loading: false,
             guide_error: None,
             guide_starting: false,
-            _guide_poll: None,
+            app_access: None,
+            _app_access_read: None,
             code: None,
             write: write::WriteState::default(),
             stack: None,
@@ -218,6 +230,7 @@ impl Panel {
             guide_rail_open: false,
             guide_files_open: HashSet::new(),
             guide_diff: guide::GuideDiff::default(),
+            guide_picking: None,
         }
     }
 
@@ -294,11 +307,16 @@ fn is_not_found(error: &RpcError) -> bool {
     matches!(error, RpcError::Failure(value) if value["_tag"] == "PullRequestOperationError" && value["reason"] == "not-found")
 }
 
-fn toast_error(window: &mut Window, cx: &mut App, title: impl Into<SharedString>, message: impl Into<SharedString>) {
+pub(super) fn toast_error(
+    window: &mut Window,
+    cx: &mut App,
+    title: impl Into<SharedString>,
+    message: impl Into<SharedString>,
+) {
     window.push_notification(Notification::error(message).title(title), cx);
 }
 
-fn toast_success(window: &mut Window, cx: &mut App, title: impl Into<SharedString>) {
+pub(super) fn toast_success(window: &mut Window, cx: &mut App, title: impl Into<SharedString>) {
     window.push_notification(Notification::success("").title(title), cx);
 }
 
@@ -309,7 +327,7 @@ fn repository_url(url: &str) -> Option<String> {
 
 impl Workspace {
     /// Opens a pull request in the panel, or shows the one already open.
-    pub(super) fn open_pull_request_panel(
+    pub(in crate::app) fn open_pull_request_panel(
         &mut self,
         reference: Reference,
         seed: Option<Rc<Entry>>,
@@ -323,8 +341,8 @@ impl Workspace {
             cx.notify();
             return;
         }
-        let guides = self.review_guides_enabled(&reference.project_id);
-        let writable = self.pr_write_grant(&reference.project_id) == Some(true);
+        let guides = self.review_guides_enabled(&reference);
+        let writable = self.pr_write_grant(&reference) == Some(true);
         let key = reference.key();
         if self.show_pr_tab(reference, seed, cx) {
             return;
@@ -345,6 +363,7 @@ impl Workspace {
         if guides {
             self.read_pr_guide(cx);
         }
+        self.read_pr_app_access_of(&key, false, cx);
         cx.notify();
     }
 
@@ -359,11 +378,17 @@ impl Workspace {
             .shell
             .projects
             .iter()
-            .map(|p| (p.id.as_str(), p.repository_identity.as_ref().and_then(|i| i.canonical_key.as_deref())));
-        let Some(project_id) = logic::project_for_link(projects, &host, &repository).map(str::to_owned) else {
+            .map(|p| (p, p.repository_identity.as_ref().and_then(|i| i.canonical_key.as_deref())));
+        let Some(project) = logic::project_for_link(projects, &host, &repository) else {
             return false;
         };
-        let reference = Reference { project_id, host: Some(host), repository, number };
+        let reference = Reference {
+            environment_id: project.environment_id.to_string(),
+            project_id: project.id.clone(),
+            host: Some(host),
+            repository,
+            number,
+        };
         if self.page != Some(super::Page::PullRequests) {
             self.open_page(super::Page::PullRequests, cx);
         }
@@ -374,13 +399,26 @@ impl Workspace {
 
     /// The connection's `source-control:write` on the pull request's environment
     /// (`useEnvironmentScope`), from its current session; `None` until that session's check answers.
-    fn pr_write_grant(&self, project_id: &str) -> Option<bool> {
-        self.env_grant(&self.project_environment(project_id)?, SOURCE_CONTROL_WRITE)
+    pub(super) fn pr_write_grant(&self, reference: &Reference) -> Option<bool> {
+        self.env_grant(&reference.environment_id, SOURCE_CONTROL_WRITE)
+    }
+
+    /// The socket of the environment a pull request is read on.
+    pub(in crate::app) fn pr_client(&self, reference: &Reference) -> Option<RpcClient> {
+        self.env_client(&reference.environment_id)
+    }
+
+    /// The listed project a pull request belongs to, on its own environment.
+    pub(super) fn pr_project(&self, reference: &Reference) -> Option<&crate::model::ProjectShell> {
+        self.shell
+            .projects
+            .iter()
+            .find(|p| p.id == reference.project_id && p.environment_id == reference.environment_id)
     }
 
     /// The pull request `key` names may be acted on.
     fn pr_panel_writable(&self, key: &str) -> bool {
-        self.pr_panel_ref(key).is_some_and(|p| self.pr_write_grant(&p.reference.project_id) == Some(true))
+        self.pr_panel_ref(key).is_some_and(|p| self.pr_write_grant(&p.reference) == Some(true))
     }
 
     /// An environment's session answered (`before` was its grant): a newly granted environment
@@ -398,7 +436,7 @@ impl Workspace {
             .iter()
             .chain(self.pull_requests.parked.values())
             .filter(|p| p.detail.is_some())
-            .filter(|p| self.project_environment(&p.reference.project_id).as_ref() == Some(environment))
+            .filter(|p| p.reference.environment_id == environment.as_ref())
             .map(|p| p.reference.key())
             .collect();
         for key in keys {
@@ -424,21 +462,21 @@ impl Workspace {
     fn pull_request_client_of(&self, key: &str) -> Option<RpcClient> {
         let shown = self.pull_requests.panel.as_ref().filter(|p| p.reference.key() == key);
         let panel = shown.or_else(|| self.pull_requests.parked.get(key))?;
-        self.project_client(&panel.reference.project_id)
+        self.pr_client(&panel.reference)
     }
 
     /// The config of the machine a pull request's project lives on: its settings, not the chat's.
-    fn pull_request_info(&self, project_id: &str) -> Option<&crate::model::ServerInfo> {
-        self.env_info(&self.project_environment(project_id)?)
+    fn pull_request_info(&self, reference: &Reference) -> Option<&crate::model::ServerInfo> {
+        self.env_info(&reference.environment_id)
     }
 
-    fn review_guides_enabled(&self, project_id: &str) -> bool {
-        self.pull_request_info(project_id).is_some_and(|info| info.settings.bool("reviewGuidesEnabled"))
+    fn review_guides_enabled(&self, reference: &Reference) -> bool {
+        self.pull_request_info(reference).is_some_and(|info| info.settings.bool("reviewGuidesEnabled"))
     }
 
     /// The socket of the shown pull request's machine; none while no pull request is shown.
     pub(in crate::app) fn pull_request_client(&self) -> Option<RpcClient> {
-        self.project_client(&self.pull_requests.panel.as_ref()?.reference.project_id)
+        self.pr_client(&self.pull_requests.panel.as_ref()?.reference)
     }
 
     fn shown_pr_key(&self) -> Option<String> {
@@ -502,6 +540,7 @@ impl Workspace {
                     }
                     if landed {
                         this.read_pr_avatars(&detail_key, cx);
+                        this.read_pr_app_access_of(&detail_key, false, cx);
                     }
                     cx.notify();
                 });
@@ -560,6 +599,7 @@ impl Workspace {
                 let Some(panel) = this.pr_panel(&key) else { return };
                 panel.refreshing = false;
                 this.read_pr_detail_of(&key, cx);
+                this.read_pr_app_access_of(&key, true, cx);
                 this.read_pr_stack_of(&key, cx);
                 if this.shown_pr_key().as_deref() == Some(key.as_str()) {
                     this.refresh_pr_code(cx);
@@ -669,7 +709,13 @@ impl Workspace {
 
     /// Shows an action's reply in the panel and the list instead of reading them again; without
     /// one, as from an older server, both are read.
-    fn apply_pr_action_reply(&mut self, key: &str, reference: &Reference, reply: &Value, cx: &mut Context<Self>) {
+    pub(super) fn apply_pr_action_reply(
+        &mut self,
+        key: &str,
+        reference: &Reference,
+        reply: &Value,
+        cx: &mut Context<Self>,
+    ) {
         let Some(reply) = pull_request_reply::Reply::read(reply) else {
             self.read_pr_detail_of(key, cx);
             self.read_pull_requests(false, cx);
@@ -764,86 +810,11 @@ impl Workspace {
         cx.notify();
     }
 
-    /// `pullRequests.reviewGuide`, read again while a run is writing one.
+    /// `pullRequests.reviewGuide` for the shown pull request.
     fn read_pr_guide(&mut self, cx: &mut Context<Self>) {
-        let Some(client) = self.pull_request_client() else { return };
-        let Some(panel) = self.pull_requests.panel.as_mut() else { return };
-        panel.guide_loading = true;
-        let key = panel.reference.key();
-        let input = panel.reference.to_json();
-        cx.spawn(async move |this, cx| {
-            let result = client.request("pullRequests.reviewGuide", input).await;
-            let _ = this.update(cx, |this, cx| {
-                let Some(panel) = this.pr_panel(&key) else { return };
-                panel.guide_loading = false;
-                match result {
-                    Ok(value) => {
-                        panel.guide_error = None;
-                        panel.set_guide(value);
-                    }
-                    Err(error) => panel.guide_error = Some(list_logic::error_message(&error).into()),
-                }
-                this.poll_pr_guide(cx);
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn poll_pr_guide(&mut self, cx: &mut Context<Self>) {
-        let Some(panel) = self.pull_requests.panel.as_mut() else { return };
-        let running = panel.guide.as_ref().is_some_and(|g| g["run"]["_tag"] == "Running");
-        if !running {
-            panel._guide_poll = None;
-            return;
+        if let Some(key) = self.shown_pr_key() {
+            self.read_pr_guide_of(&key, cx);
         }
-        let key = panel.reference.key();
-        panel._guide_poll = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(GUIDE_POLL).await;
-            let _ = this.update(cx, |this, cx| {
-                if this.pr_panel(&key).is_some() {
-                    this.read_pr_guide(cx);
-                }
-            });
-        }));
-    }
-
-    /// `useReviewGuideWriter.write`: starts an agent run on the server (`pullRequests.generateReviewGuide`).
-    fn write_pr_guide(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.pull_request_client() else { return };
-        let Some(panel) = self.pull_requests.panel.as_mut() else { return };
-        if panel.guide_starting || panel.guide.as_ref().is_some_and(|g| g["run"]["_tag"] == "Running") {
-            return;
-        }
-        panel.guide_starting = true;
-        if panel.guide.as_ref().is_none_or(|g| g["guide"].is_null()) {
-            panel.tab = Tab::Guide;
-        }
-        let key = panel.reference.key();
-        let input = panel.reference.to_json();
-        cx.spawn_in(window, async move |this, cx| {
-            let result = client.request("pullRequests.generateReviewGuide", input).await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                let Some(panel) = this.pr_panel(&key) else { return };
-                panel.guide_starting = false;
-                match result {
-                    Ok(value) => panel.set_guide(value),
-                    Err(error) => toast_error(
-                        window,
-                        cx,
-                        "Could not start a review guide",
-                        logic::readable_failure(
-                            &list_logic::error_message(&error),
-                            "Check the review guide model in Settings → Source control.",
-                        ),
-                    ),
-                }
-                this.poll_pr_guide(cx);
-                cx.notify();
-            });
-        })
-        .detach();
-        cx.notify();
     }
 
     fn rebuild_pr_timeline(&mut self) {
@@ -874,7 +845,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// One markdown body, parsed once and kept while the panel shows this pull request.
     /// What a markdown body's view parses: HTML comments out, media links resolved on the host.
     fn pr_markdown_source(&self, text: &str) -> String {
         let panel = self.pull_requests.panel.as_ref();
@@ -887,19 +857,18 @@ impl Workspace {
         }
     }
 
+    /// One prose run of a body (see [`Self::pr_body`]), parsed once and kept while the panel
+    /// shows this pull request.
     fn pr_markdown(&mut self, key: &str, text: &str, cx: &mut Context<Self>) -> Option<Entity<TextViewState>> {
-        let shown = self.pr_markdown_source(text);
         let panel = self.pull_requests.panel.as_mut()?;
         if let Some((held, view, _)) = panel.markdown.get_mut(key) {
             if held != text {
-                let source = shown;
-                view.update(cx, |view, cx| view.set_text(&source, cx));
+                view.update(cx, |view, cx| view.set_text(text, cx));
                 text.clone_into(held);
             }
             return Some(view.clone());
         }
-        let source = shown;
-        let view = cx.new(|cx| TextViewState::markdown(&source, cx));
+        let view = cx.new(|cx| TextViewState::markdown(text, cx));
         let changed = cx.observe(&view, |this, _, cx| {
             if let Some(panel) = this.pull_requests.panel.as_mut() {
                 panel.timeline.remeasure();
@@ -908,6 +877,14 @@ impl Workspace {
         });
         panel.markdown.insert(key.to_owned(), (text.to_owned(), view.clone(), changed));
         Some(view)
+    }
+
+    /// Re-lays out the open pull request, as something in its bodies changed size.
+    pub(in crate::app) fn remeasure_pr_panel(&mut self, cx: &mut Context<Self>) {
+        if let Some(panel) = self.pull_requests.panel.as_mut() {
+            panel.timeline.remeasure();
+        }
+        cx.notify();
     }
 
     /// Whether the code blocks of the markdown body `state` wrap; they do until toggled.
@@ -971,17 +948,19 @@ impl Workspace {
 
     /// The merge method the header and menu use (`resolvePullRequestMergeMethod`).
     fn pr_merge_method(&self, panel: &Panel, detail: &Detail) -> &'static str {
-        let project = self.shell.projects.iter().find(|p| p.id == detail.project_id);
-        let project_default = self
-            .pull_request_info(&detail.project_id)
-            .map(|info| info.project_setting(project, "pullRequestMergeMethod"))
-            .unwrap_or_default();
         logic::resolve_merge_method(
             &logic::allowed_merge_methods(detail),
             panel.merge_method.or(detail.auto_merge_method.as_deref().and_then(known_method)),
-            project_default.as_str(),
+            self.pr_project_merge_method(&panel.reference).as_deref(),
             self.pull_requests.last_merge_method,
         )
+    }
+
+    /// The project's default merge method (`usePullRequestDefaultMergeMethodResolver`).
+    pub(super) fn pr_project_merge_method(&self, reference: &Reference) -> Option<String> {
+        self.pull_request_info(reference).and_then(|info| {
+            info.project_setting(self.pr_project(reference), "pullRequestMergeMethod").as_str().map(str::to_owned)
+        })
     }
 
     pub(super) fn render_pull_request_panel(
@@ -1000,10 +979,14 @@ impl Workspace {
                 }
                 _ => detail_ghost(&t),
             };
-            return frame.child(self.render_pr_seed_header(thread, &t, cx)).child(body).into_any_element();
+            return frame
+                .child(self.render_pr_seed_header(thread, &t, cx))
+                .children(self.render_pr_app_access(&t))
+                .child(body)
+                .into_any_element();
         };
-        let guides = self.review_guides_enabled(&detail.project_id);
         let panel = self.pull_requests.panel.as_ref().expect("checked above");
+        let guides = self.review_guides_enabled(&panel.reference);
         let tab = match panel.tab {
             Tab::Guide if !guides => Tab::Summary,
             Tab::Code if !detail.capabilities.diff => Tab::Summary,
@@ -1022,6 +1005,7 @@ impl Workspace {
         let composer = self.render_pr_composer(&detail, &t, cx);
         frame
             .child(header)
+            .children(self.render_pr_app_access(&t))
             .child(
                 self.pr_scroll_watch(body, cx)
                     .children(composer.map(|c| div().absolute().right(px(16.)).bottom(px(12.)).child(c))),
@@ -1499,7 +1483,7 @@ impl Workspace {
             .then(|| (panel.maintainer_choice.or(detail.maintainer_can_modify) == Some(true), panel.maintainer_saving));
         let can_link = logic::parse_change_request_url(&detail.url).is_some();
         let current_thread =
-            thread.and_then(|thread| self.pr_current_thread(&detail.project_id, &thread.id, &detail.url));
+            thread.and_then(|thread| self.pr_current_thread(&panel.reference.environment_id, &thread.id, &detail.url));
         let handoff = panel.handoff.clone();
         let attaches = self.pr_attaches_to_composer();
         let can_fix = self.pr_can_fix(detail);
@@ -1966,17 +1950,7 @@ impl Workspace {
             }
             let text = if body.trim().is_empty() { "_No description provided._" } else { body.as_str() };
             let editable = logic::can_edit_change_request(detail);
-            let view = cx.entity();
-            let state = self.pr_markdown("description", text, cx);
-            let markdown = state.map(|state| {
-                let markdown = pr_markdown_view(&state, t, view.clone(), self.pr_code_wraps(&state));
-                if !editable {
-                    return markdown;
-                }
-                markdown.on_task_toggle(move |item_start, checked, window, cx| {
-                    view.update(cx, |this, cx| this.toggle_pr_task(item_start, checked, window, cx));
-                })
-            });
+            let markdown = self.pr_body("description", text, editable, t, cx);
             let edit = editable.then(|| self.pr_edit_button("description".into(), "description", body.clone(), t, cx));
             let reactions = activity.as_ref().and_then(|a| self.render_pr_reactions(None, &a.reactions, t, cx));
             Some(
@@ -2111,7 +2085,7 @@ impl Workspace {
                     .rounded(px(6.))
                     .border_1()
                     .border_color(Hsla { a: 0.3, ..t.warning })
-                    .bg(Hsla { a: 0.08, ..t.warning })
+                    .bg(t.warning_surface)
                     .px(px(8.))
                     .py(px(6.))
                     .text_xs()
@@ -2209,8 +2183,11 @@ impl Workspace {
         let reply_count = replies.len() + more;
         let body = logic::visible_body(&root.body);
         let preview = (!open).then(|| body.as_deref().map(preview_line)).flatten();
-        let opened_body =
-            if open { body.as_ref().and_then(|b| self.pr_markdown(&format!("c:{}", root.id), b, cx)) } else { None };
+        let opened_body = if open {
+            body.as_ref().and_then(|b| self.pr_body(&format!("c:{}", root.id), b, false, t, cx))
+        } else {
+            None
+        };
         let chat = self.render_pr_add_to_chat(&root.id, logic::chat_subject(root, thread), false, t, cx);
         let toggle_key = key;
         v_flex()
@@ -2263,17 +2240,7 @@ impl Workspace {
                     ),
             )
             .when(open, |el| {
-                el.child(
-                    v_flex()
-                        .px(px(12.))
-                        .pb(px(12.))
-                        .gap(px(12.))
-                        .children(
-                            opened_body
-                                .map(|state| pr_markdown_view(&state, t, cx.entity(), self.pr_code_wraps(&state))),
-                        )
-                        .children(replies_column),
-                )
+                el.child(v_flex().px(px(12.)).pb(px(12.)).gap(px(12.)).children(opened_body).children(replies_column))
             })
             .children(more_replies.map(|line| div().px(px(12.)).pb(px(12.)).child(line)))
             .into_any_element()
@@ -2288,7 +2255,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let body = logic::visible_body(&comment.body);
-        let markdown = body.as_ref().and_then(|b| self.pr_markdown(&format!("c:{}", comment.id), b, cx));
+        let markdown = body.as_ref().and_then(|b| self.pr_body(&format!("c:{}", comment.id), b, false, t, cx));
         let can_edit = self
             .pull_requests
             .panel
@@ -2350,9 +2317,7 @@ impl Workspace {
                         .gap(px(4.))
                         .px(px(12.))
                         .py(px(12.))
-                        .child(div().flex_1().min_w_0().children(
-                            markdown.map(|state| pr_markdown_view(&state, t, cx.entity(), self.pr_code_wraps(&state))),
-                        ))
+                        .child(div().flex_1().min_w_0().children(markdown))
                         .children(edit),
                 ),
                 None => el,
@@ -2556,6 +2521,7 @@ fn pr_markdown_view(state: &Entity<TextViewState>, t: &Tokens, view: Entity<Work
                 // No `onRunCommand`: a terminal here would open in the last active thread.
                 false,
                 None,
+                None,
                 &t,
                 cx,
                 move |this, cx| {
@@ -2698,7 +2664,7 @@ fn meta_line<const N: usize>(segments: [Option<AnyElement>; N], t: &Tokens) -> g
 }
 
 /// `PullRequestActorAvatar`: the picture once read, else the login's initial.
-fn avatar(actor: Option<&Actor>, size: f32, t: &Tokens) -> gpui_kit::Div {
+pub(in crate::app) fn avatar(actor: Option<&Actor>, size: f32, t: &Tokens) -> gpui_kit::Div {
     let login = actor.map_or("ghost", |a| a.login.as_str());
     let initial = div()
         .size(px(size))
@@ -2739,10 +2705,10 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let stat = diff_stat(detail.additions, detail.deletions, size, t)?;
-        let reference = self.pull_requests.panel.as_ref()?.reference.to_json();
+        let panel_reference = &self.pull_requests.panel.as_ref()?.reference;
         let subject = breakdown::Subject {
-            project_id: detail.project_id.clone(),
-            reference,
+            environment_id: panel_reference.environment_id.clone(),
+            reference: panel_reference.to_json(),
             additions: detail.additions,
             deletions: detail.deletions,
         };
@@ -2764,7 +2730,7 @@ fn diff_stat(additions: u64, deletions: u64, size: f32, t: &Tokens) -> Option<im
     })
 }
 
-fn state_glyph(state: list_logic::State, draft: bool, t: &Tokens) -> (Lucide, Hsla, &'static str) {
+pub(in crate::app) fn state_glyph(state: list_logic::State, draft: bool, t: &Tokens) -> (Lucide, Hsla, &'static str) {
     match (state, draft) {
         (list_logic::State::Merged, _) => (Lucide::GitMerge, tone(t, 0x7f22fe, 0xc4b4ff, 0.9), "Merged"),
         (list_logic::State::Closed, _) => (Lucide::GitPullRequestClosed, tone(t, 0xe7000b, 0xffa2a2, 0.9), "Closed"),
@@ -2783,7 +2749,7 @@ fn checks_glyph(state: &str, t: &Tokens) -> Option<(Lucide, Hsla, &'static str)>
 }
 
 /// `CHECK_STATUS_PRESENTATION`. A running check shows a still spinner glyph, not an animation.
-fn check_status_icon(status: &str, t: &Tokens) -> (Lucide, Hsla) {
+pub(super) fn check_status_icon(status: &str, t: &Tokens) -> (Lucide, Hsla) {
     let muted = Hsla { a: 0.7, ..t.muted_foreground };
     match status {
         "pending" => (Lucide::LoaderCircle, tone(t, 0xfe9a00, 0xfe9a00, 1.)),
@@ -3246,9 +3212,8 @@ fn open_on_host_button(id: String, url: Option<String>, t: &Tokens) -> Option<im
 
 fn timeline_body(event: &Event, view: &Entity<Workspace>, t: &Tokens, cx: &mut App) -> Option<AnyElement> {
     let body = event.body.as_ref()?;
-    let state = view.update(cx, |this, cx| this.pr_markdown(&format!("c:{}", event.id), body, cx))?;
-    let wrap = view.read(cx).pr_code_wraps(&state);
-    Some(div().mt(px(12.)).child(pr_markdown_view(&state, t, view.clone(), wrap)).into_any_element())
+    let markdown = view.update(cx, |this, cx| this.pr_body(&format!("c:{}", event.id), body, false, t, cx))?;
+    Some(div().mt(px(12.)).child(markdown).into_any_element())
 }
 
 /// `ConversationCard`.

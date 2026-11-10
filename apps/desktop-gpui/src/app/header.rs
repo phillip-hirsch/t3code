@@ -19,17 +19,28 @@ impl Workspace {
         let tokens = *theme::tokens(cx);
         // Clears the caption buttons plus 12px, like `--workspace-native-controls-inset`.
         let controls_inset = CAPTION_BUTTONS_WIDTH + px(12.) - RIGHT_RESIZE_INSET;
-        // An open right panel owns the titlebar controls, so the header keeps only its `px-5`.
-        let panel_open = self.right_panel_open()
+        // An open inline right panel owns the titlebar controls, so the header keeps only its `px-5`;
+        // a sheet leaves them to the header (`inlineRightPanelOwnsTitleBar`).
+        let panel_open = self.right_panel_docked_width(window).is_some()
             || (self.page == Some(super::pages::Page::PullRequests) && self.pull_request_panel_shown());
         let header = h_flex()
             .id("chat-header")
             .h(TITLEBAR_HEIGHT)
             .flex_none()
-            .pl(if self.sidebar_open.docked() { px(20.) } else { titlebar::collapsed_content_left(window) })
+            .pl(if self.sidebar_open.docked() && !self.welcome_open() {
+                px(20.)
+            } else {
+                titlebar::collapsed_content_left(window)
+            })
             .pr(if panel_open { px(20.) } else { controls_inset })
-            .bg(tokens.background);
-        let header = titlebar::drag_region(header);
+            // `bg-background`, which a theme replaces with its toolbar (`[data-chat-header]`).
+            .bg(tokens.toolbar.background);
+        let header = titlebar::drag_region(header)
+            .children(crate::app::theme_inspect::probe(&["toolbar", "toolbarForeground"], cx));
+        // The Welcome page keeps only a strip the window moves by (`WorkspacePageHeader electron`).
+        if self.welcome_open() {
+            return header;
+        }
         if let Some(page) = self.page.filter(|page| !page.is_modal()) {
             return header.child(div().text_sm().font_medium().text_color(tokens.foreground).child(page.title()));
         }
@@ -202,6 +213,7 @@ impl Workspace {
             .occlude()
             .cursor_pointer()
             .text_color(tokens.foreground)
+            .children(crate::app::theme_inspect::probe(&["text"], cx))
             .child(div().min_w_0().truncate().child(title))
             .child(
                 div()

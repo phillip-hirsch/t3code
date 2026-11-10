@@ -15,9 +15,9 @@ use gpui_kit::component::popover::Popover;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Disableable as _, Icon, Selectable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    Anchor, AnyElement, AppContext as _, Context, ElementId, Entity, FocusHandle, Focusable as _, FontWeight, Hsla,
-    InteractiveElement as _, IntoElement, Keystroke, ParentElement as _, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Window, div, prelude::FluentBuilder as _, px, svg,
+    Anchor, AnyElement, AppContext as _, ClickEvent, Context, ElementId, Entity, FocusHandle, Focusable as _,
+    FontWeight, Hsla, InteractiveElement as _, IntoElement, Keystroke, ParentElement as _, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, prelude::FluentBuilder as _, px, svg,
 };
 use serde_json::{Value, json};
 
@@ -93,14 +93,16 @@ pub(super) struct TriggerText {
     /// [`model_label::speed_label`].
     speed: Option<&'static str>,
     ultracode: bool,
-    logo: bool,
+    /// The 16px logos drawn, overlapping by 4px when several models are picked.
+    logos: usize,
 }
 
 impl TriggerText {
     /// The trigger's width with nothing truncated (`providerModelPickerNaturalWidth`), from the
-    /// layout below: 8px sides and a 1px border, a 16px logo, 6px gaps, the suffix 2px closer.
+    /// layout below: 8px sides and a 1px border, the logos, 6px gaps, the suffix 2px closer.
     pub(super) fn natural_width(&self, measure: impl Fn(&str) -> f32) -> f32 {
-        let logo = if self.logo { 16. + 6. } else { 0. };
+        #[expect(clippy::cast_precision_loss, reason = "at most four logos")]
+        let logo = if self.logos == 0 { 0. } else { 16. + 12. * (self.logos - 1) as f32 + 6. };
         let parts: Vec<f32> = self
             .effort
             .as_deref()
@@ -284,10 +286,12 @@ impl Workspace {
     }
 
     /// The docked picker keeps its popup open and moves to the new model's levels; any other
-    /// closes and hands the model to its host.
-    fn pick_row(&mut self, selection: ModelSelection, window: &mut Window, cx: &mut Context<Self>) {
+    /// closes and hands the model to its host. `additive` (Shift) toggles one of a draft's models.
+    fn pick_row(&mut self, selection: ModelSelection, additive: bool, window: &mut Window, cx: &mut Context<Self>) {
         match self.picker.host.as_ref().map(|host| host.on_pick.clone()) {
+            None if additive && self.fanout_supported() => self.toggle_fanout_model(selection, cx),
             None => {
+                self.clear_fanout();
                 self.pick_model(selection, cx);
                 self.focus_effort(false, window, cx);
             }
@@ -304,6 +308,7 @@ impl Workspace {
         self.model_override = Some(ModelSelection { options, ..selection });
         self.model_explicit = true;
         self.sticky_model.clone_from(&self.model_override);
+        self.drafts_changed(cx);
         self.refresh_menu_items(cx);
         // A pick on another harness shows its pending handoff at the timeline's end.
         self.refresh_rows(cx);
@@ -397,6 +402,7 @@ impl Workspace {
         self.sticky_model = Some(next.clone());
         self.model_override = Some(next);
         self.model_explicit = true;
+        self.drafts_changed(cx);
         cx.notify();
     }
 
@@ -451,12 +457,18 @@ impl Workspace {
         let is_favorite = |p: &Provider, m: &ProviderModel| {
             favorites.iter().any(|(instance_id, slug)| *instance_id == p.instance_id && *slug == m.slug)
         };
+        // A draft starting several models marks each of them.
+        let fanout = self.picker.host.is_none().then(|| self.model_fanout()).flatten();
+        let selected = move |p: &Provider, m: &ProviderModel| match fanout {
+            Some(list) => list.iter().any(|s| s.instance_id == p.instance_id && s.model == m.slug),
+            None => current.is_some_and(|c| c.instance_id == p.instance_id && c.model == m.slug),
+        };
         let row = |p: &Provider, m: &ProviderModel| Row {
             selection: ModelSelection { instance_id: p.instance_id.clone(), model: m.slug.clone(), options: None },
             name: model_label::display_model_name(m),
             sub_provider: m.sub_provider.clone(),
             icon: crate::assets::provider_icon(&p.driver),
-            selected: current.is_some_and(|c| c.instance_id == p.instance_id && c.model == m.slug),
+            selected: selected(p, m),
             favorite: is_favorite(p, m),
             new: m.badge.as_deref() == Some("new"),
             legacy: m.is_legacy,
@@ -526,14 +538,23 @@ impl Workspace {
     /// Up/Down/Enter/Escape while the picker is open, Right into the docked effort column;
     /// Ctrl+1-9 are `modelPicker.jump.N`.
     pub(super) fn picker_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if keystroke.modifiers.modified() {
+        let m = keystroke.modifiers;
+        // Shift+Enter adds the highlighted model to the ones a draft starts.
+        let additive = keystroke.key == "enter" && m.shift && !(m.control || m.alt || m.platform || m.function);
+        if m.modified() && !additive {
             return false;
         }
-        if let Some(index) = self.picker.effort_focus {
+        if let Some(index) = self.picker.effort_focus.filter(|_| !additive) {
             return self.effort_key(index, keystroke, window, cx);
         }
         let current = self.picker_current();
         let (rows, _) = self.picker_rows(current.as_ref());
+        if additive {
+            if let Some(row) = self.picker.highlighted.and_then(|i| rows.into_iter().nth(i)) {
+                self.pick_row(row.selection, true, window, cx);
+            }
+            return true;
+        }
         match keystroke.key.as_str() {
             "escape" => self.close_model_picker(window, cx),
             "down" | "up" if !rows.is_empty() => {
@@ -548,14 +569,19 @@ impl Workspace {
             }
             "enter" => {
                 if let Some(row) = self.picker.highlighted.and_then(|i| rows.into_iter().nth(i)) {
-                    self.pick_row(row.selection, window, cx);
+                    self.pick_row(row.selection, false, window, cx);
                 }
             }
-            // The column shows the selected model's levels, so a highlighted model is picked first.
+            // The column shows the composer model's levels, so a highlighted model is picked first.
             "right" if self.picker.host.is_none() && self.picker_search_caret_at_end(cx) => {
                 let highlighted = self.picker.highlighted.and_then(|i| rows.into_iter().nth(i));
-                match highlighted.filter(|row| !row.selected) {
-                    Some(row) => self.pick_row(row.selection, window, cx),
+                let is_current = |row: &Row| {
+                    current
+                        .as_ref()
+                        .is_some_and(|c| c.instance_id == row.selection.instance_id && c.model == row.selection.model)
+                };
+                match highlighted.filter(|row| !is_current(row)) {
+                    Some(row) => self.pick_row(row.selection, false, window, cx),
                     None => {
                         self.focus_effort(true, window, cx);
                     }
@@ -605,7 +631,7 @@ impl Workspace {
         let current = self.picker_current();
         let (rows, _) = self.picker_rows(current.as_ref());
         if let Some(row) = rows.into_iter().nth(index) {
-            self.pick_row(row.selection, window, cx);
+            self.pick_row(row.selection, false, window, cx);
         }
         true
     }
@@ -635,15 +661,33 @@ impl Workspace {
         (name, effort, speed, ultracode)
     }
 
+    /// The logos of a draft's models: the first three, and how many more there are.
+    fn fanout_icons(&self, selections: &[ModelSelection]) -> (Vec<(&'static str, Option<Hsla>)>, usize) {
+        let icons = selections
+            .iter()
+            .take(3)
+            .filter_map(|s| crate::assets::provider_icon(&self.server_info().provider(&s.instance_id)?.driver))
+            .collect();
+        (icons, selections.len().saturating_sub(3))
+    }
+
     /// What the composer trigger shows, for measuring it.
     pub(super) fn model_trigger_text(&self) -> TriggerText {
         let (name, effort, speed, ultracode) = self.trigger_labels();
-        let logo = self
-            .composer_model()
-            .and_then(|s| self.server_info().provider(&s.instance_id))
-            .and_then(|p| crate::assets::provider_icon(&p.driver))
-            .is_some();
-        TriggerText { name, effort, speed, ultracode, logo }
+        let (name, logos) = match self.model_fanout() {
+            Some(selections) => {
+                let (icons, more) = self.fanout_icons(selections);
+                (self.fanout_label(selections).into(), icons.len() + usize::from(more > 0))
+            }
+            None => {
+                let logo = self
+                    .composer_model()
+                    .and_then(|s| self.server_info().provider(&s.instance_id))
+                    .and_then(|p| crate::assets::provider_icon(&p.driver));
+                (name, usize::from(logo.is_some()))
+            }
+        };
+        TriggerText { name, effort, speed, ultracode, logos }
     }
 
     /// The trigger and, while open, the popover.
@@ -654,7 +698,43 @@ impl Workspace {
         let descriptors =
             model.and_then(|m| m.capabilities.as_ref()).map(|c| c.option_descriptors.as_slice()).unwrap_or_default();
         let (name, effort, speed, ultracode) = self.trigger_labels();
+        let fanout = self.model_fanout();
+        let label: SharedString =
+            fanout.map_or_else(|| name.clone(), |selections| self.fanout_label(selections).into());
         let icon = provider.and_then(|p| crate::assets::provider_icon(&p.driver));
+        // Several models stack their logos in rings of the composer's fill (`-space-x-1`, `ring-2`).
+        let surface = t.background.blend(t.card.opacity(t.glass));
+        let logos = fanout.and_then(|selections| {
+            let (icons, more) = self.fanout_icons(selections);
+            if icons.is_empty() && more == 0 {
+                return None;
+            }
+            // A 16px logo with its 2px ring outside it: 20px drawn, 16px laid out, each 4px over the last.
+            let circle = |first: bool| {
+                div()
+                    .size(px(20.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .my(px(-2.))
+                    .ml(px(if first { -2. } else { -6. }))
+                    .mr(px(-2.))
+                    .rounded_full()
+                    .bg(surface)
+                    .border_2()
+                    .border_color(surface)
+            };
+            let has_icons = !icons.is_empty();
+            let stack = h_flex()
+                .flex_none()
+                .children(icons.into_iter().enumerate().map(|(index, (path, tint))| {
+                    circle(index == 0)
+                        .child(svg().path(path).size(px(16.)).text_color(tint.unwrap_or(t.muted_foreground)))
+                }))
+                .when(more > 0, |el| el.child(circle(!has_icons).text_size(px(8.)).child(format!("+{more}"))));
+            Some(stack)
+        });
         let open = self.composer_picker_open();
         let disabled = self.target.is_none() || self.server_info().model_choices().is_empty();
         let suffix_color = if open { t.foreground } else { t.muted_foreground };
@@ -671,16 +751,19 @@ impl Workspace {
                     .flex_1()
                     .gap(px(6.))
                     // `[&_svg:not([class*='text-'])]:text-muted-foreground`: a logo without its own colour.
-                    .children(icon.map(|(path, tint)| {
-                        svg().path(path).size(px(16.)).flex_none().text_color(tint.unwrap_or(t.muted_foreground))
-                    }))
+                    .map(|el| match fanout {
+                        Some(_) => el.children(logos),
+                        None => el.children(icon.map(|(path, tint)| {
+                            svg().path(path).size(px(16.)).flex_none().text_color(tint.unwrap_or(t.muted_foreground))
+                        })),
+                    })
                     .child(
                         div()
                             .min_w_0()
                             .max_w(px(224.))
                             .truncate()
                             .text_color(if open { t.foreground } else { t.foreground.opacity(0.8) })
-                            .child(name.clone()),
+                            .child(label),
                     )
                     .when(effort.is_some() || speed.is_some() || ultracode, |el| {
                         el.child(
@@ -702,8 +785,9 @@ impl Workspace {
     /// `showProviderUnavailable`: no provider the composer may use is enabled and available, so
     /// the controls give way to provider setup, or say there is none.
     pub(super) fn render_provider_unavailable(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
-        // `providerCatalogPending`: until the server's config arrives, the picker stays.
-        if self.client().is_none() || self.server_info().config.is_null() {
+        // `providerCatalogPending`: until the server's config arrives, the picker stays. A draft
+        // starting several models keeps it too.
+        if self.client().is_none() || self.server_info().config.is_null() || self.model_fanout().is_some() {
             return None;
         }
         let lock = self.composer_provider_lock();
@@ -919,7 +1003,8 @@ impl Workspace {
                 })),
         );
         // Inside the docked picker's fixed height, so a ChatGPT plan never resizes it.
-        let sharing = self.render_chatgpt_sharing(current, t);
+        let several = self.picker.host.is_none() && self.model_fanout().is_some();
+        let sharing = if several { None } else { self.render_chatgpt_sharing(current, t) };
         let (list_footer, footer) = if docked.is_some() { (sharing, None) } else { (None, sharing) };
         let column = v_flex()
             .w(px(if searching { LIST + RAIL } else { LIST }))
@@ -1092,7 +1177,9 @@ impl Workspace {
                     cx.notify();
                 }
             }))
-            .on_click(cx.listener(move |this, _, window, cx| this.pick_row(selection.clone(), window, cx)))
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                this.pick_row(selection.clone(), event.modifiers().shift, window, cx);
+            }))
             .child(
                 div().size(px(16.)).flex_none().flex().items_center().justify_center().children(
                     row.icon.map(|(path, tint)| {
@@ -1121,12 +1208,14 @@ impl Workspace {
                                 .py(px(1.))
                                 .rounded(px(4.))
                                 .border_1()
-                                .border_color(t.primary.opacity(0.35))
-                                .bg(t.primary.opacity(0.15))
+                                .border_color(t.update.opacity(0.35))
+                                .bg(t.update.opacity(0.15))
                                 .text_size(px(10.))
                                 .line_height(px(10.))
                                 .font_weight(FontWeight::BOLD)
-                                .text_color(t.info_foreground)
+                                .text_color(t.update_foreground)
+                                .relative()
+                                .children(super::theme_inspect::probe(&["update", "updateForeground"], cx))
                                 .child("NEW"),
                         )
                     }),

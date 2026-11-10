@@ -8,12 +8,28 @@ use gpui_kit::component::diff::{
     DiffParseOptions, DiffSide, DiffState,
 };
 
+use std::cell::Cell;
+
 use super::*;
+use crate::app::right_panel::diff_tree::{DiffTree, TreeOwner};
 use crate::backend::Endpoint;
 use crate::pull_request_detail::{ReviewThread, ThreadComment};
 use crate::pull_request_diff::{self as diff_logic, FilePatch, Side};
 
 const DIFF_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// `t3code.pullRequestFileTreeOpen`, kept on this device.
+fn file_tree_open_path() -> Option<std::path::PathBuf> {
+    Some(crate::settings::userdata_dir()?.join("pull-request-file-tree-open.json"))
+}
+
+/// Whether the Code tab's file tree was left open; closed until it has been opened.
+pub(in crate::app) fn stored_file_tree_open() -> bool {
+    file_tree_open_path()
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or(false)
+}
 
 /// One page of the host's diff.
 struct Slice {
@@ -58,6 +74,9 @@ pub(in crate::app) struct CodeTab {
     /// Later replies read with `pullRequests.threadComments`, by thread.
     pages: HashMap<String, (Vec<ThreadComment>, Option<String>)>,
     loading_more: Option<String>,
+    tree: DiffTree,
+    /// The width of the row the tree shares with the diff, as last laid out.
+    row_width: Rc<Cell<Option<f32>>>,
 }
 
 impl CodeTab {
@@ -88,6 +107,8 @@ impl CodeTab {
             toggled: HashSet::new(),
             pages: HashMap::new(),
             loading_more: None,
+            tree: DiffTree::new(cx),
+            row_width: Rc::default(),
         }
     }
 
@@ -258,7 +279,8 @@ fn describe_diff_error(error: &str, host: &str, term: &str) -> (String, String) 
     )
 }
 
-/// A 28px ghost icon toggle (`Toggle variant="ghost" size="sm"`).
+/// A 28px ghost icon toggle (`Toggle variant="ghost" size="sm"`): a tab stop that Enter and
+/// Space press.
 fn icon_toggle(
     id: &'static str,
     icon: Lucide,
@@ -266,9 +288,11 @@ fn icon_toggle(
     tip: &'static str,
     t: &Tokens,
 ) -> gpui_kit::Stateful<gpui_kit::Div> {
-    let accent = t.accent;
+    let (accent, ring) = (t.accent, t.ring);
     div()
         .id(id)
+        .tab_index(0)
+        .focus_visible(move |s| s.border_2().border_color(ring))
         .size(px(28.))
         .flex_none()
         .flex()
@@ -286,6 +310,39 @@ fn icon_toggle(
 impl Workspace {
     fn pr_code(&mut self) -> Option<&mut CodeTab> {
         self.pull_requests.panel.as_mut()?.code.as_mut()
+    }
+
+    /// The Code tab's file tree and the diff it lists.
+    pub(in crate::app) fn pr_code_tree(&self) -> Option<(&DiffTree, &Entity<DiffState>)> {
+        let code = self.pull_requests.panel.as_ref()?.code.as_ref()?;
+        Some((&code.tree, &code.diff))
+    }
+
+    pub(in crate::app) fn pr_code_tree_mut(&mut self) -> Option<(&mut DiffTree, Entity<DiffState>)> {
+        let code = self.pr_code()?;
+        Some((&mut code.tree, code.diff.clone()))
+    }
+
+    /// A file picked in the tree (`revealFile`).
+    pub(in crate::app) fn reveal_pr_code_file(&self, path: &str, cx: &mut App) {
+        if let Some(code) = self.pull_requests.panel.as_ref().and_then(|p| p.code.as_ref()) {
+            code.reveal(path, cx);
+        }
+    }
+
+    /// "Show file tree" / "Hide file tree", remembered for every pull request.
+    fn toggle_pr_file_tree(&mut self, cx: &mut Context<Self>) {
+        let open = !self.pull_requests.file_tree_open;
+        self.pull_requests.file_tree_open = open;
+        if let Some(path) = file_tree_open_path() {
+            cx.background_spawn(async move {
+                if let Err(error) = crate::settings::write_atomically(&path, &open.into()) {
+                    log::warn!("could not save {}: {error}", path.display());
+                }
+            })
+            .detach();
+        }
+        cx.notify();
     }
 
     /// The Code tab was shown: its state is made once, and its diff read once.
@@ -311,10 +368,10 @@ impl Workspace {
 
     /// Reads one page of the diff; the first page replaces what was loaded.
     fn read_pr_diff(&mut self, cursor: Option<String>, cx: &mut Context<Self>) {
-        let Some(project_id) = self.pull_requests.panel.as_ref().map(|p| p.reference.project_id.clone()) else {
+        let Some(environment) = self.pull_requests.panel.as_ref().map(|p| p.reference.environment_id.clone()) else {
             return;
         };
-        let endpoint = self.project_endpoint(&project_id).cloned();
+        let endpoint = self.env_endpoint(&environment).cloned();
         let Some(panel) = self.pull_requests.panel.as_mut() else { return };
         let key = panel.reference.key();
         let mut input = panel.reference.to_json();
@@ -386,7 +443,20 @@ impl Workspace {
 
     /// Parses the loaded pages into the viewer, hiding whitespace and tests as asked.
     fn rebuild_pr_code(&mut self, cx: &mut Context<Self>) {
+        let workspace = cx.weak_entity();
+        let Some(panel) = self.pull_requests.panel.as_ref() else { return };
+        let (key, mut source) = (panel.reference.key(), panel.reference.to_json());
         let Some(code) = self.pr_code() else { return };
+        // `createPullRequestDiffFileContentsLoader`: the shown files read in full from the host.
+        if let Some(commit) = &code.commit {
+            source["commit"] = json!(commit);
+        }
+        let loader = crate::app::right_panel::contents_loader(
+            workspace,
+            move |this| this.pull_request_client_of(&key),
+            "pullRequests.diffFileContents",
+            source,
+        );
         let mut text = String::new();
         let mut files = Vec::new();
         code.raw.clear();
@@ -420,12 +490,14 @@ impl Workspace {
         let fold = code.folded;
         code.diff.update(cx, |state, cx| {
             state.set_files(ordered, cx);
+            state.set_contents_loader(Some(loader), cx);
             if fold {
                 for path in &fresh {
                     state.set_file_collapsed(path, true, cx);
                 }
             }
         });
+        self.rebuild_diff_tree(TreeOwner::PullRequest, cx);
     }
 
     /// A timeline commit: Code, scoped to that commit (`openCommit`).
@@ -595,7 +667,7 @@ impl Workspace {
         &mut self,
         detail: &Rc<Detail>,
         t: &Tokens,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let Some(code) = self.pull_requests.panel.as_ref().and_then(|p| p.code.as_ref()) else {
@@ -686,6 +758,7 @@ impl Workspace {
                 }
             }
             let draft = self.pull_requests.panel.as_ref().and_then(|p| p.write.draft.as_ref());
+            let draft = draft.filter(|d| d.excerpt.is_none());
             if let Some(draft) = draft {
                 let (side, line) = draft.anchor();
                 group_at(&mut groups, &draft.path.clone(), side, line).draft = true;
@@ -808,6 +881,33 @@ impl Workspace {
                     .into_any_element()
             });
 
+        let tree = self.pull_requests.file_tree_open.then(|| {
+            let footer = code.next_cursor().map(|cursor| {
+                let cursor = cursor.to_owned();
+                div().flex_none().p(px(8.)).border_t_1().border_color(Hsla { a: t.border.a * 0.6, ..t.border }).child(
+                    outline_button("pr-code-tree-more", t)
+                        .h(px(24.))
+                        .px(px(7.))
+                        .gap(px(4.))
+                        .text_xs()
+                        .w_full()
+                        .disabled(code.loading)
+                        .child(if code.error.is_some() {
+                            "Retry"
+                        } else if code.loading {
+                            "Loading more files..."
+                        } else {
+                            "Load more files"
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| this.read_pr_diff(Some(cursor.clone()), cx)))
+                        .into_any_element(),
+                )
+            });
+            // The row's width as last laid out; before the first layout, the panel's.
+            let row = code.row_width.get().unwrap_or_else(|| self.pr_panel_width(window));
+            self.render_diff_tree(TreeOwner::PullRequest, row, footer.map(IntoElement::into_any_element), t, window, cx)
+        });
+        let row_width = code.row_width.clone();
         let more = code.next_cursor().map(|cursor| {
             let cursor = cursor.to_owned();
             let failed = code.error.is_some();
@@ -834,13 +934,32 @@ impl Workspace {
                         .on_click(cx.listener(move |this, _, _, cx| this.read_pr_diff(Some(cursor.clone()), cx))),
                 )
         });
+        let measure = gpui_kit::canvas(
+            move |bounds, window, _| {
+                let width = f32::from(bounds.size.width);
+                if row_width.replace(Some(width)).is_none_or(|last| (last - width).abs() >= 0.5) {
+                    window.request_animation_frame();
+                }
+            },
+            |_, (), _, _| {},
+        )
+        .absolute()
+        .size_full();
         frame(
             v_flex()
                 .flex_1()
                 .min_h_0()
                 .children(orphan_list)
-                .child(diff)
-                .children(more)
+                .child(
+                    h_flex()
+                        .relative()
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_hidden()
+                        .child(measure)
+                        .child(v_flex().flex_1().min_w_0().min_h_0().child(diff).children(more))
+                        .children(tree),
+                )
                 .children(unstructured)
                 .into_any_element(),
         )
@@ -871,7 +990,7 @@ impl Workspace {
                     .items_center()
                     .justify_center()
                     .rounded_full()
-                    .bg(Hsla { a: 0.12, ..t.warning })
+                    .bg(t.warning_surface)
                     .child(Icon::new(Lucide::TriangleAlert).with_size(px(20.)).text_color(t.warning)),
             )
             .child(div().text_base().font_weight(FontWeight::SEMIBOLD).text_color(t.foreground).child(title))
@@ -1178,6 +1297,19 @@ impl Workspace {
                         cx.notify();
                     })),
                 )
+            })
+            .when(!code.shown.is_empty(), |el| {
+                let open = self.pull_requests.file_tree_open;
+                el.child(
+                    icon_toggle(
+                        "pr-code-file-tree",
+                        Lucide::FolderTree,
+                        open,
+                        if open { "Hide file tree" } else { "Show file tree" },
+                        t,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_pr_file_tree(cx))),
+                )
             });
         h_flex()
             .h(px(40.))
@@ -1349,8 +1481,7 @@ impl Workspace {
             for comment in &comments {
                 let time = parse_ms(&comment.created_at).map(|at| relative_time(now - at)).unwrap_or_default();
                 let markdown = logic::visible_body(&comment.body)
-                    .and_then(|b| self.pr_markdown(&format!("c:{}", comment.id), &b, cx))
-                    .map(|state| pr_markdown_view(&state, t, cx.entity(), self.pr_code_wraps(&state)));
+                    .and_then(|b| self.pr_body(&format!("c:{}", comment.id), &b, false, t, cx));
                 let can_edit = self.pull_requests.panel.as_ref().and_then(|p| p.detail.as_ref()).is_some_and(|d| {
                     logic::can_edit_comment(d, "review-comment", comment.author.as_ref(), comment.can_edit)
                 });

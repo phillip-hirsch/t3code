@@ -43,6 +43,35 @@ pub(super) struct ComposerUi {
         std::cell::RefCell<Option<(super::composer::FooterText, super::composer_fit::ControlsWidths)>>,
     /// The chip under the pointer and its window bounds, for its details tooltip.
     pub(super) chip_hover: Option<(String, gpui_kit::Bounds<gpui_kit::Pixels>)>,
+    /// The rich editor's Markdown presentation and its code language picker.
+    pub(super) rich: super::composer_rich::RichUi,
+    /// The models each draft starts at once.
+    pub(super) fanout: super::fanout::FanoutState,
+    /// Compacting an idle thread before its next send.
+    pub(super) compact: super::compact_send::CompactState,
+    /// `/usage-limits`' panel in the banner dock.
+    pub(super) usage_limits: super::pages::UsageLimitsPanel,
+}
+
+impl ComposerUi {
+    /// Build or Plan as picked for `target`.
+    pub(super) fn interaction(&self, target: &Target) -> Option<&'static str> {
+        self.interaction.get(target).copied()
+    }
+
+    pub(super) fn interaction_targets(&self) -> impl Iterator<Item = &Target> {
+        self.interaction.keys()
+    }
+
+    /// A saved pick comes back unless the target has one already; an unknown mode is dropped.
+    pub(super) fn restore_interaction(&mut self, target: Target, mode: &str) {
+        let mode = match mode {
+            "plan" => "plan",
+            "default" => "default",
+            _ => return,
+        };
+        self.interaction.entry(target).or_insert(mode);
+    }
 }
 
 /// `resolveComposerInteractionMode`: whether the toggle shows, and the mode sends use.
@@ -121,6 +150,7 @@ impl Workspace {
             return;
         }
         self.composer_ui.interaction.insert(target, mode);
+        self.drafts_changed(cx);
         self.focus_composer(window, cx);
         cx.notify();
     }

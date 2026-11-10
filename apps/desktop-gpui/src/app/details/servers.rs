@@ -126,13 +126,13 @@ impl Workspace {
     }
 
     fn open_server(&mut self, url: String, event: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(Target::Thread { id: thread_id, .. }) = self.target.clone() else { return };
+        let Some(thread) = self.preview_thread() else { return };
         let m = event.modifiers();
         if m.control || m.platform {
             let url = self.resolve_server_url(self.servers.environment.as_deref(), url);
             cx.open_url(&url);
         } else {
-            self.open_preview_tab(thread_id, Some(url), window, cx);
+            self.open_preview_tab(thread, Some(url), window, cx);
         }
     }
 

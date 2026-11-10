@@ -71,6 +71,8 @@ pub struct DesktopSettings {
     pub wsl_backend_enabled: bool,
     pub wsl_distro: Option<String>,
     pub wsl_only: bool,
+    /// The app zoom level (`webContents.getZoomLevel`), kept between launches.
+    pub zoom_level: f64,
     /// Keys the desktop app knows that this client does not use (e.g. `linuxPasswordStore`).
     other: Map<String, Value>,
 }
@@ -89,12 +91,13 @@ impl Default for DesktopSettings {
             wsl_backend_enabled: false,
             wsl_distro: None,
             wsl_only: false,
+            zoom_level: 0.,
             other: Map::new(),
         }
     }
 }
 
-const KNOWN_KEYS: [&str; 12] = [
+const KNOWN_KEYS: [&str; 13] = [
     "localEnvironmentEnabled",
     "mainWindowBounds",
     "mainWindowMaximized",
@@ -107,6 +110,7 @@ const KNOWN_KEYS: [&str; 12] = [
     "wslMode",
     "wslDistro",
     "wslOnly",
+    "zoomLevel",
 ];
 
 impl DesktopSettings {
@@ -179,6 +183,7 @@ impl DesktopSettings {
                     && document.get("wslMode").and_then(Value::as_str) == Some("wsl")),
             wsl_distro: distro,
             wsl_only: flag("wslOnly") == Some(true),
+            zoom_level: document.get("zoomLevel").and_then(Value::as_f64).map_or(0., super::zoom::normalize),
             other,
         }
     }
@@ -213,6 +218,7 @@ impl DesktopSettings {
         put("wslBackendEnabled", self.wsl_backend_enabled, json!(true));
         put("wslDistro", self.wsl_distro.is_some(), json!(self.wsl_distro));
         put("wslOnly", self.wsl_only, json!(true));
+        put("zoomLevel", self.zoom_level != 0., json!(self.zoom_level));
         Value::Object(document)
     }
 }
@@ -244,12 +250,14 @@ mod tests {
             "mainWindowMaximized": true,
             "serverExposureMode": "network-accessible",
             "tailscaleServePort": 8443,
+            "zoomLevel": -1.5,
             "linuxPasswordStore": "basic",
         });
         let settings = DesktopSettings::from_document(&document);
         assert_eq!(settings.main_window_bounds, Some(WindowRect { x: -1200, y: 40, width: 1300, height: 900 }));
         assert!(settings.main_window_maximized);
         assert_eq!(settings.server_exposure_mode, ExposureMode::NetworkAccessible);
+        assert_eq!(settings.zoom_level, -1.5);
         assert_eq!(settings.to_document(), document);
     }
 
@@ -261,8 +269,10 @@ mod tests {
             "tailscaleServePort": 70000,
             "wslDistro": "-bad",
             "wslMode": "wsl",
+            "zoomLevel": "large",
         }));
         assert_eq!(settings.main_window_bounds, None);
+        assert_eq!(settings.zoom_level, 0.);
         // Maximized only with bounds to restore to.
         assert!(!settings.main_window_maximized);
         assert_eq!(settings.tailscale_serve_port, 443);

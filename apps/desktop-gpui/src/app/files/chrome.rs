@@ -1,11 +1,12 @@
 //! `fileSurfaceChrome.tsx`: the pieces every file viewer shares.
 
 use gpui_kit::assets::IconName;
+use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{Icon, Sizable as _, v_flex};
+use gpui_kit::component::{Disableable as _, Icon, Sizable as _, v_flex};
 use gpui_kit::{
-    AnyElement, Div, ElementId, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, Stateful,
+    AnyElement, App, Div, ElementId, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled as _, div, px,
 };
 
@@ -34,6 +35,28 @@ pub(super) fn action(
         .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
 }
 
+/// [`action`] as a Tab stop that Enter and Space press, ringed while focused; a disabled one
+/// leaves the Tab order, like a disabled `<button>`.
+pub(super) fn action_button(
+    id: impl Into<ElementId>,
+    icon: IconName,
+    label: impl Into<SharedString>,
+    enabled: bool,
+    tokens: &Tokens,
+    cx: &App,
+) -> Button {
+    Button::new(id)
+        .custom(
+            ButtonCustomVariant::new(cx).foreground(tokens.muted_foreground).hover(tokens.accent).active(tokens.accent),
+        )
+        .xsmall()
+        .size(px(24.))
+        .rounded(px(6.))
+        .icon(Icon::new(icon).size(px(14.)))
+        .tooltip(label)
+        .disabled(!enabled)
+}
+
 /// `FileSurfaceLoading`.
 pub(super) fn loading(tokens: &Tokens) -> AnyElement {
     div()
@@ -54,7 +77,7 @@ pub(super) fn notice(text: impl Into<SharedString>, tokens: &Tokens) -> Div {
         .py(px(6.))
         .border_b_1()
         .border_color(tokens.warning.opacity(0.2))
-        .bg(tokens.warning.opacity(0.08))
+        .bg(tokens.warning_surface)
         .text_size(gpui_kit::rems(0.625))
         .text_color(tokens.warning_foreground)
         .child(text.into())

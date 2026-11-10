@@ -7,7 +7,7 @@ use std::rc::Rc;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::{
     AnyElement, Context, ElementId, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
-    StatefulInteractiveElement as _, Styled as _, div, px, rgb,
+    StatefulInteractiveElement as _, Styled as _, div, prelude::FluentBuilder as _, px, rgb,
 };
 use serde_json::Value;
 
@@ -26,15 +26,15 @@ pub(in crate::app) enum Breakdown {
 
 /// The pull request and totals a split belongs to: new totals read it again.
 pub(in crate::app) struct Subject {
-    pub(in crate::app) project_id: String,
+    pub(in crate::app) environment_id: String,
     pub(in crate::app) reference: Value,
     pub(in crate::app) additions: u64,
     pub(in crate::app) deletions: u64,
 }
 
 impl Subject {
-    fn key(&self) -> String {
-        format!("{}:{}:{}:{}", self.project_id, self.reference, self.additions, self.deletions)
+    pub(in crate::app) fn key(&self) -> String {
+        format!("{}:{}:{}:{}", self.environment_id, self.reference, self.additions, self.deletions)
     }
 }
 
@@ -45,7 +45,7 @@ impl Workspace {
         if self.pull_requests.breakdowns.contains_key(&key) {
             return;
         }
-        let Some(client) = self.project_client(&subject.project_id) else { return };
+        let Some(client) = self.env_client(&subject.environment_id) else { return };
         self.pull_requests.breakdowns.insert(key.clone(), Breakdown::Loading);
         let reference = subject.reference.clone();
         cx.spawn(async move |this, cx| {
@@ -89,7 +89,7 @@ pub(in crate::app) fn breakdown_stat(
                 let t = *theme::tokens(cx);
                 match view.read(cx).pull_requests.breakdowns.get(&key) {
                     None | Some(Breakdown::Loading) => div().child("Loading breakdown").into_any_element(),
-                    Some(Breakdown::Ready(Some(split))) => grid(split, totals, &t),
+                    Some(Breakdown::Ready(Some(split))) => grid(split, Some(totals), &t),
                     Some(Breakdown::Ready(None) | Breakdown::Failed) => div().into_any_element(),
                 }
             })
@@ -99,8 +99,8 @@ pub(in crate::app) fn breakdown_stat(
         .into_any_element()
 }
 
-/// `ChangeBreakdownGrid`: each kind with lines, then the total under a rule.
-fn grid(split: &ChangeBreakdown, (additions, deletions): (u64, u64), t: &Tokens) -> AnyElement {
+/// `ChangeBreakdownGrid`: each kind with lines, then any total under a rule.
+pub(in crate::app) fn grid(split: &ChangeBreakdown, total: Option<(u64, u64)>, t: &Tokens) -> AnyElement {
     let addition: gpui_kit::Hsla = if t.dark { rgb(0x00d492).into() } else { rgb(0x007a55).into() };
     let row = |label: &str, additions: u64, deletions: u64| {
         [
@@ -118,7 +118,8 @@ fn grid(split: &ChangeBreakdown, (additions, deletions): (u64, u64), t: &Tokens)
         .py(px(2.))
         .font_family(t.fonts.mono)
         .children(split.rows().into_iter().flat_map(|(label, count)| row(label, count.additions, count.deletions)))
-        .child(div().col_span(3).border_t_1().border_color(t.border))
-        .children(row("Total", additions, deletions))
+        .when_some(total, |el, (additions, deletions)| {
+            el.child(div().col_span(3).border_t_1().border_color(t.border)).children(row("Total", additions, deletions))
+        })
         .into_any_element()
 }

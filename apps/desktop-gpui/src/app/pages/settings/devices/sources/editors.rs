@@ -1,32 +1,37 @@
 //! The source editors: `DeviceHostEditor.tsx` (SSH), `EasDeviceHostEditor.tsx` and
-//! `SimlockDeviceHostEditor.tsx`, each a dialog owning its draft. Saves patch the
-//! environment's host list, read fresh from settings when Save is pressed.
-//!
-//! The web's secret-source picker for the Expo token only appears behind
-//! `T3CODE_FEATURE_SECRETS`; without it the field is the plain secret input ported here,
-//! and a saved secret reference is kept unless replaced or cleared.
+//! `SimlockDeviceHostEditor.tsx`, each a dialog owning its draft. Each keeps the environments
+//! selected when it opened: it tests on all of them and, when Save is pressed, rewrites the host
+//! list of each one still connected, read fresh from its settings. Token fields offer the secret
+//! providers their environment can read from (`SecretSourceInput`).
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, Font, FontWeight, Hsla, InteractiveElement as _, IntoElement,
+    AnyElement, App, AppContext as _, Context, Entity, Font, FontWeight, Hsla, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, StyledText, Subscription,
     TextRun, WeakEntity, Window, div, prelude::FluentBuilder as _, px,
 };
 use serde_json::{Value, json};
 
 use super::hosts::{self, EasHost, SimlockHost, SshHost, TokenEntry};
-use super::{failure_message, muted_text, notify_error, outline_button, test_host, update_settings};
+use super::{
+    Check, Member, Write, check_target, device_writes, eas_plan, failure_message, muted_text, notify_error,
+    outline_button, report_failures, run_writes, simlock_save_plan, ssh_plan,
+};
 use crate::app::Workspace;
+use crate::app::pages::settings::secret_source::{as_reference, secret_source_input};
+use crate::app::request_cards::SecretSource;
 use crate::device::PlatformAvailability;
 use crate::rpc::RpcClient;
 use crate::theme::{FONT_MONO, Tokens, tokens};
 
 trait Editor: Render {
     fn busy(&self) -> bool;
+    fn set_busy(&mut self, busy: bool);
 }
 
 fn new_host_id() -> String {
@@ -132,49 +137,65 @@ fn footer<E: Editor>(
         )
 }
 
-/// Writes `patch` and closes the dialog, or keeps it open and says why not.
-fn save_patch<E: Editor>(
-    client: RpcClient,
-    patch: Value,
-    failed: &'static str,
-    environment: String,
-    set_busy: fn(&mut E, bool),
-    window: &mut Window,
-    cx: &mut Context<E>,
-) {
+/// The writes a save makes on the editor's environments still connected, planned from their
+/// settings as they are now; an error says why nothing was written.
+fn plan_writes(
+    workspace: &WeakEntity<Workspace>,
+    environments: &[(String, String)],
+    cx: &App,
+    plan: impl FnOnce(&[Member]) -> Result<Vec<(String, Value)>, String>,
+) -> Result<Vec<Write>, String> {
+    let workspace = workspace.upgrade().ok_or_else(|| "The window closed.".to_owned())?;
+    let workspace = workspace.read(cx);
+    let members = workspace.members_among(environments);
+    if members.is_empty() {
+        return Err("None of the environments this editor opened on is connected.".into());
+    }
+    let patches = plan(&members)?;
+    device_writes(|id| workspace.env_client(id), &members, patches)
+}
+
+/// Sends `writes` and closes the dialog, or keeps it open and toasts the environments that failed.
+fn save_writes<E: Editor>(writes: Vec<Write>, failed: &'static str, window: &mut Window, cx: &mut Context<E>) {
     cx.spawn_in(window, async move |this, cx| {
-        let result = update_settings(&client, patch).await;
+        let failures = run_writes(writes).await;
         let _ = this.update_in(cx, |this, window, cx| {
-            set_busy(this, false);
+            this.set_busy(false);
             cx.notify();
-            match result {
-                Ok(()) => window.close_dialog(cx),
-                Err(error) => notify_error(window, cx, failed, format!("{environment}: {error}")),
+            if report_failures(window, cx, failed, &failures) {
+                window.close_dialog(cx);
             }
         });
     })
     .detach();
 }
 
-/// The connection, settings and name of the environment an editor opened on, which it saves
-/// against even after Settings moves to another environment.
-fn context(
+/// Plans, checks and sends a save; a refused plan is toasted under `refused`.
+fn save<E: Editor>(
+    editor: &mut E,
     workspace: &WeakEntity<Workspace>,
-    scope: Option<&SharedString>,
-    cx: &App,
-) -> Option<(RpcClient, Value, String)> {
-    let (workspace, scope) = (workspace.upgrade()?, scope?);
-    let workspace = workspace.read(cx);
-    let info = workspace.env_info(scope)?;
-    let name = info.environment_label.clone().unwrap_or_else(|| "This environment".into());
-    Some((workspace.env_client(scope)?, (*info.settings).clone(), name))
+    environments: &[(String, String)],
+    titles: (&'static str, &'static str),
+    plan: impl FnOnce(&[Member]) -> Result<Vec<(String, Value)>, String>,
+    window: &mut Window,
+    cx: &mut Context<E>,
+) {
+    let (refused, failed) = titles;
+    match plan_writes(workspace, environments, cx, plan) {
+        Ok(writes) => {
+            editor.set_busy(true);
+            cx.notify();
+            save_writes(writes, failed, window, cx);
+        }
+        Err(error) => notify_error(window, cx, refused, error),
+    }
 }
 
 fn token_placeholder(configured: bool, otherwise: &'static str) -> &'static str {
     if configured { "Stored secret, enter a new value to replace" } else { otherwise }
 }
 
-fn clear_button(id: &'static str, busy: bool, t: &Tokens) -> Button {
+fn clear_button(id: impl Into<gpui_kit::ElementId>, busy: bool, t: &Tokens) -> Button {
     Button::new(id)
         .ghost()
         .small()
@@ -184,18 +205,49 @@ fn clear_button(id: &'static str, busy: bool, t: &Tokens) -> Button {
         .disabled(busy)
 }
 
+/// A token entry's secret reference: a new one, or the saved one while it is kept.
+fn token_reference<'a>(token: &'a TokenEntry, saved: &'a Value) -> Option<&'a Value> {
+    match token {
+        TokenEntry::New(value) => as_reference(value),
+        TokenEntry::Saved => as_reference(saved),
+        TokenEntry::Cleared => None,
+    }
+}
+
 impl Workspace {
-    pub(super) fn open_ssh_editor(&mut self, host: Option<SshHost>, window: &mut Window, cx: &mut Context<Self>) {
-        let (workspace, scope) = (cx.weak_entity(), self.settings_environment());
-        let environment = self.environment_name();
-        let editor = cx.new(|cx| SshEditor::new(workspace, scope, environment, host, window, cx));
+    /// The environments Settings selects, `(id, label)`, for an editor to keep.
+    fn editor_environments(&self) -> Vec<(String, String)> {
+        let view = self.settings_view();
+        view.selected_environments().iter().map(|e| (e.id.to_owned(), e.label.to_owned())).collect()
+    }
+
+    /// `only` limits the save to those environments, for a host that differs between them.
+    pub(super) fn open_ssh_editor(
+        &mut self,
+        host: Option<SshHost>,
+        only: Option<Vec<String>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (workspace, environments) = (cx.weak_entity(), self.editor_environments());
+        let editor = cx.new(|cx| SshEditor::new(workspace, environments, only, host, window, cx));
         open_editor(editor, window, cx);
     }
 
-    pub(super) fn open_eas_editor(&mut self, host: Option<EasHost>, window: &mut Window, cx: &mut Context<Self>) {
-        let (workspace, scope) = (cx.weak_entity(), self.settings_environment());
-        let client = self.settings_client();
-        let editor = cx.new(|cx| EasEditor::new(workspace, scope, client, host, window, cx));
+    /// `check_on`: the holder whose account check the editor shows; a new host checks on the
+    /// environment Settings reads.
+    pub(super) fn open_eas_editor(
+        &mut self,
+        host: Option<EasHost>,
+        check_on: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (workspace, environments) = (cx.weak_entity(), self.editor_environments());
+        let check_on = check_on.or_else(|| self.settings_environment().map(|id| id.to_string()));
+        let client = check_on.as_deref().and_then(|id| self.env_client(id));
+        let sources = check_on.as_deref().map(|id| self.secret_sources_on(id)).unwrap_or_default();
+        let editor = cx.new(|cx| EasEditor::new(workspace, environments, client, sources, host, window, cx));
         open_editor(editor, window, cx);
     }
 
@@ -205,28 +257,34 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (workspace, scope) = (cx.weak_entity(), self.settings_environment());
-        let client = self.settings_client();
-        let editor = cx.new(|cx| SimlockEditor::new(workspace, scope, client, host, window, cx));
+        let (workspace, environments) = (cx.weak_entity(), self.editor_environments());
+        let id = host.as_ref().map_or_else(new_host_id, |host| host.id.clone());
+        let fields: Vec<TokenSeed> = self
+            .members_among(&environments)
+            .iter()
+            .map(|member| TokenSeed {
+                environment: member.id.to_owned(),
+                label: member.label.to_owned(),
+                client: self.env_client(member.id),
+                sources: self.secret_sources_on(member.id),
+                saved: hosts::readable_hosts::<SimlockHost>(member.settings, "simlockDeviceHosts")
+                    .into_iter()
+                    .find(|saved| saved.id == id)
+                    .map_or_else(|| json!(""), |saved| saved.agent_token),
+            })
+            .collect();
+        let editor = cx.new(|cx| SimlockEditor::new(workspace, environments, fields, host, id, window, cx));
         open_editor(editor, window, cx);
     }
-}
-
-#[derive(Clone)]
-enum Check {
-    Pending,
-    Local,
-    Connected(Vec<PlatformAvailability>),
-    Failed(String),
 }
 
 type ConnectionKey = (String, Option<i64>, Option<String>);
 
 struct SshEditor {
     workspace: WeakEntity<Workspace>,
-    /// The settings environment at open, which the editor saves to.
-    scope: Option<SharedString>,
-    environment: String,
+    /// The environments selected at open: checked on, and saved to while connected.
+    environments: Vec<(String, String)>,
+    only: Option<Vec<String>>,
     id: String,
     /// The saved host, matched by id or destination on save; `None` adds one.
     original: Option<SshHost>,
@@ -235,9 +293,12 @@ struct SshEditor {
     identity: Entity<InputState>,
     port: Entity<InputState>,
     options_open: bool,
-    /// The latest connection check and the connection it answers for.
-    check: Option<(ConnectionKey, Check)>,
-    show_error: bool,
+    /// The latest checks, per environment, and the connection they answer for.
+    checks: Option<(ConnectionKey, Vec<Check>)>,
+    /// The per-environment results' fold, as toggled for one connection.
+    checks_open: Option<(ConnectionKey, bool)>,
+    /// Environments whose check error is shown.
+    shown_errors: Vec<String>,
     busy: bool,
     _subscriptions: Vec<Subscription>,
 }
@@ -246,13 +307,17 @@ impl Editor for SshEditor {
     fn busy(&self) -> bool {
         self.busy
     }
+
+    fn set_busy(&mut self, busy: bool) {
+        self.busy = busy;
+    }
 }
 
 impl SshEditor {
     fn new(
         workspace: WeakEntity<Workspace>,
-        scope: Option<SharedString>,
-        environment: String,
+        environments: Vec<(String, String)>,
+        only: Option<Vec<String>>,
         original: Option<SshHost>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -269,8 +334,8 @@ impl SshEditor {
         let subscriptions = [&name, &target, &identity, &port].map(|input| watch(input, window, cx, Self::save)).into();
         Self {
             workspace,
-            scope,
-            environment,
+            environments,
+            only,
             id: host.as_ref().map_or_else(new_host_id, |host| host.id.clone()),
             options_open: host.as_ref().is_some_and(|host| host.port.is_some() || host.identity_file.is_some()),
             original,
@@ -278,8 +343,9 @@ impl SshEditor {
             target,
             identity,
             port,
-            check: None,
-            show_error: false,
+            checks: None,
+            checks_open: None,
+            shown_errors: Vec::new(),
             busy: false,
             _subscriptions: subscriptions,
         }
@@ -311,34 +377,31 @@ impl SshEditor {
         hosts::parse_ssh_draft(&SshHost { label, ..draft })
     }
 
-    fn current_check(&self, cx: &App) -> Option<&Check> {
-        let key = hosts::ssh_connection_key(&self.draft(cx)?);
-        self.check.as_ref().filter(|(checked, _)| *checked == key).map(|(_, check)| check)
+    fn key(&self, cx: &App) -> Option<ConnectionKey> {
+        Some(hosts::ssh_connection_key(&self.draft(cx)?))
+    }
+
+    fn current_checks(&self, cx: &App) -> Option<&[Check]> {
+        let key = self.key(cx)?;
+        self.checks.as_ref().filter(|(checked, _)| *checked == key).map(|(_, checks)| checks.as_slice())
     }
 
     fn checking(&self, cx: &App) -> bool {
-        matches!(self.current_check(cx), Some(Check::Pending))
+        self.current_checks(cx).is_some_and(|checks| checks.iter().any(|check| matches!(check, Check::Pending)))
     }
 
     fn test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(host) = self.input(cx) else { return };
-        let Some((client, _, _)) = context(&self.workspace, self.scope.as_ref(), cx) else { return };
-        let key = hosts::ssh_connection_key(&host);
-        self.check = Some((key.clone(), Check::Pending));
-        self.show_error = false;
+        let (Some(host), Some(key)) = (self.input(cx), self.key(cx)) else { return };
+        let Some(workspace) = self.workspace.upgrade() else { return };
+        let targets = workspace.read(cx).check_targets_among(&self.environments);
+        self.checks = Some((key.clone(), vec![Check::Pending; targets.len()]));
+        self.shown_errors.clear();
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
-            let result = test_host(&client, &host).await;
-            let check = match result {
-                Ok(summary) if summary.get("kind").and_then(Value::as_str) == Some("local") => Check::Local,
-                Ok(summary) => {
-                    Check::Connected(serde_json::from_value(summary["platforms"].clone()).unwrap_or_default())
-                }
-                Err(error) => Check::Failed(error),
-            };
+            let checks = futures::future::join_all(targets.iter().map(|target| check_target(target, &host))).await;
             let _ = this.update(cx, |this, cx| {
-                if this.check.as_ref().is_some_and(|(checked, _)| *checked == key) {
-                    this.check = Some((key, check));
+                if this.checks.as_ref().is_some_and(|(checked, _)| *checked == key) {
+                    this.checks = Some((key, checks));
                     cx.notify();
                 }
             });
@@ -349,111 +412,158 @@ impl SshEditor {
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let named = self.draft(cx).is_some_and(|draft| !draft.label.trim().is_empty());
         let Some(host) = self.input(cx).filter(|_| named && !self.busy && !self.checking(cx)) else { return };
-        let Some((client, settings, environment)) = context(&self.workspace, self.scope.as_ref(), cx) else { return };
         let original = self.original.clone().unwrap_or_else(|| host.clone());
-        let next = hosts::host_list(&settings, "deviceHosts")
-            .and_then(|saved| hosts::update_device_hosts(&saved, &host, false, &original).map_err(str::to_owned));
-        let next = match next {
-            Ok(next) => next,
-            Err(error) => return notify_error(window, cx, "Device host not saved", error),
-        };
-        self.busy = true;
-        cx.notify();
-        let patch = json!({"deviceHosts": next});
-        save_patch(
-            client,
-            patch,
-            "Device host not saved everywhere",
-            environment,
-            |this: &mut Self, busy| this.busy = busy,
+        let (workspace, environments, only) = (self.workspace.clone(), self.environments.clone(), self.only.clone());
+        save(
+            self,
+            &workspace,
+            &environments,
+            ("Device host not saved", "Device host not saved everywhere"),
+            |members| ssh_plan(members, &host, false, &original, only.as_deref()),
             window,
             cx,
         );
     }
 
     fn render_check(&self, t: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
-        let check = self.current_check(cx).cloned();
+        let checks = self.current_checks(cx).map(<[Check]>::to_vec);
+        let key = self.key(cx);
         let valid = self.input(cx).is_some();
-        let checking = matches!(check, Some(Check::Pending));
-        let summary = match &check {
-            Some(Check::Pending) => "Checking environments…",
-            Some(Check::Failed(_)) => "1 of 1 failed",
-            Some(_) => "Connection checks passed",
-            None => "Check access before saving",
+        let checking = self.checking(cx);
+        let total = self.environments.len();
+        let failed = checks.iter().flatten().filter(|check| matches!(check, Check::Failed(_))).count();
+        let summary: SharedString = match &checks {
+            _ if checking => "Checking environments…".into(),
+            Some(_) if failed > 0 => format!("{failed} of {total} failed").into(),
+            Some(_) => "Connection checks passed".into(),
+            None => "Check access before saving".into(),
         };
-        let result = check.map(|check| {
-            let (icon, text, color) = match &check {
-                Check::Pending => (None, "Checking…", t.muted_foreground),
-                Check::Local => (Some(Lucide::Monitor), "Already available locally", t.muted_foreground),
-                Check::Failed(_) => (Some(Lucide::X), "Failed", t.error),
-                Check::Connected(_) => (Some(Lucide::Check), "Connected", t.muted_foreground),
-            };
-            v_flex()
-                .px(px(12.))
-                .py(px(10.))
+        let open = total == 1
+            || self.checks_open.as_ref().filter(|(seen, _)| Some(seen) == key.as_ref()).map_or(failed > 0, |(_, o)| *o);
+        let summary = if total == 1 {
+            muted_text(summary, t.muted_foreground).into_any_element()
+        } else {
+            // `CollapsibleTrigger`: the summary toggles the per-environment results once there are some.
+            Button::new("device-host-checks-toggle")
+                .text()
+                .xsmall()
+                .min_w_0()
+                .gap(px(4.))
                 .text_xs()
-                .border_t_1()
-                .border_color(t.border.opacity(0.6))
-                .child(
-                    h_flex()
-                        .justify_between()
-                        .gap(px(12.))
-                        .child(div().truncate().font_weight(FontWeight::MEDIUM).child(self.environment.clone()))
-                        .child(
-                            h_flex()
-                                .flex_none()
-                                .gap(px(6.))
-                                .text_color(color)
-                                .when_some(icon, |this, icon| this.child(Icon::new(icon).with_size(px(12.))))
-                                .child(text),
-                        ),
-                )
-                .map(|this| match check {
-                    Check::Connected(platforms) => this.child(availability(&platforms, t)),
-                    Check::Failed(error) => this.child(
-                        v_flex()
-                            .mt(px(6.))
-                            .text_color(t.muted_foreground)
-                            .child(div().id("device-host-show-error").cursor_pointer().child("Show error").on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.show_error = !this.show_error;
-                                    cx.notify();
-                                }),
-                            ))
-                            .when(self.show_error, |this| {
-                                this.child(
-                                    div()
-                                        .id("device-host-error")
-                                        .mt(px(4.))
-                                        .max_h(px(128.))
-                                        .overflow_y_scroll()
-                                        .child(error),
-                                )
-                            }),
-                    ),
-                    _ => this,
+                .text_color(t.muted_foreground)
+                .disabled(checks.is_none())
+                .child(summary)
+                .when(checks.is_some(), |el| {
+                    el.child(Icon::new(if open { Lucide::ChevronUp } else { Lucide::ChevronDown }).with_size(px(12.)))
                 })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(key) = this.key(cx) {
+                        this.checks_open = Some((key, !open));
+                        cx.notify();
+                    }
+                }))
+                .into_any_element()
+        };
+        let results = checks.filter(|_| open).map(|checks| {
+            v_flex().border_t_1().border_color(t.border.opacity(0.6)).children(
+                self.environments
+                    .iter()
+                    .zip(checks)
+                    .enumerate()
+                    .map(|(index, ((id, label), check))| self.render_result(index, id, label, check, t, cx)),
+            )
         });
         v_flex()
             .rounded(px(8.))
             .border_1()
             .border_color(t.border.opacity(0.6))
             .child(
+                h_flex().justify_between().gap(px(12.)).px(px(12.)).py(px(10.)).child(summary).child(
+                    outline_button("device-host-test")
+                        .label("Test connection")
+                        .loading(checking)
+                        .disabled(self.busy || checking || !valid)
+                        .on_click(cx.listener(|this, _, window, cx| this.test(window, cx))),
+                ),
+            )
+            .children(results)
+    }
+
+    fn render_result(
+        &self,
+        index: usize,
+        environment: &str,
+        label: &str,
+        check: Check,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (icon, text, color) = match &check {
+            Check::Pending => (None, "Checking…", t.muted_foreground),
+            Check::Local => (Some(Lucide::Monitor), "Already available locally", t.muted_foreground),
+            Check::Failed(_) => (Some(Lucide::X), "Failed", t.error),
+            Check::Connected(_) => (Some(Lucide::Check), "Connected", t.muted_foreground),
+        };
+        let shown = self.shown_errors.iter().any(|id| id == environment);
+        let environment = environment.to_owned();
+        v_flex()
+            .px(px(12.))
+            .py(px(10.))
+            .text_xs()
+            .when(index > 0, |el| el.border_t_1().border_color(t.border.opacity(0.4)))
+            .child(
                 h_flex()
                     .justify_between()
                     .gap(px(12.))
-                    .px(px(12.))
-                    .py(px(10.))
-                    .child(muted_text(summary, t.muted_foreground))
+                    .child(div().truncate().font_weight(FontWeight::MEDIUM).child(label.to_owned()))
                     .child(
-                        outline_button("device-host-test")
-                            .label("Test connection")
-                            .loading(checking)
-                            .disabled(self.busy || checking || !valid)
-                            .on_click(cx.listener(|this, _, window, cx| this.test(window, cx))),
+                        h_flex()
+                            .flex_none()
+                            .gap(px(6.))
+                            .text_color(color)
+                            .when(matches!(check, Check::Pending), |el| {
+                                el.child(Spinner::new().xsmall().color(t.muted_foreground))
+                            })
+                            .when_some(icon, |this, icon| this.child(Icon::new(icon).with_size(px(12.))))
+                            .child(text),
                     ),
             )
-            .children(result)
+            .map(|this| match check {
+                Check::Connected(platforms) => this.child(availability(&platforms, t)),
+                Check::Failed(error) => this.child(
+                    v_flex()
+                        .mt(px(6.))
+                        .text_color(t.muted_foreground)
+                        .child(
+                            Button::new(SharedString::from(format!("device-host-show-error-{environment}")))
+                                .text()
+                                .xsmall()
+                                .text_xs()
+                                .text_color(t.muted_foreground)
+                                .label("Show error")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if this.shown_errors.contains(&environment) {
+                                        this.shown_errors.retain(|id| *id != environment);
+                                    } else {
+                                        this.shown_errors.push(environment.clone());
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .when(shown, |this| {
+                            this.child(
+                                div()
+                                    .id(SharedString::from(format!("device-host-error-{index}")))
+                                    .mt(px(4.))
+                                    .max_h(px(128.))
+                                    .overflow_y_scroll()
+                                    .child(error),
+                            )
+                        }),
+                ),
+                _ => this,
+            })
+            .into_any_element()
     }
 }
 
@@ -497,10 +607,14 @@ impl Render for SshEditor {
             && self.draft(cx).is_some_and(|draft| !draft.label.trim().is_empty())
             && !self.checking(cx);
         let options_open = self.options_open;
+        let from = match self.environments.as_slice() {
+            [(_, label)] => format!("Connect from {label}."),
+            environments => format!("Connect from {} selected environments.", environments.len()),
+        };
         v_flex()
             .child(header(
                 if self.original.is_none() { "Add device host" } else { "Edit device host" },
-                format!("Connect from {}. Hosts on the same machine are skipped.", self.environment),
+                format!("{from} Hosts on the same machine are skipped."),
                 &t,
             ))
             .child(
@@ -581,16 +695,22 @@ enum AccountCheck {
 
 struct EasEditor {
     workspace: WeakEntity<Workspace>,
-    /// The settings environment at open, which the editor saves to.
-    scope: Option<SharedString>,
-    /// Taken at open: the editor is built while the workspace is being updated.
+    /// The environments selected at open, saved to while connected.
+    environments: Vec<(String, String)>,
+    /// The socket of the environment the account check runs on, taken at open.
     client: Option<RpcClient>,
+    /// The secret providers the token can read from there.
+    sources: Vec<SecretSource>,
     host: EasHost,
     is_new: bool,
     name: Entity<InputState>,
     token_input: Entity<InputState>,
     /// A saved token arrives redacted; only a replacement or a clear changes it.
     token: TokenEntry,
+    /// The token's secret source field accepts what it holds.
+    token_valid: bool,
+    /// Bumped by Clear, which starts the token's source field over.
+    token_generation: u64,
     app_id: Option<String>,
     sessions: Entity<InputState>,
     session_minutes: Entity<InputState>,
@@ -606,6 +726,10 @@ impl Editor for EasEditor {
     fn busy(&self) -> bool {
         self.busy
     }
+
+    fn set_busy(&mut self, busy: bool) {
+        self.busy = busy;
+    }
 }
 
 fn has_token(token: &Value) -> bool {
@@ -619,8 +743,9 @@ fn has_token(token: &Value) -> bool {
 impl EasEditor {
     fn new(
         workspace: WeakEntity<Workspace>,
-        scope: Option<SharedString>,
+        environments: Vec<(String, String)>,
         client: Option<RpcClient>,
+        sources: Vec<SecretSource>,
         host: Option<EasHost>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -644,7 +769,7 @@ impl EasEditor {
                     // Emptying the field is not clearing the saved token; the Clear button is.
                     let typed = value(input, cx);
                     this.token = if !typed.is_empty() {
-                        TokenEntry::New(typed)
+                        TokenEntry::New(typed.into())
                     } else if has_token(&this.host.access_token) {
                         TokenEntry::Saved
                     } else {
@@ -659,10 +784,13 @@ impl EasEditor {
         }));
         let mut editor = Self {
             workspace,
-            scope,
+            environments,
             client,
+            sources,
             app_id: host.app_id.clone(),
             token: if saved { TokenEntry::Saved } else { TokenEntry::Cleared },
+            token_valid: true,
+            token_generation: 0,
             host,
             is_new,
             name,
@@ -698,7 +826,7 @@ impl EasEditor {
             input["hostId"] = self.host.id.clone().into();
         }
         match &self.token {
-            TokenEntry::New(token) => input["accessToken"] = token.clone().into(),
+            TokenEntry::New(token) => input["accessToken"] = token.clone(),
             // A cleared token is sent empty, so the check does not use the saved one Save drops.
             TokenEntry::Cleared => input["accessToken"] = "".into(),
             TokenEntry::Saved => {}
@@ -741,11 +869,7 @@ impl EasEditor {
         EasHost {
             label: value(&self.name, cx).trim().to_owned(),
             app_id: self.app_id.clone(),
-            access_token: match &self.token {
-                TokenEntry::Saved => self.host.access_token.clone(),
-                TokenEntry::New(token) => token.clone().into(),
-                TokenEntry::Cleared => "".into(),
-            },
+            access_token: self.token.resolve(&self.host.access_token),
             max_concurrent_sessions: number(&self.sessions, cx),
             max_session_minutes: number(&self.session_minutes, cx),
             idle_minutes: number(&self.idle_minutes, cx),
@@ -755,25 +879,17 @@ impl EasEditor {
 
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let next = self.next(cx);
-        if self.busy || !hosts::valid_eas_draft(&next) {
+        if self.busy || !self.token_valid || !hosts::valid_eas_draft(&next) {
             return;
         }
-        let Some((client, settings, environment)) = context(&self.workspace, self.scope.as_ref(), cx) else { return };
         let keep_token = !self.is_new && self.token == TokenEntry::Saved;
-        let saved = match hosts::host_list(&settings, "easDeviceHosts") {
-            Ok(saved) => saved,
-            Err(error) => return notify_error(window, cx, "EAS host not saved", error),
-        };
-        let hosts = hosts::update_eas_hosts(&saved, &next, false, keep_token);
-        self.busy = true;
-        cx.notify();
-        let patch = json!({"easDeviceHosts": hosts});
-        save_patch(
-            client,
-            patch,
-            "EAS host not saved everywhere",
-            environment,
-            |this: &mut Self, busy| this.busy = busy,
+        let (workspace, environments) = (self.workspace.clone(), self.environments.clone());
+        save(
+            self,
+            &workspace,
+            &environments,
+            ("EAS host not saved", "EAS host not saved everywhere"),
+            |members| eas_plan(members, &next, false, keep_token),
             window,
             cx,
         );
@@ -781,12 +897,51 @@ impl EasEditor {
 
     fn clear_token(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.token = TokenEntry::Cleared;
+        self.token_valid = true;
+        self.token_generation += 1;
         self.token_input.update(cx, |input, cx| {
             input.set_value("", window, cx);
             input.set_placeholder("Optional", window, cx);
         });
         self.reset_account();
         cx.notify();
+    }
+
+    fn render_token(&mut self, window: &mut Window, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+        let busy = self.busy;
+        let editor = cx.entity().downgrade();
+        let token_input = self.token_input.clone();
+        let parts = secret_source_input(
+            format!("eas-token-{}-{}", self.host.id, self.token_generation),
+            "Expo access token",
+            token_reference(&self.token, &self.host.access_token),
+            &self.sources,
+            busy,
+            || input(&token_input, busy).into_any_element(),
+            move |secret, _, cx| {
+                let _ = editor.update(cx, |this, cx| {
+                    this.token = secret.map_or(TokenEntry::Cleared, TokenEntry::New);
+                    this.reset_account();
+                    cx.notify();
+                });
+            },
+            window,
+            cx,
+        );
+        if parts.valid != self.token_valid {
+            self.token_valid = parts.valid;
+            self.reset_account();
+        }
+        field(
+            "Expo access token",
+            h_flex().items_start().gap(px(8.)).child(parts.row()).when(self.token != TokenEntry::Cleared, |this| {
+                this.child(
+                    clear_button("eas-token-clear", busy, t)
+                        .on_click(cx.listener(|this, _, window, cx| this.clear_token(window, cx))),
+                )
+            }),
+        )
+        .into_any_element()
     }
 
     fn render_project(&self, t: &Tokens, cx: &mut Context<Self>) -> impl IntoElement {
@@ -838,18 +993,19 @@ impl EasEditor {
 }
 
 impl Render for EasEditor {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *tokens(cx);
         let busy = self.busy;
+        let token = self.render_token(window, &t, cx);
         let next = self.next(cx);
-        let valid = hosts::valid_eas_draft(&next);
+        let valid = self.token_valid && hosts::valid_eas_draft(&next);
         // Why Save is off, for the limits the fields' ranges do not show.
-        let problem = (!valid).then_some({
-            if next.max_session_minutes > 0 && next.idle_minutes >= next.max_session_minutes {
-                "Idle minutes must be smaller than session minutes."
-            } else {
-                "Give the host a label and limits within the ranges shown."
-            }
+        let problem = (!valid).then_some(if !self.token_valid {
+            "Enter a valid secret reference."
+        } else if next.max_session_minutes > 0 && next.idle_minutes >= next.max_session_minutes {
+            "Idle minutes must be smaller than session minutes."
+        } else {
+            "Give the host a label and limits within the ranges shown."
         });
         let status: SharedString = match &self.account {
             AccountCheck::SignedIn { signed_in_as, credential_source, .. } => {
@@ -880,18 +1036,7 @@ impl Render for EasEditor {
                     .pt(px(4.))
                     .pb(px(24.))
                     .child(field("Name", input(&self.name, busy)))
-                    .child(field(
-                        "Expo access token",
-                        h_flex()
-                            .gap(px(8.))
-                            .child(div().flex_1().min_w_0().child(input(&self.token_input, busy)))
-                            .when(self.token != TokenEntry::Cleared, |this| {
-                                this.child(
-                                    clear_button("eas-token-clear", busy, &t)
-                                        .on_click(cx.listener(|this, _, window, cx| this.clear_token(window, cx))),
-                                )
-                            }),
-                    ))
+                    .child(token)
                     .child(
                         h_flex()
                             .justify_between()
@@ -906,7 +1051,7 @@ impl Render for EasEditor {
                                 outline_button("eas-check-account")
                                     .label("Check account")
                                     .loading(checking)
-                                    .disabled(busy || checking)
+                                    .disabled(busy || checking || !self.token_valid)
                                     .on_click(cx.listener(|this, _, window, cx| this.check_account(window, cx))),
                             ),
                     )
@@ -932,7 +1077,7 @@ impl Render for EasEditor {
     }
 }
 
-/// The token check under the Simlock token field.
+/// The token check under a Simlock token field.
 #[derive(Clone)]
 enum Identity {
     Checking,
@@ -940,24 +1085,52 @@ enum Identity {
     Failed(String),
 }
 
+/// What an environment's Simlock token field starts from.
+struct TokenSeed {
+    environment: String,
+    label: String,
+    client: Option<RpcClient>,
+    sources: Vec<SecretSource>,
+    /// This environment's saved token: redacted when a literal, shown when a reference.
+    saved: Value,
+}
+
+/// One environment's agent token (`SimlockTokenField`): Simlock counts leases per token.
+struct TokenField {
+    seed: TokenSeed,
+    input: Entity<InputState>,
+    token: TokenEntry,
+    /// The token's secret source field accepts what it holds.
+    valid: bool,
+    /// Bumped by Clear, which starts the source field over.
+    generation: u64,
+    /// The check's answer and the input it was asked with.
+    identity: Option<(Value, Identity)>,
+}
+
+impl TokenField {
+    /// Emptying the field or leaving a reference returns to a saved literal, never to a saved reference.
+    fn fallback(&self) -> TokenEntry {
+        match &self.seed.saved {
+            Value::String(saved) if !saved.is_empty() => TokenEntry::Saved,
+            _ => TokenEntry::Cleared,
+        }
+    }
+}
+
 struct SimlockEditor {
     workspace: WeakEntity<Workspace>,
-    /// The settings environment at open, which the editor saves to.
-    scope: Option<SharedString>,
-    /// Taken at open: the editor is built while the workspace is being updated.
-    client: Option<RpcClient>,
+    /// The environments selected at open, saved to while connected.
+    environments: Vec<(String, String)>,
     host: SimlockHost,
     is_new: bool,
     name: Entity<InputState>,
     gateway: Entity<InputState>,
     /// The gateway field was typed in, so a detected gateway no longer fills it.
     url_edited: bool,
-    token_input: Entity<InputState>,
-    token: TokenEntry,
+    tokens: Vec<TokenField>,
     leases: Entity<InputState>,
     lease_minutes: Entity<InputState>,
-    /// The check's answer and the (gateway, token) it was asked about.
-    identity: Option<(Value, Identity)>,
     busy: bool,
     _subscriptions: Vec<Subscription>,
 }
@@ -966,24 +1139,26 @@ impl Editor for SimlockEditor {
     fn busy(&self) -> bool {
         self.busy
     }
+
+    fn set_busy(&mut self, busy: bool) {
+        self.busy = busy;
+    }
 }
 
 impl SimlockEditor {
     fn new(
         workspace: WeakEntity<Workspace>,
-        scope: Option<SharedString>,
-        client: Option<RpcClient>,
+        environments: Vec<(String, String)>,
+        seeds: Vec<TokenSeed>,
         host: Option<SimlockHost>,
+        id: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let is_new = host.is_none();
-        let host = host.unwrap_or_else(|| hosts::new_simlock_host(new_host_id()));
-        let saved = has_token(&host.agent_token);
-        let configured = saved && host.agent_token.is_string();
+        let host = host.unwrap_or_else(|| hosts::new_simlock_host(id));
         let name = text_input(window, cx, &host.label, "", false);
         let gateway = text_input(window, cx, &host.gateway_url, "https://gateway.example.ts.net:4700", false);
-        let token_input = text_input(window, cx, "", token_placeholder(configured, "Not set"), true);
         let leases = text_input(window, cx, &host.max_leases.to_string(), "", false);
         let lease_minutes = text_input(window, cx, &host.max_lease_minutes.to_string(), "", false);
         name.update(cx, |input, cx| input.focus(window, cx));
@@ -992,67 +1167,70 @@ impl SimlockEditor {
         subscriptions.push(cx.subscribe_in(&gateway, window, |this, _, event: &InputEvent, window, cx| match event {
             InputEvent::Change => {
                 this.url_edited = true;
-                this.check_identity(window, cx);
+                this.check_identities(window, cx);
             }
             InputEvent::PressEnter { .. } => this.save(window, cx),
             _ => {}
         }));
-        subscriptions.push(cx.subscribe_in(&token_input, window, |this, input, event: &InputEvent, window, cx| {
-            match event {
-                InputEvent::Change => {
-                    // Emptying the field is not clearing the saved token; the Clear button is.
-                    let typed = value(input, cx);
-                    this.token = if !typed.is_empty() {
-                        TokenEntry::New(typed)
-                    } else if has_token(&this.host.agent_token) {
-                        TokenEntry::Saved
-                    } else {
-                        TokenEntry::Cleared
-                    };
-                    this.check_identity(window, cx);
+        let mut tokens = Vec::new();
+        for (index, seed) in seeds.into_iter().enumerate() {
+            let configured = matches!(&seed.saved, Value::String(saved) if !saved.is_empty());
+            let token = if has_token(&seed.saved) { TokenEntry::Saved } else { TokenEntry::Cleared };
+            let input = text_input(window, cx, "", token_placeholder(configured, "Not set"), true);
+            subscriptions.push(cx.subscribe_in(&input, window, move |this, input, event: &InputEvent, window, cx| {
+                match event {
+                    InputEvent::Change => {
+                        let typed = value(input, cx);
+                        let Some(field) = this.tokens.get_mut(index) else { return };
+                        // Emptying the field is not clearing the saved token; the Clear button is.
+                        field.token = if typed.is_empty() { field.fallback() } else { TokenEntry::New(typed.into()) };
+                        this.check_identities(window, cx);
+                    }
+                    InputEvent::PressEnter { .. } => this.save(window, cx),
+                    _ => {}
                 }
-                InputEvent::PressEnter { .. } => this.save(window, cx),
-                _ => {}
-            }
-        }));
+            }));
+            tokens.push(TokenField { seed, input, token, valid: true, generation: 0, identity: None });
+        }
         let mut editor = Self {
             workspace,
-            scope,
-            client,
-            token: if saved { TokenEntry::Saved } else { TokenEntry::Cleared },
+            environments,
             host,
             is_new,
             name,
             gateway,
             url_edited: false,
-            token_input,
+            tokens,
             leases,
             lease_minutes,
-            identity: None,
             busy: false,
             _subscriptions: subscriptions,
         };
         if is_new {
             editor.detect_gateway(window, cx);
         }
-        editor.check_identity(window, cx);
+        editor.check_identities(window, cx);
         editor
     }
 
-    /// A new host starts at the gateway the machine's own agent-device already uses.
+    /// A new host starts at the gateway an environment's own agent-device already uses.
     fn detect_gateway(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(client) = self.client.clone() else { return };
+        let clients: Vec<RpcClient> = self.tokens.iter().filter_map(|field| field.seed.client.clone()).collect();
         cx.spawn_in(window, async move |this, cx| {
-            let Ok(identity) = client.request("device.simlockIdentity", json!({})).await else { return };
-            let Some(url) = identity["gatewayUrl"].as_str().filter(|url| !url.is_empty()).map(str::to_owned) else {
-                return;
-            };
+            let answers = futures::future::join_all(
+                clients.iter().map(|client| client.request("device.simlockIdentity", json!({}))),
+            )
+            .await;
+            let url = answers.into_iter().find_map(|answer| {
+                answer.ok()?["gatewayUrl"].as_str().filter(|url| !url.is_empty()).map(str::to_owned)
+            });
+            let Some(url) = url else { return };
             let _ = this.update_in(cx, |this, window, cx| {
                 if this.url_edited || !value(&this.gateway, cx).is_empty() {
                     return;
                 }
                 this.gateway.update(cx, |input, cx| input.set_value(url, window, cx));
-                this.check_identity(window, cx);
+                this.check_identities(window, cx);
             });
         })
         .detach();
@@ -1068,86 +1246,99 @@ impl SimlockEditor {
         }
     }
 
-    /// Asks the gateway about the token once the shared fields are valid; a cleared
-    /// field asks about the machine's own token, which a blank one falls back to.
-    fn check_identity(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Asks the gateway about each environment's token once the shared fields are valid; a
+    /// cleared field asks about the machine's own token, which a blank one falls back to.
+    fn check_identities(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         cx.notify();
         let next = self.next(cx);
-        if hosts::simlock_problem(&next).is_some() {
-            self.identity = None;
-            return;
-        }
-        let mut input = json!({"gatewayUrl": next.gateway_url});
-        match &self.token {
-            TokenEntry::New(token) if !token.trim().is_empty() => input["agentToken"] = token.trim().into(),
-            TokenEntry::Saved if !self.is_new => input["hostId"] = self.host.id.clone().into(),
-            _ => {}
-        }
-        if self.identity.as_ref().is_some_and(|(asked, _)| *asked == input) {
-            return;
-        }
-        let Some(client) = self.client.clone() else { return };
-        self.identity = Some((input.clone(), Identity::Checking));
-        cx.spawn_in(window, async move |this, cx| {
-            let result = client.request("device.simlockIdentity", input.clone()).await;
-            let identity = match result {
-                Ok(identity) => Identity::Accepted {
-                    signed_in_as: identity["signedInAs"].as_str().unwrap_or_default().to_owned(),
-                    from_machine: identity["tokenSource"].as_str() == Some("env"),
-                },
-                Err(error) => Identity::Failed(failure_message(&error)),
-            };
-            let _ = this.update(cx, |this, cx| {
-                if this.identity.as_ref().is_some_and(|(asked, _)| *asked == input) {
-                    this.identity = Some((input, identity));
-                    cx.notify();
+        let valid = hosts::simlock_problem(&next).is_none();
+        for index in 0..self.tokens.len() {
+            let field = &mut self.tokens[index];
+            if !valid {
+                field.identity = None;
+                continue;
+            }
+            let mut input = json!({"gatewayUrl": next.gateway_url});
+            match &field.token {
+                TokenEntry::New(Value::String(token)) if !token.trim().is_empty() => {
+                    input["agentToken"] = token.trim().into();
                 }
-            });
-        })
-        .detach();
+                TokenEntry::New(reference @ Value::Object(_)) => input["agentToken"] = reference.clone(),
+                TokenEntry::Saved if !self.is_new => input["hostId"] = self.host.id.clone().into(),
+                _ => {}
+            }
+            if field.identity.as_ref().is_some_and(|(asked, _)| *asked == input) {
+                continue;
+            }
+            let Some(client) = field.seed.client.clone() else { continue };
+            field.identity = Some((input.clone(), Identity::Checking));
+            cx.spawn_in(window, async move |this, cx| {
+                let result = client.request("device.simlockIdentity", input.clone()).await;
+                let identity = match result {
+                    Ok(identity) => Identity::Accepted {
+                        signed_in_as: identity["signedInAs"].as_str().unwrap_or_default().to_owned(),
+                        from_machine: identity["tokenSource"].as_str() == Some("env"),
+                    },
+                    Err(error) => Identity::Failed(failure_message(&error)),
+                };
+                let _ = this.update(cx, |this, cx| {
+                    let Some(field) = this.tokens.get_mut(index) else { return };
+                    if field.identity.as_ref().is_some_and(|(asked, _)| *asked == input) {
+                        field.identity = Some((input, identity));
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
+    }
+
+    /// Why Save is off: the shared fields' problem, else a token reference that can't be saved.
+    fn problem(&self, next: &SimlockHost) -> Option<&'static str> {
+        hosts::simlock_problem(next)
+            .or_else(|| self.tokens.iter().any(|field| !field.valid).then_some("Enter a valid secret reference."))
     }
 
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy {
+        let next = self.next(cx);
+        if self.busy || self.problem(&next).is_some() {
             return;
         }
-        let Some((client, settings, environment)) = context(&self.workspace, self.scope.as_ref(), cx) else { return };
-        let saved = match hosts::host_list(&settings, "simlockDeviceHosts") {
-            Ok(saved) => saved,
-            Err(error) => return notify_error(window, cx, "Simlock host not saved", error),
-        };
-        let Ok(hosts) = hosts::plan_simlock_save(&saved, &self.next(cx), &self.token) else { return };
-        self.busy = true;
-        cx.notify();
-        let patch = json!({"simlockDeviceHosts": hosts});
-        save_patch(
-            client,
-            patch,
-            "Simlock host not saved everywhere",
-            environment,
-            |this: &mut Self, busy| this.busy = busy,
+        let tokens: Vec<(String, TokenEntry)> =
+            self.tokens.iter().map(|field| (field.seed.environment.clone(), field.token.clone())).collect();
+        let (workspace, environments) = (self.workspace.clone(), self.environments.clone());
+        save(
+            self,
+            &workspace,
+            &environments,
+            ("Simlock host not saved", "Simlock host not saved everywhere"),
+            |members| simlock_save_plan(members, &next, &tokens),
             window,
             cx,
         );
     }
 
-    fn clear_token(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.token = TokenEntry::Cleared;
-        self.token_input.update(cx, |input, cx| {
+    fn clear_token(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(field) = self.tokens.get_mut(index) else { return };
+        field.token = TokenEntry::Cleared;
+        field.valid = true;
+        field.generation += 1;
+        field.input.update(cx, |input, cx| {
             input.set_value("", window, cx);
             input.set_placeholder("Not set", window, cx);
         });
-        self.check_identity(window, cx);
+        self.check_identities(window, cx);
     }
-}
 
-impl Render for SimlockEditor {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_token(&mut self, index: usize, several: bool, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = *tokens(cx);
         let busy = self.busy;
-        let next = self.next(cx);
-        let problem = hosts::simlock_problem(&next);
-        let status = self.identity.as_ref().map(|(_, identity)| match identity {
+        let editor = cx.entity().downgrade();
+        let field = &self.tokens[index];
+        let label = if several { format!("Agent token · {}", field.seed.label) } else { "Agent token".to_owned() };
+        let (token_input, cleared) = (field.input.clone(), field.token == TokenEntry::Cleared);
+        let fallback = field.fallback();
+        let status = field.identity.as_ref().map(|(_, identity)| match identity {
             Identity::Checking => muted_text("Checking…", t.muted_foreground),
             Identity::Accepted { signed_in_as, from_machine: true } => {
                 muted_text(format!("Using this machine's agent-device token ({signed_in_as})."), t.muted_foreground)
@@ -1155,19 +1346,62 @@ impl Render for SimlockEditor {
             Identity::Accepted { signed_in_as, .. } => {
                 muted_text(format!("Accepted as {signed_in_as}."), t.muted_foreground)
             }
-            Identity::Failed(error) => {
-                muted_text(error.clone(), if self.token == TokenEntry::Cleared { t.muted_foreground } else { t.error })
-            }
+            Identity::Failed(error) => muted_text(error.clone(), if cleared { t.muted_foreground } else { t.error }),
         });
+        let parts = secret_source_input(
+            format!("simlock-token-{}-{}-{}", self.host.id, field.seed.environment, field.generation),
+            "Agent token",
+            token_reference(&field.token, &field.seed.saved),
+            &field.seed.sources,
+            busy,
+            || input(&token_input, busy).into_any_element(),
+            move |secret, window, cx| {
+                let _ = editor.update(cx, |this, cx| {
+                    let Some(field) = this.tokens.get_mut(index) else { return };
+                    field.token = secret.map_or_else(|| fallback.clone(), TokenEntry::New);
+                    this.check_identities(window, cx);
+                });
+            },
+            window,
+            cx,
+        );
+        if self.tokens[index].valid != parts.valid {
+            self.tokens[index].valid = parts.valid;
+        }
+        v_flex()
+            .gap(px(6.))
+            .text_sm()
+            .child(label)
+            .child(h_flex().items_start().gap(px(8.)).child(parts.row()).when(!cleared, |this| {
+                this.child(
+                    clear_button(SharedString::from(format!("simlock-token-clear-{index}")), busy, &t)
+                        .on_click(cx.listener(move |this, _, window, cx| this.clear_token(index, window, cx))),
+                )
+            }))
+            .children(status)
+            .into_any_element()
+    }
+}
+
+impl Render for SimlockEditor {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = *tokens(cx);
+        let busy = self.busy;
+        let several = self.tokens.len() > 1;
+        let token_fields: Vec<AnyElement> =
+            (0..self.tokens.len()).map(|index| self.render_token(index, several, window, cx)).collect();
+        let next = self.next(cx);
+        let problem = self.problem(&next);
         let limit = |label: &'static str, input_state: &Entity<InputState>| {
             div().flex_1().min_w_0().child(field(label, input(input_state, busy)))
         };
+        let description = if several {
+            "Each selected environment's server leases devices from your Simlock gateway with its own agent token, and releases them when they close."
+        } else {
+            "The environment's server leases devices from your Simlock gateway and releases them when they close."
+        };
         v_flex()
-            .child(header(
-                if self.is_new { "Add Simlock host" } else { "Edit Simlock host" },
-                "The environment's server leases devices from your Simlock gateway and releases them when they close.",
-                &t,
-            ))
+            .child(header(if self.is_new { "Add Simlock host" } else { "Edit Simlock host" }, description, &t))
             .child(
                 v_flex()
                     .gap(px(16.))
@@ -1176,40 +1410,28 @@ impl Render for SimlockEditor {
                     .pb(px(24.))
                     .child(field("Name", input(&self.name, busy)))
                     .child(field("Gateway URL", input(&self.gateway, busy)))
-                    .child(
-                        v_flex()
-                            .gap(px(12.))
-                            .child(
-                                v_flex()
-                                    .gap(px(6.))
-                                    .text_sm()
-                                    .child("Agent token")
-                                    .child(
-                                        h_flex()
-                                            .gap(px(8.))
-                                            .child(div().flex_1().min_w_0().child(input(&self.token_input, busy)))
-                                            .when(self.token != TokenEntry::Cleared, |this| {
-                                                this.child(clear_button("simlock-token-clear", busy, &t).on_click(
-                                                    cx.listener(|this, _, window, cx| this.clear_token(window, cx)),
-                                                ))
-                                            }),
-                                    )
-                                    .children(status),
-                            )
-                            .child(div().text_xs().text_color(t.muted_foreground).child(with_code(
-                                &[
-                                    ("Leases, drives, and streams devices. Create one with ", false),
-                                    ("simlock --gateway token create --role agent", true),
-                                    (", or leave it blank to add it later. A blank token uses the machine's ", false),
-                                    ("AGENT_DEVICE_DAEMON_AUTH_TOKEN", true),
-                                    (" when its ", false),
-                                    ("AGENT_DEVICE_DAEMON_BASE_URL", true),
-                                    (" is this gateway.", false),
-                                ],
-                                t.muted_foreground,
-                                window,
-                            ))),
-                    )
+                    .child(v_flex().gap(px(12.)).children(token_fields).child(
+                        div().text_xs().text_color(t.muted_foreground).child(with_code(
+                            &[
+                                (
+                                    if several {
+                                        "Leases, drives, and streams devices. Create one per environment with "
+                                    } else {
+                                        "Leases, drives, and streams devices. Create one with "
+                                    },
+                                    false,
+                                ),
+                                ("simlock --gateway token create --role agent", true),
+                                (", or leave it blank to add it later. A blank token uses the machine's ", false),
+                                ("AGENT_DEVICE_DAEMON_AUTH_TOKEN", true),
+                                (" when its ", false),
+                                ("AGENT_DEVICE_DAEMON_BASE_URL", true),
+                                (" is this gateway.", false),
+                            ],
+                            t.muted_foreground,
+                            window,
+                        )),
+                    ))
                     .child(
                         h_flex()
                             .gap(px(12.))

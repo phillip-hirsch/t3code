@@ -1,14 +1,23 @@
 //! The right panel (`RightPanelTabs.tsx` inside `PreviewPanelShell`, state as `rightPanelStore.ts`)
 //! with its Diff (`DiffPanel.tsx`) and Browser (`preview/`) surfaces. The panel owns the titlebar
-//! row above it, keeps per-thread open state and tabs, and resizes from its left edge.
+//! row above it, keeps per-thread open state, tabs and width across launches (`stored`) with the
+//! tabs it closed (`closed`), and resizes from its left edge.
 //! Other surfaces render in their own modules (files, terminal, pull requests, side chats); the
 //! device surface is not native, so the launcher leaves it out.
 
+mod closed;
 mod commit_link;
 mod diff_base;
+mod diff_comments;
 mod diff_load;
 mod diff_open;
-mod diff_tree;
+mod diff_tool_call;
+pub(super) mod diff_tree;
+mod sheet;
+mod stored;
+mod writer;
+
+pub(in crate::app) use diff_load::contents_loader;
 
 use std::collections::{HashMap, HashSet};
 
@@ -28,12 +37,14 @@ use gpui_kit::{
     KeyDownEvent, LayoutId, MouseButton, ParentElement as _, Pixels, Point, ScrollHandle, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, deferred, div, px,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::git::{self, DiffColorScheme};
 use super::titlebar::{CAPTION_BUTTONS_WIDTH, RIGHT_RESIZE_INSET, TITLEBAR_HEIGHT, icon};
 use super::{Target, Workspace};
 use crate::model::{Checkpoint, ThreadProjection};
+use crate::preview::ThreadRef;
 use crate::rpc::RpcClient;
 use crate::theme::{self, Tokens};
 
@@ -65,6 +76,11 @@ pub(super) enum DiffScope {
     Unstaged,
     Turn(String),
     Commit(String),
+    /// A tool call's recorded file change, by the thread and item it was recorded in.
+    ToolCall {
+        thread_id: String,
+        item_id: String,
+    },
 }
 
 /// One completed turn the Diff menu offers (`ThreadCheckpointSummary`).
@@ -94,12 +110,15 @@ pub(super) fn turn_summaries(projection: &ThreadProjection) -> Vec<TurnSummary> 
 
 /// One tab of the panel (`RightPanelSurface`): the Diff, one browser tab by its preview tab id,
 /// the Files tree, or a file (or folder) by its workspace path.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "kebab-case")]
 pub(super) enum Surface {
     Diff,
     Browser(String),
     Files,
     File(String),
+    /// A file sent with a message (`attachment:<id>`), which needs no workspace.
+    Attachment(super::files::AttachmentFile),
     /// A side chat's tab, by its thread id.
     SideChat(String),
     /// A pull request in the detail panel.
@@ -126,6 +145,8 @@ struct PanelState {
     proactive_diff_run: Option<String>,
     /// The panel fills the row and the chat column steps aside (`maximized`), kept per thread.
     maximized: bool,
+    /// The width the user dragged it to (`t3code:preview-panel-width:<thread>`); none is the default.
+    width: Option<f32>,
 }
 
 impl PanelState {
@@ -197,6 +218,12 @@ impl PanelState {
         self.active = Some(surface);
     }
 
+    /// `openAttachment`: like a file, an attachment's tab replaces the standalone Files tree.
+    fn open_attachment(&mut self, file: super::files::AttachmentFile) {
+        self.surfaces.retain(|s| *s != Surface::Files);
+        self.upsert(Surface::Attachment(file));
+    }
+
     /// `navigateFolder`: `source` turns into the folder (the root is the Files tree), or with
     /// `keep_source` the folder opens beside it. A folder already open is focused instead.
     fn navigate_folder(&mut self, source: &Surface, folder: &str, keep_source: bool) {
@@ -222,24 +249,30 @@ impl PanelState {
     }
 
     /// `reconcileBrowserSurfaces`: a tab per preview session, dropping closed ones. Closing the
-    /// last session hides the panel rather than leave it on the launcher.
-    fn reconcile_browsers(&mut self, tab_ids: &[&str]) {
+    /// last session hides the panel rather than leave it on the launcher. Returns whether
+    /// anything changed.
+    fn reconcile_browsers(&mut self, tab_ids: &[&str]) -> bool {
+        let (count, open) = (self.surfaces.len(), self.open);
         let had_browser = self.surfaces.iter().any(|s| matches!(s, Surface::Browser(_)));
         self.surfaces.retain(|s| !matches!(s, Surface::Browser(tab) if !tab_ids.contains(&tab.as_str())));
+        let mut changed = self.surfaces.len() != count;
         for tab in tab_ids {
-            let surface = Surface::Browser((*tab).to_owned());
-            if !self.surfaces.contains(&surface) {
-                self.surfaces.push(surface);
+            if !self.surfaces.iter().any(|s| matches!(s, Surface::Browser(id) if id == tab)) {
+                self.surfaces.push(Surface::Browser((*tab).to_owned()));
+                changed = true;
             }
         }
         // Nothing active, as after a restart, also falls back to a browser tab.
         if self.active.as_ref().is_none_or(|active| !self.surfaces.contains(active)) {
             let browser = self.surfaces.iter().find(|s| matches!(s, Surface::Browser(_)));
-            self.active = browser.or(self.surfaces.first()).cloned();
+            let active = browser.or(self.surfaces.first()).cloned();
+            changed |= active != self.active;
+            self.active = active;
         }
         if self.surfaces.is_empty() && had_browser {
             self.open = false;
         }
+        changed || open != self.open
     }
 }
 
@@ -276,6 +309,19 @@ enum DiffLoad {
         truncated: bool,
         /// Patch reads asked for that have not settled.
         pending: usize,
+        /// A tool call's recorded files and how many its patch leaves out.
+        omitted: Option<(usize, usize)>,
+    },
+    /// A tool call's patch the viewer can't read, as text with why.
+    Raw {
+        reason: &'static str,
+        text: SharedString,
+        truncated: bool,
+    },
+    /// File contents a tool call recorded without a diff, each under its label.
+    Recorded {
+        content: std::rc::Rc<[(&'static str, SharedString)]>,
+        truncated: bool,
     },
     Empty(&'static str),
     Failed(SharedString),
@@ -351,7 +397,10 @@ impl FilePatches {
 
 pub(super) struct RightPanel {
     panels: HashMap<Target, PanelState>,
-    width: f32,
+    /// Saves `panels` across launches; see [`RightPanel::panels_mut`].
+    layout: stored::LayoutStore,
+    /// Closed tabs for Reopen Closed Tab.
+    closed: closed::ClosedViews,
     /// The "+" menu is open; a native browser view must not cover it. It also opens the menu,
     /// as `rightPanel.new` does.
     pub(super) add_menu_open: bool,
@@ -408,15 +457,19 @@ pub(super) struct RightPanel {
     patch_states: std::rc::Rc<HashMap<SharedString, diff_load::FileState>>,
     hide_test_files: bool,
     tree_open: bool,
-    /// Folded tree folders (with their trailing `/`) and the file picked in the tree.
-    tree_folded: HashSet<String>,
-    tree_selected: Option<String>,
-    /// The tree's visible rows, rebuilt when the shown files or the folds change.
-    tree_rows: std::rc::Rc<[diff_tree::Row]>,
+    tree: diff_tree::DiffTree,
     /// The file `open_turn_diff` asked for, scrolled to once the shown selection holds it.
     pending_reveal: Option<((Target, DiffScope), SharedString)>,
     toolbar_focus: DiffToolbarFocus,
-    tree_pane: diff_tree::TreePane,
+    /// The line comment being written (`AnnotatableCodeView`'s draft).
+    comment: Option<diff_comments::DiffComment>,
+    /// The window width at the last render, for work that runs outside one.
+    viewport_width: f32,
+    /// The narrow-window sheet's focus: what had it when the sheet opened, the sheet's trap, and
+    /// an opening whose focus move waits for the sheet's first frame.
+    sheet_focus: super::sidebar_sheet::SheetFocus<FocusHandle>,
+    sheet_trap: FocusHandle,
+    sheet_entering: bool,
     _diff_events: Subscription,
 }
 
@@ -431,9 +484,11 @@ impl RightPanel {
             DiffEvent::FileExpanded(_) | DiffEvent::FileCollapsed(_) => this.remember_collapsed(cx),
             _ => {}
         });
+        let (layout, panels) = stored::LayoutStore::restored();
         Self {
-            panels: HashMap::new(),
-            width: DEFAULT_WIDTH,
+            panels,
+            layout,
+            closed: closed::ClosedViews::restored(),
             add_menu_open: false,
             profiles_menu_open: false,
             launcher_focus: cx.focus_handle().tab_stop(true),
@@ -468,14 +523,22 @@ impl RightPanel {
             patch_states: std::rc::Rc::default(),
             hide_test_files: false,
             tree_open: false,
-            tree_folded: HashSet::new(),
-            tree_selected: None,
-            tree_rows: std::rc::Rc::new([]),
+            tree: diff_tree::DiffTree::new(cx),
             pending_reveal: None,
             toolbar_focus: DiffToolbarFocus::new(cx),
-            tree_pane: diff_tree::TreePane::new(cx),
+            comment: None,
+            viewport_width: f32::INFINITY,
+            sheet_focus: Default::default(),
+            sheet_trap: cx.focus_handle(),
+            sheet_entering: false,
             _diff_events: diff_events,
         }
+    }
+
+    /// The panels for a change, which the layout then saves.
+    fn panels_mut(&mut self) -> &mut HashMap<Target, PanelState> {
+        self.layout.changed = true;
+        &mut self.panels
     }
 }
 
@@ -544,7 +607,7 @@ impl Workspace {
 
     fn panel_state_mut(&mut self) -> Option<&mut PanelState> {
         let target = self.target.clone()?;
-        Some(self.right_panel.panels.entry(target).or_default())
+        Some(self.right_panel.panels_mut().entry(target).or_default())
     }
 
     /// The panel state for a change the user made, which proactive opens then defer to.
@@ -569,11 +632,20 @@ impl Workspace {
             return None;
         }
         let viewport = f32::from(window.viewport_size().width);
+        if self.right_panel_sheet(window) {
+            return Some(sheet::sheet_width(viewport));
+        }
         let sidebar = if self.sidebar_open.docked() { f32::from(self.sidebar_width()) } else { 0. };
         if self.right_panel_maximized() {
             return Some(panel_row(viewport, sidebar));
         }
-        Some(clamp_width(self.right_panel.width, viewport, panel_row(viewport, sidebar)))
+        let width = self.panel_state().and_then(|panel| panel.width).unwrap_or(DEFAULT_WIDTH);
+        Some(clamp_width(width, viewport, panel_row(viewport, sidebar)))
+    }
+
+    /// The width the open panel takes from the row beside the chat; a sheet takes none.
+    pub(super) fn right_panel_docked_width(&self, window: &Window) -> Option<f32> {
+        self.right_panel_width(window).filter(|_| !self.right_panel_sheet(window))
     }
 
     /// `rightPanelMaximized`: only an open panel counts as maximized.
@@ -606,10 +678,8 @@ impl Workspace {
 
     /// `closePreviewPanel`: hiding the panel floats the browser it showed.
     pub(super) fn close_right_panel(&mut self, cx: &mut Context<Self>) {
-        if let (Some(Target::Thread { id: thread_id, .. }), Some(Surface::Browser(tab))) =
-            (self.target.clone(), self.active_surface().cloned())
-        {
-            self.float_browser(thread_id, tab, cx);
+        if let (Some(thread), Some(Surface::Browser(tab))) = (self.preview_thread(), self.active_surface().cloned()) {
+            self.float_browser(thread, tab, cx);
         }
         if let Some(panel) = self.user_panel_state() {
             panel.open = false;
@@ -639,7 +709,7 @@ impl Workspace {
         if self.target.as_ref() == Some(target) {
             return self.open_surface(surface, window, cx);
         }
-        let panel = self.right_panel.panels.entry(target.clone()).or_default();
+        let panel = self.right_panel.panels_mut().entry(target.clone()).or_default();
         panel.user_revision += 1;
         panel.upsert(surface);
     }
@@ -655,7 +725,7 @@ impl Workspace {
 
     /// Removes a tab without the side effects of closing it (its terminals already closed).
     pub(super) fn drop_surface(&mut self, target: &Target, surface: &Surface) {
-        if let Some(panel) = self.right_panel.panels.get_mut(target) {
+        if let Some(panel) = self.right_panel.panels_mut().get_mut(target) {
             panel.close(surface);
         }
     }
@@ -665,14 +735,19 @@ impl Workspace {
         if let Surface::Terminal(id) = surface {
             return self.request_close_terminal_surface(id, window, cx);
         }
-        if let Some(panel) = self.user_panel_state() {
+        let closed = self.user_panel_state().is_some_and(|panel| {
+            let shown = panel.surfaces.contains(&surface);
             panel.close(&surface);
+            shown
+        });
+        if closed {
+            self.remember_closed_surface(&surface);
         }
         if let Surface::SideChat(thread_id) = &surface {
             self.release_side_chat(thread_id, cx);
         }
-        if let (Surface::Browser(tab), Some(Target::Thread { id: thread_id, .. })) = (&surface, self.target.clone()) {
-            self.close_preview_tab(thread_id, tab.clone(), window, cx);
+        if let (Surface::Browser(tab), Some(thread)) = (&surface, self.preview_thread()) {
+            self.close_preview_tab(thread.tab(tab), window, cx);
         }
         self.sync_active_browser(window, cx);
         cx.notify();
@@ -708,7 +783,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let active = self.panel_state().and_then(|panel| panel.active.clone());
-        for surface in close {
+        for surface in closed::closed_in_order(close, active.as_ref()) {
             self.close_surface(surface, window, cx);
         }
         if let Some(panel) = self.panel_state_mut().filter(|panel| !panel.surfaces.is_empty()) {
@@ -804,23 +879,23 @@ impl Workspace {
 
     /// Keeps the thread's focused preview tab on the browser surface the panel shows.
     fn sync_active_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let (Some(Target::Thread { id: thread_id, .. }), Some(Surface::Browser(tab))) =
-            (self.target.clone(), self.active_surface().cloned())
-        {
-            self.focus_preview_tab(&thread_id, &tab, window, cx);
+        if let (Some(thread), Some(Surface::Browser(tab))) = (self.preview_thread(), self.active_surface().cloned()) {
+            self.focus_preview_tab(&thread, &tab, window, cx);
         }
     }
 
     /// Follows a thread's preview sessions: a panel tab per drawable session.
-    pub(super) fn reconcile_browser_surfaces(&mut self, thread_id: &str, tab_ids: &[&str]) {
-        let Some(target) = self.thread_target(thread_id) else { return };
-        self.right_panel.panels.entry(target).or_default().reconcile_browsers(tab_ids);
+    pub(super) fn reconcile_browser_surfaces(&mut self, thread: &ThreadRef, tab_ids: &[&str]) {
+        let target = super::preview::panel_target(thread);
+        // Preview events reconcile often; only a real change is saved.
+        if self.right_panel.panels.entry(target).or_default().reconcile_browsers(tab_ids) {
+            self.right_panel.layout.changed = true;
+        }
     }
 
     /// Whether the thread's panel has a tab for `tab_id`; `focus` shows it (`revealSurface`).
-    pub(super) fn reveal_browser_surface(&mut self, thread_id: &str, tab_id: &str, focus: bool) -> bool {
-        let Some(target) = self.thread_target(thread_id) else { return false };
-        let Some(panel) = self.right_panel.panels.get_mut(&target) else { return false };
+    pub(super) fn reveal_browser_surface(&mut self, thread: &ThreadRef, tab_id: &str, focus: bool) -> bool {
+        let Some(panel) = self.right_panel.panels.get_mut(&super::preview::panel_target(thread)) else { return false };
         let surface = Surface::Browser(tab_id.to_owned());
         if !panel.surfaces.contains(&surface) {
             return false;
@@ -828,6 +903,7 @@ impl Workspace {
         if focus {
             panel.open = true;
             panel.active = Some(surface);
+            self.right_panel.layout.changed = true;
         }
         true
     }
@@ -865,11 +941,46 @@ impl Workspace {
         self.open_surface(Surface::Diff, window, cx);
     }
 
+    /// `onOpenToolDiff` (`selectToolCall` then the Diff tab): the file change a tool call
+    /// recorded, by the thread and item it was recorded in. It opens without a git repository.
+    pub(super) fn open_tool_call_diff(
+        &mut self,
+        thread_id: String,
+        item_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !matches!(self.target, Some(Target::Thread { .. })) {
+            return;
+        }
+        if let Some(panel) = self.panel_state_mut() {
+            panel.scope = DiffScope::ToolCall { thread_id, item_id };
+            panel.turn_file = None;
+        }
+        self.right_panel.pending_reveal = None;
+        self.open_surface(Surface::Diff, window, cx);
+    }
+
     /// `openFile` for the open target's panel.
     pub(super) fn open_file_surface(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
         self.page = None;
         if let Some(panel) = self.user_panel_state() {
             panel.open_file(path);
+        }
+        self.sync_active_browser(window, cx);
+        cx.notify();
+    }
+
+    /// `openAttachment`: an uploaded attachment's tab on the open target's panel.
+    pub(super) fn open_attachment(
+        &mut self,
+        file: super::files::AttachmentFile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.page = None;
+        if let Some(panel) = self.user_panel_state() {
+            panel.open_attachment(file);
         }
         self.sync_active_browser(window, cx);
         cx.notify();
@@ -1047,7 +1158,7 @@ impl Workspace {
         });
         let offer = match &newly {
             // A thread with pull requests offers those instead of its turn diffs.
-            Some(run) if self.client_settings.values.bool("proactivePanelsEnabled") && !pull_requests => {
+            Some(run) if self.proactive_panels_enabled() && !pull_requests => {
                 let checkpoint = projection.checkpoints.iter().rev().find(|c| c.run_id.as_ref() == Some(run));
                 turn_diff_offer(checkpoint, self.vcs.status.as_ref().map(|status| status.local.is_repo))
             }
@@ -1059,7 +1170,7 @@ impl Workspace {
         let revision = observation.revision;
         self.right_panel.observation = Some(observation);
         let (DiffOffer::Open, Some(run)) = (offer, newly) else { return };
-        if self.right_panel.panels.entry(target).or_default().open_proactive_diff(&run, revision) {
+        if self.right_panel.panels_mut().entry(target).or_default().open_proactive_diff(&run, revision) {
             cx.notify();
         }
     }
@@ -1086,12 +1197,12 @@ impl Workspace {
             0 => linked.as_ref().map(|r| format!("{}:{}#{}", r.project_id, r.repository.to_lowercase(), r.number)),
             _ => Some(visible.join("\n")),
         };
-        let eligible = self.client_settings.values.bool("proactivePanelsEnabled")
-            && key.is_some()
-            && observation.target_key.as_ref() != Some(&key);
+        let eligible =
+            self.proactive_panels_enabled() && key.is_some() && observation.target_key.as_ref() != Some(&key);
         observation.target_key = Some(key.clone());
         let revision = observation.revision;
         let Some(target) = self.thread_target(thread_id) else { return false };
+        // This runs on every thread update; only a tab it opens is saved.
         let panel = self.right_panel.panels.entry(target).or_default();
         let mut changed = false;
         if let (true, Some(linked)) = (follow, &linked) {
@@ -1105,6 +1216,7 @@ impl Workspace {
             }
         }
         if changed {
+            self.right_panel.layout.changed = true;
             cx.notify();
         }
         key.is_some()
@@ -1148,6 +1260,7 @@ impl Workspace {
             DiffScope::Turn(run) => {
                 (turns.iter().find(|t| &t.run_id == run).map_or(0, |t| u64::from(t.turn_count)), 0, 0)
             }
+            DiffScope::ToolCall { .. } => (0, 0, 0),
             _ => self.vcs.status.as_ref().map_or((0, 0, 0), |s| {
                 let (ins, del, _) = git::changes_totals(s);
                 (ins, del, s.local.working_tree.insertions + s.local.working_tree.deletions)
@@ -1155,6 +1268,8 @@ impl Workspace {
         };
         let mutation = match &scope {
             DiffScope::Turn(_) => (None, None),
+            // `resolveToolCallDiffTarget`: the item is read again once it changes.
+            DiffScope::ToolCall { thread_id, item_id } => (self.tool_call_revision(thread_id, item_id), None),
             _ => self
                 .open_projection()
                 .map(|p| workspace_mutation_id(p, turns.first().map(|t| t.completed_at.as_str())))
@@ -1170,7 +1285,7 @@ impl Workspace {
             base_ref: base_ref.clone(),
             ignore_whitespace,
             version,
-            mutation,
+            mutation: mutation.clone(),
             refresh: self.right_panel.refresh,
         };
         if self.right_panel.loaded.as_ref() == Some(&key) {
@@ -1184,7 +1299,17 @@ impl Workspace {
             && matches!(self.right_panel.load, DiffLoad::Ready { .. } | DiffLoad::Empty(_));
         let install = if retain { Install::Update } else { Install::Replace };
         self.right_panel.loaded = Some(key);
-        let (Some(client), Target::Thread { id: thread_id, .. }) = (self.client(), target) else { return };
+        let (Some(client), Target::Thread { env, id: thread_id }) = (self.client(), target) else { return };
+        if let DiffScope::ToolCall { thread_id, item_id } = &scope {
+            let mut input = json!({"threadId": thread_id, "itemId": item_id});
+            if let Some(revision) = mutation.0 {
+                input["revision"] = revision.into();
+            }
+            if let Some(cwd) = cwd {
+                self.read_branch_commits(client.clone(), cwd, remembered_base, cx);
+            }
+            return self.read_tool_call_diff(selection, client, input, ignore_whitespace, install, window, cx);
+        }
         if self.vcs.status.as_ref().is_some_and(|s| !s.local.is_repo) {
             self.right_panel.load =
                 DiffLoad::Empty("Turn diffs are unavailable because this project is not a git repository.");
@@ -1227,21 +1352,10 @@ impl Workspace {
             DiffScope::Unstaged => Some("working-tree"),
             DiffScope::Commit(_) => Some("commit"),
             DiffScope::Branch => Some("branch-range"),
-            DiffScope::Turn(_) => None,
+            DiffScope::Turn(_) | DiffScope::ToolCall { .. } => None,
         };
         if let Some(cwd) = cwd.clone() {
-            let mut input = json!({"cwd": cwd});
-            if let Some(base) = remembered_base.clone() {
-                input["baseRef"] = base.into();
-            }
-            let client = client.clone();
-            self.right_panel._commits_task = Some(cx.spawn(async move |this, cx| {
-                let Ok(reply) = client.request("review.getBranchCommits", input).await else { return };
-                let _ = this.update(cx, |this, cx| {
-                    this.right_panel.commits = parse_commits(&reply);
-                    cx.notify();
-                });
-            }));
+            self.read_branch_commits(client.clone(), cwd, remembered_base.clone(), cx);
         }
         let commit_sha = match &scope {
             DiffScope::Commit(sha) => Some(sha.clone()),
@@ -1268,6 +1382,13 @@ impl Workspace {
                 Ok(Some(parsed)) => parsed.base.clone(),
                 _ => None,
             };
+            // `createGitDiffFileContentsLoader`: a git comparison's files read in full, from its refs.
+            let contents_source = match (&parsed, source_kind, &cwd) {
+                (Ok(Some(parsed)), Some(kind), Some(cwd)) => {
+                    Some(json!({"cwd": cwd, "sourceKind": kind, "baseRef": parsed.base, "headRef": parsed.head}))
+                }
+                _ => None,
+            };
             let base_ref = if commit_sha.is_some() { remembered_base } else { source_base.or(remembered_base) };
             let patch_request = source_kind.zip(cwd).map(|(source_kind, cwd)| diff_load::PatchRequest {
                 cwd,
@@ -1282,6 +1403,15 @@ impl Workspace {
                     this.right_panel.diff_read_at = Some(std::time::Instant::now());
                 }
                 let previous = this.right_panel.patches.take().filter(|_| retain);
+                let loader = contents_source.map(|source| {
+                    contents_loader(
+                        cx.weak_entity(),
+                        move |this| this.env_client(&env),
+                        "review.getDiffFileContents",
+                        source,
+                    )
+                });
+                diff.update(cx, |state, cx| state.set_contents_loader(loader, cx));
                 this.right_panel.load = match parsed {
                     Err(error) => DiffLoad::Failed(error.into()),
                     Ok(None) => {
@@ -1326,10 +1456,100 @@ impl Workspace {
                             base: parsed.base,
                             truncated: parsed.truncated,
                             pending,
+                            omitted: None,
                         }
                     }
                 };
                 this.rebuild_tree_rows(cx);
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    /// `branchCommitsQuery`: the branch's commits for the scope menu.
+    fn read_branch_commits(&mut self, client: RpcClient, cwd: String, base: Option<String>, cx: &mut Context<Self>) {
+        let mut input = json!({"cwd": cwd});
+        if let Some(base) = base {
+            input["baseRef"] = base.into();
+        }
+        self.right_panel._commits_task = Some(cx.spawn(async move |this, cx| {
+            let Ok(reply) = client.request("review.getBranchCommits", input).await else { return };
+            let _ = this.update(cx, |this, cx| {
+                this.right_panel.commits = parse_commits(&reply);
+                cx.notify();
+            });
+        }));
+    }
+
+    /// The revision of a tool call's item in the thread or side chat on screen
+    /// (`turnItemDetailRevision`), while it is still a file change there.
+    fn tool_call_revision(&self, thread_id: &str, item_id: &str) -> Option<String> {
+        let projections = self.open_projection().into_iter().chain(self.side_chat_projection());
+        let mut rows = projections.flat_map(|projection| &projection.visible_turn_items);
+        let row = rows.find(|row| row.source_thread_id == thread_id && row.source_item_id == item_id)?;
+        (row.item.item_type == "file_change").then(|| super::inspector::revision(&row.item).to_string())
+    }
+
+    /// `useTurnItemDetail` for a tool call selection: reads the item and shows its recorded diff.
+    fn read_tool_call_diff(
+        &mut self,
+        selection: (Target, DiffScope),
+        client: RpcClient,
+        input: Value,
+        ignore_whitespace: bool,
+        install: Install,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(install, Install::Replace) {
+            self.right_panel.load = DiffLoad::Loading;
+        }
+        (self.right_panel.patches, self.right_panel.patch_states) = (None, std::rc::Rc::default());
+        let diff = self.right_panel.diff.clone();
+        self.right_panel.diff_reading = true;
+        self.right_panel._task = Some(cx.spawn_in(window, async move |this, cx| {
+            let reply = client.request("orchestration.getTurnItem", input).await;
+            let view = cx
+                .background_executor()
+                .spawn(async move {
+                    reply
+                        .map(|reply| diff_tool_call::view(&reply, ignore_whitespace))
+                        .map_err(|error| error.to_string())
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.right_panel.diff_reading = false;
+                diff.update(cx, |state, cx| state.set_contents_loader(None, cx));
+                let view = match view {
+                    Ok(view) => view,
+                    Err(error) => {
+                        this.right_panel.load = DiffLoad::Failed(error.into());
+                        return cx.notify();
+                    }
+                };
+                let truncated = view.truncated;
+                if !matches!(view.body, diff_tool_call::Body::Files { .. }) {
+                    this.clear_diff(cx);
+                }
+                this.right_panel.load = match view.body {
+                    diff_tool_call::Body::Files { files, omitted } => {
+                        let additions = files.iter().map(DiffFile::additions).sum();
+                        let deletions = files.iter().map(DiffFile::deletions).sum();
+                        this.show_diff_files(&selection, files, install, cx);
+                        this.rebuild_tree_rows(cx);
+                        DiffLoad::Ready { additions, deletions, head: None, base: None, truncated, pending: 0, omitted }
+                    }
+                    diff_tool_call::Body::NoPatch => DiffLoad::Empty("No patch available for this selection."),
+                    diff_tool_call::Body::NoNetChanges => DiffLoad::Empty("No net changes in this selection."),
+                    diff_tool_call::Body::Raw { reason, text } => {
+                        DiffLoad::Raw { reason, text: text.into(), truncated }
+                    }
+                    diff_tool_call::Body::Recorded(content) => DiffLoad::Recorded {
+                        content: content.into_iter().map(|(label, text)| (label, text.into())).collect(),
+                        truncated,
+                    },
+                };
                 cx.notify();
             });
         }));
@@ -1518,7 +1738,9 @@ impl Workspace {
         self.right_panel_open()
             && self.active_surface() == Some(&Surface::Diff)
             && self.diff_available()
-            && self.panel_state().is_some_and(|panel| !matches!(panel.scope, DiffScope::Turn(_)))
+            && self.panel_state().is_some_and(|panel| {
+                matches!(panel.scope, DiffScope::Branch | DiffScope::Unstaged | DiffScope::Commit(_))
+            })
     }
 
     /// `useLiveRefresh(…, { refreshOnShow })` for the git diff: showing it, or the window
@@ -1536,6 +1758,9 @@ impl Workspace {
     }
 
     pub(super) fn render_right_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.persist_panel_layout(cx);
+        self.right_panel.viewport_width = f32::from(window.viewport_size().width);
+        self.sync_right_panel_sheet_focus(window, cx);
         let git_diff_shown = self.git_diff_shown();
         if git_diff_shown && !self.right_panel.git_diff_shown {
             self.revalidate_diff();
@@ -1562,6 +1787,7 @@ impl Workspace {
             self.request_visible_patches(cx);
         }
         let tokens = *theme::tokens(cx);
+        let sheet = self.right_panel_sheet(window);
         let panel = self.panel_state().cloned().unwrap_or_default();
         // A newly active tab, or a new tab, can sit outside the scrolled strip.
         let active_index = panel.active.as_ref().and_then(|active| panel.surfaces.iter().position(|s| s == active));
@@ -1579,14 +1805,15 @@ impl Workspace {
         }
         let content = match (&panel.active, self.target.clone()) {
             (Some(Surface::Diff), _) => self.render_diff_surface(&panel.scope, &tokens, window, cx),
-            (Some(Surface::Browser(tab)), Some(Target::Thread { id: thread_id, .. })) => {
-                self.render_browser_surface(&thread_id, tab, width, window, cx)
+            (Some(Surface::Browser(tab)), Some(Target::Thread { env, id })) => {
+                self.render_browser_surface(&ThreadRef::new(env, id), tab, width, window, cx)
             }
             (Some(Surface::Files), _) => self.render_files_surface(None, width, window, cx),
             (Some(Surface::File(path)), _) => self.render_files_surface(Some(path.clone()), width, window, cx),
+            (Some(Surface::Attachment(file)), _) => self.render_attachment_surface(file, width, window, cx),
             (Some(Surface::SideChat(thread_id)), _) => self.render_side_chat_surface(thread_id, width, window, cx),
             (Some(Surface::PullRequest(reference)), _) => self.render_pull_request_surface(reference, window, cx),
-            (Some(Surface::PullRequests), _) => self.render_linked_pull_requests(cx),
+            (Some(Surface::PullRequests), _) => self.render_linked_pull_requests(window, cx),
             (Some(Surface::Terminal(id)), _) => self.render_terminal_surface(&id.clone(), window, cx),
             _ => self.render_launcher(&tokens, cx),
         };
@@ -1601,8 +1828,10 @@ impl Workspace {
             .cursor_col_resize()
             .on_drag(RightPanelResize, |_, _, _, cx| cx.new(|_| Empty))
             .on_click(cx.listener(|this, event: &gpui_kit::ClickEvent, _, cx| {
-                if event.click_count() == 2 {
-                    this.right_panel.width = DEFAULT_WIDTH;
+                if event.click_count() == 2
+                    && let Some(panel) = this.panel_state_mut()
+                {
+                    panel.width = None;
                     cx.notify();
                 }
             }))
@@ -1626,25 +1855,29 @@ impl Workspace {
                 .h_full()
                 .flex_none()
                 .bg(tokens.background)
+                .children(super::theme_inspect::probe(&["canvas", "border"], cx))
                 .border_l_1()
                 .border_color(tokens.border)
                 .on_drag_move(cx.listener(|this, event: &DragMoveEvent<RightPanelResize>, window, cx| {
                     let viewport = f32::from(window.viewport_size().width);
                     let right = f32::from(event.bounds.right());
-                    this.right_panel.width = (right - f32::from(event.event.position.x)).max(MIN_WIDTH);
+                    let width = (right - f32::from(event.event.position.x)).max(MIN_WIDTH);
                     let sidebar = if this.sidebar_open.docked() { f32::from(this.sidebar_width()) } else { 0. };
-                    this.right_panel.width =
-                        clamp_width(this.right_panel.width, viewport, panel_row(viewport, sidebar));
+                    let width = clamp_width(width, viewport, panel_row(viewport, sidebar));
+                    if let Some(panel) = this.panel_state_mut() {
+                        panel.width = Some(width);
+                    }
                     cx.notify();
                 }))
                 .child({
                     // `COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS`: maximized past a hidden sidebar, clear its toggle.
                     let inset = (panel.maximized && !self.sidebar_open.docked())
                         .then(|| super::titlebar::collapsed_content_left(window));
-                    self.render_tab_bar(&panel, inset, &tokens, window, cx)
+                    self.render_tab_bar(&panel, inset, sheet, &tokens, window, cx)
                 })
                 .child(div().flex_1().min_h_0().flex().flex_col().child(content))
-                .child(deferred(handle).with_priority(1))
+                // The sheet keeps its fixed width (`mode="sheet"` has no resize handle).
+                .when(!sheet, |el| el.child(deferred(handle).with_priority(1)))
                 .children(self.right_panel.tab_menu.as_ref().map(|(menu, position, _)| {
                     deferred(
                         gpui_kit::anchored().position(*position).snap_to_window_with_margin(px(8.)).child(menu.clone()),
@@ -1787,6 +2020,7 @@ impl Workspace {
         &self,
         panel: &PanelState,
         left_inset: Option<Pixels>,
+        sheet: bool,
         tokens: &Tokens,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1811,21 +2045,28 @@ impl Workspace {
             .flex_none()
             .min_w_0()
             .pl(left_inset.unwrap_or(px(8.)))
-            .pr(reserve)
+            .pr(if sheet { px(12.) } else { reserve })
             .gap_1();
+        // Only the inline panel owns the titlebar row (`ownsDesktopTitleBar`); the sheet carries
+        // the layout controls at its right end (`layoutControls`).
+        let (tab_bar, layout_controls) = if sheet {
+            (tab_bar, Some(self.render_sheet_layout_controls(window, cx)))
+        } else {
+            (super::titlebar::drag_region(tab_bar), None)
+        };
         // The open "+" menu has focus; its letters bubble up here (gpui-kit menus bind only arrows,
         // Enter and Escape).
-        super::titlebar::drag_region(tab_bar)
+        tab_bar
             .when(add_menu_open, |el| el.on_key_down(cx.listener(Self::add_surface_for_key)))
             .child(
-                h_flex()
-                    .id("right-panel-tabs")
-                    .min_w_0()
-                    .h_full()
-                    .gap_1()
-                    .overflow_x_scroll()
-                    .track_scroll(&self.right_panel.tabs_scroll)
-                    .children(tabs),
+                super::history_swipe::horizontal_scroller(
+                    h_flex().id("right-panel-tabs"),
+                    &self.right_panel.tabs_scroll,
+                )
+                .min_w_0()
+                .h_full()
+                .gap_1()
+                .children(tabs),
             )
             .child(
                 Button::new("right-panel-add")
@@ -1918,6 +2159,7 @@ impl Workspace {
                         cx.notify();
                     })),
             )
+            .when_some(layout_controls, |el, controls| el.child(div().flex_1()).child(controls))
     }
 
     /// A tab (`h-6 rounded-md pl-1.5 pr-2 text-xs`), its icon turning into a close button on hover
@@ -1949,6 +2191,14 @@ impl Workspace {
                     Icon::empty().path(asset).size(px(12.)).text_color(color).into_any_element()
                 })
             }
+            Surface::Attachment(file) => (
+                format!("attachment:{}", file.id).into(),
+                { file.name.rsplit(['/', '\\']).next().unwrap_or(&file.name).to_owned().into() },
+                {
+                    let (asset, color) = crate::file_icons::file_icon(&file.name, self.dark_theme(cx));
+                    Icon::empty().path(asset).size(px(12.)).text_color(color).into_any_element()
+                },
+            ),
             Surface::SideChat(thread_id) => {
                 let (title, state) = self.side_chat_tab(thread_id);
                 // Static dots: a side chat tab can stay open for a whole run.
@@ -2328,7 +2578,9 @@ impl Workspace {
                 .find(|c| &c.sha == sha)
                 .map_or_else(|| format!("Commit {}", &sha[..sha.len().min(7)]), |c| c.subject.clone())
                 .into(),
+            DiffScope::ToolCall { .. } => "Tool call".into(),
         };
+        let section = diff_comments::section(&scope, &turns, &scope_label);
         let view = cx.entity();
         let menu_scope = scope.clone();
         let menu_turns = turns;
@@ -2443,11 +2695,12 @@ impl Workspace {
                 })
             });
         let scheme = self.diff_color_scheme();
-        let (stats, truncated, pending) = match &self.right_panel.load {
-            DiffLoad::Ready { additions, deletions, truncated, pending, .. } => {
-                (Some((*additions, *deletions)), *truncated, *pending)
+        let (stats, truncated, pending, omitted) = match &self.right_panel.load {
+            DiffLoad::Ready { additions, deletions, truncated, pending, omitted, .. } => {
+                (Some((*additions, *deletions)), *truncated, *pending, *omitted)
             }
-            _ => (None, false, 0),
+            DiffLoad::Raw { truncated, .. } | DiffLoad::Recorded { truncated, .. } => (None, *truncated, 0, None),
+            _ => (None, false, 0, None),
         };
         // `comparisonHeadRef` / `comparisonBaseRef`, with the base as its picker.
         let refs = matches!(scope, DiffScope::Branch).then(|| {
@@ -2468,7 +2721,7 @@ impl Workspace {
             let narrow = refs_width < window.rem_size() * 20.;
             self.render_base_ref_picker(&head, &base, narrow, tokens, window, cx)
         });
-        let can_refresh = !matches!(scope, DiffScope::Turn(_));
+        let can_refresh = matches!(scope, DiffScope::Branch | DiffScope::Unstaged | DiffScope::Commit(_));
         let (shows_files, all_collapsed) = {
             let state = self.right_panel.diff.read(cx);
             let shows = matches!(self.right_panel.load, DiffLoad::Ready { .. }) && !state.files().is_empty();
@@ -2604,6 +2857,25 @@ impl Workspace {
                         )
                     }),
             );
+        // `bg-muted/40` notices above the patch.
+        let notice = |text: SharedString| {
+            div()
+                .px_3()
+                .py(px(6.))
+                .border_b_1()
+                .border_color(tokens.border.opacity(0.7))
+                .bg(tokens.muted.opacity(0.4))
+                .text_size(px(11.))
+                .text_color(tokens.muted_foreground)
+                .child(text)
+        };
+        let truncated_notice =
+            truncated.then(|| notice("This preview exceeds the size limit. Changes shown are incomplete.".into()));
+        let omitted_notice = omitted.map(|(recorded, omitted)| {
+            notice(
+                format!("This tool call changed {recorded} files. The recorded patch omits {omitted} of them.").into(),
+            )
+        });
         let quiet = |text: SharedString| {
             div()
                 .flex_1()
@@ -2619,6 +2891,7 @@ impl Workspace {
         let body = match &self.right_panel.load {
             DiffLoad::Idle | DiffLoad::Loading => quiet(
                 match &scope {
+                    DiffScope::ToolCall { .. } => "Loading tool call diff...",
                     DiffScope::Turn(_) => "Loading checkpoint diff...",
                     DiffScope::Unstaged => "Loading uncommitted changes...",
                     DiffScope::Commit(_) => "Loading commit...",
@@ -2634,27 +2907,30 @@ impl Workspace {
                 .text_color(tokens.error.opacity(0.8))
                 .child(error.clone())
                 .into_any_element(),
+            DiffLoad::Raw { reason, text, .. } => v_flex()
+                .flex_1()
+                .min_h_0()
+                .children(truncated_notice)
+                .child(raw_patch(reason, text, wrap, tokens))
+                .into_any_element(),
+            DiffLoad::Recorded { content, .. } => v_flex()
+                .flex_1()
+                .min_h_0()
+                .children(truncated_notice)
+                .child(recorded_contents(content, wrap, tokens))
+                .into_any_element(),
             DiffLoad::Ready { .. } => v_flex()
                 .flex_1()
                 .min_h_0()
-                .when(truncated, |el| {
-                    el.child(
-                        div()
-                            .px_3()
-                            .py(px(6.))
-                            .border_b_1()
-                            .border_color(tokens.border)
-                            .bg(tokens.muted)
-                            .text_size(px(11.))
-                            .text_color(tokens.muted_foreground)
-                            .child("This preview exceeds the size limit. Changes shown are incomplete."),
-                    )
-                })
+                .children(truncated_notice)
+                .children(omitted_notice)
                 .child(
                     h_flex()
                         .flex_1()
                         .min_h_0()
                         .items_start()
+                        .relative()
+                        .children(super::theme_inspect::probe(&["codeBackground", "codeForeground"], cx))
                         .child({
                             // `--diffs-font-size`, the Code font size.
                             let stats = self.right_panel.patches.as_ref().map(|patches| patches.stats.clone());
@@ -2687,6 +2963,7 @@ impl Workspace {
                                 .flex_1()
                                 .min_h_0()
                                 .text_size(px(tokens.fonts.code_size));
+                            let diff = self.with_diff_comments(diff, section, tokens, cx);
                             match scheme {
                                 DiffColorScheme::RedGreen => diff.into_any_element(),
                                 DiffColorScheme::BlueOrange => DiffTint {
@@ -2698,7 +2975,14 @@ impl Workspace {
                         })
                         .when(tree_open, |el| {
                             let row = self.right_panel_width(window).unwrap_or_default();
-                            el.child(self.render_diff_tree(row, tokens, window, cx))
+                            el.child(self.render_diff_tree(
+                                diff_tree::TreeOwner::Changes,
+                                row,
+                                None,
+                                tokens,
+                                window,
+                                cx,
+                            ))
                         }),
                 )
                 // `DiffFileLoadingBoundary` while file patches are still on their way.
@@ -2771,6 +3055,59 @@ impl Workspace {
             .child(segment("diff-stacked", "icons/rows-3.svg", !split, false, cx))
             .child(segment("diff-split", "icons/columns-2.svg", split, true, cx))
     }
+}
+
+/// A tool call's patch the viewer can't read: why, then its text (`renderablePatch.kind === "raw"`).
+fn raw_patch(reason: &'static str, text: &SharedString, wrap: bool, tokens: &Tokens) -> impl IntoElement {
+    let block = div()
+        .id("diff-raw-patch")
+        .rounded(px(6.))
+        .border_1()
+        .border_color(tokens.border.opacity(0.7))
+        .bg(tokens.background.opacity(0.7))
+        .p_3()
+        .font_family(tokens.fonts.mono)
+        .text_size(px(11.))
+        .line_height(gpui_kit::relative(1.625))
+        .text_color(tokens.muted_foreground.opacity(0.9))
+        .when(!wrap, gpui_kit::Styled::whitespace_nowrap)
+        .overflow_x_scroll()
+        .child(gpui_kit::base::SelectableText::new("diff-raw-patch-text", text.clone()));
+    div().id("diff-raw").flex_1().min_h_0().overflow_y_scroll().p_2().child(
+        v_flex()
+            .gap_2()
+            .child(div().text_size(px(11.)).text_color(tokens.muted_foreground.opacity(0.75)).child(reason))
+            .child(block),
+    )
+}
+
+/// File contents a tool call recorded without a diff, each under its label.
+fn recorded_contents(content: &[(&'static str, SharedString)], wrap: bool, tokens: &Tokens) -> impl IntoElement {
+    let entries = content.iter().enumerate().map(|(index, (label, text))| {
+        let text = if text.is_empty() { SharedString::from("Empty content.") } else { text.clone() };
+        v_flex().gap_1().child(div().text_color(tokens.muted_foreground).child(*label)).child(
+            div()
+                .id(ElementId::NamedInteger("diff-recorded".into(), index as u64))
+                .font_family(tokens.fonts.mono)
+                .text_size(px(11.))
+                .when(!wrap, gpui_kit::Styled::whitespace_nowrap)
+                .overflow_x_scroll()
+                .child(gpui_kit::base::SelectableText::new(
+                    ElementId::NamedInteger("diff-recorded-text".into(), index as u64),
+                    text,
+                )),
+        )
+    });
+    v_flex()
+        .id("diff-recorded-contents")
+        .flex_1()
+        .min_h_0()
+        .overflow_y_scroll()
+        .p_3()
+        .gap_3()
+        .text_xs()
+        .child(div().text_color(tokens.muted_foreground).child("The provider recorded file content without a diff."))
+        .children(entries)
 }
 
 /// A menu row's 16px icon (`sm:size-4`, `-mx-0.5`): the menu lays icons out in a 12px box, so
@@ -3387,18 +3724,41 @@ mod tests {
     }
 
     #[test]
+    fn attachments_open_as_their_own_tabs_without_a_workspace() {
+        use crate::app::files::AttachmentFile;
+        let file = || AttachmentFile { id: "a1".into(), name: "notes.txt".into(), mime: "text/plain".into(), size: 3 };
+        let mut panel = PanelState::default();
+        panel.upsert(Surface::Files);
+        panel.open_file("notes.txt".into());
+        panel.upsert(Surface::Files);
+        panel.open_attachment(file());
+        assert_eq!(
+            panel.surfaces,
+            [Surface::File("notes.txt".into()), Surface::Attachment(file())],
+            "an attachment is not the workspace file of its name, and replaces the standalone tree"
+        );
+        panel.upsert(Surface::Diff);
+        panel.open_attachment(file());
+        assert_eq!(panel.surfaces.len(), 3, "reopening an attachment focuses its tab");
+        assert_eq!(panel.active, Some(Surface::Attachment(file())));
+        panel.close(&Surface::Attachment(file()));
+        assert_eq!(panel.surfaces, [Surface::File("notes.txt".into()), Surface::Diff]);
+    }
+
+    #[test]
     fn browser_tabs_follow_the_preview_sessions() {
         let browser = |tab: &str| Surface::Browser(tab.into());
         let mut panel = PanelState::default();
         panel.upsert(Surface::Diff);
         panel.upsert(browser("gone"));
-        panel.reconcile_browsers(&["kept", "new"]);
+        assert!(panel.reconcile_browsers(&["kept", "new"]));
         assert_eq!(panel.surfaces, [Surface::Diff, browser("kept"), browser("new")]);
         assert_eq!(panel.active, Some(browser("kept")), "a closed active tab falls back to a browser");
         assert!(panel.open);
+        assert!(!panel.reconcile_browsers(&["kept", "new"]), "the same sessions change nothing to save");
         let mut only_browser = PanelState::default();
         only_browser.upsert(browser("a"));
-        only_browser.reconcile_browsers(&[]);
+        assert!(only_browser.reconcile_browsers(&[]));
         assert!(!only_browser.open, "losing the last session hides the panel");
         let mut restarted = PanelState::default();
         restarted.reconcile_browsers(&["left"]);

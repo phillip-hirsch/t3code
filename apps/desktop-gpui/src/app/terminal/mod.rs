@@ -19,7 +19,6 @@ use std::time::Duration;
 
 use gpui_kit::component::button::Button;
 use gpui_kit::component::button::ButtonVariant;
-use gpui_kit::component::input::InlineToken;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Disableable as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -31,10 +30,10 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use self::layout::{DrawerLayout, Place, Split};
-use self::session::{Launch, SessionEvent, TerminalSession};
+pub(in crate::app) use self::session::{Launch, SessionEvent, TerminalSession};
+use super::draft_sessions::DraftId;
 use super::titlebar::icon;
 use super::{Target, Workspace};
-use crate::composer_text::Chip;
 use crate::rpc::RpcClient;
 use crate::theme::{self, Tokens};
 
@@ -111,18 +110,15 @@ pub(super) struct Terminals {
     /// The environment whose metadata stream reported each thread's terminals.
     summary_environments: HashMap<String, SharedString>,
     /// The id a draft's thread will launch with, so its terminals carry over.
-    draft_threads: HashMap<String, String>,
+    draft_threads: HashMap<DraftId, String>,
     /// The terminal to focus once it mounts, by thread: another thread's request never lands.
     focus_pending: Option<(String, String)>,
-    /// Selections added to chat, by context id: the `TerminalContextRecord` each chip sends.
-    pub(super) contexts: HashMap<String, Value>,
     /// Right-panel terminal tabs, by surface id.
     panel: HashMap<String, panel::PanelGroup>,
 }
 
-/// `COMPOSER_CONTEXT_TERMINAL_TEXT_MAX_CHARS` and `clampContextText`'s marker.
+/// `COMPOSER_CONTEXT_TERMINAL_TEXT_MAX_CHARS`.
 const CONTEXT_TEXT_MAX: usize = 64_000;
-const TRUNCATION_MARKER: &str = "\n… truncated …";
 
 /// `formatTerminalContextLabel`.
 fn context_label(terminal_label: &str, line_start: usize, line_end: usize) -> String {
@@ -135,17 +131,7 @@ fn context_label(terminal_label: &str, line_start: usize, line_end: usize) -> St
 
 /// `terminalContextRecord`: the text clamped to the server's limit in UTF-16 units.
 fn context_record(id: &str, terminal_id: &str, terminal_label: &str, selected: &session::Selected) -> Value {
-    let mut text = selected.text.clone();
-    if text.encode_utf16().count() > CONTEXT_TEXT_MAX {
-        let budget = CONTEXT_TEXT_MAX - TRUNCATION_MARKER.encode_utf16().count();
-        let mut units = 0;
-        let end = text.char_indices().find(|(_, c)| {
-            units += c.len_utf16();
-            units > budget
-        });
-        text.truncate(end.map_or(text.len(), |(i, _)| i));
-        text.push_str(TRUNCATION_MARKER);
-    }
+    let text = crate::composer_context::clamp_text(&selected.text, CONTEXT_TEXT_MAX);
     let label = context_label(terminal_label, selected.line_start, selected.line_end);
     json!({
         "version": 1,
@@ -230,21 +216,21 @@ impl Terminals {
         }));
     }
 
-    /// The thread id the draft in `project_id` launches with, if its terminal drawer used one.
-    pub(super) fn take_draft_thread(&mut self, project_id: &str) -> Option<String> {
-        self.draft_threads.remove(project_id)
+    /// The thread id `draft` launches with, if its terminal drawer used one.
+    pub(super) fn take_draft_thread(&mut self, draft: &DraftId) -> Option<String> {
+        self.draft_threads.remove(draft)
     }
 
-    /// The project whose unsent draft launches with `thread_id`.
-    fn draft_project(&self, thread_id: &str) -> Option<&str> {
-        self.draft_threads.iter().find(|(_, id)| *id == thread_id).map(|(project_id, _)| project_id.as_str())
+    /// The unsent draft that launches with `thread_id`.
+    fn draft_of(&self, thread_id: &str) -> Option<&DraftId> {
+        self.draft_threads.iter().find(|(_, id)| *id == thread_id).map(|(draft, _)| draft)
     }
 
     fn summaries(&self, thread_id: &str) -> &[Summary] {
         self.summaries.as_ref().and_then(|all| all.get(thread_id)).map_or(&[], Vec::as_slice)
     }
 
-    fn running(&self, thread_id: &str) -> Vec<&str> {
+    pub(in crate::app) fn running(&self, thread_id: &str) -> Vec<&str> {
         self.summaries(thread_id).iter().filter(|s| s.running_subprocess).map(|s| s.terminal_id.as_str()).collect()
     }
 
@@ -330,11 +316,11 @@ impl Workspace {
     pub(in crate::app) fn terminal_thread(&mut self, create: bool) -> Option<String> {
         match self.target.as_ref()? {
             Target::Thread { id, .. } => Some(id.clone()),
-            Target::Draft { project_id, .. } => match self.terminals.draft_threads.get(project_id) {
+            Target::Draft { draft, .. } => match self.terminals.draft_threads.get(draft) {
                 Some(id) => Some(id.clone()),
                 None if create => {
                     let id = super::new_id();
-                    self.terminals.draft_threads.insert(project_id.clone(), id.clone());
+                    self.terminals.draft_threads.insert(draft.clone(), id.clone());
                     Some(id)
                 }
                 None => None,
@@ -345,7 +331,7 @@ impl Workspace {
     fn shown_terminal_thread(&self) -> Option<&str> {
         match self.target.as_ref()? {
             Target::Thread { id, .. } => Some(id),
-            Target::Draft { project_id, .. } => self.terminals.draft_threads.get(project_id).map(String::as_str),
+            Target::Draft { draft, .. } => self.terminals.draft_threads.get(draft).map(String::as_str),
         }
     }
 
@@ -362,8 +348,8 @@ impl Workspace {
         Some(Launch {
             cwd: worktree_path.clone().unwrap_or_else(|| project.workspace_root.clone()),
             worktree_path,
-            project_root: project.workspace_root.clone(),
-            stop_on_settle: None,
+            project_root: Some(project.workspace_root.clone()),
+            ..Launch::default()
         })
     }
 
@@ -410,6 +396,7 @@ impl Workspace {
                 pane.session.update(cx, |session, cx| session.attach(client.clone(), cx));
             }
         }
+        self.reattach_setup_terminal(&environment, client, cx);
         task
     }
 
@@ -517,12 +504,13 @@ impl Workspace {
             None => self.launch_terminal_with(thread_id.clone(), Place::New, launch, Some(input), cx),
         };
         let environment = self.thread_environment(&thread_id);
-        match run.preview_url.clone().map(|url| self.resolve_server_url(environment.as_deref(), url)) {
-            Some(url) => cx
+        let preview = self.preview_thread_of(&thread_id);
+        match run.preview_url.clone().map(|url| self.resolve_server_url(environment.as_deref(), url)).zip(preview) {
+            Some((url, thread)) => cx
                 .spawn_in(window, async move |this, cx| {
                     if written.await {
                         let _ = this.update_in(cx, |this, window, cx| {
-                            this.open_preview_tab(thread_id, Some(url), window, cx);
+                            this.open_preview_tab(thread, Some(url), window, cx);
                         });
                     }
                 })
@@ -576,8 +564,8 @@ impl Workspace {
         };
         self.terminals.focus_later(&thread_id, &terminal_id);
         let payload = launch.payload(&thread_id, &terminal_id);
-        let origin = match self.terminals.draft_project(&thread_id) {
-            Some(project_id) => self.draft_target(project_id),
+        let origin = match self.terminals.draft_of(&thread_id) {
+            Some(draft) => self.drafts.target(draft),
             None => self.thread_target(&thread_id),
         }
         .or_else(|| self.target.clone());
@@ -795,7 +783,7 @@ impl Workspace {
             }
             // `openTerminalLinkInPreview`: the in-app browser when links open there, else the system's.
             SessionEvent::OpenUrl { url, force_browser } => {
-                let thread = self.preview_thread_id().filter(|id| *id == thread_id).map(str::to_owned);
+                let thread = self.preview_thread().filter(|thread| thread.thread_id == *thread_id);
                 let in_app = crate::preview::link_opens_in_app(
                     url,
                     *force_browser,
@@ -807,15 +795,18 @@ impl Workspace {
                     None => cx.open_url(url),
                 }
             }
-            SessionEvent::OpenPath(path) => match self.preferred_editor_id() {
-                Some(editor) => {
-                    self.open_path_in_editor(path.clone(), editor, false, "Unable to open path".into(), window, cx);
+            SessionEvent::OpenPath(path) => match self.preferred_editor_id().zip(self.active_environment().cloned()) {
+                Some((editor, environment)) => {
+                    let failure = "Unable to open path".to_owned();
+                    self.open_path_in_editor(&environment, path.clone(), editor, false, failure, window, cx);
                 }
                 None => {
                     self.error = Some("No editor is available to open this path.".into());
                     cx.notify();
                 }
             },
+            // Only a sink session sends these, and drawer panes are never sinks.
+            SessionEvent::Input(_) | SessionEvent::Resize { .. } => {}
         }
     }
 
@@ -829,42 +820,13 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.question.is_some() {
-            return;
-        }
+        let Some(target) = self.target.clone() else { return };
         let terminal_label = self.terminals.label(thread_id, terminal_id);
         let id = format!("terminal_{}", super::new_id());
         let record = context_record(&id, terminal_id, &terminal_label, selected);
-        let label = record["label"].as_str().unwrap_or_default().to_owned();
-        let chip = Chip::Context { kind: "terminal".into(), id: id.clone(), label: label.clone() };
-        let link = crate::composer_text::context_link("terminal", &id, &label);
-        self.terminals.contexts.insert(id, record);
-        self.composer.update(cx, |state, cx| {
-            let at = state.cursor();
-            if at > 0 && !state.value()[..at].ends_with(char::is_whitespace) {
-                state.insert(" ", window, cx);
-            }
-            let at = state.cursor();
-            let token = InlineToken::new(chip.id(), link).with_label(label);
-            if state.replace_range_with_token(at..at, token, window, cx).is_ok() {
-                state.insert(" ", window, cx);
-            }
-        });
-        self.sync_composer_empty(cx);
-        self.focus_composer(window, cx);
-        cx.notify();
-    }
-
-    /// The terminal records the prompt's chips name (`buildMessageContext` puts them first).
-    pub(super) fn terminal_context_records(&self, text: &str) -> Vec<Value> {
-        let mut found: Vec<(usize, &Value)> = self
-            .terminals
-            .contexts
-            .iter()
-            .filter_map(|(id, record)| Some((text.find(&format!("/terminal/{id})"))?, record)))
-            .collect();
-        found.sort_by_key(|(at, _)| *at);
-        found.into_iter().map(|(_, record)| record.clone()).collect()
+        if self.add_context_record(&target, record, window, cx).is_some() {
+            self.focus_composer(window, cx);
+        }
     }
 
     /// Wires the terminal actions onto the workspace root.
@@ -934,7 +896,12 @@ impl Workspace {
                 .flex_1()
                 .min_h_0()
                 .w_full()
-                .bg(tokens.background)
+                .bg(tokens.terminal.background)
+                .relative()
+                .children(super::theme_inspect::probe(
+                    &["terminalBackground", "terminalForeground", "terminalCursor", "terminalSelection"],
+                    cx,
+                ))
                 .when(has_sidebar, |el| el.gap(px(6.)))
                 .child(self.render_terminal_panes(drawer, &tokens))
                 .when(has_sidebar, |el| {
@@ -1471,17 +1438,18 @@ mod tests {
         assert_eq!(record["label"], "Terminal 1 lines 2-9");
         let text = record["text"].as_str().unwrap();
         assert_eq!(text.encode_utf16().count(), CONTEXT_TEXT_MAX);
-        assert!(text.ends_with(TRUNCATION_MARKER));
+        assert!(text.ends_with("\n… truncated …"));
     }
 
     #[test]
-    fn a_drafts_future_thread_maps_back_to_its_project_until_sent() {
+    fn a_drafts_future_thread_maps_back_to_its_draft_until_sent() {
         let mut terminals = Terminals::default();
-        terminals.draft_threads.insert("project".into(), "future".into());
-        assert_eq!(terminals.draft_project("future"), Some("project"));
-        assert_eq!(terminals.draft_project("other"), None);
-        terminals.take_draft_thread("project");
-        assert_eq!(terminals.draft_project("future"), None, "a sent draft's thread is listed");
+        let draft = DraftId::for_test("draft");
+        terminals.draft_threads.insert(draft.clone(), "future".into());
+        assert_eq!(terminals.draft_of("future"), Some(&draft));
+        assert_eq!(terminals.draft_of("other"), None);
+        terminals.take_draft_thread(&draft);
+        assert_eq!(terminals.draft_of("future"), None, "a sent draft's thread is listed");
     }
 
     #[test]

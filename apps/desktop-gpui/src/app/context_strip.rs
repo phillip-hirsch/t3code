@@ -85,6 +85,8 @@ pub(super) enum PermissionsForm {
 #[derive(Default)]
 pub(super) struct DraftWorkspaceState {
     project_id: Option<String>,
+    /// The draft the picks belong to; another draft of the project starts without them.
+    draft: Option<super::draft_sessions::DraftId>,
     pub(super) choice: WorkspaceChoice,
     default_mode: Option<EnvMode>,
     start_from_origin_default: bool,
@@ -162,8 +164,10 @@ impl RefSearch {
     }
 }
 
-/// One row of the branch picker: a ref, or "Create new ref".
+/// One row of the branch picker: "Checkout pull request" for the reference the search names, a
+/// ref, or "Create new ref".
 enum BranchItem {
+    Checkout(String),
     Ref(Value),
     Create(String),
 }
@@ -172,20 +176,22 @@ enum BranchItem {
 const NEXT_PAGE_DISTANCE: f32 = 96.;
 
 impl Workspace {
-    /// Loads the draft's default workspace mode and refs when its project changes.
+    /// Loads the draft's default workspace mode and refs when the draft or its project changes.
     pub(super) fn sync_draft_workspace(&mut self, cx: &mut Context<Self>) {
-        let Some(Target::Draft { project_id, .. }) = self.target.clone() else { return };
-        if self.draft_workspace.project_id.as_ref() == Some(&project_id) {
+        let Some(Target::Draft { project_id, draft, .. }) = self.target.clone() else { return };
+        let state = &self.draft_workspace;
+        if state.project_id.as_ref() == Some(&project_id) && state.draft.as_ref() == Some(&draft) {
             return;
         }
-        // Reset first, so nothing from the previous project survives; send.rs resolves the
+        // Reset first, so nothing from the previous draft survives; send.rs resolves the
         // workspace itself when this never loads.
-        self.draft_workspace = DraftWorkspaceState { project_id: Some(project_id.clone()), ..Default::default() };
+        self.draft_workspace =
+            DraftWorkspaceState { project_id: Some(project_id.clone()), draft: Some(draft), ..Default::default() };
         let (Some(client), Some(project)) = (self.client(), self.shell.projects.iter().find(|p| p.id == project_id))
         else {
             return;
         };
-        let has_threads = self.shell.threads.iter().any(|t| t.project_id == project_id);
+        let has_threads = self.shell.project_has_threads(project);
         let workspace = DraftWorkspace::new(self.server_info(), project, has_threads);
         self.draft_workspace.start_from_origin_default = workspace.start_from_origin();
         let cwd = project.workspace_root.clone();
@@ -242,6 +248,7 @@ impl Workspace {
                         self.select_branch(name, window, cx);
                     }
                     Some(BranchItem::Create(name)) => self.create_branch(name, cx),
+                    Some(BranchItem::Checkout(reference)) => self.pick_checkout_item(reference, window, cx),
                     None => return false,
                 }
             }
@@ -251,8 +258,9 @@ impl Workspace {
         true
     }
 
-    /// The picker's rows: its loaded refs that match the search, then "Create new ref" when no
-    /// ref has that exact name (`branchPickerItems`, `shouldIncludeBranchPickerItem`).
+    /// The picker's rows: "Checkout pull request" when the search names one and the draft can
+    /// check it out, its loaded refs that match the search, then "Create new ref" when no ref has
+    /// that exact name (`branchPickerItems`, `shouldIncludeBranchPickerItem`).
     fn branch_items(&self) -> Vec<BranchItem> {
         let state = &self.draft_workspace;
         let (_, worktree_base, _) = self.branch_trigger();
@@ -262,14 +270,31 @@ impl Workspace {
         let exact = refs.iter().any(|r| r["name"].as_str() == Some(state.branch_pages.query.as_str()));
         let create =
             (!query.is_empty() && !exact && !worktree_base).then(|| BranchItem::Create(state.branch_query.clone()));
-        refs.into_iter()
-            .filter(|r| {
-                let name = r["name"].as_str().unwrap_or_default().to_lowercase();
-                query.is_empty() || name.contains(&query) || name.contains(&sanitized)
-            })
-            .map(|r| BranchItem::Ref(r.clone()))
+        let checkout = self
+            .can_checkout_pull_request()
+            .then(|| crate::pull_request_checkout::parse_reference(&state.branch_query))
+            .flatten()
+            .map(BranchItem::Checkout);
+        checkout
+            .into_iter()
+            .chain(
+                refs.into_iter()
+                    .filter(|r| {
+                        let name = r["name"].as_str().unwrap_or_default().to_lowercase();
+                        query.is_empty() || name.contains(&query) || name.contains(&sanitized)
+                    })
+                    .map(|r| BranchItem::Ref(r.clone())),
+            )
             .chain(create)
             .collect()
+    }
+
+    /// "Checkout pull request" picked: the picker closes, the composer takes focus, and the
+    /// checkout dialog opens on the reference.
+    fn pick_checkout_item(&mut self, reference: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.draft_workspace.branch_open = false;
+        self.focus_composer(window, cx);
+        self.open_pull_request_checkout(Some(reference), window, cx);
     }
 
     /// Fetches the picker's first page for its current search, or the next page after the last.
@@ -437,6 +462,10 @@ impl Workspace {
     }
 
     fn set_env_mode(&mut self, mode: EnvMode, cx: &mut Context<Self>) {
+        // Several models each take a new worktree, whatever the mode (`onEnvModeChange`).
+        if self.model_fanout().is_some() {
+            return;
+        }
         let choice = &mut self.draft_workspace.choice;
         choice.mode = Some(mode);
         choice.existing_worktree = None;
@@ -935,7 +964,11 @@ impl Workspace {
             .child(div().max_w(px(240.)).truncate().child(label));
         let popover = self.branch_popover("branch-popover", trigger, false, t, cx);
         let wrap = div().id("branch-selector-wrap").min_w_0().child(popover);
-        with_copy_menu(wrap, branch.map(str::to_owned), "Copy branch name", "Branch name copied")
+        let selector = with_copy_menu(wrap, branch.map(str::to_owned), "Copy branch name", "Branch name copied");
+        match self.render_composer_pull_request_badge(branch, cx) {
+            Some(badge) => h_flex().min_w_0().gap(px(4.)).child(badge).child(selector).into_any_element(),
+            None => selector,
+        }
     }
 
     fn render_branch_popover(
@@ -958,6 +991,15 @@ impl Workspace {
             });
             let r = match item {
                 BranchItem::Ref(r) => r,
+                BranchItem::Checkout(reference) => {
+                    let row = self.render_checkout_branch_item(&reference, highlighted, t);
+                    return row
+                        .on_mouse_move(hover)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.pick_checkout_item(reference.clone(), window, cx);
+                        }))
+                        .into_any_element();
+                }
                 BranchItem::Create(name) => {
                     let label = format!("Create new ref \"{name}\"");
                     return div()

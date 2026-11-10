@@ -210,7 +210,6 @@ pub(in crate::app) struct SettingRow {
     control_beside: Option<AnyElement>,
     /// A reset the row works out itself, replacing the bound keys' default.
     reset: Option<Option<Value>>,
-    unavailable: bool,
     /// Edits server settings although no key is bound (`serverScoped`).
     server_scoped: bool,
     /// Dot paths inside a setting an administrator can lock (`managedPaths`).
@@ -261,7 +260,6 @@ impl SettingRow {
             keys: Vec::new(),
             control: Control::None,
             control_beside: None,
-            unavailable: false,
             reset: None,
             server_scoped: false,
             managed_paths: Vec::new(),
@@ -299,12 +297,6 @@ impl SettingRow {
     /// Content under the row's text and control, such as a list.
     pub(in crate::app) fn body(mut self, body: impl IntoElement) -> Self {
         self.body = Some(body.into_any_element());
-        self
-    }
-
-    /// `SettingsUnavailableGroup`: dimmed text and an inert control.
-    pub(in crate::app) fn unavailable(mut self) -> Self {
-        self.unavailable = true;
         self
     }
 
@@ -532,7 +524,7 @@ fn scroll_target_marker(pending: Rc<Cell<u8>>, scroll: ScrollHandle) -> impl Int
     .size_full()
 }
 
-fn section_frame(
+pub(in crate::app) fn section_frame(
     id: impl Into<ElementId>,
     title: impl IntoElement,
     action: Option<AnyElement>,
@@ -628,7 +620,6 @@ pub(in crate::app) struct RowFrame {
     /// The control hugs its content under the title and is at least this wide beside it.
     hug: Option<Pixels>,
     body: Option<AnyElement>,
-    dimmed: bool,
 }
 
 impl RowFrame {
@@ -643,7 +634,6 @@ impl RowFrame {
             control_beside: None,
             hug: None,
             body: None,
-            dimmed: false,
         }
     }
 
@@ -667,18 +657,11 @@ impl RowFrame {
         self
     }
 
-    /// `SettingsUnavailableGroup` dims titles and descriptions to 64%.
-    pub(in crate::app) fn dimmed(mut self, dimmed: bool) -> Self {
-        self.dimmed = dimmed;
-        self
-    }
-
     /// The row remembers its width under its call site and its ancestors' ids, so rows from one
     /// call site that sit in columns of different widths need parents with their own ids.
     #[track_caller]
     pub(in crate::app) fn render(self, t: &Tokens) -> gpui_kit::Div {
         let layout_id = ElementId::CodeLocation(*std::panic::Location::caller());
-        let text = if self.dimmed { 0.64 } else { 1. };
         let has_body = self.body.is_some();
         let label = v_flex()
             .flex_1()
@@ -693,19 +676,14 @@ impl RowFrame {
                             .text_sm()
                             .line_height(px(20.))
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(t.foreground.opacity(text))
+                            .text_color(t.foreground)
                             .child(self.title),
                     )
                     .children(self.marker)
                     .child(div().size(px(20.)).flex().items_center().justify_center().children(self.reset)),
             )
             .children(self.description.map(|description| {
-                div()
-                    .max_w(px(672.))
-                    .text_xs()
-                    .line_height(px(18.))
-                    .text_color(t.muted_foreground.opacity(text))
-                    .child(description)
+                div().max_w(px(672.)).text_xs().line_height(px(18.)).text_color(t.muted_foreground).child(description)
             }))
             .children(
                 self.status.map(|status| div().pt(px(2.)).text_xs().text_color(t.muted_foreground).child(status)),
@@ -827,7 +805,12 @@ impl Workspace {
             })
             .collect();
         let mut view = SettingsView {
-            scope: Scope { kind: ScopeKind::All, label: String::new(), environment_ids: Vec::new() },
+            scope: Scope {
+                kind: ScopeKind::All,
+                label: String::new(),
+                environment_ids: Vec::new(),
+                checkout_environment: None,
+            },
             targets: Vec::new(),
             groups,
             search: self.settings_ui.scope.clone(),
@@ -1200,7 +1183,7 @@ impl Workspace {
         // Values set right here explain nothing new, so their marker waits for hover.
         let quiet_marker = overriding.is_empty();
         let reset = self.render_reset(view, &row, &scoped_keys, mixed, lock.is_some(), cx);
-        let SettingRow { id, title, description, status, tip, body, control, control_beside, unavailable, .. } = row;
+        let SettingRow { id, title, description, status, tip, body, control, control_beside, .. } = row;
         let (state, summary) = match view.environment() {
             Some(environment) => scope::row_inheritance(&view.scope, &view.targets, &environment, &keys),
             None => (InheritanceState::Default, "Built-in default".to_owned()),
@@ -1215,14 +1198,13 @@ impl Workspace {
                 .then(|| SharedString::from("Environment-wide setting. Select an environment to change it."))
         });
         let control = self.render_control(view, &id, keys.first().copied(), control, mixed, window, cx);
-        // A row's own body goes inert only with the row unavailable (`SettingsRow` children).
+        // A row's own body stays live; only a body field goes inert (`SettingsRow` children).
         let (control, hug, body, inert_body) = match control {
             Some(RowControl::Body(field)) => (None, None, Some(field), true),
-            Some(RowControl::Side(control)) => (Some(control), None, body, unavailable),
-            Some(RowControl::Hugging(control, min)) => (Some(control), Some(min), body, unavailable),
-            None => (None, None, body, unavailable),
+            Some(RowControl::Side(control)) => (Some(control), None, body, false),
+            Some(RowControl::Hugging(control, min)) => (Some(control), Some(min), body, false),
+            None => (None, None, body, false),
         };
-        let inert = if unavailable { Some(SharedString::default()) } else { inert };
         let group: SharedString = format!("settings-row-{id}").into();
         let target = self.settings_ui.target.as_ref() == Some(&id);
         let title = h_flex().gap(px(6.)).child(title).when_some(tip, |el, tip| {
@@ -1233,7 +1215,7 @@ impl Workspace {
                     .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx)),
             )
         });
-        let mut frame = RowFrame::new(title).dimmed(unavailable).status(status);
+        let mut frame = RowFrame::new(title).status(status);
         frame.marker = inheritance.map(|marker| {
             div()
                 .size(px(20.))
@@ -1244,7 +1226,7 @@ impl Workspace {
                 .child(marker)
                 .into_any_element()
         });
-        frame.reset = reset.filter(|_| !unavailable);
+        frame.reset = reset;
         frame.description = description;
         frame.hug = hug;
         // `inert`: a cover over the control or body takes its pointer events and carries the
@@ -1771,9 +1753,11 @@ impl Workspace {
             (Some(_), None) => "Unavailable project".to_owned(),
             (None, None) => "All projects".to_owned(),
         };
+        // A checkout pick names its checkout's environment (`environmentAxisValue`).
+        let environment_value = search.machine.clone().or_else(|| view.scope.checkout_environment.clone());
         let selected_environment =
-            search.machine.as_deref().and_then(|id| view.environments.iter().find(|e| e.id == id));
-        let environment_label = match (&search.machine, selected_environment) {
+            environment_value.as_deref().and_then(|id| view.environments.iter().find(|e| e.id == id));
+        let environment_label = match (&environment_value, selected_environment) {
             (_, Some(environment)) => environment.label.clone(),
             (Some(_), None) => "Unavailable environment".to_owned(),
             (None, None) if single => "No environments".to_owned(),
@@ -1784,8 +1768,13 @@ impl Workspace {
         };
         let environment_icon = selected_environment.map(|e| machine_glyph(&e.machine, &t));
         let projects: Rc<Vec<ScopeProject>> = Rc::new(self.scope_projects(view));
-        let environments: Vec<(String, String, String)> =
-            view.environments.iter().map(|e| (e.id.clone(), e.label.clone(), e.machine.clone())).collect();
+        // A picked project offers only the environments its checkouts live on.
+        let environments: Vec<(String, String, String)> = view
+            .environments
+            .iter()
+            .filter(|e| selected.is_none_or(|group| group.members.iter().any(|m| *m.project.environment_id == e.id)))
+            .map(|e| (e.id.clone(), e.label.clone(), e.machine.clone()))
+            .collect();
         let pick = |workspace: gpui_kit::Entity<Workspace>, next: scope::ScopeSearch| {
             move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut gpui_kit::App| {
                 workspace.update(cx, |this, cx| {
@@ -1851,7 +1840,7 @@ impl Workspace {
                 .into_any_element()
         };
         let environment_menu = {
-            let (search, workspace) = (search.clone(), workspace);
+            let (search, workspace, value) = (search.clone(), workspace, environment_value.clone());
             scope_trigger("settings-scope-environment", environment_icon, environment_label, &t)
                 .dropdown_menu_with_anchor(gpui_kit::Anchor::TopLeft, move |mut menu, _, _| {
                     if !single {
@@ -1859,7 +1848,7 @@ impl Workspace {
                             .item(
                                 PopupMenuItem::new("All environments")
                                     .icon(IconName::Layers)
-                                    .checked(search.machine.is_none())
+                                    .checked(value.is_none())
                                     .on_click(pick(workspace.clone(), search.with_machine(None))),
                             )
                             .separator();
@@ -1868,14 +1857,14 @@ impl Workspace {
                         menu = menu.item(
                             PopupMenuItem::new(label.clone())
                                 .icon(Icon::empty().path(machine_icon(machine)))
-                                .checked(search.machine.as_deref() == Some(id.as_str()))
+                                .checked(value.as_deref() == Some(id.as_str()))
                                 .on_click(pick(workspace.clone(), search.with_machine(Some(id.clone())))),
                         );
                     }
                     menu
                 })
         };
-        let joiner = if search.machine.is_some() { "on" } else { "across" };
+        let joiner = if environment_value.is_some() { "on" } else { "across" };
         h_flex()
             .flex_wrap()
             .gap_x(px(6.))

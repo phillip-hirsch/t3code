@@ -63,7 +63,7 @@ impl Workspace {
         let project_scope = matches!(view.scope.kind, ScopeKind::Project { .. });
         let sections = [
             self.render_device_integration(view, project_scope, cx),
-            self.render_device_sources(project_scope, window, cx),
+            self.render_device_sources(view, project_scope, window, cx),
         ];
         self.settings_page("devices", view, sections, cx)
     }

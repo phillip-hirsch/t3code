@@ -1,10 +1,15 @@
 #![forbid(unsafe_code)]
 
 mod app;
+mod artifact_templates;
 mod assets;
+mod assistant_citations;
 mod backend;
 mod browser_history;
+mod browser_import;
 mod caret;
+mod composer_code;
+mod composer_context;
 mod composer_edit;
 mod composer_guard;
 mod composer_markdown;
@@ -13,37 +18,47 @@ mod composer_text;
 mod desktop;
 mod device;
 mod environments;
+mod external_links;
 mod file_icons;
 mod file_links;
 mod handoff;
 mod hex;
+mod image_attachment;
 mod inbox;
 mod keybindings;
 mod load_balancing;
+mod mcp_apps;
 mod model;
 mod model_label;
 mod new_thread;
 mod notifications;
+mod older_settled;
 mod open_vsx;
 mod preview;
 mod project_groups;
 mod proposed_plan;
+mod pull_request_body;
+mod pull_request_checkout;
 mod pull_request_completions;
 mod pull_request_detail;
 mod pull_request_diff;
 mod pull_request_reply;
 mod pull_request_reviewers;
+mod pull_request_routing;
 mod pull_requests;
 mod queue;
 mod quit_shortcut;
+mod remote_open;
 mod requests;
+mod review_comment;
 mod rpc;
 mod search;
 mod secure_storage;
 mod settings;
 mod snap_shot;
+mod sqlite;
+mod ssh;
 mod terminal_text;
-mod tex;
 mod theme;
 mod theme_color;
 mod theme_file;
@@ -56,6 +71,7 @@ mod timeline;
 mod timestamp;
 mod turn_diff_tree;
 mod usage;
+mod user_message;
 mod vscode_theme;
 mod work_log;
 mod workflow;
@@ -84,21 +100,26 @@ fn main() {
     // A second launch hands its command line to the running app and exits.
     let (links, launches) = async_channel::unbounded();
     let channel = match settings::t3_home() {
-        Some(home) => {
-            match desktop::activation::claim(&home, &desktop::launch_args(), links.clone(), runtime().handle()) {
-                desktop::activation::Instance::Forwarded => return,
-                desktop::activation::Instance::Primary { channel } => channel,
-            }
-        }
+        Some(home) => match desktop::activation::claim(&home, &desktop::launch_args(), links, runtime().handle()) {
+            desktop::activation::Instance::Forwarded => return,
+            desktop::activation::Instance::Primary { channel } => channel,
+        },
         None => None,
     };
+    // `t3 app` reaches the app that owns this T3 home.
+    let (activations_tx, activations) = async_channel::unbounded();
+    let control = settings::userdata_dir()
+        .and_then(|state_dir| desktop::app_control::start(&state_dir, activations_tx, runtime().handle()));
     // `channel` stays here until the process exits, holding the single-instance lock; GPUI
     // drops quit handlers as soon as quitting starts, so they get only the socket's removal.
     let close_channel = channel.as_ref().map(desktop::activation::Channel::closer);
+    let close_control = control.as_ref().map(desktop::app_control::ControlServer::closer);
     let app = gpui_kit::application().with_assets(assets::Assets);
-    // macOS hands `t3code://` links to the running app as URLs (Electron's `open-url`).
+    // macOS hands links and opened web pages to the running app as URLs (Electron's `open-url`
+    // and `open-file`).
+    let (opened_tx, opened) = async_channel::unbounded();
     app.on_open_urls(move |urls| {
-        let _ = links.try_send(urls);
+        let _ = opened_tx.try_send(urls);
     });
     // A Dock click brings the window forward, or opens it again when closed (Electron's `activate`).
     app.on_reopen(|cx| {
@@ -130,6 +151,13 @@ fn main() {
             })
             .detach();
         }
+        if let Some(close_control) = close_control {
+            cx.on_app_quit(move |_| {
+                close_control();
+                async {}
+            })
+            .detach();
+        }
         #[cfg(all(unix, not(target_os = "macos")))]
         desktop::linux_url_handler::register();
         cx.set_global(desktop::Desktop::load(cx));
@@ -139,6 +167,8 @@ fn main() {
             return;
         }
         app::main_window::receive_launches(launches, cx);
+        app::main_window::receive_opened_urls(opened, cx);
+        app::main_window::receive_activations(activations, cx);
     });
 }
 

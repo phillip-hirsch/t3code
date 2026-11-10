@@ -161,6 +161,16 @@ impl Workspace {
             duplicate: seed(Some(&theme.id), &theme.label),
             custom: None,
         }));
+        // Saved themes win id resolution, so a published theme they shadow has no card.
+        cards.extend(self.client_settings.themes.published_cards().map(|theme| Card {
+            key: format!("environment:{}", theme.id),
+            label: theme.label.clone(),
+            card: Some(theme.id.clone()),
+            on_use: Use::Theme(theme.id.clone()),
+            previews: previews_of(theme),
+            duplicate: seed(Some(&theme.id), &theme.label),
+            custom: None,
+        }));
         let mut rendered: Vec<AnyElement> =
             cards.into_iter().map(|card| self.render_theme_card(card, &owners, None, &t, cx)).collect();
         for (key, group) in collections(self.client_settings.themes.custom()) {

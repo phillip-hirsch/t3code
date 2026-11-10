@@ -212,7 +212,7 @@ pub(super) fn status_key(provider: Option<&Value>) -> StatusKey {
 }
 
 /// `getProviderSummary`: a headline and an optional detail.
-pub(super) fn summary(provider: Option<&Value>) -> (String, Option<String>) {
+pub(in crate::app) fn summary(provider: Option<&Value>) -> (String, Option<String>) {
     let Some(provider) = provider else {
         return (
             "Checking provider status".into(),
@@ -506,6 +506,13 @@ pub(super) fn environment_with_field_value(environment: &[Value], name: &str, va
         next.push(json!({"name": name, "value": trimmed, "sensitive": true}));
     }
     next
+}
+
+/// `nextProviderEnvironmentWithFieldSecret`: the field's variable read from `secret`, or gone.
+pub(super) fn environment_with_field_secret(environment: &[Value], name: &str, secret: Option<Value>) -> Vec<Value> {
+    let others = environment.iter().filter(|v| v["name"] != name).cloned();
+    let variable = secret.map(|secret| json!({"name": name, "value": "", "secret": secret, "sensitive": true}));
+    others.chain(variable).collect()
 }
 
 /// Generic variables being edited (`ProviderEnvironmentSection`'s `RowsDraft`).
@@ -1546,10 +1553,31 @@ impl Workspace {
         );
         let clear_row = row.clone();
         let stacked = self.settings_ui.provider_rows_stacked;
+        let disabled = read_only || managed.is_some();
+        let secret = variable.as_ref().and_then(|v| v.get("secret")).filter(|s| s.is_object());
+        let (workspace, instance_id) = (cx.weak_entity(), row.id.clone());
+        let field_value = crate::app::pages::settings::secret_source::secret_source_input(
+            format!("env-field:{}:{}", row.id, field.name),
+            field.label,
+            secret,
+            &self.settings_secret_sources(),
+            disabled,
+            || text_input(&input, None).flex_1().disabled(disabled).into_any_element(),
+            move |secret, window, cx| {
+                let _ = workspace.update(cx, |this, cx| {
+                    let Some(row) = this.instance_row(&instance_id) else { return };
+                    let instance = row.instance();
+                    let next = environment_with_field_secret(&environment(&instance), field.name, secret);
+                    this.persist_provider_instance(&instance_id, with_environment(&instance, next), window, cx);
+                });
+            },
+            window,
+            cx,
+        );
         let control = h_flex()
             .map(|el| if stacked { el.w_full() } else { el.w(px(224.)) })
             .gap_2()
-            .child(text_input(&input, None).flex_1().disabled(read_only || managed.is_some()))
+            .child(field_value.row())
             .when(variable.is_some() && managed.is_none() && !read_only, |el| {
                 el.child(
                     ghost_icon_button(
@@ -1873,6 +1901,31 @@ impl Workspace {
             })
         };
         let lock = if env.sensitive { gpui_kit::assets::IconName::Lock } else { gpui_kit::assets::IconName::LockOpen };
+        let value_field = || text_input(&value_input, None).flex_1().disabled(inert).into_any_element();
+        let parts = if env.sensitive {
+            let (workspace, update) = (cx.weak_entity(), update.clone());
+            crate::app::pages::settings::secret_source::secret_source_input(
+                format!("env:{}:{id}:value", row.id),
+                &format!("Environment variable value {}", index + 1),
+                Some(&env.value).filter(|value| value.is_object()),
+                &self.settings_secret_sources(),
+                inert,
+                value_field,
+                move |secret, window, cx| {
+                    let _ = workspace.update(cx, |this, cx| {
+                        let patch = move |row: &mut EnvRow| {
+                            row.value = secret.clone().unwrap_or_else(|| json!(""));
+                            row.redacted = None;
+                        };
+                        update(this, &patch, window, cx);
+                    });
+                },
+                window,
+                cx,
+            )
+        } else {
+            crate::app::pages::settings::secret_source::SecretParts { source: None, value: value_field(), valid: true }
+        };
         v_flex()
             .min_w_0()
             .gap(px(6.))
@@ -1884,6 +1937,7 @@ impl Workspace {
                 h_flex()
                     .gap(px(6.))
                     .child(text_input(&name_input, None).flex_1().disabled(inert || env.redacted == Some(true)))
+                    .children(parts.source)
                     .child(
                         ghost_icon_button(
                             SharedString::from(format!("env-remove-{id}")),
@@ -1896,18 +1950,15 @@ impl Workspace {
                         .on_click(remove),
                     ),
             )
-            .child(h_flex().gap(px(6.)).child(text_input(&value_input, None).flex_1().disabled(inert)).when(
-                env.value.is_string(),
-                |el| {
-                    el.child(
-                        ghost_icon_button(SharedString::from(format!("env-sensitive-{id}")), lock, t)
-                            .size(px(20.))
-                            .disabled(inert || env.redacted == Some(true))
-                            .tooltip(if env.sensitive { "Sensitive, stored separately" } else { "Plain text" })
-                            .on_click(toggle),
-                    )
-                },
-            ))
+            .child(h_flex().items_start().gap(px(6.)).child(parts.value).when(env.value.is_string(), |el| {
+                el.child(
+                    ghost_icon_button(SharedString::from(format!("env-sensitive-{id}")), lock, t)
+                        .size(px(20.))
+                        .disabled(inert || env.redacted == Some(true))
+                        .tooltip(if env.sensitive { "Sensitive, stored separately" } else { "Plain text" })
+                        .on_click(toggle),
+                )
+            }))
             .into_any_element()
     }
 
@@ -2194,6 +2245,14 @@ mod tests {
             draft.published(),
             Some(vec![json!({"name": "API_KEY", "value": "", "secret": secret, "sensitive": true})])
         );
+
+        // A dedicated field read from a secret provider is stored the same way, or goes.
+        let saved = [json!({"name": "CURSOR_API_KEY", "value": "x", "sensitive": true}), json!({"name": "OTHER"})];
+        assert_eq!(
+            environment_with_field_secret(&saved, "CURSOR_API_KEY", Some(secret.clone())),
+            [saved[1].clone(), json!({"name": "CURSOR_API_KEY", "value": "", "secret": secret, "sensitive": true})]
+        );
+        assert_eq!(environment_with_field_secret(&saved, "CURSOR_API_KEY", None), [saved[1].clone()]);
     }
 
     #[test]

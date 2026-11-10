@@ -63,7 +63,32 @@ pub struct Tokens {
     pub indigo_foreground: Hsla,
     pub scrollbar_thumb: Hsla,
     pub scrollbar_thumb_hover: Hsla,
+    /// `--app-chrome-background`: the window behind every pane.
+    pub chrome: Hsla,
+    pub toolbar: ToolbarTokens,
+    /// `--surface-raised`: the composer's glass in dark and themed palettes.
+    pub surface_raised: Hsla,
+    pub secondary_foreground: Hsla,
+    pub placeholder: Hsla,
+    /// `--accent-foreground`: text on [`Self::accent`].
+    pub accent_foreground: Hsla,
+    pub error_surface: Hsla,
+    pub warning_surface: Hsla,
+    pub update: Hsla,
+    pub update_foreground: Hsla,
+    /// `--message-foreground`: text in a user message bubble.
+    pub message_foreground: Hsla,
+    /// `--code-background` and `--code-foreground`: code blocks and diffs.
+    pub code_background: Hsla,
+    pub code_foreground: Hsla,
+    pub search_match: SearchMatchTokens,
+    pub terminal: TerminalTokens,
     pub sidebar: SidebarTokens,
+    /// A theme library palette paints the app (`html[data-theme-id]`), which some surfaces
+    /// (the chat header, code blocks, the composer outline) style differently.
+    pub themed: bool,
+    /// That palette is T3 Chat's (`html[data-theme-id="t3-chat"]`).
+    pub t3_chat: bool,
     /// `--glass-opacity`: the alpha of glass surfaces such as the composer.
     pub glass: f32,
     /// `--appearance-contrast-boost` as a fraction: 0 up to 100% contrast, 1 at 200%.
@@ -126,7 +151,46 @@ pub struct SidebarTokens {
     /// (the settings nav) use.
     pub sheet_row_hover: Hsla,
     pub sheet_row_selected: Hsla,
+    /// `--sidebar-row-selected` inside the sidebar: a selected thread row.
+    pub row_selected: Hsla,
+    /// `--sidebar-control-surface`: the update and provider pills.
+    pub control_surface: Hsla,
     pub icon: Hsla,
+}
+
+/// The chat header's palette (`--toolbar-*`, `index.css`), which themes set apart from the canvas.
+#[derive(Clone, Copy)]
+pub struct ToolbarTokens {
+    pub background: Hsla,
+    pub foreground: Hsla,
+    pub border: Hsla,
+    pub control: Hsla,
+    pub control_foreground: Hsla,
+    pub control_hover: Hsla,
+}
+
+impl ToolbarTokens {
+    /// The unthemed defaults, which follow the page's own tokens.
+    fn over(background: Hsla, foreground: Hsla, border: Hsla, popover: Hsla, accent: Hsla) -> Self {
+        Self { background, foreground, border, control: popover, control_foreground: foreground, control_hover: accent }
+    }
+}
+
+/// Find-in-thread highlights (`::highlight(t3-thread-find)` and its active match). The text view
+/// paints a range highlight behind its glyphs only, so the search-match text roles have no use.
+#[derive(Clone, Copy)]
+pub struct SearchMatchTokens {
+    pub background: Hsla,
+    pub active_background: Hsla,
+}
+
+/// `--terminal-*`, which `terminalThemeFromApp` reads.
+#[derive(Clone, Copy)]
+pub struct TerminalTokens {
+    pub background: Hsla,
+    pub foreground: Hsla,
+    pub cursor: Hsla,
+    pub selection: Hsla,
 }
 
 impl Global for Tokens {}
@@ -147,33 +211,59 @@ impl Tokens {
     pub fn dark() -> Self {
         let foreground = hex(0xf5f5f5);
         let sidebar_foreground = hex(0xf1f3f7);
+        let (background, card, popover, accent, border) =
+            (hex(0x000000), hex(0x111111), hex(0x111111), white(0.04), white(0.08));
+        let (primary, muted_foreground, error, warning) = (hex(0x346bf1), hex(0xa1a1a1), hex(0xfb414a), hex(0xfe9a00));
         Self {
             dark: true,
-            background: hex(0x000000),
+            background,
             foreground,
-            card: hex(0x111111),
-            popover: hex(0x111111),
-            primary: hex(0x346bf1),
+            card,
+            popover,
+            primary,
             primary_foreground: hex(0xffffff),
             primary_hover: hex(0x2f60d9),
             secondary: white(0.03),
             muted: white(0.03),
-            muted_foreground: hex(0xa1a1a1),
-            accent: white(0.04),
+            muted_foreground,
+            accent,
             message_surface: hex(0x1e1e1e),
-            border: white(0.08),
+            border,
             input: white(0.11),
             ring: hex(0x346bf1),
-            error: hex(0xfb414a),
+            error,
             error_foreground: hex(0xff6467),
             info: hex(0x2b7fff),
             info_foreground: hex(0x51a2ff),
             success_foreground: hex(0x00d492),
-            warning: hex(0xfe9a00),
+            warning,
             warning_foreground: hex(0xffb900),
             indigo_foreground: hex(0xa3b3ff),
             scrollbar_thumb: white(0.08),
             scrollbar_thumb_hover: white(0.12),
+            chrome: background,
+            toolbar: ToolbarTokens::over(background, foreground, border, popover, accent),
+            // `color-mix(in srgb, neutral-950 97%, white)`.
+            surface_raised: card,
+            secondary_foreground: foreground,
+            placeholder: muted_foreground,
+            accent_foreground: foreground,
+            error_surface: with_alpha(error, 0.16),
+            warning_surface: with_alpha(warning, 0.16),
+            update: primary,
+            update_foreground: hex(0x51a2ff),
+            message_foreground: foreground,
+            code_background: mix_srgb(background, card, 0.9),
+            code_foreground: foreground,
+            search_match: SearchMatchTokens { background: hex(0x8c6c1f), active_background: hex(0xeea52b) },
+            terminal: TerminalTokens {
+                background,
+                foreground,
+                cursor: hex(0xb4cbff),
+                selection: with_alpha(hex(0xb4cbff), 0.25),
+            },
+            themed: false,
+            t3_chat: false,
             sidebar: SidebarTokens {
                 background: hex(0x000000),
                 sheet: hex(0x111111),
@@ -186,6 +276,8 @@ impl Tokens {
                 // `--accent` and `--muted`.
                 sheet_row_hover: white(0.04),
                 sheet_row_selected: white(0.03),
+                row_selected: with_alpha(sidebar_foreground, 0.07),
+                control_surface: hex(0x0a0a0a),
                 icon: hex(0x8b8b8b),
             },
             glass: 0.8,
@@ -197,33 +289,59 @@ impl Tokens {
 
     pub fn light() -> Self {
         let foreground = hex(0x18181b);
+        let (background, card, popover, accent, border) =
+            (hex(0xfcfcfc), hex(0xffffff), hex(0xffffff), hex(0xf4f4f5), hex(0xe4e4e7));
+        let (primary, muted_foreground, error, warning) = (hex(0x1b4ed8), hex(0x71717b), hex(0xfb2c36), hex(0xfe9a00));
         Self {
             dark: false,
-            background: hex(0xfcfcfc),
+            background,
             foreground,
-            card: hex(0xffffff),
-            popover: hex(0xffffff),
-            primary: hex(0x1b4ed8),
+            card,
+            popover,
+            primary,
             primary_foreground: hex(0xffffff),
             primary_hover: hex(0x3160db),
             secondary: hex(0xfafafa),
             muted: hex(0xfafafa),
-            muted_foreground: hex(0x71717b),
-            accent: hex(0xf4f4f5),
+            muted_foreground,
+            accent,
             message_surface: hex(0xebebed),
-            border: hex(0xe4e4e7),
+            border,
             input: hex(0xd4d4d8),
             ring: hex(0x1b4ed8),
-            error: hex(0xfb2c36),
+            error,
             error_foreground: hex(0xc10007),
             info: hex(0x2b7fff),
             info_foreground: hex(0x1447e6),
             success_foreground: hex(0x007a55),
-            warning: hex(0xfe9a00),
+            warning,
             warning_foreground: hex(0xbb4d00),
             indigo_foreground: hex(0x4f39f6),
             scrollbar_thumb: hex(0xd9d9d9),
             scrollbar_thumb_hover: hex(0xbfbfbf),
+            chrome: background,
+            toolbar: ToolbarTokens::over(background, foreground, border, popover, accent),
+            // `color-mix(in srgb, var(--card) 20%, transparent)`.
+            surface_raised: with_alpha(card, 0.2),
+            secondary_foreground: hex(0x27272a),
+            placeholder: muted_foreground,
+            accent_foreground: foreground,
+            error_surface: with_alpha(error, 0.08),
+            warning_surface: with_alpha(warning, 0.08),
+            update: primary,
+            update_foreground: primary,
+            message_foreground: foreground,
+            code_background: mix_srgb(background, card, 0.9),
+            code_foreground: foreground,
+            search_match: SearchMatchTokens { background: hex(0xffde8b), active_background: hex(0xeea52b) },
+            terminal: TerminalTokens {
+                background,
+                foreground,
+                cursor: hex(0x26384e),
+                selection: with_alpha(hex(0x253f63), 0.2),
+            },
+            themed: false,
+            t3_chat: false,
             sidebar: SidebarTokens {
                 background: hex(0xfafafa),
                 sheet: hex(0xfafafa),
@@ -235,6 +353,8 @@ impl Tokens {
                 row_active: hex(0xffffff),
                 sheet_row_hover: hex(0xfcfcfc),
                 sheet_row_selected: hex(0xffffff),
+                row_selected: hex(0xffffff),
+                control_surface: hex(0xf4f4f5),
                 icon: hex(0x86858e),
             },
             glass: 0.8,
@@ -424,6 +544,37 @@ impl Tokens {
         self.error_foreground = c.error_foreground;
         self.warning = c.warning;
         self.warning_foreground = c.warning_foreground;
+        self.chrome = c.chrome;
+        self.toolbar = ToolbarTokens {
+            background: c.toolbar,
+            foreground: c.toolbar_foreground,
+            border: c.toolbar_border,
+            control: c.toolbar_control,
+            control_foreground: c.toolbar_control_foreground,
+            control_hover: c.toolbar_control_hover,
+        };
+        self.surface_raised = c.surface_raised;
+        self.secondary_foreground = c.secondary_foreground;
+        self.placeholder = c.placeholder;
+        self.accent_foreground = c.accent_surface_foreground;
+        self.error_surface = c.error_surface;
+        self.warning_surface = c.warning_surface;
+        self.update = c.update;
+        self.update_foreground = c.update_foreground;
+        self.message_foreground = c.message_foreground;
+        self.code_background = c.code_background;
+        self.code_foreground = c.code_foreground;
+        self.search_match = SearchMatchTokens {
+            background: c.search_match_background,
+            active_background: c.search_match_active_background,
+        };
+        self.terminal = TerminalTokens {
+            background: c.terminal_background,
+            foreground: c.terminal_foreground,
+            cursor: c.terminal_cursor,
+            selection: c.terminal_selection,
+        };
+        self.themed = true;
         self.sidebar = SidebarTokens {
             background: c.sidebar,
             sheet: c.sidebar,
@@ -435,6 +586,8 @@ impl Tokens {
             row_active: c.sidebar_row_active,
             sheet_row_hover: c.sidebar_row_hover,
             sheet_row_selected: c.sidebar_row_selected,
+            row_selected: c.sidebar_row_selected,
+            control_surface: c.sidebar_control_surface,
             icon: c.icon_muted,
         };
         self
@@ -444,7 +597,44 @@ impl Tokens {
     pub fn for_choice(choice: &ThemeChoice, system_dark: bool) -> Self {
         let (dark, colors) = choice.resolve(system_dark);
         let base = if dark { Self::dark() } else { Self::light() };
-        colors.map_or(base, |colors| base.themed(&colors))
+        let Some(colors) = colors else { return base };
+        Self { t3_chat: choice.owner(dark).as_deref() == Some("t3-chat"), ..base.themed(&colors) }
+    }
+
+    /// A panel layout toggle's icon: the themed toolbar text (55% toward the toolbar when
+    /// disabled), otherwise the ghost toggle's own.
+    pub fn titlebar_toggle_ink(&self, enabled: bool) -> Hsla {
+        match (self.themed, enabled) {
+            (true, true) => self.toolbar.foreground,
+            (true, false) => mix_oklab(self.toolbar.background, self.toolbar.foreground, 0.55),
+            (false, true) => self.foreground.opacity(0.8),
+            (false, false) => self.muted_foreground,
+        }
+    }
+
+    /// `--chat-composer-glass-surface`: the card in the light default, the raised surface otherwise.
+    pub fn composer_glass(&self) -> Hsla {
+        if self.themed || self.dark { self.surface_raised } else { self.card }
+    }
+
+    /// `--chat-composer-highlight`, the dark composer's inset top edge.
+    pub fn composer_highlight(&self) -> Hsla {
+        match (self.themed, self.t3_chat) {
+            (true, true) => with_alpha(hex(0x432d48), 0.12),
+            (true, false) => self.input.opacity(0.12),
+            (false, _) => white(0.03),
+        }
+    }
+
+    /// `--chat-composer-outline` (`ComposerSurface.tsx`), which attached banners share.
+    pub fn composer_outline(&self) -> Hsla {
+        match (self.themed, self.dark) {
+            (true, true) if self.t3_chat => hex(0x241e28),
+            (true, true) => mix_srgb(self.background, self.input, 0.3),
+            (true, false) => self.toolbar.border,
+            (false, true) => white(0.05),
+            (false, false) => hsla(0., 0., 0., 0.08),
+        }
     }
 
     /// Chat body text: `text-foreground/[calc(90%+var(--appearance-contrast-boost)/10)]`.
@@ -466,15 +656,27 @@ impl Tokens {
         self.muted_foreground = text(self.muted_foreground, self.background);
         self.border = line(self.border, foreground);
         self.input = line(self.input, foreground);
+        self.placeholder = text(self.placeholder, self.background);
+        self.secondary_foreground = text(self.secondary_foreground, self.secondary);
+        self.accent_foreground = text(self.accent_foreground, self.accent);
+        self.message_foreground = text(self.message_foreground, self.message_surface);
+        let toolbar = &mut self.toolbar;
+        let toolbar_foreground = toolbar.foreground;
+        toolbar.foreground = text(toolbar_foreground, toolbar.background);
+        toolbar.control_foreground = text(toolbar.control_foreground, toolbar.control);
+        toolbar.border = line(toolbar.border, toolbar_foreground);
         let sidebar = &mut self.sidebar;
         sidebar.foreground = text(sidebar_foreground, sidebar.background);
         sidebar.muted_foreground = text(sidebar.muted_foreground, sidebar.background);
         sidebar.secondary_label = text(sidebar.secondary_label, self.background);
         sidebar.icon = text(sidebar.icon, self.background);
         sidebar.border = line(sidebar.border, sidebar_foreground);
-        if self.dark {
+        // The unthemed dark sidebar tints its rows from its contrast-adjusted text; a theme's own
+        // row roles win (`html[data-theme-id] [data-app-sidebar]`).
+        if self.dark && !self.themed {
             sidebar.row_hover = with_alpha(sidebar.foreground, 0.08);
             sidebar.row_active = with_alpha(sidebar.foreground, 0.11);
+            sidebar.row_selected = with_alpha(sidebar.foreground, 0.07);
         }
         self.glass = appearance.glass / 100.;
         self.contrast_boost = boost;
@@ -639,11 +841,11 @@ pub fn sync(window: &mut Window, cx: &mut App) {
         colors.secondary = tokens.secondary;
         colors.secondary_hover = tokens.accent;
         colors.secondary_active = tokens.accent;
-        colors.secondary_foreground = tokens.foreground;
+        colors.secondary_foreground = tokens.secondary_foreground;
         colors.muted = tokens.muted;
         colors.muted_foreground = tokens.muted_foreground;
         colors.accent = tokens.accent;
-        colors.accent_foreground = tokens.foreground;
+        colors.accent_foreground = tokens.accent_foreground;
         colors.popover = tokens.popover;
         colors.popover_foreground = tokens.foreground;
         colors.list_hover = tokens.accent;
@@ -669,6 +871,10 @@ pub fn sync(window: &mut Window, cx: &mut App) {
         colors.sidebar_accent_foreground = tokens.sidebar.foreground;
     });
     web_scrollbar(&tokens, cx);
+    cx.set_global(gpui_kit::component::diff::DiffCodeColors {
+        background: tokens.code_background,
+        foreground: tokens.code_foreground,
+    });
     cx.set_global(tokens);
 }
 
@@ -781,5 +987,70 @@ mod tests {
             hex_of(Tokens::for_choice(&Default::default(), false).background),
             hex_of(Tokens::light().background)
         );
+    }
+
+    #[test]
+    fn every_painted_role_reaches_its_token() {
+        type Pick = fn(&Tokens) -> Hsla;
+        let cases: [(&str, Pick); 26] = [
+            ("chrome", |t| t.chrome),
+            ("toolbar", |t| t.toolbar.background),
+            ("toolbarForeground", |t| t.toolbar.foreground),
+            ("toolbarBorder", |t| t.toolbar.border),
+            ("toolbarControl", |t| t.toolbar.control),
+            ("toolbarControlForeground", |t| t.toolbar.control_foreground),
+            ("toolbarControlHover", |t| t.toolbar.control_hover),
+            ("surfaceRaised", |t| t.surface_raised),
+            ("secondaryForeground", |t| t.secondary_foreground),
+            ("placeholder", |t| t.placeholder),
+            ("accentSurfaceForeground", |t| t.accent_foreground),
+            ("errorSurface", |t| t.error_surface),
+            ("warningSurface", |t| t.warning_surface),
+            ("update", |t| t.update),
+            ("updateForeground", |t| t.update_foreground),
+            ("messageForeground", |t| t.message_foreground),
+            ("codeBackground", |t| t.code_background),
+            ("codeForeground", |t| t.code_foreground),
+            ("searchMatchBackground", |t| t.search_match.background),
+            ("searchMatchActiveBackground", |t| t.search_match.active_background),
+            ("sidebarControlSurface", |t| t.sidebar.control_surface),
+            ("sidebarRowSelected", |t| t.sidebar.row_selected),
+            ("terminalBackground", |t| t.terminal.background),
+            ("terminalForeground", |t| t.terminal.foreground),
+            ("terminalCursor", |t| t.terminal.cursor),
+            ("terminalSelection", |t| t.terminal.selection),
+        ];
+        for (role, pick) in cases {
+            let mut roles = crate::themes::default_roles(true).clone();
+            roles.set(role, "#123456".into());
+            let colors = ThemeColors::from_roles(&roles, None).unwrap();
+            // Through the contrast and glass settings too, at their defaults.
+            let tokens = Tokens::dark().themed(&colors).with_appearance(Appearance::default());
+            assert_eq!(hex_of(pick(&tokens)), (0x123456, 1.), "{role}");
+        }
+    }
+
+    #[test]
+    fn themed_surfaces_follow_the_theme_not_the_default_look() {
+        let picked = |id: &str, dark| {
+            let choice = crate::themes::ThemeChoice { base: Some(id.into()), ..Default::default() };
+            Tokens::for_choice(&choice, dark).with_appearance(Appearance::default())
+        };
+        let grove = picked("grove", true);
+        let colors = crate::themes::built_in()[1].colors_for(true).unwrap();
+        assert!(grove.themed && !grove.t3_chat);
+        // A dark theme keeps its own sidebar rows instead of the default's tints.
+        assert_eq!(hex_of(grove.sidebar.row_hover), hex_of(colors.sidebar_row_hover));
+        assert_eq!(hex_of(grove.composer_glass()), hex_of(colors.surface_raised));
+        assert_eq!(hex_of(grove.composer_outline()), hex_of(mix_srgb(grove.background, grove.input, 0.3)));
+        assert_eq!(hex_of(picked("t3-chat", true).composer_outline()).0, 0x241e28);
+        let light = picked("grove", false);
+        assert_eq!(hex_of(light.composer_outline()), hex_of(light.toolbar.border));
+        // The default look: the light composer glass is the card; dark is the raised surface.
+        assert_eq!(hex_of(Tokens::light().composer_glass()), hex_of(Tokens::light().card));
+        assert_eq!(hex_of(Tokens::dark().composer_glass()).0, 0x111111);
+        let ghost = Tokens::dark();
+        assert_eq!(hex_of(ghost.titlebar_toggle_ink(true)), hex_of(ghost.foreground.opacity(0.8)));
+        assert_eq!(hex_of(grove.titlebar_toggle_ink(true)), hex_of(grove.toolbar.foreground));
     }
 }

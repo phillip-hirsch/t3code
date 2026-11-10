@@ -21,6 +21,10 @@ use crate::{GlobalState, TextSelection, text::TextViewStyle};
 pub(crate) type CodeBlockActionsFn =
     dyn Fn(&CodeBlock, &mut Window, &mut App) -> AnyElement + Send + Sync;
 
+/// Draws a code block in place of the block, or `None` to draw it as usual.
+pub(crate) type CodeBlockRenderFn =
+    dyn Fn(&CodeBlock, &mut Window, &mut App) -> Option<AnyElement> + Send + Sync;
+
 pub(crate) type CodeBlockHighlighterFn =
     dyn Fn(&CodeBlock) -> Vec<(Range<usize>, gpui::HighlightStyle)> + Send + Sync;
 
@@ -108,12 +112,56 @@ pub(crate) type ImageSourceFn = dyn Fn(&gpui::SharedUri) -> gpui::ImageSource + 
 
 pub(crate) type LinkClickHandlerFn =
     dyn Fn(&SharedString, &ClickEvent, &mut Window, &mut App) + Send + Sync;
+/// The link under the pointer: its destination, and the line box of the link
+/// text under the pointer, in window coordinates.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LinkHover {
+    pub url: SharedString,
+    pub bounds: Bounds<Pixels>,
+}
+
+/// The pointer entered a link (`Some`), or left the link it was on (`None`).
+pub(crate) type LinkHoverFn = dyn Fn(Option<LinkHover>, &mut Window, &mut App) + Send + Sync;
+/// A click (or Enter/Space) on an image that is not inside a link, with its URL.
+pub(crate) type ImageClickHandlerFn = dyn Fn(&gpui::SharedUri, &mut Window, &mut App) + Send + Sync;
 /// A task checkbox's toggle: its list item's source offset and the state it asks for.
 pub(crate) type TaskToggleFn = dyn Fn(usize, bool, &mut Window, &mut App) + Send + Sync;
 
 /// Kept by the element only, so unlike the handlers the state carries, it
 /// may hold a `ScrollHandle`.
 pub(crate) type RevealHandlerFn = dyn Fn(Bounds<Pixels>, &mut Window, &mut App);
+
+/// Makes an image outside any link a tab stop that opens through `handler` on a
+/// left click, Enter or Space (`TextView::on_image_click`).
+pub(crate) fn clickable_image(
+    image: gpui::Stateful<gpui::Img>,
+    url: &gpui::SharedUri,
+    handler: Option<&Arc<ImageClickHandlerFn>>,
+    cx: &App,
+) -> gpui::Stateful<gpui::Img> {
+    use crate::theme::ActiveTheme as _;
+    use gpui::StatefulInteractiveElement as _;
+    let Some(handler) = handler.cloned() else {
+        return image;
+    };
+    let (url, ring) = (url.clone(), cx.theme().tokens.colors.ring);
+    image
+        .tab_index(0)
+        .cursor_pointer()
+        .focus_visible(move |style| style.border_2().border_color(ring))
+        .on_click(move |event, window, cx| {
+            let primary = match event {
+                ClickEvent::Mouse(click) => click.up.button == MouseButton::Left,
+                ClickEvent::Keyboard(_) => true,
+                ClickEvent::Touch(click) => !click.long_press,
+            };
+            if primary {
+                TextSelection::end(window, cx);
+                cx.stop_propagation();
+                handler(&url, window, cx);
+            }
+        })
+}
 
 pub(crate) fn handle_link_click(
     handler: &Option<Arc<LinkClickHandlerFn>>,
@@ -168,10 +216,13 @@ pub struct TextView {
     scrollable: bool,
     max_lines: Option<usize>,
     code_block_actions: Option<Arc<CodeBlockActionsFn>>,
+    code_block_renderer: Option<Arc<CodeBlockRenderFn>>,
     code_block_highlighter: Option<Arc<CodeBlockHighlighterFn>>,
     table_actions: Option<Arc<TableActionsFn>>,
     link_click_handler: Option<Arc<LinkClickHandlerFn>>,
+    image_click_handler: Option<Arc<ImageClickHandlerFn>>,
     task_toggle_handler: Option<Arc<TaskToggleFn>>,
+    link_hover_handler: Option<Arc<LinkHoverFn>>,
     image_source: Option<Arc<ImageSourceFn>>,
     reveal_handler: Option<Rc<RevealHandlerFn>>,
     markdown_extensions: Arc<MarkdownExtensions>,
@@ -220,10 +271,13 @@ impl TextView {
             scrollable: false,
             max_lines: None,
             code_block_actions: None,
+            code_block_renderer: None,
             code_block_highlighter: None,
             table_actions: None,
             link_click_handler: None,
+            image_click_handler: None,
             task_toggle_handler: None,
+            link_hover_handler: None,
             image_source: None,
             reveal_handler: None,
             markdown_extensions: Arc::default(),
@@ -249,10 +303,13 @@ impl TextView {
             scrollable: false,
             max_lines: None,
             code_block_actions: None,
+            code_block_renderer: None,
             code_block_highlighter: None,
             table_actions: None,
             link_click_handler: None,
+            image_click_handler: None,
             task_toggle_handler: None,
+            link_hover_handler: None,
             image_source: None,
             reveal_handler: None,
             markdown_extensions: Arc::default(),
@@ -278,10 +335,13 @@ impl TextView {
             scrollable: false,
             max_lines: None,
             code_block_actions: None,
+            code_block_renderer: None,
             code_block_highlighter: None,
             table_actions: None,
             link_click_handler: None,
+            image_click_handler: None,
             task_toggle_handler: None,
+            link_hover_handler: None,
             image_source: None,
             reveal_handler: None,
             markdown_extensions: Arc::default(),
@@ -409,6 +469,17 @@ impl TextView {
         self
     }
 
+    /// Draws chosen code blocks another way, such as a diagram for its
+    /// source: the closure returns the element that replaces the block, with
+    /// the block's spacing kept, or `None` to draw the block as usual.
+    pub fn code_block_renderer<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&CodeBlock, &mut Window, &mut App) -> Option<AnyElement> + Send + Sync + 'static,
+    {
+        self.code_block_renderer = Some(Arc::new(f));
+        self
+    }
+
     /// Adds opt-in syntax highlighting for fenced code blocks.
     ///
     /// Returned byte ranges are relative to [`CodeBlock::code`]. Invalid
@@ -462,6 +533,29 @@ impl TextView {
         F: Fn(&SharedString, &ClickEvent, &mut Window, &mut App) + Send + Sync + 'static,
     {
         self.link_click_handler = Some(Arc::new(handler));
+        self
+    }
+
+    /// Report the link under the pointer: `Some` when the pointer enters a
+    /// link's text (or moves to another link), `None` when it leaves it. A link
+    /// wrapped over several lines, or split around an inline object, reports
+    /// from each piece, so a move between pieces can report a leave and an
+    /// enter in the same event, in either order.
+    pub fn on_link_hover<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(Option<LinkHover>, &mut Window, &mut App) + Send + Sync + 'static,
+    {
+        self.link_hover_handler = Some(Arc::new(handler));
+        self
+    }
+
+    /// Make images that are not inside a link clickable and focusable: a click,
+    /// or Enter or Space while one has focus, calls `handler` with its URL.
+    pub fn on_image_click<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(&gpui::SharedUri, &mut Window, &mut App) + Send + Sync + 'static,
+    {
+        self.image_click_handler = Some(Arc::new(handler));
         self
     }
 
@@ -791,10 +885,13 @@ impl Element for TextView {
                 state.preserve_selection_for_reflow();
             }
             state.code_block_actions = self.code_block_actions.clone();
+            state.code_block_renderer = self.code_block_renderer.clone();
             state.code_block_highlighter = code_block_highlighter;
             state.table_actions = self.table_actions.clone();
             state.link_click_handler = self.link_click_handler.clone();
+            state.image_click_handler = self.image_click_handler.clone();
             state.task_toggle_handler = self.task_toggle_handler.clone();
+            state.link_hover_handler = self.link_hover_handler.clone();
             state.image_source = self.image_source.clone();
             state.set_markdown_extensions(self.markdown_extensions.clone(), cx);
             if let Some(motion) = &self.motion {
@@ -3443,6 +3540,60 @@ mod tests {
         assert!(clicks[1].1.is_middle_click());
         assert!(clicks[2].1.is_right_click());
         assert_eq!(cx.opened_url(), None);
+    }
+
+    #[gpui::test]
+    fn link_hover_reports_entering_and_leaving_a_link(cx: &mut TestAppContext) {
+        use std::sync::{Arc, Mutex};
+
+        struct HoverRoot {
+            text_view: Entity<TextViewState>,
+            hovers: Arc<Mutex<Vec<Option<super::LinkHover>>>>,
+        }
+
+        impl Render for HoverRoot {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let hovers = self.hovers.clone();
+                div().w(px(400.)).child(
+                    TextView::new(&self.text_view).on_link_hover(move |hover, _, _| {
+                        hovers.lock().unwrap().push(hover);
+                    }),
+                )
+            }
+        }
+
+        cx.update(crate::init);
+        let hovers = Arc::new(Mutex::new(Vec::new()));
+        let captured = hovers.clone();
+        let (_, cx) = cx.add_window_view(move |_, cx| HoverRoot {
+            text_view: cx.new(|cx| {
+                TextViewState::markdown("[example](https://example.com) and plain words", cx)
+            }),
+            hovers,
+        });
+        let cx: &mut VisualTestContext = cx;
+        let mut move_to = |x: f32, y: f32| {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            cx.simulate_mouse_move(point(px(x), px(y)), None, Modifiers::default());
+        };
+        move_to(10., 10.);
+        move_to(14., 10.);
+        move_to(300., 10.);
+        move_to(10., 10.);
+        move_to(10., 300.);
+        let hovers = captured.lock().unwrap();
+        let urls: Vec<_> = hovers
+            .iter()
+            .map(|hover| hover.as_ref().map(|hover| hover.url.to_string()))
+            .collect();
+        let link = Some("https://example.com".to_owned());
+        // A move within the link reports nothing; off it, by text or by leaving the view, reports once.
+        assert_eq!(urls, [link.clone(), None, link, None]);
+        let bounds = hovers[0].as_ref().unwrap().bounds;
+        assert!(bounds.left() <= px(10.) && bounds.right() > px(14.) && bounds.right() < px(300.));
+        assert!(bounds.top() <= px(10.) && bounds.bottom() > px(10.));
     }
 
     #[gpui::test]

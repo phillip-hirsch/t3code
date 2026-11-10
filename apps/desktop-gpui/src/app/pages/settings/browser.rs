@@ -1,7 +1,7 @@
 //! Settings › Browser (`BrowserSettingsPanel` in `apps/web/src/components/settings/IntegrationsSettings.tsx`).
-//!
-//! Left out until this client has what they configure: the recordings' key and mouse press
-//! overlays (it doesn't record its own tabs) and importing cookies from other browsers.
+
+#[path = "browser_import.rs"]
+mod import;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -18,6 +18,7 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use crate::app::Workspace;
+use crate::app::pages::settings::fields::FieldInput;
 use crate::app::pages::settings::widgets::{SelectWidth, SettingRow, SettingsView, select_trigger, settings_section};
 use crate::preview::{self, PRESETS, Profile, ProfileKind, Viewport};
 use crate::theme::{self, Tokens};
@@ -119,7 +120,19 @@ impl Workspace {
             .description("Maximum recording rate. 30 fps saves CPU and storage; 60 fps is smoother.")
             .setting("browserRecordingFrameRate")
             .control(rate_select);
-        let recordings = [self.setting_row(view, frame_rate, window, cx)];
+        let key_presses = SettingRow::new("browser-recording-key-presses")
+            .description("Show pressed keys and shortcuts in new recordings. Password fields are excluded.")
+            .setting("browserRecordingShowKeyPresses")
+            .switch();
+        let mouse_presses = SettingRow::new("browser-recording-mouse-presses")
+            .description("Highlight mouse presses and held buttons in new recordings.")
+            .setting("browserRecordingShowMousePresses")
+            .switch();
+        let recordings = [
+            self.setting_row(view, frame_rate, window, cx),
+            self.setting_row(view, key_presses, window, cx),
+            self.setting_row(view, mouse_presses, window, cx),
+        ];
 
         let sections = [
             settings_section("browser-agent-access", "Agent access", [agent_access], &t),
@@ -263,9 +276,15 @@ impl Workspace {
         self.setting_row(view, row, window, cx)
     }
 
-    /// `BrowserProfilesSetting`: the profile list with its menus, and "Add profile".
+    /// `BrowserProfilesSetting`: the profile list with its menus, and "Add profile" with the
+    /// browsers to import cookies from, which are looked for when the page shows and the menu opens.
     fn browser_profiles_row(&mut self, view: &SettingsView, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme::tokens(cx);
+        if self.preview.cookie_import.sources.is_none() {
+            self.refresh_browser_import_sources(cx);
+        }
+        let importing = self.preview.cookie_import.in_flight;
+        let import_menu = self.import_menu_entries();
         let settings = &self.client_settings.values;
         let at_limit = preview::profiles_full(settings);
         let default_id = preview::default_profile_id(settings);
@@ -286,15 +305,44 @@ impl Workspace {
             .font_weight(FontWeight::MEDIUM)
             .child(Icon::new(IconName::Plus).size(px(14.)))
             .child("Add profile")
+            .disabled(importing)
             .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, {
                 let workspace = workspace.clone();
                 move |menu, window, _| {
-                    menu.item(PopupMenuItem::new("Blank profile").disabled(at_limit).on_click(
-                        window.listener_for(&workspace, |this, _, window, cx| this.create_browser_profile(window, cx)),
-                    ))
-                    .when(at_limit, |menu| {
-                        menu.item(PopupMenuItem::new("You\u{2019}ve reached the profile limit").disabled(true))
-                    })
+                    let mut menu =
+                        menu.item(PopupMenuItem::new("Blank profile").disabled(at_limit).on_click(
+                            window.listener_for(&workspace, |this, _, window, cx| {
+                                this.create_browser_profile(window, cx);
+                            }),
+                        ))
+                        .when(at_limit, |menu| {
+                            menu.item(PopupMenuItem::new("You\u{2019}ve reached the profile limit").disabled(true))
+                        })
+                        .separator()
+                        .label("Import from");
+                    for entry in &import_menu {
+                        menu = menu.item(match entry {
+                            ImportMenuEntry::Note(note) => PopupMenuItem::new(note.clone()).disabled(true),
+                            ImportMenuEntry::Source(source, enabled) => {
+                                let source = source.clone();
+                                PopupMenuItem::new(source.name()).disabled(!enabled).on_click(window.listener_for(
+                                    &workspace,
+                                    move |this, _, window, cx| {
+                                        this.open_cookie_import(source.clone(), window, cx);
+                                    },
+                                ))
+                            }
+                        });
+                    }
+                    menu
+                }
+            })
+            .on_open_change({
+                let workspace = workspace.clone();
+                move |open, _, cx| {
+                    if *open {
+                        workspace.update(cx, Workspace::refresh_browser_import_sources);
+                    }
                 }
             });
         let rows: Vec<AnyElement> = listed
@@ -306,7 +354,7 @@ impl Workspace {
                     div().truncate().text_sm().text_color(t.foreground).child(profile.name.clone()).into_any_element()
                 } else {
                     let id = profile.id.clone();
-                    self.text_field(
+                    let field = self.text_field(
                         &format!("browser-profile-{}", profile.id),
                         &profile.name,
                         "",
@@ -315,9 +363,13 @@ impl Workspace {
                         window,
                         cx,
                         move |this, name, window, cx| this.rename_browser_profile(&id, &name, window, cx),
-                    )
-                    .sized(px(224.))
-                    .into_any_element()
+                    );
+                    match field {
+                        FieldInput::Line(input) if importing => {
+                            div().w(px(224.)).child(Input::new(&input).disabled(true)).into_any_element()
+                        }
+                        field => field.sized(px(224.)).into_any_element(),
+                    }
                 };
                 h_flex()
                     .px(px(12.))
@@ -327,7 +379,7 @@ impl Workspace {
                     .child(
                         h_flex().flex_1().min_w_0().gap(px(8.)).child(name).when(is_default, |el| el.child(badge(&t))),
                     )
-                    .child(profile_menu(&workspace, profile.clone(), is_default, connected, &t))
+                    .child(profile_menu(&workspace, profile.clone(), is_default, connected, importing, &t))
                     .into_any_element()
             })
             .collect();
@@ -346,7 +398,32 @@ impl Workspace {
         self.setting_row(view, row, window, cx)
     }
 
+    /// The Add profile menu's "Import from" group (`importableSources`).
+    fn import_menu_entries(&self) -> Vec<ImportMenuEntry> {
+        // Cookies are imported on this desktop, whose policy the primary environment reports.
+        if let Some(denial) = crate::app::preview::cookie_import_denial(&self.primary_info().managed_policy) {
+            return vec![ImportMenuEntry::Note(denial.into())];
+        }
+        let Some(sources) = &self.preview.cookie_import.sources else {
+            return vec![ImportMenuEntry::Note("Looking for browsers\u{2026}".into())];
+        };
+        let listed: Vec<_> = sources.iter().filter(|source| source.listed()).collect();
+        if listed.is_empty() {
+            return vec![ImportMenuEntry::Note("No supported browsers found".into())];
+        }
+        let connected = self.primary_environment().is_some();
+        let mut entries: Vec<_> =
+            listed.into_iter().map(|source| ImportMenuEntry::Source(source.clone(), connected)).collect();
+        if !connected {
+            entries.push(ImportMenuEntry::Note("Connect to an environment to import cookies".into()));
+        }
+        entries
+    }
+
     fn create_browser_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.preview.cookie_import.in_flight {
+            return;
+        }
         let settings = &self.client_settings.values;
         let name =
             preview::unique_profile_name("New profile", &preview::resolve_profiles(&preview::user_profiles(settings)));
@@ -358,6 +435,9 @@ impl Workspace {
     }
 
     fn rename_browser_profile(&mut self, id: &str, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.preview.cookie_import.in_flight {
+            return;
+        }
         let name: String = name.trim().chars().take(preview::PROFILE_NAME_MAX_LENGTH).collect();
         if name.is_empty() {
             return;
@@ -368,6 +448,9 @@ impl Workspace {
 
     /// Clears now, or asks first when the server's browser has tabs to close.
     fn confirm_clear_browser_profile(&mut self, profile: Profile, window: &mut Window, cx: &mut Context<Self>) {
+        if self.preview.cookie_import.in_flight {
+            return;
+        }
         if !self.settings_info().capability("serverBrowser") {
             return self.clear_browser_profile_data(profile, window, cx);
         }
@@ -410,6 +493,9 @@ impl Workspace {
     }
 
     fn confirm_remove_browser_profile(&mut self, profile: Profile, window: &mut Window, cx: &mut Context<Self>) {
+        if self.preview.cookie_import.in_flight {
+            return;
+        }
         let workspace = cx.entity();
         let removal: Entity<Removal> = cx.new(|_| Removal::default());
         window.open_dialog(cx, move |dialog, _, cx| {
@@ -525,12 +611,20 @@ fn badge(t: &Tokens) -> impl IntoElement {
         .child("Default")
 }
 
+/// An entry of the Add profile menu's "Import from" group: a browser, enabled with an environment
+/// to import for, or a disabled note.
+enum ImportMenuEntry {
+    Source(crate::browser_import::Source, bool),
+    Note(SharedString),
+}
+
 /// A profile's options: set as default, clear its data, and remove it unless it is built in.
 fn profile_menu(
     workspace: &Entity<Workspace>,
     profile: Profile,
     is_default: bool,
     connected: bool,
+    importing: bool,
     t: &Tokens,
 ) -> impl IntoElement {
     let (workspace, error) = (workspace.clone(), t.error);
@@ -540,6 +634,7 @@ fn profile_menu(
         .size(px(24.))
         .text_color(t.muted_foreground)
         .icon(Icon::new(IconName::EllipsisVertical).size(px(14.)))
+        .disabled(importing)
         .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |mut menu, window, _| {
             let on = |action: fn(&mut Workspace, Profile, &mut Window, &mut Context<Workspace>)| {
                 let profile = profile.clone();

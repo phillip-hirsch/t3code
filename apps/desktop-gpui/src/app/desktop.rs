@@ -14,16 +14,21 @@ use gpui_kit::{
 };
 use serde_json::json;
 
+use super::project_clone::paths;
 use super::{Workspace, pages::Page};
 use crate::desktop::links::{self, AppLink, LinkedPrompt, NewThreadLink, Repository};
 use crate::desktop::settings::WindowRect;
 use crate::desktop::window_state::{self, BoundsPersistence};
 use crate::desktop::{self, Desktop};
-use crate::model::ProjectShell;
+use crate::model::{ProjectShell, ScopedId};
 use crate::pull_request_detail::{CheckoutMode, CheckoutRequest, terminology};
 
 /// `MAIN_WINDOW_BOUNDS_PERSIST_DEBOUNCE_MS`.
 const BOUNDS_PERSIST_DEBOUNCE: Duration = Duration::from_millis(500);
+/// How long a link waits for its cloned project to be listed (`waitForProject(…, 5_000)`).
+const CLONED_PROJECT_WAIT: Duration = Duration::from_secs(5);
+const CANNOT_CLONE: &str =
+    "This machine cannot clone from a link. Update T3 Code on it, or clone the repository from the command palette.";
 
 /// Where an opened `/new` link stands (`NewThreadLinkView`'s `LinkState`).
 #[derive(Clone)]
@@ -40,10 +45,19 @@ pub(super) enum LinkPage {
         link: NewThreadLink,
         repository: Repository,
     },
+    /// The missing repository is cloning into `project`, chosen before the clone starts;
+    /// `started` once the server took it, and the link resumes when the project is listed.
+    Cloning {
+        link: NewThreadLink,
+        repository: Repository,
+        project: ScopedId,
+        started: bool,
+    },
     /// The pull request has no thread yet; checking it out runs setup from its code, so it waits
     /// for the user (`PullRequestLinkCheckout`).
     PullRequestCheckout {
         pull_request: links::PullRequest,
+        environment_id: SharedString,
         project_id: String,
         prompt: Option<String>,
         checking: bool,
@@ -59,6 +73,8 @@ pub(super) struct DesktopShell {
     pending_links: Vec<AppLink>,
     pub(super) link_page: Option<LinkPage>,
     _link_task: Option<Task<()>>,
+    /// Gives up on a cloned project that is not listed in time.
+    _clone_wait: Option<Task<()>>,
     /// Settings > About's `t3` command row.
     pub(super) cli: Option<crate::desktop::cli::CliState>,
     pub(super) cli_pending: bool,
@@ -91,6 +107,7 @@ impl DesktopShell {
             pending_links,
             link_page: None,
             _link_task: None,
+            _clone_wait: None,
             cli: None,
             cli_pending: false,
             _cli_task: None,
@@ -132,14 +149,28 @@ impl Workspace {
 
     /// A later launch's arguments (`second-instance`), once [`super::main_window::ensure`]
     /// brought this window forward: its app links open here.
+    /// Links wait for the launch landing; setup must not take their place.
+    pub(super) fn has_pending_links(&self) -> bool {
+        !self.desktop.pending_links.is_empty()
+    }
+
     pub(super) fn receive_launch(&mut self, args: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
         self.desktop.pending_links.extend(args.iter().filter_map(|arg| links::parse_app_link(arg)));
         self.open_pending_links(window, cx);
     }
 
-    /// Opens queued links once the server has listed its projects; the shell's first
-    /// snapshot calls this again.
+    /// URLs macOS opened with the app (`open-url`, and `open-file` for web pages): app links,
+    /// and ordinary pages for the browser or the Pull requests page.
+    pub(super) fn receive_opened_urls(&mut self, urls: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+        self.desktop.pending_links.extend(urls.iter().filter_map(|url| links::parse_opened_url(url)));
+        self.open_pending_links(window, cx);
+    }
+
+    /// Opens queued links and `t3 app` requests once the server has listed its projects; the
+    /// shell's snapshots call this again.
     pub(super) fn open_pending_links(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.process_activations(window, cx);
+        self.resume_link_clone(window, cx);
         if !self.landed || self.client().is_none() {
             return;
         }
@@ -151,6 +182,7 @@ impl Workspace {
     fn open_app_link(&mut self, link: AppLink, window: &mut Window, cx: &mut Context<Self>) {
         match link {
             AppLink::Pair { pairing_url } => self.pair_from_link(pairing_url, window, cx),
+            AppLink::Web { url } => self.open_web_link(url, window, cx),
             AppLink::Thread { environment_id, thread_id, query } => {
                 let listed = self.shell.threads.iter().any(|t| t.id == thread_id && t.environment_id == environment_id);
                 if listed {
@@ -183,6 +215,26 @@ impl Workspace {
                 ),
                 Ok(link) => self.launch_new_thread_link(link, window, cx),
             },
+        }
+    }
+
+    /// `DesktopWebLinkCoordinator.openLink` for a page: a pull request link opens in the Pull
+    /// requests page when that setting is on (`openChangeRequest`), anything else in the open
+    /// thread's browser. Only this machine serves files, so an HTML file needs a thread on it.
+    fn open_web_link(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.open_change_request_link(&url, cx) {
+            return;
+        }
+        let file = url::Url::parse(&url).ok().filter(|u| u.scheme() == "file").and_then(|u| u.to_file_path().ok());
+        let primary = self.primary_environment().cloned();
+        let thread =
+            self.preview_thread().filter(|thread| file.is_none() || primary.as_ref() == Some(&thread.environment));
+        let Some(thread) = thread else {
+            return toast_error(window, cx, "Could not open the link", url);
+        };
+        match file {
+            Some(path) => self.open_host_file_in_browser(&path.to_string_lossy(), window, cx),
+            None => self.request_preview_tab(thread, Some(url), false, window, cx),
         }
     }
 
@@ -232,12 +284,12 @@ impl Workspace {
                 return;
             }
             let catalog = saved.read_with(cx, |saved, _| saved.environments().to_vec());
-            let paired = crate::runtime().spawn(crate::environments::pair(host, code, catalog)).await;
+            let paired = crate::runtime().spawn(crate::environments::pair(host, code, catalog, None)).await;
             let paired = paired.unwrap_or_else(|error| Err(error.to_string()));
             let saving = match paired {
                 // The workspace's own environment is already here.
                 Ok(paired) if primary.as_deref() == Some(paired.environment_id.as_str()) => None,
-                Ok(paired) => Some(saved.update(cx, |saved, cx| saved.add(paired, cx))),
+                Ok(paired) => Some(saved.update(cx, |saved, cx| saved.register(paired, true, cx))),
                 Err(error) => {
                     let _ = this.update_in(cx, |_, window, cx| fail(&error, window, cx));
                     return;
@@ -308,7 +360,7 @@ impl Workspace {
                     self.show_link_page(LinkPage::MissingRepository { link, repository }, cx);
                     return;
                 }
-                let project_id = found[0].id.clone();
+                let (environment_id, project_id) = (found[0].environment_id.clone(), found[0].id.clone());
                 // Each project asks the machine it lives on.
                 let projects: Vec<_> = found
                     .iter()
@@ -349,6 +401,7 @@ impl Workspace {
                                 this.show_link_page(
                                     LinkPage::PullRequestCheckout {
                                         pull_request: pull_request.clone(),
+                                        environment_id,
                                         project_id,
                                         prompt: prompt.as_ref().map(|p| p.text.clone()),
                                         checking: false,
@@ -386,16 +439,7 @@ impl Workspace {
     /// `openScratchDraft`: the "No project" workspace, with the pull request's URL when the
     /// link names one, on `scratchEnvironmentId(lastActiveEnvironmentId())`.
     fn open_scratch_draft(&mut self, link: NewThreadLink, window: &mut Window, cx: &mut Context<Self>) {
-        let last_active = self
-            .shell
-            .threads
-            .iter()
-            .fold(None, |latest: Option<&crate::model::ThreadShell>, thread| match latest {
-                Some(latest) if thread.updated_at <= latest.updated_at => Some(latest),
-                _ => Some(thread),
-            })
-            .map(|thread| thread.environment_id.clone())
-            .or_else(|| self.primary_environment().cloned());
+        let last_active = self.last_active_environment();
         let environment = self.scratch_environment_from(last_active.as_deref());
         let Some((environment, client)) =
             environment.and_then(|environment| Some((environment.clone(), self.env_client(&environment)?)))
@@ -427,6 +471,129 @@ impl Workspace {
                 }
             });
         }));
+    }
+
+    /// `lastActiveEnvironmentId`: the environment of the thread updated last, else the primary.
+    fn last_active_environment(&self) -> Option<SharedString> {
+        self.shell
+            .threads
+            .iter()
+            .fold(None, |latest: Option<&crate::model::ThreadShell>, thread| match latest {
+                Some(latest) if thread.updated_at <= latest.updated_at => Some(latest),
+                _ => Some(thread),
+            })
+            .map(|thread| thread.environment_id.clone())
+            .or_else(|| self.primary_environment().cloned())
+    }
+
+    /// `cloneRepository`: clones the link's GitHub repository on the last active environment,
+    /// into its new-projects folder (its add-project base with the ghq layout), then resumes the
+    /// link once the project is listed.
+    fn clone_link_repository(
+        &mut self,
+        link: NewThreadLink,
+        repository: Repository,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let environment = self.last_active_environment();
+        let target = environment.and_then(|environment| {
+            let info = self.env_info(&environment).filter(|info| !info.config.is_null())?;
+            let root = info.new_projects_root.clone()?;
+            let ghq = info.settings.get("ghqCloneLayout").as_bool() == Some(true);
+            let base = info.settings.get("addProjectBaseDirectory").as_str().map(str::to_owned);
+            Some((environment, root, ghq, base))
+        });
+        let Some((environment, root, ghq, base)) = target else {
+            let page = LinkPage::Failed { title: "Could not open the link".into(), message: CANNOT_CLONE.into() };
+            return self.show_link_page(page, cx);
+        };
+        if self.env_grant(&environment, super::git::SOURCE_CONTROL_WRITE) == Some(false) {
+            return toast_error(
+                window,
+                cx,
+                "Clone unavailable",
+                "This connection needs permission to write source control.",
+            );
+        }
+        let Some(client) = self.env_client(&environment) else {
+            return toast_error(window, cx, "Clone failed", "This environment is not connected.");
+        };
+        let remote_url = format!("https://github.com/{}/{}.git", repository.owner, repository.name);
+        let directory = if ghq { paths::add_project_initial_query(base.as_deref()) } else { root };
+        let destination =
+            paths::clone_destination_path(&directory, &paths::clone_directory_path(&remote_url, ghq, &remote_url));
+        let project = ScopedId::new(environment, super::new_id());
+        let input = json!({
+            "projectId": project.id,
+            "title": repository.name,
+            "createdAt": crate::timestamp::iso(crate::timestamp::now_ms()),
+            "remoteUrl": remote_url,
+            "destinationPath": destination,
+        });
+        let page = LinkPage::Cloning { link, repository, project: project.clone(), started: false };
+        self.show_link_page(page, cx);
+        self.desktop._link_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = client.request("projectClone.start", input).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                // Another link may have replaced this one meanwhile.
+                let Some(LinkPage::Cloning { link, repository, project: cloning, started }) =
+                    &mut this.desktop.link_page
+                else {
+                    return;
+                };
+                if *cloning != project {
+                    return;
+                }
+                match result {
+                    Err(error) => {
+                        let page = LinkPage::MissingRepository { link: link.clone(), repository: repository.clone() };
+                        toast_error(window, cx, "Clone failed", error.message());
+                        this.show_link_page(page, cx);
+                    }
+                    Ok(_) => {
+                        *started = true;
+                        this.suggest_app_access(&project.env, &remote_url, window, cx);
+                        this.desktop._clone_wait = Some(cx.spawn(async move |this, cx| {
+                            cx.background_executor().timer(CLONED_PROJECT_WAIT).await;
+                            let _ = this.update(cx, |this, cx| {
+                                let waiting = matches!(
+                                    &this.desktop.link_page,
+                                    Some(LinkPage::Cloning { project: cloning, .. }) if *cloning == project
+                                );
+                                if waiting {
+                                    this.link_failed("The clone started, but its project did not appear.", cx);
+                                }
+                            });
+                        }));
+                        this.resume_link_clone(window, cx);
+                    }
+                }
+            });
+        }));
+    }
+
+    /// A link waiting on its clone goes on once the project is listed: a draft in it, or, for a
+    /// pull request, a note to open the link again when the clone is done.
+    fn resume_link_clone(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(LinkPage::Cloning { link, repository, project, started: true }) = &self.desktop.link_page else {
+            return;
+        };
+        if !self.shell.projects.iter().any(|p| ScopedId::of_project(p) == *project) {
+            return;
+        }
+        let (link, repository, project) = (link.clone(), repository.clone(), project.clone());
+        self.desktop._clone_wait = None;
+        match link {
+            NewThreadLink::PullRequest { .. } => {
+                let page = LinkPage::Failed {
+                    title: format!("Cloning {}/{}", repository.owner, repository.name).into(),
+                    message: "Open this link again when the clone finishes.".into(),
+                };
+                self.show_link_page(page, cx);
+            }
+            NewThreadLink::New { .. } => self.open_link_draft(project.env, project.id, &link, None, window, cx),
+        }
     }
 
     fn link_failed(&mut self, message: &'static str, cx: &mut Context<Self>) {
@@ -525,7 +692,7 @@ impl Workspace {
     /// `PullRequestLinkCheckout`'s Check out: a worktree of the pull request with a draft on it,
     /// the link's prompt in its composer.
     fn check_out_linked_pull_request(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(LinkPage::PullRequestCheckout { pull_request, project_id, prompt, checking }) =
+        let Some(LinkPage::PullRequestCheckout { pull_request, environment_id, project_id, prompt, checking }) =
             &mut self.desktop.link_page
         else {
             return;
@@ -535,10 +702,11 @@ impl Workspace {
         }
         *checking = true;
         let request = CheckoutRequest {
+            environment_id: environment_id.to_string(),
             project_id: project_id.clone(),
             url: pull_request.url(),
             term: terminology("github").0,
-            task: prompt.clone(),
+            task: prompt.clone().map(Into::into),
             mode: CheckoutMode::Worktree,
         };
         let settled = |this: &mut Workspace| {
@@ -559,7 +727,7 @@ impl Workspace {
             .clone()
             .unwrap_or(LinkPage::Opening)
         {
-            LinkPage::Opening => ("Opening the link...".into(), None, Vec::new()),
+            LinkPage::Opening | LinkPage::Cloning { .. } => ("Opening the link...".into(), None, Vec::new()),
             LinkPage::Opened { link } => {
                 let again = Button::new("link-open-again").outline().small().label("Open it again").on_click(
                     cx.listener(move |this, _, window, cx| this.launch_new_thread_link(link.clone(), window, cx)),
@@ -569,6 +737,18 @@ impl Workspace {
             LinkPage::Failed { title, message } => (title, Some(message), Vec::new()),
             LinkPage::MissingRepository { link, repository } => {
                 let name = format!("{}/{}", repository.owner, repository.name);
+                let denied = self
+                    .last_active_environment()
+                    .is_some_and(|env| self.env_grant(&env, super::git::SOURCE_CONTROL_WRITE) == Some(false));
+                let clone_link = link.clone();
+                let clone = Button::new("link-clone")
+                    .primary()
+                    .small()
+                    .disabled(denied)
+                    .label(format!("Clone {name}"))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.clone_link_repository(clone_link.clone(), repository.clone(), window, cx);
+                    }));
                 let without =
                     Button::new("link-without-project").outline().small().label("Use without project").on_click(
                         cx.listener(move |this, _, window, cx| this.open_scratch_draft(link.clone(), window, cx)),
@@ -576,7 +756,7 @@ impl Workspace {
                 (
                     format!("You don't have {name}").into(),
                     Some("Clone it to work on it here, or start without a project.".into()),
-                    vec![without.into_any_element()],
+                    vec![clone.into_any_element(), without.into_any_element()],
                 )
             }
             LinkPage::PullRequestCheckout { pull_request, checking, .. } => {

@@ -203,7 +203,8 @@ fn syntax_spans(
     if language.as_str() == "text" || lines.is_empty() {
         return per_line;
     }
-    let ranges = if file.hunks().is_empty() {
+    // A hydrated side is the whole file, so one pass sees every scope.
+    let ranges = if file.hunks().is_empty() || file.is_hydrated() {
         vec![0..lines.len()]
     } else {
         file.hunks().iter().map(|hunk| hunk.lines(side)).collect()

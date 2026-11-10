@@ -5,7 +5,7 @@
 pub(in crate::app) mod agents;
 mod chat;
 pub(in crate::app) mod code;
-mod connections;
+pub(in crate::app) mod connections;
 pub(in crate::app) use connections::check_filesystem_read;
 pub(in crate::app) use connections::check_scope;
 pub(in crate::app) use connections::logic::{machine_icon, one_password_account};
@@ -22,12 +22,19 @@ mod model_select;
 
 mod providers;
 mod row_layout;
-pub(in crate::app) use providers::{chatgpt_usage_button, redacted_email, uses_chatgpt_sharing};
+pub(in crate::app) use providers::{
+    ModeChange, chatgpt_usage_button, codex_setup_managed, idle_compaction, provider_summary, redacted_email,
+    uses_chatgpt_sharing, with_setup_mode,
+};
 pub(in crate::app) use widgets::device_only;
 mod search;
+pub(in crate::app) mod secret_source;
+pub(in crate::app) use secret_source::source_select;
 mod snap_shot;
 mod star_prompt;
 mod system;
+pub(in crate::app) use fields::resolve_pasted_path;
+pub(in crate::app) use system::format_bytes;
 pub(in crate::app) mod theme_import;
 pub(in crate::app) mod theme_library;
 mod typography;
@@ -260,6 +267,8 @@ pub(in crate::app) struct SettingsUi {
     open_marker: Option<SharedString>,
     /// Open "Advanced" folds, by section id.
     advanced_open: HashSet<&'static str>,
+    /// A pull request routing grant is being saved; the pickers wait for it.
+    pull_request_routing_saving: bool,
     /// The Typography rows' family pickers, by setting key.
     font_pickers: HashMap<&'static str, typography::FontPicker>,
     project_picker: Option<widgets::ScopeProjectPicker>,
@@ -327,6 +336,7 @@ impl SettingsUi {
             sliders: HashMap::new(),
             open_marker: None,
             advanced_open: HashSet::new(),
+            pull_request_routing_saving: false,
             font_pickers: HashMap::new(),
             star_prompt_shown: false,
             project_picker: None,

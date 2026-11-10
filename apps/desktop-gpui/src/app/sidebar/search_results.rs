@@ -7,14 +7,14 @@ use std::rc::Rc;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::{
     AnyElement, Context, FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, prelude::FluentBuilder as _, px,
+    StatefulInteractiveElement as _, Styled as _, Window, div, prelude::FluentBuilder as _, px,
 };
 
-use super::{now_ms, project_icon, text_sm, text_xs};
+use super::{now_ms, project_icon, row_id, text_sm, text_xs};
 use crate::app::Workspace;
-use crate::app::palette::MessageSearch;
+use crate::app::palette::{MessageMatch, MessageSearch, SearchScope};
 use crate::inbox;
-use crate::model::ThreadShell;
+use crate::model::{ScopedId, ThreadShell};
 use crate::search::{self, ThreadSubject};
 use crate::theme::Tokens;
 use crate::thread_pull_requests::SearchPullRequest;
@@ -50,9 +50,16 @@ impl Workspace {
     /// After a keystroke: no row is highlighted and the message search restarts.
     pub(super) fn on_search_changed(&mut self, cx: &mut Context<Self>) {
         self.sidebar.search_highlight = None;
-        let query = self.sidebar.search.read(cx).value().to_string();
-        self.search_messages(query, Self::sidebar_messages, cx);
+        self.refresh_sidebar_search(cx);
         self.notify_sidebar(cx);
+    }
+
+    /// Searches the server for the box's query in the filter's projects, unless that search
+    /// already ran.
+    pub(super) fn refresh_sidebar_search(&mut self, cx: &mut Context<Self>) {
+        let query = self.sidebar.search.read(cx).value().to_string();
+        let projects = self.scoped_projects().map(|scoped| super::older_settled::search_projects(&scoped));
+        self.search_messages(query, SearchScope { projects, labels: None }, Self::sidebar_messages, cx);
     }
 
     /// `searchSidebarThreads` over the scoped threads, then the message-only hits.
@@ -64,18 +71,18 @@ impl Workspace {
                 && t.archived_at.is_none()
                 && t.deleted_at.is_none()
                 && scope
-                    .get_or_init(|| self.scoped_project_ids())
+                    .get_or_init(|| self.scoped_projects())
                     .as_ref()
-                    .is_none_or(|ids| ids.contains(&t.project_id))
+                    .is_none_or(|projects| projects.contains(&ScopedId::thread_project(t)))
         };
         let threads = self.ranked_search(query, now, &visible);
         let mut results: Vec<SearchResult> =
             threads.iter().map(|&at| SearchResult { thread: &self.shell.threads[at], snippet: None }).collect();
         for hit in &self.sidebar.messages.matches {
-            if results.iter().any(|r| r.thread.id == hit.thread_id) {
+            if results.iter().any(|r| is_hit_thread(hit, r.thread)) {
                 continue;
             }
-            let Some(thread) = self.shell.threads.iter().find(|t| t.id == hit.thread_id && visible(t)) else {
+            let Some(thread) = self.shell.threads.iter().find(|t| is_hit_thread(hit, t) && visible(t)) else {
                 continue;
             };
             let ranges = search::token_ranges(&hit.snippet, query);
@@ -143,7 +150,8 @@ impl Workspace {
         if query.is_empty() {
             return;
         }
-        let ids: Vec<String> = self.search_results(&query, now_ms()).iter().map(|r| r.thread.id.clone()).collect();
+        let ids: Vec<ScopedId> =
+            self.search_results(&query, now_ms()).iter().map(|r| ScopedId::of_thread(r.thread)).collect();
         let at = self.sidebar.search_highlight.as_ref().and_then(|id| ids.iter().position(|i| i == id));
         match event.keystroke.key.as_str() {
             "escape" => self.clear_search(window, cx),
@@ -180,18 +188,20 @@ impl Workspace {
     }
 
     /// A row listed for a message match opens find on it, as the palette does.
-    fn open_search_result(&mut self, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_search_result(&mut self, key: ScopedId, window: &mut Window, cx: &mut Context<Self>) {
         let query = self.sidebar.search.read(cx).value().trim().to_owned();
         let message_row = self
             .search_results(&self.search_query(cx), now_ms())
             .iter()
-            .any(|r| r.thread.id == thread_id && r.snippet.is_some());
+            .any(|r| key.is_thread(r.thread) && r.snippet.is_some());
         let find = message_row
-            .then(|| self.sidebar.messages.matches.iter().find(|m| m.thread_id == thread_id))
+            .then(|| {
+                self.sidebar.messages.matches.iter().find(|m| m.environment_id == key.env && m.thread_id == key.id)
+            })
             .flatten()
             .map(|m| (crate::app::find::query_for_message(&m.snippet, &query), m.message_id.clone()));
         self.clear_search(window, cx);
-        self.select_thread(thread_id, window, cx);
+        self.select_thread_in(key.env, key.id, window, cx);
         if let Some((query, message_id)) = find {
             self.open_thread_find_on(&query, message_id, window, cx);
         }
@@ -216,18 +226,17 @@ impl Workspace {
                 .child(text)
                 .into_any_element();
         }
-        let route = self.route_thread();
-        let highlight = self.sidebar.search_highlight.as_deref().or(results.first().map(|r| r.thread.id.as_str()));
-        let highlight = highlight.filter(|_| self.sidebar.search_highlight.is_some());
+        let route = self.route_key();
+        let highlight = self.sidebar.search_highlight.as_ref();
         v_flex()
             .gap(px(1.))
             .children(results.into_iter().map(|result| {
                 let thread = result.thread;
-                let active = highlight == Some(thread.id.as_str()) || route == Some(thread.id.as_str());
+                let active = highlight.is_some_and(|key| key.is_thread(thread)) || route == Some(thread.thread_ref());
                 let settled = thread.settled_override.as_deref() == Some("settled");
                 let muted_icon = settled && !active;
-                let hovered = self.sidebar.hovered.as_deref() == Some(thread.id.as_str());
-                let project = self.shell.projects.iter().find(|p| p.id == thread.project_id);
+                let hovered = self.sidebar.hovered.as_ref().is_some_and(|key| key.is_thread(thread));
+                let project = self.shell.projects.iter().find(|p| p.project_ref() == thread.project_ref());
                 let time = inbox::Facts { thread, child_request: None }
                     .activity_timestamp()
                     .map(|at| inbox::format_relative(now - at));
@@ -238,7 +247,8 @@ impl Workspace {
                 } else {
                     sb.foreground
                 };
-                let (open_id, hover_id) = (thread.id.clone(), thread.id.clone());
+                let open_id = ScopedId::of_thread(thread);
+                let hover_id = open_id.clone();
                 let snippet = result.snippet.map(|(user, parts)| {
                     text_xs(h_flex())
                         .min_w_0()
@@ -260,7 +270,7 @@ impl Workspace {
                         }))
                 });
                 text_sm(h_flex())
-                    .id(SharedString::from(format!("search-{}", thread.id)))
+                    .id(row_id("search", &thread.environment_id, &thread.id))
                     .min_h(px(36.))
                     .px(px(10.))
                     .py(px(4.))
@@ -318,4 +328,9 @@ impl Workspace {
             }))
             .into_any_element()
     }
+}
+
+/// Whether a message hit is from `thread`, on its environment.
+fn is_hit_thread(hit: &MessageMatch, thread: &ThreadShell) -> bool {
+    hit.environment_id == thread.environment_id && hit.thread_id == thread.id
 }
