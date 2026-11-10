@@ -533,6 +533,8 @@ pub(super) fn skill_links(
                 let url = model_link(&driver, &mention.instance_id, &mention.model);
                 links.push((mention.range, format!("[{}]({url})", escape_link_text(&label))));
             }
+            let linked = link_spans(part);
+            links.retain(|(range, _)| !linked.iter().any(|span| range.start < span.end && span.start < range.end));
             links.sort_by_key(|(range, _)| range.start);
             let mut last = 0;
             for (range, link) in links {
@@ -547,6 +549,52 @@ pub(super) fn skill_links(
         }
     }
     out
+}
+
+/// Byte ranges of inline links and images (`[text](url)`), whose text stays as written.
+fn link_spans(text: &str) -> Vec<std::ops::Range<usize>> {
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'[' => match closing(bytes, i, b'[', b']')
+                .filter(|end| bytes.get(end + 1) == Some(&b'('))
+                .and_then(|end| closing(bytes, end + 1, b'(', b')'))
+            {
+                Some(close) => {
+                    spans.push(i..close + 1);
+                    i = close + 1;
+                }
+                None => i += 1,
+            },
+            _ => i += 1,
+        }
+    }
+    spans
+}
+
+/// The index of the bracket closing the one at `open`, past escaped and nested pairs.
+fn closing(bytes: &[u8], open: usize, left: u8, right: u8) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = open;
+    while let Some(&byte) = bytes.get(i) {
+        if byte == b'\\' {
+            i += 2;
+            continue;
+        }
+        if byte == left {
+            depth += 1;
+        } else if byte == right {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Draws `t3-skill:` links as the composer's skill chip; a click opens its popover.
@@ -1245,6 +1293,10 @@ mod tests {
         assert_eq!(links("Try `$design` here"), "Try `$design` here");
         assert_eq!(links("```\n$design \n```\n$design now"), "```\n$design \n```\n[Design](t3-skill:design) now");
         assert_eq!(links("costs $5 and $10"), "costs $5 and $10");
+        assert_eq!(
+            links("see [$design](https://x.dev) or $design"),
+            "see [$design](https://x.dev) or [Design](t3-skill:design)"
+        );
     }
 
     #[test]
@@ -1259,6 +1311,13 @@ mod tests {
         );
         assert_eq!(links("Try `model:codex/gpt-6.1` here"), "Try `model:codex/gpt-6.1` here");
         assert_eq!(links("```\nmodel:codex/gpt-6.1\n```\n"), "```\nmodel:codex/gpt-6.1\n```\n");
+        // Links keep their text as written, as the web leaves `a` children alone.
+        let linked = "[use model:codex/gpt-6.1 now](https://example.com) ![model:codex/gpt-6.1](a.png)";
+        assert_eq!(links(linked), linked);
+        assert_eq!(
+            links("[a [b] model:codex/gpt-6.1](u (v)) model:codex/gpt-6.1"),
+            "[a [b] model:codex/gpt-6.1](u (v)) [GPT\\-6\\.1](t3-model:codex/codex/gpt-6.1)"
+        );
         let odd = "gpt-6.1(x) [1m]%";
         let url = model_link("codex", "codex", odd);
         assert!(!url.contains(['(', ')', ' ', '[', ']']), "{url}");
