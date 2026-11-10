@@ -44,6 +44,7 @@ use super::git::{self, DiffColorScheme};
 use super::titlebar::{CAPTION_BUTTONS_WIDTH, RIGHT_RESIZE_INSET, TITLEBAR_HEIGHT, icon};
 use super::{Target, Workspace};
 use crate::model::{Checkpoint, ThreadProjection};
+use crate::preview::ThreadRef;
 use crate::rpc::RpcClient;
 use crate::theme::{self, Tokens};
 
@@ -677,10 +678,8 @@ impl Workspace {
 
     /// `closePreviewPanel`: hiding the panel floats the browser it showed.
     pub(super) fn close_right_panel(&mut self, cx: &mut Context<Self>) {
-        if let (Some(Target::Thread { id: thread_id, .. }), Some(Surface::Browser(tab))) =
-            (self.target.clone(), self.active_surface().cloned())
-        {
-            self.float_browser(thread_id, tab, cx);
+        if let (Some(thread), Some(Surface::Browser(tab))) = (self.preview_thread(), self.active_surface().cloned()) {
+            self.float_browser(thread, tab, cx);
         }
         if let Some(panel) = self.user_panel_state() {
             panel.open = false;
@@ -747,8 +746,8 @@ impl Workspace {
         if let Surface::SideChat(thread_id) = &surface {
             self.release_side_chat(thread_id, cx);
         }
-        if let (Surface::Browser(tab), Some(Target::Thread { id: thread_id, .. })) = (&surface, self.target.clone()) {
-            self.close_preview_tab(thread_id, tab.clone(), window, cx);
+        if let (Surface::Browser(tab), Some(thread)) = (&surface, self.preview_thread()) {
+            self.close_preview_tab(thread.tab(tab), window, cx);
         }
         self.sync_active_browser(window, cx);
         cx.notify();
@@ -880,16 +879,14 @@ impl Workspace {
 
     /// Keeps the thread's focused preview tab on the browser surface the panel shows.
     fn sync_active_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let (Some(Target::Thread { id: thread_id, .. }), Some(Surface::Browser(tab))) =
-            (self.target.clone(), self.active_surface().cloned())
-        {
-            self.focus_preview_tab(&thread_id, &tab, window, cx);
+        if let (Some(thread), Some(Surface::Browser(tab))) = (self.preview_thread(), self.active_surface().cloned()) {
+            self.focus_preview_tab(&thread, &tab, window, cx);
         }
     }
 
     /// Follows a thread's preview sessions: a panel tab per drawable session.
-    pub(super) fn reconcile_browser_surfaces(&mut self, thread_id: &str, tab_ids: &[&str]) {
-        let Some(target) = self.thread_target(thread_id) else { return };
+    pub(super) fn reconcile_browser_surfaces(&mut self, thread: &ThreadRef, tab_ids: &[&str]) {
+        let target = super::preview::panel_target(thread);
         // Preview events reconcile often; only a real change is saved.
         if self.right_panel.panels.entry(target).or_default().reconcile_browsers(tab_ids) {
             self.right_panel.layout.changed = true;
@@ -897,9 +894,8 @@ impl Workspace {
     }
 
     /// Whether the thread's panel has a tab for `tab_id`; `focus` shows it (`revealSurface`).
-    pub(super) fn reveal_browser_surface(&mut self, thread_id: &str, tab_id: &str, focus: bool) -> bool {
-        let Some(target) = self.thread_target(thread_id) else { return false };
-        let Some(panel) = self.right_panel.panels.get_mut(&target) else { return false };
+    pub(super) fn reveal_browser_surface(&mut self, thread: &ThreadRef, tab_id: &str, focus: bool) -> bool {
+        let Some(panel) = self.right_panel.panels.get_mut(&super::preview::panel_target(thread)) else { return false };
         let surface = Surface::Browser(tab_id.to_owned());
         if !panel.surfaces.contains(&surface) {
             return false;
@@ -1809,8 +1805,8 @@ impl Workspace {
         }
         let content = match (&panel.active, self.target.clone()) {
             (Some(Surface::Diff), _) => self.render_diff_surface(&panel.scope, &tokens, window, cx),
-            (Some(Surface::Browser(tab)), Some(Target::Thread { id: thread_id, .. })) => {
-                self.render_browser_surface(&thread_id, tab, width, window, cx)
+            (Some(Surface::Browser(tab)), Some(Target::Thread { env, id })) => {
+                self.render_browser_surface(&ThreadRef::new(env, id), tab, width, window, cx)
             }
             (Some(Surface::Files), _) => self.render_files_surface(None, width, window, cx),
             (Some(Surface::File(path)), _) => self.render_files_surface(Some(path.clone()), width, window, cx),
@@ -2063,14 +2059,14 @@ impl Workspace {
         tab_bar
             .when(add_menu_open, |el| el.on_key_down(cx.listener(Self::add_surface_for_key)))
             .child(
-                h_flex()
-                    .id("right-panel-tabs")
-                    .min_w_0()
-                    .h_full()
-                    .gap_1()
-                    .overflow_x_scroll()
-                    .track_scroll(&self.right_panel.tabs_scroll)
-                    .children(tabs),
+                super::history_swipe::horizontal_scroller(
+                    h_flex().id("right-panel-tabs"),
+                    &self.right_panel.tabs_scroll,
+                )
+                .min_w_0()
+                .h_full()
+                .gap_1()
+                .children(tabs),
             )
             .child(
                 Button::new("right-panel-add")

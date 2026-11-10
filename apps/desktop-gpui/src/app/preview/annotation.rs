@@ -20,6 +20,7 @@ use super::icon_button;
 use crate::app::send::Intent;
 use crate::app::{Target, Workspace};
 use crate::composer_context::{kind_scoped_id, sanitize_label};
+use crate::preview::{TabRef, ThreadRef};
 use crate::theme::Tokens;
 
 /// Defines `window.__t3Annotation` in every page a tab loads.
@@ -42,8 +43,7 @@ pub(super) struct Annotations {
 struct Pick {
     /// The nonce the page's messages carry.
     session: String,
-    thread_id: String,
-    tab_id: String,
+    tab: TabRef,
     /// Where the window's focus was before the page took it.
     restore_focus: Option<FocusHandle>,
     /// Whether the page offers Cmd/Ctrl+Enter, as last told.
@@ -386,14 +386,13 @@ impl Workspace {
     /// The pick button for a tab this computer draws; `page_ready` is a reachable page.
     pub(super) fn render_annotate_button(
         &self,
-        thread_id: &str,
-        tab_id: &str,
+        tab: &TabRef,
         page_ready: bool,
         unreachable: bool,
         tokens: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let active = self.annotation_pick(tab_id).is_some();
+        let active = self.annotation_pick(tab).is_some();
         let enabled = page_ready || active;
         let tooltip = if unreachable {
             "Page didn't load. Pick is unavailable until the page renders"
@@ -402,7 +401,7 @@ impl Workspace {
         } else {
             "Annotate elements, regions, and drawings"
         };
-        let (thread, tab) = (thread_id.to_owned(), tab_id.to_owned());
+        let tab = tab.clone();
         icon_button("preview-annotate", IconName::MousePointerClick, enabled, tokens, cx)
             // `variant="secondary"` with a primary icon while picking.
             .when(active, |el| {
@@ -420,15 +419,15 @@ impl Workspace {
                     if this.annotation_pick(&tab).is_some() {
                         this.cancel_annotation(window, cx);
                     } else {
-                        this.start_annotation(&thread, &tab, window, cx);
+                        this.start_annotation(&tab, window, cx);
                     }
                 }))
             })
             .into_any_element()
     }
 
-    fn annotation_pick(&self, tab_id: &str) -> Option<&Pick> {
-        self.preview.annotation.pick.as_ref().filter(|pick| pick.tab_id == tab_id)
+    fn annotation_pick(&self, tab: &TabRef) -> Option<&Pick> {
+        self.preview.annotation.pick.as_ref().filter(|pick| pick.tab == *tab)
     }
 
     /// Whether a pick is in progress in any tab.
@@ -437,12 +436,12 @@ impl Workspace {
     }
 
     /// `handlePickElement`: starts the overlay in the tab's page and hands it the keyboard.
-    fn start_annotation(&mut self, thread_id: &str, tab_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    fn start_annotation(&mut self, key: &TabRef, window: &mut Window, cx: &mut Context<Self>) {
         if self.preview.annotation.pick.is_some() {
             self.cancel_annotation(window, cx);
         }
-        let Some(tab) = self.preview.tabs.get(tab_id) else { return };
-        let send_enabled = self.annotation_send_enabled(thread_id);
+        let send_enabled = self.annotation_send_enabled(&key.thread);
+        let Some(tab) = self.preview.tabs.get(key) else { return };
         let session = uuid::Uuid::new_v4().simple().to_string();
         let options = json!({
             "session": session,
@@ -458,26 +457,20 @@ impl Workspace {
         if let Err(error) = view.focus() {
             log::debug!("could not focus the browser tab: {error}");
         }
-        self.preview.annotation.pick = Some(Pick {
-            session,
-            thread_id: thread_id.to_owned(),
-            tab_id: tab_id.to_owned(),
-            restore_focus,
-            send_enabled,
-            capturing: false,
-        });
+        self.preview.annotation.pick =
+            Some(Pick { session, tab: key.clone(), restore_focus, send_enabled, capturing: false });
         cx.notify();
     }
 
     /// `canSendAnnotation`: the thread's environment lets this client send.
-    fn annotation_send_enabled(&self, thread_id: &str) -> bool {
-        self.thread_environment(thread_id).is_some_and(|environment| self.can_operate(&environment))
+    fn annotation_send_enabled(&self, thread: &ThreadRef) -> bool {
+        self.can_operate(&thread.environment)
     }
 
     /// Ends the pick and tears the overlay down, also mid-capture: that capture is dropped.
     pub(super) fn cancel_annotation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(pick) = self.preview.annotation.pick.as_ref() else { return };
-        if let Some(tab) = self.preview.tabs.get(&pick.tab_id)
+        if let Some(tab) = self.preview.tabs.get(&pick.tab)
             && let Err(error) = tab.view.read(cx).raw().evaluate_script(&page_call("cancel()"))
         {
             log::debug!("could not cancel the annotation overlay: {error}");
@@ -488,7 +481,7 @@ impl Workspace {
     /// `finishPick`: forgets the pick and gives the keyboard back to where it was.
     fn finish_annotation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(pick) = self.preview.annotation.pick.take() else { return };
-        if let Some(tab) = self.preview.tabs.get(&pick.tab_id)
+        if let Some(tab) = self.preview.tabs.get(&pick.tab)
             && let Err(error) = tab.view.read(cx).raw().focus_parent()
         {
             log::debug!("could not take the focus back from the browser tab: {error}");
@@ -504,14 +497,14 @@ impl Workspace {
     /// Call it before the panel's drawn tab is taken.
     pub(super) fn sync_annotation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(pick) = self.preview.annotation.pick.as_ref() else { return };
-        if self.preview.panel_view.as_ref().is_none_or(|(tab, _)| *tab != pick.tab_id) {
+        if self.preview.panel_view.as_ref().is_none_or(|(tab, _)| *tab != pick.tab) {
             return self.cancel_annotation(window, cx);
         }
-        let enabled = self.annotation_send_enabled(&pick.thread_id);
+        let enabled = self.annotation_send_enabled(&pick.tab.thread);
         if enabled == pick.send_enabled {
             return;
         }
-        if let Some(tab) = self.preview.tabs.get(&pick.tab_id) {
+        if let Some(tab) = self.preview.tabs.get(&pick.tab) {
             let _ = tab.view.read(cx).raw().evaluate_script(&page_call(&format!("setSendEnabled({enabled})")));
         }
         if let Some(pick) = self.preview.annotation.pick.as_mut() {
@@ -520,23 +513,22 @@ impl Workspace {
     }
 
     /// A tab's page started loading: its overlay went with the old page.
-    pub(super) fn annotation_page_left(&mut self, tab_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.annotation_pick(tab_id).is_some() {
+    pub(super) fn annotation_page_left(&mut self, tab: &TabRef, window: &mut Window, cx: &mut Context<Self>) {
+        if self.annotation_pick(tab).is_some() {
             self.finish_annotation(window, cx);
         }
     }
 
-    /// The overlay's message from `tab_id`; one from any other session is ignored.
+    /// The overlay's message from `tab`; one from any other session is ignored.
     pub(super) fn on_pick_message(
         &mut self,
-        tab_id: &str,
+        tab: &TabRef,
         session: &str,
         message: PickMessage,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(pick) = self.preview.annotation.pick.as_mut().filter(|p| p.tab_id == tab_id && p.session == session)
-        else {
+        let Some(pick) = self.preview.annotation.pick.as_mut().filter(|p| p.tab == *tab && p.session == session) else {
             return;
         };
         let submission = match message {
@@ -546,7 +538,7 @@ impl Workspace {
         };
         pick.capturing = true;
         let rect = crop_area(submission.crop, submission.viewport, &submission.annotation.target_rects())
-            .and_then(|area| self.annotation_screen_rect(tab_id, area, submission.viewport, window, cx));
+            .and_then(|area| self.annotation_screen_rect(tab, area, submission.viewport, window, cx));
         let session = session.to_owned();
         let shot = cx.background_executor().spawn(async move { rect.map(capture::grab_png) });
         cx.spawn_in(window, async move |this, cx| {
@@ -560,13 +552,13 @@ impl Workspace {
     /// Where `area` of the tab's viewport is on screen.
     fn annotation_screen_rect(
         &self,
-        tab_id: &str,
+        tab: &TabRef,
         area: Rect,
         (width, _): (f64, f64),
         window: &Window,
         cx: &App,
     ) -> Option<ScreenRect> {
-        let bounds = self.preview.tabs.get(tab_id).filter(|tab| tab.shown)?.view.read(cx).bounds();
+        let bounds = self.preview.tabs.get(tab).filter(|hosted| hosted.shown)?.view.read(cx).bounds();
         // The page's CSS pixels to the view's, through its zoom.
         #[expect(clippy::cast_possible_truncation, reason = "on-screen sizes fit in an f32")]
         let scale = (f64::from(f32::from(bounds.size.width)) / width) as f32;
@@ -574,7 +566,7 @@ impl Workspace {
         let pixels = |value: f64| px(value as f32 * scale);
         let origin = point(bounds.origin.x + pixels(area.x), bounds.origin.y + pixels(area.y));
         let area = Bounds { origin, size: size(pixels(area.width), pixels(area.height)) };
-        capture::screen_rect(window.bounds().origin, area, capture::screen_units(window))
+        capture::screen_rect(capture::content_origin(window), area, capture::screen_units(window))
     }
 
     /// The screenshot was read (or not): the overlay goes, and the annotation joins the draft.
@@ -588,13 +580,13 @@ impl Workspace {
     ) {
         // A cancel during the capture drops it.
         let Some(pick) = self.preview.annotation.pick.as_ref().filter(|pick| pick.session == session) else { return };
-        let (thread_id, tab_id) = (pick.thread_id.clone(), pick.tab_id.clone());
-        if let Some(tab) = self.preview.tabs.get(&tab_id) {
+        let key = pick.tab.clone();
+        if let Some(tab) = self.preview.tabs.get(&key) {
             let _ = tab.view.read(cx).raw().evaluate_script(&page_call(&format!("captured({})", json!(session))));
         }
         self.finish_annotation(window, cx);
-        let Some(environment) = self.thread_environment(&thread_id) else { return };
-        let target = Target::Thread { env: environment.clone(), id: thread_id };
+        let environment = key.thread.environment.clone();
+        let target = Target::Thread { env: key.thread.environment, id: key.thread.thread_id };
         let png = match shot {
             Some(Ok(png)) => Some(png),
             Some(Err(error)) => {

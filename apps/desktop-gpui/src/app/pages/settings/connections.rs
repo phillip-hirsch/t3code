@@ -17,6 +17,7 @@ mod exposure;
 mod load_balancing;
 pub(super) mod logic;
 mod saved;
+pub(super) use saved::empty_media;
 mod secrets;
 pub(super) mod ui;
 

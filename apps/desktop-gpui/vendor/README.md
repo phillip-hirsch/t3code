@@ -151,6 +151,44 @@ so saved bounds include no shadow. The app keeps its resize edges for that case
 
 - `src/linux/x11/window.rs`: `request_decorations`, `window_decorations` and `set_client_inset`.
 
+## lb-wry 0.53.3
+
+The webview crate (a wry fork) behind the preview browser, file previews and `gpui-webview`.
+
+**A handler for failed navigations.** Electron reports a page that failed to load with
+`did-fail-load` and its Chromium net error, which the browser panel shows as its unreachable page
+and reports to the server. 0.53.3 reports a failed main-frame navigation only as a finished one,
+so the app could tell a failure only by probing for WebView2's `chrome-error:` page, and WebKit's
+failures went unseen. The patch adds `WebViewBuilder::with_on_page_load_error_handler`, which
+passes a `PageLoadError` (the URL, the platform's error domain and code, its description, and on
+Windows the HTTP status when a server answered); the app maps it to a net error
+(`preview::net_error`). Files:
+
+- `src/lib.rs`: `PageLoadError`, the attribute and the builder method.
+- `src/webview2/mod.rs`: a `NavigationCompleted` handler for unsuccessful navigations, added before
+  the page load handler's, so the failure arrives ahead of that navigation's `Finished`.
+- `src/wkwebview/class/wry_navigation_delegate.rs`, `src/wkwebview/navigation.rs`,
+  `src/wkwebview/mod.rs`: `webView:didFailProvisionalNavigation:withError:` and
+  `webView:didFailNavigation:withError:`, with the failing URL from the error's user info.
+- `src/webkitgtk/mod.rs`: `load-failed`, with the code read through the error domains a load
+  reports (`load_error_code`). It handles the signal, so WebKitGTK loads no error page of its own,
+  which would read as a new page load.
+- `Cargo.toml`: objc2-foundation's `NSError` and `NSURLError` features.
+
+**A child webview can move to another window.** The browser's separate preview window takes a
+tab's live page out of the main window and gives it back when it closes. 0.53.3's `reparent`
+takes a different platform type on each OS (an HWND, an `NSWindow` pointer, a GTK container), can
+reach none of them from a window handle without `unsafe`, keeps WebView2's old parent for a child
+webview, and can't move an X11 child at all. The patch adds `WebView::reparent_as_child`, which
+takes a window handle as `build_as_child` does. Files:
+
+- `src/lib.rs`: `reparent_as_child`.
+- `src/webview2/mod.rs`: `SetParent` through the existing `reparent`, then the new parent for a
+  child webview too, which `focus_parent` and `bounds` use.
+- `src/wkwebview/mod.rs`: `addSubview` on the handle's `NSView`, as `new_as_child` does.
+- `src/webkitgtk/mod.rs`: `XReparentWindow` of the child's container window, from an Xlib or XCB
+  handle.
+
 ## gpui-webview 0.9.0
 
 The native WebView the app embeds in GPUI's layout (the preview browser, HTML pages, MCP apps,
@@ -163,6 +201,14 @@ GPUI's pixels to wry as logical ones, so a zoomed window misplaced its pages. Th
 `src/lib.rs`, multiplies those bounds by the scale and the page zoom by it too, so a CSS pixel
 draws as one GPUI pixel on every platform (its `ui_scale` field, kept current in `prepaint`). The
 preview divides its own zoom by the scale, since Electron's app zoom leaves previews alone.
+
+**A webview can move to another window.** For the separate preview window. 0.9.0 has no way to
+move its view, and on Linux it forwards page clicks to the window the view was built in, so a
+moved page would click the main window. The patch adds `WebView::move_to_window` (through lb-wry's
+`reparent_as_child`); on Linux it also points the click forwarding at the new window. Files:
+
+- `src/lib.rs`: `move_to_window` and the `window` cell.
+- `src/linux.rs`: `forward_mouse_down` reads the window from that cell.
 
 ## gpui-base 0.9.0
 

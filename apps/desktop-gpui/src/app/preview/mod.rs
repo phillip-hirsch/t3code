@@ -6,6 +6,7 @@
 //! the server's own Chromium and stream to the panel (`server.rs`).
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::base::FocusTrapElement as _;
@@ -25,28 +26,30 @@ use gpui_kit::{
 use gpui_webview::WebView;
 use serde_json::{Value, json};
 
+use super::keymap;
 use super::right_panel::Surface;
 use super::titlebar::TITLEBAR_HEIGHT;
 use super::{Target, Workspace};
-use crate::preview::{self, Appearance, Applied, NavStatus, Session, ThreadPreviews};
+use crate::preview::{self, Appearance, NavStatus, PreviewThreads, Session, TabRef, ThreadPreviews, ThreadRef};
 use crate::rpc::RpcClient;
 use crate::theme::{self, Tokens};
 
 mod annotation;
 mod capture;
 mod cookie_import;
+mod device_toolbar;
 mod empty;
+mod mini_layout;
+mod mini_player;
 mod profiles;
+mod separate;
 mod server;
+mod viewport;
 
 pub(super) use cookie_import::{ImportOutcome, ImportTarget, cookie_import_denial};
 
 gpui_kit::actions!(preview, [TogglePreview]);
 
-/// `previewMiniPlayerLayout.ts`.
-const MINI_SIZE: f32 = 320.;
-const MINI_EDGE_GAP: f32 = 12.;
-const MINI_HEADER: f32 = 28.;
 /// The inline chrome row: `h-7` plus its `mb-3`.
 const CHROME_ROW: f32 = 28. + 12.;
 
@@ -71,10 +74,27 @@ pub(super) enum PageEvent {
     OpenLink(String),
     /// The annotation overlay's message, with its session.
     Annotation(String, annotation::PickMessage),
+    /// The focused page handed back a shell shortcut's command.
+    Shortcut(String),
+    /// The pointer entered or left the page's top-right corner ([`preview::CORNER_SCRIPT`]).
+    Corner(bool),
+}
+
+/// The chords a focused page forwards (`setForwardedShortcuts`), and what they were resolved from.
+struct PageChords {
+    source: Option<(Rc<[crate::keybindings::Rule]>, bool)>,
+    list: Vec<keymap::PageChord>,
+    /// `list` as JSON, for the pages' script.
+    json: Rc<str>,
+}
+
+impl Default for PageChords {
+    fn default() -> Self {
+        Self { source: None, list: Vec::new(), json: "[]".into() }
+    }
 }
 
 struct HostedTab {
-    thread_id: String,
     view: Entity<WebView>,
     status: NavStatus,
     can_go_back: bool,
@@ -88,8 +108,8 @@ struct HostedTab {
     /// apply until the tab is adjusted (`browserDefaultTabState`).
     defaults: (f64, Appearance),
     shown: bool,
-    /// The tab's own page events, which a load's failure probe reports on.
-    page_events: async_channel::Sender<PageEvent>,
+    /// The chords the view's script starts each new document with.
+    chords: Rc<str>,
     _events: Task<()>,
 }
 
@@ -100,28 +120,35 @@ impl HostedTab {
 }
 
 pub(super) struct PreviewState {
-    threads: HashMap<String, ThreadPreviews>,
-    /// Native views by tab id, created when a tab first shows a page.
-    tabs: HashMap<String, HostedTab>,
+    threads: PreviewThreads,
+    /// Native views, created when a tab first shows a page.
+    tabs: HashMap<TabRef, HostedTab>,
     /// Tabs whose native view is being built, with the URL it should end up on.
-    starting: HashMap<String, String>,
-    /// The tab each thread's mini player floats (`previewMiniPlayerStore`).
-    floating: HashMap<String, String>,
-    /// Agent reveals not yet shown: thread, tab and whether the reveal is forced.
-    reveals: Vec<(String, String, bool)>,
+    starting: HashMap<TabRef, String>,
+    /// The tab each thread's mini player floats, and where (`previewMiniPlayerStore`).
+    floating: HashMap<ThreadRef, mini_player::MiniPlayer>,
+    mini: mini_player::MiniPlayerUi,
+    /// Tabs whose page is in its separate window.
+    separate: HashMap<TabRef, separate::Separate>,
+    toolbar: device_toolbar::DeviceToolbar,
+    /// The page area the panel last drew a tab in: "Show device toolbar" sizes to it, and a
+    /// fill tab floated from it keeps its layout.
+    panel_area: Option<(TabRef, (f32, f32))>,
+    /// Agent reveals not yet shown, and whether each is forced.
+    reveals: Vec<(TabRef, bool)>,
     /// The tabs drawn this frame, by the panel and the mini player, with their page scale.
-    panel_view: Option<(String, f32)>,
-    mini_view: Option<(String, f32)>,
+    panel_view: Option<(TabRef, f32)>,
+    mini_view: Option<(TabRef, f32)>,
     address: Entity<InputState>,
     /// The tab whose URL the address bar shows.
-    address_tab: Option<String>,
+    address_tab: Option<TabRef>,
     pub(super) menu_open: bool,
     /// The address bar's "Open in system browser" button, shown while it has focus.
     external_focus: FocusHandle,
     /// The More menu's Zoom row, which keeps Tab among its buttons.
     zoom_focus: FocusHandle,
     /// Threads whose session list must be (re)fetched.
-    stale: HashSet<String>,
+    stale: HashSet<ThreadRef>,
     reported_profiles: profiles::ReportedProfiles,
     /// Settings › Browser's sources to import cookies from, and an import under way.
     pub(super) cookie_import: cookie_import::CookieImport,
@@ -135,7 +162,8 @@ pub(super) struct PreviewState {
     /// The annotation in progress.
     annotation: annotation::Annotations,
     /// Failed tabs showing the unreachable page's details.
-    unreachable_details: HashSet<String>,
+    unreachable_details: HashSet<TabRef>,
+    chords: PageChords,
     /// A hidden view that keeps WebView2's browser process running, so tabs and file previews
     /// start without its startup cost.
     #[cfg(windows)]
@@ -156,10 +184,14 @@ impl PreviewState {
             }
         });
         Self {
-            threads: HashMap::new(),
+            threads: PreviewThreads::default(),
             tabs: HashMap::new(),
             starting: HashMap::new(),
             floating: HashMap::new(),
+            mini: mini_player::MiniPlayerUi::new(cx),
+            separate: HashMap::new(),
+            toolbar: device_toolbar::DeviceToolbar::new(window, cx),
+            panel_area: None,
             reveals: Vec::new(),
             panel_view: None,
             mini_view: None,
@@ -177,6 +209,7 @@ impl PreviewState {
             capture: Default::default(),
             annotation: Default::default(),
             unreachable_details: HashSet::new(),
+            chords: PageChords::default(),
             #[cfg(windows)]
             _warm: None,
             #[cfg(windows)]
@@ -221,6 +254,17 @@ fn icon_button(id: impl Into<gpui_kit::ElementId>, icon: IconName, enabled: bool
         .rounded(px(6.))
         .icon(Icon::new(icon).size(px(14.)))
         .disabled(!enabled)
+}
+
+/// An [`icon_button`] for a state that is on: `variant="secondary"`, its icon in `icon`.
+fn pressed(button: Button, icon: gpui_kit::Hsla, tokens: &Tokens, cx: &App) -> Button {
+    button.custom(
+        ButtonCustomVariant::new(cx)
+            .color(tokens.secondary)
+            .foreground(icon)
+            .hover(tokens.secondary)
+            .active(tokens.secondary),
+    )
 }
 
 /// The menu's Zoom row (`closeOnClick={false}`): its buttons step the active tab's zoom, read
@@ -290,6 +334,33 @@ impl Workspace {
         }
     }
 
+    /// The open thread on its environment: the one the panel's browser and the address bar act on.
+    pub(in crate::app) fn preview_thread(&self) -> Option<ThreadRef> {
+        match self.target.as_ref()? {
+            Target::Thread { env, id } => Some(ThreadRef::new(env.clone(), id.clone())),
+            Target::Draft { .. } => None,
+        }
+    }
+
+    /// `thread_id` on its environment: the open thread's, else the one the sidebar lists it on.
+    pub(in crate::app) fn preview_thread_of(&self, thread_id: &str) -> Option<ThreadRef> {
+        self.preview_thread()
+            .filter(|thread| thread.thread_id == thread_id)
+            .or_else(|| Some(ThreadRef::new(self.thread_environment(thread_id)?, thread_id)))
+    }
+
+    /// The open thread's tab `tab_id`.
+    fn preview_tab(&self, tab_id: &str) -> Option<TabRef> {
+        Some(self.preview_thread()?.tab(tab_id))
+    }
+
+    /// The tab the chrome, the menu and the shortcuts act on.
+    fn active_tab(&self) -> Option<TabRef> {
+        let thread = self.preview_thread()?;
+        let tab_id = self.active_session(&thread)?.tab_id.clone();
+        Some(thread.tab(tab_id))
+    }
+
     /// Tabs this client draws: its own pages and the agents' streamed ones.
     fn hosted_sessions(previews: &ThreadPreviews) -> impl Iterator<Item = &Session> {
         previews.sessions.iter()
@@ -297,8 +368,8 @@ impl Workspace {
 
     /// The tab the panel shows, else the thread's focused tab, or its last drawable one when an
     /// agent focused a server tab. Another client may move the focus without changing the panel.
-    fn active_session(&self, thread_id: &str) -> Option<&Session> {
-        let previews = self.preview.threads.get(thread_id)?;
+    fn active_session(&self, thread: &ThreadRef) -> Option<&Session> {
+        let previews = self.preview.threads.get(thread)?;
         let shown = match self.active_surface() {
             Some(Surface::Browser(tab)) => previews.get(tab),
             _ => None,
@@ -307,9 +378,8 @@ impl Workspace {
     }
 
     /// A tab's zoom and page colour scheme: its own, else the defaults it was created with.
-    fn tab_look(&self, session: &Session) -> (f64, Appearance) {
-        let defaults =
-            self.preview.tabs.get(&session.tab_id).map_or_else(|| self.browser_defaults(), |tab| tab.defaults);
+    fn tab_look(&self, tab: &TabRef, session: &Session) -> (f64, Appearance) {
+        let defaults = self.preview.tabs.get(tab).map_or_else(|| self.browser_defaults(), |tab| tab.defaults);
         (session.zoom_factor.unwrap_or(defaults.0), session.color_scheme.unwrap_or(defaults.1))
     }
 
@@ -328,8 +398,8 @@ impl Workspace {
         let middle = matches!(event, ClickEvent::Mouse(click) if click.down.button == MouseButton::Middle);
         let modified = modifiers.control || modifiers.platform || middle;
         let in_app = preview::link_opens_in_app(url, modified, &self.client_settings.values, self.browser_available());
-        match self.preview_thread_id().map(str::to_owned).filter(|_| in_app) {
-            Some(thread_id) => self.request_preview_tab(thread_id, Some(url.to_owned()), true, window, cx),
+        match self.preview_thread().filter(|_| in_app) {
+            Some(thread) => self.request_preview_tab(thread, Some(url.to_owned()), true, window, cx),
             None => cx.open_url(url),
         }
     }
@@ -341,8 +411,9 @@ impl Workspace {
 
     /// A browser tab's label (`surfaceTitle`): the page title, else its host, else "Browser".
     pub(super) fn browser_tab_title(&self, tab_id: &str) -> SharedString {
-        let session = self.preview_thread_id().and_then(|id| self.preview.threads.get(id)).and_then(|p| p.get(tab_id));
-        let hosted = self.preview.tabs.get(tab_id);
+        let tab = self.preview_tab(tab_id);
+        let session = tab.as_ref().and_then(|tab| self.preview.threads.session(tab));
+        let hosted = tab.as_ref().and_then(|tab| self.preview.tabs.get(tab));
         let title = hosted.and_then(|tab| tab.status.title()).or_else(|| session.and_then(|s| s.nav_status.title()));
         let url = hosted.and_then(|tab| tab.status.url()).or_else(|| session.and_then(|s| s.nav_status.url()));
         match (title.filter(|title| !title.trim().is_empty()), url) {
@@ -358,6 +429,7 @@ impl Workspace {
             || self.settings.is_some()
             || self.palette.is_some()
             || self.preview.menu_open
+            || self.preview.toolbar.menu_open
             || self.right_panel.add_menu_open
             || self.right_panel.profiles_menu_open
             || self.tab_menu_open()
@@ -375,92 +447,73 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Task<()> {
         // Lists fetched before a reconnect may have missed events.
-        let on_environment =
-            |this: &Self, thread_id: &str| this.thread_environment(thread_id).as_ref() == Some(environment);
-        let mut stale: Vec<String> =
-            self.preview.threads.keys().filter(|thread_id| on_environment(self, thread_id)).cloned().collect();
-        stale.extend(self.preview_thread_id().filter(|thread_id| on_environment(self, thread_id)).map(str::to_owned));
-        for thread_id in stale {
-            if let Some(previews) = self.preview.threads.get_mut(&thread_id) {
+        let mut stale: Vec<ThreadRef> = self.preview.threads.on_environment(environment).cloned().collect();
+        stale.extend(self.preview_thread().filter(|thread| thread.environment == *environment));
+        for thread in stale {
+            if let Some(previews) = self.preview.threads.get_mut(&thread) {
                 previews.list_loaded = false;
             }
-            self.preview.stale.insert(thread_id);
+            self.preview.stale.insert(thread);
         }
         self.preview.discovery.reconnected(environment);
         self.preview.reported_profiles.forget(environment);
         // Tabs whose report failed or waited for this connection send it now.
-        let unreported: Vec<String> = self
+        let unreported: Vec<TabRef> = self
             .preview
             .tabs
             .iter()
-            .filter(|(_, tab)| tab.reported.is_none() && on_environment(self, &tab.thread_id))
-            .map(|(tab_id, _)| tab_id.clone())
+            .filter(|(key, tab)| tab.reported.is_none() && key.thread.environment == *environment)
+            .map(|(key, _)| key.clone())
             .collect();
-        for tab_id in unreported {
-            self.report_status(&tab_id, cx);
+        for tab in unreported {
+            self.report_status(&tab, cx);
         }
         let stream = client.stream("subscribePreviewEvents", json!({}));
+        let environment = environment.clone();
         let task = Self::pump(
             stream,
             window,
             cx,
-            super::Workspace::apply_preview_event,
+            move |this, event| this.apply_preview_event(&environment, event),
             super::Workspace::after_preview_change,
         );
         self.after_preview_change(window, cx);
         task
     }
 
-    fn apply_preview_event(&mut self, event: &Value) {
-        let Some(thread_id) = event.get("threadId").and_then(Value::as_str) else { return };
-        let previews = self.preview.threads.entry(thread_id.to_owned()).or_default();
-        let before = previews.clone();
-        let applied = previews.apply_event(event);
-        let fresh = previews.fresh_reveals(&before);
-        self.preview.reveals.extend(fresh.into_iter().map(|(tab, force)| (thread_id.to_owned(), tab, force)));
-        let previews = self.preview.threads.entry(thread_id.to_owned()).or_default();
-        match applied {
-            Ok(Applied::Relist) => {
-                self.preview.stale.insert(thread_id.to_owned());
-            }
-            Ok(_) if !previews.list_loaded => {
-                self.preview.stale.insert(thread_id.to_owned());
-            }
-            Ok(_) => {}
-            Err(error) => log::warn!("bad preview event: {error}"),
+    /// An item of `environment`'s event stream: it changes that environment's thread only.
+    fn apply_preview_event(&mut self, environment: &SharedString, event: &Value) {
+        let Some(applied) = self.preview.threads.apply_event(environment, event) else { return };
+        let thread = applied.thread;
+        self.preview.reveals.extend(applied.reveals.into_iter().map(|(tab, force)| (thread.tab(tab), force)));
+        if applied.needs_list {
+            self.preview.stale.insert(thread);
         }
     }
 
     /// Opening a thread fetches its tabs once.
-    pub(super) fn load_previews(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.preview.threads.get(thread_id).is_some_and(|previews| previews.list_loaded) {
-            self.preview.stale.insert(thread_id.to_owned());
+    pub(super) fn load_previews(&mut self, thread: ThreadRef, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.preview.threads.get(&thread).is_some_and(|previews| previews.list_loaded) {
+            self.preview.stale.insert(thread);
         }
         self.after_preview_change(window, cx);
     }
 
     /// Refetches stale lists, drops views whose tab closed and refreshes the address bar.
     fn after_preview_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        for thread_id in std::mem::take(&mut self.preview.stale) {
+        for thread in std::mem::take(&mut self.preview.stale) {
             // A thread whose environment is offline refetches once it reconnects.
-            let Some(client) = self.thread_client(&thread_id) else {
-                self.preview.stale.insert(thread_id);
+            let Some(client) = self.env_client(&thread.environment) else {
+                self.preview.stale.insert(thread);
                 continue;
             };
             cx.spawn_in(window, async move |this, cx| {
-                let result = client.request("preview.list", json!({"threadId": thread_id})).await;
+                let result = client.request("preview.list", json!({"threadId": thread.thread_id})).await;
                 let _ = this.update_in(cx, |this, window, cx| {
                     match result {
                         Ok(list) => {
-                            let previews = this.preview.threads.entry(thread_id.clone()).or_default();
-                            let before = previews.clone();
-                            if let Err(error) = previews.apply_list(&list) {
-                                log::warn!("bad preview list: {error}");
-                            }
-                            let fresh = previews.fresh_reveals(&before);
-                            this.preview
-                                .reveals
-                                .extend(fresh.into_iter().map(|(tab, force)| (thread_id.clone(), tab, force)));
+                            let fresh = this.preview.threads.apply_list(&thread, &list);
+                            this.preview.reveals.extend(fresh.into_iter().map(|(tab, force)| (thread.tab(tab), force)));
                         }
                         Err(error) => log::warn!("preview.list failed: {error}"),
                     }
@@ -471,16 +524,20 @@ impl Workspace {
         }
         self.show_agent_reveals();
         let threads = &self.preview.threads;
-        self.preview.tabs.retain(|tab_id, tab| threads.get(&tab.thread_id).is_none_or(|p| p.get(tab_id).is_some()));
-        self.preview.floating.retain(|thread_id, tab| threads.get(thread_id).is_none_or(|p| p.get(tab).is_some()));
-        let loaded: Vec<(String, Vec<String>)> = threads
+        let open = |tab: &TabRef| threads.get(&tab.thread).is_none_or(|p| p.get(&tab.tab_id).is_some());
+        self.preview.tabs.retain(|tab, _| open(tab));
+        self.preview.floating.retain(|thread, mini| threads.get(thread).is_none_or(|p| p.get(&mini.tab_id).is_some()));
+        let loaded: Vec<(ThreadRef, Vec<String>)> = threads
             .iter()
             .filter(|(_, previews)| previews.list_loaded)
-            .map(|(id, previews)| (id.clone(), Self::hosted_sessions(previews).map(|s| s.tab_id.clone()).collect()))
+            .map(|(thread, previews)| {
+                (thread.clone(), Self::hosted_sessions(previews).map(|s| s.tab_id.clone()).collect())
+            })
             .collect();
-        for (thread_id, tabs) in &loaded {
-            self.reconcile_browser_surfaces(thread_id, &tabs.iter().map(String::as_str).collect::<Vec<_>>());
+        for (thread, tabs) in &loaded {
+            self.reconcile_browser_surfaces(thread, &tabs.iter().map(String::as_str).collect::<Vec<_>>());
         }
+        self.prune_separate_windows(window, cx);
         self.sync_address(window, cx);
         cx.notify();
     }
@@ -490,37 +547,36 @@ impl Workspace {
     /// Runs before the panel gains tabs for new sessions, so a new tab floats first.
     fn show_agent_reveals(&mut self) {
         let auto_show = self.client_settings.values.bool("browserAutoShowFloatingPreview");
-        for (thread_id, tab_id, force) in std::mem::take(&mut self.preview.reveals) {
+        for (tab, force) in std::mem::take(&mut self.preview.reveals) {
             if !auto_show && !force {
                 continue;
             }
             let supported = self
-                .thread_environment(&thread_id)
-                .and_then(|environment| self.session(&environment))
+                .session(&tab.thread.environment)
                 .is_some_and(|session| session.server_info.capability("serverBrowser"));
             if !supported {
                 continue;
             }
-            if !self.reveal_browser_surface(&thread_id, &tab_id, force) {
-                self.preview.floating.insert(thread_id, tab_id);
+            if !self.reveal_browser_surface(&tab.thread, &tab.tab_id, force) {
+                self.float_tab(tab.thread, tab.tab_id);
             }
         }
     }
 
     /// The URL the active tab shows, as its address bar reads when not being edited.
     fn active_url(&self) -> String {
-        let Some(thread_id) = self.preview_thread_id() else { return String::new() };
-        let Some(session) = self.active_session(thread_id) else { return String::new() };
-        match self.preview.tabs.get(&session.tab_id) {
-            Some(tab) => tab.status.url().unwrap_or_default().to_owned(),
-            None => preview::display_url(session).to_owned(),
+        let Some(tab) = self.active_tab() else { return String::new() };
+        match (self.preview.tabs.get(&tab), self.preview.threads.session(&tab)) {
+            (Some(hosted), _) => hosted.status.url().unwrap_or_default().to_owned(),
+            (None, Some(session)) => preview::display_url(session).to_owned(),
+            (None, None) => String::new(),
         }
     }
 
     /// Shows the active tab's URL, unless the user is editing the address of that same tab.
     fn sync_address(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let address = self.preview.address.clone();
-        let tab = self.preview_thread_id().and_then(|id| self.active_session(id)).map(|s| s.tab_id.clone());
+        let tab = self.active_tab();
         let same_tab = std::mem::replace(&mut self.preview.address_tab, tab.clone()) == tab;
         if same_tab && address.read(cx).focus_handle(cx).is_focused(window) {
             return;
@@ -535,16 +591,12 @@ impl Workspace {
     /// thread's focused tab, else opens a new one.
     /// `preview.refresh` / `focusUrl` / `zoomIn` / `zoomOut` / `resetZoom` on the panel's browser tab.
     pub(super) fn preview_command(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(session) = self.preview_thread_id().and_then(|thread_id| self.active_session(thread_id)) else {
-            return;
-        };
-        let (zoom, _) = self.tab_look(session);
+        let Some(tab) = self.active_tab() else { return };
+        let Some(session) = self.preview.threads.session(&tab) else { return };
+        let (zoom, _) = self.tab_look(&tab, session);
         let zoom_to = |direction| json!({"zoomFactor": preview::step_zoom(zoom, direction)});
         match command {
-            "preview.refresh" => {
-                let tab_id = session.tab_id.clone();
-                self.refresh_preview_tab(&tab_id, cx);
-            }
+            "preview.refresh" => self.refresh_preview_tab(&tab, cx),
             "preview.focusUrl" => self.preview.address.update(cx, |input, cx| {
                 input.focus(window, cx);
                 input.select_all(window, cx);
@@ -557,13 +609,13 @@ impl Workspace {
     }
 
     pub(super) fn toggle_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(thread_id) = self.preview_thread_id().map(str::to_owned) else { return };
+        let Some(thread) = self.preview_thread() else { return };
         if matches!(self.active_surface(), Some(Surface::Browser(_))) {
             return self.close_right_panel(cx);
         }
-        match self.active_session(&thread_id).map(|s| s.tab_id.clone()) {
+        match self.active_session(&thread).map(|s| s.tab_id.clone()) {
             Some(tab) => self.open_surface(Surface::Browser(tab), window, cx),
-            None => self.open_preview_tab(thread_id, None, window, cx),
+            None => self.open_preview_tab(thread, None, window, cx),
         }
     }
 
@@ -579,8 +631,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(thread_id) = self.preview_thread_id().map(str::to_owned) {
-            self.open_browser_tab(thread_id, None, false, profile, window, cx);
+        if let Some(thread) = self.preview_thread() {
+            self.open_browser_tab(thread, None, false, profile, window, cx);
         }
     }
 
@@ -590,8 +642,8 @@ impl Workspace {
     }
 
     /// Hiding the panel floats the tab it showed over the chat.
-    pub(super) fn float_browser(&mut self, thread_id: String, tab_id: String, cx: &mut Context<Self>) {
-        self.preview.floating.insert(thread_id, tab_id);
+    pub(super) fn float_browser(&mut self, thread: ThreadRef, tab_id: String, cx: &mut Context<Self>) {
+        self.float_tab(thread, tab_id);
         cx.notify();
     }
 
@@ -599,39 +651,39 @@ impl Workspace {
     /// scripts with `autoOpenPreview` open their `previewUrl` through this.
     pub(super) fn open_preview_tab(
         &mut self,
-        thread_id: String,
+        thread: ThreadRef,
         url: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.request_preview_tab(thread_id, url, false, window, cx);
+        self.request_preview_tab(thread, url, false, window, cx);
     }
 
     /// `preview.open` with the default viewport; `external_fallback` opens `url` in the system
     /// browser when the tab can't be opened, as `useOpenLink` does.
     pub(in crate::app) fn request_preview_tab(
         &mut self,
-        thread_id: String,
+        thread: ThreadRef,
         url: Option<String>,
         external_fallback: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_browser_tab(thread_id, url, external_fallback, None, window, cx);
+        self.open_browser_tab(thread, url, external_fallback, None, window, cx);
     }
 
     fn open_browser_tab(
         &mut self,
-        thread_id: String,
+        thread: ThreadRef,
         url: Option<String>,
         external_fallback: bool,
         profile: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.thread_client(&thread_id) else { return };
+        let Some(client) = self.env_client(&thread.environment) else { return };
         let profile = profile.unwrap_or_else(|| preview::default_profile_id(&self.client_settings.values));
-        let mut input = json!({"threadId": thread_id, "profileId": profile});
+        let mut input = json!({"threadId": thread.thread_id, "profileId": profile});
         if let Some(url) = &url {
             input["url"] = url.clone().into();
         }
@@ -648,14 +700,15 @@ impl Workspace {
                     Ok(session) => {
                         let tab = session.tab_id.clone();
                         if let Some(url) = &url {
-                            this.record_visit(&thread_id, url);
+                            this.record_visit(&thread, url);
                         }
-                        this.preview.threads.entry(thread_id.clone()).or_default().apply_snapshot(session, true);
-                        if this.preview_thread_id() == Some(thread_id.as_str()) {
+                        this.preview.threads.entry(&thread).apply_snapshot(session, true);
+                        // A tab for a thread the user has since left joins that thread's panel.
+                        if this.preview_thread().as_ref() == Some(&thread) {
                             this.open_surface(Surface::Browser(tab), window, cx);
-                        }
-                        if url.is_none() {
-                            this.preview.address.update(cx, |input, cx| input.focus(window, cx));
+                            if url.is_none() {
+                                this.preview.address.update(cx, |input, cx| input.focus(window, cx));
+                            }
                         }
                     }
                     Err(error) => match url.as_deref().filter(|_| external_fallback) {
@@ -673,16 +726,16 @@ impl Workspace {
     }
 
     /// `openPreviewSession` with a ready `input`, for Reopen Closed Tab: the new session joins
-    /// `thread_id`'s tabs and `opened` gets its tab id, or the error.
+    /// `thread`'s tabs and `opened` gets its tab id, or the error.
     pub(in crate::app) fn request_preview_open(
         &mut self,
-        thread_id: String,
+        thread: ThreadRef,
         input: Value,
         window: &mut Window,
         cx: &mut Context<Self>,
         opened: impl FnOnce(&mut Self, Result<String, String>, &mut Window, &mut Context<Self>) + 'static,
     ) {
-        let Some(client) = self.thread_client(&thread_id) else {
+        let Some(client) = self.env_client(&thread.environment) else {
             return opened(self, Err("The environment is not connected.".into()), window, cx);
         };
         let url = input.get("url").and_then(Value::as_str).map(str::to_owned);
@@ -695,9 +748,9 @@ impl Workspace {
                 let tab = session.map(|session| {
                     let tab = session.tab_id.clone();
                     if let Some(url) = &url {
-                        this.record_visit(&thread_id, url);
+                        this.record_visit(&thread, url);
                     }
-                    this.preview.threads.entry(thread_id.clone()).or_default().apply_snapshot(session, true);
+                    this.preview.threads.entry(&thread).apply_snapshot(session, true);
                     tab
                 });
                 opened(this, tab, window, cx);
@@ -710,13 +763,12 @@ impl Workspace {
     /// `setActivePreviewTab`: the tab the address bar and the chrome act on.
     pub(super) fn focus_preview_tab(
         &mut self,
-        thread_id: &str,
+        thread: &ThreadRef,
         tab_id: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(previews) =
-            self.preview.threads.get_mut(thread_id).filter(|p| p.active_tab.as_deref() != Some(tab_id))
+        if let Some(previews) = self.preview.threads.get_mut(thread).filter(|p| p.active_tab.as_deref() != Some(tab_id))
         {
             previews.active_tab = Some(tab_id.to_owned());
             self.sync_address(window, cx);
@@ -724,37 +776,33 @@ impl Workspace {
     }
 
     /// `closePreviewSession`.
-    pub(super) fn close_preview_tab(
-        &mut self,
-        thread_id: String,
-        tab_id: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let snapshot = self.preview.threads.get(&thread_id).and_then(|previews| previews.get(&tab_id)).cloned();
-        let closing = self.preview.threads.entry(thread_id.clone()).or_default().begin_close(&tab_id);
+    pub(super) fn close_preview_tab(&mut self, tab: TabRef, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_separate_window(&tab, window, cx);
+        let snapshot = self.preview.threads.session(&tab).cloned();
+        let closing = self.preview.threads.entry(&tab.thread).begin_close(&tab.tab_id);
         // The page stays alive, hidden, until the server confirms the close.
-        let mut hosted = self.preview.tabs.remove(&tab_id);
-        if let Some(tab) = hosted.as_mut().filter(|tab| tab.shown) {
-            tab.shown = false;
-            let _ = tab.view.read(cx).set_visible(false);
+        let mut hosted = self.preview.tabs.remove(&tab);
+        if let Some(hosted) = hosted.as_mut().filter(|hosted| hosted.shown) {
+            hosted.shown = false;
+            let _ = hosted.view.read(cx).set_visible(false);
         }
-        if let Some(client) = self.thread_client(&thread_id) {
+        if let Some(client) = self.env_client(&tab.thread.environment) {
+            let input = json!({"threadId": tab.thread.thread_id, "tabId": tab.tab_id});
             cx.spawn_in(window, async move |this, cx| {
-                let result = client.request("preview.close", json!({"threadId": thread_id, "tabId": tab_id})).await;
+                let result = client.request("preview.close", input).await;
                 let Err(error) = result else {
                     if let Some(snapshot) = snapshot {
-                        let _ = this.update_in(cx, |this, _, _| this.remember_closed_browser(&snapshot));
+                        let _ = this.update_in(cx, |this, _, _| this.remember_closed_browser(&tab.thread, &snapshot));
                     }
                     return;
                 };
                 let _ = this.update_in(cx, |this, window, cx| {
-                    if let Some(previews) = this.preview.threads.get_mut(&thread_id) {
+                    if let Some(previews) = this.preview.threads.get_mut(&tab.thread) {
                         previews.cancel_close(closing);
-                        if previews.get(&tab_id).is_some()
-                            && let Some(tab) = hosted
+                        if previews.get(&tab.tab_id).is_some()
+                            && let Some(hosted) = hosted
                         {
-                            this.preview.tabs.insert(tab_id, tab);
+                            this.preview.tabs.insert(tab, hosted);
                         }
                     }
                     this.error = Some(format!("Unable to close the browser tab: {error}").into());
@@ -767,7 +815,7 @@ impl Workspace {
     }
 
     fn submit_address(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(thread_id) = self.preview_thread_id().map(str::to_owned) else { return };
+        let Some(thread) = self.preview_thread() else { return };
         if text.trim().is_empty() {
             return;
         }
@@ -779,51 +827,52 @@ impl Workspace {
                 return;
             }
         };
-        self.record_visit(&thread_id, &url);
-        self.navigate_preview(thread_id, url, window, cx);
+        self.record_visit(&thread, &url);
+        self.navigate_preview(thread, url, window, cx);
     }
 
     /// `navigateToResolvedUrl`: the active tab loads `url`, or a new tab opens on it.
-    fn navigate_preview(&mut self, thread_id: String, url: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((tab_id, server)) = self.active_session(&thread_id).map(|s| (s.tab_id.clone(), s.server_hosted()))
+    fn navigate_preview(&mut self, thread: ThreadRef, url: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((tab, server)) = self.active_session(&thread).map(|s| (thread.tab(&s.tab_id), s.server_hosted()))
         else {
-            return self.open_preview_tab(thread_id, Some(url), window, cx);
+            return self.open_preview_tab(thread, Some(url), window, cx);
         };
         if server {
-            self.send_server_input(&tab_id, json!({"type": "navigate", "url": url}));
+            self.send_server_input(&tab, json!({"type": "navigate", "url": url}));
             window.blur(cx);
             return;
         }
-        match self.preview.tabs.get(&tab_id) {
-            Some(tab) => tab.view.update(cx, |view, _| view.load_url(&url)),
-            None => self.host_tab(&thread_id, &tab_id, &url, window, cx),
+        match self.preview.tabs.get(&tab) {
+            Some(hosted) => hosted.view.update(cx, |view, _| view.load_url(&url)),
+            None => self.host_tab(&tab, &url, window, cx),
         }
         window.blur(cx);
         cx.notify();
     }
 
     /// Creates the native view for a tab and starts `url` in it, from a task: see [`build_view`].
-    fn host_tab(&mut self, thread_id: &str, tab_id: &str, url: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(pending) = self.preview.starting.get_mut(tab_id) {
+    fn host_tab(&mut self, tab: &TabRef, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(pending) = self.preview.starting.get_mut(tab) {
             *pending = url.to_owned();
             return;
         }
-        let session = self.preview.threads.get(thread_id).and_then(|p| p.get(tab_id));
+        let session = self.preview.threads.session(tab);
         let partition = profiles::Storage::of(session.and_then(|s| s.profile_id.as_deref()));
-        self.preview.starting.insert(tab_id.to_owned(), url.to_owned());
-        let (thread_id, tab_id) = (thread_id.to_owned(), tab_id.to_owned());
+        self.preview.starting.insert(tab.clone(), url.to_owned());
+        let tab = tab.clone();
         cx.spawn_in(window, async move |this, cx| {
             let _ = this.update_in(cx, |this, window, cx| {
-                let url = this.preview.starting.remove(&tab_id).unwrap_or_default();
+                let url = this.preview.starting.remove(&tab).unwrap_or_default();
                 // The tab closed while its view was waiting to start.
-                if this.preview.threads.get(&thread_id).and_then(|p| p.get(&tab_id)).is_none() {
+                if this.preview.threads.session(&tab).is_none() {
                     return;
                 }
                 let (sender, events) = async_channel::unbounded();
                 let mut context = partition.context();
-                let builder = page_builder(partition.builder(context.as_mut()), &url, sender.clone());
+                let chords = this.preview.chords.json.clone();
+                let builder = page_builder(partition.builder(context.as_mut()), &url, &chords, sender);
                 match build_view(builder, window, cx) {
-                    Ok(webview) => this.adopt_view(thread_id, tab_id, url, webview, (sender, events), window, cx),
+                    Ok(webview) => this.adopt_view(tab, url, webview, events, window, cx),
                     Err(error) => {
                         this.error = Some(format!("Unable to start the browser: {error}").into());
                         cx.notify();
@@ -836,29 +885,27 @@ impl Workspace {
 
     fn adopt_view(
         &mut self,
-        thread_id: String,
-        tab_id: String,
+        tab: TabRef,
         url: String,
         webview: WebView,
-        (page_events, events): (async_channel::Sender<PageEvent>, async_channel::Receiver<PageEvent>),
+        events: async_channel::Receiver<PageEvent>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // Hidden until a frame lays it out, so it never flashes at the window's origin.
         let _ = webview.set_visible(false);
         let view = cx.new(|_| webview);
-        let tab = tab_id.clone();
+        let events_tab = tab.clone();
         let pump = cx.spawn_in(window, async move |this, cx| {
             while let Ok(event) = events.recv().await {
-                if this.update_in(cx, |this, window, cx| this.on_page_event(&tab, event, window, cx)).is_err() {
+                if this.update_in(cx, |this, window, cx| this.on_page_event(&events_tab, event, window, cx)).is_err() {
                     break;
                 }
             }
         });
         self.preview.tabs.insert(
-            tab_id,
+            tab,
             HostedTab {
-                thread_id,
                 view,
                 status: NavStatus::Loading { url, title: String::new() },
                 // Until the page reports its history; WebKit without the Navigation API never does.
@@ -869,30 +916,35 @@ impl Workspace {
                 appearance: None,
                 defaults: self.browser_defaults(),
                 shown: false,
-                page_events,
+                // The same set `host_tab` just built the view with.
+                chords: self.preview.chords.json.clone(),
                 _events: pump,
             },
         );
         cx.notify();
     }
 
-    fn on_page_event(&mut self, tab_id: &str, event: PageEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_page_event(&mut self, key: &TabRef, event: PageEvent, window: &mut Window, cx: &mut Context<Self>) {
         if let PageEvent::Annotation(session, message) = event {
-            return self.on_pick_message(tab_id, &session, message, window, cx);
+            return self.on_pick_message(key, &session, message, window, cx);
         }
         if matches!(event, PageEvent::Started(_)) {
-            self.annotation_page_left(tab_id, window, cx);
+            self.annotation_page_left(key, window, cx);
         }
-        let Some(tab) = self.preview.tabs.get_mut(tab_id) else { return };
+        let Some(tab) = self.preview.tabs.get_mut(key) else { return };
         let title = tab.status.title().unwrap_or_default().to_owned();
         let loaded = matches!(event, PageEvent::Finished(_));
         match event {
             PageEvent::Started(url) => tab.status = NavStatus::Loading { url, title },
-            // A failure reported for this load stays; the error page's load is not a success.
+            // A failed load also finishes (WebView2, WebKitGTK); only a new load clears the failure.
             PageEvent::Finished(url) => {
-                if !matches!(&tab.status, NavStatus::LoadFailed { url: failed, .. } if *failed == url) {
-                    probe_failure(tab.view.read(cx).raw(), &url, &tab.page_events);
+                if !matches!(tab.status, NavStatus::LoadFailed { .. }) {
                     tab.status = NavStatus::Success { url, title };
+                }
+                // The new document started with the chords the view was built with.
+                if tab.chords != self.preview.chords.json {
+                    let script = preview::shortcut_update_script(&self.preview.chords.json);
+                    let _ = tab.view.read(cx).raw().evaluate_script(&script);
                 }
             }
             PageEvent::Title(new_title) => match &mut tab.status {
@@ -914,50 +966,109 @@ impl Workspace {
                 }
             }
             PageEvent::Failed { url, code, description } => {
+                // A first load that fails can leave WKWebView without the URL it tried.
+                let url = if url.is_empty() { tab.status.url().unwrap_or_default().to_owned() } else { url };
                 tab.status = NavStatus::LoadFailed { url, title, code, description, download: None };
             }
             PageEvent::OpenLink(url) => {
-                let thread_id = tab.thread_id.clone();
-                self.open_preview_tab(thread_id, Some(url), window, cx);
+                self.open_preview_tab(key.thread.clone(), Some(url), window, cx);
+                return;
+            }
+            PageEvent::Shortcut(command) => {
+                self.page_shortcut(key, &command, window, cx);
+                return;
+            }
+            PageEvent::Corner(inside) => {
+                self.page_corner(&key.thread, &key.tab_id, inside, cx);
                 return;
             }
             PageEvent::Annotation(..) => return,
         }
-        let (thread_id, status) = (tab.thread_id.clone(), tab.status.clone());
-        self.record_title(&thread_id, &status);
-        self.report_status(tab_id, cx);
+        let status = tab.status.clone();
+        self.record_title(&key.thread, &status);
+        self.report_status(key, cx);
         if loaded {
-            self.recording_page_loaded(tab_id, cx);
+            self.recording_page_loaded(key, cx);
         }
         self.sync_address(window, cx);
         cx.notify();
     }
 
+    /// A shell shortcut a focused page handed back (`MENU_ACTION_CHANNEL`). The page can post any
+    /// message, so only a forwarded command from a page on screen runs.
+    fn page_shortcut(&mut self, key: &TabRef, command: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.preview.tabs.get(key).filter(|tab| tab.shown) else { return };
+        let Some(command) = self.preview.chords.list.iter().find(|chord| chord.command == command).map(|c| c.command)
+        else {
+            return;
+        };
+        if matches!(command, "workspace.focusNext" | "workspace.focusPrevious" | "preview.focusUrl") {
+            // GPUI focus alone can't take the keyboard back from the native view.
+            let _ = tab.view.read(cx).raw().focus_parent();
+            // F6 moves on from the area that shows the page: the panel, or the chat under the mini player.
+            if command != "preview.focusUrl" {
+                let in_panel = self.preview_thread().as_ref() == Some(&key.thread)
+                    && self.active_surface() == Some(&Surface::Browser(key.tab_id.clone()));
+                let area = if in_panel { &self.areas.panel } else { &self.focus };
+                area.focus(window, cx);
+            }
+        }
+        let context = keymap::ShortcutContext {
+            preview_focus: true,
+            preview_open: true,
+            terminal_open: self.terminal_open(),
+            right_panel_open: self.right_panel_open(),
+            ..Default::default()
+        };
+        self.run_command(command, false, &context, window, cx);
+    }
+
+    /// Resolves the chords pages forward again when the keymap or the terminal changed, and swaps
+    /// a changed set into every hosted page.
+    fn sync_page_chords(&mut self, cx: &App) {
+        let terminal_open = self.terminal_open();
+        let chords = &mut self.preview.chords;
+        if chords.source.as_ref().is_some_and(|(rules, open)| Rc::ptr_eq(rules, &self.keymap) && *open == terminal_open)
+        {
+            return;
+        }
+        chords.source = Some((self.keymap.clone(), terminal_open));
+        let list = keymap::page_chords(&self.keymap, terminal_open);
+        if list == chords.list {
+            return;
+        }
+        chords.json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".into()).into();
+        chords.list = list;
+        let script = preview::shortcut_update_script(&chords.json);
+        for tab in self.preview.tabs.values() {
+            let _ = tab.view.read(cx).raw().evaluate_script(&script);
+        }
+    }
+
     /// `preview.reportStatus`, once per change, so the server and agents see this tab's page.
     /// It goes to the tab's own thread's environment: a hidden tab's need not be the open one's.
     /// A failed report is sent again with the tab's next change or its environment's reconnect.
-    fn report_status(&mut self, tab_id: &str, cx: &mut Context<Self>) {
-        let Some(tab) = self.preview.tabs.get(tab_id) else { return };
-        let Some(client) = self.thread_client(&tab.thread_id) else { return };
-        let Some(tab) = self.preview.tabs.get_mut(tab_id) else { return };
+    fn report_status(&mut self, key: &TabRef, cx: &mut Context<Self>) {
+        let Some(client) = self.env_client(&key.thread.environment) else { return };
+        let Some(tab) = self.preview.tabs.get_mut(key) else { return };
         let state = (tab.status.clone(), tab.can_go_back, tab.can_go_forward);
         if tab.reported.as_ref() == Some(&state) {
             return;
         }
         let input = json!({
-            "threadId": tab.thread_id,
-            "tabId": tab_id,
+            "threadId": key.thread.thread_id,
+            "tabId": key.tab_id,
             "navStatus": state.0.to_json(),
             "canGoBack": state.1,
             "canGoForward": state.2,
         });
         tab.reported = Some(state.clone());
-        let tab_id = tab_id.to_owned();
+        let key = key.clone();
         cx.spawn(async move |this, cx| {
             let Err(error) = client.request("preview.reportStatus", input).await else { return };
             log::warn!("preview.reportStatus failed: {error}");
             let _ = this.update(cx, |this, _| {
-                if let Some(tab) = this.preview.tabs.get_mut(&tab_id).filter(|tab| tab.reported == Some(state)) {
+                if let Some(tab) = this.preview.tabs.get_mut(&key).filter(|tab| tab.reported == Some(state)) {
                     tab.reported = None;
                 }
             });
@@ -967,11 +1078,9 @@ impl Workspace {
 
     /// `preview.adjust` / `preview.resize`; the returned snapshot updates the tab.
     fn adjust_preview(&mut self, method: &'static str, change: Value, cx: &mut Context<Self>) {
-        let (Some(client), Some(thread_id)) = (self.client(), self.preview_thread_id().map(str::to_owned)) else {
-            return;
-        };
-        let Some(tab_id) = self.active_session(&thread_id).map(|s| s.tab_id.clone()) else { return };
-        let mut input = json!({"threadId": thread_id, "tabId": tab_id});
+        let Some(tab) = self.active_tab() else { return };
+        let Some(client) = self.env_client(&tab.thread.environment) else { return };
+        let mut input = json!({"threadId": tab.thread.thread_id, "tabId": tab.tab_id});
         if let (Some(input), Value::Object(change)) = (input.as_object_mut(), change) {
             input.extend(change);
         }
@@ -981,7 +1090,7 @@ impl Workspace {
                 match result.map_err(|e| e.to_string()).and_then(|v| {
                     serde_json::from_value::<Session>(v).map_err(|e| format!("Unexpected {method} result: {e}"))
                 }) {
-                    Ok(session) => this.preview.threads.entry(thread_id).or_default().apply_snapshot(session, false),
+                    Ok(session) => this.preview.threads.entry(&tab.thread).apply_snapshot(session, false),
                     Err(error) => this.error = Some(format!("Unable to change the browser tab: {error}").into()),
                 }
                 cx.notify();
@@ -991,54 +1100,52 @@ impl Workspace {
     }
 
     /// `handleRefresh`: an agent tab reloads over its stream, this client's own tab in its view.
-    pub(super) fn refresh_preview_tab(&self, tab_id: &str, cx: &App) {
-        let server = self
-            .preview_thread_id()
-            .and_then(|thread_id| self.preview.threads.get(thread_id))
-            .and_then(|previews| previews.get(tab_id))
-            .is_some_and(Session::server_hosted);
-        if server {
-            self.send_server_input(tab_id, json!({"type": "reload"}));
-        } else if let Some(tab) = self.preview.tabs.get(tab_id) {
-            let _ = tab.view.read(cx).raw().reload();
+    pub(super) fn refresh_preview_tab(&self, tab: &TabRef, cx: &App) {
+        if self.preview.threads.session(tab).is_some_and(Session::server_hosted) {
+            self.send_server_input(tab, json!({"type": "reload"}));
+        } else if let Some(hosted) = self.preview.tabs.get(tab) {
+            // WebKit keeps no entry for a page that failed to load, so a reload would load the one before.
+            let _ = match &hosted.status {
+                NavStatus::LoadFailed { url, .. } if !url.is_empty() => hosted.view.read(cx).raw().load_url(url),
+                _ => hosted.view.read(cx).raw().reload(),
+            };
         }
     }
 
     fn with_active_view(&self, cx: &App, action: impl FnOnce(&wry::WebView)) {
-        let Some(thread_id) = self.preview_thread_id() else { return };
-        let Some(session) = self.active_session(thread_id) else { return };
-        if let Some(tab) = self.preview.tabs.get(&session.tab_id) {
-            action(tab.view.read(cx).raw());
+        if let Some(hosted) = self.active_tab().and_then(|tab| self.preview.tabs.get(&tab)) {
+            action(hosted.view.read(cx).raw());
         }
     }
 
     /// Applies each hosted tab's zoom, colour scheme and visibility to its native view, after the
     /// panel and the mini player recorded what they draw. It only calls into a view on a change.
     pub(super) fn sync_preview_views(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_page_chords(cx);
         let covered = self.browser_covered(window, cx);
         self.retain_server_streams(covered, window, cx);
         self.sync_annotation(window, cx);
         let panel = self.preview.panel_view.take().filter(|_| !covered);
         let mini = self.preview.mini_view.take().filter(|_| !covered);
         let shown =
-            |tab: &str| [&panel, &mini].into_iter().flatten().find(|(id, _)| id == tab).map(|(_, scale)| *scale);
+            |tab: &TabRef| [&panel, &mini].into_iter().flatten().find(|(id, _)| id == tab).map(|(_, scale)| *scale);
         // A shown tab's page appears once it has a URL to load.
-        if let Some(thread_id) = self.preview_thread_id().map(str::to_owned) {
-            for (tab_id, _) in [&panel, &mini].into_iter().flatten() {
-                if self.preview.tabs.contains_key(tab_id) {
-                    continue;
-                }
-                let url = (self.preview.threads.get(&thread_id).and_then(|p| p.get(tab_id)))
-                    .filter(|s| !s.server_hosted())
-                    .and_then(|s| s.nav_status.url());
-                if let Some(url) = url.map(str::to_owned) {
-                    self.host_tab(&thread_id, tab_id, &url, window, cx);
-                }
+        for (tab, _) in [&panel, &mini].into_iter().flatten() {
+            if self.preview.tabs.contains_key(tab) {
+                continue;
+            }
+            let url = self.preview.threads.session(tab).filter(|s| !s.server_hosted()).and_then(|s| s.nav_status.url());
+            if let Some(url) = url.map(str::to_owned) {
+                self.host_tab(tab, &url, window, cx);
             }
         }
-        for (tab_id, tab) in &mut self.preview.tabs {
-            let scale = shown(tab_id);
-            let session = self.preview.threads.get(&tab.thread_id).and_then(|p| p.get(tab_id));
+        for (key, tab) in &mut self.preview.tabs {
+            // The separate window draws its tab's page.
+            if self.preview.separate.contains_key(key) {
+                continue;
+            }
+            let scale = shown(key);
+            let session = self.preview.threads.session(key);
             let view = tab.view.read(cx);
             if let Some(scale) = scale {
                 // Electron's app zoom leaves previews at their own zoom (`reapplyZoom`).
@@ -1051,11 +1158,7 @@ impl Workspace {
                 let appearance = session.and_then(|s| s.color_scheme).unwrap_or(tab.defaults.1);
                 if tab.appearance != Some(appearance) {
                     tab.appearance = Some(appearance);
-                    let _ = view.set_theme(match appearance {
-                        Appearance::System => wry::Theme::Auto,
-                        Appearance::Light => wry::Theme::Light,
-                        Appearance::Dark => wry::Theme::Dark,
-                    });
+                    let _ = view.set_theme(wry_theme(appearance));
                 }
             }
             if tab.shown != scale.is_some() {
@@ -1068,7 +1171,7 @@ impl Workspace {
     /// The Browser surface: the chrome row over the tab's page.
     pub(super) fn render_browser_surface(
         &mut self,
-        thread_id: &str,
+        thread: &ThreadRef,
         tab_id: &str,
         width: f32,
         window: &mut Window,
@@ -1090,79 +1193,106 @@ impl Workspace {
                     }
                 }))
             })
-            .child(self.render_preview_chrome(thread_id, &tokens, window, cx))
-            .child(self.render_page_area(thread_id, tab_id, available, window, cx))
+            .child(self.render_preview_chrome(thread, &tokens, window, cx))
+            .child(self.render_page_area(&thread.tab(tab_id), available, window, cx))
             .into_any_element()
     }
 
     /// The page, the empty state of a blank tab, or a fixed viewport centered in the panel.
     fn render_page_area(
         &mut self,
-        thread_id: &str,
-        tab_id: &str,
+        tab: &TabRef,
         available: (f32, f32),
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let tokens = *theme::tokens(cx);
-        let session = self.preview.threads.get(thread_id).and_then(|p| p.get(tab_id)).cloned();
+        let session = self.preview.threads.session(tab).cloned();
         let server = session.as_ref().filter(|s| s.server_hosted());
         // An agent tab's stream stays connected under the empty and unreachable states, so a URL
         // picked there and a Reload reach the page.
         if server.is_some() {
-            self.keep_server_stream(thread_id, tab_id, window, cx);
+            self.keep_server_stream(tab, window, cx);
         }
         // A failed load shows `PreviewUnreachable` in place of the page (and its native view).
-        let status = match self.preview.tabs.get(tab_id) {
-            Some(tab) => Some(tab.status.clone()),
+        let status = match self.preview.tabs.get(tab) {
+            Some(hosted) => Some(hosted.status.clone()),
             None => server.map(|s| s.nav_status.clone()),
         };
-        if let Some(page) = status.and_then(|status| self.render_unreachable(tab_id, &status, &tokens, cx)) {
+        if let Some(page) = status.and_then(|status| self.render_unreachable(tab, &status, &tokens, cx)) {
             return div().flex_1().min_h_0().child(page).into_any_element();
         }
         if let Some(session) = server {
             if matches!(session.nav_status, NavStatus::Idle) {
-                let empty = self.render_preview_empty_state(thread_id, &tokens, cx);
+                let empty = self.render_preview_empty_state(&tab.thread, &tokens, cx);
                 return div().flex_1().min_h_0().child(empty).into_any_element();
             }
             let follow_size = session.viewport.size().is_none();
-            return self.render_server_page(thread_id, tab_id, follow_size, false, &tokens, window, cx);
+            let setting = session.viewport.clone();
+            let page = self.render_server_page(tab, follow_size, false, &tokens, window, cx);
+            if follow_size {
+                return page;
+            }
+            let toolbar = self.render_device_toolbar(tab, &setting, available.0, window, cx);
+            return v_flex().flex_1().min_h_0().child(toolbar).child(page).into_any_element();
         }
-        let fixed = session.as_ref().and_then(|s| s.viewport.size()).map(|size| preview::fit_viewport(size, available));
-        self.preview.panel_view = Some((tab_id.to_owned(), fixed.map_or(1., |(_, scale)| scale)));
-        let view = self.preview.tabs.get(tab_id).map(|tab| tab.view.clone());
-        let Some(view) = view.filter(|_| !self.preview.menu_open) else {
+        self.preview.panel_area = Some((tab.clone(), available));
+        let setting = session.as_ref().map(|s| s.viewport.clone()).unwrap_or_default();
+        let view = self.preview.tabs.get(tab).map(|hosted| hosted.view.clone());
+        // `resolveBrowserDeviceViewportLayout`: under the toolbar, inside the resize rails' margin.
+        let toolbar = view.is_some() && setting.size().is_some();
+        let area = if toolbar {
+            (available.0 - viewport::RAIL * 2., available.1 - viewport::TOOLBAR_HEIGHT - viewport::RAIL)
+        } else {
+            available
+        };
+        let fixed = setting.size().map(|size| preview::fit_viewport(size, area));
+        let separated = self.separated(tab);
+        if !separated {
+            self.preview.panel_view = Some((tab.clone(), fixed.map_or(1., |(_, scale)| scale)));
+        }
+        let Some(view) = view else {
             let blank = session.as_ref().is_none_or(|s| matches!(s.nav_status, NavStatus::Idle));
             return div()
                 .flex_1()
                 .min_h_0()
-                .when(blank, |el| el.child(self.render_preview_empty_state(thread_id, &tokens, cx)))
+                .when(blank, |el| el.child(self.render_preview_empty_state(&tab.thread, &tokens, cx)))
                 .into_any_element();
         };
-        match fixed {
+        // A menu open over the page hides it, since the native view would cover the menu.
+        let hidden = self.preview.menu_open || self.preview.toolbar.menu_open;
+        let page = match fixed {
+            _ if separated => div().flex_1().min_h_0().child(self.render_separated(tab, false, &tokens, cx)),
             Some(((width, height), _)) => div()
                 .flex_1()
                 .min_h_0()
                 .flex()
-                .items_start()
+                .items_center()
                 .justify_center()
-                .bg(tokens.muted)
-                .child(div().w(px(width)).h(px(height)).child(view))
-                .into_any_element(),
-            None => div().flex_1().min_h_0().child(view).into_any_element(),
+                .px(px(viewport::RAIL))
+                .pb(px(viewport::RAIL))
+                .bg(tokens.muted.opacity(0.35))
+                .when(!hidden, |el| el.child(div().w(px(width)).h(px(height)).child(view))),
+            None => div().flex_1().min_h_0().when(!hidden, |el| el.child(view)),
+        };
+        if !toolbar {
+            return page.into_any_element();
         }
+        let toolbar = self.render_device_toolbar(tab, &setting, available.0, window, cx);
+        v_flex().flex_1().min_h_0().child(toolbar).child(page).into_any_element()
     }
 
     /// `PreviewChromeRow`: back, forward, reload, the address bar, capture, float and the menu.
     fn render_preview_chrome(
         &self,
-        thread_id: &str,
+        thread: &ThreadRef,
         tokens: &Tokens,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let session = self.active_session(thread_id);
-        let hosted = session.and_then(|s| self.preview.tabs.get(&s.tab_id));
+        let session = self.active_session(thread);
+        let tab = session.map(|s| thread.tab(&s.tab_id));
+        let hosted = tab.as_ref().and_then(|tab| self.preview.tabs.get(tab));
         // An agent tab navigates over its stream, from the server's own history.
         let server_tab = session.filter(|s| s.server_hosted());
         let (can_back, can_forward) = match server_tab {
@@ -1175,23 +1305,23 @@ impl Workspace {
         };
         let url = self.active_url();
         let has_page = hosted.is_some() || server_tab.is_some_and(|s| !matches!(s.nav_status, NavStatus::Idle));
-        let reload_tab = session.map(|s| s.tab_id.clone());
+        let reload_tab = tab.clone();
         let unreachable = match server_tab {
             Some(s) => matches!(s.nav_status, NavStatus::LoadFailed { .. }),
             None => hosted.is_some_and(|tab| matches!(tab.status, NavStatus::LoadFailed { .. })),
         };
         // `onPictureInPicture`: float the tab over the chat, or stop floating it.
         let float = session.map(|s| {
-            let floating = self.preview.floating.get(thread_id) == Some(&s.tab_id);
+            let floating = self.floating_tab(thread) == Some(s.tab_id.as_str());
             (s.tab_id.clone(), floating, !unreachable && (server_tab.is_some() || hosted.is_some()))
         });
         // `onPickElement` and `onCapture`: this computer's own tabs, once they show a reachable page.
         let own_tab = session.filter(|s| !s.server_hosted());
         let page_ready = hosted.is_some() && !unreachable;
         let annotate =
-            own_tab.map(|s| self.render_annotate_button(thread_id, &s.tab_id, page_ready, unreachable, tokens, cx));
-        let capture = own_tab.map(|s| self.render_capture_button(thread_id, &s.tab_id, page_ready, tokens, cx));
-        let server_tab = server_tab.map(|s| s.tab_id.clone());
+            own_tab.map(|s| self.render_annotate_button(&thread.tab(&s.tab_id), page_ready, unreachable, tokens, cx));
+        let capture = own_tab.map(|s| self.render_capture_button(&thread.tab(&s.tab_id), page_ready, tokens, cx));
+        let server_tab = server_tab.map(|s| thread.tab(&s.tab_id));
         let (back_tab, forward_tab) = (server_tab.clone(), server_tab);
         let address_focused = self.preview.address.read(cx).focus_handle(cx).is_focused(window);
         // `opacity-0` until the address bar is hovered or the button has focus, but still a Tab stop.
@@ -1287,18 +1417,10 @@ impl Workspace {
             .children(capture)
             .children(float.map(|(tab, floating, enabled)| {
                 let label = if floating { "Close floating preview" } else { "Float preview over chat" };
-                let thread = thread_id.to_owned();
+                let thread = thread.clone();
                 icon_button("preview-float", IconName::PictureInPicture2, enabled, tokens, cx)
-                    // `variant="secondary"` with a primary icon while floating.
-                    .when(floating, |el| {
-                        el.custom(
-                            ButtonCustomVariant::new(cx)
-                                .color(tokens.secondary)
-                                .foreground(tokens.primary)
-                                .hover(tokens.secondary)
-                                .active(tokens.secondary),
-                        )
-                    })
+                    // A primary icon while floating.
+                    .when(floating, |el| pressed(el, tokens.primary, tokens, cx))
                     .tooltip(label)
                     .when(enabled, |el| {
                         el.on_click(cx.listener(move |this, _, _, cx| {
@@ -1306,13 +1428,13 @@ impl Workspace {
                                 this.preview.floating.remove(&thread);
                                 cx.notify();
                             } else {
-                                this.preview.floating.insert(thread.clone(), tab.clone());
+                                this.float_tab(thread.clone(), tab.clone());
                                 this.close_right_panel(cx);
                             }
                         }))
                     })
             }))
-            .child(self.render_preview_menu(session, has_page, tokens, cx))
+            .child(self.render_preview_menu(thread, session, has_page, tokens, cx))
             .when(loading, |el| {
                 el.child(div().absolute().left_0().right_0().bottom(px(-1.)).h(px(2.)).bg(tokens.primary))
             })
@@ -1322,6 +1444,7 @@ impl Workspace {
     /// closes, handing focus back to where it was.
     fn render_preview_menu(
         &self,
+        thread: &ThreadRef,
         session: Option<&Session>,
         has_page: bool,
         tokens: &Tokens,
@@ -1332,10 +1455,11 @@ impl Workspace {
             .selected(self.preview.menu_open);
         let Some(session) = session else { return trigger.into_any_element() };
         let server = session.server_hosted();
-        let move_label = self.move_tab_label(session);
-        let moving = session.clone();
-        let (_, appearance) = self.tab_look(session);
-        let preset = session.viewport.preset_id().map(str::to_owned);
+        let move_label = self.move_tab_label(thread, session);
+        let moving = (thread.clone(), session.clone());
+        let separate_tab = thread.tab(&session.tab_id);
+        let separated = self.separated(&separate_tab);
+        let (_, appearance) = self.tab_look(&separate_tab, session);
         let fill = session.viewport.size().is_none();
         let view = cx.entity();
         trigger
@@ -1363,16 +1487,31 @@ impl Workspace {
                             this.with_active_view(cx, wry::WebView::open_devtools);
                         }),
                     ));
+                    let label =
+                        if separated { "Close separate preview window" } else { "Open separate preview window" };
+                    let tab = separate_tab.clone();
+                    menu = menu.item(PopupMenuItem::new(label).disabled(!has_page).on_click(window.listener_for(
+                        &view,
+                        move |this, _: &ClickEvent, window, cx| {
+                            this.toggle_separate_window(tab.clone(), window, cx);
+                        },
+                    )));
                 }
                 if let Some(label) = move_label.clone() {
                     let moving = moving.clone();
                     menu = menu.item(PopupMenuItem::new(label).on_click(window.listener_for(
                         &view,
                         move |this, _: &ClickEvent, window, cx| {
-                            this.move_preview_tab(moving.clone(), window, cx);
+                            let (thread, session) = moving.clone();
+                            this.move_preview_tab(thread, session, window, cx);
                         },
                     )));
                 }
+                // The viewport's size and presets are in the device toolbar this shows.
+                let toolbar = if fill { "Show device toolbar" } else { "Hide device toolbar" };
+                menu = menu.item(PopupMenuItem::new(toolbar).disabled(!has_page && !server).on_click(
+                    window.listener_for(&view, |this, _: &ClickEvent, _, cx| this.toggle_device_toolbar(cx)),
+                ));
                 menu = menu.separator().label("Appearance");
                 for option in Appearance::ALL {
                     menu = menu.item(
@@ -1389,21 +1528,7 @@ impl Workspace {
                     .item(
                         PopupMenuItem::element(move |window, cx| zoom_row(&zoom_view, &menu_focus, window, cx))
                             .disabled(true),
-                    )
-                    .separator()
-                    .label("Viewport")
-                    .item(
-                        PopupMenuItem::new("Fill panel")
-                            .checked(fill)
-                            .on_click(adjust("preview.resize", json!({"viewport": {"_tag": "fill"}}))),
                     );
-                for option in &preview::PRESETS {
-                    let label = format!("{} · {} × {}", option.label, option.width, option.height);
-                    menu =
-                        menu.item(PopupMenuItem::new(label).checked(preset.as_deref() == Some(option.id)).on_click(
-                            adjust("preview.resize", json!({"viewport": preview::Viewport::preset(option)})),
-                        ));
-                }
                 // The server's browser clears the tab's profile itself. wry clears a profile's cache
                 // only with all its other data, so this computer's tabs offer cookies alone.
                 if server {
@@ -1442,102 +1567,23 @@ impl Workspace {
 
     /// The active tab's zoom factor.
     fn active_zoom(&self) -> f64 {
-        self.preview_thread_id().and_then(|thread_id| self.active_session(thread_id)).map_or(1., |s| self.tab_look(s).0)
+        let Some(tab) = self.active_tab() else { return 1. };
+        self.preview.threads.session(&tab).map_or(1., |session| self.tab_look(&tab, session).0)
     }
+}
 
-    /// `ThreadPreviewMiniPlayer`: the floated tab over the chat's bottom-right corner, unless the
-    /// panel shows that same tab (`shouldRenderPreviewMiniPlayer`).
-    pub(super) fn render_preview_mini_player(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let thread_id = self.preview_thread_id()?.to_owned();
-        let tab_id = self.preview.floating.get(&thread_id)?.clone();
-        if self.page.is_some() || self.active_surface() == Some(&Surface::Browser(tab_id.clone())) {
-            return None;
-        }
-        let tokens = *theme::tokens(cx);
-        let session = self.preview.threads.get(&thread_id)?.get(&tab_id)?.clone();
-        let body = (MINI_SIZE, MINI_SIZE - MINI_HEADER);
-        let fixed = session.viewport.size().map(|size| preview::fit_viewport(size, body));
-        // An agent's tab streams here as in the panel, with its control bar below the page.
-        let streamed = session
-            .server_hosted()
-            .then(|| self.render_server_page(&thread_id, &tab_id, false, true, &tokens, window, cx));
-        if streamed.is_none() {
-            self.preview.mini_view = Some((tab_id.clone(), fixed.map_or(1., |(_, scale)| scale)));
-        }
-        let view = self.preview.tabs.get(&tab_id).map(|tab| tab.view.clone());
-        let title = self.browser_tab_title(&tab_id);
-        let (expand_thread, expand_tab) = (thread_id.clone(), tab_id);
-        let close_thread = thread_id;
-        Some(
-            v_flex()
-                .id("preview-mini-player")
-                .absolute()
-                .right(px(MINI_EDGE_GAP))
-                .bottom(px(MINI_EDGE_GAP))
-                .w(px(MINI_SIZE))
-                .h(px(MINI_SIZE))
-                .rounded(px(12.))
-                .overflow_hidden()
-                .border_1()
-                .border_color(tokens.border.opacity(0.8))
-                .bg(tokens.muted)
-                .shadow_2xl()
-                .occlude()
-                .child(
-                    h_flex()
-                        .h(px(MINI_HEADER))
-                        .flex_none()
-                        .pl_2()
-                        .pr_1()
-                        .gap_1()
-                        .bg(tokens.popover)
-                        .text_xs()
-                        .child(Icon::new(IconName::Globe).size(px(12.)).text_color(tokens.muted_foreground))
-                        .child(div().flex_1().min_w_0().truncate().child(title))
-                        .child(
-                            icon_button("mini-expand", IconName::PanelRight, true, &tokens, cx)
-                                .tooltip("Open in panel")
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.preview.floating.remove(&expand_thread);
-                                    this.open_surface(Surface::Browser(expand_tab.clone()), window, cx);
-                                })),
-                        )
-                        .child(
-                            icon_button("mini-close", IconName::X, true, &tokens, cx)
-                                .tooltip("Close floating preview")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.preview.floating.remove(&close_thread);
-                                    cx.notify();
-                                })),
-                        ),
-                )
-                .child(match (streamed, view, fixed) {
-                    (Some(page), _, _) => page,
-                    (None, Some(view), Some(((width, height), _))) => div()
-                        .flex_1()
-                        .min_h_0()
-                        .flex()
-                        .justify_center()
-                        .child(div().w(px(width)).h(px(height)).child(view))
-                        .into_any_element(),
-                    (None, Some(view), None) => div().flex_1().min_h_0().child(view).into_any_element(),
-                    (None, None, _) => div()
-                        .flex_1()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_xs()
-                        .text_color(tokens.muted_foreground)
-                        .child("No preview yet")
-                        .into_any_element(),
-                })
-                .into_any_element(),
-        )
+/// The native view's colour scheme for a tab's.
+fn wry_theme(appearance: Appearance) -> wry::Theme {
+    match appearance {
+        Appearance::System => wry::Theme::Auto,
+        Appearance::Light => wry::Theme::Light,
+        Appearance::Dark => wry::Theme::Dark,
     }
+}
+
+/// The target whose right panel holds `thread`'s browser tabs.
+pub(super) fn panel_target(thread: &ThreadRef) -> Target {
+    Target::Thread { env: thread.environment.clone(), id: thread.thread_id.clone() }
 }
 
 /// A tab's fallback title: the page's host.
@@ -1574,20 +1620,6 @@ fn clear_cookies(view: &wry::WebView) {
     }
 }
 
-/// wry reports a failed navigation as a finished one: asks the page whether it is WebView2's
-/// error page, and if so reports the load as failed with the error it names.
-fn probe_failure(view: &wry::WebView, url: &str, events: &async_channel::Sender<PageEvent>) {
-    let (url, events) = (url.to_owned(), events.clone());
-    let probed = view.evaluate_script_with_callback(preview::FAILURE_PROBE, move |result| {
-        if let Some((code, description)) = preview::failed_load(&result) {
-            let _ = events.try_send(PageEvent::Failed { url: url.clone(), code, description: description.into() });
-        }
-    });
-    if let Err(error) = probed {
-        log::warn!("could not check the page for a failed load: {error}");
-    }
-}
-
 /// Builds a native view in `window` (gpui-webview's safe constructor). Call it from inside a task's
 /// update, never from an event handler or `defer`: WebView2's constructor runs the window's message
 /// loop, and only while a task runs does GPUI post no other task to that loop, so no task re-enters
@@ -1596,10 +1628,12 @@ pub(super) fn build_view(builder: wry::WebViewBuilder, window: &mut Window, cx: 
     WebView::build(builder, window, cx)
 }
 
-/// A tab's view: its page events, and the script that reports its history.
+/// A tab's view: its page events, and the scripts that report its history and forward the app's
+/// shell `chords` while it has focus.
 fn page_builder<'a>(
     builder: wry::WebViewBuilder<'a>,
     url: &str,
+    chords: &str,
     sender: async_channel::Sender<PageEvent>,
 ) -> wry::WebViewBuilder<'a> {
     builder
@@ -1608,6 +1642,8 @@ fn page_builder<'a>(
         .with_initialization_script(preview::HISTORY_SCRIPT)
         .with_initialization_script(capture::RECORDING_SCRIPT)
         .with_initialization_script(annotation::PICKER_SCRIPT)
+        .with_initialization_script(preview::shortcut_script(chords, keymap::MAC))
+        .with_initialization_script(preview::CORNER_SCRIPT)
         .with_ipc_handler({
             let sender = sender.clone();
             move |request| {
@@ -1616,6 +1652,10 @@ fn page_builder<'a>(
                     let _ = sender.try_send(PageEvent::History(history));
                 } else if let Some((session, message)) = annotation::pick_message(body) {
                     let _ = sender.try_send(PageEvent::Annotation(session, message));
+                } else if let Some(command) = preview::shortcut_message(body) {
+                    let _ = sender.try_send(PageEvent::Shortcut(command));
+                } else if let Some(inside) = preview::corner_message(body) {
+                    let _ = sender.try_send(PageEvent::Corner(inside));
                 }
             }
         })
@@ -1626,6 +1666,16 @@ fn page_builder<'a>(
                     wry::PageLoadEvent::Started => PageEvent::Started(url),
                     wry::PageLoadEvent::Finished => PageEvent::Finished(url),
                 });
+            }
+        })
+        // Electron's `did-fail-load`, from each platform's own navigation failure callback.
+        .with_on_page_load_error_handler({
+            let sender = sender.clone();
+            move |error| {
+                if let Some((code, description)) = preview::net_error(&error) {
+                    let _ =
+                        sender.try_send(PageEvent::Failed { url: error.url, code, description: description.into() });
+                }
             }
         })
         .with_document_title_changed_handler({

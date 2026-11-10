@@ -92,9 +92,6 @@ impl Workspace {
         let group = self.scoped_project_group(view);
         let detail = group.as_ref().is_some_and(|scoped| !scoped.group.members.is_empty());
         let content = match (group, &view.scope.kind) {
-            (Some(scoped), _) if scoped.group.members.is_empty() => {
-                vec![self.render_scope_unavailable("This project has no checkout on this environment.", &t, cx)]
-            }
             (Some(scoped), _) => self.render_project_detail(&panel, view, &scoped, window, cx),
             (None, ScopeKind::Unavailable { message }) => vec![self.render_scope_unavailable(message, &t, cx)],
             (None, _) => vec![self.render_project_choices(view, &t, cx)],
@@ -112,11 +109,12 @@ impl Workspace {
         )
     }
 
-    /// The group the scope picked, while it resolves, narrowed to the picked machine.
+    /// The group the scope picked, while it resolves, narrowed to the picked machine or checkout.
     fn scoped_project_group(&self, view: &SettingsView) -> Option<ScopedGroup> {
-        let key = self.settings_ui.scope.project.as_ref().filter(|_| view.scope.is_project())?;
+        let scope = &self.settings_ui.scope;
+        let key = scope.project.as_ref().filter(|_| view.scope.is_project())?;
         let whole = view.groups.iter().find(|group| &group.key == key)?;
-        Some(groups::narrow(whole, self.settings_ui.scope.machine.as_deref()))
+        Some(groups::narrow(whole, scope.machine.as_deref(), scope.checkout.as_deref()))
     }
 
     /// Whether this connection may change projects on `environment` (`orchestration:operate`).
@@ -147,13 +145,15 @@ impl Workspace {
             .filter(|(last_key, _)| *last_key == key)
             .and_then(|(_, members)| groups::successor(&view.groups, members));
         let Some(successor) = successor else { return false };
-        self.settings_ui.scope = self.settings_ui.scope.with_project(Some(successor.key.clone()));
+        // The machine and checkout picks follow the project to its new group.
+        self.settings_ui.scope.project = Some(successor.key.clone());
         true
     }
 
     /// The scope's message, with a way back to every environment (`ProjectsSettings`).
     fn render_scope_unavailable(&mut self, message: &str, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
-        let show_all = self.settings_ui.scope.machine.is_some().then(|| {
+        let scope = &self.settings_ui.scope;
+        let show_all = (scope.machine.is_some() || scope.checkout.is_some()).then(|| {
             Button::new("settings-scope-show-all")
                 .outline()
                 .xsmall()

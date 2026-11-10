@@ -37,10 +37,13 @@ pub(super) struct ScopedGroup {
     pub(super) has_other_members: bool,
 }
 
-/// `ProjectSettingsPanel`'s member filter: only `machine`'s checkouts, when one is picked.
-pub(super) fn narrow(group: &ProjectGroup, machine: Option<&str>) -> ScopedGroup {
+/// `ProjectSettingsPanel`'s member filter: only `machine`'s checkouts, and only `checkout`,
+/// when picked.
+pub(super) fn narrow(group: &ProjectGroup, machine: Option<&str>, checkout: Option<&str>) -> ScopedGroup {
     let mut scoped = group.clone();
-    scoped.members.retain(|m| machine.is_none_or(|id| m.project.environment_id == id));
+    scoped.members.retain(|m| {
+        machine.is_none_or(|id| m.project.environment_id == id) && checkout.is_none_or(|key| m.physical_key == key)
+    });
     let has_other_members = scoped.members.len() < group.members.len();
     ScopedGroup { group: scoped, whole_members: group.members.clone(), has_other_members }
 }
@@ -145,7 +148,7 @@ mod tests {
     }
 
     #[test]
-    fn a_picked_machine_narrows_the_group_to_its_checkouts() {
+    fn a_picked_machine_or_checkout_narrows_the_group() {
         let member = |id: &str, environment: &str| {
             let mut project = project(id, &format!("/{id}"), Value::Null);
             project.environment_id = environment.into();
@@ -165,14 +168,16 @@ mod tests {
             archived: false,
         };
         let ids = |members: &[Member]| members.iter().map(|m| m.project.id.clone()).collect::<Vec<_>>();
-        let scoped = narrow(&group, Some("laptop"));
+        let scoped = narrow(&group, Some("laptop"), None);
         assert_eq!(ids(&scoped.group.members), ["a", "c"]);
         assert_eq!(ids(&scoped.whole_members), ["a", "b", "c"]);
         assert!(scoped.has_other_members);
-        let all = narrow(&group, None);
+        let all = narrow(&group, None, None);
         assert_eq!(ids(&all.group.members), ["a", "b", "c"]);
         assert!(!all.has_other_members);
-        assert!(narrow(&group, Some("gone")).group.members.is_empty());
+        assert!(narrow(&group, Some("gone"), None).group.members.is_empty());
+        let checkout = narrow(&group, Some("laptop"), Some("c"));
+        assert_eq!((ids(&checkout.group.members), checkout.has_other_members), (vec!["c".to_owned()], true));
     }
 
     #[test]

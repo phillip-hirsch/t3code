@@ -85,16 +85,34 @@ pub fn ensure(cx: &mut App) -> Option<(AnyWindowHandle, Entity<Workspace>)> {
     Some((window, workspace))
 }
 
-/// Later launches' command lines ([`desktop::activation`]) and, on macOS, URLs the OS opens
-/// with the app: each brings the main window forward, reopening it if needed, and opens its
-/// app links there.
+/// Later launches' command lines ([`desktop::activation`]): each brings the main window
+/// forward, reopening it if needed, and opens its app links there.
 pub fn receive_launches(launches: async_channel::Receiver<Vec<String>>, cx: &mut App) {
+    deliver(launches, Workspace::receive_launch, cx);
+}
+
+/// URLs macOS opens with the app, which may also be ordinary web pages and HTML files.
+pub fn receive_opened_urls(urls: async_channel::Receiver<Vec<String>>, cx: &mut App) {
+    deliver(urls, Workspace::receive_opened_urls, cx);
+}
+
+/// `t3 app` requests ([`desktop::app_control`]): each brings the main window forward, reopening
+/// it if needed, as the broker's `activate` does. A request that finds no window is answered so.
+pub fn receive_activations(requests: async_channel::Receiver<desktop::app_control::Incoming>, cx: &mut App) {
+    deliver(requests, Workspace::receive_activation, cx);
+}
+
+fn deliver<T: 'static>(
+    receiver: async_channel::Receiver<T>,
+    receive: fn(&mut Workspace, T, &mut gpui_kit::Window, &mut gpui_kit::Context<Workspace>),
+    cx: &mut App,
+) {
     cx.spawn(async move |cx| {
-        while let Ok(args) = launches.recv().await {
+        while let Ok(item) = receiver.recv().await {
             cx.update(|cx| {
                 let Some((window, workspace)) = ensure(cx) else { return };
-                let received = window
-                    .update(cx, |_, window, cx| workspace.update(cx, |this, cx| this.receive_launch(args, window, cx)));
+                let received =
+                    window.update(cx, |_, window, cx| workspace.update(cx, |this, cx| receive(this, item, window, cx)));
                 if let Err(error) = received {
                     log::warn!("a later launch could not reach the window: {error:#}");
                 }

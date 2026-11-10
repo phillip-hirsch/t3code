@@ -95,21 +95,26 @@ fn main() {
     // A second launch hands its command line to the running app and exits.
     let (links, launches) = async_channel::unbounded();
     let channel = match settings::t3_home() {
-        Some(home) => {
-            match desktop::activation::claim(&home, &desktop::launch_args(), links.clone(), runtime().handle()) {
-                desktop::activation::Instance::Forwarded => return,
-                desktop::activation::Instance::Primary { channel } => channel,
-            }
-        }
+        Some(home) => match desktop::activation::claim(&home, &desktop::launch_args(), links, runtime().handle()) {
+            desktop::activation::Instance::Forwarded => return,
+            desktop::activation::Instance::Primary { channel } => channel,
+        },
         None => None,
     };
+    // `t3 app` reaches the app that owns this T3 home.
+    let (activations_tx, activations) = async_channel::unbounded();
+    let control = settings::userdata_dir()
+        .and_then(|state_dir| desktop::app_control::start(&state_dir, activations_tx, runtime().handle()));
     // `channel` stays here until the process exits, holding the single-instance lock; GPUI
     // drops quit handlers as soon as quitting starts, so they get only the socket's removal.
     let close_channel = channel.as_ref().map(desktop::activation::Channel::closer);
+    let close_control = control.as_ref().map(desktop::app_control::ControlServer::closer);
     let app = gpui_kit::application().with_assets(assets::Assets);
-    // macOS hands `t3code://` links to the running app as URLs (Electron's `open-url`).
+    // macOS hands links and opened web pages to the running app as URLs (Electron's `open-url`
+    // and `open-file`).
+    let (opened_tx, opened) = async_channel::unbounded();
     app.on_open_urls(move |urls| {
-        let _ = links.try_send(urls);
+        let _ = opened_tx.try_send(urls);
     });
     // A Dock click brings the window forward, or opens it again when closed (Electron's `activate`).
     app.on_reopen(|cx| {
@@ -141,6 +146,13 @@ fn main() {
             })
             .detach();
         }
+        if let Some(close_control) = close_control {
+            cx.on_app_quit(move |_| {
+                close_control();
+                async {}
+            })
+            .detach();
+        }
         #[cfg(all(unix, not(target_os = "macos")))]
         desktop::linux_url_handler::register();
         cx.set_global(desktop::Desktop::load(cx));
@@ -150,6 +162,8 @@ fn main() {
             return;
         }
         app::main_window::receive_launches(launches, cx);
+        app::main_window::receive_opened_urls(opened, cx);
+        app::main_window::receive_activations(activations, cx);
     });
 }
 

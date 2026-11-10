@@ -234,8 +234,8 @@ impl Workspace {
     }
 
     /// `closePreviewSession`'s record: a browser tab the server closed, as it last stood.
-    pub(in crate::app) fn remember_closed_browser(&mut self, session: &preview::Session) {
-        let Some(target) = self.thread_target(&session.thread_id) else { return };
+    pub(in crate::app) fn remember_closed_browser(&mut self, thread: &preview::ThreadRef, session: &preview::Session) {
+        let target = crate::app::preview::panel_target(thread);
         let view = ClosedView::Browser {
             owner: (&target).into(),
             tab_id: session.tab_id.clone(),
@@ -380,7 +380,7 @@ impl Workspace {
             }
             ClosedView::Browser { owner, url, viewport, profile_id, .. } => {
                 let target = owner.target();
-                let Target::Thread { id: thread_id, .. } = &target else {
+                let Target::Thread { env, id: thread_id } = &target else {
                     self.right_panel.closed.update(|history| history.remove(id));
                     return true;
                 };
@@ -399,8 +399,8 @@ impl Workspace {
                     }
                 }
                 self.right_panel.closed.reopening = true;
-                let thread_id = thread_id.clone();
-                self.request_preview_open(thread_id, input, window, cx, move |this, opened, window, cx| {
+                let thread = preview::ThreadRef::new(env.clone(), thread_id.clone());
+                self.request_preview_open(thread, input, window, cx, move |this, opened, window, cx| {
                     this.right_panel.closed.reopening = false;
                     match opened {
                         Ok(tab) => {

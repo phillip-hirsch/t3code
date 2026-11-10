@@ -3,7 +3,7 @@
 //! `SettingInheritance.tsx` and `resolveProjectSettings` (`packages/shared/src/projectSettings.ts`)
 //! over the connected environments. A project scope is a project group (checkouts grouped by
 //! repository, as Settings groups them, across environments): it reads each checkout and writes
-//! them all, each on its own environment. The web's checkout axis is not ported.
+//! them all, each on its own environment. A checkout pick narrows a project to one of them.
 
 use std::collections::HashMap;
 
@@ -12,22 +12,24 @@ use serde_json::{Map, Value, json};
 use super::{Settings, contract};
 use crate::model::T3ProjectFile;
 
-/// The scope picked in the scope sentence (`SettingsScopeSearch`, minus `checkout`).
+/// The scope picked in the scope sentence (`SettingsScopeSearch`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ScopeSearch {
     pub project: Option<String>,
     pub machine: Option<String>,
+    /// One checkout of `project`, by its physical project key.
+    pub checkout: Option<String>,
 }
 
 impl ScopeSearch {
-    /// `selectEnvironmentAxis`: `None` is "All environments".
+    /// `selectEnvironmentAxis`: `None` is "All environments". Drops a checkout narrowing.
     pub fn with_machine(&self, machine: Option<String>) -> Self {
-        Self { project: self.project.clone(), machine }
+        Self { project: self.project.clone(), machine, checkout: None }
     }
 
-    /// `selectProjectAxis`: `None` is "All projects".
+    /// `selectProjectAxis`: `None` is "All projects". Drops a checkout narrowing.
     pub fn with_project(&self, project: Option<String>) -> Self {
-        Self { project, machine: self.machine.clone() }
+        Self { project, machine: self.machine.clone(), checkout: None }
     }
 }
 
@@ -77,9 +79,12 @@ pub struct Scope {
     pub label: String,
     /// The selected environments (`environmentIds`), in the order they were given.
     pub environment_ids: Vec<String>,
+    /// `kind: "checkout"`: a project scope narrowed to one checkout, on this environment.
+    pub checkout_environment: Option<String>,
 }
 
 impl Scope {
+    /// A project, or one of its checkouts.
     pub fn is_project(&self) -> bool {
         matches!(self.kind, ScopeKind::Project { .. })
     }
@@ -91,7 +96,11 @@ pub fn resolve(search: &ScopeSearch, groups: &[Group], environments: &[Environme
         kind: ScopeKind::Unavailable { message },
         label: "Unavailable selection".into(),
         environment_ids: Vec::new(),
+        checkout_environment: None,
     };
+    if search.checkout.is_some() && search.project.is_none() {
+        return unavailable("Select a project to choose one of its checkouts.");
+    }
     let machine = match search.machine.as_deref() {
         Some(id) => match environments.iter().find(|e| e.id == id) {
             Some(environment) => Some(environment),
@@ -103,8 +112,37 @@ pub fn resolve(search: &ScopeSearch, groups: &[Group], environments: &[Environme
         let Some(group) = groups.iter().find(|g| &g.key == key) else {
             return unavailable("This project is no longer available.");
         };
-        let members: Vec<Project> =
-            group.members.iter().filter(|m| machine.is_none_or(|e| e.id == m.environment_id)).cloned().collect();
+        let checkout_key = |m: &Project| crate::project_groups::physical_key(&m.environment_id, &m.workspace_root);
+        let members: Vec<Project> = group
+            .members
+            .iter()
+            .filter(|m| machine.is_none_or(|e| e.id == m.environment_id))
+            .filter(|m| search.checkout.as_ref().is_none_or(|key| *key == checkout_key(m)))
+            .cloned()
+            .collect();
+        let Some(first) = members.first() else {
+            return unavailable(match search.checkout {
+                Some(_) => "This checkout is no longer available in the selected project and environment.",
+                None => "This project has no checkout on this environment.",
+            });
+        };
+        if search.checkout.is_some() {
+            let Some(environment) = environments.iter().find(|e| e.id == first.environment_id) else {
+                return unavailable("This checkout's environment is no longer available.");
+            };
+            let shares_environment = group
+                .members
+                .iter()
+                .any(|m| m.environment_id == first.environment_id && checkout_key(m) != checkout_key(first));
+            let root = if shares_environment { format!(" \u{b7} {}", first.workspace_root) } else { String::new() };
+            let environment_id = first.environment_id.clone();
+            return Scope {
+                label: format!("{} / {}{root}", group.name, environment.label),
+                kind: ScopeKind::Project { members },
+                environment_ids: vec![environment_id.clone()],
+                checkout_environment: Some(environment_id),
+            };
+        }
         let mut environment_ids: Vec<String> = Vec::new();
         for member in &members {
             if !environment_ids.contains(&member.environment_id) {
@@ -116,6 +154,7 @@ pub fn resolve(search: &ScopeSearch, groups: &[Group], environments: &[Environme
             kind: ScopeKind::Project { members },
             label: format!("{} / {place}", group.name),
             environment_ids,
+            checkout_environment: None,
         };
     }
     match machine {
@@ -123,11 +162,13 @@ pub fn resolve(search: &ScopeSearch, groups: &[Group], environments: &[Environme
             kind: ScopeKind::Environment,
             label: environment.label.to_owned(),
             environment_ids: vec![environment.id.to_owned()],
+            checkout_environment: None,
         },
         None => Scope {
             kind: ScopeKind::All,
             label: "All environments".into(),
             environment_ids: environments.iter().map(|e| e.id.to_owned()).collect(),
+            checkout_environment: None,
         },
     }
 }
@@ -148,7 +189,7 @@ pub fn single_environment(search: &ScopeSearch, groups: &[Group], environments: 
         .find(|e| Some(e.id) == primary)
         .or_else(|| candidates.iter().find(|e| e.settings.is_some()))
         .or(candidates.first());
-    selected.map_or_else(|| search.clone(), |e| search.with_machine(Some(e.id.to_owned())))
+    selected.map_or_else(|| search.clone(), |e| ScopeSearch { machine: Some(e.id.to_owned()), ..search.clone() })
 }
 
 /// An environment as scope labels name it: `(id, label, address url)`.
@@ -884,7 +925,7 @@ mod tests {
     }
 
     fn search(project: Option<&str>, machine: Option<&str>) -> ScopeSearch {
-        ScopeSearch { project: project.map(Into::into), machine: machine.map(Into::into) }
+        ScopeSearch { project: project.map(Into::into), machine: machine.map(Into::into), checkout: None }
     }
 
     #[test]
@@ -946,6 +987,67 @@ mod tests {
     }
 
     #[test]
+    fn a_checkout_narrows_a_project_to_one_member_and_either_axis_drops_it() {
+        let s = Settings::server_defaults();
+        let environments = [env(&s), Environment { id: "env-2", label: "Laptop", settings: Some(&s) }];
+        let mut remote = project("b");
+        remote.environment_id = "env-2".into();
+        let groups =
+            [Group { key: "a".into(), name: "Repo".into(), members: vec![project("a"), remote, project("c")] }];
+        let pick = |checkout: &str, machine: Option<&str>| ScopeSearch {
+            checkout: Some(checkout.into()),
+            ..search(Some("a"), machine)
+        };
+        let message = |scope: Scope| match scope.kind {
+            ScopeKind::Unavailable { message } => message,
+            other => panic!("expected an unavailable scope, got {other:?}"),
+        };
+
+        let laptop = resolve(&pick("env-2:/b", Some("env-2")), &groups, &environments);
+        assert_eq!(
+            (laptop.label.as_str(), laptop.environment_ids.as_slice()),
+            ("Repo / Laptop", ["env-2".to_owned()].as_slice())
+        );
+        assert_eq!(laptop.checkout_environment.as_deref(), Some("env-2"));
+        assert!(laptop.is_project());
+        assert!(matches!(&laptop.kind, ScopeKind::Project { members } if members.len() == 1 && members[0].id == "b"));
+        // Another checkout on its environment: the label names this one's root.
+        let studio = resolve(&pick("env-1:/a", None), &groups, &environments);
+        assert_eq!(studio.label, "Repo / Studio \u{b7} /a");
+        let plan = plan_patch(&studio, &environments, json!({"defaultRuntimeMode": "auto"}).as_object().unwrap());
+        assert_eq!(
+            plan.server_writes.iter().map(|w| Value::Object(w.patch.clone())).collect::<Vec<_>>(),
+            [json!({"projectSettingsOverrides": {"a": {"defaultRuntimeMode": "auto"}}})],
+            "only the picked checkout gets the override"
+        );
+        // A page on one environment keeps the narrowing while it fills in the machine.
+        let single = single_environment(&pick("env-2:/b", None), &groups, &environments);
+        assert_eq!((single.machine.as_deref(), single.checkout.as_deref()), (Some("env-2"), Some("env-2:/b")));
+
+        let checkout_only = ScopeSearch { checkout: Some("env-1:/a".into()), ..ScopeSearch::default() };
+        assert_eq!(
+            message(resolve(&checkout_only, &groups, &environments)),
+            "Select a project to choose one of its checkouts."
+        );
+        let gone = "This checkout is no longer available in the selected project and environment.";
+        assert_eq!(message(resolve(&pick("env-1:/gone", None), &groups, &environments)), gone);
+        assert_eq!(message(resolve(&pick("env-2:/b", Some("env-1")), &groups, &environments)), gone);
+        assert_eq!(
+            message(resolve(&pick("env-2:/b", None), &groups, &environments[..1])),
+            "This checkout's environment is no longer available."
+        );
+        let local_only = [group(&["p1"])];
+        assert_eq!(
+            message(resolve(&search(Some("p1"), Some("env-2")), &local_only, &environments)),
+            "This project has no checkout on this environment."
+        );
+
+        let picked = pick("env-2:/b", Some("env-2"));
+        assert_eq!(picked.with_machine(Some("env-1".into())), search(Some("a"), Some("env-1")));
+        assert_eq!(picked.with_project(Some("a".into())), search(Some("a"), Some("env-2")));
+    }
+
+    #[test]
     fn project_overrides_win_and_record_their_source() {
         let s = settings(json!({
             "defaultThreadEnvMode": "local",
@@ -988,6 +1090,7 @@ mod tests {
             kind: ScopeKind::Project { members: vec![project("p1")] },
             label: String::new(),
             environment_ids: vec!["env-1".into()],
+            checkout_environment: None,
         };
         let t = targets(&scope, &[env(&unset)], |member| (member.workspace_root == "/p1").then_some(&file));
         assert_eq!(row_source(&t, &["defaultThreadEnvMode"]), RowSource::ProjectFile);

@@ -818,11 +818,11 @@ impl Workspace {
     /// `openFileInPreview`: the file's asset URL in a new tab of the integrated browser.
     pub(super) fn open_file_in_browser(&mut self, key: &FileKey, window: &mut Window, cx: &mut Context<Self>) {
         let Some((client, endpoint)) = self.file_connection(key) else { return };
-        let Some(thread_id) = self.preview_thread_id().map(str::to_owned) else { return };
+        let Some(thread) = self.preview_thread() else { return };
         let Some(resource) = self.asset_resource(key, "workspace-file") else { return };
         cx.spawn_in(window, async move |this, cx| match mint_asset_url(client, endpoint.http_base, resource).await {
             Ok((url, _)) => {
-                let _ = this.update_in(cx, |this, window, cx| this.open_preview_tab(thread_id, Some(url), window, cx));
+                let _ = this.update_in(cx, |this, window, cx| this.open_preview_tab(thread, Some(url), window, cx));
             }
             Err(error) => {
                 let _ = cx.update(|window, cx| {
@@ -845,13 +845,12 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let (Some(client), Some(endpoint)) = (self.client(), self.endpoint().cloned()) else { return };
-        let Some(thread_id) = self.preview_thread_id().map(str::to_owned) else { return };
+        let Some(thread) = self.preview_thread() else { return };
         let inside = crate::app::markdown_ui::workspace_relative(path, self.git_cwd().as_deref()).is_some();
-        let resource =
-            json!({"_tag": if inside { "workspace-file" } else { "media-file" }, "threadId": thread_id, "path": path});
+        let resource = json!({"_tag": if inside { "workspace-file" } else { "media-file" }, "threadId": thread.thread_id, "path": path});
         cx.spawn_in(window, async move |this, cx| match mint_asset_url(client, endpoint.http_base, resource).await {
             Ok((url, _)) => {
-                let _ = this.update_in(cx, |this, window, cx| this.open_preview_tab(thread_id, Some(url), window, cx));
+                let _ = this.update_in(cx, |this, window, cx| this.open_preview_tab(thread, Some(url), window, cx));
             }
             Err(error) => {
                 let _ = cx.update(|window, cx| {

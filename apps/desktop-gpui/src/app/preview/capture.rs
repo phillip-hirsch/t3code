@@ -32,6 +32,7 @@ use serde_json::json;
 
 use super::icon_button;
 use crate::app::Workspace;
+use crate::preview::TabRef;
 use crate::theme::Tokens;
 
 use encode::Encoder;
@@ -61,8 +62,7 @@ pub(super) struct Captures {
 
 struct Recording {
     id: u64,
-    thread_id: String,
-    tab_id: String,
+    tab: TabRef,
     /// `__t3Recording.start`'s options, sent again after each page load.
     overlay: String,
     /// Frame requests to the recording thread; dropping it stops the recording.
@@ -72,8 +72,8 @@ struct Recording {
 }
 
 impl Captures {
-    fn recording(&self, thread_id: &str, tab_id: &str) -> Option<&Recording> {
-        self.recording.as_ref().filter(|recording| recording.thread_id == thread_id && recording.tab_id == tab_id)
+    fn recording(&self, tab: &TabRef) -> Option<&Recording> {
+        self.recording.as_ref().filter(|recording| recording.tab == *tab)
     }
 }
 
@@ -194,7 +194,15 @@ pub(super) fn grab_png(rect: ScreenRect) -> Result<Vec<u8>, String> {
 
 /// Screen units per GPUI pixel in `window`, as xcap counts them.
 pub(super) fn screen_units(window: &Window) -> f32 {
-    if cfg!(target_os = "macos") { 1. } else { window.scale_factor() }
+    // A GPUI pixel is `ui_scale` points; the scale factor already includes it.
+    if cfg!(target_os = "macos") { window.ui_scale() } else { window.scale_factor() }
+}
+
+/// Where the window's content starts, in GPUI pixels: its bounds stay in the platform's logical
+/// pixels while the interface zoom (`Window::ui_scale`) shrinks GPUI's.
+pub(super) fn content_origin(window: &Window) -> Point<Pixels> {
+    let (origin, scale) = (window.bounds().origin, window.ui_scale());
+    gpui_kit::point(px(f32::from(origin.x) / scale), px(f32::from(origin.y) / scale))
 }
 
 /// `captureScreenshot`: `browser-screenshot-<site>-<time>-<id>.png`.
@@ -371,16 +379,15 @@ impl Workspace {
     /// The camera button for a tab this computer draws; `page_ready` is a loaded, reachable page.
     pub(super) fn render_capture_button(
         &self,
-        thread_id: &str,
-        tab_id: &str,
+        tab: &TabRef,
         page_ready: bool,
         tokens: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let recording = self.preview.capture.recording(thread_id, tab_id).is_some();
+        let recording = self.preview.capture.recording(tab).is_some();
         // A recording can always be stopped.
         let enabled = page_ready || recording;
-        let (thread, tab) = (thread_id.to_owned(), tab_id.to_owned());
+        let tab = tab.clone();
         let button = icon_button("preview-capture", IconName::Camera, enabled, tokens, cx)
             // `variant="secondary"` with a destructive icon while recording.
             .when(recording, |el| {
@@ -395,7 +402,7 @@ impl Workspace {
             .tooltip(if recording { "Stop recording" } else { "Screenshot · Shift-click to record" })
             .when(enabled, |el| {
                 el.on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                    this.capture_preview(&thread, &tab, event.modifiers().shift, window, cx);
+                    this.capture_preview(&tab, event.modifiers().shift, window, cx);
                 }))
             });
         // The web's dot pulses; a static one keeps the panel from repainting every frame.
@@ -410,39 +417,32 @@ impl Workspace {
     }
 
     /// `handleCapture`: stops this tab's recording, else starts one (`record`) or takes a screenshot.
-    fn capture_preview(
-        &mut self,
-        thread_id: &str,
-        tab_id: &str,
-        record: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.preview.capture.recording(thread_id, tab_id).is_some() {
+    fn capture_preview(&mut self, tab: &TabRef, record: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.preview.capture.recording(tab).is_some() {
             self.stop_recording(cx);
         } else if record {
-            self.start_recording(thread_id, tab_id, window, cx);
+            self.start_recording(tab, window, cx);
         } else {
-            self.take_screenshot(tab_id, window, cx);
+            self.take_screenshot(tab, window, cx);
         }
     }
 
     /// The native view of one of this computer's tabs; every lookup here goes through it.
-    fn capture_tab(&self, tab_id: &str) -> Option<&super::HostedTab> {
-        self.preview.tabs.get(tab_id)
+    fn capture_tab(&self, tab: &TabRef) -> Option<&super::HostedTab> {
+        self.preview.tabs.get(tab)
     }
 
     /// Where a shown tab's page is on screen.
-    fn capture_rect(&self, tab_id: &str, window: &Window, cx: &App) -> Option<ScreenRect> {
-        let tab = self.capture_tab(tab_id).filter(|tab| tab.shown)?;
-        screen_rect(window.bounds().origin, tab.view.read(cx).bounds(), screen_units(window))
+    fn capture_rect(&self, tab: &TabRef, window: &Window, cx: &App) -> Option<ScreenRect> {
+        let hosted = self.capture_tab(tab).filter(|hosted| hosted.shown)?;
+        screen_rect(content_origin(window), hosted.view.read(cx).bounds(), screen_units(window))
     }
 
-    fn take_screenshot(&mut self, tab_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(rect) = self.capture_rect(tab_id, window, cx) else {
+    fn take_screenshot(&mut self, tab: &TabRef, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(rect) = self.capture_rect(tab, window, cx) else {
             return error_toast(window, cx, "Unable to capture screenshot", "Show the browser tab to capture it.");
         };
-        let url = self.capture_tab(tab_id).and_then(|tab| tab.status.url()).unwrap_or_default().to_owned();
+        let url = self.capture_tab(tab).and_then(|hosted| hosted.status.url()).unwrap_or_default().to_owned();
         let saved = cx.background_executor().spawn(async move { save_screenshot(rect, &url) });
         cx.spawn_in(window, async move |_, cx| {
             let saved = saved.await;
@@ -455,12 +455,12 @@ impl Workspace {
     }
 
     /// `startBrowserRecording` with the frame rate and overlays set for new recordings.
-    fn start_recording(&mut self, thread_id: &str, tab_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    fn start_recording(&mut self, tab: &TabRef, window: &mut Window, cx: &mut Context<Self>) {
         if self.preview.capture.recording.is_some() {
             let description = "Another browser tab is being recorded. Stop that recording first.";
             return error_toast(window, cx, "Unable to start recording", description);
         }
-        if self.capture_rect(tab_id, window, cx).is_none() {
+        if self.capture_rect(tab, window, cx).is_none() {
             return error_toast(window, cx, "Unable to start recording", "Show the browser tab to record it.");
         }
         let settings = &self.client_settings.values;
@@ -497,14 +497,13 @@ impl Workspace {
         .detach();
         self.preview.capture.recording = Some(Recording {
             id,
-            thread_id: thread_id.to_owned(),
-            tab_id: tab_id.to_owned(),
+            tab: tab.clone(),
             overlay,
             frames: Some(frames),
             started: Instant::now(),
             _pump: pump,
         });
-        self.recording_page_loaded(tab_id, cx);
+        self.recording_page_loaded(tab, cx);
         cx.notify();
     }
 
@@ -512,15 +511,15 @@ impl Workspace {
     fn feed_recording(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(recording) = &self.preview.capture.recording else { return false };
         let Some(frames) = recording.frames.clone() else { return false };
-        let (thread_id, tab_id, started) = (recording.thread_id.clone(), recording.tab_id.clone(), recording.started);
-        if self.capture_tab(&tab_id).is_none_or(|tab| tab.thread_id != thread_id) {
+        let (tab, started) = (recording.tab.clone(), recording.started);
+        if self.capture_tab(&tab).is_none() {
             self.stop_recording(cx);
             return false;
         }
         // A hidden or covered tab skips frames, and so does an inactive window, whose page other
         // windows may cover on screen; the video holds its last frame.
         if window.is_window_active()
-            && let Some(rect) = self.capture_rect(&tab_id, window, cx)
+            && let Some(rect) = self.capture_rect(&tab, window, cx)
             && let Err(TrySendError::Disconnected(_)) = frames.try_send(FrameRequest { rect, at: started.elapsed() })
         {
             return false;
@@ -532,8 +531,8 @@ impl Workspace {
     fn stop_recording(&mut self, cx: &mut Context<Self>) {
         let Some(recording) = self.preview.capture.recording.as_mut() else { return };
         if recording.frames.take().is_some() {
-            let tab_id = recording.tab_id.clone();
-            self.run_recording_overlay(&tab_id, None, cx);
+            let tab = recording.tab.clone();
+            self.run_recording_overlay(&tab, None, cx);
             cx.notify();
         }
     }
@@ -554,7 +553,7 @@ impl Workspace {
         if let Some(recording) = self.preview.capture.recording.take()
             && recording.frames.is_some()
         {
-            self.run_recording_overlay(&recording.tab_id, None, cx);
+            self.run_recording_overlay(&recording.tab, None, cx);
         }
         match finished {
             Ok(Some(path)) => recording_toast(path, window, cx),
@@ -565,21 +564,21 @@ impl Workspace {
     }
 
     /// Starts the overlays again in a recorded tab's newly loaded page.
-    pub(super) fn recording_page_loaded(&self, tab_id: &str, cx: &App) {
+    pub(super) fn recording_page_loaded(&self, tab: &TabRef, cx: &App) {
         let Some(recording) = self.preview.capture.recording.as_ref() else { return };
-        if recording.tab_id == tab_id && recording.frames.is_some() {
-            self.run_recording_overlay(tab_id, Some(&recording.overlay), cx);
+        if recording.tab == *tab && recording.frames.is_some() {
+            self.run_recording_overlay(tab, Some(&recording.overlay), cx);
         }
     }
 
     /// Starts the page's overlays with these options, or stops them.
-    fn run_recording_overlay(&self, tab_id: &str, options: Option<&str>, cx: &App) {
-        let Some(tab) = self.capture_tab(tab_id) else { return };
+    fn run_recording_overlay(&self, tab: &TabRef, options: Option<&str>, cx: &App) {
+        let Some(hosted) = self.capture_tab(tab) else { return };
         let script = match options {
             Some(options) => format!("window.__t3Recording&&window.__t3Recording.start({options})"),
             None => "window.__t3Recording&&window.__t3Recording.stop()".to_owned(),
         };
-        if let Err(error) = tab.view.read(cx).raw().evaluate_script(&script) {
+        if let Err(error) = hosted.view.read(cx).raw().evaluate_script(&script) {
             log::warn!("could not update the recording overlay: {error}");
         }
     }

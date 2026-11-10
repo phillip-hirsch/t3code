@@ -524,7 +524,7 @@ fn scroll_target_marker(pending: Rc<Cell<u8>>, scroll: ScrollHandle) -> impl Int
     .size_full()
 }
 
-fn section_frame(
+pub(in crate::app) fn section_frame(
     id: impl Into<ElementId>,
     title: impl IntoElement,
     action: Option<AnyElement>,
@@ -805,7 +805,12 @@ impl Workspace {
             })
             .collect();
         let mut view = SettingsView {
-            scope: Scope { kind: ScopeKind::All, label: String::new(), environment_ids: Vec::new() },
+            scope: Scope {
+                kind: ScopeKind::All,
+                label: String::new(),
+                environment_ids: Vec::new(),
+                checkout_environment: None,
+            },
             targets: Vec::new(),
             groups,
             search: self.settings_ui.scope.clone(),
@@ -1748,9 +1753,11 @@ impl Workspace {
             (Some(_), None) => "Unavailable project".to_owned(),
             (None, None) => "All projects".to_owned(),
         };
+        // A checkout pick names its checkout's environment (`environmentAxisValue`).
+        let environment_value = search.machine.clone().or_else(|| view.scope.checkout_environment.clone());
         let selected_environment =
-            search.machine.as_deref().and_then(|id| view.environments.iter().find(|e| e.id == id));
-        let environment_label = match (&search.machine, selected_environment) {
+            environment_value.as_deref().and_then(|id| view.environments.iter().find(|e| e.id == id));
+        let environment_label = match (&environment_value, selected_environment) {
             (_, Some(environment)) => environment.label.clone(),
             (Some(_), None) => "Unavailable environment".to_owned(),
             (None, None) if single => "No environments".to_owned(),
@@ -1761,8 +1768,13 @@ impl Workspace {
         };
         let environment_icon = selected_environment.map(|e| machine_glyph(&e.machine, &t));
         let projects: Rc<Vec<ScopeProject>> = Rc::new(self.scope_projects(view));
-        let environments: Vec<(String, String, String)> =
-            view.environments.iter().map(|e| (e.id.clone(), e.label.clone(), e.machine.clone())).collect();
+        // A picked project offers only the environments its checkouts live on.
+        let environments: Vec<(String, String, String)> = view
+            .environments
+            .iter()
+            .filter(|e| selected.is_none_or(|group| group.members.iter().any(|m| *m.project.environment_id == e.id)))
+            .map(|e| (e.id.clone(), e.label.clone(), e.machine.clone()))
+            .collect();
         let pick = |workspace: gpui_kit::Entity<Workspace>, next: scope::ScopeSearch| {
             move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut gpui_kit::App| {
                 workspace.update(cx, |this, cx| {
@@ -1828,7 +1840,7 @@ impl Workspace {
                 .into_any_element()
         };
         let environment_menu = {
-            let (search, workspace) = (search.clone(), workspace);
+            let (search, workspace, value) = (search.clone(), workspace, environment_value.clone());
             scope_trigger("settings-scope-environment", environment_icon, environment_label, &t)
                 .dropdown_menu_with_anchor(gpui_kit::Anchor::TopLeft, move |mut menu, _, _| {
                     if !single {
@@ -1836,7 +1848,7 @@ impl Workspace {
                             .item(
                                 PopupMenuItem::new("All environments")
                                     .icon(IconName::Layers)
-                                    .checked(search.machine.is_none())
+                                    .checked(value.is_none())
                                     .on_click(pick(workspace.clone(), search.with_machine(None))),
                             )
                             .separator();
@@ -1845,14 +1857,14 @@ impl Workspace {
                         menu = menu.item(
                             PopupMenuItem::new(label.clone())
                                 .icon(Icon::empty().path(machine_icon(machine)))
-                                .checked(search.machine.as_deref() == Some(id.as_str()))
+                                .checked(value.as_deref() == Some(id.as_str()))
                                 .on_click(pick(workspace.clone(), search.with_machine(Some(id.clone())))),
                         );
                     }
                     menu
                 })
         };
-        let joiner = if search.machine.is_some() { "on" } else { "across" };
+        let joiner = if environment_value.is_some() { "on" } else { "across" };
         h_flex()
             .flex_wrap()
             .gap_x(px(6.))

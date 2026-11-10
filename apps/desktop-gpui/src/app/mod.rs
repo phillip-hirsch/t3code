@@ -26,6 +26,7 @@ use crate::runtime;
 use crate::timeline::{self, Row};
 
 mod alerts;
+mod app_activation;
 mod attachment_preview;
 mod attachments;
 mod banners;
@@ -56,6 +57,7 @@ mod fresh_session;
 mod git;
 mod guest_share;
 mod header;
+mod history_swipe;
 mod host_picker;
 mod html_page;
 mod image_viewer;
@@ -314,6 +316,10 @@ pub struct Workspace {
     /// This device's settings; the server's are in `server_info.settings`.
     client_settings: crate::settings::ClientSettings,
     history: pages::History,
+    /// Trackpad history swipes and their edge indicator.
+    swipe: history_swipe::SwipeState,
+    /// `t3 app` requests waiting for the primary environment.
+    activation: app_activation::ActivationQueue,
     devices: crate::device::Devices,
     /// The server's keybindings `keymap` was merged from; see [`keymap`].
     installed_keybindings: Rc<[crate::keybindings::Rule]>,
@@ -542,6 +548,8 @@ impl Workspace {
             settings_ui: pages::settings::SettingsUi::new(window, cx),
             client_settings,
             history: pages::History::default(),
+            swipe: Default::default(),
+            activation: Default::default(),
             devices: Default::default(),
             installed_keybindings: Rc::default(),
             keymap: Rc::from(crate::keybindings::merge_with_defaults(&[])),
@@ -1003,7 +1011,9 @@ impl Workspace {
         if resumed {
             self.refresh_rows(cx);
         }
-        self.load_previews(&thread_id, window, cx);
+        if let Some(thread) = self.preview_thread() {
+            self.load_previews(thread, window, cx);
+        }
         self.open_visit(&thread_id, cx);
         self.focus_composer(window, cx);
         self.notify_sidebar(cx);
@@ -1389,92 +1399,104 @@ impl Render for Workspace {
                 h_flex()
                     .size_full()
                     .when(self.sidebar_open.docked(), |el| el.child(self.render_cached_sidebar(cx)))
+                    // The main content (`sidebar-inset`), which the history swipe indicator edges.
                     .child(
-                        v_flex()
+                        h_flex()
+                            .relative()
                             .flex_1()
                             .h_full()
                             .min_w_0()
-                            // `SidebarInset`'s `bg-background`.
-                            .bg(canvas)
-                            .relative()
-                            .children(theme_inspect::probe(&["canvas", "text"], cx))
-                            .when(right_panel.is_none(), |el| el.pr(titlebar::RIGHT_RESIZE_INSET))
-                            // A maximized panel takes the row; the chat column keeps its state at zero width.
-                            .when(self.right_panel_maximized(), |el| el.w_0().flex_none().overflow_hidden())
-                            // The Pull requests page heads its list column; its panel takes the top row.
-                            .when(self.page != Some(pages::Page::PullRequests), |el| {
-                                el.child(self.render_header(window, cx))
-                            })
+                            .child(self.render_history_swipe_probe(cx))
                             .child(
-                                div()
-                                    .id("chat-canvas")
-                                    .group("chat-canvas")
-                                    .relative()
+                                v_flex()
                                     .flex_1()
-                                    .min_h_0()
-                                    .map(|el| {
-                                        if let Some(page) = self.render_page(window, cx) {
-                                            return el.child(page);
-                                        }
-                                        match self.target.clone() {
-                                            Some(Target::Draft { project_id, .. }) => el
-                                                .child(self.render_draft_stage(&project_id, window, cx))
-                                                .children(self.render_citation_comment(cx))
-                                                .children(self.render_details_card(window, cx)),
-                                            _ => el
-                                                .child(
-                                                    div()
-                                                        .relative()
-                                                        .size_full()
-                                                        .child(
-                                                            // A click on the timeline leaves the editor, as in a
-                                                            // browser, so a question card's 1-9 keys reach it.
-                                                            v_flex()
-                                                                .size_full()
-                                                                .on_mouse_down(
-                                                                    gpui_kit::MouseButton::Left,
-                                                                    |_, window, cx| window.blur(cx),
-                                                                )
-                                                                // The Cite button follows selections the text
-                                                                // views make, so it listens ahead of them.
-                                                                .capture_any_mouse_down(cx.listener(
-                                                                    |this, _: &gpui_kit::MouseDownEvent, _, cx| {
-                                                                        this.chat_mouse_down(cx);
-                                                                    },
-                                                                ))
-                                                                .capture_any_mouse_up(cx.listener(
-                                                                    |this, event: &gpui_kit::MouseUpEvent, window, cx| {
-                                                                        if event.button == gpui_kit::MouseButton::Left {
-                                                                            this.chat_mouse_up(event.position, window, cx);
-                                                                        }
-                                                                    },
-                                                                ))
-                                                                .child(self.render_body(window, cx)),
-                                                        )
-                                                        .child(self.render_floating_composer(window, cx)),
-                                                )
-                                                .children(self.render_find_bar(cx))
-                                                .children(self.render_cite_toolbar(cx))
-                                                .children(self.render_citation_comment(cx))
-                                                .children(self.render_details_card(window, cx)),
-                                        }
+                                    .h_full()
+                                    .min_w_0()
+                                    // `SidebarInset`'s `bg-background`.
+                                    .bg(canvas)
+                                    .relative()
+                                    .children(theme_inspect::probe(&["canvas", "text"], cx))
+                                    .when(right_panel.is_none(), |el| el.pr(titlebar::RIGHT_RESIZE_INSET))
+                                    // A maximized panel takes the row; the chat column keeps its state at zero width.
+                                    .when(self.right_panel_maximized(), |el| el.w_0().flex_none().overflow_hidden())
+                                    // The Pull requests page heads its list column; its panel takes the top row.
+                                    .when(self.page != Some(pages::Page::PullRequests), |el| {
+                                        el.child(self.render_header(window, cx))
                                     })
-                                    .children(mini_player)
-                                    .children(self.render_link_hover(cx))
-                                    .children(self.render_banner_lane(cx))
-                                    .on_drop(cx.listener(|this, paths: &gpui_kit::ExternalPaths, window, cx| {
-                                        this.drop_paths(paths, window, cx);
-                                    }))
-                                    .on_drag_move(cx.listener(Self::on_file_drag_move))
-                                    .when(self.dragging_files && cx.has_active_drag(), |el| {
-                                        el.child(self.render_drop_overlay(crate::theme::tokens(cx)))
-                                    }),
+                                    .child(
+                                        div()
+                                            .id("chat-canvas")
+                                            .group("chat-canvas")
+                                            .relative()
+                                            .flex_1()
+                                            .min_h_0()
+                                            .map(|el| {
+                                                if let Some(page) = self.render_page(window, cx) {
+                                                    return el.child(page);
+                                                }
+                                                match self.target.clone() {
+                                                    Some(Target::Draft { project_id, .. }) => el
+                                                        .child(self.render_draft_stage(&project_id, window, cx))
+                                                        .children(self.render_citation_comment(cx))
+                                                        .children(self.render_details_card(window, cx)),
+                                                    _ => el
+                                                        .child(
+                                                            div()
+                                                                .relative()
+                                                                .size_full()
+                                                                .child(
+                                                                    // A click on the timeline leaves the editor, as in a
+                                                                    // browser, so a question card's 1-9 keys reach it.
+                                                                    v_flex()
+                                                                        .size_full()
+                                                                        .on_mouse_down(
+                                                                            gpui_kit::MouseButton::Left,
+                                                                            |_, window, cx| window.blur(cx),
+                                                                        )
+                                                                        // The Cite button follows selections the text
+                                                                        // views make, so it listens ahead of them.
+                                                                        .capture_any_mouse_down(cx.listener(
+                                                                            |this, _: &gpui_kit::MouseDownEvent, _, cx| {
+                                                                                this.chat_mouse_down(cx);
+                                                                            },
+                                                                        ))
+                                                                        .capture_any_mouse_up(cx.listener(
+                                                                            |this, event: &gpui_kit::MouseUpEvent, window, cx| {
+                                                                                if event.button == gpui_kit::MouseButton::Left {
+                                                                                    this.chat_mouse_up(event.position, window, cx);
+                                                                                }
+                                                                            },
+                                                                        ))
+                                                                        .child(self.render_body(window, cx)),
+                                                                )
+                                                                .child(self.render_floating_composer(window, cx)),
+                                                        )
+                                                        .children(self.render_find_bar(cx))
+                                                        .children(self.render_cite_toolbar(cx))
+                                                        .children(self.render_citation_comment(cx))
+                                                        .children(self.render_details_card(window, cx)),
+                                                }
+                                            })
+                                            .children(mini_player)
+                                            .children(self.render_link_hover(cx))
+                                            .children(self.render_banner_lane(cx))
+                                            .on_drop(cx.listener(
+                                                |this, paths: &gpui_kit::ExternalPaths, window, cx| {
+                                                    this.drop_paths(paths, window, cx);
+                                                },
+                                            ))
+                                            .on_drag_move(cx.listener(Self::on_file_drag_move))
+                                            .when(self.dragging_files && cx.has_active_drag(), |el| {
+                                                el.child(self.render_drop_overlay(crate::theme::tokens(cx)))
+                                            }),
+                                    )
+                                    .children(terminal_drawer),
                             )
-                            .children(terminal_drawer),
-                    )
-                    .children(
-                        right_panel
-                            .map(|panel| div().h_full().flex_none().mr(titlebar::RIGHT_RESIZE_INSET).child(panel)),
+                            .children(
+                                right_panel.map(|panel| {
+                                    div().h_full().flex_none().mr(titlebar::RIGHT_RESIZE_INSET).child(panel)
+                                }),
+                            ),
                     ),
             )
             .children(right_panel_sheet.map(|panel| self.render_right_panel_sheet(panel, window, cx)))
@@ -1492,6 +1514,7 @@ impl Render for Workspace {
             .children(self.render_image_viewer(window, cx))
             .child(self.embeds.sweep())
             .children(self.render_quit_hint(cx))
+            .children(self.render_history_swipe(cx))
             .child(self.render_caption_overlay(window, cx))
             .children(titlebar::render_resize_edges(window, cx))
             .into_any_element()

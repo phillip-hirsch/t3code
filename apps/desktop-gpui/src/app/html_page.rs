@@ -503,8 +503,8 @@ impl Workspace {
                         &self.client_settings.values,
                         self.browser_available(),
                     );
-                    match self.preview_thread_id().map(str::to_owned).filter(|_| in_app) {
-                        Some(thread_id) => self.request_preview_tab(thread_id, Some(url), true, window, cx),
+                    match self.preview_thread().filter(|_| in_app) {
+                        Some(thread) => self.request_preview_tab(thread, Some(url), true, window, cx),
                         None => cx.open_url(&url),
                     }
                 }

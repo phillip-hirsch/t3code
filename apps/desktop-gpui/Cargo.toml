@@ -74,6 +74,8 @@ html5ever = "0.27"
 markup5ever_rcdom = "0.3"
 # Browser recordings' AV1 video: pure Rust without its assembly (no nasm); xcap's image already builds it.
 rav1e = { version = "0.8", default-features = false, features = ["threading"] }
+# The types of files sent to an agent browser page's file picker; GPUI already builds this crate.
+mime_guess = "2"
 raw-window-handle = "0.6"
 rodio = { version = "0.23", default-features = false, features = ["playback", "mp3"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "form", "rustls"] }
@@ -136,9 +138,10 @@ win32job = "2"
 resvg = { version = "0.46", default-features = false, features = ["text", "system-fonts"] }
 
 [target.'cfg(unix)'.dependencies]
-# SIGTERM for the local server on quit (`backend::LocalServer::stop`), through nix's safe `kill`.
-# The hostname a browser's profile lock names (`browser_import`).
-nix = { version = "0.31", default-features = false, features = ["hostname", "signal"] }
+# SIGTERM for the local server on quit (`backend::LocalServer::stop`), through nix's safe `kill`;
+# the hostname a browser's profile lock names (`browser_import`); `getuid` for the app control
+# socket's folder (`desktop::app_control`).
+nix = { version = "0.31", default-features = false, features = ["hostname", "signal", "user"] }
 
 [target.'cfg(not(windows))'.dependencies]
 # The OS keyring that holds `secure_storage`'s key.
@@ -196,8 +199,11 @@ gpui-pre = { path = "vendor/gpui-pre" }
 gpui-pre-windows = { path = "vendor/gpui-pre-windows" }
 # gpui-pre-linux 0.3.11: X11 client-side decorations without a compositor.
 gpui-pre-linux = { path = "vendor/gpui-pre-linux" }
-# gpui-webview 0.9.0: native views follow the interface scale.
+# gpui-webview 0.9.0: native views follow the interface scale, and a webview can move to another
+# window.
 gpui-webview = { path = "vendor/gpui-webview" }
+# lb-wry 0.53.3: a handler for failed navigations; a child webview can move to another window.
+lb-wry = { path = "vendor/lb-wry" }
 
 # BeautifulRust's lint set (github.com/morganlinton/BeautifulRust), trimmed for an application:
 # no library-API lints (missing_docs, missing_*_doc, exhaustive_enums, unreachable_pub, print_*).
