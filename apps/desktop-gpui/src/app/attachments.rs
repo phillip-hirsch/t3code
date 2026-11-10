@@ -657,6 +657,36 @@ impl Workspace {
         Ok(local_id)
     }
 
+    /// A preview annotation's screenshot for `target`'s draft, on screen or set aside, under the
+    /// annotation's id and without a chip of its own (`addImage`); `false` when it can't join.
+    pub(super) fn attach_annotation_screenshot(
+        &mut self,
+        target: &Target,
+        local_id: String,
+        name: String,
+        png: Vec<u8>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.attachment_error(&name, Kind::Image, png.len() as u64).is_some() {
+            return false;
+        }
+        let attachments = if self.target.as_ref() == Some(target) {
+            &mut self.attachments
+        } else {
+            match self.composer_drafts.entry(target.clone()).or_insert_with(ComposerDraft::empty) {
+                ComposerDraft::Prompt(_, kept, _) => kept,
+                ComposerDraft::Question(_) => return false,
+            }
+        };
+        if attachments.len() >= MAX_ATTACHMENTS || attachments.iter().any(|a| a.local_id == local_id) {
+            return false;
+        }
+        attachments.push(Attachment::restored_as(local_id.clone(), "image", name, "image/png".to_owned(), png));
+        self.upload(local_id, cx);
+        cx.notify();
+        true
+    }
+
     /// Mints a signed upload URL on the environment of the attachment's draft, then POSTs the bytes to it.
     pub(super) fn upload(&mut self, local_id: String, cx: &mut Context<Self>) {
         let Some((draft, _)) = find_attachment(&mut self.attachments, &mut self.composer_drafts, &local_id) else {
@@ -734,6 +764,7 @@ impl Workspace {
                     // Removed, moved to another machine or uploaded again meanwhile: the server drops the pending file.
                     this.delete_upload(&environment, id, cx);
                 }
+                this.annotation_upload_settled();
                 cx.notify();
             });
         })
@@ -842,12 +873,17 @@ impl Workspace {
         }
         let mut attachments = Vec::new();
         let mut records = self.message_context_records(text);
+        let mut unlinked = Vec::new();
         for attachment in &self.attachments {
             let Upload::Ready(id) = &attachment.upload else { continue };
             let (sent, record) = attachment.wire(id, text);
             attachments.push(sent);
-            records.extend(record);
+            match record {
+                Some(record) => records.push(record),
+                None => unlinked.push(attachment.context_record(id)),
+            }
         }
+        bind_screenshots(&mut records, &unlinked);
         let context = (!records.is_empty()).then(|| json!({"version": 1, "records": records}));
         Ok((attachments, context))
     }
@@ -1078,6 +1114,29 @@ fn ghost_icon(id: ElementId, icon: Lucide, t: &Tokens) -> gpui_kit::Stateful<gpu
         .child(Icon::new(icon).with_size(px(14.)))
 }
 
+/// `buildMessageContext`: an annotation names its screenshot only while the message carries it.
+/// A screenshot without a chip of its own (`unlinked`) joins the records; a removed one's
+/// reference goes.
+fn bind_screenshots(records: &mut Vec<Value>, unlinked: &[Value]) {
+    let present: Vec<String> = records.iter().filter_map(|r| r["contextId"].as_str().map(str::to_owned)).collect();
+    let mut joined: Vec<Value> = Vec::new();
+    for record in records.iter_mut().filter(|record| record["kind"] == "preview-annotation") {
+        let Some(id) = record["screenshotContextId"].as_str().map(str::to_owned) else { continue };
+        if present.contains(&id) || joined.iter().any(|r| r["contextId"] == id.as_str()) {
+            continue;
+        }
+        match unlinked.iter().find(|r| r["contextId"] == id.as_str()) {
+            Some(image) => joined.push(image.clone()),
+            None => {
+                if let Some(fields) = record.as_object_mut() {
+                    fields.remove("screenshotContextId");
+                }
+            }
+        }
+    }
+    records.extend(joined);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1201,6 +1260,25 @@ It is referenced in your text; removing it also removes every reference."
         // A second upload finishing after the first landed is stale too.
         attachment.upload = Upload::Ready("on-b".into());
         assert!(!attachment.awaits_upload_on("b"));
+    }
+
+    #[test]
+    fn an_annotation_sends_its_screenshot_or_forgets_it() {
+        let annotation =
+            |id: &str, shot: &str| json!({"kind": "preview-annotation", "contextId": id, "screenshotContextId": shot});
+        let image = |id: &str| json!({"kind": "image", "contextId": id, "attachmentId": "srv"});
+        let mut records =
+            vec![annotation("preview-annotation_a", "image_a"), annotation("preview-annotation_b", "image_b")];
+        bind_screenshots(&mut records, &[image("image_a"), image("image_other")]);
+        assert_eq!(records[2], image("image_a"), "the chipless screenshot rides along");
+        assert_eq!(records.len(), 3);
+        assert!(records[1].get("screenshotContextId").is_none(), "a removed screenshot is not claimed");
+
+        // A screenshot the text links is already sent once.
+        let mut linked = vec![annotation("preview-annotation_a", "image_a"), image("image_a")];
+        bind_screenshots(&mut linked, &[]);
+        assert_eq!(linked.len(), 2);
+        assert_eq!(linked[0]["screenshotContextId"], "image_a");
     }
 
     #[test]

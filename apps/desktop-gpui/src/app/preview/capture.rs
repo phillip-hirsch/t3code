@@ -88,7 +88,7 @@ pub(super) struct ScreenRect {
 
 /// The screen rectangle of a view at `view` in a window whose content starts at `origin`, both
 /// in GPUI pixels, at `units` screen units per pixel.
-fn screen_rect(origin: Point<Pixels>, view: Bounds<Pixels>, units: f32) -> Option<ScreenRect> {
+pub(super) fn screen_rect(origin: Point<Pixels>, view: Bounds<Pixels>, units: f32) -> Option<ScreenRect> {
     #[expect(clippy::cast_possible_truncation, reason = "screen coordinates fit in an i32")]
     let to_screen = |value: f32| (value * units).round() as i32;
     let x = to_screen(f32::from(origin.x) + f32::from(view.origin.x));
@@ -182,13 +182,24 @@ struct Screenshot {
     png: Arc<[u8]>,
 }
 
-/// `captureScreenshot`: `browser-screenshot-<site>-<time>-<id>.png`.
-fn save_screenshot(rect: ScreenRect, url: &str) -> Result<Screenshot, String> {
+/// The screen's pixels under `rect` as a PNG.
+pub(super) fn grab_png(rect: ScreenRect) -> Result<Vec<u8>, String> {
     let image = grab(rect)?;
     let mut png = Vec::new();
     image
         .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
         .map_err(|error| format!("Unable to encode the screenshot: {error}"))?;
+    Ok(png)
+}
+
+/// Screen units per GPUI pixel in `window`, as xcap counts them.
+pub(super) fn screen_units(window: &Window) -> f32 {
+    if cfg!(target_os = "macos") { 1. } else { window.scale_factor() }
+}
+
+/// `captureScreenshot`: `browser-screenshot-<site>-<time>-<id>.png`.
+fn save_screenshot(rect: ScreenRect, url: &str) -> Result<Screenshot, String> {
+    let png = grab_png(rect)?;
     let id = uuid::Uuid::new_v4().simple().to_string();
     let name = format!("browser-screenshot-{}-{}-{}.png", site_slug(url), base36(now_millis()), &id[..8]);
     let path = save_artifact(&name, &png)?;
@@ -268,7 +279,7 @@ fn record(
 }
 
 /// The theme's primary colour for the page's press overlay (`readPreviewAnnotationTheme`).
-fn css_color(color: gpui_kit::Hsla) -> String {
+pub(super) fn css_color(color: gpui_kit::Hsla) -> String {
     let rgb = color.to_rgb();
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "channels are 0–1")]
     let channel = |value: f32| (value.clamp(0., 1.) * 255.).round() as u8;
@@ -424,8 +435,7 @@ impl Workspace {
     /// Where a shown tab's page is on screen.
     fn capture_rect(&self, tab_id: &str, window: &Window, cx: &App) -> Option<ScreenRect> {
         let tab = self.capture_tab(tab_id).filter(|tab| tab.shown)?;
-        let units = if cfg!(target_os = "macos") { 1. } else { window.scale_factor() };
-        screen_rect(window.bounds().origin, tab.view.read(cx).bounds(), units)
+        screen_rect(window.bounds().origin, tab.view.read(cx).bounds(), screen_units(window))
     }
 
     fn take_screenshot(&mut self, tab_id: &str, window: &mut Window, cx: &mut Context<Self>) {
