@@ -532,6 +532,12 @@ past their column floors, and draws no scrollbar on either. The patch: `src/text
 column floors, and `src/scrollable_mask.rs` (`horizontal_scroll_area`) adds an always-shown
 horizontal `Scrollbar` in the text style's muted color, 1px off the bottom edge.
 
+**Plugins can resolve reference definitions.** The web's chat plays `![clip][v]` as video when
+`[v]` is defined as an `.mp4`, since its renderer resolves the reference to an `<img src>` first.
+0.9.0's parse context has no definitions, so a plugin can't tell where an `ImageReference` points.
+`src/text/markdown_ext.rs` adds `MarkdownParseContext::definition`, read from the document's
+collected definitions, which `src/text/format/markdown.rs` passes in.
+
 The crate's own tests need `--features test-support` and `include_str!` a `README.md` four levels
 above `src/text`, which this folder lacks: run them from a scratch copy laid out as
 `<dir>/crates/gpui-base` with a `<dir>/README.md`, with `[patch.crates-io]` pointing `gpui-pre` and

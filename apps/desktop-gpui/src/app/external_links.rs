@@ -20,6 +20,7 @@ use gpui_kit::{
 };
 
 use super::Workspace;
+use super::side_chat::{ChatPane, PaneOwner};
 use crate::external_links::{self as logic, HoverBatch, HoverChange, LinkMark, Preview};
 use crate::pull_request_detail::Reference;
 use crate::theme::Tokens;
@@ -145,7 +146,7 @@ impl MarkdownPlugin for LinkMarks {
 #[derive(Default)]
 pub(super) struct LinkHoverState {
     /// What this event did to every text view's links, resolved once they all reported.
-    batch: Option<HoverBatch<Bounds<Pixels>>>,
+    batch: Option<HoverBatch<(Bounds<Pixels>, ChatPane)>>,
     hover: Option<Hover>,
     next_id: u64,
     /// `pullRequests.preview` answers by environment and pull request.
@@ -156,8 +157,9 @@ struct Hover {
     id: u64,
     url: SharedString,
     bounds: Bounds<Pixels>,
-    /// The thread whose timeline holds the link; the card hides once another opens.
-    thread: Option<String>,
+    /// The pane and thread whose timeline holds the link; the card goes once the pane shows
+    /// another thread or closes.
+    owner: Option<PaneOwner>,
     /// The pull request the link names, in the message's environment; `None` shows the URL tooltip.
     target: Option<(SharedString, Reference)>,
     over_link: bool,
@@ -191,14 +193,15 @@ impl Workspace {
         }
     }
 
-    /// A text view's link hover report, resolved with the rest of this event's.
-    pub(super) fn link_hovered(&mut self, hover: Option<LinkHover>, cx: &mut Context<Self>) {
+    /// A text view's link hover report, resolved with the rest of this event's. `pane` shows the
+    /// view's timeline.
+    pub(super) fn link_hovered(&mut self, hover: Option<LinkHover>, pane: ChatPane, cx: &mut Context<Self>) {
         // Only web links show anything (`faviconHost`); any other link is no link here.
         let hover = hover.filter(|hover| logic::web_link_host(&hover.url).is_some());
         let first = self.link_hover.batch.is_none();
-        let batch = self.link_hover.batch.get_or_insert_with(HoverBatch::default);
+        let batch = self.link_hover.batch.get_or_insert(HoverBatch { entered: None, left: false });
         match hover {
-            Some(hover) => batch.entered = Some((hover.url.to_string(), hover.bounds)),
+            Some(hover) => batch.entered = Some((hover.url.to_string(), (hover.bounds, pane))),
             None => batch.left = true,
         }
         if first {
@@ -213,7 +216,7 @@ impl Workspace {
         let Some(batch) = self.link_hover.batch.take() else { return };
         let current = self.link_hover.hover.as_ref().map(|hover| hover.url.as_ref());
         match logic::hover_change(current, batch) {
-            HoverChange::Stay(bounds) => {
+            HoverChange::Stay((bounds, _)) => {
                 if let Some(hover) = self.link_hover.hover.as_mut() {
                     hover.over_link = true;
                     if !hover.shown {
@@ -221,9 +224,10 @@ impl Workspace {
                     }
                 }
             }
-            HoverChange::Enter(url, bounds) => {
+            HoverChange::Enter(url, (bounds, pane)) => {
                 let shown = self.link_hover.hover.as_ref().is_some_and(|hover| hover.shown);
-                let target = self.link_preview_target(&url);
+                let owner = self.pane_owner(pane);
+                let target = owner.as_ref().and_then(|owner| self.link_preview_target(&owner.env, &url));
                 let id = self.link_hover.next_id;
                 self.link_hover.next_id += 1;
                 let delay = if target.is_some() { CARD_OPEN } else { TOOLTIP_OPEN };
@@ -231,7 +235,7 @@ impl Workspace {
                     id,
                     url: url.into(),
                     bounds,
-                    thread: self.thread.as_ref().map(|thread| thread.id.clone()),
+                    owner,
                     target,
                     over_link: true,
                     over_card: false,
@@ -260,9 +264,9 @@ impl Workspace {
         }
     }
 
-    /// `resolvePullRequestPreviewTarget` in the open thread's environment.
-    fn link_preview_target(&self, url: &str) -> Option<(SharedString, Reference)> {
-        let environment = self.active_environment()?.clone();
+    /// `resolvePullRequestPreviewTarget` in the environment of the thread the link is in.
+    fn link_preview_target(&self, environment: &SharedString, url: &str) -> Option<(SharedString, Reference)> {
+        let environment = environment.clone();
         let loaded = self.env_info(&environment).is_some_and(|info| !info.config.is_null());
         let projects =
             self.shell.projects.iter().filter(|project| project.environment_id == environment).map(|project| {
@@ -286,6 +290,14 @@ impl Workspace {
             self.read_link_preview(environment, reference, cx);
         }
         cx.notify();
+    }
+
+    /// Drops the card or tooltip once the pane and thread holding its link go.
+    pub(super) fn release_left_link_hover(&mut self) {
+        let owner = self.link_hover.hover.as_ref().and_then(|hover| hover.owner.as_ref());
+        if owner.is_none_or(|owner| !self.owner_shown(owner)) {
+            self.link_hover.hover = None;
+        }
     }
 
     /// Hides the card or tooltip: a click on its link opens what it previewed.
@@ -366,7 +378,7 @@ impl Workspace {
     /// The hover card or URL tooltip of the link under the pointer.
     pub(super) fn render_link_hover(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let hover = self.link_hover.hover.as_ref().filter(|hover| hover.shown)?;
-        if hover.thread != self.thread.as_ref().map(|thread| thread.id.clone()) {
+        if !hover.owner.as_ref().is_some_and(|owner| self.owner_shown(owner)) {
             return None;
         }
         let t = *crate::theme::tokens(cx);

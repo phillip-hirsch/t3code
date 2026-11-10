@@ -122,6 +122,8 @@ serde_json = "1"
 [dev-dependencies]
 # Paused time for the backend supervisor's restart backoff tests.
 tokio = { version = "1", features = ["test-util"] }
+# The Markdown parser chat text views run (gpui-kit already builds it), for plugin tests.
+gpui-base = "=0.9.0"
 
 [target.'cfg(windows)'.dependencies]
 # GPUI's Windows platform (gpui-kit already builds it, at this exact version): turns off

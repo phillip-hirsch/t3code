@@ -13,7 +13,7 @@ use gpui::{AnyElement, App, IntoElement, SharedString, Window};
 use markdown::{ParseOptions, mdast};
 
 use super::{InlineElement, InlineRenderContext};
-use crate::text::node::Span;
+use crate::text::node::{LinkMark, Span};
 
 static MARKDOWN_EXTENSIONS_REVISION: AtomicU64 = AtomicU64::new(1);
 
@@ -78,11 +78,18 @@ pub trait MarkdownPlugin: Send + Sync + 'static {
 pub struct MarkdownParseContext<'a> {
     source: &'a str,
     offset: usize,
+    definitions: &'a HashMap<SharedString, LinkMark>,
 }
 
 impl<'a> MarkdownParseContext<'a> {
-    pub(crate) fn new(source: &'a str, offset: usize) -> Self {
-        Self { source, offset }
+    pub(crate) fn new(source: &'a str, offset: usize, definitions: &'a HashMap<SharedString, LinkMark>) -> Self {
+        Self { source, offset, definitions }
+    }
+
+    /// The URL a reference's normalized `identifier` is defined as, as an
+    /// `ImageReference` or `LinkReference` resolves it.
+    pub fn definition(&self, identifier: &str) -> Option<&'a str> {
+        self.definitions.get(identifier).map(|definition| definition.url.as_ref())
     }
 
     /// Source text for the Markdown fragment currently being parsed.

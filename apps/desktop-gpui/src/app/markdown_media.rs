@@ -338,14 +338,19 @@ impl MarkdownPlugin for MarkdownMedia {
     fn parse(
         &self,
         node: &gpui_kit::component::text::markdown_ast::Node,
-        _: &MarkdownParseContext<'_>,
+        cx: &MarkdownParseContext<'_>,
     ) -> Option<MarkdownNode> {
-        let gpui_kit::component::text::markdown_ast::Node::Image(image) = node else { return None };
-        let kind = media_kind(&image.url)?;
-        let alt = image.alt.clone();
+        use gpui_kit::component::text::markdown_ast::Node;
+        let (url, alt) = match node {
+            Node::Image(image) => (image.url.as_str(), image.alt.clone()),
+            // `![clip][v]` plays its definition's destination, as the web's resolved `<img>` does.
+            Node::ImageReference(image) => (cx.definition(&image.identifier)?, image.alt.clone()),
+            _ => return None,
+        };
+        let kind = media_kind(url)?;
         // `markdownImageCopy`.
-        let copy = format!("![{}]({})", alt.replace('\\', "\\\\").replace('[', "\\[").replace(']', "\\]"), image.url);
-        let media = MediaNode { kind, destination: image.url.clone(), alt: alt.clone() };
+        let copy = format!("![{}]({url})", alt.replace('\\', "\\\\").replace('[', "\\[").replace(']', "\\]"));
+        let media = MediaNode { kind, destination: url.to_owned(), alt: alt.clone() };
         Some(MarkdownNode::new("t3-media", media).text(alt).markdown(copy))
     }
 
@@ -411,15 +416,22 @@ fn media_name(destination: &str, path: Option<&str>, alt: &str, kind: MediaKind)
     }
 }
 
-impl Workspace {
-    fn media_playable(&self, destination: &str, thread_id: &str) -> Option<Playable> {
-        match classify(destination, self.git_cwd().as_deref()) {
-            Source::Direct(url) => Some(Playable::Url(url)),
-            Source::WorkspaceFile(path) => Some(Playable::File { thread_id: thread_id.to_owned(), path }),
-            _ => None,
-        }
+/// What a media destination plays (`classifyMarkdownImageSource`): a web or data URL as it is, a
+/// host file through a signed URL, nothing for the rest.
+fn media_playable(destination: &str, cwd: Option<&str>, thread_id: &str) -> Option<Playable> {
+    let source = destination.trim();
+    // `classify` decodes data URLs as images; a media one plays from the URL itself.
+    if source.get(..5).is_some_and(|scheme| scheme.eq_ignore_ascii_case("data:")) {
+        return Some(Playable::Url(source.to_owned()));
     }
+    match classify(destination, cwd) {
+        Source::Direct(url) => Some(Playable::Url(url)),
+        Source::WorkspaceFile(path) => Some(Playable::File { thread_id: thread_id.to_owned(), path }),
+        _ => None,
+    }
+}
 
+impl Workspace {
     #[expect(clippy::too_many_arguments, reason = "the plugin's render context, passed through")]
     fn render_chat_media(
         &mut self,
@@ -436,7 +448,7 @@ impl Workspace {
         let Some(owner) = self.pane_owner(super::chat::view_pane(&message).0) else {
             return unavailable(media.kind, &media.alt, &t);
         };
-        let Some(playable) = self.media_playable(&media.destination, &owner.thread) else {
+        let Some(playable) = media_playable(&media.destination, self.git_cwd().as_deref(), &owner.thread) else {
             return unavailable(media.kind, &media.alt, &t);
         };
         let key = (owner.env.clone(), message, at);
@@ -921,6 +933,37 @@ mod tests {
         ] {
             assert_eq!(media_kind(destination), kind, "{destination}");
         }
+    }
+
+    #[test]
+    fn media_image_references_play_their_definitions() {
+        use gpui_base::text::editor_host::{BlockNode, parse_markdown};
+        use gpui_kit::component::text::MarkdownExtensions;
+        let plugin =
+            MarkdownMedia { workspace: WeakEntity::new_invalid(), key: "m".into(), background: Hsla::default() };
+        let extensions = std::sync::Arc::new(MarkdownExtensions::default().plugin(plugin));
+        let source = "![clip][V] ![shot][p]\n\n[v]: https://example.com/clip.mp4\n[p]: shot.png";
+        let blocks = parse_markdown(source, extensions).unwrap();
+        let BlockNode::Paragraph(paragraph) = &blocks[0] else { panic!("a paragraph") };
+        let media: Vec<_> = paragraph
+            .children()
+            .iter()
+            .filter_map(|node| node.as_custom()?.data::<MediaNode>())
+            .map(|media| (media.kind, media.destination.as_str(), media.alt.as_str()))
+            .collect();
+        assert_eq!(media, [(MediaKind::Video, "https://example.com/clip.mp4", "clip")]);
+    }
+
+    #[test]
+    fn media_data_urls_play_as_they_are() {
+        for url in ["data:audio/wav;base64,UklGRg==", "data:video/mp4;base64,AAAA", "https://x.dev/a.mp4"] {
+            assert_eq!(media_playable(url, None, "t"), Some(Playable::Url(url.to_owned())), "{url}");
+        }
+        assert_eq!(
+            media_playable("clip.mp4", Some("/work"), "t"),
+            Some(Playable::File { thread_id: "t".into(), path: "/work/clip.mp4".into() })
+        );
+        assert_eq!(media_playable("javascript:alert(1)", Some("/work"), "t"), None);
     }
 
     #[test]

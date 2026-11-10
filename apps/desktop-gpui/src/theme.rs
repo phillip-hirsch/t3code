@@ -788,6 +788,26 @@ pub fn set_editor_preview(preview: Option<(bool, ThemeColors)>, window: &mut Win
     window.refresh();
 }
 
+/// The palette the tokens are painted from (`resolveActiveThemeColors`): the theme editor's draft,
+/// the theme pick's, or the standard one, with whether it is dark.
+#[derive(Clone, Copy)]
+struct Palette(bool, Option<ThemeColors>);
+
+impl Global for Palette {}
+
+/// The active [`Palette`]'s roles, which rendered pages read as their theme (`htmlRenderTheme`).
+pub fn palette(cx: &App) -> Option<(bool, &ThemeColors)> {
+    let Palette(dark, colors) = cx.try_global::<Palette>()?;
+    Some((*dark, colors.as_ref()?))
+}
+
+/// `getStandardThemeColors`.
+fn standard_colors(dark: bool) -> Option<ThemeColors> {
+    static COLORS: OnceLock<[Option<ThemeColors>; 2]> = OnceLock::new();
+    COLORS.get_or_init(|| [false, true].map(|dark| ThemeColors::from_roles(crate::themes::standard_roles(dark), None)))
+        [usize::from(dark)]
+}
+
 pub fn system_dark(window: &Window) -> bool {
     matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark)
 }
@@ -799,10 +819,13 @@ pub fn sync(window: &mut Window, cx: &mut App) {
     let mut appearance = cx.try_global::<Appearance>().copied().unwrap_or_default();
     appearance.fonts = appearance.fonts.installed_or_default(cx);
     cx.text_system().set_thin_font_smoothing(appearance.thin_smoothing);
-    let base = match cx.try_global::<EditorPreview>().and_then(|preview| preview.0) {
+    let preview = cx.try_global::<EditorPreview>().and_then(|preview| preview.0);
+    let base = match preview {
         Some((dark, colors)) => if dark { Tokens::dark() } else { Tokens::light() }.themed(&colors),
         None => Tokens::for_choice(&choice, system_dark(window)),
     };
+    let (dark, colors) = preview.map_or_else(|| choice.resolve(system_dark(window)), |(dark, c)| (dark, Some(c)));
+    cx.set_global(Palette(dark, colors.or_else(|| standard_colors(dark))));
     let tokens =
         Tokens { breakpoint: Breakpoint::of(window.viewport_size().width), ..base.with_appearance(appearance) };
     let (dark, fonts) = (tokens.dark, tokens.fonts);

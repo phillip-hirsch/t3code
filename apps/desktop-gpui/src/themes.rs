@@ -28,10 +28,10 @@ macro_rules! theme_colors {
     };
 }
 
-// The roles this client paints with (`html[data-theme-id]` in `index.css`). `textMuted`,
-// `accentForeground`, `updateSurface` and the terminal scrollbar roles are stored and edited, but
-// nothing on the web paints with them either; the search-match text roles color find results'
-// glyphs, which a native range highlight leaves alone.
+// The roles this client paints with (`html[data-theme-id]` in `index.css`), and `accentForeground`,
+// which only rendered pages read (`htmlRenderTheme`). `textMuted`, `updateSurface` and the terminal
+// scrollbar roles are stored and edited, but nothing on the web paints with them either; the
+// search-match text roles color find results' glyphs, which a native range highlight leaves alone.
 theme_colors! {
     canvas = "canvas",
     chrome = "chrome",
@@ -51,6 +51,7 @@ theme_colors! {
     muted_foreground = "mutedForeground",
     placeholder = "placeholder",
     accent = "accent",
+    accent_foreground = "accentForeground",
     accent_surface = "accentSurface",
     accent_surface_foreground = "accentSurfaceForeground",
     message_surface = "messageSurface",

@@ -424,6 +424,7 @@ impl super::Workspace {
     /// own upkeep.
     pub(super) fn begin_embed_frame(&mut self, window: &mut Window, cx: &mut gpui_kit::Context<Self>) {
         self.release_left_image_viewer();
+        self.release_left_chat_overlays();
         self.sync_side_markdown();
         let over_everything = self.settings.is_some()
             || self.palette.is_some()

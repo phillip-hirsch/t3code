@@ -6,6 +6,7 @@
 //! button need the reader's activation, as the web's frame does.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -16,17 +17,20 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, Context, FocusHandle, Image, InteractiveElement as _, IntoElement as _, KeyDownEvent,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Task, Window, div, px,
+    AnyElement, App, Context, FocusHandle, Image, InteractiveElement as _, IntoElement as _, KeyDownEvent, Keystroke,
+    Modifiers, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Task, Window, div, px,
 };
 use serde_json::{Value, json};
 
 use super::Workspace;
 use super::embed::{EmbedView, FRAME_CSS, FRAME_SCRIPT, Layer};
 use super::image_viewer::{Reference, ViewerImage};
+use super::keymap;
 use super::mermaid::css_color;
 use super::side_chat::{ChatPane, PaneOwner};
+use crate::keybindings::{Rule, Shortcut};
 use crate::theme::Tokens;
+use crate::themes::ThemeColors;
 use crate::timeline::{self, PAGE_MAX_HEIGHT, PAGE_MIN_HEIGHT, PageSize, clamp_page_height};
 
 /// `HTML_RENDER_COLUMN_WIDTH`.
@@ -77,6 +81,181 @@ enum PageMessage {
     Image { src: String, name: String },
     /// The shell's "Open full screen" button.
     Expand,
+    /// `readHtmlRenderKeyDown`: a shortcut the page handed back.
+    Key(PageKeyDown),
+}
+
+/// A key the page reports pressing, which a page script can forge.
+#[derive(Debug, PartialEq)]
+struct PageKeyDown {
+    key: String,
+    code: String,
+    meta: bool,
+    ctrl: bool,
+    shift: bool,
+    alt: bool,
+    repeat: bool,
+}
+
+/// `HTML_RENDER_SHORTCUT_COMMANDS`, beside the thread and model picker jumps: commands that change
+/// what the reader sees, never a thread, since the page can report any key.
+fn page_shortcut_command(command: &str) -> bool {
+    const COMMANDS: [&str; 14] = [
+        "commandPalette.toggle",
+        "filePicker.toggle",
+        "projectSearch.toggle",
+        "chat.find",
+        "sidebar.toggle",
+        "rightPanel.toggle",
+        "rightPanel.toggleMaximized",
+        "threadPanel.toggle",
+        "terminal.toggle",
+        "preview.toggle",
+        "navigation.back",
+        "navigation.forward",
+        "thread.previous",
+        "thread.next",
+    ];
+    COMMANDS.contains(&command)
+        || keymap::jump_index(command, "thread").is_some()
+        || keymap::jump_index(command, "modelPicker").is_some()
+}
+
+/// `EVENT_CODE_SHORTCUT_KEYS`.
+const EVENT_CODE_KEYS: [(&str, &str); 21] = [
+    ("Backquote", "`"),
+    ("Backslash", "\\"),
+    ("BracketLeft", "["),
+    ("BracketRight", "]"),
+    ("Comma", ","),
+    ("Digit0", "0"),
+    ("Digit1", "1"),
+    ("Digit2", "2"),
+    ("Digit3", "3"),
+    ("Digit4", "4"),
+    ("Digit5", "5"),
+    ("Digit6", "6"),
+    ("Digit7", "7"),
+    ("Digit8", "8"),
+    ("Digit9", "9"),
+    ("Equal", "="),
+    ("Minus", "-"),
+    ("Period", "."),
+    ("Quote", "'"),
+    ("Semicolon", ";"),
+    ("Slash", "/"),
+];
+
+/// `normalizeEventKey`.
+fn normalize_key(key: &str) -> String {
+    let key = key.to_lowercase();
+    if key == "esc" { "escape".to_owned() } else { key }
+}
+
+/// `resolveEventKeys`: the typed key, a letter's physical key, and `shortcutKeyFromEvent`.
+fn event_keys(key: &str, code: &str) -> Vec<String> {
+    let typed = normalize_key(key);
+    let letter = typed.len() == 1 && typed.as_bytes()[0].is_ascii_lowercase();
+    let mut keys = vec![typed.clone()];
+    if let Some(physical) = code.strip_prefix("Key").filter(|c| c.len() == 1 && c.as_bytes()[0].is_ascii_uppercase())
+        && !letter
+    {
+        keys.push(physical.to_ascii_lowercase());
+    }
+    let mapped = EVENT_CODE_KEYS.iter().find(|(name, _)| *name == code).map(|(_, key)| (*key).to_owned());
+    keys.push(if letter { typed } else { mapped.unwrap_or(typed) });
+    keys
+}
+
+/// `HtmlRenderShortcut`: a shortcut with `mod` resolved for this platform.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PageShortcut {
+    key: String,
+    meta_key: bool,
+    ctrl_key: bool,
+    shift_key: bool,
+    alt_key: bool,
+}
+
+impl PageShortcut {
+    fn of(shortcut: &Shortcut, mac: bool) -> Self {
+        Self {
+            key: shortcut.key.clone(),
+            meta_key: shortcut.meta_key || (shortcut.mod_key && mac),
+            ctrl_key: shortcut.ctrl_key || (shortcut.mod_key && !mac),
+            shift_key: shortcut.shift_key,
+            alt_key: shortcut.alt_key,
+        }
+    }
+
+    /// `matchesKeybindingShortcut` with `mod` already resolved.
+    fn matches(&self, key: &PageKeyDown, keys: &[String]) -> bool {
+        (self.meta_key, self.ctrl_key, self.shift_key, self.alt_key) == (key.meta, key.ctrl, key.shift, key.alt)
+            && keys.contains(&self.key)
+    }
+}
+
+/// What a page hands back (`htmlRenderShortcutsMessage`): the Cmd/Ctrl chords of the allowed
+/// commands, and every other binding's chord, which a matching key must not also be.
+#[derive(Debug, Default, PartialEq)]
+struct PageShortcuts {
+    allowed: Vec<PageShortcut>,
+    blocked: Vec<PageShortcut>,
+}
+
+impl PageShortcuts {
+    /// From the primary's rules and the page's environment's (its project scripts).
+    fn of(primary: &[Rule], environment: &[Rule], mac: bool) -> Self {
+        let blocked = primary
+            .iter()
+            .chain(environment)
+            .filter(|rule| !page_shortcut_command(&rule.command))
+            .map(|rule| PageShortcut::of(&rule.shortcut, mac))
+            .collect();
+        let mut allowed: Vec<PageShortcut> = Vec::new();
+        for rule in primary {
+            let s = &rule.shortcut;
+            let shortcut = PageShortcut::of(s, mac);
+            if page_shortcut_command(&rule.command)
+                && (s.meta_key || s.ctrl_key || s.mod_key)
+                && !allowed.contains(&shortcut)
+            {
+                allowed.push(shortcut);
+            }
+        }
+        Self { allowed, blocked }
+    }
+
+    fn script(&self) -> String {
+        let message = json!({
+            "jsonrpc": "2.0",
+            "method": "t3/notifications/shortcuts",
+            "params": {"shortcuts": self.allowed, "blocked": self.blocked},
+        });
+        format!("window.t3Bridge&&t3Bridge('shortcuts',{});", script_json(&message))
+    }
+
+    /// `isShortcut`: the allowed shortcut `key` presses, unless it also presses a blocked one or
+    /// names a key no allowed shortcut does, as a forged key/code pair can.
+    fn admit(&self, key: &PageKeyDown) -> Option<&PageShortcut> {
+        let keys = event_keys(&key.key, &key.code);
+        let mut allowed = self.allowed.iter().filter(|shortcut| shortcut.matches(key, &keys)).peekable();
+        let first = allowed.peek().copied()?;
+        if self.blocked.iter().any(|shortcut| shortcut.matches(key, &keys)) {
+            return None;
+        }
+        let typed = normalize_key(&key.key);
+        let named = key.key.chars().count() == 1 || key.key == "Dead" || allowed.any(|s| s.key == typed);
+        named.then_some(first)
+    }
+}
+
+/// The keystroke an admitted key replays as, keyed by the shortcut it pressed.
+fn page_keystroke(key: &PageKeyDown, shortcut: &PageShortcut) -> Keystroke {
+    let modifiers =
+        Modifiers { control: key.ctrl, alt: key.alt, shift: key.shift, platform: key.meta, function: false };
+    Keystroke { modifiers, key: shortcut.key.clone(), key_char: None }
 }
 
 fn starts_with_ignore_case(text: &str, prefix: &str) -> bool {
@@ -124,12 +303,26 @@ fn page_message(body: &str) -> Option<PageMessage> {
                 name: if name.is_empty() { "Image".to_owned() } else { name },
             })
         }
+        "t3/notifications/keydown" => {
+            let flag = |name: &str| params[name] == true;
+            Some(PageMessage::Key(PageKeyDown {
+                key: params["key"].as_str()?.to_owned(),
+                code: params["code"].as_str()?.to_owned(),
+                meta: flag("metaKey"),
+                ctrl: flag("ctrlKey"),
+                shift: flag("shiftKey"),
+                alt: flag("altKey"),
+                repeat: flag("repeat"),
+            }))
+        }
         _ => None,
     }
 }
 
 /// Forwards the page's bridge (`HtmlRenderDocument`'s message listener): its height always, the
 /// rest with the activation it carries, and answers a link request the way the web does.
+/// `t3Bridge(kind, message)` keeps the app's latest message of a kind (the theme, the shortcuts)
+/// and posts it to the page now and on each load, as the web's frame does on `onLoad`.
 const PAGE_SCRIPT: &str = "(()=>{const f=document.getElementById('f'),x=document.getElementById('x');\
 const post=(m)=>window.ipc.postMessage(JSON.stringify(m));\
 addEventListener('message',(e)=>{if(e.source!==f.contentWindow)return;const d=e.data;\
@@ -140,7 +333,105 @@ f.contentWindow.postMessage({jsonrpc:'2.0',id:d.id,result:{}},'*');\
 try{post({type:'page',active,data:d});}catch(_){}});\
 if(x)x.addEventListener('click',(e)=>{if(e.isTrusted)post({type:'expand'});});\
 window.t3Zoom=(z)=>{document.getElementById('t3-embed').style.zoom=z;};\
-window.t3Scheme=(s)=>{f.style.colorScheme=s;document.querySelector('meta[name=color-scheme]').content=s;};})();";
+window.t3Scheme=(s)=>{f.style.colorScheme=s;document.querySelector('meta[name=color-scheme]').content=s;};\
+const M={},send=(k)=>{const w=f.contentWindow;if(w&&M[k])w.postMessage(M[k],'*');};\
+f.addEventListener('load',()=>Object.keys(M).forEach(send));window.t3Bridge=(k,m)=>{M[k]=m;send(k);};})();";
+
+/// `htmlRenderTheme`: the palette's roles as the page's variables (`--accent` is the brand color,
+/// not the hover surface), and the fixed status and chart colors.
+fn page_theme(dark: bool, c: &ThemeColors, (sans, mono): (String, String)) -> Value {
+    let (fixed, chart) = if dark {
+        (
+            [("--success-foreground", "#34d399"), ("--info-foreground", "#60a5fa")],
+            ["#2dd4bf", "#fbbf24", "#c084fc", "#fb7185", "#a3e635"],
+        )
+    } else {
+        (
+            [("--success-foreground", "#047857"), ("--info-foreground", "#1d4ed8")],
+            ["#0d9488", "#d97706", "#9333ea", "#e11d48", "#65a30d"],
+        )
+    };
+    let roles = [
+        ("--background", c.canvas),
+        ("--foreground", c.text),
+        ("--muted", c.muted),
+        ("--muted-foreground", c.muted_foreground),
+        ("--card", c.surface),
+        ("--card-foreground", c.text),
+        ("--popover", c.surface_overlay),
+        ("--popover-foreground", c.text),
+        ("--secondary", c.secondary),
+        ("--secondary-foreground", c.secondary_foreground),
+        ("--border", c.border),
+        ("--input", c.input),
+        ("--ring", c.focus),
+        ("--primary", c.message_action),
+        ("--primary-foreground", c.message_action_foreground),
+        ("--accent", c.accent),
+        ("--accent-foreground", c.accent_foreground),
+        ("--accent-surface", c.accent_surface),
+        ("--accent-surface-foreground", c.accent_surface_foreground),
+        ("--destructive", c.error),
+        ("--destructive-foreground", c.error_foreground),
+        ("--destructive-surface", c.error_surface),
+        ("--warning", c.warning),
+        ("--warning-foreground", c.warning_foreground),
+        ("--warning-surface", c.warning_surface),
+        ("--code-background", c.code_background),
+        ("--code-foreground", c.code_foreground),
+        ("--chart-1", c.accent),
+    ];
+    let mut variables: serde_json::Map<String, Value> =
+        roles.into_iter().map(|(name, color)| (name.to_owned(), css_color(color).into())).collect();
+    let fixed = [("--success", "#10b981"), ("--info", "#3b82f6")].into_iter().chain(fixed);
+    variables.extend(fixed.map(|(name, color)| (name.to_owned(), color.into())));
+    variables.extend(chart.into_iter().enumerate().map(|(i, color)| (format!("--chart-{}", i + 2), color.into())));
+    variables.insert("--radius".into(), "0.625rem".into());
+    variables.insert("--font-sans".into(), sans.into());
+    variables.insert("--font-mono".into(), mono.into());
+    json!({"appearance": if dark { "dark" } else { "light" }, "variables": variables})
+}
+
+/// `encodeURIComponent`.
+fn encode_uri_component(text: &str) -> String {
+    let mut encoded = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&byte) {
+            encoded.push(char::from(byte));
+        } else {
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+
+/// `value` as a script literal that can't close the `<script>` it sits in.
+fn script_json(value: &Value) -> String {
+    value.to_string().replace('<', "\\u003c")
+}
+
+/// A page's theme as the bridge sends it: `htmlRenderThemeFragment` on the first load, then
+/// `htmlRenderThemeMessage` whenever it changes. Without a palette it is empty, leaving the page
+/// its own default theme.
+#[derive(Debug, Default)]
+struct PageTheme {
+    fragment: String,
+    script: String,
+}
+
+impl PageTheme {
+    fn new(theme: &Value) -> Self {
+        let message = json!({
+            "jsonrpc": "2.0",
+            "method": "ui/notifications/host-context-changed",
+            "params": {"theme": theme["appearance"], "styles": {"variables": theme["variables"]}},
+        });
+        Self {
+            fragment: format!("#t3-theme={}", encode_uri_component(&theme.to_string())),
+            script: format!("window.t3Bridge&&t3Bridge('theme',{});", script_json(&message)),
+        }
+    }
+}
 
 /// Lucide's `Maximize2`.
 const EXPAND_ICON: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" \
@@ -180,9 +471,11 @@ impl ShellLook {
 /// The embed's shell: the page in its sandboxed frame (`sandbox="allow-scripts allow-forms"`, never
 /// `allow-same-origin`, so it stays out of the app's session), and inline, the hover-revealed
 /// "Open full screen" button over its top-right corner. Full screen scrolls when zoomed past 100%.
-fn page_shell(url: &str, title: &str, look: &ShellLook, inline: bool) -> String {
+/// The page loads with the theme's fragment, and `bridge` scripts seed what the shell posts it.
+fn page_shell(url: &str, title: &str, look: &ShellLook, inline: bool, theme: &PageTheme, bridge: &str) -> String {
     let scheme = if look.dark { "dark" } else { "light" };
-    let src = escape_attribute(url.split('#').next().unwrap_or(url));
+    let src = escape_attribute(&format!("{}{}", url.split('#').next().unwrap_or(url), theme.fragment));
+    let bridge = format!("{}{bridge}", theme.script);
     let title = escape_attribute(title);
     let ShellLook { background, glass, border, icon, hover_border, ring, .. } = look;
     let (button, overflow) = if inline {
@@ -206,7 +499,7 @@ fn page_shell(url: &str, title: &str, look: &ShellLook, inline: bool) -> String 
          body:hover #x,#x:focus-visible{{opacity:1}}#x:hover{{border-color:{hover_border}}}\
          #x:focus-visible{{outline:2px solid {ring};outline-offset:1px}}</style></head>\
          <body><div id=\"t3-embed\"><iframe id=\"f\" src=\"{src}\" title=\"{title}\" sandbox=\"allow-scripts allow-forms\" \
-         allow=\"fullscreen\"></iframe>{button}</div><script>{FRAME_SCRIPT}{PAGE_SCRIPT}</script></body></html>"
+         allow=\"fullscreen\"></iframe>{button}</div><script>{FRAME_SCRIPT}{PAGE_SCRIPT}{bridge}</script></body></html>"
     )
 }
 
@@ -226,10 +519,31 @@ struct Page {
     /// The live page's height, once it reports one.
     content_height: Option<f32>,
     dark: bool,
+    /// The theme the page was last sent.
+    theme: Option<Rc<PageTheme>>,
+    /// The shortcuts the page was last sent.
+    shortcuts: Option<ShownShortcuts>,
     /// The frame this page last drew in.
     used: u64,
     _task: Option<Task<()>>,
     _messages: Option<Task<()>>,
+}
+
+/// A page's [`PageShortcuts`] and the keymaps they were resolved from.
+struct ShownShortcuts {
+    keymap: Rc<[Rule]>,
+    environment: Option<Rc<[Rule]>>,
+    list: PageShortcuts,
+}
+
+impl ShownShortcuts {
+    fn from(&self, keymap: &Rc<[Rule]>, environment: Option<&Rc<[Rule]>>) -> bool {
+        Rc::ptr_eq(&self.keymap, keymap)
+            && match (&self.environment, environment) {
+                (Some(shown), Some(now)) => Rc::ptr_eq(shown, now),
+                (shown, now) => shown.is_none() && now.is_none(),
+            }
+    }
 }
 
 struct Dialog {
@@ -239,6 +553,7 @@ struct Dialog {
     embed: Option<EmbedView>,
     zoom: f32,
     dark: bool,
+    theme: Option<Rc<PageTheme>>,
     focus: FocusHandle,
     close_focus: FocusHandle,
     restore: Option<FocusHandle>,
@@ -246,10 +561,15 @@ struct Dialog {
     _messages: Option<Task<()>>,
 }
 
+/// What a page's theme is built from: the palette, whether it is dark, and the fonts.
+type ThemeStamp = (bool, ThemeColors, &'static str, &'static str);
+
 #[derive(Default)]
 pub(super) struct HtmlPages {
     pages: HashMap<PageKey, Page>,
     dialog: Option<Dialog>,
+    /// The theme pages show now, rebuilt only when what it is built from changes.
+    theme: Option<(ThemeStamp, Rc<PageTheme>)>,
 }
 
 /// Where a shell's report came from.
@@ -294,6 +614,52 @@ fn page_row(row: &timeline::Row, attachment_id: &SharedString) -> bool {
 }
 
 impl Workspace {
+    /// `useHtmlRenderTheme`: the active palette and fonts as the page theme.
+    fn page_theme_now(&mut self, cx: &App) -> Rc<PageTheme> {
+        let tokens = crate::theme::tokens(cx);
+        let Some((dark, colors)) = crate::theme::palette(cx) else { return Rc::default() };
+        let stamp = (dark, *colors, tokens.fonts.sans, tokens.fonts.mono);
+        match &self.html_pages.theme {
+            Some((current, theme)) if *current == stamp => theme.clone(),
+            _ => {
+                let theme = Rc::new(PageTheme::new(&page_theme(dark, colors, super::mcp_app::font_stacks(tokens))));
+                self.html_pages.theme = Some((stamp, theme.clone()));
+                theme
+            }
+        }
+    }
+
+    /// The shortcuts an inline page hands back, from the primary's keymap and the page's environment's.
+    fn page_shortcuts_now(&self, key: &PageKey) -> ShownShortcuts {
+        let environment = self.env_info(&key.owner.env).map(|info| info.keybindings.clone());
+        let list = PageShortcuts::of(&self.keymap, environment.as_deref().unwrap_or_default(), keymap::MAC);
+        ShownShortcuts { keymap: self.keymap.clone(), environment, list }
+    }
+
+    /// A shortcut a focused inline page handed back (`HtmlRenderDocument` replays it on the frame).
+    /// The page can post any key, so it runs only as an allowed chord no other binding claims, and
+    /// resolves as a key pressed with nothing in the app focused.
+    fn html_page_key(&mut self, page: &PageKey, key: &PageKeyDown, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(shown) = self.html_pages.pages.get(page).and_then(|page| page.shortcuts.as_ref()) else { return };
+        let Some(shortcut) = shown.list.admit(key) else { return };
+        let keystroke = page_keystroke(key, shortcut);
+        let context = keymap::ShortcutContext {
+            composer_focus: false,
+            composer_requires_modifier: false,
+            ..self.shortcut_context(&[], window, cx)
+        };
+        let keymap = self.keymap.clone();
+        let Some(command) = keymap::resolve(&keymap, &keystroke, &context) else { return };
+        let focused = window.focused(cx);
+        if self.run_command(command, key.repeat, &context, window, cx)
+            && window.focused(cx) != focused
+            && let Some(embed) = self.html_pages.pages.get(page).and_then(|page| page.embed.as_ref())
+        {
+            // The command moved focus (the palette, find), which the native page still holds.
+            let _ = embed.raw(cx).focus_parent();
+        }
+    }
+
     fn page_key(&self, pane: ChatPane, embed: &timeline::Embed) -> Option<PageKey> {
         Some(PageKey { owner: self.pane_owner(pane)?, attachment: embed.attachment_id.clone() })
     }
@@ -349,6 +715,8 @@ impl Workspace {
             failed: false,
             content_height: None,
             dark: look.dark,
+            theme: None,
+            shortcuts: None,
             used: self.embeds.frame(),
             _task: None,
             _messages: None,
@@ -365,9 +733,13 @@ impl Workspace {
             let minted = mint_page_url(client, base, attachment, file_name).await;
             let _ = this.update_in(cx, |this, window, cx| match minted {
                 Some((url, expires)) => {
+                    let theme = this.page_theme_now(cx);
+                    let shortcuts = this.page_shortcuts_now(&request);
                     let Some(page) = this.html_pages.pages.get_mut(&request) else { return };
                     page.url = Some((url.clone(), expires));
-                    let shell = page_shell(&url, &title, &look, true);
+                    page.theme = Some(theme.clone());
+                    let shell = page_shell(&url, &title, &look, true, &theme, &shortcuts.list.script());
+                    page.shortcuts = Some(shortcuts);
                     this.build_page_view(Origin::Inline(request), shell, look.dark, window, cx);
                 }
                 None => this.html_page_failed(&request, cx),
@@ -533,6 +905,12 @@ impl Workspace {
                     self.open_html_dialog(key, window, cx);
                 }
             }
+            // Full screen keeps its keys: the dialog draws over what the commands would open.
+            PageMessage::Key(key) => {
+                if let Origin::Inline(page) = origin {
+                    self.html_page_key(&page, &key, window, cx);
+                }
+            }
         }
     }
 
@@ -612,6 +990,7 @@ impl Workspace {
             embed: None,
             zoom: 1.,
             dark: look.dark,
+            theme: None,
             focus: cx.focus_handle(),
             close_focus,
             restore,
@@ -626,7 +1005,8 @@ impl Workspace {
             .filter(|(_, expires)| expires - now_ms() > MIN_URL_LIFE_MS);
         let title = embed.title.to_string();
         if let Some((url, _)) = fresh {
-            self.build_page_view(Origin::Dialog(key), page_shell(&url, &title, &look, false), look.dark, window, cx);
+            let shell = self.dialog_shell(&url, &title, &look, cx);
+            self.build_page_view(Origin::Dialog(key), shell, look.dark, window, cx);
             cx.notify();
             return;
         }
@@ -645,7 +1025,7 @@ impl Workspace {
                 }
                 match minted {
                     Some((url, _)) => {
-                        let shell = page_shell(&url, &title, &look, false);
+                        let shell = this.dialog_shell(&url, &title, &look, cx);
                         this.build_page_view(Origin::Dialog(key), shell, look.dark, window, cx);
                     }
                     None => {
@@ -659,6 +1039,15 @@ impl Workspace {
             dialog._task = Some(task);
         }
         cx.notify();
+    }
+
+    /// The full screen shell for `url`, in the theme the dialog now records.
+    fn dialog_shell(&mut self, url: &str, title: &str, look: &ShellLook, cx: &App) -> String {
+        let theme = self.page_theme_now(cx);
+        if let Some(dialog) = self.html_pages.dialog.as_mut() {
+            dialog.theme = Some(theme.clone());
+        }
+        page_shell(url, title, look, false, &theme, "")
     }
 
     fn close_html_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -688,22 +1077,53 @@ impl Workspace {
         for key in left {
             self.html_pages.pages.remove(&key);
         }
+        if self.html_pages.pages.is_empty() && self.html_pages.dialog.is_none() {
+            return;
+        }
         let dark = crate::theme::tokens(cx).dark;
         let scheme = if dark { "window.t3Scheme&&t3Scheme('dark')" } else { "window.t3Scheme&&t3Scheme('light')" };
         let theme = if dark { wry::Theme::Dark } else { wry::Theme::Light };
+        let page_theme = self.page_theme_now(cx);
         let pages = &mut self.html_pages;
-        let views = pages
-            .pages
-            .values_mut()
-            .map(|page| (&mut page.dark, page.embed.as_ref()))
-            .chain(pages.dialog.as_mut().map(|dialog| (&mut dialog.dark, dialog.embed.as_ref())));
-        for (shown_dark, embed) in views {
-            if let Some(embed) = embed.filter(|_| *shown_dark != dark) {
+        let views =
+            pages.pages.values_mut().map(|page| (&mut page.dark, &mut page.theme, page.embed.as_ref())).chain(
+                pages.dialog.as_mut().map(|dialog| (&mut dialog.dark, &mut dialog.theme, dialog.embed.as_ref())),
+            );
+        for (shown_dark, shown_theme, embed) in views {
+            let Some(embed) = embed else { continue };
+            if *shown_dark != dark {
                 *shown_dark = dark;
                 let _ = embed.webview(cx).set_theme(theme);
                 let _ = embed.raw(cx).evaluate_script(scheme);
             }
+            // `htmlRenderThemeMessage` on a theme change, as the web's frame posts it.
+            if shown_theme.as_ref().is_none_or(|shown| !Rc::ptr_eq(shown, &page_theme)) {
+                *shown_theme = Some(page_theme.clone());
+                let _ = embed.raw(cx).evaluate_script(&page_theme.script);
+            }
         }
+        let keymap = &self.keymap;
+        let stale: Vec<PageKey> = self
+            .html_pages
+            .pages
+            .iter()
+            .filter(|(key, page)| {
+                let environment = self.env_info(&key.owner.env).map(|info| &info.keybindings);
+                page.embed.is_some() && page.shortcuts.as_ref().is_none_or(|shown| !shown.from(keymap, environment))
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in stale {
+            let next = self.page_shortcuts_now(&key);
+            let Some(page) = self.html_pages.pages.get_mut(&key) else { continue };
+            if let Some(embed) = &page.embed
+                && page.shortcuts.as_ref().is_none_or(|shown| shown.list != next.list)
+            {
+                let _ = embed.raw(cx).evaluate_script(&next.list.script());
+            }
+            page.shortcuts = Some(next);
+        }
+        let pages = &mut self.html_pages;
         if pages.pages.len() > KEPT_PAGES {
             let last = self.embeds.frame();
             let mut used: Vec<u64> = pages.pages.values().map(|page| page.used).collect();
@@ -859,6 +1279,70 @@ impl Workspace {
 mod tests {
     use super::*;
 
+    fn press(key: &str, code: &str, ctrl: bool, shift: bool) -> PageKeyDown {
+        PageKeyDown { key: key.into(), code: code.into(), meta: false, ctrl, shift, alt: false, repeat: false }
+    }
+
+    fn chord(key: &str, shift: bool) -> PageShortcut {
+        PageShortcut { key: key.into(), meta_key: false, ctrl_key: true, shift_key: shift, alt_key: false }
+    }
+
+    #[test]
+    fn pages_hand_back_only_allowed_chords_no_other_binding_claims() {
+        let rule = |key: &str, command: &str| crate::keybindings::compile(key, command, None).unwrap();
+        let primary = [
+            rule("mod+k", "commandPalette.toggle"),
+            rule("mod+f", "chat.find"),
+            rule("mod+shift+k", "commandPalette.toggle"),
+            rule("mod+k", "commandPalette.toggle"),
+            rule("f6", "sidebar.toggle"),
+            rule("mod+2", "thread.jump.2"),
+            rule("mod+n", "chat.new"),
+            rule("mod+j", "terminal.toggle"),
+            rule("mod+j", "composer.focus"),
+        ];
+        let environment = [rule("mod+shift+f", "script.build.run")];
+        let shortcuts = PageShortcuts::of(&primary, &environment, false);
+        assert_eq!(
+            shortcuts.allowed,
+            [chord("k", false), chord("f", false), chord("k", true), chord("2", false), chord("j", false)],
+            "Cmd/Ctrl chords of the allowed commands, once each; F6 alone stays with the page"
+        );
+        assert_eq!(shortcuts.blocked, [chord("n", false), chord("j", false), chord("f", true)]);
+        let mac = PageShortcuts::of(&primary[..1], &[], true);
+        assert_eq!(mac.allowed, [PageShortcut { meta_key: true, ctrl_key: false, ..chord("k", false) }]);
+
+        assert_eq!(shortcuts.admit(&press("k", "KeyK", true, false)), Some(&chord("k", false)));
+        assert_eq!(shortcuts.admit(&press("K", "KeyK", true, true)), Some(&chord("k", true)));
+        assert_eq!(shortcuts.admit(&press("л", "KeyK", true, false)), Some(&chord("k", false)), "by its physical key");
+        assert_eq!(shortcuts.admit(&press("@", "Digit2", true, false)), Some(&chord("2", false)));
+        assert_eq!(shortcuts.admit(&press("Enter", "KeyK", true, false)), None, "a forged named key");
+        assert_eq!(shortcuts.admit(&press("k", "KeyK", false, false)), None, "the modifiers must match");
+        assert_eq!(shortcuts.admit(&press("j", "KeyJ", true, false)), None, "another binding claims it");
+        assert_eq!(shortcuts.admit(&press("n", "KeyN", true, false)), None);
+
+        // An admitted key replays through the keymap as the command it is bound to.
+        let defaults = PageShortcuts::of(crate::keybindings::defaults(), &[], keymap::MAC);
+        let context = keymap::ShortcutContext::default();
+        let replay = |key: PageKeyDown| {
+            let key = PageKeyDown { meta: keymap::MAC && key.ctrl, ctrl: !keymap::MAC && key.ctrl, ..key };
+            let shortcut = defaults.admit(&key).unwrap();
+            keymap::resolve(crate::keybindings::defaults(), &page_keystroke(&key, shortcut), &context)
+        };
+        assert_eq!(replay(press("[", "BracketLeft", true, false)), Some("navigation.back"));
+        assert_eq!(replay(press("B", "KeyB", true, true)), Some("threadPanel.toggle"));
+
+        let script = shortcuts.script();
+        let message = script.strip_prefix("window.t3Bridge&&t3Bridge('shortcuts',").and_then(|s| s.strip_suffix(");"));
+        let message: Value = serde_json::from_str(message.unwrap()).unwrap();
+        assert_eq!(message["method"], "t3/notifications/shortcuts");
+        assert_eq!(
+            message["params"]["shortcuts"][0],
+            json!({"key": "k", "metaKey": false, "ctrlKey": true, "shiftKey": false, "altKey": false})
+        );
+        assert_eq!(message["params"]["blocked"].as_array().map(Vec::len), Some(3));
+    }
+
     #[test]
     fn frames_fit_the_page_like_html_render_frame_height() {
         let plain = PageSize { height: 640., heights: vec![] };
@@ -904,15 +1388,21 @@ mod tests {
             Some(PageMessage::Image { src: "data:image/png;base64,AA".into(), name: "Image".into() })
         );
         assert_eq!(page(true, rpc("t3/notifications/open-image", json!({"src": "file:///etc/passwd"}))), None);
+        let key = rpc("t3/notifications/keydown", json!({"key": "k", "code": "KeyK", "ctrlKey": true, "repeat": true}));
+        assert_eq!(page(false, key.clone()), None, "a page can't press keys without the reader");
+        assert_eq!(
+            page(true, key),
+            Some(PageMessage::Key(PageKeyDown { repeat: true, ..press("k", "KeyK", true, false) }))
+        );
+        assert_eq!(page(true, rpc("t3/notifications/keydown", json!({"key": "k"}))), None, "a key needs its code");
         assert_eq!(page(true, json!({"method": "ui/notifications/size-changed", "params": {"height": 9}})), None);
         assert_eq!(page_message(r#"{"type":"ready"}"#), Some(PageMessage::Ready));
         assert_eq!(page_message(r#"{"type":"expand"}"#), Some(PageMessage::Expand));
         assert_eq!(page_message("nope"), None);
     }
 
-    #[test]
-    fn the_shell_sandboxes_the_page_without_its_fragment() {
-        let look = ShellLook {
+    fn look() -> ShellLook {
+        ShellLook {
             dark: true,
             background: "#000".into(),
             glass: "#111".into(),
@@ -920,12 +1410,52 @@ mod tests {
             icon: "#333".into(),
             hover_border: "#444".into(),
             ring: "#555".into(),
-        };
-        let inline = page_shell("http://h/a?x=1&y=\"2\"#t3-theme=x", "A <b>", &look, true);
-        assert!(inline.contains("src=\"http://h/a?x=1&amp;y=&quot;2&quot;\" title=\"A &lt;b>\""));
+        }
+    }
+
+    #[test]
+    fn the_shell_sandboxes_the_page_with_the_apps_theme_fragment() {
+        let theme = PageTheme { fragment: "#t3-theme=%7B%7D".into(), script: "t3Bridge('theme',{});".into() };
+        let inline = page_shell("http://h/a?x=1&y=\"2\"#t3-theme=x", "A <b>", &look(), true, &theme, "");
+        assert!(inline.contains("src=\"http://h/a?x=1&amp;y=&quot;2&quot;#t3-theme=%7B%7D\" title=\"A &lt;b>\""));
         assert!(inline.contains("sandbox=\"allow-scripts allow-forms\"") && !inline.contains("allow-same-origin"));
         assert!(inline.contains("aria-label=\"Open full screen\"") && inline.contains("content=\"dark\""));
-        let full = page_shell("http://h/a", "A", &look, false);
+        assert!(inline.contains("t3Bridge('theme',{});</script>"));
+        let full = page_shell("http://h/a", "A", &look(), false, &PageTheme::default(), "");
         assert!(!full.contains("id=\"x\"") && full.contains("html,body{overflow:auto}"));
+    }
+
+    #[test]
+    fn pages_take_the_palette_like_html_render_theme() {
+        let colors = ThemeColors::from_roles(crate::themes::standard_roles(true), None).unwrap();
+        let fonts = ("\"Inter\", sans-serif".to_owned(), "monospace".to_owned());
+        let theme = page_theme(true, &colors, fonts);
+        let variables = &theme["variables"];
+        assert_eq!(theme["appearance"], "dark");
+        assert_eq!(variables["--background"], "#000000", "the standard dark canvas");
+        assert_eq!(variables["--primary"], css_color(colors.message_action).as_str());
+        assert_eq!(variables["--accent"], css_color(colors.accent).as_str(), "the brand, not the hover surface");
+        assert_eq!(variables["--chart-1"], variables["--accent"]);
+        assert_eq!(variables["--accent-surface"], css_color(colors.accent_surface).as_str());
+        assert_eq!((&variables["--success"], &variables["--chart-6"]), (&json!("#10b981"), &json!("#a3e635")));
+        assert_eq!(variables["--font-sans"], "\"Inter\", sans-serif");
+        assert_eq!(variables.as_object().map(serde_json::Map::len), Some(40));
+
+        let page = PageTheme::new(&json!({"appearance": "light", "variables": {"--font-sans": "A </script> & b"}}));
+        assert_eq!(
+            page.fragment,
+            "#t3-theme=%7B%22appearance%22%3A%22light%22%2C%22variables%22%3A%7B%22--font-sans%22%3A%22A%20%3C%2Fscript%3E%20%26%20b%22%7D%7D"
+        );
+        let message = page.script.strip_prefix("window.t3Bridge&&t3Bridge('theme',").and_then(|s| s.strip_suffix(");"));
+        let message = message.unwrap();
+        assert!(!message.contains('<'), "the script can't be closed early");
+        assert_eq!(
+            serde_json::from_str::<Value>(message).unwrap(),
+            json!({
+                "jsonrpc": "2.0",
+                "method": "ui/notifications/host-context-changed",
+                "params": {"theme": "light", "styles": {"variables": {"--font-sans": "A </script> & b"}}},
+            })
+        );
     }
 }
