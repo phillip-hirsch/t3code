@@ -222,6 +222,12 @@ impl DrawerLayout {
         self.open = true;
     }
 
+    /// Whether [`Self::set_active`] would change the drawer: it holds `terminal_id`, and another is active.
+    pub fn activates(&self, terminal_id: &str) -> bool {
+        self.active_id != terminal_id
+            && self.groups.iter().any(|group| group.terminal_ids.iter().any(|id| id == terminal_id))
+    }
+
     pub fn set_active(&mut self, terminal_id: &str) {
         let Some(group) = self.groups.iter().find(|group| group.terminal_ids.iter().any(|id| id == terminal_id)) else {
             return;
@@ -439,6 +445,9 @@ mod tests {
         layout.place("term-1", Place::New);
         layout.place("term-2", Place::Split(Split::Horizontal));
         layout.place("term-3", Place::New);
+        assert!(layout.activates("term-1"));
+        assert!(!layout.activates("term-3"), "the active terminal");
+        assert!(!layout.activates("panel-only"), "a terminal the drawer does not hold");
         layout.set_active("term-1");
         layout.close("term-1");
         assert_eq!(layout.active_id, "term-2");

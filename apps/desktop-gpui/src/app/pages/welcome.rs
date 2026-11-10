@@ -1778,7 +1778,14 @@ impl Workspace {
                         el.child(div().truncate().text_sm().font_weight(FontWeight::MEDIUM).child(label.to_owned()))
                     })
                     .child(path)
-                    .tooltip(tooltip(candidate.path.clone())),
+                    .tooltip(tooltip(candidate.path.clone()))
+                    // The web's row is a label: its text toggles the box too.
+                    .when(!importing, |el| {
+                        let key = candidate.key.clone();
+                        el.on_click(cx.listener(move |this, _, _, cx| {
+                            this.welcome_toggle_keys(std::slice::from_ref(&key), !checked, cx);
+                        }))
+                    }),
             )
             .child(import_meta(
                 (!nested).then_some(&candidate.sources),

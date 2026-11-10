@@ -906,8 +906,9 @@ impl Workspace {
             SessionEvent::Exited => {}
             SessionEvent::Activated => {
                 self.activate_panel_terminal(thread_id, terminal_id, cx);
-                // Focusing the active terminal again leaves an older build's drawer unadopted.
-                if self.terminals.drawer_ref(key).is_some_and(|d| d.active_id != terminal_id)
+                // Only a focus that changes the drawer adopts one an older build saved: not the
+                // active terminal again, and not a panel tab's terminal the drawer does not hold.
+                if self.terminals.drawer_ref(key).is_some_and(|d| d.activates(terminal_id))
                     && let Some(drawer) = self.terminals.drawer_mut(key)
                 {
                     drawer.set_active(terminal_id);
