@@ -205,7 +205,7 @@ fn is_js_space(c: char) -> bool {
 /// `CONTEXT_LINK` pattern `(!?)\[([^\]\n]{0,512})\]\((t3-context://v1/[^\s)]{1,200})\)`, left to
 /// right without overlap, each with its chip id when the href parses (`parseComposerContextHref`).
 /// A match whose href does not parse is still consumed, as `matchAll` does.
-fn context_links(text: &str) -> Vec<(Range<usize>, Option<String>)> {
+fn context_links(text: &str) -> Vec<(Range<usize>, Option<Chip>)> {
     let mut links = Vec::new();
     if !text.contains("](t3-context:") {
         return links;
@@ -216,8 +216,8 @@ fn context_links(text: &str) -> Vec<(Range<usize>, Option<String>)> {
         // `!?` takes a `!` right before the `[`; with or without it the rest must match.
         let start = if bracket > at && text[..bracket].ends_with('!') { bracket - 1 } else { bracket };
         match context_link_at(text, bracket) {
-            Some((end, id)) => {
-                links.push((start..end, id));
+            Some((end, chip)) => {
+                links.push((start..end, chip));
                 at = end;
             }
             None => at = bracket + 1,
@@ -226,8 +226,8 @@ fn context_links(text: &str) -> Vec<(Range<usize>, Option<String>)> {
     links
 }
 
-/// The end of a context link whose `[` is at `bracket`, and its chip id if the href parses.
-fn context_link_at(text: &str, bracket: usize) -> Option<(usize, Option<String>)> {
+/// The end of a context link whose `[` is at `bracket`, and its chip if the href parses.
+fn context_link_at(text: &str, bracket: usize) -> Option<(usize, Option<Chip>)> {
     let rest = text[bracket..].strip_prefix('[')?;
     let close = rest.find([']', '\n'])?;
     if !rest[close..].starts_with(']') || rest[..close].encode_utf16().count() > 512 {
@@ -250,18 +250,43 @@ fn context_link_at(text: &str, bracket: usize) -> Option<(usize, Option<String>)
     };
     let id_ok =
         |i: &str| (1..=128).contains(&i.len()) && i.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-    let id = body
-        .split_once('/')
-        .filter(|(kind, id)| kind_ok(kind) && id_ok(id))
-        .map(|(kind, id)| Chip::Context { kind: kind.to_owned(), id: id.to_owned(), label: String::new() }.id());
-    Some((end, id))
+    let chip = body.split_once('/').filter(|(kind, id)| kind_ok(kind) && id_ok(id)).map(|(kind, id)| Chip::Context {
+        kind: kind.to_owned(),
+        id: id.to_owned(),
+        label: context_label(&rest[..close], kind),
+    });
+    Some((end, chip))
+}
+
+/// `sanitizeComposerContextLabel`: brackets, backslashes and line breaks become spaces, runs of
+/// whitespace one space, at most 200 UTF-16 units without splitting a pair, else the kind.
+fn context_label(raw: &str, kind: &str) -> String {
+    let spaced: String =
+        raw.chars().map(|c| if matches!(c, '[' | ']' | '\\' | '\r' | '\n') { ' ' } else { c }).collect();
+    let mut label = String::new();
+    for word in spaced.split(is_js_space).filter(|w| !w.is_empty()) {
+        if !label.is_empty() {
+            label.push(' ');
+        }
+        label.push_str(word);
+    }
+    let mut units = 0;
+    let cut = label
+        .char_indices()
+        .find(|(_, c)| {
+            units += c.len_utf16();
+            units > 200
+        })
+        .map_or(label.len(), |(at, _)| at);
+    label.truncate(cut);
+    if label.is_empty() { kind.to_owned() } else { label }
 }
 
 /// `collectInlineContextIds`: the chip id of each context link anywhere in `text`, once, chip or
 /// not (fenced code included).
 pub fn context_reference_ids(text: &str) -> Vec<String> {
     let mut ids: Vec<String> = Vec::new();
-    for id in context_links(text).into_iter().filter_map(|(_, id)| id) {
+    for id in context_links(text).into_iter().filter_map(|(_, chip)| chip.map(|chip| chip.id())) {
         if !ids.contains(&id) {
             ids.push(id);
         }
@@ -276,7 +301,7 @@ pub fn context_reference_ids(text: &str) -> Vec<String> {
 pub fn context_reference_removals(text: &str, id: &str) -> Vec<Range<usize>> {
     let found: Vec<Range<usize>> = context_links(text)
         .into_iter()
-        .filter(|(_, link)| link.as_deref() == Some(id))
+        .filter(|(_, chip)| chip.as_ref().is_some_and(|chip| chip.id() == id))
         .map(|(range, _)| range)
         .collect();
     let mut result = text.to_owned();
@@ -315,9 +340,7 @@ pub fn chips(text: &str, is_skill: impl Fn(&str) -> bool) -> Vec<(Range<usize>, 
             i += next;
             continue;
         }
-        let parsed = if let Some(found) = parse_context_link(rest) {
-            Some(found)
-        } else if rest.starts_with('[') {
+        let parsed = if rest.starts_with('[') {
             parse_file_link(rest).map(|(len, path)| (len, Chip::File { path }))
         } else if rest.starts_with(is_currency) {
             parse_skill(&rest[next..])
@@ -327,16 +350,23 @@ pub fn chips(text: &str, is_skill: impl Fn(&str) -> bool) -> Vec<(Range<usize>, 
             None
         };
         match parsed {
-            Some((len, chip))
-                if text[i + len..].starts_with(is_space)
-                    || (matches!(chip, Chip::Context { .. }) && i + len == text.len()) =>
-            {
+            Some((len, chip)) if text[i + len..].starts_with(is_space) => {
                 found.push((i..i + len, chip));
                 i += len;
             }
             _ => i += next,
         }
     }
+    // Context links chip wherever the web's collector finds them, and win over what they
+    // overlap (`collectComposerPromptInlineTokens`).
+    let links: Vec<(Range<usize>, Chip)> =
+        context_links(text).into_iter().filter_map(|(range, chip)| Some((range, chip?))).collect();
+    if links.is_empty() {
+        return found;
+    }
+    found.retain(|(range, _)| !links.iter().any(|(link, _)| range.start < link.end && link.start < range.end));
+    found.extend(links);
+    found.sort_by_key(|(range, _)| range.start);
     found
 }
 
@@ -600,21 +630,6 @@ fn parse_link_label(text: &str) -> Option<(usize, String)> {
             _ => label.push(c),
         }
     }
-}
-
-fn parse_context_link(text: &str) -> Option<(usize, Chip)> {
-    let bang = usize::from(text.starts_with('!'));
-    let (close, label) = parse_link_label(&text[bang..])?;
-    let after = &text[bang + close + 1..];
-    let target = after.strip_prefix('(')?.strip_prefix(CONTEXT_PREFIX)?;
-    let end = target.find(')')?;
-    let (kind, id) = target[..end].split_once('/')?;
-    let valid = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-    if !valid(kind) || !valid(id) {
-        return None;
-    }
-    let len = bang + close + 1 + 1 + CONTEXT_PREFIX.len() + end + 1;
-    Some((len, Chip::Context { kind: kind.to_owned(), id: id.to_owned(), label }))
 }
 
 /// A skill name after the sigil: alphanumerics, `:`, `_`, `-`, with a letter.
@@ -930,6 +945,12 @@ mod tests {
         // The web's pattern: a label ends at the first `]` (no Markdown escapes) and holds no
         // newline, and an href needs a lowercase kind and a valid id.
         assert_eq!(remove(&format!("KEEP ![literal\\]{link}"), image), "KEEP ![literal\\]", "only the link");
+        // Chips use the same pattern, wherever it matches, so a pasted chip spans just the link.
+        let pasted = format!("KEEP ![literal\\]!{link} tail");
+        let found = chips(&pasted, |_| false);
+        assert_eq!(found.len(), 1);
+        assert_eq!(&pasted[found[0].0.clone()], format!("!{link}"), "the chip leaves the literal text");
+        assert_eq!(found[0].1.label(), "I");
         assert!(context_reference_ids("[x](t3-context://v1/Image/img_1)").is_empty(), "kind is lowercase");
         assert_eq!(remove(&format!("x\u{feff} {link}"), image), "x", "JavaScript's trimEnd set");
         assert!(context_reference_removals(&format!("a {link}"), "context:image/other").is_empty());
