@@ -49,6 +49,23 @@ struct ChildApproval {
     error: Option<SharedString>,
 }
 
+/// The children of `parent` (on `env`) waiting on an approval, with their titles and the fetch key
+/// their current version is read under.
+fn approval_children(
+    threads: &[crate::model::ThreadShell],
+    env: &str,
+    parent: &str,
+) -> Vec<(ScopedId, String, String)> {
+    crate::inbox::child_thread_inputs(threads, env, parent)
+        .into_iter()
+        .filter(|child| thread_now::has_pending_approval(child))
+        .map(|child| {
+            let key = format!("{}:{}:{}", child.environment_id, child.id, child.updated_at);
+            (ScopedId::of_thread(child), child.title.clone(), key)
+        })
+        .collect()
+}
+
 impl Workspace {
     /// Reads the pending approvals of each child that asks for one; the shell only says that it does.
     pub(super) fn sync_child_approvals(&mut self, cx: &mut Context<Self>) {
@@ -59,15 +76,7 @@ impl Workspace {
                 return;
             }
         };
-        let children: Vec<(ScopedId, String, String)> =
-            crate::inbox::child_thread_inputs(&self.shell.threads, &env, &parent)
-                .into_iter()
-                .filter(|child| thread_now::has_pending_approval(child))
-                .map(|child| {
-                    let key = format!("{}:{}:{}", child.environment_id, child.id, child.updated_at);
-                    (ScopedId::of_thread(child), child.title.clone(), key)
-                })
-                .collect();
+        let children = approval_children(&self.shell.threads, &env, &parent);
         let before = self.subagents.approvals.len();
         self.subagents.approvals.retain(|entry| children.iter().any(|(thread, ..)| *thread == entry.thread));
         let mut changed = before != self.subagents.approvals.len();
@@ -105,6 +114,11 @@ impl Workspace {
                     };
                     // The user moved to another thread, or to the same id elsewhere, while this read ran.
                     if this.target.as_ref() != Some(&origin) {
+                        return;
+                    }
+                    // The child changed again, or stopped asking, while this read ran.
+                    let Some(Target::Thread { env, id }) = &this.target else { return };
+                    if !approval_children(&this.shell.threads, env, id).iter().any(|(_, _, current)| *current == key) {
                         return;
                     }
                     let requests: Vec<(RuntimeRequest, Option<TurnItem>)> = projection
@@ -638,6 +652,29 @@ mod tests {
 
     fn status(status: &str, completed: Option<&str>) -> (String, Option<String>, Option<String>) {
         (status.into(), Some("2026-01-01T00:00:00Z".into()), completed.map(Into::into))
+    }
+
+    #[test]
+    fn only_the_childs_current_version_is_awaited() {
+        let child = |updated_at: &str| {
+            let mut thread: crate::model::ThreadShell = serde_json::from_value(json!({
+                "id": "c", "projectId": "p", "title": "Child", "status": "idle", "updatedAt": updated_at,
+                "lineage": {"parentThreadId": "parent", "sideChat": true},
+                "pendingRuntimeRequest": {"kind": "command", "createdAt": updated_at},
+            }))
+            .unwrap();
+            thread.environment_id = "a".into();
+            thread
+        };
+        let keys = |threads: &[crate::model::ThreadShell]| -> Vec<String> {
+            approval_children(threads, "a", "parent").into_iter().map(|(_, _, key)| key).collect()
+        };
+        let older = keys(&[child("2026-01-01T00:00:00Z")]);
+        let newer = keys(&[child("2026-01-01T00:00:01Z")]);
+        assert_eq!(newer.len(), 1);
+        assert!(!newer.contains(&older[0]), "an older read no longer matches the child");
+        assert!(keys(&[]).is_empty(), "a removed child takes no result");
+        assert!(approval_children(&[child("2026-01-01T00:00:01Z")], "b", "parent").is_empty());
     }
 
     #[test]
