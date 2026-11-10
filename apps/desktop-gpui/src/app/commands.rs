@@ -18,7 +18,7 @@ impl Workspace {
     /// then the composer's own keys. Returns whether the key was consumed.
     pub(super) fn on_keystroke(&mut self, event: &KeystrokeEvent, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let keystroke = &event.keystroke;
-        if self.snap_shot_record_key(keystroke, cx) {
+        if self.snap_shot_record_key(keystroke, window, cx) {
             return true;
         }
         if keymap::focus_in(&event.context_stack, CAPTURE_CONTEXT) || self.recording_shortcut(cx) {

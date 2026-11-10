@@ -20,6 +20,8 @@ const APP_ICONS: &[(&str, &[u8])] = &[
     ("icons/app/t3-wordmark.svg", include_bytes!("../assets/icons/t3-wordmark.svg")),
     ("icons/app/t3.svg", include_bytes!("../assets/icons/t3.svg")),
     ("icons/app/snap-shot.svg", include_bytes!("../assets/icons/snap-shot.svg")),
+    ("icons/app/mac-screen-recording.svg", include_bytes!("../assets/icons/mac-screen-recording.svg")),
+    ("icons/app/mac-accessibility.svg", include_bytes!("../assets/icons/mac-accessibility.svg")),
     ("icons/app/empty-media-back.svg", include_bytes!("../assets/icons/empty-media-back.svg")),
     ("icons/app/empty-media-back-border.svg", include_bytes!("../assets/icons/empty-media-back-border.svg")),
     ("icons/app/browser.svg", include_bytes!("../assets/icons/browser.svg")),

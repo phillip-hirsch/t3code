@@ -548,6 +548,7 @@ impl Workspace {
             _subscriptions: subscriptions,
         };
         workspace.sync_snap_shot(window, cx);
+        workspace.resume_snap_shot_setup(window, cx);
         workspace.sync_saved_sessions(window, cx);
         workspace
     }

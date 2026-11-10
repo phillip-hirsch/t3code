@@ -1,15 +1,32 @@
-//! The native half of Electron's `DesktopSnapShot` where it captures directly (Windows and
-//! macOS): the global capture shortcut (`globalShortcut` for chords, a key-state poll for
-//! modifier pairs), the foreground window capture (`ActiveWindow.ts`, `RegionSnapShot.ts`,
-//! `MacSnapShot.ts`) and the flash over the captured window (`SnapShotFlash`). Electron has no
-//! capture on X11; its Wayland portal capture is not ported, so Linux reports SnapShots unavailable.
+//! The native half of Electron's `DesktopSnapShot`. Windows and macOS capture directly: the
+//! global capture shortcut (`globalShortcut` for chords, a key-state poll for modifier pairs),
+//! the foreground window capture (`ActiveWindow.ts`, `RegionSnapShot.ts`, `MacSnapShot.ts`) and
+//! the flash over the captured window (`SnapShotFlash`); macOS also reports and requests its
+//! Screen Recording and Accessibility permissions. Linux captures through the XDG portals on
+//! Wayland (`LinuxSnapShot.ts`, `PortalCaptureShortcut.ts`), and not at all on X11, as Electron.
+
+#[cfg(any(windows, target_os = "macos"))]
+use crate::snap_shot::setup::{LinuxBackend, PortalShortcut};
+#[cfg(not(target_os = "macos"))]
+use crate::snap_shot::setup::{MacPermission, MacPermissions};
 
 /// A registered shortcut; dropping it unregisters.
 pub struct Registration {
     #[cfg(any(windows, target_os = "macos"))]
     _stop: hotkeys::Stop,
     #[cfg(not(any(windows, target_os = "macos")))]
-    _stop: imp::Stop,
+    portal: portal::Session,
+}
+
+impl Registration {
+    /// `retry-shortcut`: asks the desktop to show its shortcut settings for this session. `None`
+    /// when there is no session to ask about, so the shortcut registers again instead.
+    pub fn configure(&self) -> Option<Result<(), &'static str>> {
+        #[cfg(any(windows, target_os = "macos"))]
+        return None;
+        #[cfg(not(any(windows, target_os = "macos")))]
+        return self.portal.configure();
+    }
 }
 
 /// The foreground window, captured: a PNG, or a JPEG when the PNG is over the image limit.
@@ -42,15 +59,57 @@ pub struct Grab<'a> {
 }
 
 #[cfg(any(windows, target_os = "macos"))]
+pub use direct::{detect_backend, register_portal};
+#[cfg(any(windows, target_os = "macos"))]
 pub use hotkeys::{check_chord, register};
-#[cfg(not(any(windows, target_os = "macos")))]
-pub use imp::{
-    Flash, available, capture, check_chord, pair_held, play_sound, reduced_motion, register, retire_flash, show_flash,
-};
-#[cfg(any(windows, target_os = "macos"))]
 pub use media::play_sound;
+#[cfg(not(target_os = "macos"))]
+pub use no_mac::{mac_permissions, request_mac_permission, test_capture};
 #[cfg(any(windows, target_os = "macos"))]
-pub use os::{Flash, available, capture, pair_held, reduced_motion, retire_flash, show_flash};
+pub use os::{Flash, capture, pair_held, reduced_motion, retire_flash, session, show_flash};
+#[cfg(target_os = "macos")]
+pub use os::{mac_permissions, request_mac_permission, test_capture};
+#[cfg(not(any(windows, target_os = "macos")))]
+pub use portal::{
+    Flash, capture, check_chord, detect_backend, pair_held, reduced_motion, register, register_portal, retire_flash,
+    session, show_flash,
+};
+
+/// The portal half on platforms that capture directly, which never take it.
+#[cfg(any(windows, target_os = "macos"))]
+mod direct {
+    use super::{LinuxBackend, PortalShortcut, Registration, hotkeys};
+    use crate::keybindings::Shortcut as Chord;
+
+    pub async fn detect_backend() -> Result<LinuxBackend, String> {
+        Err("Portal capture is only used on Linux.".into())
+    }
+
+    pub fn register_portal(
+        _: &Chord,
+        _: async_channel::Sender<()>,
+        updates: async_channel::Sender<PortalShortcut>,
+    ) -> Registration {
+        let _ = updates.try_send(PortalShortcut::failed("Could not connect to your desktop's shortcut service."));
+        Registration { _stop: hotkeys::Stop(Box::new(|| {})) }
+    }
+}
+
+/// Permissions only macOS asks for.
+#[cfg(not(target_os = "macos"))]
+mod no_mac {
+    use super::{MacPermission, MacPermissions};
+
+    pub fn mac_permissions() -> Option<MacPermissions> {
+        None
+    }
+
+    pub fn request_mac_permission(_: MacPermission) {}
+
+    pub fn test_capture() -> Result<(), String> {
+        Err("Test capture requires macOS.".into())
+    }
+}
 
 /// The capture shortcut on platforms that capture directly: `global-hotkey` for chords (Windows'
 /// `RegisterHotKey`, macOS's Carbon hot keys) and a key-state poll for modifier pairs.
@@ -72,7 +131,7 @@ mod hotkeys {
     /// `GlobalShiftShortcutWorker`'s `POLL_INTERVAL_MS`.
     const PAIR_POLL: Duration = Duration::from_millis(50);
 
-    pub struct Stop(Box<dyn FnMut()>);
+    pub struct Stop(pub(super) Box<dyn FnMut()>);
 
     impl Drop for Stop {
         fn drop(&mut self) {
@@ -270,8 +329,7 @@ mod hotkeys {
     }
 }
 
-/// Encoding, sound and app icons for direct capture.
-#[cfg(any(windows, target_os = "macos"))]
+/// Encoding, sound and app icons.
 mod media {
     use std::io::Cursor;
     use std::thread;
@@ -328,6 +386,7 @@ mod media {
     }
 
     /// `app.getFileIcon(path, { size: "normal" })` scaled to 64px, as PNG.
+    #[cfg(any(windows, target_os = "macos"))]
     pub fn file_icon(path: &str) -> Option<Vec<u8>> {
         let icon = file_icon_provider::get_file_icon(path, 32).ok()?;
         let image = RgbaImage::from_raw(icon.width, icon.height, icon.pixels)?;
@@ -355,6 +414,7 @@ mod os {
     use winsafe::{self as w, co};
 
     use super::{Capture, Grab, media};
+    use crate::snap_shot::setup::State;
     use crate::snap_shot::{self, Modifier};
 
     /// `FLASH_PEAK_OPACITY`, `FLASH_ANIMATION_DURATION_MS`, `FLASH_STATIC_DURATION_MS`.
@@ -365,8 +425,9 @@ mod os {
     /// `ACCESSIBILITY_TIMEOUT_MS`.
     const ACCESSIBILITY_TIMEOUT: Duration = Duration::from_secs(3);
 
-    pub fn available() -> bool {
-        true
+    /// Windows captures directly and needs no setup.
+    pub fn session() -> State {
+        State { windows: true, ..State::default() }
     }
 
     /// `WINDOWS_MODIFIER_PAIR_VIRTUAL_KEYS`: the left and the right key are both down.
@@ -737,6 +798,7 @@ mod os {
     use objc2_core_graphics::{CGEventSource, CGEventSourceStateID};
 
     use super::{Capture, Grab, mac_window, media};
+    use crate::snap_shot::setup::{MacPermission, MacPermissions, State};
     use crate::snap_shot::{self, Modifier};
 
     /// `FLASH_PEAK_OPACITY`, `FLASH_ANIMATION_DURATION_MS`, `FLASH_STATIC_DURATION_MS`.
@@ -789,8 +851,54 @@ function run() {
   });
 }"#;
 
-    pub fn available() -> bool {
-        true
+    /// `MAC_PERMISSION_SETTINGS_URLS`.
+    const SCREEN_RECORDING_SETTINGS: &str =
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture";
+    const ACCESSIBILITY_SETTINGS: &str =
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
+
+    pub fn session() -> State {
+        State { mac_permissions: mac_permissions(), ..State::default() }
+    }
+
+    /// `currentMacPermissions`.
+    pub fn mac_permissions() -> Option<MacPermissions> {
+        Some(MacPermissions {
+            screen_recording: objc2_core_graphics::CGPreflightScreenCaptureAccess(),
+            accessibility: macos_accessibility_client::accessibility::application_is_trusted(),
+        })
+    }
+
+    /// `allow-screen-recording` and `allow-accessibility`: macOS asks once; after that the
+    /// permission is granted in System Settings, which opens at its pane. Blocks.
+    pub fn request_mac_permission(permission: MacPermission) {
+        let (granted, pane) = match permission {
+            MacPermission::ScreenRecording => (
+                objc2_core_graphics::CGPreflightScreenCaptureAccess()
+                    || objc2_core_graphics::CGRequestScreenCaptureAccess(),
+                SCREEN_RECORDING_SETTINGS,
+            ),
+            MacPermission::Accessibility => (
+                macos_accessibility_client::accessibility::application_is_trusted_with_prompt(),
+                ACCESSIBILITY_SETTINGS,
+            ),
+        };
+        if !granted && Command::new("/usr/bin/open").arg(pane).stdin(Stdio::null()).status().is_err() {
+            log::warn!("could not open System Settings");
+        }
+    }
+
+    /// `test-mac-capture`: a snapshot of the front window, thrown away, so macOS asks for any
+    /// consent it still needs while setup is open. Blocks.
+    pub fn test_capture() -> Result<(), String> {
+        const SUMMARY: &str = "Could not capture a test snapshot.";
+        match capture(false, |_| {}) {
+            Ok(_) => Ok(()),
+            Err(snap_shot::WINDOW_UNAVAILABLE) => Err(format!("{SUMMARY} No window is available to capture.")),
+            Err(_) => Err(format!(
+                "{SUMMARY} Capturing the window failed. macOS grants Screen Recording and Accessibility to each app separately. In System Settings, open Privacy & Security and check that \"T3 Code\" is allowed for both."
+            )),
+        }
     }
 
     /// `MAC_MODIFIER_PAIR_DEVICE_MASKS`: the left and the right key's device bits are both set.
@@ -963,15 +1071,290 @@ function run() {
     }
 }
 
+/// Linux, as Electron's `LinuxSnapShot` and `PortalCaptureShortcut` for desktops without a capture
+/// helper: on Wayland the Screenshot portal captures the active window where it offers that
+/// target, else the desktop's own screenshot picker lets the user choose; the `GlobalShortcuts`
+/// portal holds the shortcut. Nothing flashes, and window text is not available.
 #[cfg(not(any(windows, target_os = "macos")))]
-mod imp {
-    use gpui_kit::App;
+mod portal {
+    use std::collections::HashMap;
+    use std::fmt::Write as _;
+    use std::io::Read as _;
+    use std::pin::pin;
+    use std::sync::{Arc, Mutex, PoisonError};
 
-    use super::{Capture, Grab};
+    use ashpd::desktop::global_shortcuts::{
+        BindShortcutsOptions, ConfigureShortcutsOptions, GlobalShortcuts, NewShortcut, Shortcut as Bound,
+    };
+    use ashpd::desktop::screenshot::{AvailableTargets, Screenshot, ScreenshotProxy};
+    use ashpd::desktop::{CreateSessionOptions, ResponseError};
+    use futures::{FutureExt as _, StreamExt as _};
+    use gpui_kit::App;
+    use sha2::{Digest as _, Sha256};
+
+    use super::{Capture, Grab, media};
     use crate::keybindings::Shortcut as Chord;
+    use crate::snap_shot::setup::{self, LinuxBackend, Mode, PortalShortcut, State};
     use crate::snap_shot::{self, Modifier, Shortcut};
 
-    pub struct Stop;
+    const PORTAL: &str = "org.freedesktop.portal.Desktop";
+    const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
+    const CHECK_FAILED: &str = "Could not check desktop capture support. Check your desktop session and try again.";
+    const CANCELLED: &str = "Snapshot was cancelled.";
+    const DENIED: &str = "Your desktop did not allow the snapshot.";
+    const INVALID: &str = "Invalid screenshot file.";
+    const SERVICE_FAILED: &str = "Could not connect to your desktop's shortcut service.";
+    /// `MAX_PNG_BYTES`.
+    const MAX_PNG_BYTES: u64 = 32 * 1024 * 1024;
+
+    /// `captureMode` and the desktop's name; the backend comes from [`detect_backend`].
+    pub fn session() -> State {
+        let env = |key: &str| std::env::var(key).ok();
+        let runtime: Vec<String> = env("XDG_RUNTIME_DIR")
+            .and_then(|dir| std::fs::read_dir(dir).ok())
+            .map(|entries| entries.flatten().filter_map(|entry| entry.file_name().into_string().ok()).collect())
+            .unwrap_or_default();
+        let wayland = setup::is_wayland_session(
+            env("XDG_SESSION_TYPE").as_deref(),
+            env("WAYLAND_DISPLAY").as_deref(),
+            runtime.iter().map(String::as_str),
+        );
+        if !wayland {
+            return State { mode: Mode::Unavailable, message: Some(setup::X11_UNAVAILABLE.into()), ..State::default() };
+        }
+        State {
+            mode: Mode::Portal,
+            linux_desktop: env("XDG_CURRENT_DESKTOP").as_deref().and_then(setup::linux_desktop),
+            ..State::default()
+        }
+    }
+
+    /// A session bus connection the portals know as this app (`org.freedesktop.host.portal.Registry`).
+    async fn connect() -> Result<zbus::Connection, String> {
+        let connection = zbus::Connection::session().await.map_err(|_| CHECK_FAILED.to_owned())?;
+        if std::env::var_os("FLATPAK_ID").is_none() && std::env::var_os("SNAP").is_none() {
+            let options: HashMap<&str, zbus::zvariant::Value<'_>> = HashMap::new();
+            // Older portals have no registry and know the app from its desktop file.
+            let _ = connection
+                .call_method(
+                    Some(PORTAL),
+                    PORTAL_PATH,
+                    Some("org.freedesktop.host.portal.Registry"),
+                    "Register",
+                    &(crate::desktop::APP_ID, options),
+                )
+                .await;
+        }
+        Ok(connection)
+    }
+
+    async fn backend_on(connection: &zbus::Connection) -> LinuxBackend {
+        let Ok(proxy) = ScreenshotProxy::with_connection(connection.clone()).await else { return LinuxBackend::Picker };
+        let window = proxy.version() >= 3
+            && proxy.available_targets().await.is_ok_and(|targets| targets.contains(AvailableTargets::ActiveWindow));
+        if window { LinuxBackend::ScreenshotPortal } else { LinuxBackend::Picker }
+    }
+
+    /// `getLinuxCaptureSupport`: the active-window screenshot, else the picker.
+    pub async fn detect_backend() -> Result<LinuxBackend, String> {
+        Ok(backend_on(&connect().await?).await)
+    }
+
+    /// Captures the active window, or the screenshot the user picks. Blocks; run it off the UI thread.
+    pub fn capture(_text: bool, _grabbed: impl FnOnce(Grab)) -> Result<Capture, &'static str> {
+        futures::executor::block_on(async {
+            let connection = connect().await.map_err(|_| snap_shot::CAPTURE_FAILED)?;
+            let backend = backend_on(&connection).await;
+            let request = Screenshot::request().connection(Some(connection)).modal(false);
+            let request = match backend {
+                LinuxBackend::ScreenshotPortal => request.interactive(false).target(AvailableTargets::ActiveWindow),
+                LinuxBackend::Picker => request.interactive(true),
+            };
+            let screenshot = match request.send().await.and_then(|request| request.response()) {
+                Ok(screenshot) => screenshot,
+                Err(ashpd::Error::Response(ResponseError::Cancelled)) => return Err(CANCELLED),
+                Err(ashpd::Error::Response(_)) => return Err(DENIED),
+                Err(_) => return Err(snap_shot::CAPTURE_FAILED),
+            };
+            let png = read_png(screenshot.uri().as_str())?;
+            let image = image::load_from_memory_with_format(&png, image::ImageFormat::Png).map_err(|_| INVALID)?;
+            let (bytes, mime) = media::fit_and_encode(image.to_rgba8())?;
+            // `source.name`: the portal names no window, so the active one is all Electron knows.
+            let name = match backend {
+                LinuxBackend::ScreenshotPortal => "Active window",
+                LinuxBackend::Picker => "",
+            };
+            Ok(Capture {
+                bytes,
+                mime,
+                app_name: snap_shot::bounded(name, 255).unwrap_or_else(|| "Window".into()),
+                window_title: name.into(),
+                icon_png: None,
+                accessible_text: None,
+            })
+        })
+    }
+
+    /// `readPortalPng`: a local PNG within the size limit. The file is the portal's; it stays.
+    fn read_png(uri: &str) -> Result<Vec<u8>, &'static str> {
+        let path = url::Url::parse(uri)
+            .ok()
+            .filter(|url| url.scheme() == "file")
+            .and_then(|url| url.to_file_path().ok())
+            .ok_or(INVALID)?;
+        let file = std::fs::File::open(path).map_err(|_| INVALID)?;
+        let meta = file.metadata().map_err(|_| INVALID)?;
+        if !meta.is_file() || meta.len() > MAX_PNG_BYTES {
+            return Err(INVALID);
+        }
+        let mut png = Vec::new();
+        file.take(MAX_PNG_BYTES).read_to_end(&mut png).map_err(|_| INVALID)?;
+        png.starts_with(b"\x89PNG\r\n\x1a\n").then_some(png).ok_or(INVALID)
+    }
+
+    /// What the UI asks of a running shortcut session.
+    #[derive(Default)]
+    struct Info {
+        session: bool,
+        version: u32,
+        pending: bool,
+    }
+
+    /// A `GlobalShortcuts` session on its own thread; dropping it closes the session.
+    pub struct Session {
+        info: Arc<Mutex<Info>>,
+        configure: async_channel::Sender<()>,
+    }
+
+    impl Session {
+        pub fn configure(&self) -> Option<Result<(), &'static str>> {
+            let info = self.info.lock().unwrap_or_else(PoisonError::into_inner);
+            if !info.session || info.pending {
+                return None;
+            }
+            if info.version < 2 {
+                return Some(Err("Open your desktop's shortcut settings and allow T3 Code's capture shortcut."));
+            }
+            Some(self.configure.try_send(()).map_err(|_| SERVICE_FAILED))
+        }
+    }
+
+    /// `PortalCaptureShortcut`: binds `chord` through the `GlobalShortcuts` portal. Each activation
+    /// sends on `trigger`; what the desktop says about the shortcut goes to `updates`.
+    pub fn register_portal(
+        chord: &Chord,
+        trigger: async_channel::Sender<()>,
+        updates: async_channel::Sender<PortalShortcut>,
+    ) -> super::Registration {
+        let info = Arc::new(Mutex::new(Info { pending: true, ..Info::default() }));
+        let (configure, requests) = async_channel::unbounded();
+        let registration = super::Registration { portal: Session { info: info.clone(), configure } };
+        let preferred = match setup::portal_trigger(chord) {
+            Ok(preferred) => preferred,
+            Err(message) => {
+                info.lock().unwrap_or_else(PoisonError::into_inner).pending = false;
+                let _ = updates.try_send(PortalShortcut::failed(message));
+                return registration;
+            }
+        };
+        let report = updates.clone();
+        let spawned = std::thread::Builder::new().name("snap-shot-portal".into()).spawn(move || {
+            let run = run(&preferred, &trigger, &updates, &requests, &info);
+            if let Err(message) = futures::executor::block_on(run) {
+                info.lock().unwrap_or_else(PoisonError::into_inner).pending = false;
+                let _ = updates.try_send(PortalShortcut::failed(message));
+            }
+        });
+        if spawned.is_err() {
+            let _ = report.try_send(PortalShortcut::failed(SERVICE_FAILED));
+        }
+        registration
+    }
+
+    /// The shortcut's id: stable per trigger, so the desktop remembers its approval.
+    fn shortcut_id(preferred: &str) -> String {
+        let digest = Sha256::digest(preferred.as_bytes());
+        digest.iter().take(8).fold("t3-snap-shot-".to_owned(), |mut id, byte| {
+            let _ = write!(id, "{byte:02x}");
+            id
+        })
+    }
+
+    fn label<'a>(shortcuts: &'a [Bound], id: &str) -> Option<&'a str> {
+        shortcuts.iter().find(|shortcut| shortcut.id() == id).map(Bound::trigger_description)
+    }
+
+    /// Runs the session until the registration is dropped (`Ok`) or the desktop ends it (`Err`).
+    async fn run(
+        preferred: &str,
+        trigger: &async_channel::Sender<()>,
+        updates: &async_channel::Sender<PortalShortcut>,
+        requests: &async_channel::Receiver<()>,
+        info: &Mutex<Info>,
+    ) -> Result<(), String> {
+        let failed = |_| SERVICE_FAILED.to_owned();
+        let portal = GlobalShortcuts::with_connection(connect().await?).await.map_err(failed)?;
+        let version = portal.version();
+        let session = portal
+            .create_session(CreateSessionOptions::default())
+            .await
+            .map_err(|_| "Your desktop could not create a capture shortcut session.".to_owned())?;
+        {
+            let mut info = info.lock().unwrap_or_else(PoisonError::into_inner);
+            info.session = true;
+            info.version = version;
+        }
+        let mut activated = pin!(portal.receive_activated().await.map_err(failed)?.fuse());
+        let mut changed = pin!(portal.receive_shortcuts_changed().await.map_err(failed)?.fuse());
+        let mut closed = pin!(session.receive_closed().await.map_err(failed)?.fuse());
+        let id = shortcut_id(preferred);
+        let shortcut = NewShortcut::new(id.as_str(), "Capture a window").preferred_trigger(preferred);
+        // Every session binds, even when the desktop remembers this shortcut's approval.
+        let shortcuts = [shortcut];
+        let bind = portal.bind_shortcuts(&session, &shortcuts, None, BindShortcutsOptions::default());
+        let bound = futures::select! {
+            bound = pin!(bind.fuse()) => bound,
+            _ = requests.recv().fuse() => {
+                let _ = session.close().await;
+                return Ok(());
+            }
+        };
+        let mut state = match bound.and_then(|request| request.response()) {
+            Ok(bound) => PortalShortcut::bound(label(bound.shortcuts(), &id), version),
+            Err(ashpd::Error::Response(_)) => PortalShortcut::denied(version),
+            Err(_) => return Err(SERVICE_FAILED.into()),
+        };
+        loop {
+            info.lock().unwrap_or_else(PoisonError::into_inner).pending = state.pending;
+            let registered = state.registered;
+            let _ = updates.try_send(state.clone());
+            futures::select! {
+                event = activated.next() => match event {
+                    Some(event) if registered && event.shortcut_id() == id => {
+                        let _ = trigger.try_send(());
+                    }
+                    Some(_) => {}
+                    None => return Err(SERVICE_FAILED.into()),
+                },
+                event = changed.next() => match event {
+                    Some(event) => state = PortalShortcut::bound(label(event.shortcuts(), &id), version),
+                    None => return Err(SERVICE_FAILED.into()),
+                },
+                _ = closed.next() => {
+                    return Err("Your desktop closed the capture shortcut. Retry the shortcut request.".into());
+                }
+                request = requests.recv().fuse() => {
+                    if request.is_err() {
+                        let _ = session.close().await;
+                        return Ok(());
+                    }
+                    if portal.configure_shortcuts(&session, None, ConfigureShortcutsOptions::default()).await.is_err() {
+                        log::warn!("could not open the desktop's shortcut settings");
+                    }
+                }
+            }
+        }
+    }
 
     pub struct Flash;
 
@@ -979,10 +1362,6 @@ mod imp {
         pub fn new(_: &Grab) -> Self {
             Self
         }
-    }
-
-    pub fn available() -> bool {
-        false
     }
 
     pub fn register(_: &Shortcut, _: async_channel::Sender<()>) -> Option<super::Registration> {
@@ -1001,15 +1380,37 @@ mod imp {
         false
     }
 
-    pub fn play_sound(_: &'static [u8]) {}
-
-    pub fn capture(_: bool, _: impl FnOnce(Grab)) -> Result<Capture, &'static str> {
-        Err(snap_shot::CAPTURE_FAILED)
-    }
-
     pub fn retire_flash(_: &mut App) {}
 
     pub fn show_flash(_: Flash, _: bool, _: &mut App) -> gpui_kit::Task<()> {
         gpui_kit::Task::ready(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn shortcut_ids_are_stable_per_trigger() {
+            assert_eq!(shortcut_id("CTRL+SHIFT+2"), shortcut_id("CTRL+SHIFT+2"));
+            assert_ne!(shortcut_id("CTRL+SHIFT+2"), shortcut_id("CTRL+SHIFT+3"));
+            assert_eq!(shortcut_id("CTRL+SHIFT+2").len(), "t3-snap-shot-".len() + 16);
+        }
+
+        #[test]
+        fn screenshots_must_be_local_pngs() {
+            assert_eq!(read_png("https://example.com/shot.png"), Err(INVALID));
+            assert_eq!(read_png("file:///nonexistent/t3-shot.png"), Err(INVALID));
+            let dir = std::env::temp_dir().join(format!("t3-snap-shot-test-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("a temp dir");
+            let file = dir.join("shot.png");
+            std::fs::write(&file, b"not a png").expect("a file");
+            let uri = url::Url::from_file_path(&file).expect("a file url").to_string();
+            assert_eq!(read_png(&uri), Err(INVALID));
+            std::fs::write(&file, b"\x89PNG\r\n\x1a\nrest").expect("a file");
+            assert_eq!(read_png(&uri).map(|png| png.len()), Ok(12));
+            std::fs::remove_file(&file).expect("removed");
+            std::fs::remove_dir(&dir).expect("removed");
+        }
     }
 }

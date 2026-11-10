@@ -138,17 +138,23 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
   "NSString",
   "NSUserDefaults",
 ] }
-# SnapShots' modifier-pair shortcut reads the modifier keys' state.
+# SnapShots' modifier-pair shortcut reads the modifier keys' state, and setup checks and asks
+# for Screen Recording.
 objc2-core-graphics = { version = "0.3", default-features = false, features = [
   "std",
   "CGEventSource",
   "CGEventTypes",
+  "CGWindow",
 ] }
+# SnapShots' setup checks and asks for Accessibility (`AXIsProcessTrusted`), through safe wrappers.
+macos-accessibility-client = "0.0.2"
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 zbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
 # The launcher badge (Unity's LauncherEntry signal); the keyring store already builds it.
 zbus = "5"
+# SnapShots on Wayland: the Screenshot and GlobalShortcuts portals; GPUI already builds it.
+ashpd = { version = "0.13", default-features = false, features = ["async-io", "screenshot", "global_shortcuts"] }
 
 # Vendored crates.io copies with small patches; see vendor/README.md.
 [patch.crates-io]
