@@ -106,6 +106,8 @@ pub(super) struct DraftWorkspaceState {
     /// The picker row Enter picks (`autoHighlight`); `None` until a search or the arrows set one.
     branch_highlight: Option<usize>,
     branch_scroll: ScrollHandle,
+    /// "Start from remote" in the picker's footer, which Tab reaches from the search.
+    origin_focus: Option<gpui_kit::FocusHandle>,
     /// The permissions popover that is open, by element id, and the mode it previews.
     permissions_open: Option<&'static str>,
     permissions_preview: Option<&'static str>,
@@ -277,6 +279,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> bool {
         if !self.draft_workspace.branch_open || keystroke.modifiers.modified() {
+            return false;
+        }
+        // Enter and Space on the focused "Start from remote" are that switch's.
+        let on_origin = self.draft_workspace.origin_focus.as_ref().is_some_and(|f| f.is_focused(window));
+        if on_origin && matches!(keystroke.key.as_str(), "enter" | "space") {
             return false;
         }
         match keystroke.key.as_str() {
@@ -667,6 +674,9 @@ impl Workspace {
         // The checkout's first page until `refresh_refs` brings a fresh one.
         let pages = self.refs().cloned().into_iter().collect();
         let state = &mut self.draft_workspace;
+        if state.origin_focus.is_none() {
+            state.origin_focus = Some(cx.focus_handle().tab_stop(true));
+        }
         state.branch_query.clear();
         state.branch_highlight = None;
         state.branch_open = true;
@@ -1177,6 +1187,10 @@ impl Workspace {
                 el.child(
                     h_flex()
                         .id("start-from-remote")
+                        .when_some(self.draft_workspace.origin_focus.as_ref(), |el, focus| {
+                            let ring = gpui_kit::BoxShadow::new(px(0.), px(0.), t.ring).spread_radius(px(1.)).inset();
+                            el.track_focus(focus).focus_visible(move |s| s.shadow(vec![ring]))
+                        })
                         .px(px(12.))
                         .py(px(8.))
                         .gap(px(6.))

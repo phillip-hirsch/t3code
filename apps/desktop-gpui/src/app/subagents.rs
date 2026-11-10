@@ -129,7 +129,7 @@ impl Workspace {
 
     fn respond_to_child(&mut self, thread: ScopedId, request_id: String, decision: String, cx: &mut Context<Self>) {
         let Some(client) = self.env_client(&thread.env) else { return };
-        if self.subagents.responding.is_some() {
+        if self.subagents.responding.is_some() || !self.can_operate(&thread.env) {
             return;
         }
         self.subagents.responding = Some(request_id.clone());
@@ -201,25 +201,26 @@ impl Workspace {
                 },
             );
         let live = request.is_live();
-        let enabled = live && self.subagents.responding.is_none();
+        let enabled = live && self.subagents.responding.is_none() && self.can_operate(&entry.thread.env);
         let mut actions = h_flex().flex_wrap().items_center().gap(px(8.)).text_xs();
         for (decision, label) in options.iter().filter(|(d, _)| d == "decline" || d == "accept") {
             let (thread, request_id, decision) = (entry.thread.clone(), request.id.clone(), decision.clone());
             let tone = if decision == "accept" { t.foreground } else { t.muted_foreground };
+            // `InlineButton`: a focusable text button, so Tab and Enter reach it too.
             actions = actions.child(
-                div()
-                    .id(ElementId::Name(format!("child-approval-{}-{decision}", request.id).into()))
+                Button::new(ElementId::Name(format!("child-approval-{}-{decision}", request.id).into()))
+                    .ghost()
+                    .xsmall()
+                    .label(label.clone())
+                    .h(px(16.))
+                    .px(px(0.))
+                    .text_xs()
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(tone)
-                    .child(label.clone())
-                    .when(!enabled, |el| el.opacity(0.64))
-                    .when(enabled, |el| {
-                        el.cursor_pointer().hover(|s| s.underline().text_color(t.foreground)).on_click(cx.listener(
-                            move |this, _, _, cx| {
-                                this.respond_to_child(thread.clone(), request_id.clone(), decision.clone(), cx);
-                            },
-                        ))
-                    }),
+                    .disabled(!enabled)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.respond_to_child(thread.clone(), request_id.clone(), decision.clone(), cx);
+                    })),
             );
         }
         let more: Vec<(String, String)> =
