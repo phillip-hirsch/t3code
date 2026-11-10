@@ -747,6 +747,10 @@ focuses the diff. 0.9.0 has no find. The patch:
   and bindings, match highlights in `line_highlights`, the panel in `render_diff`, and
   `reveal_match_horizontally`.
 - `locales/ui.yml`: the English `Diff.Search*` strings.
+- `Cargo.toml`: a `fancy-regex` dependency. Pierre compiles the query as a JavaScript `RegExp`
+  (flags `g`, plus `i` without Match Case), which has lookaround and backreferences; the `regex`
+  crate rejects both. `fancy-regex` hands any pattern without them to `regex`'s own engine.
+  JavaScript's non-Unicode `\w`, `\d` and `\b` are ASCII-only and stay Unicode-aware here.
 - `src/diff/search_tests.rs`.
 
 **A parsed file reports its hunks and each side's lines.** The app checks a tool call's recorded

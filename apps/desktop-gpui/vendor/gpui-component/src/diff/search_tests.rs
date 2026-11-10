@@ -117,6 +117,22 @@ fn matches_follow_the_unified_order_and_the_panel_toggles() {
         ..SearchOptions::default()
     };
     assert_eq!(find("^t.o$", regex).len(), 2);
+    // JavaScript RegExp syntax: lookaround and backreferences.
+    assert_eq!(find("ten(?= )", regex), [(1, modified, 0, 0..3, false)]);
+    assert_eq!(find("(?<=ten )two", regex), [(1, modified, 0, 4..7, false)]);
+    assert_eq!(find("(?<!ten )two", regex).len(), 3);
+    assert_eq!(find("(E)\\1", regex), [(0, modified, 2, 3..5, true)]);
+    assert!(
+        find(
+            "(E)\\1",
+            SearchOptions {
+                case_sensitive: true,
+                ..regex
+            }
+        )
+        .is_empty(),
+        "a backreference follows Match Case"
+    );
     assert!(
         find("(", regex).is_empty(),
         "an invalid pattern finds nothing"
