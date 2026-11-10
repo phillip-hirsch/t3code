@@ -1081,24 +1081,25 @@ impl Workspace {
         );
     }
 
-    /// Sending while an approval waits declines it: with the text as its
-    /// feedback when the provider takes feedback (the text is then used up and
-    /// `true` comes back), else every live approval is declined before the
-    /// message goes out.
-    pub(super) fn approval_declines(&self, text: &str) -> (Vec<Value>, bool) {
-        // Approvals the typing guard holds stay unseen and pending.
-        let live: Vec<_> =
-            self.shown_approvals().into_iter().map(|(request, _)| request).filter(|r| r.is_live()).collect();
+    /// Sending from the pane while an approval waits declines it: with the text
+    /// as its feedback when the provider takes feedback (the text is then used
+    /// up and `true` comes back), else every live approval is declined before
+    /// the message goes out.
+    pub(super) fn approval_declines(&self, pane: ChatPane, text: &str) -> (Vec<Value>, bool) {
+        let Some((_, thread_id)) = self.pane_thread(pane) else { return (Vec::new(), false) };
+        // Approvals the open thread's typing guard holds stay unseen and pending.
+        let shown = match pane {
+            ChatPane::Main => self.shown_approvals(),
+            ChatPane::Side => self.side_chat_projection().map(|p| p.pending_approvals()).unwrap_or_default(),
+        };
+        let live: Vec<_> = shown.into_iter().map(|(request, _)| request).filter(|r| r.is_live()).collect();
+        let decline = |id: &str, response| super::respond_value(&thread_id, id, response);
         match live.first() {
             None => (Vec::new(), false),
             Some(first) if first.supports_feedback() => {
-                let decline = self.respond_command(&first.id, json!({"decision": "decline", "feedback": text}));
-                (decline.into_iter().collect(), true)
+                (vec![decline(&first.id, json!({"decision": "decline", "feedback": text}))], true)
             }
-            Some(_) => (
-                live.iter().filter_map(|r| self.respond_command(&r.id, json!({"decision": "decline"}))).collect(),
-                false,
-            ),
+            Some(_) => (live.iter().map(|r| decline(&r.id, json!({"decision": "decline"}))).collect(), false),
         }
     }
 

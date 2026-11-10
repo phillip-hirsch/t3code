@@ -268,7 +268,7 @@ impl Workspace {
         };
         let message_text = if text.is_empty() { ATTACHMENT_ONLY_PROMPT.to_owned() } else { text.clone() };
         let origin = target.clone();
-        let (declines, text_is_feedback) = self.approval_declines(&text);
+        let (declines, text_is_feedback) = self.approval_declines(super::side_chat::ChatPane::Main, &text);
         // Feedback answers the approval as text alone; nothing else may ride along.
         if text_is_feedback && (!attachments.is_empty() || context.is_some()) {
             self.error = Some("Send approval feedback without attachments or added context.".into());
