@@ -565,7 +565,13 @@ hunk. 0.9.0 keeps only the patch's lines. The patch adds `DiffState::set_content
 expansion count, the count expanding both ends), the first expansion reads the file and
 `DiffFile::with_contents` rebuilds it with every line of both sides, and each gap between hunks
 shows its revealed ends (`GapReveal`) around a separator that hides the rest. A failed read leaves
-the patch as it was. `DiffFile::is_same` also matches a hydrated file to the patch-only file it
+the patch as it was, and so do contents that no longer fit it: `with_contents` refuses a hunk line
+whose text differs from the patch's, or a gap line that differs between the sides, line endings and
+a final newline included as `git diff` compares them, so a file edited since the patch never shows
+its new lines as unchanged. A patch made ignoring whitespace
+(`DiffFileContents::ignore_whitespace`) is checked by `with_contents_ignoring_whitespace`, which
+compares those lines with whitespace (line endings too, as `git diff -w` does) removed. (Pierre's `hydratePartialDiff` does not check; this
+is stricter.) `DiffFile::is_same` also matches a hydrated file to the patch-only file it
 came from, so `update_files` keeps it. Files:
 
 - `src/diff/document.rs`: `with_contents`, `can_load_contents`, `is_hydrated`, `gap_pairs`,
@@ -599,6 +605,17 @@ on Windows set Segoe UI at 9pt in 28px rows. 0.9.0's `PopupMenu` rows are always
 menu is unchanged. Files:
 
 - `src/menu/popup_menu.rs`: the `item_text` field and builder, read in `render_item` and `render`.
+
+**A menu row can hold a second item.** The web's diff Commits menu puts each commit's SHA link,
+its own `DropdownMenuItem`, on the commit's row, so the arrow keys reach it after the commit.
+0.9.0 draws one item per row. The patch adds `PopupMenuItem::inline` for element items: an inline
+item draws at the end of the previous item's row and stays its own stop for the arrow keys, and
+the row highlights as one while either item is hovered or selected. Files:
+
+- `src/menu/popup_menu.rs`: the `inline` field and builder, `render_rows` (which `render` uses in
+  place of one `render_item` per item), `row_of` for scrolling the selection into view, and
+  `render_item`'s `in_row`.
+- `src/menu/menu_item.rs`: `MenuItemElement::in_row`, which leaves the highlight to the row.
 
 **Inputs grow below the web's `sm` breakpoint.** The web's `Input` and `Textarea` are 0.25rem taller
 with 1rem text in a window narrower than 640px (`h-9 sm:h-8`, `text-base sm:text-sm`). 0.9.0 sizes

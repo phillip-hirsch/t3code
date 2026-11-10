@@ -563,8 +563,7 @@ impl Workspace {
                             .children(cells)
                             .children(empty.then(|| div().text_sm().text_color(muted).child("This notebook is empty.")))
                             .children((remaining > 0).then(|| {
-                                div()
-                                    .id("notebook-more")
+                                crate::app::chat::focusable(div().id("notebook-more"), tokens)
                                     .flex_none()
                                     .self_start()
                                     .px(px(10.))

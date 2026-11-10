@@ -502,24 +502,60 @@ impl DiffFile {
     /// being the full files. The hunks keep their changes; the unchanged
     /// lines between and after them come from the contents, and
     /// [`super::DiffState`] shows them on demand. Fails when the contents are
-    /// too short for the hunks or the gaps between hunks differ in length.
+    /// too short for the hunks, the gaps between hunks differ in length or
+    /// text, or a hunk's lines differ from the patch: the file changed since.
     pub fn with_contents(
         &self,
         original: &str,
         modified: &str,
     ) -> Result<Self, DiffContentsMismatch> {
+        self.hydrate_with(original, modified, |a, b| a == b)
+    }
+
+    /// [`Self::with_contents`] for a patch made ignoring whitespace (`git diff
+    /// -w`): its unchanged lines may differ from the contents, and from each
+    /// other, in whitespace only.
+    pub fn with_contents_ignoring_whitespace(
+        &self,
+        original: &str,
+        modified: &str,
+    ) -> Result<Self, DiffContentsMismatch> {
+        let visible = |c: &char| !c.is_whitespace();
+        self.hydrate_with(original, modified, |a, b| {
+            a.chars().filter(visible).eq(b.chars().filter(visible))
+        })
+    }
+
+    fn hydrate_with(
+        &self,
+        original: &str,
+        modified: &str,
+        same: impl Fn(&str, &str) -> bool,
+    ) -> Result<Self, DiffContentsMismatch> {
         if !self.can_load_contents() {
             return Err(DiffContentsMismatch);
         }
-        let sides = [original, modified].map(line_ranges);
+        let contents = [original, modified];
+        let sides = contents.map(line_ranges);
         let count = |side: DiffSide| sides[side as usize].len();
+        // The zero-based `line` on `side` with its ending, which `git diff` compares too.
+        let text = |side: DiffSide, line: usize| {
+            &contents[side as usize][sides[side as usize][line].clone()]
+        };
         let mut pairs = Vec::with_capacity(count(DiffSide::Modified) + self.deletions());
         let mut hunks = Vec::with_capacity(self.inner.hunks.len());
         // The next one-based line on each side not yet paired.
         let mut next = [1, 1];
         let gap = |pairs: &mut Vec<LinePair>, next: [usize; 2], end: [usize; 2]| {
             let len = end[0].checked_sub(next[0]).ok_or(DiffContentsMismatch)?;
-            if end[1].checked_sub(next[1]) != Some(len) {
+            if end[1].checked_sub(next[1]) != Some(len)
+                || (0..len).any(|ix| {
+                    !same(
+                        text(DiffSide::Original, next[0] - 1 + ix),
+                        text(DiffSide::Modified, next[1] - 1 + ix),
+                    )
+                })
+            {
                 return Err(DiffContentsMismatch);
             }
             pairs
@@ -542,6 +578,20 @@ impl DiffFile {
             let start = pairs.len();
             let index =
                 |side: DiffSide, ix: Option<usize>| ix.map(|ix| self.line_number(side, ix) - 1);
+            let differs = |side: DiffSide, ix: Option<usize>| {
+                ix.is_some_and(|ix| {
+                    !same(
+                        &self.source(side)[self.lines(side)[ix].source.clone()],
+                        text(side, self.line_number(side, ix) - 1),
+                    )
+                })
+            };
+            if self.inner.pairs[hunk.pairs()].iter().any(|pair| {
+                differs(DiffSide::Original, pair.original)
+                    || differs(DiffSide::Modified, pair.modified)
+            }) {
+                return Err(DiffContentsMismatch);
+            }
             pairs.extend(self.inner.pairs[hunk.pairs()].iter().map(|pair| {
                 LinePair::new(
                     index(DiffSide::Original, pair.original),
@@ -918,13 +968,17 @@ fn line_ranges(text: &str) -> Vec<Range<usize>> {
         .collect()
 }
 
-/// Builds the display form of one source line from its range in `source`.
-fn source_line(source: &str, range: Range<usize>, line_number: usize) -> SourceLine {
-    let raw = &source[range.clone()];
-    let content = match raw.strip_suffix('\n') {
+/// A line without its `\n` or `\r\n` ending.
+fn line_content(raw: &str) -> &str {
+    match raw.strip_suffix('\n') {
         Some(content) => content.strip_suffix('\r').unwrap_or(content),
         None => raw,
-    };
+    }
+}
+
+/// Builds the display form of one source line from its range in `source`.
+fn source_line(source: &str, range: Range<usize>, line_number: usize) -> SourceLine {
+    let content = line_content(&source[range.clone()]);
     let text = SharedString::from(content.to_owned());
     let (display, display_tabs): (SharedString, Vec<DisplayTab>) = if content.contains('\t') {
         let mut display = String::with_capacity(content.len());

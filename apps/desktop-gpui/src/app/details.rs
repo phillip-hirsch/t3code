@@ -1829,11 +1829,15 @@ impl Workspace {
     }
 
     pub(super) fn target_project(&self) -> Option<&crate::model::ProjectShell> {
-        let project_id = match self.target.as_ref()? {
-            Target::Thread { id, .. } => &self.shell.threads.iter().find(|thread| &thread.id == id)?.project_id,
+        let target = self.target.as_ref()?;
+        let env = target.environment();
+        let project_id = match target {
+            Target::Thread { id, .. } => {
+                &self.shell.threads.iter().find(|thread| &thread.id == id && &thread.environment_id == env)?.project_id
+            }
             Target::Draft { project_id, .. } => project_id,
         };
-        self.shell.projects.iter().find(|project| &project.id == project_id)
+        self.shell.projects.iter().find(|project| &project.id == project_id && &project.environment_id == env)
     }
 }
 

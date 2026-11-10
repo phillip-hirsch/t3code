@@ -133,6 +133,25 @@ impl History {
     pub(super) fn remove(&mut self, id: u64) {
         self.entries.retain(|entry| entry.id != id);
     }
+
+    /// A sent draft's tabs belong to the thread it launched, as the web's draft and thread share a
+    /// ref; a newer close of the same tab replaces an older one, as in `remember`.
+    pub(super) fn retarget(&mut self, from: &StoredTarget, to: &StoredTarget) {
+        for entry in &mut self.entries {
+            if let ClosedView::PanelTab { owner, .. } | ClosedView::Browser { owner, .. } = &mut entry.view
+                && owner == from
+            {
+                *owner = to.clone();
+            }
+        }
+        let mut kept: Vec<Entry> = Vec::with_capacity(self.entries.len());
+        for entry in self.entries.drain(..) {
+            if !kept.iter().any(|newer| newer.view.same_target(&entry.view)) {
+                kept.push(entry);
+            }
+        }
+        self.entries = kept;
+    }
 }
 
 /// The history and the file that keeps it.
@@ -248,6 +267,12 @@ impl Workspace {
         });
     }
 
+    /// `draft` launched `thread`: its closed tabs reopen there.
+    pub(in crate::app) fn retarget_closed_views(&mut self, draft: &Target, thread: &Target) {
+        let (from, to) = (StoredTarget::from(draft), StoredTarget::from(thread));
+        self.right_panel.closed.update(|history| history.retarget(&from, &to));
+    }
+
     /// Forgets a deleted thread's panel layout (`removeThread`).
     pub(in crate::app) fn forget_thread_panel(&mut self, environment_id: &str, thread_id: &str) {
         let target = Target::Thread { env: environment_id.to_owned().into(), id: thread_id.to_owned() };
@@ -284,8 +309,10 @@ impl Workspace {
         let environment = target.environment();
         let owner_exists = match &target {
             Target::Thread { env, id } => self.shell.threads.iter().any(|t| &t.id == id && &t.environment_id == env),
-            Target::Draft { env, project_id, .. } => {
-                self.shell.projects.iter().any(|p| &p.id == project_id && &p.environment_id == env)
+            // `getDraftThreadByRef`: the draft itself, unsent, not its project's next one.
+            Target::Draft { env, project_id, draft } => {
+                self.drafts.is_live(draft)
+                    && self.shell.projects.iter().any(|p| &p.id == project_id && &p.environment_id == env)
             }
         };
         let side_chat_exists = match view {
@@ -479,6 +506,29 @@ mod tests {
         assert_eq!(history.entries().iter().map(|e| e.id).collect::<Vec<_>>(), [older, newer]);
         history.remove(older);
         assert_eq!(history.entries().iter().map(|e| e.id).collect::<Vec<_>>(), [newer]);
+    }
+
+    #[test]
+    fn a_sent_drafts_tabs_move_to_the_thread_it_launched() {
+        let draft =
+            |id: &str| StoredTarget::Draft { environment_id: "b".into(), project_id: "p".into(), draft_id: id.into() };
+        let thread = StoredTarget::Thread { environment_id: "b".into(), thread_id: "t".into() };
+        let on = |owner: &StoredTarget, surface| ClosedView::PanelTab { owner: owner.clone(), surface };
+        let mut history = History::default();
+        history.remember(on(&thread, Surface::Diff));
+        history.remember(on(&draft("other"), Surface::Files));
+        history.remember(on(&draft("sent"), Surface::Diff));
+        history.remember(on(&draft("sent"), Surface::File("x".into())));
+        history.retarget(&draft("sent"), &thread);
+        // The newer close of the same tab wins, as `remember` keeps it.
+        assert_eq!(
+            views(&history),
+            [
+                &on(&thread, Surface::File("x".into())),
+                &on(&thread, Surface::Diff),
+                &on(&draft("other"), Surface::Files)
+            ]
+        );
     }
 
     #[test]

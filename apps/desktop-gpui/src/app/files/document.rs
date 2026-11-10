@@ -412,8 +412,7 @@ impl Workspace {
                     .text_xs()
                     .child(div().text_color(tokens.error).child(message))
                     .child(
-                        div()
-                            .id("document-retry")
+                        crate::app::chat::focusable(div().id("document-retry"), &tokens)
                             .px(px(10.))
                             .py(px(4.))
                             .rounded(px(6.))

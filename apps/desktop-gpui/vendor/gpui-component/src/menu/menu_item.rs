@@ -14,6 +14,7 @@ pub(crate) struct MenuItemElement {
     style: StyleRefinement,
     disabled: bool,
     selected: bool,
+    in_row: bool,
     checked: Option<bool>,
     on_click: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
     on_hover: Option<Box<dyn Fn(&bool, &mut Window, &mut App) + 'static>>,
@@ -30,6 +31,7 @@ impl MenuItemElement {
             style: StyleRefinement::default(),
             disabled: false,
             selected: false,
+            in_row: false,
             checked: None,
             on_click: None,
             on_hover: None,
@@ -40,6 +42,12 @@ impl MenuItemElement {
     /// Set ListItem as the selected item style.
     pub(crate) fn selected(mut self, selected: bool) -> Self {
         self.selected = selected;
+        self
+    }
+
+    /// Leave the highlight to the row this item shares with others.
+    pub(crate) fn in_row(mut self, in_row: bool) -> Self {
+        self.in_row = in_row;
         self
     }
 
@@ -130,11 +138,13 @@ impl RenderOnce for MenuItemElement {
                 // Not `group_hover` on the item's own group: GPUI styles an
                 // element before registering its group, and that fallback keeps
                 // the pointer's item lit after a key moves the highlight away.
-                this.hover(|this| {
-                    this.bg(cx.theme().tokens.accent)
-                        .text_color(cx.theme().accent_foreground)
+                this.when(!self.in_row, |this| {
+                    this.hover(|this| {
+                        this.bg(cx.theme().tokens.accent)
+                            .text_color(cx.theme().accent_foreground)
+                    })
                 })
-                .when(self.selected, |this| {
+                .when(self.selected && !self.in_row, |this| {
                     this.bg(cx.theme().tokens.accent)
                         .text_color(cx.theme().accent_foreground)
                 })

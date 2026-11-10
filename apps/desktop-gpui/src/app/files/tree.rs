@@ -230,7 +230,7 @@ impl Workspace {
                 all_open: false,
                 has_folders: false,
                 scroll: UniformListScrollHandle::new(),
-                focus: cx.focus_handle(),
+                focus: cx.focus_handle().tab_stop(true),
                 focused: None,
                 reveal: Reveal::default(),
                 mutation: None,
@@ -497,8 +497,7 @@ impl Workspace {
         let muted = tokens.muted_foreground;
         let key = root.clone();
         let icon_button = |id: &'static str, icon: IconName, label: SharedString| {
-            div()
-                .id(id)
+            crate::app::chat::focusable(div().id(id), &tokens)
                 .size(px(24.))
                 .flex_none()
                 .flex()
@@ -568,6 +567,13 @@ impl Workspace {
                 .into_any_element()
         } else {
             let selected = selected.map(str::to_owned);
+            // Tabbing in lands on the selected row, or the first, like the web tree's roving stop.
+            if tree.focused.is_none() && tree.focus.is_focused(window) {
+                tree.focused = selected
+                    .clone()
+                    .filter(|path| rows.iter().any(|row| &row.path == path))
+                    .or_else(|| rows.first().map(|row| row.path.clone()));
+            }
             let focused = tree.focused.clone().filter(|_| tree.focus.is_focused(window));
             let list_key = key.clone();
             uniform_list(
@@ -603,8 +609,7 @@ impl Workspace {
             .bg(tokens.background)
             .child(subheader)
             .children(error.map(|error| {
-                div()
-                    .id("files-error")
+                crate::app::chat::focusable(div().id("files-error"), &tokens)
                     .p(px(16.))
                     .text_xs()
                     .line_height(gpui_kit::relative(1.625))

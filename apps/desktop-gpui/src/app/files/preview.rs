@@ -710,6 +710,7 @@ impl Workspace {
             let content_width = if explorer_shown { width - explorer_width } else { width };
             let content = self.render_file_content(&key, &tokens, content_width, window, cx);
             let explorer = explorer_shown.then(|| {
+                let ring = tokens.ring;
                 let tree = self.render_tree(&checkout, Some(&path), reveal, window, cx);
                 div()
                     .id("file-explorer")
@@ -728,13 +729,27 @@ impl Workspace {
                     .child(
                         div()
                             .id("file-explorer-resize")
+                            .tab_index(0)
                             .absolute()
                             .top_0()
                             .bottom_0()
                             .left(px(-3.))
                             .w(px(6.))
                             .cursor_col_resize()
-                            .on_drag(ExplorerResize, |_, _, _, cx| cx.new(|_| Empty)),
+                            .focus_visible(move |s| s.bg(ring))
+                            .on_drag(ExplorerResize, |_, _, _, cx| cx.new(|_| Empty))
+                            .on_key_down(cx.listener(move |this, event: &gpui_kit::KeyDownEvent, _, cx| {
+                                let modifiers = &event.keystroke.modifiers;
+                                if modifiers.alt || modifiers.control || modifiers.platform {
+                                    return;
+                                }
+                                let key = event.keystroke.key.as_str();
+                                if let Some(next) = logic::explorer_key_width(explorer_width, EXPLORER_MIN, max, key) {
+                                    this.files.explorer_width = Some(next);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }
+                            })),
                     )
                     .child(tree)
             });
@@ -828,17 +843,19 @@ impl Workspace {
                         }
                     })
                     .when(!current, |el| {
-                        el.cursor_pointer().hover(|s| s.text_color(tokens.foreground)).on_click(cx.listener(
-                            move |this, _, _, cx| this.navigate_file_folder(source.clone(), &crumb, keep, cx),
-                        ))
+                        crate::app::chat::focusable(el, tokens)
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(tokens.foreground))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.navigate_file_folder(source.clone(), &crumb, keep, cx);
+                            }))
                     })
                     .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
                     .child(label),
             );
         }
         let action = |id: &'static str, icon: IconName, label: SharedString, pressed: bool| {
-            div()
-                .id(id)
+            crate::app::chat::focusable(div().id(id), tokens)
                 .size(px(24.))
                 .flex_none()
                 .flex()
@@ -1157,8 +1174,7 @@ impl Workspace {
     ) -> AnyElement {
         let muted = tokens.muted_foreground;
         let action = |id: &'static str, icon: IconName, label: &'static str| {
-            div()
-                .id(id)
+            crate::app::chat::focusable(div().id(id), tokens)
                 .size(px(24.))
                 .flex_none()
                 .flex()
@@ -1216,8 +1232,7 @@ impl Workspace {
                 .text_xs()
                 .child(div().text_color(tokens.error).child("Unable to load file preview."))
                 .child(
-                    div()
-                        .id("full-file-retry")
+                    crate::app::chat::focusable(div().id("full-file-retry"), tokens)
                         .px(px(10.))
                         .py(px(4.))
                         .rounded(px(6.))
@@ -1283,7 +1298,6 @@ impl Workspace {
                         pressed: bool| {
             let key = key.clone();
             super::chrome::action(id, icon, label, tokens)
-                .tab_index(0)
                 .when(pressed, |el| el.bg(tokens.accent).text_color(tokens.foreground))
                 .when(disabled, |el| el.opacity(0.64).cursor_default())
                 .on_click(cx.listener(move |this, _, _, cx| {

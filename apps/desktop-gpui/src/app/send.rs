@@ -429,11 +429,14 @@ impl Workspace {
                             this.disarm_fresh_session(&origin, fresh_arm);
                         }
                         this.record_prompt_sent(window, cx);
-                        if new_thread_id.is_some() {
+                        if let Some((thread_id, _)) = &new_thread_id {
                             // The launched draft's picks went with it, and its project's next draft is new.
                             this.composer_selections.remove(&origin);
                             if let Some(draft) = origin.draft_id() {
                                 this.drafts.promote(draft);
+                                let thread =
+                                    Target::Thread { env: origin.environment().clone(), id: thread_id.clone() };
+                                this.retarget_closed_views(&origin, &thread);
                             }
                             this.drafts_changed(cx);
                         }

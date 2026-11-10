@@ -334,6 +334,24 @@ struct Commit {
     committed_at: Option<String>,
 }
 
+/// `review.getBranchCommits`' answer.
+#[derive(Clone)]
+struct CommitList {
+    commits: Vec<Commit>,
+    truncated: bool,
+}
+
+/// The checkout and comparison base a commit list answers: (environment, cwd, base ref).
+type CommitsSource = (SharedString, String, Option<String>);
+
+/// The commit list read for `source`; none while only another checkout's (or base's) is loaded.
+fn commits_for<'a>(
+    loaded: Option<&'a (CommitsSource, Result<CommitList, SharedString>)>,
+    source: Option<&CommitsSource>,
+) -> Option<&'a Result<CommitList, SharedString>> {
+    loaded.filter(|(from, _)| Some(from) == source).map(|(_, reply)| reply)
+}
+
 /// How [`Workspace::show_diff_files`] puts files in the patch.
 #[derive(Clone, Copy)]
 enum Install {
@@ -433,9 +451,12 @@ pub(super) struct RightPanel {
     diff_reading: bool,
     /// The git diff showed at the last render, to revalidate it when it shows again.
     git_diff_shown: bool,
-    commits: Vec<Commit>,
+    /// The last commit list read and the checkout it answers (`branchCommitsQuery`).
+    commits: Option<(CommitsSource, Result<CommitList, SharedString>)>,
     /// The tab strip, and the tab it last scrolled into view.
     tabs_scroll: ScrollHandle,
+    /// The diff header's commit SHA link, a Tab stop as the web's `<a>` is.
+    commit_link_focus: FocusHandle,
     /// The diff header's refs area, measured for its narrow form (`@max-[20rem]/diff-refs`).
     diff_refs: ScrollHandle,
     /// A frame was already spent waiting for `diff_refs` to be measured; zero after that is a real width.
@@ -443,7 +464,7 @@ pub(super) struct RightPanel {
     revealed_tab: Option<(Target, Surface, usize)>,
     observation: Option<Observation>,
     /// The pull request each thread showed at the last read (`observedThreadPullRequests`).
-    observed_pull_requests: HashMap<String, Option<crate::pull_request_detail::Reference>>,
+    observed_pull_requests: HashMap<Target, Option<crate::pull_request_detail::Reference>>,
     /// The branch diff's picked comparison target per thread; none is Automatic.
     base_refs: HashMap<Target, String>,
     base_picker: diff_base::BasePicker,
@@ -508,8 +529,9 @@ impl RightPanel {
             diff_read_at: None,
             diff_reading: false,
             git_diff_shown: false,
-            commits: Vec::new(),
+            commits: None,
             tabs_scroll: ScrollHandle::new(),
+            commit_link_focus: cx.focus_handle().tab_stop(true),
             diff_refs: ScrollHandle::new(),
             diff_refs_waited: std::cell::Cell::new(false),
             revealed_tab: None,
@@ -833,6 +855,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> impl FnOnce(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
         let view = cx.entity();
+        // The tabs belong to this thread's panel; after navigating, the menu closes nothing.
+        let owner = self.target.clone();
         let surfaces = self.panel_state().map(|panel| panel.surfaces.clone()).unwrap_or_default();
         let index = surfaces.iter().position(|s| s == surface).unwrap_or(0);
         let surface = surface.clone();
@@ -860,23 +884,33 @@ impl Workspace {
             let right: Vec<Surface> = surfaces.iter().skip(index + 1).cloned().collect();
             let all = surfaces.clone();
             let (close, keep, keep_right) = (surface.clone(), surface.clone(), surface.clone());
-            menu.item(PopupMenuItem::new("Close").on_click(
-                window.listener_for(&view, move |this, _, window, cx| this.close_surface(close.clone(), window, cx)),
-            ))
+            let owned = |owner: &Option<Target>, this: &Workspace| this.target == *owner;
+            let (o1, o2, o3, o4) = (owner.clone(), owner.clone(), owner.clone(), owner.clone());
+            menu.item(PopupMenuItem::new("Close").on_click(window.listener_for(&view, move |this, _, window, cx| {
+                if owned(&o1, this) {
+                    this.close_surface(close.clone(), window, cx);
+                }
+            })))
             .item(PopupMenuItem::new("Close others").disabled(surfaces.len() <= 1).on_click(window.listener_for(
                 &view,
                 move |this, _, window, cx| {
-                    this.close_surfaces(others.clone(), Some(keep.clone()), window, cx);
+                    if owned(&o2, this) {
+                        this.close_surfaces(others.clone(), Some(keep.clone()), window, cx);
+                    }
                 },
             )))
             .item(PopupMenuItem::new("Close to the right").disabled(index + 1 >= surfaces.len()).on_click(
                 window.listener_for(&view, move |this, _, window, cx| {
-                    this.close_surfaces(right.clone(), Some(keep_right.clone()), window, cx);
+                    if owned(&o3, this) {
+                        this.close_surfaces(right.clone(), Some(keep_right.clone()), window, cx);
+                    }
                 }),
             ))
             .item(PopupMenuItem::new("Close all").disabled(surfaces.is_empty()).on_click(
                 window.listener_for(&view, move |this, _, window, cx| {
-                    this.close_surfaces(all.clone(), None, window, cx);
+                    if owned(&o4, this) {
+                        this.close_surfaces(all.clone(), None, window, cx);
+                    }
                 }),
             ))
         }
@@ -1138,13 +1172,11 @@ impl Workspace {
             self.right_panel.observation = None;
             return;
         };
-        let Target::Thread { id: thread_id, .. } = &target else { return };
-        let thread_id = thread_id.clone();
         let revision = self.right_panel.panels.get(&target).map_or(0, |panel| panel.user_revision);
         let projection = self.open_projection();
         let running = projection.and_then(ThreadProjection::interruptible_run).map(|run| run.id.clone());
-        let mut observation = observe(self.right_panel.observation.as_ref(), &thread_id, running.as_deref(), revision);
-        let pull_requests = self.observe_proactive_pull_requests(&thread_id, &mut observation, cx);
+        let mut observation = observe(self.right_panel.observation.as_ref(), &target, running.as_deref(), revision);
+        let pull_requests = self.observe_proactive_pull_requests(&target, &mut observation, cx);
         let projection = self.open_projection();
         let Some(projection) = projection else {
             self.right_panel.observation = Some(observation);
@@ -1185,12 +1217,12 @@ impl Workspace {
     /// open (the list when there are several). `true` while the thread has any.
     fn observe_proactive_pull_requests(
         &mut self,
-        thread_id: &str,
+        target: &Target,
         observation: &mut Observation,
         cx: &mut Context<Self>,
     ) -> bool {
         let linked = self.thread_pull_request_target();
-        let previous = self.right_panel.observed_pull_requests.insert(thread_id.to_owned(), linked.clone()).flatten();
+        let previous = self.right_panel.observed_pull_requests.insert(target.clone(), linked.clone()).flatten();
         let shown = self.active_surface().cloned();
         // `shouldRetargetThreadPullRequestPanel`.
         let follow = match (&previous, &linked, &shown) {
@@ -1206,9 +1238,8 @@ impl Workspace {
             self.proactive_panels_enabled() && key.is_some() && observation.target_key.as_ref() != Some(&key);
         observation.target_key = Some(key.clone());
         let revision = observation.revision;
-        let Some(target) = self.thread_target(thread_id) else { return false };
         // This runs on every thread update; only a tab it opens is saved.
-        let panel = self.right_panel.panels.entry(target).or_default();
+        let panel = self.right_panel.panels.entry(target.clone()).or_default();
         let mut changed = false;
         if let (true, Some(linked)) = (follow, &linked) {
             changed |= panel.open_proactive(Surface::PullRequest(linked.clone()), revision, true);
@@ -1225,6 +1256,13 @@ impl Workspace {
             cx.notify();
         }
         key.is_some()
+    }
+
+    /// `set_diff_scope` while `owner` is still the open thread.
+    fn set_diff_scope_of(&mut self, owner: Option<&Target>, scope: DiffScope, cx: &mut Context<Self>) {
+        if self.target.as_ref() == owner {
+            self.set_diff_scope(scope, cx);
+        }
     }
 
     fn set_diff_scope(&mut self, scope: DiffScope, cx: &mut Context<Self>) {
@@ -1304,14 +1342,18 @@ impl Workspace {
             && matches!(self.right_panel.load, DiffLoad::Ready { .. } | DiffLoad::Empty(_));
         let install = if retain { Install::Update } else { Install::Replace };
         self.right_panel.loaded = Some(key);
-        let (Some(client), Target::Thread { env, id: thread_id }) = (self.client(), target) else { return };
+        // A read still on its way answers the previous key, maybe another checkout's.
+        (self.right_panel._task, self.right_panel.diff_reading) = (None, false);
+        let (Some(client), Target::Thread { env, id: thread_id }) = (self.client(), target) else {
+            return self.reset_unread_diff(retain, cx);
+        };
         if let DiffScope::ToolCall { thread_id, item_id } = &scope {
             let mut input = json!({"threadId": thread_id, "itemId": item_id});
             if let Some(revision) = mutation.0 {
                 input["revision"] = revision.into();
             }
             if let Some(cwd) = cwd {
-                self.read_branch_commits(client.clone(), cwd, remembered_base, cx);
+                self.read_branch_commits(client.clone(), (env, cwd, remembered_base), cx);
             }
             return self.read_tool_call_diff(selection, client, input, ignore_whitespace, install, window, cx);
         }
@@ -1339,7 +1381,7 @@ impl Workspace {
                 }
             }
             scope => {
-                let Some(cwd) = cwd.clone() else { return };
+                let Some(cwd) = cwd.clone() else { return self.reset_unread_diff(retain, cx) };
                 // Stats only; the patches follow one file at a time, as the web reads them.
                 let mut input = json!({"cwd": cwd, "ignoreWhitespace": ignore_whitespace, "metadataOnly": true});
                 if let Some(base) = &base_ref {
@@ -1360,7 +1402,7 @@ impl Workspace {
             DiffScope::Turn(_) | DiffScope::ToolCall { .. } => None,
         };
         if let Some(cwd) = cwd.clone() {
-            self.read_branch_commits(client.clone(), cwd, remembered_base.clone(), cx);
+            self.read_branch_commits(client.clone(), (env.clone(), cwd, remembered_base.clone()), cx);
         }
         let commit_sha = match &scope {
             DiffScope::Commit(sha) => Some(sha.clone()),
@@ -1414,6 +1456,7 @@ impl Workspace {
                         move |this| this.env_client(&env),
                         "review.getDiffFileContents",
                         source,
+                        ignore_whitespace,
                     )
                 });
                 diff.update(cx, |state, cx| state.set_contents_loader(loader, cx));
@@ -1473,18 +1516,26 @@ impl Workspace {
     }
 
     /// `branchCommitsQuery`: the branch's commits for the scope menu.
-    fn read_branch_commits(&mut self, client: RpcClient, cwd: String, base: Option<String>, cx: &mut Context<Self>) {
-        let mut input = json!({"cwd": cwd});
-        if let Some(base) = base {
-            input["baseRef"] = base.into();
+    fn read_branch_commits(&mut self, client: RpcClient, source: CommitsSource, cx: &mut Context<Self>) {
+        let mut input = json!({"cwd": source.1});
+        if let Some(base) = &source.2 {
+            input["baseRef"] = base.clone().into();
         }
         self.right_panel._commits_task = Some(cx.spawn(async move |this, cx| {
-            let Ok(reply) = client.request("review.getBranchCommits", input).await else { return };
+            let reply = client.request("review.getBranchCommits", input).await;
+            let reply = reply.map(|reply| parse_commits(&reply)).map_err(|error| error.to_string().into());
             let _ = this.update(cx, |this, cx| {
-                this.right_panel.commits = parse_commits(&reply);
+                this.right_panel.commits = Some((source, reply));
                 cx.notify();
             });
         }));
+    }
+
+    /// The checkout and base the open thread's Commits menu lists: its environment, git cwd and
+    /// picked base ref.
+    fn branch_commits_source(&self) -> Option<CommitsSource> {
+        let Some(Target::Thread { env, .. }) = &self.target else { return None };
+        Some((env.clone(), self.git_cwd()?, self.diff_base_ref().map(str::to_owned)))
     }
 
     /// The revision of a tool call's item in the thread or side chat on screen
@@ -1728,6 +1779,14 @@ impl Workspace {
         };
         self.right_panel.pending_reveal = None;
         self.reveal_diff_file(&path, cx);
+    }
+
+    /// A selection that cannot be read yet shows nothing of the last one, unless it is that one.
+    fn reset_unread_diff(&mut self, retain: bool, cx: &mut Context<Self>) {
+        if !retain {
+            self.right_panel.load = DiffLoad::Idle;
+            self.clear_diff(cx);
+        }
     }
 
     fn clear_diff(&mut self, cx: &mut Context<Self>) {
@@ -2570,7 +2629,9 @@ impl Workspace {
             }
             scope => scope.clone(),
         };
-        let commits = self.right_panel.commits.clone();
+        let commits_source = self.branch_commits_source();
+        let commits = commits_for(self.right_panel.commits.as_ref(), commits_source.as_ref()).cloned();
+        let listed = commits.as_ref().and_then(|reply| reply.as_ref().ok()).map_or(&[][..], |list| &list.commits[..]);
         let scope_label: SharedString = match &scope {
             DiffScope::Branch => "Changes".into(),
             DiffScope::Unstaged => "Uncommitted".into(),
@@ -2578,7 +2639,7 @@ impl Workspace {
             DiffScope::Turn(run) => {
                 format!("Turn {}", turns.iter().find(|t| &t.run_id == run).map_or(0, |t| t.turn_count)).into()
             }
-            DiffScope::Commit(sha) => commits
+            DiffScope::Commit(sha) => listed
                 .iter()
                 .find(|c| &c.sha == sha)
                 .map_or_else(|| format!("Commit {}", &sha[..sha.len().min(7)]), |c| c.subject.clone())
@@ -2596,10 +2657,13 @@ impl Workspace {
         let header_sha = match &scope {
             DiffScope::Commit(sha) => {
                 let url = identity.as_ref().and_then(|identity| commit_link::commit_url(identity, sha));
-                Some(commit_sha_link("diff-commit-sha", sha, url, &view, None, tokens))
+                let focus = Some(self.right_panel.commit_link_focus.clone());
+                Some(commit_sha_link("diff-commit-sha", sha, url, &view, focus, tokens))
             }
             _ => None,
         };
+        // A menu still open after navigating never picks a turn of this thread on the next.
+        let scope_owner = self.target.clone();
         let scope_menu = Button::new("diff-scope")
             .custom(
                 ButtonCustomVariant::new(cx)
@@ -2619,9 +2683,13 @@ impl Workspace {
             .child(icon("icons/chevron-down.svg").with_size(px(14.)).opacity(0.7))
             .dropdown_menu(move |menu: PopupMenu, window, cx| {
                 let pick = |label: &str, value: DiffScope, checked: bool, window: &mut Window| {
-                    PopupMenuItem::new(label.to_owned()).checked(checked).on_click(
-                        window.listener_for(&view, move |this, _, _, cx| this.set_diff_scope(value.clone(), cx)),
-                    )
+                    let owner = scope_owner.clone();
+                    PopupMenuItem::new(label.to_owned()).checked(checked).on_click(window.listener_for(
+                        &view,
+                        move |this, _, _, cx| {
+                            this.set_diff_scope_of(owner.as_ref(), value.clone(), cx);
+                        },
+                    ))
                 };
                 let latest_checked = matches!(&menu_scope, DiffScope::Turn(run) if Some(run) == menu_latest.as_ref());
                 let mut menu = menu
@@ -2632,6 +2700,7 @@ impl Workspace {
                     menu = menu.item(pick("Latest turn", DiffScope::Turn(latest.clone()), latest_checked, window));
                 }
                 let (turns, scope, turn_view) = (menu_turns.clone(), menu_scope.clone(), view.clone());
+                let turn_owner = scope_owner.clone();
                 menu = menu.submenu("Turn", window, cx, move |mut menu, window, _| {
                     if turns.is_empty() {
                         return menu.item(PopupMenuItem::new("No completed turns yet.").disabled(true));
@@ -2652,26 +2721,31 @@ impl Workspace {
                                 )
                             })
                             .checked(checked)
-                            .on_click(window.listener_for(
-                                &turn_view,
-                                move |this, _, _, cx| {
-                                    this.set_diff_scope(value.clone(), cx);
-                                },
-                            )),
+                            .on_click(window.listener_for(&turn_view, {
+                                let owner = turn_owner.clone();
+                                move |this, _, _, cx| this.set_diff_scope_of(owner.as_ref(), value.clone(), cx)
+                            })),
                         );
                     }
                     menu
                 });
                 let (commits, scope, commit_view) = (commits.clone(), menu_scope.clone(), view.clone());
                 let identity = menu_identity.clone();
-                menu.submenu("Commits", window, cx, move |mut menu, window, cx| {
-                    if commits.is_empty() {
-                        return menu.item(PopupMenuItem::new("No commits on this branch.").disabled(true));
-                    }
+                let source = commits_source.clone();
+                let commit_owner = scope_owner.clone();
+                menu.submenu("Commits", window, cx, move |mut menu, window, _| {
+                    let list = match &commits {
+                        None => return menu.item(PopupMenuItem::new("Loading commits...").disabled(true)),
+                        Some(Err(error)) => return menu.item(PopupMenuItem::new(error.clone()).disabled(true)),
+                        Some(Ok(list)) if list.commits.is_empty() => {
+                            return menu.item(PopupMenuItem::new("No commits on this branch.").disabled(true));
+                        }
+                        Some(Ok(list)) => list,
+                    };
                     let now = crate::timestamp::now_ms();
-                    let popup = cx.entity().downgrade();
-                    for commit in &commits {
+                    for commit in &list.commits {
                         let value = DiffScope::Commit(commit.sha.clone());
+                        let (source, owner) = (source.clone(), commit_owner.clone());
                         let checked = scope == value;
                         let url = identity.as_ref().and_then(|identity| commit_link::commit_url(identity, &commit.sha));
                         let time: SharedString = commit
@@ -2681,20 +2755,45 @@ impl Workspace {
                             .map(|at| crate::timestamp::relative_label(now - at))
                             .unwrap_or_default()
                             .into();
-                        let row = CommitRow {
-                            subject: commit.subject.clone().into(),
-                            time,
-                            sha: commit.sha.clone(),
-                            url,
-                            view: commit_view.clone(),
-                            menu: popup.clone(),
-                        };
+                        let row = CommitRow { subject: commit.subject.clone().into(), time, sha: commit.sha.clone() };
                         menu =
                             menu.item(PopupMenuItem::element(move |_, cx| row.render(cx)).checked(checked).on_click(
                                 window.listener_for(&commit_view, move |this, _, _, cx| {
-                                    this.set_diff_scope(value.clone(), cx);
+                                    // The list belongs to one checkout; a commit never lands on another.
+                                    if this.branch_commits_source() == source {
+                                        this.set_diff_scope_of(owner.as_ref(), value.clone(), cx);
+                                    }
                                 }),
                             ));
+                        // Its own arrow-key stop after the commit; it opens without picking the commit.
+                        let sha = commit.sha.clone();
+                        let link = match url {
+                            Some(url) => {
+                                let tip = SharedString::from(url.clone());
+                                PopupMenuItem::element(move |_, cx| {
+                                    let id = ElementId::Name(format!("diff-commit-link:{sha}").into());
+                                    let tip = tip.clone();
+                                    commit_sha(id, &sha, true, theme::tokens(cx))
+                                        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                                })
+                                .on_click(window.listener_for(
+                                    &commit_view,
+                                    move |this, event, window, cx| {
+                                        this.open_link(&url, event, window, cx);
+                                    },
+                                ))
+                            }
+                            None => PopupMenuItem::element(move |_, cx| {
+                                let id = ElementId::Name(format!("diff-commit-sha:{sha}").into());
+                                commit_sha(id, &sha, false, theme::tokens(cx))
+                            })
+                            .disabled(true),
+                        };
+                        menu = menu.item(link.inline());
+                    }
+                    if list.truncated {
+                        let label = format!("Showing latest {} commits", list.commits.len());
+                        menu = menu.item(PopupMenuItem::new(label).disabled(true));
                     }
                     menu.max_h(px(320.)).max_w(px(384.)).scrollable(true)
                 })
@@ -2947,7 +3046,7 @@ impl Workspace {
                             );
                             // A custom header replaces the kit's, suffix included, so the file's load status goes in it.
                             let diff = Diff::new(&self.right_panel.diff)
-                                .render_header(move |file, _, cx| {
+                                .render_header(move |file, window, cx| {
                                     let status =
                                         states.get(file.path()).map(|load| diff_file_status(file.path(), *load, &view));
                                     let stat = stats.as_ref().and_then(|stats| stats.get(file.path()));
@@ -2959,6 +3058,7 @@ impl Workspace {
                                         &header_tokens,
                                         scheme,
                                         status,
+                                        window,
                                         cx,
                                     )
                                 })
@@ -3188,7 +3288,8 @@ fn workspace_mutation_id(
 /// What the proactive panel last saw of the open thread (`ProactivePanelObservation`).
 #[derive(Clone, Debug, PartialEq)]
 struct Observation {
-    thread_id: String,
+    /// The thread, with its environment (`scopedThreadKey`).
+    thread: Target,
     /// The running turn at the last read; `None` before the first, when a just-completed turn still opens.
     running: Option<Option<String>>,
     /// The turn the user's last panel choice belongs to.
@@ -3201,11 +3302,11 @@ struct Observation {
 
 /// `observeProactivePanelUserChoice`: a panel choice made since the thread opened or its
 /// current turn started outranks a proactive open.
-fn observe(previous: Option<&Observation>, thread_id: &str, running: Option<&str>, revision: u64) -> Observation {
-    let same = previous.filter(|previous| previous.thread_id == thread_id);
+fn observe(previous: Option<&Observation>, thread: &Target, running: Option<&str>, revision: u64) -> Observation {
+    let same = previous.filter(|previous| &previous.thread == thread);
     let new_turn = same.is_some_and(|previous| running.is_some() && running != previous.user_turn.as_deref());
     Observation {
-        thread_id: thread_id.to_owned(),
+        thread: thread.clone(),
         running: same.and_then(|previous| previous.running.clone()),
         user_turn: running.map(str::to_owned).or_else(|| same.and_then(|previous| previous.user_turn.clone())),
         target_key: same.and_then(|previous| previous.target_key.clone()),
@@ -3332,8 +3433,8 @@ struct ParsedDiff {
 }
 
 /// `review.getBranchCommits`' commits, newest first as the server lists them.
-fn parse_commits(reply: &Value) -> Vec<Commit> {
-    reply["commits"]
+fn parse_commits(reply: &Value) -> CommitList {
+    let commits = reply["commits"]
         .as_array()
         .into_iter()
         .flatten()
@@ -3344,7 +3445,8 @@ fn parse_commits(reply: &Value) -> Vec<Commit> {
                 committed_at: c["committedAt"].as_str().map(str::to_owned),
             })
         })
-        .collect()
+        .collect();
+    CommitList { commits, truncated: reply["truncated"].as_bool().unwrap_or(false) }
 }
 
 fn parse_diff(value: &Value, source_kind: Option<&str>) -> Option<ParsedDiff> {
@@ -3419,73 +3521,70 @@ fn wait_for_measure(width: Pixels, waited: &std::cell::Cell<bool>) -> bool {
 
 /// A 28px ghost icon toggle (`Toggle variant="ghost" size="sm"` / `Button size="icon-sm"`).
 /// A commit's short SHA (`font-mono text-xs text-muted-foreground`), underlined as a link to
-/// its host's page when it has one; the link opens without picking the commit, and closes
-/// `menu` when it sits in one.
+/// its host's page when it has one. With `focus`, it is a Tab stop that Enter opens.
 fn commit_sha_link(
     id: impl Into<ElementId>,
     sha: &str,
     url: Option<String>,
     view: &Entity<Workspace>,
-    menu: Option<gpui_kit::WeakEntity<PopupMenu>>,
+    focus: Option<FocusHandle>,
     tokens: &Tokens,
 ) -> AnyElement {
-    let short: SharedString = sha.chars().take(7).collect::<String>().into();
-    let base =
-        div().id(id.into()).flex_none().font_family(tokens.fonts.mono).text_xs().text_color(tokens.muted_foreground);
-    let Some(url) = url else { return base.child(short).into_any_element() };
-    let (view, tip) = (view.clone(), SharedString::from(url.clone()));
-    base.underline()
-        .cursor_pointer()
-        .child(short)
+    let base = commit_sha(id, sha, url.is_some(), tokens);
+    let Some(url) = url else { return base.into_any_element() };
+    let (view, tip, ring) = (view.clone(), SharedString::from(url.clone()), tokens.ring);
+    base.cursor_pointer()
+        .when_some(focus, |el, focus| {
+            // The ring sits outside the text without moving it.
+            el.track_focus(&focus)
+                .m(px(-1.))
+                .border_1()
+                .rounded_sm()
+                .border_color(gpui_kit::transparent_black())
+                .focus_visible(move |s| s.border_color(ring))
+        })
         .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
         .on_click(move |event, window, cx| {
             cx.stop_propagation();
             view.update(cx, |this, cx| this.open_link(&url, event, window, cx));
-            if let Some(menu) = menu.as_ref().and_then(gpui_kit::WeakEntity::upgrade) {
-                cx.defer(move |cx| menu.update(cx, |_, cx| cx.emit(DismissEvent)));
-            }
         })
         .into_any_element()
 }
 
-/// A Commits menu row: the subject (with its tooltip), how long ago, and the SHA link.
+/// The short SHA's text, underlined when it links to the host's page.
+fn commit_sha(id: impl Into<ElementId>, sha: &str, linked: bool, tokens: &Tokens) -> gpui_kit::Stateful<gpui_kit::Div> {
+    let short: SharedString = sha.chars().take(7).collect::<String>().into();
+    div()
+        .id(id.into())
+        .flex_none()
+        .font_family(tokens.fonts.mono)
+        .text_xs()
+        .text_color(tokens.muted_foreground)
+        .when(linked, gpui_kit::Styled::underline)
+        .child(short)
+}
+
+/// A Commits menu row: the subject (with its tooltip) and how long ago. Its SHA follows on the
+/// same row as a menu item of its own, like the web's link `DropdownMenuItem`.
 #[derive(Clone)]
 struct CommitRow {
     subject: SharedString,
     time: SharedString,
     sha: String,
-    url: Option<String>,
-    view: Entity<Workspace>,
-    menu: gpui_kit::WeakEntity<PopupMenu>,
 }
 
 impl CommitRow {
     fn render(&self, cx: &App) -> AnyElement {
         let tokens = theme::tokens(cx);
         let subject = self.subject.clone();
-        let link = commit_sha_link(
-            ElementId::Name(format!("diff-commit-link:{}", self.sha).into()),
-            &self.sha,
-            self.url.clone(),
-            &self.view,
-            Some(self.menu.clone()),
-            tokens,
-        );
         h_flex()
+            .id(ElementId::Name(format!("diff-commit-row:{}", self.sha).into()))
             .w_full()
             .min_w_0()
             .gap_3()
-            .child(
-                h_flex()
-                    .id(ElementId::Name(format!("diff-commit-row:{}", self.sha).into()))
-                    .flex_1()
-                    .min_w_0()
-                    .gap_3()
-                    .child(div().flex_1().min_w_0().truncate().child(self.subject.clone()))
-                    .child(div().flex_none().text_xs().text_color(tokens.muted_foreground).child(self.time.clone()))
-                    .tooltip(move |window, cx| Tooltip::new(subject.clone()).build(window, cx)),
-            )
-            .child(div().flex_none().px_2().child(link))
+            .child(div().flex_1().min_w_0().truncate().child(self.subject.clone()))
+            .child(div().flex_none().text_xs().text_color(tokens.muted_foreground).child(self.time.clone()))
+            .tooltip(move |window, cx| Tooltip::new(subject.clone()).build(window, cx))
             .into_any_element()
     }
 }
@@ -3615,6 +3714,24 @@ fn launcher_step(keystroke: &gpui_kit::Keystroke, highlight: Option<usize>, len:
 mod tests {
     use super::*;
     use crate::model::ThreadState;
+
+    #[test]
+    fn commits_show_only_for_the_checkout_and_base_they_came_from() {
+        let source = |env: &str, cwd: &str, base: Option<&str>| -> CommitsSource {
+            (env.to_owned().into(), cwd.to_owned(), base.map(str::to_owned))
+        };
+        let list = CommitList { commits: vec![], truncated: false };
+        let loaded = Some((source("a", "/repo", None), Ok(list)));
+        assert!(commits_for(loaded.as_ref(), Some(&source("a", "/repo", None))).is_some());
+        for other in [
+            Some(source("b", "/repo", None)),
+            Some(source("a", "/other", None)),
+            Some(source("a", "/repo", Some("main"))),
+            None,
+        ] {
+            assert!(commits_for(loaded.as_ref(), other.as_ref()).is_none());
+        }
+    }
 
     #[test]
     fn showing_the_diff_reads_it_again_only_after_the_floor() {
@@ -3847,7 +3964,8 @@ mod tests {
     #[test]
     fn a_completed_turn_opens_its_diff_once_unless_the_user_chose_a_panel() {
         // The turn runs, then settles: the diff opens for a big enough checkpoint.
-        let running = observe(None, "t", Some("r1"), 0);
+        let thread = |env: &str| Target::Thread { env: env.to_owned().into(), id: "t".into() };
+        let running = observe(None, &thread("a"), Some("r1"), 0);
         assert_eq!((running.revision, running.user_turn.as_deref()), (0, Some("r1")));
         let previous = Some(Some("r1"));
         assert!(turn_just_completed(previous, None, "r1", true));
@@ -3878,9 +3996,12 @@ mod tests {
         assert!(!panel.open && panel.proactive_diff_run.as_deref() == Some("r2"));
 
         // A choice before the next turn starts is superseded once it runs.
-        let next = observe(Some(&running), "t", Some("r3"), 1);
+        let next = observe(Some(&running), &thread("a"), Some("r3"), 1);
         assert_eq!(next.revision, 1);
-        assert_eq!(observe(Some(&next), "t", None, 2).revision, 1, "choices during the turn still count");
+        assert_eq!(observe(Some(&next), &thread("a"), None, 2).revision, 1, "choices during the turn still count");
+        // The same thread id on another environment is another thread.
+        let other = observe(Some(&next), &thread("b"), None, 2);
+        assert_eq!((other.revision, other.running, other.user_turn), (2, None, None));
     }
 
     #[test]

@@ -223,13 +223,15 @@ pub(super) fn carried_rows<R: Clone>(previous: &[FileStat], rows: &[Option<R>], 
 }
 
 /// `createDiffFileContentsLoader`: reads a file's old and new text with `method`, `source` naming
-/// the comparison, so the diff can show the unchanged lines outside its hunks. The socket is
-/// looked up at each read, so a reconnect does not strand the loader.
+/// the comparison, so the diff can show the unchanged lines outside its hunks; `ignore_whitespace`
+/// says the patch was made ignoring whitespace. The socket is looked up at each read, so a
+/// reconnect does not strand the loader.
 pub(in crate::app) fn contents_loader(
     workspace: WeakEntity<Workspace>,
     client: impl Fn(&Workspace) -> Option<RpcClient> + 'static,
     method: &'static str,
     source: Value,
+    ignore_whitespace: bool,
 ) -> DiffContentsLoader {
     Rc::new(move |file: &DiffFile, cx: &mut App| {
         let input = contents_input(&source, file);
@@ -237,7 +239,8 @@ pub(in crate::app) fn contents_loader(
         cx.spawn(async move |_| -> anyhow::Result<DiffFileContents> {
             let client = client.ok_or_else(|| anyhow!("This environment is not connected."))?;
             let reply = client.request(method, input).await?;
-            parse_contents(&reply).ok_or_else(|| anyhow!("Unreadable file contents."))
+            let contents = parse_contents(&reply).ok_or_else(|| anyhow!("Unreadable file contents."))?;
+            Ok(DiffFileContents { ignore_whitespace, ..contents })
         })
     })
 }
@@ -257,6 +260,7 @@ fn parse_contents(reply: &Value) -> Option<DiffFileContents> {
     Some(DiffFileContents {
         original: reply["oldContents"].as_str()?.to_owned(),
         modified: reply["newContents"].as_str()?.to_owned(),
+        ignore_whitespace: false,
     })
 }
 

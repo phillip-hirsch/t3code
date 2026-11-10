@@ -20,8 +20,7 @@ pub(super) fn action(
     tokens: &Tokens,
 ) -> Stateful<Div> {
     let label = label.into();
-    div()
-        .id(id)
+    crate::app::chat::focusable(div().id(id), tokens)
         .size(px(24.))
         .flex_none()
         .flex()
@@ -102,8 +101,7 @@ pub(super) fn failure(message: impl Into<SharedString>, retry: Option<Stateful<D
 
 /// The "Try again" button of a failure.
 pub(super) fn retry_button(id: impl Into<ElementId>, tokens: &Tokens) -> Stateful<Div> {
-    div()
-        .id(id)
+    crate::app::chat::focusable(div().id(id), tokens)
         .px(px(10.))
         .py(px(4.))
         .rounded(px(6.))

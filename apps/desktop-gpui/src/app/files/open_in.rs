@@ -124,6 +124,7 @@ impl Workspace {
         let enabled = preferred.is_some() && can_open;
         let primary = div()
             .id("file-open-in")
+            .when(enabled, |el| crate::app::chat::focusable(el, tokens))
             .h_full()
             .px(px(5.))
             .flex()

@@ -135,6 +135,9 @@ impl GapReveal {
 pub struct DiffFileContents {
     pub original: String,
     pub modified: String,
+    /// The patch was made ignoring whitespace, so its unchanged lines match
+    /// these up to whitespace ([`DiffFile::with_contents_ignoring_whitespace`]).
+    pub ignore_whitespace: bool,
 }
 
 /// Reads a file's full contents so a [`DiffState`] can show the unchanged
@@ -1003,7 +1006,14 @@ impl DiffState {
             let hydrated = cx
                 .background_spawn(async move {
                     let contents = contents?;
-                    let hydrated = file.with_contents(&contents.original, &contents.modified)?;
+                    let hydrated = if contents.ignore_whitespace {
+                        file.with_contents_ignoring_whitespace(
+                            &contents.original,
+                            &contents.modified,
+                        )
+                    } else {
+                        file.with_contents(&contents.original, &contents.modified)
+                    }?;
                     anyhow::Ok((file, hydrated))
                 })
                 .await;

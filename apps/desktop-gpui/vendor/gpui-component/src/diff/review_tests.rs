@@ -410,7 +410,11 @@ fn partial_contents() -> super::DiffFileContents {
     let modified = original
         .replace("line 5\n", "changed 5\n")
         .replace("line 25\n", "changed 25\n");
-    super::DiffFileContents { original, modified }
+    super::DiffFileContents {
+        original,
+        modified,
+        ignore_whitespace: false,
+    }
 }
 
 #[test]
@@ -451,6 +455,30 @@ fn full_contents_fill_the_gaps_between_hunks() {
     assert!(file.with_contents(&short, &short).is_err());
     let longer = format!("{}extra\n", contents.modified);
     assert!(file.with_contents(&contents.original, &longer).is_err());
+    // So are files edited since the patch with the same line count: in a gap, and in a hunk's
+    // changed and unchanged lines.
+    for edited in ["line 10\n", "changed 5\n", "line 24\n"] {
+        let modified = contents.modified.replacen(edited, "edited\n", 1);
+        assert!(
+            file.with_contents(&contents.original, &modified).is_err(),
+            "{edited:?}"
+        );
+    }
+    let original = contents.original.replacen("line 5\n", "edited\n", 1);
+    assert!(file.with_contents(&original, &contents.modified).is_err());
+    // A line ending changed since, in a gap or a hunk, or a final newline dropped, is a change
+    // `git diff` would have shown.
+    for (edited, with) in [
+        ("line 10\n", "line 10\r\n"),
+        ("line 24\n", "line 24\r\n"),
+        ("line 30\n", "line 30"),
+    ] {
+        let modified = contents.modified.replacen(edited, with, 1);
+        assert!(
+            file.with_contents(&contents.original, &modified).is_err(),
+            "{with:?}"
+        );
+    }
     assert!(
         hydrated
             .with_contents(&contents.original, &contents.modified)
@@ -458,6 +486,42 @@ fn full_contents_fill_the_gaps_between_hunks() {
     );
     let added = DiffFile::parse("--- /dev/null\n+++ b/n.txt\n@@ -0,0 +1 @@\n+n\n").unwrap();
     assert!(!added[0].can_load_contents());
+}
+
+#[test]
+fn contents_of_a_whitespace_ignoring_patch_match_it_up_to_whitespace() {
+    // `git diff -w` leaves out the reindented line 10 and keeps the reindented line 4 as context.
+    let file = DiffFile::parse(PARTIAL).unwrap().remove(0);
+    let contents = partial_contents();
+    // `-w` ignores a CR and a dropped final newline too.
+    let modified = contents
+        .modified
+        .replacen("line 10\n", "    line 10\n", 1)
+        .replacen("line 4\n", "line\t4 \n", 1)
+        .replacen("line 12\n", "line 12\r\n", 1)
+        .replacen("line 30\n", "line 30", 1);
+    assert!(file.with_contents(&contents.original, &modified).is_err());
+    let hydrated = file
+        .with_contents_ignoring_whitespace(&contents.original, &modified)
+        .unwrap();
+    assert_eq!(hydrated.pairs().len(), 30);
+    assert_eq!(
+        hydrated.text_for_lines(DiffSide::Modified, 4, 4),
+        "line\t4 \n"
+    );
+    assert_eq!(
+        hydrated.text_for_lines(DiffSide::Modified, 10, 10),
+        "    line 10\n"
+    );
+    // Other edits since the patch are still refused.
+    for edited in ["line 10\n", "changed 5\n", "line 24\n"] {
+        let modified = modified.replacen(edited, "edited\n", 1);
+        assert!(
+            file.with_contents_ignoring_whitespace(&contents.original, &modified)
+                .is_err(),
+            "{edited:?}"
+        );
+    }
 }
 
 fn separators(state: &DiffState) -> Vec<(usize, std::ops::Range<usize>)> {
