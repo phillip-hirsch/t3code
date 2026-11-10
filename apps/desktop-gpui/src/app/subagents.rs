@@ -16,7 +16,7 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use super::{Target, Workspace, new_id};
-use crate::model::{RuntimeRequest, ThreadProjection, TurnItem};
+use crate::model::{RuntimeRequest, ScopedId, ThreadProjection, TurnItem};
 use crate::model_label;
 use crate::theme::Tokens;
 use crate::thread_now;
@@ -40,9 +40,10 @@ pub(super) struct SubagentUi {
 }
 
 struct ChildApproval {
-    thread_id: String,
+    /// The child, on its parent's environment.
+    thread: ScopedId,
     title: SharedString,
-    /// The child's `updatedAt` the approvals were read at; a newer one reads them again.
+    /// The child's environment, id and `updatedAt` the approvals were read at; a newer one reads them again.
     key: String,
     requests: Vec<(RuntimeRequest, Option<TurnItem>)>,
     error: Option<SharedString>,
@@ -58,17 +59,21 @@ impl Workspace {
                 return;
             }
         };
-        let children: Vec<(String, String, String)> =
+        let children: Vec<(ScopedId, String, String)> =
             crate::inbox::child_thread_inputs(&self.shell.threads, &env, &parent)
                 .into_iter()
                 .filter(|child| thread_now::has_pending_approval(child))
-                .map(|child| (child.id.clone(), child.title.clone(), format!("{}:{}", child.id, child.updated_at)))
+                .map(|child| {
+                    let key = format!("{}:{}:{}", child.environment_id, child.id, child.updated_at);
+                    (ScopedId::of_thread(child), child.title.clone(), key)
+                })
                 .collect();
         let before = self.subagents.approvals.len();
-        self.subagents.approvals.retain(|entry| children.iter().any(|(id, ..)| *id == entry.thread_id));
+        self.subagents.approvals.retain(|entry| children.iter().any(|(thread, ..)| *thread == entry.thread));
         let mut changed = before != self.subagents.approvals.len();
-        for (thread_id, title, key) in children {
-            match self.subagents.approvals.iter_mut().find(|e| e.thread_id == thread_id) {
+        let origin = Target::Thread { env, id: parent };
+        for (thread, title, key) in children {
+            match self.subagents.approvals.iter_mut().find(|e| e.thread == thread) {
                 Some(entry) if entry.key == key => {
                     if entry.title != title.as_str() {
                         entry.title = title.into();
@@ -81,9 +86,9 @@ impl Workspace {
             if !self.subagents.fetching.insert(key.clone()) {
                 continue;
             }
-            let Some(client) = self.client() else { return };
-            let input = json!({"threadId": thread_id});
-            let parent = parent.clone();
+            let Some(client) = self.env_client(&thread.env) else { return };
+            let input = json!({"threadId": thread.id});
+            let origin = origin.clone();
             self.subagents._fetches.push(cx.spawn(async move |this, cx| {
                 let result = client.request("orchestration.getThreadProjection", input).await;
                 let _ = this.update(cx, |this, cx| {
@@ -94,12 +99,12 @@ impl Workspace {
                     {
                         Ok(projection) => projection,
                         Err(error) => {
-                            log::warn!("child approvals for {thread_id}: {error}");
+                            log::warn!("child approvals for {}: {error}", thread.id);
                             return;
                         }
                     };
-                    // The user moved to another thread while this read ran.
-                    if this.open_thread_id() != Some(parent.as_str()) {
+                    // The user moved to another thread, or to the same id elsewhere, while this read ran.
+                    if this.target.as_ref() != Some(&origin) {
                         return;
                     }
                     let requests: Vec<(RuntimeRequest, Option<TurnItem>)> = projection
@@ -107,8 +112,8 @@ impl Workspace {
                         .into_iter()
                         .map(|(request, item)| (request.clone(), item.cloned()))
                         .collect();
-                    let entry = ChildApproval { thread_id, title: title.into(), key, requests, error: None };
-                    match this.subagents.approvals.iter_mut().find(|e| e.thread_id == entry.thread_id) {
+                    let entry = ChildApproval { thread, title: title.into(), key, requests, error: None };
+                    match this.subagents.approvals.iter_mut().find(|e| e.thread == entry.thread) {
                         Some(existing) => *existing = entry,
                         None => this.subagents.approvals.push(entry),
                     }
@@ -122,23 +127,23 @@ impl Workspace {
         }
     }
 
-    fn respond_to_child(&mut self, thread_id: String, request_id: String, decision: String, cx: &mut Context<Self>) {
-        let Some(client) = self.client() else { return };
+    fn respond_to_child(&mut self, thread: ScopedId, request_id: String, decision: String, cx: &mut Context<Self>) {
+        let Some(client) = self.env_client(&thread.env) else { return };
         if self.subagents.responding.is_some() {
             return;
         }
         self.subagents.responding = Some(request_id.clone());
-        if let Some(entry) = self.subagents.approvals.iter_mut().find(|e| e.thread_id == thread_id) {
+        if let Some(entry) = self.subagents.approvals.iter_mut().find(|e| e.thread == thread) {
             entry.error = None;
         }
         cx.notify();
-        let command = json!({"type": "runtime-request.respond", "commandId": new_id(), "threadId": thread_id,
+        let command = json!({"type": "runtime-request.respond", "commandId": new_id(), "threadId": thread.id,
             "requestId": request_id, "decision": decision});
         cx.spawn(async move |this, cx| {
             let result = client.request("orchestration.dispatchCommand", command).await;
             let _ = this.update(cx, |this, cx| {
                 this.subagents.responding = None;
-                if let Some(entry) = this.subagents.approvals.iter_mut().find(|e| e.thread_id == thread_id) {
+                if let Some(entry) = this.subagents.approvals.iter_mut().find(|e| e.thread == thread) {
                     match result {
                         Err(error) => entry.error = Some(error.to_string().into()),
                         Ok(_) => entry.requests.retain(|(request, _)| request.id != request_id),
@@ -199,7 +204,7 @@ impl Workspace {
         let enabled = live && self.subagents.responding.is_none();
         let mut actions = h_flex().flex_wrap().items_center().gap(px(8.)).text_xs();
         for (decision, label) in options.iter().filter(|(d, _)| d == "decline" || d == "accept") {
-            let (thread_id, request_id, decision) = (entry.thread_id.clone(), request.id.clone(), decision.clone());
+            let (thread, request_id, decision) = (entry.thread.clone(), request.id.clone(), decision.clone());
             let tone = if decision == "accept" { t.foreground } else { t.muted_foreground };
             actions = actions.child(
                 div()
@@ -211,7 +216,7 @@ impl Workspace {
                     .when(enabled, |el| {
                         el.cursor_pointer().hover(|s| s.underline().text_color(t.foreground)).on_click(cx.listener(
                             move |this, _, _, cx| {
-                                this.respond_to_child(thread_id.clone(), request_id.clone(), decision.clone(), cx);
+                                this.respond_to_child(thread.clone(), request_id.clone(), decision.clone(), cx);
                             },
                         ))
                     }),
@@ -221,7 +226,7 @@ impl Workspace {
             options.iter().filter(|(d, _)| d != "decline" && d != "accept").cloned().collect();
         if !more.is_empty() {
             let view = cx.entity();
-            let (thread_id, request_id) = (entry.thread_id.clone(), request.id.clone());
+            let (thread, request_id) = (entry.thread.clone(), request.id.clone());
             actions = actions.child(
                 Button::new(ElementId::Name(format!("child-approval-more-{}", request.id).into()))
                     .ghost()
@@ -235,12 +240,11 @@ impl Workspace {
                     .disabled(!enabled)
                     .dropdown_menu(move |mut menu, window, _| {
                         for (decision, label) in &more {
-                            let (thread_id, request_id, decision) =
-                                (thread_id.clone(), request_id.clone(), decision.clone());
+                            let (thread, request_id, decision) = (thread.clone(), request_id.clone(), decision.clone());
                             menu = menu.item(PopupMenuItem::new(label.clone()).on_click(window.listener_for(
                                 &view,
                                 move |this, _, _, cx| {
-                                    this.respond_to_child(thread_id.clone(), request_id.clone(), decision.clone(), cx);
+                                    this.respond_to_child(thread.clone(), request_id.clone(), decision.clone(), cx);
                                 },
                             )));
                         }
@@ -294,7 +298,7 @@ impl Workspace {
     /// `isProviderNativeSubagentThread` for the open thread: the composer gives way to the bar.
     pub(super) fn open_provider_subagent(&self) -> Option<&ThreadProjection> {
         let projection = self.open_projection()?;
-        let shell = self.shell.threads.iter().find(|t| t.id == projection.thread.id)?;
+        let shell = self.shell.thread(&self.target.as_ref()?.thread_key()?)?;
         (shell.lineage.relationship_to_parent.as_deref() == Some("subagent")
             && shell.creation_source.as_deref() == Some("provider"))
         .then_some(projection)
@@ -338,12 +342,12 @@ impl Workspace {
         let status = format_status(provider_subagent_status(projection), super::sidebar::now_ms());
         let icon = provider.and_then(|p| crate::assets::provider_icon(&p.driver));
         let parent = self
-            .shell
-            .threads
-            .iter()
-            .find(|t| t.id == projection.thread.id)
-            .and_then(|t| t.lineage.parent_thread_id.clone())
-            .filter(|parent| self.shell.threads.iter().any(|t| &t.id == parent));
+            .target
+            .as_ref()
+            .and_then(Target::thread_key)
+            .and_then(|open| self.shell.thread(&open))
+            .and_then(|t| Some(ScopedId::new(t.environment_id.clone(), t.lineage.parent_thread_id.clone()?)))
+            .filter(|parent| self.shell.thread(parent).is_some());
         Some(
             h_flex()
                 .min_h(px(48.))
@@ -398,9 +402,9 @@ impl Workspace {
                         .small()
                         .icon(Icon::new(IconName::ArrowUpLeft).size(px(16.)))
                         .label("Open parent")
-                        .on_click(
-                            cx.listener(move |this, _, window, cx| this.select_thread(parent.clone(), window, cx)),
-                        )
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.select_thread_in(parent.env.clone(), parent.id.clone(), window, cx);
+                        }))
                 }))
                 .into_any_element(),
         )
