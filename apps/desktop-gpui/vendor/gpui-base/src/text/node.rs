@@ -1106,6 +1106,7 @@ fn set_leaf_key(state: &mut Arc<Mutex<InlineState>>, key: u64) {
         text,
         editor_key: Some(key),
         cleanup_senders: Vec::new(),
+        reported_hover: None,
         ..Default::default()
     }));
 }

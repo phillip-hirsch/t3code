@@ -271,6 +271,47 @@ line, so the open tag, the Markdown inside and `</details>` arrive as sibling bl
   panel's text stays in the rendered text while closed, so find counts it; the index records each
   panel's range for `reveal_range`.
 
+**Links can drop their underline.** The chat's links show by color alone (`.chat-markdown a {
+text-decoration: none }`); 0.9.0 always draws a hairline under every link. The patch adds an
+opt-in flag; other views keep the underline. Files:
+
+- `src/text/style.rs`: `TextViewStyle::link_underline`, `with_link_underline`.
+- `src/text/text_view.rs`: `TextView::link_underline`, applied to the frame's style.
+- `src/text/node.rs`: `link_underline`, read wherever a link mark is styled.
+
+gpui-component's `src/text/compat.rs` forwards `link_underline` from its `TextView`.
+
+**Links report hover.** The chat opens a pull request link's preview card, and shows any web
+link's URL in a tooltip, when the pointer rests on it (`PullRequestLinkPreview`). 0.9.0 tracks the
+hovered link only to set the cursor. The patch adds `TextView::on_link_hover`: the handler gets
+`Some(LinkHover)` (the URL and the line box of the link under the pointer, in window coordinates)
+when the pointer enters a link, and `None` when it leaves it. A link wrapped over lines, or led by
+an inline object, reports from each piece, so one event can carry a leave and an enter in either
+order; the app resolves them together. Files:
+
+- `src/text/text_view.rs`: `LinkHover`, `LinkHoverFn`, the `link_hover_handler` field and builder;
+  test `link_hover_reports_entering_and_leaving_a_link`.
+- `src/text/state.rs`: the handler, set each frame like the task toggle's.
+- `src/text/inline.rs`: the mouse-move listener reports changes, also when the pointer leaves the
+  text; `InlineState::reported_hover` keeps the last report across frames, so a repaint under a
+  still pointer reports nothing and a link drawn under the pointer reports on the first move;
+  `link_line_bounds`. `src/text/node.rs`: `set_leaf_key` initializes the new field.
+- `src/text/inline_object.rs`: an object inside a link reports its own bounds.
+
+gpui-component's `src/text/compat.rs` forwards `on_link_hover`, and `src/text/mod.rs` re-exports
+`LinkHover`.
+
+**A plugin object can lead a link.** The chat draws a host mark (the GitHub icon, a favicon, a
+globe) before a web link's text (`MarkdownExternalLinkContent`), and a click or right click on it
+is the link's. 0.9.0's inline plugins replace the node they claim. The patch adds
+`MarkdownNode::leading()`: for a claimed link, the converter places the object first with the
+link's mark, then converts the link as if no plugin claimed it. The object's text and Markdown stay
+empty, so it adds nothing to the text, find or copies. Files:
+
+- `src/text/markdown_ext.rs`: the `leading` flag and builder.
+- `src/text/format/markdown.rs`: the leading branch of `parse_paragraph`, `link_text_mark` (shared
+  with the `Node::Link` arm); test `a_leading_object_opens_the_link_whose_text_follows_it`.
+
 The crate's own tests need `--features test-support` and `include_str!` a `README.md` four levels
 above `src/text`, which this folder lacks: run them from a scratch copy laid out as
 `<dir>/crates/gpui-base` with a `<dir>/README.md`, with `[patch.crates-io]` pointing `gpui-pre` and
@@ -369,6 +410,10 @@ gpui-base) adds `mixed`, exposed as `aria-checked="mixed"` like the web's mixed 
 `composer.workspace` (Mod+Shift+X) and the right panel's "+" menu with `rightPanel.new`. 0.9.0's `DropdownMenuPopover` opens only from its trigger.
 `src/menu/dropdown_menu.rs` adds `DropdownMenuPopover::open`, passed to its `Popover` as
 `Popover::open` is, so a caller can hold the open state with `on_open_change`.
+
+**Text views pass link styling and hover through.** `src/text/compat.rs`: `TextView::link_underline`
+and `TextView::on_link_hover` forward to gpui-base's (see its "Links can drop their underline" and
+"Links report hover"); `src/text/mod.rs` re-exports `LinkHover`.
 
 **Soft breaks can render as line breaks.** `src/text/compat.rs`: `TextView::markdown_line_breaks`,
 passing through to gpui-base's (see its "Soft breaks can render as line breaks").

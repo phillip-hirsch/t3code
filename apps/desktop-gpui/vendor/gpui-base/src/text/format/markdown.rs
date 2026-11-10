@@ -767,6 +767,18 @@ fn append_inline_html_blocks(paragraph: &mut Paragraph, blocks: Vec<BlockNode>) 
     Some(text)
 }
 
+/// The mark a link puts on its text.
+fn link_text_mark(link: &mdast::Link) -> TextMark {
+    TextMark {
+        link: Some(LinkMark {
+            url: link.url.clone().into(),
+            title: link.title.clone().map(|s| s.into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 fn parse_paragraph(
     source: &str,
     paragraph: &mut Paragraph,
@@ -783,6 +795,16 @@ fn parse_paragraph(
 
     let parse_cx = MarkdownParseContext::new(source, cx.offset);
     if let Some(mut custom) = cx.markdown_extensions.parse_inline(node, &parse_cx) {
+        if custom.leading
+            && let Node::Link(link) = node
+        {
+            let mark = link_text_mark(link);
+            let mut lead = InlineNode::custom(custom);
+            lead.marks.push((0..lead.text.len(), mark.clone()));
+            paragraph.push(lead);
+            let text = merge_children_with_mark(source, paragraph, &link.children, mark, cx);
+            return text;
+        }
         let label_start = paragraph.children.len();
         let mut text = match node.children() {
             Some(children) if custom.after_children => {
@@ -864,22 +886,7 @@ fn parse_paragraph(
             );
         }
         Node::Link(val) => {
-            let link_mark = Some(LinkMark {
-                url: val.url.clone().into(),
-                title: val.title.clone().map(|s| s.into()),
-                ..Default::default()
-            });
-
-            text = merge_children_with_mark(
-                source,
-                paragraph,
-                &val.children,
-                TextMark {
-                    link: link_mark,
-                    ..Default::default()
-                },
-                cx,
-            );
+            text = merge_children_with_mark(source, paragraph, &val.children, link_text_mark(val), cx);
         }
         Node::Image(raw) => {
             paragraph.push_image(ImageNode {
@@ -2533,6 +2540,61 @@ mod tests {
         let object = paragraph.children[4].custom.as_ref().unwrap();
         assert_eq!(object.source_range(), Some(4..30));
         assert_eq!(document.text(), "See the long label a.rs now\n");
+    }
+
+    #[test]
+    fn a_leading_object_opens_the_link_whose_text_follows_it() {
+        let extensions = MarkdownExtensions::default().plugin(
+            crate::text::markdown_ext::TestInlinePlugin::new("test").parse_with(|node, _| {
+                match node {
+                    Node::Link(link) if link.url.starts_with("https:") => {
+                        Some(MarkdownNode::new("icon", ()).leading())
+                    }
+                    _ => None,
+                }
+            }),
+        );
+        let mut cx = NodeContext {
+            markdown_extensions: extensions.into(),
+            ..Default::default()
+        };
+        let source = "See *[the **docs**](https://a.dev)* and <https://b.dev>";
+        let document = parse(source, &mut cx).unwrap();
+        let BlockNode::Paragraph(paragraph) = &document.blocks[0] else {
+            panic!()
+        };
+        let runs: Vec<_> = paragraph
+            .children
+            .iter()
+            .map(|node| {
+                let link = node
+                    .marks
+                    .iter()
+                    .find_map(|(_, mark)| mark.link.as_ref().map(|link| link.url.to_string()));
+                (node.text.as_str(), node.custom.is_some(), link)
+            })
+            .collect();
+        let a = Some("https://a.dev".to_owned());
+        let b = Some("https://b.dev".to_owned());
+        assert_eq!(
+            runs,
+            [
+                ("See ", false, None),
+                ("", true, a.clone()),
+                ("the docs", false, a),
+                (" and ", false, None),
+                ("", true, b.clone()),
+                ("https://b.dev", false, b),
+            ]
+        );
+        assert_eq!(bold_runs(paragraph), ["docs"]);
+        // The object adds no text, and copying writes each link once.
+        assert_eq!(document.text(), "See the docs and https://b.dev\n");
+        let document = parse("See [docs](https://a.dev) and <https://b.dev>", &mut cx).unwrap();
+        assert_eq!(
+            document.to_markdown(),
+            "See [docs](https://a.dev) and [https://b.dev](https://b.dev)"
+        );
     }
 
     #[test]

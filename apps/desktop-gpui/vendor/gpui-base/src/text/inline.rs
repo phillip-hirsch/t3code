@@ -32,7 +32,7 @@ use crate::{
     text::range_highlight::RevealAt,
     text::selection::word_range_at,
     text::state::LineSpan,
-    text::text_view::{LinkClickHandlerFn, handle_link_click},
+    text::text_view::{LinkClickHandlerFn, LinkHover, handle_link_click},
     text_selection::text_rows_extent,
 };
 
@@ -351,6 +351,10 @@ pub(crate) struct InlineState {
     pub(crate) editor_key: Option<u64>,
     /// UI owners of retained layouts; cleanup metadata is not document state.
     pub(super) cleanup_senders: Vec<Sender<()>>,
+    /// The link range last reported to the link hover handler. It outlives
+    /// the frame, so a repaint under a still pointer reports nothing new, and
+    /// a link drawn under the pointer reports on the first move.
+    pub(super) reported_hover: Option<Range<usize>>,
 }
 
 impl PartialEq for InlineState {
@@ -1400,24 +1404,52 @@ impl Element for Inline {
         }
 
         // Mouse move: repaint only when the pointer enters, leaves or moves
-        // between links, so the link cursor follows it. Hovering plain text
-        // changes nothing painted.
+        // between links, so the link cursor follows it, and tell the view's
+        // link hover handler. Hovering plain text changes nothing painted.
         if !self.links.is_empty() {
+            let hover_handler = GlobalState::global(cx)
+                .text_view_state()
+                .and_then(|state| state.read(cx).link_hover_handler.clone());
+            let text_align = window.text_style().text_align;
+            let inline_state = self.state.clone();
             window.on_mouse_event({
                 let hitbox = hitbox.clone();
                 let text_layout = text_layout.clone();
                 let links = self.links.clone();
                 let mut hovered_link = hovered_link;
                 move |event: &MouseMoveEvent, phase, window, cx| {
-                    if !phase.bubble() || !hitbox.is_hovered(window) {
+                    if !phase.bubble() {
                         return;
                     }
 
-                    let updated =
-                        Self::link_range_for_position(&text_layout, &links, event.position);
+                    let updated = if hitbox.is_hovered(window) {
+                        Self::link_range_for_position(&text_layout, &links, event.position)
+                    } else {
+                        None
+                    };
                     if hovered_link != updated {
-                        hovered_link = updated;
+                        hovered_link = updated.clone();
                         cx.notify(current_view);
+                    }
+                    if let Some(handler) = &hover_handler
+                        && let Ok(mut state) = inline_state.lock()
+                        && state.reported_hover != updated
+                    {
+                        state.reported_hover = updated.clone();
+                        drop(state);
+                        let hover = updated.and_then(|range| {
+                                let (_, link) = links.iter().find(|(r, _)| *r == range)?;
+                                Some(LinkHover {
+                                    url: link.url.clone(),
+                                    bounds: link_line_bounds(
+                                        &text_layout,
+                                        text_align,
+                                        range,
+                                        event.position,
+                                    ),
+                                })
+                        });
+                        handler(hover, window, cx);
                     }
                 }
             });
@@ -1593,6 +1625,31 @@ fn range_boxes(glyphs: &[GlyphBox], range: Range<usize>) -> Vec<(usize, Pixels, 
         }
     }
     boxes
+}
+
+/// The line box of the link text `range` on the row under `position`, or
+/// the first row it is on: what a hover card anchors to.
+fn link_line_bounds(
+    text_layout: &TextLayout,
+    align: TextAlign,
+    range: Range<usize>,
+    position: Point<Pixels>,
+) -> Bounds<Pixels> {
+    let bounds = text_layout.bounds();
+    let line_height = text_layout.line_height();
+    let glyphs = glyph_boxes(text_layout, align, bounds.size.width);
+    let rows = range_boxes(&glyphs, range);
+    let pointer_row = ((position.y - bounds.top()) / line_height).floor().max(0.) as usize;
+    let (row, left, right) = rows
+        .iter()
+        .find(|(row, _, _)| *row == pointer_row)
+        .or(rows.first())
+        .copied()
+        .unwrap_or((0, Pixels::ZERO, Pixels::ZERO));
+    Bounds::from_corners(
+        point(bounds.left() + left, bounds.top() + line_height * row as f32),
+        point(bounds.left() + right, bounds.top() + line_height * (row + 1) as f32),
+    )
 }
 
 fn selection_for_multi_click(

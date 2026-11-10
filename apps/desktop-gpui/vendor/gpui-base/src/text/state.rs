@@ -132,6 +132,7 @@ pub struct TextViewState {
     pub(super) image_source: Option<std::sync::Arc<super::text_view::ImageSourceFn>>,
     pub(super) link_click_handler: Option<std::sync::Arc<LinkClickHandlerFn>>,
     pub(super) task_toggle_handler: Option<std::sync::Arc<super::text_view::TaskToggleFn>>,
+    pub(super) link_hover_handler: Option<std::sync::Arc<super::text_view::LinkHoverFn>>,
     pub(super) markdown_extensions: Arc<MarkdownExtensions>,
 
     pub(super) is_selecting: bool,
@@ -240,6 +241,7 @@ impl TextViewState {
             table_actions: None,
             link_click_handler: None,
             task_toggle_handler: None,
+            link_hover_handler: None,
             image_source: None,
             markdown_extensions: Arc::default(),
             is_selecting: false,

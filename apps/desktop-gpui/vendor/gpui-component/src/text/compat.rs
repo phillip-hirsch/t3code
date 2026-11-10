@@ -190,6 +190,15 @@ impl TextView {
         self.inner = self.inner.on_link_click(f);
         self
     }
+    /// Reports the link under the pointer, `None` once it leaves; see
+    /// gpui-base's `TextView::on_link_hover`.
+    pub fn on_link_hover<F>(mut self, f: F) -> Self
+    where
+        F: Fn(Option<super::LinkHover>, &mut Window, &mut App) + Send + Sync + 'static,
+    {
+        self.inner = self.inner.on_link_hover(f);
+        self
+    }
     /// Makes task list checkboxes toggle, with the item's source offset and
     /// the state it asks for.
     pub fn on_task_toggle<F>(mut self, f: F) -> Self
