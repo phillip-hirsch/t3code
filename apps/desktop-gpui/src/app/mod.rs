@@ -658,6 +658,7 @@ impl Workspace {
             theme_feed: Default::default(),
             _subscriptions: subscriptions,
         };
+        workspace.restore_terminal_surfaces();
         workspace.sync_snap_shot(window, cx);
         workspace.resume_snap_shot_setup(window, cx);
         workspace.sync_saved_sessions(window, cx);

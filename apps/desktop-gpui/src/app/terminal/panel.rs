@@ -9,8 +9,11 @@ use gpui_kit::{
     div, px,
 };
 
+use serde::{Deserialize, Serialize};
+
 use super::layout::{self, Split};
 use super::{DrawerKey, Workspace};
+use crate::app::Target;
 use crate::app::right_panel::Surface;
 use crate::theme;
 
@@ -23,7 +26,73 @@ pub(super) struct PanelGroup {
     pub split: Split,
 }
 
+/// A tab's group as the panel layout keeps it: the web's terminal surface fields, and the thread
+/// its terminals run under (for a draft, the one it will launch with).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::app) struct StoredGroup {
+    thread_id: String,
+    terminal_ids: Vec<String>,
+    active_terminal_id: String,
+    #[serde(default)]
+    split_direction: Split,
+}
+
+impl StoredGroup {
+    /// `migratePersistedRightPanelState` for a terminal surface: ids deduplicated, an active id
+    /// it lacks falls back to the first. A thread's tab runs on that thread; none other is kept.
+    pub(in crate::app) fn restored(mut self, target: &Target) -> Option<Self> {
+        if matches!(target, Target::Thread { id, .. } if *id != self.thread_id) {
+            return None;
+        }
+        let mut seen = std::collections::HashSet::new();
+        self.terminal_ids.retain(|id| seen.insert(id.clone()));
+        if !self.terminal_ids.contains(&self.active_terminal_id) {
+            self.active_terminal_id = self.terminal_ids.first()?.clone();
+        }
+        Some(self)
+    }
+}
+
 impl super::Terminals {
+    /// The tab groups for a change, which the panel layout then saves.
+    pub(super) fn groups_mut(&mut self) -> &mut std::collections::HashMap<String, PanelGroup> {
+        self.panel_changed = true;
+        &mut self.panel
+    }
+
+    /// Whether a tab group changed since the last call.
+    pub(in crate::app) fn take_panel_changed(&mut self) -> bool {
+        std::mem::take(&mut self.panel_changed)
+    }
+
+    /// `surface`'s group as the panel layout stores it.
+    pub(in crate::app) fn stored_group(&self, surface: &str) -> Option<StoredGroup> {
+        let group = self.panel.get(surface)?;
+        Some(StoredGroup {
+            thread_id: group.key.thread_id.clone(),
+            terminal_ids: group.terminal_ids.clone(),
+            active_terminal_id: group.active.clone(),
+            split_direction: group.split,
+        })
+    }
+
+    /// Puts back a tab the last launch left on `target`; a draft's terminals keep the thread it
+    /// will launch with.
+    pub(in crate::app) fn restore_group(&mut self, target: &Target, surface: String, group: StoredGroup) {
+        let key = DrawerKey::new(target.environment(), &group.thread_id);
+        if let Target::Draft { draft, .. } = target {
+            self.draft_threads.entry(draft.clone()).or_insert_with(|| group.thread_id.clone());
+        }
+        let group = PanelGroup {
+            key,
+            terminal_ids: group.terminal_ids,
+            active: group.active_terminal_id,
+            split: group.split_direction,
+        };
+        self.panel.insert(surface, group);
+    }
+
     /// Every panel tab's terminal ids for `key`'s thread.
     pub(super) fn panel_ids(&self, key: &DrawerKey) -> Vec<String> {
         self.panel.values().filter(|g| g.key == *key).flat_map(|g| g.terminal_ids.clone()).collect()
@@ -44,6 +113,7 @@ impl super::Terminals {
                 changed = true;
             }
         }
+        self.panel_changed |= changed;
         changed
     }
 
@@ -51,6 +121,7 @@ impl super::Terminals {
     /// it emptied, which are removed.
     pub(super) fn remove_from_panel(&mut self, key: &DrawerKey, terminal_id: &str, shown: bool) -> Vec<String> {
         let mut emptied = Vec::new();
+        self.panel_changed = true;
         for (surface, group) in self.panel.iter_mut().filter(|(_, g)| g.key == *key) {
             let Some(index) = group.terminal_ids.iter().position(|id| id == terminal_id) else { continue };
             group.terminal_ids.remove(index);
@@ -134,7 +205,7 @@ impl Workspace {
             active: terminal_id.clone(),
             split: Split::Horizontal,
         };
-        self.terminals.panel.insert(surface.clone(), group);
+        self.terminals.groups_mut().insert(surface.clone(), group);
         self.open_surface(Surface::Terminal(surface), window, cx);
         self.open_terminal_session(key, terminal_id, launch, None, cx).detach();
     }
@@ -149,7 +220,7 @@ impl Workspace {
             return;
         }
         let terminal_id = self.next_terminal_id(&key);
-        if let Some(group) = self.terminals.panel.get_mut(surface) {
+        if let Some(group) = self.terminals.groups_mut().get_mut(surface) {
             let at = group
                 .terminal_ids
                 .iter()
@@ -189,7 +260,7 @@ impl Workspace {
 
     /// Drops the shown target's tab alone; its terminals keep running on the server.
     fn drop_terminal_surface(&mut self, surface: String) {
-        self.terminals.panel.remove(&surface);
+        self.terminals.groups_mut().remove(&surface);
         if let Some(target) = self.target.clone() {
             self.drop_surface(&target, &Surface::Terminal(surface));
         }

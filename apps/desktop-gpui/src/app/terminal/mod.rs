@@ -15,6 +15,7 @@ mod scrollbar;
 mod session;
 
 pub(in crate::app) use self::grid::TerminalTheme;
+pub(in crate::app) use self::panel::StoredGroup;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -149,8 +150,10 @@ pub(super) struct Terminals {
     draft_threads: HashMap<DraftId, String>,
     /// The terminal to focus once it mounts, by drawer: another thread's request never lands.
     focus_pending: Option<(DrawerKey, String)>,
-    /// Right-panel terminal tabs, by surface id.
+    /// Right-panel terminal tabs, by surface id. A change sets `panel_changed`, so the panel layout
+    /// saves them.
     panel: HashMap<String, panel::PanelGroup>,
+    panel_changed: bool,
 }
 
 /// `COMPOSER_CONTEXT_TERMINAL_TEXT_MAX_CHARS`.
@@ -268,7 +271,7 @@ impl Terminals {
     /// tabs' groups go with the tabs.
     pub(super) fn forget_thread(&mut self, env: &str, thread_id: &str, cx: &App) {
         let key = DrawerKey::new(env, thread_id);
-        self.panel.retain(|_, group| group.key != key);
+        self.groups_mut().retain(|_, group| group.key != key);
         if self.remove_drawer(&key) {
             self.persist(cx);
         }
