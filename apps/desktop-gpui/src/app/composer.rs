@@ -1724,7 +1724,7 @@ impl Workspace {
                     .text_color(tone)
                     .when(warning.is_some(), |el| el.icon(Icon::new(Lucide::TriangleAlert).with_size(px(12.))))
                     .label(label.to_owned())
-                    .when_some(warning, |el, warning| el.tooltip(warning))
+                    .when_some(warning, Button::tooltip)
                     .disabled(!enabled)
                     .when(!enabled, |el| el.opacity(0.64))
                     .on_click(cx.listener(move |this, _, _, cx| {

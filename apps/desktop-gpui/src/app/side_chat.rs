@@ -103,14 +103,14 @@ type Key = (SharedString, String);
 enum SideDraft {
     Prompt(String),
     /// An open question card's answers and progress; its prompt is the one it set aside.
-    Question(QuestionDraft),
+    Question(Box<QuestionDraft>),
 }
 
 impl SideDraft {
     /// What a released view keeps: its open question, else its composer's text.
     fn kept(question: Option<QuestionDraft>, text: String) -> Option<Self> {
         match question {
-            Some(question) => Some(Self::Question(question)),
+            Some(question) => Some(Self::Question(Box::new(question))),
             None => (!text.is_empty()).then_some(Self::Prompt(text)),
         }
     }
@@ -123,7 +123,7 @@ impl SideDraft {
             Self::Question(question) => {
                 let active = &question.active().id;
                 let text = question.drafts.get(active).and_then(|draft| draft.custom.clone()).unwrap_or_default();
-                (text, Some(question))
+                (text, Some(*question))
             }
         }
     }
@@ -1370,7 +1370,7 @@ mod tests {
         let key = |id: &str| (SharedString::from("e"), id.to_owned());
         let mut side_chats = SideChats::default();
         side_chats.drafts.insert(key("typed"), SideDraft::Prompt("newer".into()));
-        side_chats.drafts.insert(key("asking"), SideDraft::Question(answered_card()));
+        side_chats.drafts.insert(key("asking"), SideDraft::Question(Box::new(answered_card())));
         for id in ["typed", "asking", "empty"] {
             side_chats.give_back(key(id), "failed".into());
         }
