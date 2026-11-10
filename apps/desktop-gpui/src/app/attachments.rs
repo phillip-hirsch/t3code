@@ -786,6 +786,11 @@ impl Workspace {
                 state.set_selected_range(span, cx);
                 state.replace("", window, cx);
             }
+            // References that are plain text (rich text shows a fenced one as code) go too.
+            for range in composer_text::context_reference_removals(&state.value(), &chip_id) {
+                state.set_selected_range(range, cx);
+                state.replace("", window, cx);
+            }
         });
         self.sync_composer_empty(cx);
         cx.notify();
