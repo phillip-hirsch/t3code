@@ -1328,9 +1328,8 @@ impl Workspace {
         };
         let fixed = setting.size().map(|size| preview::fit_viewport(size, area));
         let separated = self.separated(tab);
-        if !separated {
-            self.preview.panel_view = Some((tab.clone(), fixed.map_or(1., |(_, scale)| scale)));
-        }
+        // A separated tab counts as shown, so a pick in it lasts; its window draws the page.
+        self.preview.panel_view = Some((tab.clone(), fixed.map_or(1., |(_, scale)| scale)));
         let Some(view) = view else {
             let blank = session.as_ref().is_none_or(|s| matches!(s.nav_status, NavStatus::Idle));
             return div()
