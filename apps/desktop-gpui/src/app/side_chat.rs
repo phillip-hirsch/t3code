@@ -30,6 +30,7 @@ use crate::timeline::{self, Row};
 
 /// The side chat tab on screen, subscribed while it shows.
 pub(super) struct SideChatView {
+    environment: SharedString,
     thread_id: String,
     state: ThreadState,
     pub(super) rows: Rc<[Row]>,
@@ -48,12 +49,15 @@ pub(super) struct SideChats {
     starting: bool,
     bringing_back: bool,
     deleting: bool,
-    /// Unsent composer text of side chats not on screen, by thread id.
-    drafts: HashMap<String, String>,
+    /// Unsent composer text of side chats not on screen. Ids repeat across environments.
+    drafts: HashMap<Key, String>,
     /// The parent composer's model pick for a side chat that started without a question; its
     /// first message runs on it (`setModelSelection` on the side chat's draft).
-    models: HashMap<String, ModelSelection>,
+    models: HashMap<Key, ModelSelection>,
 }
+
+/// A side chat: its environment and thread id.
+type Key = (SharedString, String);
 
 impl SideChats {
     /// Drops the side chat's stream with the socket it ran on; it subscribes again on reconnect.
@@ -65,10 +69,11 @@ impl SideChats {
 
     /// Drops what this client keeps for a deleted side chat. A view still on screen goes without
     /// saving its text, and the next sync shows the chat as deleted.
-    pub(super) fn forget(&mut self, thread_id: &str) {
-        self.drafts.remove(thread_id);
-        self.models.remove(thread_id);
-        if self.view.as_ref().is_some_and(|view| view.thread_id == thread_id) {
+    pub(super) fn forget(&mut self, env: &SharedString, thread_id: &str) {
+        let key = (env.clone(), thread_id.to_owned());
+        self.drafts.remove(&key);
+        self.models.remove(&key);
+        if self.view.as_ref().is_some_and(|view| view.environment == *env && view.thread_id == thread_id) {
             self.view = None;
         }
     }
@@ -77,10 +82,11 @@ impl SideChats {
     fn release_view(&mut self, cx: &App) {
         let Some(view) = self.view.take() else { return };
         let text = view.composer.read(cx).value().to_string();
+        let key = (view.environment, view.thread_id);
         if text.is_empty() {
-            self.drafts.remove(&view.thread_id);
+            self.drafts.remove(&key);
         } else {
-            self.drafts.insert(view.thread_id, text);
+            self.drafts.insert(key, text);
         }
     }
 }
@@ -275,7 +281,7 @@ impl Workspace {
                     None if this.target.as_ref() != Some(&origin) => delete_unused(cx),
                     None => {
                         if let Some(model) = model.filter(|_| !asked) {
-                            this.side_chat.models.insert(target.clone(), model);
+                            this.side_chat.models.insert((origin.environment().clone(), target.clone()), model);
                         }
                         this.open_surface(Surface::SideChat(target), window, cx);
                         on_started(this, window, cx);
@@ -332,7 +338,9 @@ impl Workspace {
 
     /// `releaseSurfaceResources` for a side chat: the server keeps one that ran or got a message.
     pub(super) fn release_side_chat(&mut self, thread_id: &str, cx: &mut Context<Self>) {
-        self.side_chat.models.remove(thread_id);
+        if let Some(env) = self.active_environment() {
+            self.side_chat.models.remove(&(env.clone(), thread_id.to_owned()));
+        }
         if self.shell_thread(thread_id).is_some() {
             self.dispatch(delete_command(thread_id, true), cx);
         }
@@ -340,17 +348,18 @@ impl Workspace {
 
     /// Subscribes the side chat on screen and drops the one that left it.
     pub(super) fn sync_side_chat(&mut self, shown: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
-        let client = self.client();
+        let (client, env) = (self.client(), self.active_environment().cloned());
         // While the socket is down the view keeps what it last showed.
         if let Some(view) = &self.side_chat.view
             && Some(view.thread_id.as_str()) == shown
+            && Some(&view.environment) == env.as_ref()
             && (view._subscription.is_some() || client.is_none())
         {
             return;
         }
         self.side_chat.release_view(cx);
-        let (Some(thread_id), Some(client)) = (shown, client) else { return };
-        let draft = self.side_chat.drafts.remove(thread_id).unwrap_or_default();
+        let (Some(thread_id), Some(client), Some(env)) = (shown, client, env) else { return };
+        let draft = self.side_chat.drafts.remove(&(env.clone(), thread_id.to_owned())).unwrap_or_default();
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(1, 8)
@@ -386,6 +395,7 @@ impl Workspace {
             },
         );
         self.side_chat.view = Some(SideChatView {
+            environment: env,
             thread_id: thread_id.to_owned(),
             state: ThreadState::default(),
             rows: Rc::default(),
@@ -453,7 +463,8 @@ impl Workspace {
         } else {
             self.client_settings.values.get("followUpBehavior").as_str().unwrap_or("steer")
         };
-        let model = self.side_chat.models.get(&view.thread_id);
+        let key = (view.environment.clone(), view.thread_id.clone());
+        let model = self.side_chat.models.get(&key);
         let command = turn_command(&view.thread_id, &text, running, follow_up, model);
         let (Some(client), composer) = (self.client(), view.composer.clone()) else { return };
         let thread_id = view.thread_id.clone();
@@ -465,7 +476,7 @@ impl Workspace {
             let result = client.request("orchestration.dispatchCommand", command).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 if result.is_ok() {
-                    this.side_chat.models.remove(&thread_id);
+                    this.side_chat.models.remove(&key);
                 }
                 let Some(view) = this.side_chat.view.as_mut().filter(|v| v.thread_id == thread_id) else { return };
                 view.sending = false;
@@ -926,5 +937,22 @@ mod tests {
             options: Some(vec![json!({"id": "reasoningEffort", "value": "high"})]),
         };
         assert_eq!(turn_command("t", "hi", false, "steer", Some(&model))["modelSelection"], model.to_json());
+    }
+
+    #[test]
+    fn a_deleted_side_chat_forgets_only_its_environments_draft_and_model() {
+        let (a, b) = (SharedString::from("a"), SharedString::from("b"));
+        let model = ModelSelection { instance_id: "codex".into(), model: "gpt".into(), options: None };
+        let mut side_chats = SideChats::default();
+        for env in [&a, &b] {
+            side_chats.drafts.insert((env.clone(), "side".to_owned()), format!("{env} text"));
+            side_chats.models.insert((env.clone(), "side".to_owned()), model.clone());
+        }
+        side_chats.forget(&a, "side");
+        assert_eq!(
+            side_chats.drafts.into_iter().collect::<Vec<_>>(),
+            [((b.clone(), "side".to_owned()), "b text".to_owned())]
+        );
+        assert_eq!(side_chats.models.into_keys().collect::<Vec<_>>(), [(b, "side".to_owned())]);
     }
 }

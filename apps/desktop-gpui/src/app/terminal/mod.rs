@@ -202,9 +202,14 @@ impl Terminals {
         self.focus_pending.take().filter(|(pending, _)| pending == thread_id).map(|(_, terminal_id)| terminal_id)
     }
 
-    fn drawer(&mut self, thread_id: String) -> &mut DrawerLayout {
+    /// `thread_id`'s drawer; the first environment known to use it becomes its owner.
+    fn drawer(&mut self, thread_id: String, owner: Option<&SharedString>) -> &mut DrawerLayout {
         self.drawers_changed = true;
-        self.drawers.entry(thread_id).or_default()
+        let drawer = self.drawers.entry(thread_id).or_default();
+        if drawer.owner.is_none() {
+            drawer.owner = owner.map(ToString::to_string);
+        }
+        drawer
     }
 
     fn drawer_mut(&mut self, thread_id: &str) -> Option<&mut DrawerLayout> {
@@ -233,13 +238,23 @@ impl Terminals {
     }
 
     /// `clearTerminalUiState`: a deleted thread's drawer goes back to its default.
-    pub(super) fn forget_thread(&mut self, thread_id: &str, cx: &App) {
-        if self.drawers.remove(thread_id).is_some() {
-            self.drawers_changed = true;
+    pub(super) fn forget_thread(&mut self, env: &str, thread_id: &str, cx: &App) {
+        if self.remove_owned_drawer(env, thread_id) {
             self.persist(cx);
         }
+    }
+
+    /// Drops the drawer `env` owns for `thread_id`. Ids repeat across environments, and a drawer
+    /// an older build saved names no owner, so another environment's drawer stays.
+    fn remove_owned_drawer(&mut self, env: &str, thread_id: &str) -> bool {
+        if self.drawers.get(thread_id).is_none_or(|d| d.owner.as_deref() != Some(env)) {
+            return false;
+        }
+        self.drawers.remove(thread_id);
+        self.drawers_changed = true;
         self.parked.retain(|(id, _)| id != thread_id);
         self.focus_pending.take_if(|(id, _)| id == thread_id);
+        true
     }
 
     /// The thread id the draft in `project_id` launches with, if its terminal drawer used one.
@@ -361,6 +376,13 @@ impl Workspace {
         }
     }
 
+    /// `thread_id`'s drawer, owned by the open target's environment when that shows the thread.
+    fn terminal_drawer(&mut self, thread_id: String) -> &mut DrawerLayout {
+        let shown = self.shown_terminal_thread() == Some(thread_id.as_str());
+        let owner = self.target.as_ref().filter(|_| shown).map(Target::environment).cloned();
+        self.terminals.drawer(thread_id, owner.as_ref())
+    }
+
     /// Where new terminals start: the thread's worktree, else its project root.
     fn terminal_launch(&self) -> Option<Launch> {
         let (project_id, worktree_path) = match self.target.as_ref()? {
@@ -455,7 +477,7 @@ impl Workspace {
     /// `toggleTerminalVisibility`.
     pub(super) fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(thread_id) = self.terminal_thread(true) else { return };
-        let drawer = self.terminals.drawer(thread_id.clone());
+        let drawer = self.terminal_drawer(thread_id.clone());
         if drawer.open {
             drawer.open = false;
             self.focus_composer(window, cx);
@@ -463,12 +485,12 @@ impl Workspace {
             // A setup or agent-started shell already runs: show it instead of starting another.
             match self.terminals.drawer_reuse(&thread_id) {
                 Some(id) => {
-                    self.terminals.drawer(thread_id.clone()).ensure(&id);
+                    self.terminal_drawer(thread_id.clone()).ensure(&id);
                     self.terminals.focus_later(&thread_id, &id);
                 }
                 // Without the grant the drawer opens on its empty state.
                 None if !self.terminal_operable(&thread_id) => {
-                    self.terminals.drawer(thread_id).open = true;
+                    self.terminal_drawer(thread_id).open = true;
                 }
                 None => self.launch_terminal(thread_id, Place::New, cx),
             }
@@ -482,7 +504,7 @@ impl Workspace {
 
     fn open_drawer_for_action(&mut self) -> Option<String> {
         let thread_id = self.terminal_thread(true)?;
-        self.terminals.drawer(thread_id.clone()).open = true;
+        self.terminal_drawer(thread_id.clone()).open = true;
         Some(thread_id)
     }
 
@@ -517,7 +539,7 @@ impl Workspace {
         launch.stop_on_settle = Some(run.stop_on_settle);
         let input = format!(" {}\r", run.command);
         let running: Vec<String> = self.terminals.running(&thread_id).into_iter().map(str::to_owned).collect();
-        let drawer = self.terminals.drawer(thread_id.clone());
+        let drawer = self.terminal_drawer(thread_id.clone());
         let idle: Vec<&String> = drawer.terminal_ids.iter().filter(|id| !running.contains(id)).collect();
         let reuse = idle.iter().find(|id| ***id == drawer.active_id).or(idle.first()).map(|id| (*id).clone());
         let written = match reuse.filter(|_| !run.stop_on_settle) {
@@ -556,7 +578,7 @@ impl Workspace {
             return Task::ready(false);
         }
         let terminal_id = self.next_terminal_id(&thread_id);
-        if !self.terminals.drawer(thread_id.clone()).place(&terminal_id, place) {
+        if !self.terminal_drawer(thread_id.clone()).place(&terminal_id, place) {
             return Task::ready(false);
         }
         self.open_terminal_session(thread_id, terminal_id, launch, then_write, cx)
@@ -1409,7 +1431,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.select_thread(thread_id.clone(), window, cx);
-        self.terminals.drawer(thread_id.clone()).ensure(&terminal_id);
+        self.terminal_drawer(thread_id.clone()).ensure(&terminal_id);
         self.terminals.focus_later(&thread_id, &terminal_id);
         cx.notify();
     }
@@ -1509,20 +1531,57 @@ mod tests {
     #[test]
     fn drawers_survive_a_relaunch_and_default_ones_are_not_stored() {
         let mut drawers = HashMap::new();
-        drawers.insert("closed".to_owned(), DrawerLayout::default());
-        let mut open = DrawerLayout::default();
+        let mut closed = DrawerLayout::default();
+        closed.owner = Some("a".to_owned());
+        drawers.insert("closed".to_owned(), closed.clone());
+        let mut open = closed;
         open.place("term-1", Place::New);
         drawers.insert("thread".to_owned(), open.clone());
         let stored = stored_drawers(&drawers);
         assert_eq!(stored.as_object().unwrap().keys().collect::<Vec<_>>(), ["thread"]);
+        assert_eq!(stored["thread"]["environmentId"], "a");
 
         let dir = std::env::temp_dir().join(format!("t3-gpui-terminal-state-{}", std::process::id()));
         let path = dir.join("terminal-state.json");
         assert!(read_drawers(&path).is_empty());
         crate::settings::write_atomically(&path, &stored).unwrap();
         assert_eq!(read_drawers(&path), HashMap::from([("thread".to_owned(), open)]));
+
+        // An older build's file names no owner.
+        let old = json!({"thread": {"terminalOpen": true, "terminalIds": ["term-1"], "activeTerminalId": "term-1"}});
+        crate::settings::write_atomically(&path, &old).unwrap();
+        let restored = read_drawers(&path);
+        assert_eq!(
+            (restored["thread"].owner.as_deref(), restored["thread"].terminal_ids.as_slice()),
+            (None, &["term-1".to_owned()][..])
+        );
+        assert!(stored_drawers(&restored)["thread"].get("environmentId").is_none());
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_deleted_thread_clears_only_the_drawer_its_environment_owns() {
+        let (a, b) = (SharedString::from("a"), SharedString::from("b"));
+        let mut terminals = Terminals::default();
+        terminals.drawer("mine".to_owned(), Some(&a)).place("term-1", Place::New);
+        terminals.drawer("theirs".to_owned(), Some(&b)).place("term-1", Place::New);
+        assert_eq!(
+            terminals.drawer("theirs".to_owned(), Some(&a)).owner.as_deref(),
+            Some("b"),
+            "the first owner stays"
+        );
+        let legacy: DrawerLayout = serde_json::from_value(json!({"terminalOpen": true})).unwrap();
+        terminals.drawers.insert("legacy".to_owned(), legacy.restored());
+        terminals.focus_later("mine", "term-1");
+
+        assert!(terminals.remove_owned_drawer("a", "mine"));
+        assert!(terminals.take_focus("mine").is_none());
+        assert!(!terminals.remove_owned_drawer("a", "theirs"), "a colliding id another environment owns");
+        assert!(!terminals.remove_owned_drawer("a", "legacy"), "an older build's drawer names no owner");
+        let mut left: Vec<&String> = terminals.drawers.keys().collect();
+        left.sort();
+        assert_eq!(left, ["legacy", "theirs"]);
     }
 
     #[test]
