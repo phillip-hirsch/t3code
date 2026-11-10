@@ -13,7 +13,7 @@ mod search_results;
 mod selection;
 mod update_plan;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
@@ -25,11 +25,11 @@ use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, h_flex, v_flex};
 use gpui_kit::{
-    Anchor, AnyElement, AnyView, App, AppContext as _, ClickEvent, Context, DismissEvent, DragMoveEvent, EmptyView,
-    Entity, FocusHandle, Focusable as _, Font, FontWeight, Hsla, Image, ImageFormat, InteractiveElement as _,
-    IntoElement, ParentElement as _, Pixels, Point, Render, ScrollHandle, SharedString,
+    Anchor, AnyElement, AnyView, App, AppContext as _, Bounds, ClickEvent, Context, DismissEvent, DragMoveEvent,
+    EmptyView, Entity, FocusHandle, Focusable as _, Font, FontWeight, Hsla, Image, ImageFormat,
+    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Point, Render, ScrollHandle, SharedString,
     StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledImage as _, Subscription, Task, TextRun,
-    WeakEntity, Window, anchored, deferred, div, img, prelude::FluentBuilder as _, px, rems, rgb, svg,
+    WeakEntity, Window, anchored, canvas, deferred, div, img, prelude::FluentBuilder as _, px, rems, rgb, svg,
 };
 use serde_json::json;
 
@@ -123,6 +123,12 @@ pub(super) struct SidebarState {
     /// The keyboard row, and the rows in order.
     cursor: Option<NavRow>,
     nav_rows: Vec<NavRow>,
+    /// The keyboard row as last drawn while the list held focus, where its menu key opens the menu.
+    ring_row: Option<NavRow>,
+    ring_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// The keyboard row's Discard draft button, the Tab stop after the list (`<button>` in the row).
+    row_control: FocusHandle,
+    row_control_focused: bool,
     search: Entity<InputState>,
     returns: inbox::ReturnTracker,
     /// When `_clock` wakes the sidebar: its next visible label, snooze or hold deadline.
@@ -177,6 +183,7 @@ impl SidebarState {
     pub(super) fn new(window: &mut Window, cx: &mut Context<Workspace>) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
         let list_focus = cx.focus_handle().tab_stop(true);
+        let row_control = cx.focus_handle().tab_stop(true);
         let header_focus: [FocusHandle; 3] = std::array::from_fn(|_| cx.focus_handle().tab_stop(true));
         let sheet_toggle = cx.focus_handle().tab_stop(true);
         let chrome_focus: [FocusHandle; 3] = std::array::from_fn(|_| cx.focus_handle().tab_stop(true));
@@ -187,7 +194,7 @@ impl SidebarState {
             InputEvent::Focus | InputEvent::Blur => this.notify_sidebar(cx),
             InputEvent::PressEnter { .. } => {}
         })];
-        for focus in header_focus.iter().chain(&chrome_focus).chain([&list_focus, &sheet_toggle]) {
+        for focus in header_focus.iter().chain(&chrome_focus).chain([&list_focus, &row_control, &sheet_toggle]) {
             subscriptions.push(cx.on_focus(focus, window, |this, _, cx| this.notify_sidebar(cx)));
             subscriptions.push(cx.on_blur(focus, window, |this, _, cx| this.notify_sidebar(cx)));
         }
@@ -228,6 +235,10 @@ impl SidebarState {
             search_highlight: None,
             messages: Default::default(),
             list_focus,
+            ring_row: None,
+            ring_bounds: Rc::default(),
+            row_control,
+            row_control_focused: false,
             header_focus,
             sheet_toggle,
             chrome_focus,
@@ -429,6 +440,7 @@ struct SidebarResize;
 #[derive(Clone, PartialEq, Eq)]
 enum NavRow {
     Thread(ScopedId),
+    Draft(Target),
     /// A boring sidebar folder, by group key.
     Folder(String),
     Shelf(Shelf),
@@ -505,7 +517,8 @@ impl Item<'_> {
             Item::Folder { group, .. } => Some(NavRow::Folder(group.key.clone())),
             Item::Header { shelf, .. } => Some(NavRow::Shelf(*shelf)),
             Item::ShowMore { .. } => Some(NavRow::SettledMore),
-            _ => None,
+            Item::Draft(row) => Some(NavRow::Draft(row.target.clone())),
+            Item::DraftDivider => None,
         }
     }
 }
@@ -513,12 +526,13 @@ impl Item<'_> {
 /// A card row's list item padding (`py-0.5`).
 const CARD_ITEM_INSET: f32 = 2.;
 
-/// The 2 px inset focus ring of the keyboard row.
-fn focus_ring(element: AnyElement, tokens: &Tokens) -> AnyElement {
+/// The 2 px inset focus ring of the keyboard row, which records where the row is in `bounds`.
+fn focus_ring(element: AnyElement, bounds: Rc<Cell<Option<Bounds<Pixels>>>>, tokens: &Tokens) -> AnyElement {
     div()
         .relative()
         .child(element)
         .child(div().absolute().inset_0().rounded(px(6.)).border_2().border_color(tokens.ring))
+        .child(canvas(move |row, _, _| bounds.set(Some(row)), |_, (), _, _| {}).absolute().size_full())
         .into_any_element()
 }
 
@@ -1264,9 +1278,19 @@ impl Workspace {
 
     /// Arrow keys, Home/End, Enter/Space, F2 and Left/Right on the focused list (`sidebarTree.ts`).
     fn list_key(&mut self, event: &gpui_kit::KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Keys on the row's own button are the button's.
+        if !self.sidebar.list_focus.is_focused(window) {
+            return;
+        }
         let rows = &self.sidebar.nav_rows;
         let modifiers = event.keystroke.modifiers;
         if rows.is_empty() || modifiers.control || modifiers.alt || modifiers.platform {
+            return;
+        }
+        let key = event.keystroke.key.as_str();
+        if key == "menu" || (modifiers.shift && key == "f10") {
+            self.open_row_menu_from_key(window, cx);
+            cx.stop_propagation();
             return;
         }
         let last = rows.len() - 1;
@@ -1303,6 +1327,7 @@ impl Workspace {
                 ("left", NavRow::Shelf(shelf)) if expanded(self, shelf) => self.toggle_shelf(shelf, cx),
                 ("enter" | "space", NavRow::SettledMore) => self.show_more_settled(cx),
                 ("enter" | "space", NavRow::Thread(thread)) => self.select_thread_in(thread.env, thread.id, window, cx),
+                ("enter" | "space", NavRow::Draft(draft)) => self.open_draft(draft, window, cx),
                 // `startRename` refuses a read-only connection.
                 ("f2", NavRow::Thread(thread)) => self.start_rename(&thread, MenuOrigin::Sidebar, window, cx),
                 _ => return,
@@ -1310,6 +1335,29 @@ impl Workspace {
         }
         cx.stop_propagation();
         self.notify_sidebar(cx);
+    }
+
+    /// `ContextMenu` or Shift+F10 on the keyboard row: its right-click menu, under the row's left edge
+    /// (`sidebarTree.ts`'s `onKeyUp`).
+    fn open_row_menu_from_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(row) = self.sidebar.ring_row.clone() else { return };
+        let Some(bounds) = self.sidebar.ring_bounds.get() else { return };
+        let position = bounds.bottom_left();
+        match row {
+            NavRow::Thread(key) => {
+                let Some(build) = self.shell.thread(&key).map(|thread| self.row_menu(thread, cx)) else { return };
+                self.open_menu(position, Anchor::TopLeft, window, cx, build);
+            }
+            NavRow::Draft(target) => {
+                let Some(row) = self.draft_rows().into_iter().find(|row| row.target == target) else { return };
+                let build = {
+                    let project = self.shell.project(&row.project);
+                    self.draft_menu(project, &row, cx)
+                };
+                self.open_menu(position, Anchor::TopLeft, window, cx, build);
+            }
+            NavRow::Folder(_) | NavRow::Shelf(_) | NavRow::SettledMore => {}
+        }
     }
 
     /// `/projects/$projectKey`: Settings › Projects with the group holding `project` picked,
@@ -1411,6 +1459,11 @@ impl Workspace {
     pub(super) fn render_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.load_favicons(cx);
         self.drop_unoperable_renames();
+        // The ring stays while Tab rests on the row's own button.
+        let list_focused = self.sidebar.list_focus.contains_focused(window, cx);
+        let cursor = self.sidebar.cursor.clone().filter(|_| list_focused);
+        self.sidebar.ring_row = cursor.clone();
+        self.sidebar.row_control_focused = self.sidebar.row_control.is_focused(window);
         let tokens = *crate::theme::tokens(cx);
         let sb = tokens.sidebar;
         let now = now_ms();
@@ -1447,8 +1500,6 @@ impl Workspace {
             .collect();
         let nav_rows: Vec<NavRow> = items.iter().filter_map(Item::nav_key).collect();
         let thread_order: Vec<ScopedId> = items.iter().filter_map(Item::thread_key).collect();
-        let list_focused = self.sidebar.list_focus.is_focused(window);
-        let cursor = self.sidebar.cursor.clone().filter(|_| list_focused);
         let has_rows = items.iter().any(|item| {
             matches!(item, Item::Card(_) | Item::Slim(..) | Item::Draft(_) | Item::FolderRow(_) | Item::Folder { .. })
         });
@@ -1504,7 +1555,7 @@ impl Workspace {
                         self.render_show_more(count, loading, failed, &tokens, cx)
                     }
                 };
-                list.push(if ring { focus_ring(element, &tokens) } else { element });
+                list.push(if ring { focus_ring(element, self.sidebar.ring_bounds.clone(), &tokens) } else { element });
             }
         }
         self.sidebar.inbox_order = inbox_order;
@@ -2048,10 +2099,17 @@ impl Workspace {
             }))
             .child(Icon::new(IconName::Check).size(px(14.)))
             .child("Settle");
+        // The keyboard row's Discard draft takes Tab from the list, as the web row's button does.
+        let keyboard = draft && self.sidebar.ring_row.as_ref() == Some(&NavRow::Thread(ScopedId::of_thread(thread)));
+        let control_focused = keyboard && self.sidebar.row_control_focused;
         let discard = draft.then(|| {
             let target = Target::Thread { env: thread.environment_id.clone(), id: thread.id.clone() };
+            let ring = super::chat::focus_ring(tokens);
             div()
                 .id(row_id("discard", &thread.environment_id, &thread.id))
+                .when(keyboard, |el| {
+                    el.track_focus(&self.sidebar.row_control).focus_visible(move |s| s.shadow(vec![ring]))
+                })
                 .flex()
                 .h_full()
                 .items_center()
@@ -2063,14 +2121,14 @@ impl Workspace {
                 .tooltip(tooltip("Discard draft"))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
-                    this.discard_draft(target.clone(), window, cx);
+                    this.discard_row_draft(target.clone(), window, cx);
                 }))
                 .child(Icon::new(IconName::X).size(px(14.)))
         });
         // A Woke label stays up beside the row controls: it is the button that dismisses it.
         let status_slot =
             text_xs(h_flex()).relative().ml_auto().h(px(20.)).min_w(px(32.)).flex_none().justify_end().child(
-                if hovered || menu_open {
+                if hovered || menu_open || control_focused {
                     h_flex()
                         .h_full()
                         .when(woke_status, |el| el.child(status_label))
@@ -2078,7 +2136,10 @@ impl Workspace {
                         .children(snooze)
                         .child(settle)
                 } else {
-                    h_flex().h_full().child(status_label)
+                    // Unseen until Tab reaches it, like the web's `has-[:focus-visible]` controls.
+                    let tab_stop =
+                        discard.filter(|_| keyboard).map(|el| div().absolute().right_0().opacity(0.).child(el));
+                    h_flex().h_full().child(status_label).children(tab_stop)
                 },
             );
         let meta = self.render_meta_line(&facts, tokens, cx);
