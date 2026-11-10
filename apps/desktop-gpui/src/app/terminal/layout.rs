@@ -49,10 +49,6 @@ pub(super) struct DrawerLayout {
     pub groups: Vec<Group>,
     #[serde(rename = "activeTerminalGroupId")]
     pub active_group_id: String,
-    /// The environment whose thread made the drawer; only deleting the thread there clears it.
-    /// The web keys drawers by environment and thread; older builds saved none.
-    #[serde(rename = "environmentId", skip_serializing_if = "Option::is_none")]
-    pub owner: Option<String>,
     /// Closed here; a lagging server list must not bring them back.
     #[serde(skip)]
     suppressed: HashSet<String>,
@@ -67,7 +63,6 @@ impl Default for DrawerLayout {
             active_id: String::new(),
             groups: Vec::new(),
             active_group_id: String::new(),
-            owner: None,
             suppressed: HashSet::new(),
         }
     }
@@ -87,7 +82,7 @@ fn group_id_for(terminal_id: &str, groups: &[Group]) -> String {
 impl DrawerLayout {
     /// What a relaunch restores; a default drawer is not kept (`isDefaultThreadTerminalUiState`).
     pub fn stored(&self) -> Option<&Self> {
-        let default = Self { suppressed: self.suppressed.clone(), owner: self.owner.clone(), ..Self::default() };
+        let default = Self { suppressed: self.suppressed.clone(), ..Self::default() };
         (*self != default).then_some(self)
     }
 

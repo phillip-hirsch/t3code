@@ -222,7 +222,7 @@ impl Workspace {
                         let _ = workspace.update(cx, |this, cx| {
                             if this.terminal_operable(&group.thread_id) {
                                 for id in &group.terminal_ids {
-                                    this.close_terminal(&group.thread_id, id, cx);
+                                    this.close_terminal(&this.drawer_key(&group.thread_id), id, cx);
                                 }
                             } else {
                                 this.drop_terminal_surface(surface);
