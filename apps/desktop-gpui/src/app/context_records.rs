@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use super::attachments::{Attachment, MAX_ATTACHMENTS};
 use super::composer::ComposerDraft;
-use super::draft_holder::DraftMut;
+use super::draft_holder::{DraftMut, PromptHolder};
 use super::{Target, Workspace, new_id};
 use crate::composer_context::{self, ContextRecords, Fragment, Imported};
 use crate::composer_text::{self, Chip};
@@ -131,20 +131,26 @@ impl Workspace {
         matches!(self.composer_drafts.get(target), Some(ComposerDraft::Prompt(..)))
     }
 
-    /// The records of `target`'s prompt, wherever it waits (see `draft_holder`).
+    /// Whether the editor shows `target`'s draft: its prompt, or a queued message's edit.
+    fn editor_shows(&self, target: &Target) -> bool {
+        self.editor_content_holder(target) == PromptHolder::Editor
+    }
+
+    /// The records of `target`'s editor content (the prompt, or a queued message's edit),
+    /// wherever it waits (see `draft_holder`): where [`Self::add_context_record`] put them.
     pub(super) fn draft_records(&self, target: &Target) -> Option<&ContextRecords> {
-        if self.composer_holds_prompt(target) {
+        if self.editor_shows(target) {
             return Some(&self.context.records);
         }
-        self.set_aside_prompt_ref(target).map(|(_, _, records)| records)
+        self.parked_editor_content_ref(target).map(|(_, _, records)| records)
     }
 
     /// Replaces a record `target`'s draft holds (a comment whose lines moved), keeping its chip.
     pub(super) fn replace_context_record(&mut self, target: &Target, record: Value, cx: &mut Context<Self>) {
-        let replaced = if self.composer_holds_prompt(target) {
+        let replaced = if self.editor_shows(target) {
             self.context.records.replace(record)
         } else {
-            self.set_aside_prompt(target).is_some_and(|(_, _, records)| records.replace(record))
+            self.parked_editor_content(target).is_some_and(|(_, _, records)| records.replace(record))
         };
         if replaced {
             cx.notify();
@@ -162,7 +168,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let chip = Chip::Context { kind: kind.to_owned(), id: id.to_owned(), label: String::new() }.id();
-        if self.composer_holds_prompt(target) {
+        if self.editor_shows(target) {
             // Every reference, chip or not (rich text shows a fenced one as code), in one edit.
             let removals = composer_text::context_reference_removals(&self.composer.read(cx).value(), &chip);
             if let Some(first) = removals.last().map(|range| range.start) {
@@ -172,7 +178,7 @@ impl Workspace {
             }
             self.context.records.remove(id);
             self.sync_composer_empty(cx);
-        } else if let Some((prompt, _, records)) = self.set_aside_prompt(target) {
+        } else if let Some((prompt, _, records)) = self.parked_editor_content(target) {
             for range in composer_text::context_reference_removals(prompt, &chip) {
                 prompt.replace_range(range, "");
             }

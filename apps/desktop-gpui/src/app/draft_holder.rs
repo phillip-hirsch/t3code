@@ -42,6 +42,16 @@ impl PromptHolder {
             (true, false, false) => Self::Editor,
         }
     }
+
+    /// Where the editor's content (the prompt, or a queued message's edit) waits: context
+    /// records join and are found there, as the web's `composerDraftTarget` is the edit's.
+    pub(super) fn of_editor_content(on_screen: bool, asking: bool) -> Self {
+        match (on_screen, asking) {
+            (false, _) => Self::OffScreen,
+            (true, true) => Self::Question,
+            (true, false) => Self::Editor,
+        }
+    }
 }
 
 /// What the editor's content belongs to: a target's prompt, or the queued message's edit begun
@@ -121,6 +131,30 @@ impl Workspace {
                 ComposerDraft::Prompt(prompt, kept, records) => Some((prompt.as_str(), kept.as_slice(), records)),
                 ComposerDraft::Question(question) => Some(parked(question)),
             },
+        }
+    }
+
+    /// Where `target`'s editor content waits (see [`PromptHolder::of_editor_content`]).
+    pub(super) fn editor_content_holder(&self, target: &Target) -> PromptHolder {
+        PromptHolder::of_editor_content(self.target.as_ref() == Some(target), self.question.is_some())
+    }
+
+    /// `target`'s editor content when the editor doesn't show it: parked under the question
+    /// card, or the draft off screen.
+    pub(super) fn parked_editor_content(&mut self, target: &Target) -> Option<DraftMut<'_>> {
+        match self.editor_content_holder(target) {
+            PromptHolder::Editor | PromptHolder::QueueEdit => None,
+            PromptHolder::Question => self.question.as_mut().map(QuestionDraft::prompt_mut),
+            PromptHolder::OffScreen => self.set_aside_prompt(target),
+        }
+    }
+
+    /// [`Self::parked_editor_content`], to read.
+    pub(super) fn parked_editor_content_ref(&self, target: &Target) -> Option<DraftRef<'_>> {
+        match self.editor_content_holder(target) {
+            PromptHolder::Editor | PromptHolder::QueueEdit => None,
+            PromptHolder::Question => self.question.as_ref().map(parked),
+            PromptHolder::OffScreen => self.set_aside_prompt_ref(target),
         }
     }
 
@@ -208,5 +242,15 @@ mod tests {
         assert_eq!(holder(true, true, false), QueueEdit);
         assert_eq!(holder(true, true, true), QueueEdit, "a card asked during an edit parked the edit's text");
         assert_eq!(holder(false, true, true), OffScreen);
+    }
+
+    #[test]
+    fn context_follows_the_editor_content_not_the_prompt_an_edit_set_aside() {
+        use PromptHolder::*;
+        // During an edit the prompt waits with it, but a comment joins and is found in the edit.
+        assert_eq!(PromptHolder::of(true, true, false), QueueEdit);
+        assert_eq!(PromptHolder::of_editor_content(true, false), Editor);
+        assert_eq!(PromptHolder::of_editor_content(true, true), Question, "the card parked the editor's content");
+        assert_eq!(PromptHolder::of_editor_content(false, false), OffScreen);
     }
 }
