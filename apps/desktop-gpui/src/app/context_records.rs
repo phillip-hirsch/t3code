@@ -6,7 +6,7 @@ use bytes::Bytes;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::input::InlineToken;
 use gpui_kit::component::notification::Notification;
-use gpui_kit::{App, ClipboardEntry, ClipboardItem, Context, SharedString, WeakEntity, Window};
+use gpui_kit::{App, ClipboardEntry, ClipboardItem, ClipboardString, Context, SharedString, WeakEntity, Window};
 use serde_json::{Value, json};
 
 use super::attachments::{Attachment, MAX_ATTACHMENTS};
@@ -48,9 +48,15 @@ struct CopiedAttachment {
     bytes: Bytes,
 }
 
-/// The composer's `set_copy_metadata` hook: a copy holding context chips carries their records.
-pub(super) fn copy_metadata(view: WeakEntity<Workspace>) -> impl Fn(&str, &mut Window, &mut App) -> Option<String> {
-    move |text, _, cx| view.update(cx, |this, _| this.context_fragment(text)).ok().flatten()
+/// The composer's `set_copy_item` hook: a copy holding context chips carries their records, as
+/// GPUI metadata and in the web's `text/html` flavor (`handleCopyCut`).
+pub(super) fn copy_item(view: WeakEntity<Workspace>) -> impl Fn(&str, &mut Window, &mut App) -> Option<ClipboardItem> {
+    move |text, _, cx| {
+        let fragment = view.update(cx, |this, _| this.context_fragment(text)).ok().flatten()?;
+        let html = composer_context::encode_clipboard_html(text, &fragment);
+        let entry = ClipboardString { text: text.to_owned(), metadata: Some(fragment), html: Some(html) };
+        Some(ClipboardItem { entries: vec![ClipboardEntry::String(entry)] })
+    }
 }
 
 /// `environmentContextRecord` for each machine the prompt mentions, once; a machine's chip
@@ -300,13 +306,15 @@ impl Workspace {
         })
     }
 
-    /// A paste whose clipboard entry carries copied context (`importPastedComposerText`): its
+    /// A paste whose clipboard entry carries copied context, as GPUI metadata or the web's HTML
+    /// flavor (`readPastedComposerContext`; the web's own custom format is Chromium's): its
     /// records join the draft under ids that don't collide, its chips follow them, and its
     /// attachments arrive as new ones. `false` leaves the paste to the other handlers.
     pub(super) fn paste_context(&mut self, item: &ClipboardItem, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let pasted = item.entries().iter().find_map(|entry| match entry {
             ClipboardEntry::String(text) => {
-                let fragment = composer_context::decode_fragment(text.metadata.as_deref()?)?;
+                let fragment = (text.metadata.as_deref().and_then(composer_context::decode_fragment))
+                    .or_else(|| composer_context::decode_clipboard_html(text.html.as_deref()?))?;
                 Some((text.text().to_owned(), fragment))
             }
             _ => None,

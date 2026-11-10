@@ -291,6 +291,31 @@ pub fn decode_fragment(raw: &str) -> Option<Fragment> {
     })
 }
 
+/// `encodeComposerContextClipboardHtml` for plain text: the copy's `text/html`, which carries the
+/// fragment to the web and to apps that drop custom clipboard formats.
+pub fn encode_clipboard_html(text: &str, fragment: &str) -> String {
+    let escaped = text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let encoded = crate::preview::encode_uri_component(fragment);
+    format!(r#"<pre data-t3-context-fragment="{encoded}">{escaped}</pre>"#)
+}
+
+/// `decodeComposerContextClipboardHtml`: the fragment in a pasted `text/html`'s first
+/// well-formed `data-t3-context-fragment` attribute.
+pub fn decode_clipboard_html(html: &str) -> Option<Fragment> {
+    const ATTRIBUTE: &str = "data-t3-context-fragment=";
+    // Percent encoding can expand each UTF-16 code unit to nine characters.
+    if html.encode_utf16().count() > MAX_FRAGMENT_CHARS * 9 + 4096 {
+        return None;
+    }
+    let encoded = html.match_indices(ATTRIBUTE).find_map(|(at, _)| {
+        let rest = &html[at + ATTRIBUTE.len()..];
+        let quote = rest.chars().next().filter(|c| matches!(c, '"' | '\''))?;
+        let value = &rest[1..];
+        value.find(quote).filter(|end| *end > 0).map(|end| &value[..end])
+    })?;
+    decode_fragment(&crate::thread_links::decode_uri_component(encoded)?)
+}
+
 /// `isSameComposerContextPayload`: equal but for the label and context id.
 pub fn same_payload(left: &Value, right: &Value) -> bool {
     let strip = |record: &Value| {
@@ -497,6 +522,29 @@ mod tests {
         assert_eq!(decode_fragment(&broken.to_string()).unwrap().records, fragment.records);
         assert_eq!(decode_fragment("plain text"), None);
         assert_eq!(decode_fragment(r#"{"version":1,"source":{},"records":[]}"#), None);
+    }
+
+    #[test]
+    fn the_html_flavor_carries_the_fragment_like_the_web() {
+        let mut review = record("review-comment", "rc1");
+        review["text"] = "error: can't find <module> & co".into();
+        let fragment = Fragment { environment_id: "env".into(), thread_id: None, records: vec![review] };
+        let raw = encode_fragment(&fragment).unwrap();
+        let html = encode_clipboard_html("<script> & café", &raw);
+        assert!(html.starts_with(r#"<pre data-t3-context-fragment="%7B%22version%22%3A1"#), "{html}");
+        assert!(html.ends_with(">&lt;script&gt; &amp; café</pre>"), "{html}");
+        assert_eq!(decode_clipboard_html(&html), Some(fragment.clone()));
+
+        // Another app's CF_HTML wrapper, a single-quoted attribute, and a malformed one first.
+        let quoted = crate::preview::encode_uri_component(&raw).replace('\'', "%27");
+        let wrapped = format!(
+            "Version:0.9\r\n<html><body><!--StartFragment--><p data-t3-context-fragment=x></p>\
+             <pre data-t3-context-fragment='{quoted}'>x</pre><!--EndFragment--></body></html>"
+        );
+        assert_eq!(decode_clipboard_html(&wrapped), Some(fragment));
+        assert_eq!(decode_clipboard_html(r#"<pre data-t3-context-fragment="%ZZ">bad</pre>"#), None);
+        assert_eq!(decode_clipboard_html(r#"<pre data-t3-context-fragment="">x</pre>"#), None);
+        assert_eq!(decode_clipboard_html("<p>Ordinary clipboard</p>"), None);
     }
 
     #[test]

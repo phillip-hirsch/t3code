@@ -3189,6 +3189,7 @@ impl ClipboardItem {
             entries: vec![ClipboardEntry::String(ClipboardString {
                 text,
                 metadata: Some(metadata),
+                html: None,
             })],
         }
     }
@@ -3215,7 +3216,7 @@ impl ClipboardItem {
         let mut answer = String::new();
 
         for entry in self.entries.iter() {
-            if let ClipboardEntry::String(ClipboardString { text, metadata: _ }) = entry {
+            if let ClipboardEntry::String(ClipboardString { text, .. }) = entry {
                 answer.push_str(text);
             }
         }
@@ -3247,6 +3248,14 @@ impl ClipboardItem {
             }
             _ => None,
         }
+    }
+
+    /// The HTML the item's first string entry offers beside its text.
+    pub fn html(&self) -> Option<&str> {
+        self.entries.iter().find_map(|entry| match entry {
+            ClipboardEntry::String(string) => string.html.as_deref(),
+            _ => None,
+        })
     }
 
     /// Get the item's entries
@@ -3536,6 +3545,9 @@ pub struct ClipboardString {
     pub text: String,
     /// Optional metadata associated with this clipboard string.
     pub metadata: Option<String>,
+    /// The same content as HTML, offered beside the text for other apps' rich paste
+    /// (`text/html`, `public.html`, Windows' `HTML Format`).
+    pub html: Option<String>,
 }
 
 impl ClipboardString {
@@ -3544,7 +3556,14 @@ impl ClipboardString {
         Self {
             text,
             metadata: None,
+            html: None,
         }
+    }
+
+    /// Return this clipboard string with `html` offered beside its text.
+    pub fn with_html(mut self, html: String) -> Self {
+        self.html = Some(html);
+        self
     }
 
     /// Return a new clipboard item with the metadata replaced by the given metadata,
@@ -3588,6 +3607,7 @@ impl From<String> for ClipboardString {
         Self {
             text: value,
             metadata: None,
+            html: None,
         }
     }
 }

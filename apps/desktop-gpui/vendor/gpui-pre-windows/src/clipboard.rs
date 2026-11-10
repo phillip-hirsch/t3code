@@ -28,6 +28,8 @@ static CLIPBOARD_HASH_FORMAT: LazyLock<u32> =
     LazyLock::new(|| register_clipboard_format(windows::core::w!("GPUI internal text hash")));
 static CLIPBOARD_METADATA_FORMAT: LazyLock<u32> =
     LazyLock::new(|| register_clipboard_format(windows::core::w!("GPUI internal metadata")));
+static CLIPBOARD_HTML_FORMAT: LazyLock<u32> =
+    LazyLock::new(|| register_clipboard_format(windows::core::w!("HTML Format")));
 static CLIPBOARD_SVG_FORMAT: LazyLock<u32> =
     LazyLock::new(|| register_clipboard_format(windows::core::w!("image/svg+xml")));
 static CLIPBOARD_GIF_FORMAT: LazyLock<u32> =
@@ -194,7 +196,42 @@ fn write_string(item: &ClipboardString) -> Result<()> {
         let wide: Vec<u16> = metadata.encode_utf16().chain(Some(0)).collect_vec();
         set_clipboard_bytes(&wide, *CLIPBOARD_METADATA_FORMAT)?;
     }
+    if let Some(html) = item.html.as_ref() {
+        let cf_html = to_cf_html(html);
+        set_clipboard_bytes(&[cf_html.as_bytes(), &[0]].concat(), *CLIPBOARD_HTML_FORMAT)?;
+    }
     Ok(())
+}
+
+/// `html` as `HTML Format` (CF_HTML): a header of UTF-8 byte offsets, then the markup.
+fn to_cf_html(html: &str) -> String {
+    let header = |offsets: [usize; 4]| {
+        format!(
+            "Version:0.9\r\nStartHTML:{:010}\r\nEndHTML:{:010}\r\nStartFragment:{:010}\r\nEndFragment:{:010}\r\n",
+            offsets[0], offsets[1], offsets[2], offsets[3]
+        )
+    };
+    let (prefix, suffix) = ("<html><body><!--StartFragment-->", "<!--EndFragment--></body></html>");
+    let start_html = header([0; 4]).len();
+    let start_fragment = start_html + prefix.len();
+    let end_fragment = start_fragment + html.len();
+    let end_html = end_fragment + suffix.len();
+    let header = header([start_html, end_html, start_fragment, end_fragment]);
+    format!("{header}{prefix}{html}{suffix}")
+}
+
+/// The markup of an `HTML Format` entry: from `StartHTML` to `EndHTML`, or the fragment when
+/// there is no HTML context, or everything when the header is unreadable.
+fn from_cf_html(cf_html: &str) -> &str {
+    let offset = |key: &str| -> Option<usize> {
+        let at = cf_html.find(key)? + key.len();
+        cf_html[at..].split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+    };
+    let range = (offset("StartHTML:").zip(offset("EndHTML:")))
+        .or_else(|| offset("StartFragment:").zip(offset("EndFragment:")));
+    range
+        .and_then(|(start, end)| cf_html.get(start..end.min(cf_html.len())))
+        .unwrap_or(cf_html)
 }
 
 fn write_image(item: &Image) -> Result<()> {
@@ -235,7 +272,16 @@ fn convert_to_png(bytes: &[u8], format: ImageFormat) -> Option<Vec<u8>> {
 fn read_string() -> Option<ClipboardEntry> {
     let text = get_clipboard_string(CF_UNICODETEXT.0 as u32)?;
     let metadata = read_clipboard_metadata(&text);
-    Some(ClipboardEntry::String(ClipboardString { text, metadata }))
+    let html = get_clipboard_data(*CLIPBOARD_HTML_FORMAT).map(|locked| {
+        let bytes = locked.as_bytes();
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        from_cf_html(&String::from_utf8_lossy(&bytes[..end])).to_owned()
+    });
+    Some(ClipboardEntry::String(ClipboardString {
+        text,
+        metadata,
+        html,
+    }))
 }
 
 fn read_clipboard_metadata(text: &str) -> Option<String> {
@@ -390,5 +436,30 @@ impl LockedGlobal {
 impl Drop for LockedGlobal {
     fn drop(&mut self) {
         unsafe { GlobalUnlock(self.global).ok() };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{from_cf_html, to_cf_html};
+
+    #[test]
+    fn cf_html_offsets_frame_the_markup() {
+        let html = r#"<pre data-x="é">a &amp; b</pre>"#;
+        let cf_html = to_cf_html(html);
+        let offset = |key: &str| -> usize {
+            let at = cf_html.find(key).unwrap() + key.len();
+            cf_html[at..at + 10].parse().unwrap()
+        };
+        let fragment = &cf_html[offset("StartFragment:")..offset("EndFragment:")];
+        assert_eq!(fragment, html);
+        assert_eq!(offset("EndHTML:"), cf_html.len());
+        assert_eq!(
+            from_cf_html(&cf_html),
+            format!("<html><body><!--StartFragment-->{html}<!--EndFragment--></body></html>")
+        );
+        let no_context = "Version:0.9\r\nStartHTML:-1\r\nEndHTML:-1\r\nStartFragment:0000000089\r\nEndFragment:0000000092\r\n<b>";
+        assert_eq!(from_cf_html(no_context), "<b>");
+        assert_eq!(from_cf_html("<p>no header</p>"), "<p>no header</p>");
     }
 }

@@ -136,6 +136,14 @@ its keyboard layout map (German Shift+7 is the key `7` typing `/`). Files:
 - `src/platform.rs`: the trait method.
 - `src/window.rs`: `Window::native_key`.
 
+**Clipboard text can carry HTML.** Copied composer context chips travel between the app and the
+web/Electron in the web's HTML fallback (`encodeComposerContextClipboardHtml`, a
+`data-t3-context-fragment` attribute), because the web's own `web application/x-t3-context-fragment+json`
+flavor lives in Chromium's private clipboard formats. 0.3.11's `ClipboardString` holds text and
+GPUI-only metadata. The patch, in `src/platform.rs`: a `ClipboardString::html` field with
+`with_html`, and `ClipboardItem::html`, the first string entry's HTML. Each platform below writes
+and reads it as the system's HTML flavor.
+
 The crate's tests need `--features test-support`; run them from a scratch copy outside this
 repository (`cargo test --features test-support --lib`). The copy needs the published crate's
 missing pieces: put it two levels below a folder whose `assets/fonts/ibm-plex-sans` and
@@ -170,6 +178,13 @@ for every key message. No new `unsafe`. Files:
 - `src/keyboard.rs`: `layout_char`, which lowercases `get_key_from_vkey`'s character.
 - `src/window.rs`: `WindowsWindowState::last_native_key` and `native_key`.
 
+**Clipboard text carries HTML** (see gpui-pre's patch of that name). A string entry with HTML
+also writes the registered `HTML Format` (CF_HTML: a header of UTF-8 byte offsets around the
+markup, which Chromium parses), and reading text also reads that format's markup, from `StartHTML`
+to `EndHTML` (or the fragment). It goes through the file's existing `register_clipboard_format`,
+`set_clipboard_bytes` and `get_clipboard_data`; no new `unsafe`. File: `src/clipboard.rs`
+(`to_cf_html`, `from_cf_html`, test `cf_html_offsets_frame_the_markup`).
+
 ## gpui-pre-linux 0.3.11
 
 GPUI's Linux platform (Zed's `gpui_linux`), which gpui-kit pulls in through `gpui-pre-platform`.
@@ -198,6 +213,16 @@ through xkbcommon's safe keymap API; an IBus commit sent as a key has none of th
 - `src/linux/wayland/client.rs`, `src/linux/wayland/window.rs`: `WaylandClientState::native_key`,
   set in the keyboard `Key` event, the repeat timer and `CommitString`, and `native_key`.
 
+**Clipboard text carries HTML** (see gpui-pre's patch of that name), as `text/html` (UTF-8, what
+Chromium writes and reads). No new `unsafe`. Files:
+
+- `src/linux/wayland/clipboard.rs`, `src/linux/wayland/client.rs`: the clipboard's data source
+  also offers `text/html` when the entry has HTML, and `send` answers that MIME type with it;
+  reading text also reads `text/html` when the offer has it. The primary selection stays text.
+- `src/linux/x11/clipboard.rs`, `src/linux/x11/client.rs`: the `HTML` atom; `set_text` also owns
+  `text/html` when given HTML (the clipboard passes it, the primary selection doesn't), and
+  `get_any` reads `text/html` beside the text.
+
 ## gpui-pre-macos 0.3.11
 
 GPUI's macOS platform (Zed's `gpui_macos`), which gpui-kit pulls in through `gpui-pre-platform`.
@@ -213,6 +238,11 @@ NO_MOD)`, and `handle_key_event` stores them in the window state before dispatch
   `parse_keystroke` hands back the unmodified character.
 - `src/window.rs`: `MacWindowState::native_key`, set in `handle_key_event`; `native_key`; the
   view-event caller drops the `NativeKey`.
+
+**Clipboard text carries HTML** (see gpui-pre's patch of that name), as `public.html`, named
+with `NSString::from_str` so it needs no `unsafe` extern static; `dataForType` and
+`setData_forType` are safe calls. File: `src/pasteboard.rs` (`html_type`, an HTML case in
+`test_string`).
 
 ## lb-wry 0.53.3
 
@@ -286,12 +316,12 @@ type parameter (default `EditorMode`, so editor code is unaffected), and its met
 - `src/input/mod.rs`: exports `TextareaExtras`.
 - `src/input/base/state.rs`: one test, `test_textarea_decorations_follow_edits_beside_tokens`.
 
-**Copies can carry clipboard metadata.** Copying a composer selection that holds context chips
-also copies their records (the web's custom context clipboard format), so a paste into another
-draft brings them back. 0.9.0's `Copy` and `Cut` always write plain text. The patch, in
-`src/input/base/state.rs`: `InputBaseState::set_copy_metadata` takes a function from the copied
-text to the entry's metadata, and `copy` and `cut` write `ClipboardItem::new_string_with_metadata`
-when it returns some. One test, `test_copy_and_cut_carry_the_copy_metadata`.
+**Copies can carry clipboard metadata and HTML.** Copying a composer selection that holds context
+chips also copies their records (as GPUI metadata, and in the web's HTML fallback through
+gpui-pre's clipboard HTML patch), so a paste into another draft, or into the web, brings them
+back. 0.9.0's `Copy` and `Cut` always write plain text. The patch, in `src/input/base/state.rs`:
+`InputBaseState::set_copy_item` takes a function from the copied text to the clipboard item, and
+`copy` and `cut` write it when it returns some. One test, `test_copy_and_cut_write_the_copy_item`.
 
 **A textarea can draw a presentation over its text.** The rich composer keeps its text as
 Markdown source and draws it the way the web's Tiptap editor renders it: delimiters hidden away

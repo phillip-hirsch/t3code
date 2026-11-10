@@ -449,7 +449,7 @@ impl Workspace {
             let mut state =
                 TextareaState::new(window, cx).auto_grow(2, composer::EDITOR_MAX_ROWS).submit_on_enter(true);
             state.set_scrollbar_renderer(Some(composer::editor_scrollbar()));
-            state.set_copy_metadata(context_records::copy_metadata(view));
+            state.set_copy_item(context_records::copy_item(view));
             state
         });
         let scroller = cx.new(|cx| MessageScrollerState::new(0, cx));

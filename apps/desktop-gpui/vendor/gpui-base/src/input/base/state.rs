@@ -580,7 +580,7 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(super) enable_context_menu: bool,
 
     /// Metadata for the clipboard entry `Copy` and `Cut` write, from the copied text.
-    copy_metadata: Option<Rc<dyn Fn(&str, &mut Window, &mut App) -> Option<String>>>,
+    copy_item: Option<Rc<dyn Fn(&str, &mut Window, &mut App) -> Option<ClipboardItem>>>,
 
     /// A flag to indicate if we are currently inserting a completion item.
     pub(super) completion_inserting: bool,
@@ -1050,7 +1050,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             context_menu_handler: None,
             pending_context_menu: None,
             enable_context_menu: true,
-            copy_metadata: None,
+            copy_item: None,
             completion_inserting: false,
             overlay_action_handler: None,
             silent_replace_text: false,
@@ -1077,22 +1077,19 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.enable_context_menu = enabled;
     }
 
-    /// Attaches metadata to what `Copy` and `Cut` put on the clipboard: `f` gets the
-    /// copied text and returns the entry's metadata, or `None` for plain text.
-    pub fn set_copy_metadata(
+    /// Replaces what `Copy` and `Cut` put on the clipboard (to add metadata or HTML): `f`
+    /// gets the copied text and returns the item, or `None` for plain text.
+    pub fn set_copy_item(
         &mut self,
-        f: impl Fn(&str, &mut Window, &mut App) -> Option<String> + 'static,
+        f: impl Fn(&str, &mut Window, &mut App) -> Option<ClipboardItem> + 'static,
     ) {
-        self.copy_metadata = Some(Rc::new(f));
+        self.copy_item = Some(Rc::new(f));
     }
 
-    /// The clipboard entry for copied `text`, with [`Self::set_copy_metadata`]'s metadata.
+    /// The clipboard item for copied `text`: [`Self::set_copy_item`]'s, else plain text.
     fn copied_item(&self, text: String, window: &mut Window, cx: &mut App) -> ClipboardItem {
-        let metadata = self.copy_metadata.clone().and_then(|f| f(&text, window, cx));
-        match metadata {
-            Some(metadata) => ClipboardItem::new_string_with_metadata(text, metadata),
-            None => ClipboardItem::new_string(text),
-        }
+        let item = self.copy_item.clone().and_then(|f| f(&text, window, cx));
+        item.unwrap_or_else(|| ClipboardItem::new_string(text))
     }
 
     /// Set whether search UI allows replacement, default is true.
@@ -10700,7 +10697,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn test_copy_and_cut_carry_the_copy_metadata(cx: &mut TestAppContext) {
+    fn test_copy_and_cut_write_the_copy_item(cx: &mut TestAppContext) {
         let view = InputView::build_textarea(cx, |state| state.default_value("one two"));
         let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
         cx.update(|window, cx| {
@@ -10708,7 +10705,11 @@ mod tests {
                 state.set_selected_range(0..3, cx);
                 state.copy(&Copy, window, cx);
                 assert_eq!(cx.read_from_clipboard().unwrap().metadata(), None);
-                state.set_copy_metadata(|text, _, _| (text != "two").then(|| format!("[{text}]")));
+                state.set_copy_item(|text, _, _| {
+                    let metadata = format!("[{text}]");
+                    (text != "two")
+                        .then(|| ClipboardItem::new_string_with_metadata(text.into(), metadata))
+                });
                 state.copy(&Copy, window, cx);
                 let copied = cx.read_from_clipboard().unwrap();
                 assert_eq!(copied.text().as_deref(), Some("one"));
