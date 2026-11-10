@@ -834,6 +834,7 @@ impl Workspace {
             return None;
         }
         let restoring = self.banners.restoring_branch.as_ref() == Some(&key);
+        let can_restore = self.permits_restore_branch(&branch);
         let tooltip: SharedString =
             format!("This thread last ran on {branch}. Sending will continue on {current}.").into();
         let title = h_flex()
@@ -864,7 +865,7 @@ impl Workspace {
                     .ghost()
                     .xsmall()
                     .label(if restoring { "Restoring..." } else { "Restore branch" })
-                    .disabled(restoring)
+                    .disabled(restoring || !can_restore)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.request_restore_thread_branch(restore_key.clone(), branch.clone(), window, cx);
                     })),
@@ -901,7 +902,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.can_write_source_control() {
+        if !self.permits_restore_branch(&branch) {
             return;
         }
         if !self.vcs.status.as_ref().is_some_and(|status| status.local.has_working_tree_changes) {
@@ -940,11 +941,17 @@ impl Workspace {
         .detach();
     }
 
+    /// `permissionAtom` for the `vcs.switchRef` Restore branch sends on the open thread's project.
+    fn permits_restore_branch(&self, branch: &str) -> bool {
+        let (Some(env), Some(project)) = (self.active_environment(), self.target_project()) else { return false };
+        self.env_permits(env, "vcs.switchRef", &json!({"cwd": project.workspace_root, "refName": branch}))
+    }
+
     /// `handleSwitchCheckoutToThread`: checks the branch out again, then points the thread at it.
     fn restore_thread_branch(&mut self, key: String, branch: String, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(client), Some(thread)) = (self.client(), self.open_shell_thread()) else { return };
         let Some(cwd) = self.target_project().map(|p| p.workspace_root.clone()) else { return };
-        if self.banners.restoring_branch.is_some() {
+        if self.banners.restoring_branch.is_some() || !self.permits_restore_branch(&branch) {
             return;
         }
         let (thread_id, thread_branch) = (thread.id.clone(), thread.branch.clone());
