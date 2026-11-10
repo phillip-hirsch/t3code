@@ -829,7 +829,12 @@ impl Workspace {
                 let result = client.request("preview.close", input).await;
                 let Err(error) = result else {
                     if let Some(snapshot) = snapshot {
-                        let _ = this.update_in(cx, |this, _, _| this.remember_closed_browser(&tab.thread, &snapshot));
+                        let _ = this.update_in(cx, |this, _, cx| {
+                            this.remember_closed_browser(&tab.thread, &snapshot);
+                            // The first closed view adds Reopen Closed Tab to what a focused page forwards.
+                            this.sync_page_chords(cx);
+                            cx.notify();
+                        });
                     }
                     return;
                 };
