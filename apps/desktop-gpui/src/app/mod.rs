@@ -126,7 +126,6 @@ impl RunInTerminal {
     }
 }
 pub use terminal::key_bindings as terminal_key_bindings;
-pub use titlebar::TRAFFIC_LIGHTS;
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
@@ -1330,6 +1329,7 @@ impl Render for Workspace {
                 this.snap_shot_record_modifiers(event, cx);
                 this.quit_modifiers_changed(event, cx);
             }))
+            .when(!cfg!(target_os = "macos"), |el| el.child(menu::wheel_zoom_listener(self.image_viewer_open())))
             .child(
                 h_flex()
                     .size_full()
