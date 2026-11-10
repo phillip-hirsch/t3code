@@ -199,7 +199,8 @@ impl Workspace {
                         .await
                         .is_ok_and(|projection| projection["thread"]["deletedAt"].is_null());
                     let _ = this.update_in(cx, |this, window, cx| {
-                        if found {
+                        // The environment may have been removed while the lookup ran.
+                        if found && this.session(&environment_id).is_some() {
                             this.open_linked_thread(environment_id.into(), thread_id, &query, window, cx);
                         } else {
                             toast_error(window, cx, "Could not open the link", "This thread is not on this machine.");

@@ -145,7 +145,7 @@ impl Workspace {
 
     /// The open target lives on the primary environment (or nothing is open).
     pub(super) fn target_on_primary(&self) -> bool {
-        self.active_index() == PRIMARY
+        self.active_index() == Some(PRIMARY)
     }
 
     /// The footer status of the saved environment the open target lives on, read as the
@@ -165,18 +165,19 @@ impl Workspace {
         }
     }
 
-    /// The open target's session's index, so callers can borrow it beside other fields.
-    pub(super) fn active_index(&self) -> usize {
-        self.target.as_ref().and_then(|t| self.session_index(t.environment())).unwrap_or(PRIMARY)
+    /// The open target's session's index, so callers can borrow it beside other fields; `None`
+    /// once the target's environment is gone. See [`target_session_index`].
+    pub(super) fn active_index(&self) -> Option<usize> {
+        target_session_index(&self.sessions, self.target.as_ref().map(|t| t.environment().as_ref()))
     }
 
-    fn active_env_session(&self) -> &EnvironmentSession {
-        &self.sessions[self.active_index()]
+    fn active_env_session(&self) -> Option<&EnvironmentSession> {
+        Some(&self.sessions[self.active_index()?])
     }
 
-    /// The open target's environment's server config.
+    /// The open target's environment's server config, or an empty one once that environment is gone.
     pub(super) fn server_info(&self) -> &ServerInfo {
-        &self.active_env_session().server_info
+        self.active_env_session().map_or(&self.unscoped_server_info, |session| &session.server_info)
     }
 
     /// One environment's config, to apply what it saved.
@@ -212,7 +213,7 @@ impl Workspace {
 
     /// The open target's environment's socket.
     pub(super) fn client(&self) -> Option<RpcClient> {
-        self.active_env_session().client.clone()
+        self.active_env_session()?.client.clone()
     }
 
     pub(super) fn env_client(&self, environment_id: &str) -> Option<RpcClient> {
@@ -226,7 +227,7 @@ impl Workspace {
 
     /// The open target's environment's address, for its HTTP routes (`/api/auth/*`).
     pub(super) fn endpoint(&self) -> Option<&Endpoint> {
-        self.active_env_session().endpoint.as_ref()
+        self.active_env_session()?.endpoint.as_ref()
     }
 
     /// The connected server's HTTP origin, for its routes and signed asset URLs.
@@ -638,6 +639,15 @@ impl Workspace {
     }
 }
 
+/// The open target's session: its environment's, none once that one is gone (never another
+/// environment's same-id thread); the primary only when nothing is open.
+fn target_session_index(sessions: &[EnvironmentSession], target: Option<&str>) -> Option<usize> {
+    match target {
+        None => Some(PRIMARY),
+        Some(environment) => sessions.iter().position(|session| session.is(environment)),
+    }
+}
+
 /// `resolveAccessEnvironmentId`: the picked environment while it is listed, else the primary.
 pub(super) fn access_session_index(sessions: &[EnvironmentSession], selected: Option<&str>) -> usize {
     selected.and_then(|id| sessions.iter().position(|session| session.is(id))).unwrap_or(PRIMARY)
@@ -702,6 +712,15 @@ mod tests {
         assert_eq!(scratch_environment_of(&sessions, Some("remote")), Some(primary));
         let sessions = [session(&"primary".into(), false), session(&remote, true)];
         assert_eq!(scratch_environment_of(&sessions, Some("remote")), Some(remote));
+    }
+
+    #[test]
+    fn a_target_whose_session_left_resolves_to_no_session() {
+        let sessions = [EnvironmentSession::saved("primary".into()), EnvironmentSession::saved("remote".into())];
+        assert_eq!(target_session_index(&sessions, None), Some(PRIMARY));
+        assert_eq!(target_session_index(&sessions, Some("remote")), Some(1));
+        assert_eq!(target_session_index(&sessions, Some("primary")), Some(PRIMARY));
+        assert_eq!(target_session_index(&sessions, Some("removed")), None);
     }
 
     #[test]
