@@ -253,8 +253,8 @@ impl Workspace {
                             el.border_color(t.border).text_color(t.muted_foreground).child((index + 1).to_string())
                         }
                     });
-                h_flex()
-                    .id(ElementId::Name(format!("pr-guide-rail-{index}").into()))
+                let row = h_flex().id(ElementId::Name(format!("pr-guide-rail-{index}").into()));
+                crate::app::chat::focusable(row, t)
                     .w_full()
                     .items_start()
                     .gap(px(8.))
@@ -621,8 +621,8 @@ impl Workspace {
                 let patch = panel.guide_diff.files.get(path);
                 let stat = patch.map(diff_logic::FilePatch::stat);
                 let key = path.clone();
-                let trigger = h_flex()
-                    .id(ElementId::Name(format!("pr-guide-file:{path}").into()))
+                let trigger = h_flex().id(ElementId::Name(format!("pr-guide-file:{path}").into()));
+                let trigger = crate::app::chat::focusable(trigger, t)
                     .w_full()
                     .min_w_0()
                     .gap(px(8.))
@@ -712,8 +712,8 @@ impl Workspace {
                     return div().text_sm().text_color(t.foreground).child(question.clone()).into_any_element();
                 }
                 let asked = question.clone();
-                h_flex()
-                    .id(ElementId::Name(format!("pr-guide-q-{index}-{i}").into()))
+                let row = h_flex().id(ElementId::Name(format!("pr-guide-q-{index}-{i}").into()));
+                crate::app::chat::focusable(row, t)
                     .items_start()
                     .gap(px(8.))
                     .px(px(12.))
