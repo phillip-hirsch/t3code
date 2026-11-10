@@ -1551,6 +1551,21 @@ impl Workspace {
         self.terminals.focus_later(&key, &terminal_id);
         cx.notify();
     }
+
+    /// The setup card's "Open terminal" (`openSetupTerminal`): the setup's terminal in the drawer
+    /// of its thread on its environment.
+    pub(in crate::app) fn open_worktree_setup_terminal(
+        &mut self,
+        env: &str,
+        thread_id: &str,
+        terminal_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let key = DrawerKey::new(env, thread_id);
+        self.terminals.drawer(&key).ensure(terminal_id);
+        self.terminals.focus_later(&key, terminal_id);
+        cx.notify();
+    }
 }
 
 /// What a session sidebar lists: the drawer's groups, or a panel tab's one group.
