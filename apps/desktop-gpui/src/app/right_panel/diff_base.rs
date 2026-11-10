@@ -401,7 +401,8 @@ impl Workspace {
                 .child(div().flex_1().min_w_0().truncate().child(choice.label.clone()))
                 .child(div().w(px(32.)).flex_none().flex().justify_end().map(|el| {
                     match both {
-                        Some((next, focus)) => el.child(
+                        Some((next, focus)) => el.child({
+                            let ring = tokens.ring;
                             div()
                                 .id(ElementId::Name(format!("diff-base-remote-{}", choice.label).into()))
                                 .track_focus(&focus)
@@ -409,18 +410,15 @@ impl Workspace {
                                 .m(px(-1.))
                                 .rounded_full()
                                 .border_1()
-                                .border_color(if focus.is_focused(window) {
-                                    tokens.ring
-                                } else {
-                                    gpui_kit::transparent_black()
-                                })
+                                .border_color(gpui_kit::transparent_black())
+                                .focus_visible(move |s| s.border_color(ring))
                                 .child(switch(use_remote, tokens))
                                 .tooltip(move |window, cx| Tooltip::new("Use remote version").build(window, cx))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
                                     this.select_base_ref(Some(next.clone()), cx);
-                                })),
-                        ),
+                                }))
+                        }),
                         None if remote_only => el.child(
                             div()
                                 .id(ElementId::Name(format!("diff-base-remote-only-{}", choice.label).into()))

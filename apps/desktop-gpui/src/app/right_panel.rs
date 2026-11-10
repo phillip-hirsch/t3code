@@ -455,6 +455,8 @@ pub(super) struct RightPanel {
     commits: Option<(CommitsSource, Result<CommitList, SharedString>)>,
     /// The tab strip, and the tab it last scrolled into view.
     tabs_scroll: ScrollHandle,
+    /// The diff header's commit SHA link, a Tab stop as the web's `<a>` is.
+    commit_link_focus: FocusHandle,
     /// The diff header's refs area, measured for its narrow form (`@max-[20rem]/diff-refs`).
     diff_refs: ScrollHandle,
     /// A frame was already spent waiting for `diff_refs` to be measured; zero after that is a real width.
@@ -529,6 +531,7 @@ impl RightPanel {
             git_diff_shown: false,
             commits: None,
             tabs_scroll: ScrollHandle::new(),
+            commit_link_focus: cx.focus_handle().tab_stop(true),
             diff_refs: ScrollHandle::new(),
             diff_refs_waited: std::cell::Cell::new(false),
             revealed_tab: None,
@@ -2630,7 +2633,8 @@ impl Workspace {
         let header_sha = match &scope {
             DiffScope::Commit(sha) => {
                 let url = identity.as_ref().and_then(|identity| commit_link::commit_url(identity, sha));
-                Some(commit_sha_link("diff-commit-sha", sha, url, &view, None, tokens))
+                let focus = Some(self.right_panel.commit_link_focus.clone());
+                Some(commit_sha_link("diff-commit-sha", sha, url, &view, None, focus, tokens))
             }
             _ => None,
         };
@@ -3470,22 +3474,32 @@ fn wait_for_measure(width: Pixels, waited: &std::cell::Cell<bool>) -> bool {
 /// A 28px ghost icon toggle (`Toggle variant="ghost" size="sm"` / `Button size="icon-sm"`).
 /// A commit's short SHA (`font-mono text-xs text-muted-foreground`), underlined as a link to
 /// its host's page when it has one; the link opens without picking the commit, and closes
-/// `menu` when it sits in one.
+/// `menu` when it sits in one. With `focus`, it is a Tab stop that Enter opens.
 fn commit_sha_link(
     id: impl Into<ElementId>,
     sha: &str,
     url: Option<String>,
     view: &Entity<Workspace>,
     menu: Option<gpui_kit::WeakEntity<PopupMenu>>,
+    focus: Option<FocusHandle>,
     tokens: &Tokens,
 ) -> AnyElement {
     let short: SharedString = sha.chars().take(7).collect::<String>().into();
     let base =
         div().id(id.into()).flex_none().font_family(tokens.fonts.mono).text_xs().text_color(tokens.muted_foreground);
     let Some(url) = url else { return base.child(short).into_any_element() };
-    let (view, tip) = (view.clone(), SharedString::from(url.clone()));
+    let (view, tip, ring) = (view.clone(), SharedString::from(url.clone()), tokens.ring);
     base.underline()
         .cursor_pointer()
+        .when_some(focus, |el, focus| {
+            // The ring sits outside the text without moving it.
+            el.track_focus(&focus)
+                .m(px(-1.))
+                .border_1()
+                .rounded_sm()
+                .border_color(gpui_kit::transparent_black())
+                .focus_visible(move |s| s.border_color(ring))
+        })
         .child(short)
         .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
         .on_click(move |event, window, cx| {
@@ -3519,6 +3533,7 @@ impl CommitRow {
             self.url.clone(),
             &self.view,
             Some(self.menu.clone()),
+            None,
             tokens,
         );
         h_flex()
