@@ -5,7 +5,8 @@
 //!
 //! `client()`, `server_info()` and `endpoint()` resolve the open target's environment, so code
 //! about the open thread or draft needs no environment of its own; code acting on a listed
-//! thread or project resolves that item's environment (`thread_client`, `project_client`).
+//! thread or project passes that item's environment (`env_client`): ids repeat across
+//! environments, so there is no lookup by a bare thread or project id.
 
 use std::mem;
 
@@ -218,45 +219,9 @@ impl Workspace {
         self.session(environment_id)?.client.clone()
     }
 
-    /// The environment of a listed thread, else the open target's.
-    pub(super) fn thread_environment(&self, thread_id: &str) -> Option<SharedString> {
-        self.shell.thread_environment(thread_id).or_else(|| self.active_environment()).cloned()
-    }
-
-    /// The environment of a listed project, else the open target's.
-    pub(super) fn project_environment(&self, project_id: &str) -> Option<SharedString> {
-        self.shell.project_environment(project_id).or_else(|| self.active_environment()).cloned()
-    }
-
-    /// The socket of the environment a listed thread lives on.
-    pub(super) fn thread_client(&self, thread_id: &str) -> Option<RpcClient> {
-        self.env_client(&self.thread_environment(thread_id)?)
-    }
-
-    /// The socket of the environment a listed project lives on.
-    pub(super) fn project_client(&self, project_id: &str) -> Option<RpcClient> {
-        self.env_client(&self.project_environment(project_id)?)
-    }
-
     /// One environment's address, for its HTTP routes.
     pub(super) fn env_endpoint(&self, environment_id: &str) -> Option<&Endpoint> {
         self.session(environment_id)?.endpoint.as_ref()
-    }
-
-    /// The address of the environment a listed project lives on.
-    pub(super) fn project_endpoint(&self, project_id: &str) -> Option<&Endpoint> {
-        self.env_endpoint(&self.project_environment(project_id)?)
-    }
-
-    /// The socket for an orchestration command: its thread's environment, else its project's.
-    pub(super) fn command_client(&self, command: &Value) -> Option<RpcClient> {
-        if let Some(thread_id) = command.get("threadId").and_then(Value::as_str) {
-            return self.thread_client(thread_id);
-        }
-        match command.get("projectId").and_then(Value::as_str) {
-            Some(project_id) => self.project_client(project_id),
-            None => self.client(),
-        }
     }
 
     /// The open target's environment's address, for its HTTP routes (`/api/auth/*`).
@@ -612,12 +577,6 @@ impl Workspace {
     }
 
     /// A removed project's drafts go with it, the open one too.
-    pub(super) fn forget_project_drafts(&mut self, project_id: &str, cx: &mut Context<Self>) {
-        let Some(env) = self.project_environment(project_id) else { return };
-        self.forget_scoped_project_drafts(&ScopedId::new(env, project_id), cx);
-    }
-
-    /// [`Self::forget_project_drafts`] for a project the shell may no longer list.
     pub(super) fn forget_scoped_project_drafts(&mut self, project: &ScopedId, cx: &mut Context<Self>) {
         let of_project = |target: &Target| match target {
             Target::Draft { env, project_id, .. } => *env == project.env && *project_id == project.id,
@@ -629,11 +588,6 @@ impl Workspace {
         }
         self.drafts.forget_project(project);
         self.drafts_changed(cx);
-    }
-
-    /// A listed thread as a target, on its environment.
-    pub(super) fn thread_target(&self, thread_id: &str) -> Option<Target> {
-        Some(Target::Thread { env: self.thread_environment(thread_id)?, id: thread_id.to_owned() })
     }
 
     /// The session a settings page reads and its environment-wide controls act on: the

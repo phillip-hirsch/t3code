@@ -660,7 +660,7 @@ impl Workspace {
             shortcut_label_for_command,
         };
         let project = self.target_project()?;
-        let project_id = project.id.clone();
+        let (project_key, project_id) = (crate::model::ScopedId::of_project(project), project.id.clone());
         let saved = resolve_project_scripts(&self.server_info().settings, project);
         // `useT3ProjectFileScripts` on the thread's checkout and machine; read on first sight.
         let checkout = self.active_environment().cloned().zip(self.git_cwd());
@@ -686,13 +686,13 @@ impl Workspace {
                     .child(div().ml(px(2.)).truncate().child("Add project script"))
                     .tooltip(|window, cx| Tooltip::new("Add project script").build(window, cx))
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_project_script_editor(&project_id, None, window, cx);
+                        this.open_project_script_editor(&project_key, None, window, cx);
                     }))
                     .into_any_element(),
             );
         }
         let primary = primary_script(&saved, self.last_invoked_script(&project_id))
-            .map(|script| (SharedString::from(script.name.clone()), ScriptRun::new(&project_id, script)));
+            .map(|script| (SharedString::from(script.name.clone()), ScriptRun::new(&project_key, script)));
         let keybindings = self.server_info().keybindings_json();
         let scripts: Vec<ScriptItem> = saved
             .iter()
@@ -702,7 +702,7 @@ impl Workspace {
                 icon: script.icon.clone(),
                 shortcut: shortcut_label_for_command(keybindings, command_for_project_script(&script.id).as_deref())
                     .map(Into::into),
-                run: ScriptRun::new(&project_id, script),
+                run: ScriptRun::new(&project_key, script),
             })
             .collect();
         // `scriptItems`: the scripts, then the `t3.json` ones to import, then "Add project script".
@@ -726,7 +726,7 @@ impl Workspace {
                 menu = menu.label("From t3.json");
             }
             for input in &importable {
-                let (pid, input) = (project_id.clone(), input.clone());
+                let (pid, input) = (project_key.clone(), input.clone());
                 let name = SharedString::from(input.name.clone());
                 menu = menu.item(
                     PopupMenuItem::element(move |_, cx| {
@@ -743,7 +743,7 @@ impl Workspace {
                     })),
                 );
             }
-            let pid = project_id.clone();
+            let pid = project_key.clone();
             menu.item(PopupMenuItem::new("Add project script").icon(icon("icons/plus.svg")).on_click(
                 window.listener_for(&view, move |this, _, window, cx| {
                     this.open_project_script_editor(&pid, None, window, cx);
@@ -792,7 +792,7 @@ impl Workspace {
     /// Scripts run in the thread's terminal; the terminal drawer owns `RunInTerminal`.
     fn run_project_script(&mut self, run: &ScriptRun, window: &mut Window, cx: &mut Context<Self>) {
         let Some(cwd) = self.git_cwd().filter(|_| self.can_run_scripts()) else { return };
-        self.remember_script(&run.project_id, &run.id);
+        self.remember_script(&run.project.id, &run.id);
         window.dispatch_action(Box::new(super::RunInTerminal::script(cwd, &run.script)), cx);
     }
 
@@ -1779,6 +1779,7 @@ impl Workspace {
 
     /// `stopThreadSession`: detaches every provider session of the open thread.
     fn detach_provider_sessions(&mut self, cx: &mut Context<Self>) {
+        let Some(Target::Thread { env, .. }) = self.target.clone() else { return };
         let Some(projection) = self.open_projection() else { return };
         let thread_id = projection.thread.id.clone();
         let command_id = new_id();
@@ -1796,7 +1797,7 @@ impl Workspace {
             })
             .collect();
         for command in commands {
-            self.dispatch(command, cx);
+            self.dispatch(&env, command, cx);
         }
     }
 
@@ -2270,12 +2271,12 @@ fn script_item_row(
     popup: &gpui_kit::Entity<PopupMenu>,
 ) -> impl Fn(&mut Window, &mut App) -> AnyElement + 'static {
     let (label, name, shortcut) = (item.label.clone(), item.name.clone(), item.shortcut.clone());
-    let (project_id, script_id) = (item.run.project_id.clone(), item.run.id.clone());
+    let (project, script_id) = (item.run.project.clone(), item.run.id.clone());
     let (view, popup) = (view.clone(), popup.clone());
     move |_, cx| {
         let tokens = *theme::tokens(cx);
         let group: SharedString = format!("details-script-{script_id}").into();
-        let (view, popup, project_id, script_id) = (view.clone(), popup.clone(), project_id.clone(), script_id.clone());
+        let (view, popup, project, script_id) = (view.clone(), popup.clone(), project.clone(), script_id.clone());
         let tooltip: SharedString = format!("Edit {name}").into();
         let edit = div()
             .id(ElementId::Name(format!("{group}-edit").into()))
@@ -2293,7 +2294,7 @@ fn script_item_row(
             .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
             .on_click(move |_, window, cx| {
                 cx.stop_propagation();
-                view.update(cx, |this, cx| this.open_project_script_editor(&project_id, Some(&script_id), window, cx));
+                view.update(cx, |this, cx| this.open_project_script_editor(&project, Some(&script_id), window, cx));
                 popup.update(cx, |_, cx| cx.emit(gpui_kit::DismissEvent));
             });
         h_flex()
@@ -2323,15 +2324,15 @@ fn script_item_row(
 
 #[derive(Clone)]
 struct ScriptRun {
-    project_id: String,
+    project: crate::model::ScopedId,
     id: String,
     /// The whole script, so its run keeps `stopOnSettle` and its preview settings.
     script: std::rc::Rc<ProjectScript>,
 }
 
 impl ScriptRun {
-    fn new(project_id: &str, script: &ProjectScript) -> Self {
-        Self { project_id: project_id.to_owned(), id: script.id.clone(), script: std::rc::Rc::new(script.clone()) }
+    fn new(project: &crate::model::ScopedId, script: &ProjectScript) -> Self {
+        Self { project: project.clone(), id: script.id.clone(), script: std::rc::Rc::new(script.clone()) }
     }
 }
 

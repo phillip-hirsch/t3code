@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 
 use super::{Connection, Target, Workspace, new_id};
 use crate::environments::{Presented, SavedEnvironment};
-use crate::model::{Provider, ThreadShell};
+use crate::model::{Provider, ScopedId, ThreadShell};
 use crate::theme::Tokens;
 use crate::timestamp::parse_ms;
 
@@ -1033,12 +1033,13 @@ impl Workspace {
             } else {
                 "Snooze until reset"
             };
-            let (thread_id, run_id, reset_at) = (thread.id.clone(), state.run_id.clone(), state.reset_at.clone());
+            let (thread_key, run_id, reset_at) =
+                (ScopedId::of_thread(thread), state.run_id.clone(), state.reset_at.clone());
             let update =
                 move |field: &'static str, value: bool| json!({"runId": run_id, "resetAt": reset_at, field: value});
             let (resume_update, snooze_update) =
                 (update("autoResume", !state.scheduled), update("snooze", !state.snoozed));
-            let (resume_thread, snooze_thread) = (thread_id.clone(), thread_id);
+            let (resume_thread, snooze_thread) = (thread_key.clone(), thread_key);
             let snooze_blocked = state.reset_passed && !state.snoozed;
             let resume_view = workspace.clone();
             let on_resume = move |window: &mut Window, cx: &mut gpui_kit::App| {
@@ -1097,13 +1098,13 @@ impl Workspace {
     /// `thread.metadata.update` with a `limitRecovery` change (`RecoveryActions.toggle`).
     fn update_limit_recovery(
         &mut self,
-        thread_id: &str,
+        thread: &ScopedId,
         update: Value,
         snooze: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(client) = self.thread_client(thread_id) else { return };
+        let Some(client) = self.env_client(&thread.env) else { return };
         let reset_passed =
             update["resetAt"].as_str().and_then(parse_ms).is_none_or(|reset| reset <= crate::timestamp::now_ms());
         if snooze && update["snooze"] == true && reset_passed {
@@ -1118,7 +1119,7 @@ impl Workspace {
         let command = json!({
             "type": "thread.metadata.update",
             "commandId": new_id(),
-            "threadId": thread_id,
+            "threadId": thread.id,
             "limitRecovery": update,
         });
         cx.spawn_in(window, async move |this, cx| {

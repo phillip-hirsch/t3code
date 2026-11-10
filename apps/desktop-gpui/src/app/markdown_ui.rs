@@ -93,23 +93,23 @@ impl Workspace {
         if !is_web_link(url) {
             return false;
         }
-        let in_preview = self.preview_thread_id().map(str::to_owned);
         let in_browser = self.preview_thread();
-        let thread_link = in_preview.as_deref().and_then(|thread_id| {
-            let thread = self.shell_thread(thread_id)?;
+        let thread_link = in_browser.as_ref().and_then(|open| {
+            let key = crate::model::ScopedId::new(open.environment.clone(), open.thread_id.as_str());
+            let thread = self.shell.thread(&key)?;
             let env = &thread.environment_id;
             let supported =
                 self.can_operate(env) && self.env_info(env).is_some_and(|info| info.capabilities.is_object());
-            Some((thread_id.to_owned(), pr_link_state(url, &thread.pull_requests).filter(|_| supported)?))
+            Some((key, pr_link_state(url, &thread.pull_requests).filter(|_| supported)?))
         });
         let view = cx.weak_entity();
         let url = url.to_owned();
         self.open_chat_menu(pane, position, window, cx, move |mut menu, _, _| {
-            if let Some((thread_id, linked)) = thread_link {
+            if let Some((thread, linked)) = thread_link {
                 let (view, url) = (view.clone(), url.clone());
                 let label = if linked { "Unlink from thread" } else { "Link to thread" };
                 menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
-                    let _ = view.update(cx, |w, cx| w.change_pr_link_by_url(&thread_id, &url, !linked, window, cx));
+                    let _ = view.update(cx, |w, cx| w.change_pr_link_by_url(&thread, &url, !linked, window, cx));
                 }));
             }
             if let Some(thread) = in_browser {
@@ -131,18 +131,17 @@ impl Workspace {
     /// `pullRequestLinking.changeLink`: links or unlinks the change request `url` names.
     fn change_pr_link_by_url(
         &mut self,
-        thread_id: &str,
+        thread: &crate::model::ScopedId,
         url: &str,
         linked: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let environment = self.thread_environment(thread_id);
-        if !environment.is_some_and(|environment| self.can_operate(&environment)) {
+        if !self.can_operate(&thread.env) {
             return;
         }
         let (Some(client), Some(mut command)) =
-            (self.thread_client(thread_id), pr_link_command(thread_id, url, linked))
+            (self.env_client(&thread.env), pr_link_command(&thread.id, url, linked))
         else {
             return;
         };

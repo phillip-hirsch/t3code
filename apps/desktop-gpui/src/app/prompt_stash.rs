@@ -393,7 +393,7 @@ impl Workspace {
         if self.palette.is_some() || self.page.is_some() || self.settings.is_some() {
             return;
         }
-        if self.thread.as_ref().is_some_and(|t| self.rewinding.contains(&t.id)) {
+        if self.target_rewinding() {
             return;
         }
         if self.question.is_some() {
@@ -501,7 +501,7 @@ impl Workspace {
     /// `restoreStashEntry`: the prompt goes after the composer's text, its attachments
     /// after the composer's, up to the attachment limit.
     fn restore_stash_entry(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.target.is_none() || self.thread.as_ref().is_some_and(|t| self.rewinding.contains(&t.id)) {
+        if self.target.is_none() || self.target_rewinding() {
             return;
         }
         if self.prompt_stash.busy {

@@ -12,6 +12,7 @@ use gpui_kit::{
 
 use super::titlebar::{self, CAPTION_BUTTONS_WIDTH, RIGHT_RESIZE_INSET, TITLEBAR_HEIGHT, icon};
 use super::{Target, Workspace};
+use crate::model::ScopedId;
 use crate::theme;
 
 impl Workspace {
@@ -46,23 +47,23 @@ impl Workspace {
         }
         let mut link_origin: Option<SharedString> = None;
         let (project, title, parent) = match &self.target {
-            Some(Target::Thread { id, .. }) => {
-                let shell = self.shell.threads.iter().find(|thread| &thread.id == id);
+            Some(Target::Thread { env, id }) => {
+                let shell = self.shell.thread(&ScopedId::new(env.clone(), id.as_str()));
                 let projection = self.thread.as_ref().and_then(|t| t.state.projection.as_ref());
                 let title: SharedString = shell
                     .map(|thread| thread.title.clone())
                     .or_else(|| projection.map(|p| p.thread.title.clone()))
                     .unwrap_or_default()
                     .into();
-                let project = shell.and_then(|thread| self.shell.projects.iter().find(|p| p.id == thread.project_id));
+                let project = shell.and_then(|thread| self.shell.project(&ScopedId::thread_project(thread)));
                 let parent = shell
                     .and_then(|thread| thread.lineage.parent_thread_id.as_ref())
-                    .and_then(|parent| self.shell.threads.iter().find(|thread| &thread.id == parent));
+                    .and_then(|parent| self.shell.thread(&ScopedId::new(env.clone(), parent.as_str())));
                 link_origin = shell.and_then(|thread| thread.link_origin.as_ref()).map(|o| o.label.clone().into());
                 (project, title, parent)
             }
-            Some(Target::Draft { project_id, .. }) => {
-                (self.shell.projects.iter().find(|p| &p.id == project_id), "New thread".into(), None)
+            Some(Target::Draft { env, project_id, .. }) => {
+                (self.shell.project(&ScopedId::new(env.clone(), project_id.as_str())), "New thread".into(), None)
             }
             // `NoActiveThreadState`: a bordered header with a quiet label.
             None => {
@@ -97,7 +98,7 @@ impl Workspace {
         if let Some(project) = project {
             // `ChatHeader.tsx` names the project by its title, not its repository.
             let name: SharedString = project.title.clone().into();
-            let project_id = project.id.clone();
+            let ScopedId { env: project_env, id: project_id } = ScopedId::of_project(project);
             let tooltip: SharedString = format!("New thread in {name}").into();
             breadcrumb = breadcrumb
                 .child(
@@ -107,22 +108,22 @@ impl Workspace {
                         .child(super::sidebar::project_icon(project, &tokens, false, 14., self.favicon(project)))
                         .child(div().max_w(px(160.)).truncate().child(name))
                         .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-                        .on_click(
-                            cx.listener(move |this, _, window, cx| this.start_draft(project_id.clone(), window, cx)),
-                        ),
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.start_draft_in(project_env.clone(), project_id.clone(), window, cx);
+                        })),
                 )
                 .child(separator());
         }
         if let Some(parent) = parent {
-            let parent_id = parent.id.clone();
+            let ScopedId { env: parent_env, id: parent_id } = ScopedId::of_thread(parent);
             breadcrumb = breadcrumb
                 .child(
                     crumb("crumb-parent", parent_focus, cx)
                         .flex_shrink(1.)
                         .child(div().min_w_0().truncate().child(parent.title.clone()))
-                        .on_click(
-                            cx.listener(move |this, _, window, cx| this.select_thread(parent_id.clone(), window, cx)),
-                        ),
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.select_thread_in(parent_env.clone(), parent_id.clone(), window, cx);
+                        })),
                 )
                 .child(separator());
         }

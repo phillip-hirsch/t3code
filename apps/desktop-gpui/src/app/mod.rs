@@ -232,7 +232,7 @@ pub struct Workspace {
     /// Targets whose send is in flight: each thread's or draft's own (`draftSendState`).
     sending: HashSet<Target>,
     /// Threads whose rewind is still rolling back on the server; they take no sends.
-    rewinding: HashSet<String>,
+    rewinding: HashSet<ScopedId>,
     /// Model picked in the composer; for an open thread it applies to the next message.
     model_override: Option<ModelSelection>,
     /// `model_override` is the user's pick, not the model a new draft inherited
@@ -1077,12 +1077,14 @@ impl Workspace {
         self.reveal_pending_citation(cx);
     }
 
-    /// Opens a listed thread on the environment it lives on.
-    fn select_thread(&mut self, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(env) = self.thread_environment(&thread_id) else { return };
+    /// Opens a thread the open timeline names (a subagent, a created thread, a sender): it
+    /// lives on the open target's environment, as both chat panes' threads do.
+    fn select_thread_beside(&mut self, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(env) = self.target.as_ref().map(Target::environment).cloned() else { return };
         self.select_thread_in(env, thread_id, window, cx);
     }
 
+    /// Opens a thread on `env`; ids repeat across environments, so callers name the one they show.
     fn select_thread_in(&mut self, env: SharedString, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
         self.mount_thread_family(&env, &thread_id, cx);
         let target = Target::Thread { env, id: thread_id.clone() };
@@ -1128,11 +1130,6 @@ impl Workspace {
         self.notify_sidebar(cx);
         cx.notify();
         self.record_location();
-    }
-
-    fn start_draft(&mut self, project_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(env) = self.project_environment(&project_id) else { return };
-        self.start_draft_in(env, project_id, window, cx);
     }
 
     /// "New thread" in a project on `env`, which the shell may not list yet (`createNewThreadHandler`).
@@ -1398,8 +1395,9 @@ impl Workspace {
         cx.notify();
     }
 
-    fn dispatch(&mut self, command: Value, cx: &mut Context<Self>) {
-        let Some(client) = self.command_client(&command) else { return };
+    /// Dispatches `command` on `env`, the environment its thread or project lives on.
+    fn dispatch(&mut self, env: &str, command: Value, cx: &mut Context<Self>) {
+        let Some(client) = self.env_client(env) else { return };
         self.dispatch_in_order(client, vec![command], cx);
     }
 

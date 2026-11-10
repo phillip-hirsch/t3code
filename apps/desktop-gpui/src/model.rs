@@ -1180,16 +1180,6 @@ impl ShellState {
         self.projects.iter().find(|p| key.is_project(p))
     }
 
-    /// The environment a thread lives on.
-    pub fn thread_environment(&self, thread_id: &str) -> Option<&SharedString> {
-        self.threads.iter().find(|t| t.id == thread_id).map(|t| &t.environment_id)
-    }
-
-    /// The environment a project lives on.
-    pub fn project_environment(&self, project_id: &str) -> Option<&SharedString> {
-        self.projects.iter().find(|p| p.id == project_id).map(|p| &p.environment_id)
-    }
-
     /// Counts the environment's full snapshots; a read made under an older one must not merge.
     pub fn generation(&self, environment_id: &str) -> u64 {
         self.cursors.get(environment_id).map_or(0, |cursor| cursor.generation)
@@ -2496,7 +2486,7 @@ mod tests {
         shell.apply(&a, &snapshot(5, "t1")).unwrap();
         shell.apply(&b, &snapshot(2, "t2")).unwrap();
         assert_eq!((shell.projects.len(), shell.threads.len()), (2, 2));
-        assert_eq!(shell.thread_environment("t2"), Some(&b));
+        assert!(shell.thread(&ScopedId::new(b.clone(), "t2")).is_some());
         // Sequences are per subscription: b's 3 is new even though a is at 5.
         shell
             .apply(&b, &json!({"kind":"thread.updated","sequence":3,"location":"active","thread":thread("t3", "2")}))

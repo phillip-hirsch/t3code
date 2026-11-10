@@ -190,8 +190,8 @@ impl Workspace {
             return self.open_page(Page::Welcome, cx);
         }
         let recent = crate::inbox::most_recent_project(&self.shell.projects, &self.shell.threads);
-        match recent.map(|p| p.id.clone()) {
-            Some(project_id) => self.start_draft(project_id, window, cx),
+        match recent.map(|p| (p.environment_id.clone(), p.id.clone())) {
+            Some((env, project_id)) => self.start_draft_in(env, project_id, window, cx),
             None => self.close_page(cx),
         }
     }
@@ -218,7 +218,7 @@ impl Workspace {
         self.page = None;
         self.settings_ui.access_environment = None;
         match location {
-            Location::Chat(Some(Target::Thread { id: thread_id, .. })) => self.select_thread(thread_id, window, cx),
+            Location::Chat(Some(Target::Thread { env, id })) => self.select_thread_in(env, id, window, cx),
             Location::Chat(Some(target @ Target::Draft { .. })) => self.open_draft_entry(target, window, cx),
             Location::Chat(None) => {}
             Location::Page(page) => {

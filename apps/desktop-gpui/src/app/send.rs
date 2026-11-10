@@ -198,7 +198,7 @@ impl Workspace {
 
     /// The open thread is still rolling back, so a send would race the rewind.
     pub(super) fn target_rewinding(&self) -> bool {
-        matches!(&self.target, Some(Target::Thread { id, .. }) if self.rewinding.contains(id))
+        self.target.as_ref().and_then(Target::thread_key).is_some_and(|key| self.rewinding.contains(&key))
     }
 
     pub(super) fn submit_with(&mut self, intent: Intent, window: &mut Window, cx: &mut Context<Self>) {
@@ -448,7 +448,7 @@ impl Workspace {
                                 if let Some(project_id) = project_id {
                                     this.draft_workspace = Default::default();
                                     this.forget_open_draft();
-                                    this.start_draft(project_id, window, cx);
+                                    this.start_draft_in(origin.environment().clone(), project_id, window, cx);
                                 }
                             }
                             // Follow the new thread only from the draft that launched it.
@@ -462,7 +462,7 @@ impl Workspace {
                             }
                             _ if new_draft_after && here => {
                                 if let Some(project_id) = project_id {
-                                    this.start_draft(project_id, window, cx);
+                                    this.start_draft_in(origin.environment().clone(), project_id, window, cx);
                                 }
                             }
                             _ => {}

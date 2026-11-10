@@ -319,10 +319,6 @@ fn worktree_pending(worktree_path: Option<&str>, runs: &[Run]) -> bool {
 }
 
 impl Workspace {
-    pub(super) fn shell_thread(&self, thread_id: &str) -> Option<&ThreadShell> {
-        self.shell.threads.iter().find(|t| t.id == thread_id)
-    }
-
     /// A side chat's key: it lives on the open thread's environment.
     fn side_key(&self, thread_id: &str) -> Option<Key> {
         Some((self.active_environment()?.clone(), thread_id.to_owned()))

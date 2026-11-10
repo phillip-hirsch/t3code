@@ -9,7 +9,7 @@ use serde_json::{Map, Value, json};
 
 use crate::app::Workspace;
 use crate::app::pages::settings::connections::logic::SETTINGS_WRITE;
-use crate::model::{ProjectScript, ProjectShell, ServerInfo, T3ProjectFile, T3ProjectFileScript};
+use crate::model::{ProjectScript, ProjectShell, ScopedId, ServerInfo, T3ProjectFile, T3ProjectFileScript};
 
 const MAX_SCRIPT_ID_LENGTH: usize = 24;
 const MAX_KEYBINDING_LENGTH: usize = 64;
@@ -512,10 +512,6 @@ pub(in crate::app) fn importable_scripts<'a>(
 }
 
 impl Workspace {
-    fn project(&self, project_id: &str) -> Option<&ProjectShell> {
-        self.shell.projects.iter().find(|project| project.id == project_id)
-    }
-
     /// The config of the environment the project lives on, which holds its actions and their
     /// shortcuts (`useProjectScriptEditing`'s `environmentId`), whatever Settings is scoped to.
     pub(super) fn project_info(&self, project: &ProjectShell) -> &ServerInfo {
@@ -525,13 +521,15 @@ impl Workspace {
     /// Writes the project's settings, then reconciles its shortcuts; both land in `server_info` at once.
     fn write_project_scripts(
         &mut self,
-        project_id: &str,
+        project_key: &ScopedId,
         next: impl FnOnce(&Value, &ProjectShell) -> Option<Vec<ProjectScript>>,
         script_id: Option<&str>,
         keybinding: Option<Option<&str>>,
         cx: &mut Context<Self>,
     ) -> Task<Result<(), String>> {
-        let Some(project) = self.project(project_id) else { return Task::ready(Err("Project not found.".into())) };
+        let Some(project) = self.shell.project(project_key) else {
+            return Task::ready(Err("Project not found.".into()));
+        };
         let environment = project.environment_id.clone();
         let (Some(client), Some(info)) = (self.env_client(&environment), self.env_info(&environment)) else {
             return Task::ready(Err("Not connected.".into()));
@@ -578,27 +576,27 @@ impl Workspace {
 
     /// The checkouts an action edit writes: on the Projects settings page, every checkout of the
     /// project's group, like the web's targets; elsewhere just the one project.
-    pub(super) fn script_targets(&self, project_id: &str) -> Vec<String> {
+    pub(super) fn script_targets(&self, project: &ScopedId) -> Vec<ScopedId> {
         if self.settings.as_deref() != Some("projects") {
-            return vec![project_id.to_owned()];
+            return vec![project.clone()];
         }
         self.settings_project_groups()
             .into_iter()
-            .find(|group| group.members.iter().any(|m| m.project.id == project_id))
+            .find(|group| group.members.iter().any(|m| project.is_project(&m.project)))
             .map_or_else(
-                || vec![project_id.to_owned()],
-                |group| group.members.into_iter().map(|m| m.project.id).collect(),
+                || vec![project.clone()],
+                |group| group.members.iter().map(|m| ScopedId::of_project(&m.project)).collect(),
             )
     }
 
     /// Runs one write per target in turn; each reads the settings the previous one left.
     fn write_targets(
         &mut self,
-        project_id: &str,
-        write: impl Fn(&mut Self, &str, &mut Context<Self>) -> Task<Result<(), String>> + 'static,
+        project: &ScopedId,
+        write: impl Fn(&mut Self, &ScopedId, &mut Context<Self>) -> Task<Result<(), String>> + 'static,
         cx: &mut Context<Self>,
     ) -> Task<Result<(), String>> {
-        let targets = self.script_targets(project_id);
+        let targets = self.script_targets(project);
         cx.spawn(async move |this, cx| {
             for target in targets {
                 let task = this.update(cx, |this, cx| write(this, &target, cx)).map_err(|e| e.to_string())?;
@@ -611,17 +609,19 @@ impl Workspace {
     /// Saves the editor's form as `script_id`, or as a new script when `None`.
     pub(super) fn save_project_script(
         &mut self,
-        project_id: &str,
+        project_key: &ScopedId,
         script_id: Option<&str>,
         input: &ScriptInput,
         cx: &mut Context<Self>,
     ) -> Task<Result<(), String>> {
-        let Some(project) = self.project(project_id) else { return Task::ready(Err("Project not found.".into())) };
+        let Some(project) = self.shell.project(project_key) else {
+            return Task::ready(Err("Project not found.".into()));
+        };
         let (id, _) =
             scripts_after_save(&self.project_info(project).settings, &self.shell.projects, project, script_id, input);
         let input = input.clone();
         self.write_targets(
-            project_id,
+            project_key,
             move |this, target, cx| {
                 let keybinding = input.keybinding.as_ref().map(Option::as_deref);
                 this.write_project_scripts(
@@ -638,13 +638,13 @@ impl Workspace {
 
     pub(super) fn delete_project_script(
         &mut self,
-        project_id: &str,
+        project: &ScopedId,
         script_id: &str,
         cx: &mut Context<Self>,
     ) -> Task<Result<(), String>> {
         let id = script_id.to_owned();
         self.write_targets(
-            project_id,
+            project,
             move |this, target, cx| {
                 let id = id.clone();
                 this.write_project_scripts(
@@ -664,11 +664,11 @@ impl Workspace {
     /// The row's reset: the project inherits the environment's actions again.
     pub(super) fn reset_project_scripts(
         &mut self,
-        project_id: &str,
+        project: &ScopedId,
         cx: &mut Context<Self>,
     ) -> Task<Result<(), String>> {
         self.write_targets(
-            project_id,
+            project,
             |this, target, cx| this.write_project_scripts(target, |_, _| None, None, None, cx),
             cx,
         )

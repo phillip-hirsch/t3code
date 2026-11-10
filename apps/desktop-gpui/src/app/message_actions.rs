@@ -142,13 +142,15 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let (Some(client), Some(http_base)) = (self.client(), self.http_base().map(str::to_owned)) else { return };
+        let Some(origin) = self.target.clone() else { return };
+        let Some(key) = origin.thread_key() else { return };
         let Some(thread) = self.thread.as_ref() else { return };
         let Some(projection) = thread.state.projection.as_ref() else { return };
         let Some(message) = projection.visible_turn_items.iter().map(|row| &row.item).find(|i| *i.id == *message_id)
         else {
             return;
         };
-        if self.rewinding.contains(&thread.id) {
+        if self.rewinding.contains(&key) {
             return;
         }
         let files: Vec<Value> = message.raw["attachments"].as_array().cloned().unwrap_or_default();
@@ -167,7 +169,7 @@ impl Workspace {
             return;
         };
         let text = composer_text::recallable_prompt(message.str("text").unwrap_or_default());
-        let (thread_id, command_id) = (thread.id.clone(), new_id());
+        let (thread_id, command_id) = (key.id.clone(), new_id());
         let command = json!({
             "type": "checkpoint.rollback",
             "restoreFiles": restore_files,
@@ -176,7 +178,7 @@ impl Workspace {
             "scopeId": checkpoint.scope_id,
             "checkpointId": checkpoint.checkpoint_id,
         });
-        self.rewinding.insert(thread_id.clone());
+        self.rewinding.insert(key.clone());
         self.error = None;
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
@@ -193,13 +195,9 @@ impl Workspace {
                 Either::Right(_) => Err("Timed out waiting for the thread to rewind.".to_owned()),
             };
             let _ = this.update_in(cx, |this, window, cx| {
-                this.rewinding.remove(&thread_id);
+                this.rewinding.remove(&key);
                 match result {
-                    Ok(files) => {
-                        if let Some(target) = this.thread_target(&thread_id) {
-                            this.restore_rewound(target, text, files, window, cx);
-                        }
-                    }
+                    Ok(files) => this.restore_rewound(origin, text, files, window, cx),
                     Err(error) => this.error = Some(error.into()),
                 }
                 cx.notify();
@@ -457,9 +455,13 @@ pub(super) fn user_actions(
 ) -> gpui_kit::Div {
     let (can_rewind, working) = this.upgrade().map_or((false, false), |workspace| {
         let workspace = workspace.read(cx);
+        let rewinding = workspace
+            .target
+            .as_ref()
+            .and_then(Target::thread_key)
+            .is_some_and(|key| workspace.rewinding.contains(&key));
         let working = workspace.thread.as_ref().is_some_and(|thread| {
-            workspace.rewinding.contains(&thread.id)
-                || thread.state.projection.as_ref().is_some_and(super::super::model::ThreadProjection::is_running)
+            rewinding || thread.state.projection.as_ref().is_some_and(super::super::model::ThreadProjection::is_running)
         });
         (workspace.supports_rollback(), working)
     });

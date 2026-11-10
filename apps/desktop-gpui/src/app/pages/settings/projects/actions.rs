@@ -20,7 +20,7 @@ use super::scripts::{
 use crate::app::Workspace;
 use crate::app::pages::settings::connections::logic::SETTINGS_WRITE;
 use crate::app::pages::settings::widgets::{RowFrame, reset_button, settings_section};
-use crate::model::{ProjectScript, T3ProjectFile};
+use crate::model::{ProjectScript, ScopedId, T3ProjectFile};
 use crate::theme::{self, Tokens};
 
 const ROW_GROUP: &str = "project-action-row";
@@ -29,30 +29,29 @@ impl Workspace {
     /// The "Actions" section of a project's settings page.
     pub(super) fn render_project_actions(
         &mut self,
-        project_id: &str,
+        project_key: &ScopedId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = *theme::tokens(cx);
-        let Some(project) = self.shell.projects.iter().find(|p| p.id == project_id) else {
+        let Some(project) = self.shell.project(project_key) else {
             return div().into_any_element();
         };
         let scripts = resolve_project_scripts(&self.settings_info().settings, project);
         // Every checkout of the group is a target; differing lists are edited one environment at a time.
-        let targets = self.script_targets(project_id);
-        let mixed = targets.iter().any(|id| {
+        let targets = self.script_targets(project_key);
+        let mixed = targets.iter().any(|target| {
             self.shell
-                .projects
-                .iter()
-                .find(|p| &p.id == id)
+                .project(target)
                 .is_some_and(|p| resolve_project_scripts(&self.settings_info().settings, p) != scripts)
         });
-        let overridden = targets.iter().any(|id| has_project_scripts_override(&self.settings_info().settings, id));
+        let overridden =
+            targets.iter().any(|target| has_project_scripts_override(&self.settings_info().settings, &target.id));
         let (environment, root) = (project.environment_id.clone(), project.workspace_root.clone());
         let file = self.t3_project_file(&environment, &root, cx).clone();
         let importable: Vec<ScriptInput> =
             importable_scripts(&file, &scripts).into_iter().map(ScriptInput::from_file_script).collect();
-        let pid = project_id.to_owned();
+        let pid = project_key.clone();
 
         let mut controls = h_flex().gap(px(6.)).flex_wrap();
         if overridden {
@@ -127,7 +126,7 @@ impl Workspace {
             );
         }
         for script in scripts.iter().filter(|_| !mixed) {
-            list.push(self.render_action_row(project_id, script, &t, window, cx));
+            list.push(self.render_action_row(project_key, script, &t, window, cx));
         }
         if file == T3ProjectFile::Invalid {
             list.push(
@@ -142,7 +141,7 @@ impl Workspace {
 
     fn render_action_row(
         &self,
-        project_id: &str,
+        project_key: &ScopedId,
         script: &ProjectScript,
         t: &Tokens,
         _: &mut Window,
@@ -174,7 +173,7 @@ impl Workspace {
             self.settings_info().keybindings_json(),
             command_for_project_script(&script.id).as_deref(),
         );
-        let (pid, sid) = (project_id.to_owned(), script.id.clone());
+        let (pid, sid) = (project_key.clone(), script.id.clone());
         let edit = Button::new(SharedString::from(format!("edit-action-{}", script.id)))
             .ghost()
             .xsmall()
@@ -197,23 +196,22 @@ impl Workspace {
     /// Adds a `t3.json` script as is; a failed save reopens it in the editor with the error.
     pub(in crate::app) fn import_project_script(
         &mut self,
-        project_id: &str,
+        project: &ScopedId,
         input: &ScriptInput,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let mut input = input.clone();
         // `keybinding: null` only with `settings:write`; otherwise the save leaves shortcuts alone.
-        let environment = self.shell.projects.iter().find(|p| p.id == project_id).map(|p| p.environment_id.clone());
-        if !environment.is_some_and(|env| self.env_grants(&env, SETTINGS_WRITE)) {
+        if !self.env_grants(&project.env, SETTINGS_WRITE) {
             input.keybinding = None;
         }
-        let task = self.save_project_script(project_id, None, &input, cx);
-        let project_id = project_id.to_owned();
+        let task = self.save_project_script(project, None, &input, cx);
+        let project = project.clone();
         cx.spawn_in(window, async move |this, cx| {
             if let Err(error) = task.await {
                 let _ = this.update_in(cx, |this, window, cx| {
-                    this.open_script_editor_with(&project_id, None, input, Some(error), window, cx);
+                    this.open_script_editor_with(&project, None, input, Some(error), window, cx);
                 });
             }
         })

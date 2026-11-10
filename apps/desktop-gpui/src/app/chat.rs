@@ -1445,7 +1445,7 @@ fn system_divider(divider: &timeline::SystemDivider, this: &WeakEntity<Workspace
                 .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
                 .on_click(move |_, window, cx| {
                     let thread_id = thread_id.to_string();
-                    let _ = this.update(cx, |w, cx| w.select_thread(thread_id, window, cx));
+                    let _ = this.update(cx, |w, cx| w.select_thread_beside(thread_id, window, cx));
                 })
                 .into_any_element()
         }
@@ -1483,7 +1483,7 @@ fn entry_open_link(entry: &Entry, this: &WeakEntity<Workspace>, t: &Tokens) -> O
             .on_click(move |_, window, cx| {
                 cx.stop_propagation();
                 let thread_id = thread_id.clone();
-                let _ = this.update(cx, |w, cx| w.select_thread(thread_id, window, cx));
+                let _ = this.update(cx, |w, cx| w.select_thread_beside(thread_id, window, cx));
             })
             .into_any_element(),
     )
@@ -1589,7 +1589,7 @@ pub(super) fn subagent_card(
                     let (env, thread_id) = (env.clone(), thread_id.clone());
                     let _ = this.update(cx, |workspace, cx| match env {
                         Some(env) => workspace.select_thread_in(env, thread_id, window, cx),
-                        None => workspace.select_thread(thread_id, window, cx),
+                        None => workspace.select_thread_beside(thread_id, window, cx),
                     });
                 })
                 .into_any_element()
@@ -1726,7 +1726,7 @@ fn created_thread_card(
         let this = this.clone();
         move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
             let thread_id = thread_id.to_string();
-            let _ = this.update(cx, |workspace, cx| workspace.select_thread(thread_id, window, cx));
+            let _ = this.update(cx, |workspace, cx| workspace.select_thread_beside(thread_id, window, cx));
         }
     });
     h_flex()
@@ -1897,7 +1897,10 @@ fn folded_message(
         timeline::Attribution::Agent { sender_thread } => {
             // `senderShell?.title || "Agent"`.
             let title = sender_thread.as_ref().and_then(|sender| {
-                let title = workspace?.shell_thread(sender)?.title.trim().to_owned();
+                // The sender is a thread beside this timeline's, on the open target's environment.
+                let workspace = workspace?;
+                let key = crate::model::ScopedId::new(workspace.active_environment()?.clone(), sender.as_ref());
+                let title = workspace.shell.thread(&key)?.title.trim().to_owned();
                 (!title.is_empty()).then_some(title)
             });
             Some(FoldedMessage {
@@ -2108,7 +2111,7 @@ fn folded_row(
         .child(label)
         .on_click(move |_, window, cx| {
             let _ = this.update(cx, |workspace, cx| match &link {
-                FoldLink::Thread(sender) => workspace.select_thread(sender.to_string(), window, cx),
+                FoldLink::Thread(sender) => workspace.select_thread_beside(sender.to_string(), window, cx),
                 FoldLink::Automation { environment: Some(environment), task_id } => {
                     workspace.open_scheduled_task(environment.clone(), task_id.clone(), cx);
                 }

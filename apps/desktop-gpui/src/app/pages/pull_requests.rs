@@ -402,10 +402,9 @@ impl Workspace {
         if let Some(environment) = &self.pull_requests.environment {
             connected.retain(|(id, _)| *id == environment);
         }
-        if let Some(project) = &self.pull_requests.project {
-            // Picking a project names its server too; a project id alone may repeat across servers.
-            let environment =
-                self.pull_requests.environment.as_ref().or_else(|| self.shell.project_environment(project));
+        if self.pull_requests.project.is_some() {
+            // Picking a project sets its server too; a project id alone may repeat across servers.
+            let environment = self.pull_requests.environment.as_ref();
             connected.retain(|(id, _)| Some(*id) == environment);
             return connected.into_iter().map(|(id, client)| (id.clone(), client, None)).collect();
         }

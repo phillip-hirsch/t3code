@@ -17,9 +17,9 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
+use super::Workspace;
 use super::sidebar::now_ms;
-use super::{Target, Workspace};
-use crate::model::GuestShare;
+use crate::model::{GuestShare, ScopedId};
 use crate::theme;
 
 /// The dialog's create request (`CreateState`).
@@ -35,7 +35,7 @@ enum Create {
 #[derive(Default)]
 pub(super) struct ShareHeader {
     tick: Cell<Option<i64>>,
-    closing: Option<String>,
+    closing: Option<ScopedId>,
 }
 
 fn minute(ms: i64) -> i64 {
@@ -193,7 +193,7 @@ impl Workspace {
 
     /// `GuestShareIndicator`: the open thread's sharing status and Stop sharing.
     pub(super) fn render_guest_share_indicator(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let Some(Target::Thread { id, .. }) = &self.target else { return None };
+        let key = self.target.as_ref()?.thread_key()?;
         let share = self.open_projection()?.thread.guest_share.as_ref()?;
         let now = now_ms();
         // `useNowMinute`: "expired" shows from the minute the link expires.
@@ -209,8 +209,7 @@ impl Workspace {
             .detach();
         }
         let t = *theme::tokens(cx);
-        let closing = self.share_header.closing.as_deref() == Some(id.as_str());
-        let thread_id = id.clone();
+        let closing = self.share_header.closing.as_ref() == Some(&key);
         let (accent, foreground) = (t.accent, t.foreground);
         let ring = gpui_kit::BoxShadow::new(px(0.), px(0.), t.ring).spread_radius(px(2.)).inset();
         // `Button size="xs" variant="ghost-muted"`, `disabled` while the close is in flight.
@@ -237,7 +236,7 @@ impl Workspace {
                     if t.themed { s.bg(t.toolbar.control_hover) } else { s.bg(accent).text_color(foreground) }
                 })
             })
-            .on_click(cx.listener(move |this, _, _, cx| this.stop_guest_share(&thread_id, cx)));
+            .on_click(cx.listener(move |this, _, _, cx| this.stop_guest_share(&key, cx)));
         Some(
             h_flex()
                 .flex_none()
@@ -252,10 +251,10 @@ impl Workspace {
     }
 
     /// `thread.guest-share.close`; the button stays disabled until the server answers.
-    fn stop_guest_share(&mut self, thread_id: &str, cx: &mut Context<Self>) {
-        let Some(client) = self.thread_client(thread_id) else { return };
-        let command = json!({"type": "thread.guest-share.close", "commandId": super::new_id(), "threadId": thread_id});
-        self.share_header.closing = Some(thread_id.to_owned());
+    fn stop_guest_share(&mut self, thread: &ScopedId, cx: &mut Context<Self>) {
+        let Some(client) = self.env_client(&thread.env) else { return };
+        let command = json!({"type": "thread.guest-share.close", "commandId": super::new_id(), "threadId": thread.id});
+        self.share_header.closing = Some(thread.clone());
         cx.spawn(async move |this, cx| {
             let result = client.request("orchestration.dispatchCommand", command).await;
             let _ = this.update(cx, |this, cx| {
