@@ -51,10 +51,12 @@ impl UsageLimitsPanel {
         self.opened.borrow_mut().take();
     }
 
-    /// When the panel showing under `key` opened; any other key closes it.
+    /// When the panel showing under `key` opened; any other key closes it. Without a key (a
+    /// thread still loading) it only hides.
     fn current(&self, key: Option<&str>) -> Option<i64> {
+        let key = key?;
         let mut opened = self.opened.borrow_mut();
-        if opened.as_ref().is_some_and(|o| Some(o.key.as_str()) != key) {
+        if opened.as_ref().is_some_and(|o| o.key != key) {
             *opened = None;
         }
         opened.as_ref().map(|o| o.now)
@@ -466,6 +468,8 @@ mod tests {
         let panel = UsageLimitsPanel::default();
         panel.open("a".into(), draft("p"), 1);
         assert_eq!(panel.current(Some("a")), Some(1));
+        assert_eq!(panel.current(None), None, "a loading thread hides it");
+        assert_eq!(panel.current(Some("a")), Some(1), "and shows it again once loaded");
         assert_eq!(panel.current(Some("b")), None, "a new run or request hides it");
         assert_eq!(panel.current(Some("a")), None, "and returning does not bring it back");
         panel.open("a".into(), draft("p"), 2);
