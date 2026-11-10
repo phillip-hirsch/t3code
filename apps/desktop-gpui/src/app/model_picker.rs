@@ -339,12 +339,13 @@ impl Workspace {
     fn apply_thread_model_pick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(target) = self.target.clone() else { return };
         let super::Target::Thread { env, id } = &target else { return };
-        let thread_model = self
+        let projection = self
             .thread
             .as_ref()
             .filter(|thread| &thread.id == id)
             .and_then(|thread| thread.state.projection.as_ref())
             .and_then(|projection| projection.thread.model_selection.as_ref());
+        let thread_model = thread_model(&self.shell.threads, env, id, projection);
         let Some(pick) = thread_pick(self.model_override.as_ref(), self.model_explicit, thread_model) else { return };
         if !self.can_operate(env) {
             pick_failed(window, cx, "This connection cannot change threads or projects.");
@@ -1783,6 +1784,18 @@ fn thread_pick(
     (pick.instance_id == thread_model.instance_id).then(|| pick.clone())
 }
 
+/// The model `env`'s thread `id` runs on, from its shell as the web reads it (`threadShellAtom`),
+/// so a pick made before the thread's projection loads is saved too; else the projection's.
+fn thread_model<'a>(
+    shells: &'a [crate::model::ThreadShell],
+    env: &str,
+    id: &str,
+    projection: Option<&'a ModelSelection>,
+) -> Option<&'a ModelSelection> {
+    let shell = shells.iter().find(|thread| thread.environment_id == env && thread.id == id);
+    shell.and_then(|thread| thread.model_selection.as_ref()).or(projection)
+}
+
 fn pick_failed(window: &mut Window, cx: &mut gpui_kit::App, reason: &str) {
     let message = format!("This model pick was not saved. {reason}");
     window.push_notification(Notification::error(message).title("Could not apply model selection"), cx);
@@ -1804,8 +1817,24 @@ mod tests {
         assert_eq!(thread_pick(Some(&same), true, Some(&thread)), Some(same.clone()));
         assert_eq!(thread_pick(Some(&selection("claude", "opus")), true, Some(&thread)), None, "waits for a send");
         assert_eq!(thread_pick(Some(&same), false, Some(&thread)), None, "an inherited model is not a pick");
-        assert_eq!(thread_pick(Some(&same), true, None), None, "the thread has not loaded");
+        assert_eq!(thread_pick(Some(&same), true, None), None, "the thread is unknown");
         assert_eq!(thread_pick(None, true, Some(&thread)), None);
+
+        // Before an uncached thread's projection loads, its shell names its model (`threadShellAtom`).
+        let mut shells: Vec<crate::model::ThreadShell> = serde_json::from_value(json!([
+            {"id": "t", "projectId": "p", "title": "T", "status": "idle", "updatedAt": "2026-01-01T00:00:00Z",
+                "modelSelection": {"instanceId": "codex", "model": "gpt-5"}},
+            {"id": "t", "projectId": "p", "title": "T", "status": "idle", "updatedAt": "2026-01-01T00:00:00Z",
+                "modelSelection": {"instanceId": "claude", "model": "opus"}},
+        ]))
+        .unwrap();
+        (shells[0].environment_id, shells[1].environment_id) = ("e1".into(), "e2".into());
+        let unloaded = thread_model(&shells, "e1", "t", None);
+        assert_eq!(thread_pick(Some(&same), true, unloaded), Some(same.clone()), "no projection yet");
+        let elsewhere = thread_model(&shells, "e2", "t", None);
+        assert_eq!(thread_pick(Some(&same), true, elsewhere), None, "another environment's thread t");
+        let moved = selection("claude", "opus");
+        assert_eq!(thread_model(&shells, "e3", "t", Some(&moved)), Some(&moved), "no shell: the projection's");
     }
 
     #[test]
