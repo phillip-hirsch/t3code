@@ -14,7 +14,7 @@ use gpui_kit::{
 };
 use serde_json::{Value, json};
 
-use super::super::git::{Checkout, SOURCE_CONTROL_WRITE};
+use super::super::git::Checkout;
 use super::super::source_control::{self, HOSTS, HostDefinition, Surface};
 use super::super::titlebar::icon;
 use super::super::{Target, Workspace};
@@ -226,7 +226,10 @@ impl PublishWizard {
 
     /// `publishRepositoryAction.isAllowed`, read live: grants change on reconnect.
     fn allowed(&self, cx: &App) -> bool {
-        self.workspace.upgrade().is_some_and(|workspace| workspace.read(cx).env_grants(&self.env, SOURCE_CONTROL_WRITE))
+        let input = json!({"cwd": self.checkout.1});
+        self.workspace.upgrade().is_some_and(|workspace| {
+            workspace.read(cx).env_permits(&self.env, "sourceControl.publishRepository", &input)
+        })
     }
 
     /// Another git action on this checkout holds it.
@@ -904,7 +907,7 @@ impl Render for PublishWizard {
 impl Workspace {
     /// `PublishRepositoryDialog` on the watched checkout.
     pub(super) fn open_publish_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.can_write_source_control() {
+        if !self.permits_publish() {
             return;
         }
         let Some(checkout) = self.vcs.checkout() else { return };
@@ -938,14 +941,14 @@ impl Workspace {
         wizard: WeakEntity<PublishWizard>,
         cx: &mut Context<Self>,
     ) -> bool {
-        if !self.env_grants(env, SOURCE_CONTROL_WRITE) {
+        let input = choices.input(&checkout.1);
+        if !self.env_permits(env, "sourceControl.publishRepository", &input) {
             return false;
         }
         let Some(client) = self.env_client(env) else { return false };
         if !self.vcs.start_on(checkout.clone(), "Publishing repository...") {
             return false;
         }
-        let input = choices.input(&checkout.1);
         cx.spawn(async move |this, cx| {
             let result =
                 client.request("sourceControl.publishRepository", input).await.map_err(|error| error.message());

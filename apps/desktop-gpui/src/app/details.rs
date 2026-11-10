@@ -33,6 +33,8 @@ pub(super) mod servers;
 const CARD_WIDTH: f32 = 280.;
 /// `quickActionDisabledReason` without `source-control:write`.
 const NO_SOURCE_CONTROL_WRITE: &str = "This connection cannot change source control.";
+/// The guard's refusal for a PR generated from a thread this connection cannot read.
+const NO_THREAD_READ: &str = "This connection requires orchestration:read.";
 /// `threadOperationFailure` without `orchestration:operate`.
 const NOT_OPERATE: &str = "This connection cannot change threads.";
 const CARD_INSET: f32 = 12.;
@@ -892,7 +894,7 @@ impl Workspace {
                 return section(rows, extra);
             }
             let running = self.vcs.running().is_some();
-            let enabled = !running && self.can_write_source_control();
+            let enabled = !running && self.permits_vcs_request("vcs.init");
             rows.push(
                 action_row("details-init-git", colors, enabled, cx)
                     .child(icon("icons/git-branch-plus.svg").with_size(px(14.)).text_color(tokens.muted_foreground))
@@ -931,26 +933,34 @@ impl Workspace {
                 .into_any_element();
         }
         let can_write = self.can_write_source_control();
-        let disabled = quick.disabled() || !can_write;
+        let permitted = self.permits_quick_action(&quick.kind);
+        let disabled = quick.disabled() || !permitted;
         let kind = quick.kind.clone();
         // `quickActionDisabledReason`: the missing grant first, then the action's own hint.
         let hint = match &quick.kind {
             _ if !can_write => Some(SharedString::from(NO_SOURCE_CONTROL_WRITE)),
+            _ if !permitted => Some(SharedString::from(NO_THREAD_READ)),
             QuickKind::Hint(hint) => Some(SharedString::from(hint.clone())),
             _ => None,
         };
         let view = cx.entity();
-        let items = git::menu_actions(status, false);
-        let can_publish = can_write && status.local.is_repo && !status.local.has_primary_remote;
+        let items: Vec<_> = git::menu_actions(status, false)
+            .into_iter()
+            .map(|item| {
+                let permitted = self.permits_git_action(&GitRequest::new(item.action));
+                (item, permitted)
+            })
+            .collect();
+        let can_publish = self.permits_publish() && status.local.is_repo && !status.local.has_primary_remote;
         let build = move |mut menu: PopupMenu, window: &mut Window, cx: &mut Context<PopupMenu>| {
             // Built as the menu opens: refresh the status, like `requestVcsStatusRefresh` on open.
             view.update(cx, super::Workspace::refresh_vcs);
-            for item in &items {
+            for (item, permitted) in &items {
                 let action = item.action;
                 menu = menu.item(
                     PopupMenuItem::new(item.label.clone())
                         .icon(icon(item.icon))
-                        .disabled(!can_write || !item.enabled)
+                        .disabled(!permitted || !item.enabled)
                         .on_click(window.listener_for(&view, move |this, _, window, cx| match action {
                             "commit" => this.open_commit_dialog(window, cx),
                             action => this.request_git_action(GitRequest::new(action), window, cx),
@@ -977,7 +987,7 @@ impl Workspace {
                         el.tooltip(move |window, cx| Tooltip::new(hint.clone()).build(window, cx))
                     })
                     .on_click(cx.listener(move |this, _, window, cx| match &kind {
-                        _ if !this.can_write_source_control() => {}
+                        kind if !this.permits_quick_action(kind) => {}
                         QuickKind::Run(action) => this.request_git_action(GitRequest::new(action), window, cx),
                         QuickKind::Pull => this.run_vcs_request("vcs.pull", "Pulling latest changes...", cx),
                         QuickKind::Publish => this.open_publish_dialog(window, cx),
@@ -1017,7 +1027,8 @@ impl Workspace {
             let muted = theme::tokens(cx).muted_foreground;
             let (can_write, can_branch) = {
                 let this = view.read(cx);
-                (this.can_write_source_control(), this.can_change_thread_branch() && unavailable.is_none())
+                let can_write = this.permits_git_action(&request);
+                (can_write, can_write && this.can_change_thread_branch() && unavailable.is_none())
             };
             let run = |feature_branch: bool| {
                 let (view, request) = (view.clone(), request.clone());
