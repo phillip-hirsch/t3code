@@ -243,7 +243,7 @@ impl TerminalSession {
             cx.on_blur(&focus, window, |this, _, cx| {
                 this.focused = false;
                 // A composition the IME never ended must not keep the next keys from the shell.
-                this.keyboard.set_preedit("");
+                this.keyboard.cancel_composition();
                 this.cursor_on = true;
                 cx.notify();
             }),
@@ -835,7 +835,7 @@ impl EntityInputHandler for TerminalSession {
     }
 
     fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
-        self.keyboard.set_preedit("");
+        self.keyboard.cancel_composition();
     }
 
     fn replace_text_in_range(&mut self, _: Option<Range<usize>>, text: &str, _: &mut Window, cx: &mut Context<Self>) {

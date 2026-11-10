@@ -49,6 +49,8 @@ pub(super) struct Keyboard {
     encoded: Vec<(KeyId, Key)>,
     /// The marked text's length in UTF-16 units.
     preedit: usize,
+    /// A Windows dead key waits for the key that completes it; Windows marks no text for it.
+    dead_key: bool,
 }
 
 impl Keyboard {
@@ -70,6 +72,12 @@ impl Keyboard {
         self.preedit = text.encode_utf16().count();
     }
 
+    /// Focus left mid-composition: the next keys belong to the program.
+    pub fn cancel_composition(&mut self) {
+        self.preedit = 0;
+        self.dead_key = false;
+    }
+
     /// The marked text's range, while there is one.
     pub fn preedit(&self) -> Option<std::ops::Range<usize>> {
         (self.preedit > 0).then_some(0..self.preedit)
@@ -78,18 +86,25 @@ impl Keyboard {
     /// The composition's committed text, which the terminal sends as typed.
     pub fn commit<'a>(&mut self, text: &'a str) -> Option<&'a str> {
         self.preedit = 0;
+        self.dead_key = false;
         (!text.is_empty()).then_some(text)
     }
 
     /// `isTerminalCompositionKey`: keys mid-composition belong to the IME. X11 Compose sequences
     /// mark no text, but GPUI strips the character from each key they swallow. A Windows dead
-    /// key carries its spacing character and asks for character input; encoding it would skip
-    /// the `TranslateMessage` that starts the composition.
-    pub fn composing(&self, keystroke: &Keystroke, prefer_character_input: bool) -> bool {
+    /// key carries its spacing character and asks for character input, and the next key that
+    /// types carries the composed character; encoding either would skip the `TranslateMessage`
+    /// that composes and commits it. Keys that type nothing leave the dead key waiting.
+    pub fn composing(&mut self, keystroke: &Keystroke, prefer_character_input: bool) -> bool {
         let m = &keystroke.modifiers;
         let plain = !(m.control || m.alt || m.platform || m.function);
+        let completes_dead_key = keystroke.key_char.is_some() && std::mem::take(&mut self.dead_key);
+        if plain && prefer_character_input {
+            self.dead_key = !completes_dead_key;
+            return true;
+        }
         self.preedit > 0
-            || (plain && prefer_character_input)
+            || (plain && completes_dead_key)
             || (plain && keystroke.key_char.is_none() && single_char(&keystroke.key).is_some_and(|c| !c.is_control()))
     }
 
@@ -631,14 +646,43 @@ mod tests {
         assert_eq!(pressed(&mut keyboard, &mut core, &key("enter"), false), None, "Enter commits");
         assert_eq!(released(&mut keyboard, &mut core, &e), None);
         assert_eq!(keyboard.commit("é"), Some("é"));
-        // Windows gives a dead key its spacing character and asks for character input.
-        let dead = Platform { character_input: true, ..Platform::default() };
-        assert_eq!(pressed_as(&mut keyboard, &mut core, &typed("'", Some("'")), dead), None);
-        assert_eq!(keyboard.preedit(), None);
-        assert_eq!(pressed(&mut keyboard, &mut core, &e, false).as_deref(), Some("\x1b[101u"));
         // X11 Compose sequences show no marked text; their keys carry no character until composed.
         assert_eq!(pressed(&mut keyboard, &mut core, &key("a"), false), None);
         assert_eq!(pressed(&mut keyboard, &mut core, &key("shift-a"), false), None);
+    }
+
+    #[test]
+    fn a_windows_dead_key_composes_with_the_key_that_completes_it() {
+        use NativeKeyCode::Windows;
+        let mut core = core(80, 24);
+        // Report-all: every key would otherwise be encoded.
+        core.write(b"\x1b[>11u");
+        let mut keyboard = Keyboard::default();
+        // US-International: the dead key carries its spacing character and asks for character
+        // input; the key after it carries the composed character. Both must reach
+        // `TranslateMessage`, which commits `é` through the input handler.
+        let quote = typed("'", Some("'"));
+        let dead = Platform { character_input: true, ..Platform::key(Windows(0x28)) };
+        let e_key = Platform::key(Windows(0x12));
+        let e_acute = typed("e", Some("é"));
+        assert_eq!(pressed_as(&mut keyboard, &mut core, &quote, dead), None);
+        assert_eq!(keyboard.preedit(), None, "Windows marks no text for a dead key");
+        assert_eq!(pressed_as(&mut keyboard, &mut core, &e_acute, e_key), None);
+        assert_eq!(released_as(&mut keyboard, &mut core, &e_acute, e_key), None);
+        assert_eq!(keyboard.commit("é"), Some("é"), "the committed text goes out once");
+        let e = typed("e", Some("e"));
+        assert_eq!(pressed_as(&mut keyboard, &mut core, &e, e_key).as_deref(), Some("\x1b[101u"), "composition over");
+        // A key that types nothing leaves the dead key waiting, and still reaches the program.
+        let left = key("left");
+        let left_key = Platform::key(Windows(0xe04b));
+        assert_eq!(pressed_as(&mut keyboard, &mut core, &quote, dead), None);
+        assert_eq!(pressed_as(&mut keyboard, &mut core, &left, left_key), sent_as(&mut core, &left, left_key));
+        assert_eq!(pressed_as(&mut keyboard, &mut core, &e_acute, e_key), None);
+        assert_eq!(keyboard.commit("é"), Some("é"));
+        // Leaving the terminal cancels it.
+        assert_eq!(pressed_as(&mut keyboard, &mut core, &quote, dead), None);
+        keyboard.cancel_composition();
+        assert_eq!(pressed_as(&mut keyboard, &mut core, &e, e_key).as_deref(), Some("\x1b[101u"));
     }
 
     #[test]
