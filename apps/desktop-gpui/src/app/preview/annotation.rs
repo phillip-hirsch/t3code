@@ -613,25 +613,28 @@ impl Workspace {
         }
         // The overlay offers sending only with the grant; it's checked again here.
         if submission.send && self.target.as_ref() == Some(&target) && self.can_operate(&environment) {
-            self.send_annotated_draft(target, window, cx);
+            self.send_annotated_draft(window, cx);
         }
     }
 
-    /// `onSendAnnotation`: sends the draft once its uploads (the screenshot's) are done.
-    fn send_annotated_draft(&mut self, target: Target, window: &mut Window, cx: &mut Context<Self>) {
+    /// `onSendAnnotation`: sends the draft once its uploads (the screenshot's) are done, while
+    /// the editor still holds the draft it went to: not a queued edit or question begun since.
+    fn send_annotated_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.attachments_busy() {
             return self.submit_with(Intent::Foreground, window, cx);
         }
+        let Some(origin) = self.attachment_origin() else { return };
         let (sender, settled) = async_channel::bounded(1);
         self.preview.annotation.upload_settled = Some(sender);
         cx.spawn_in(window, async move |this, cx| {
             while settled.recv().await.is_ok() {
                 let done = this.update_in(cx, |this, window, cx| {
-                    if this.target.as_ref() == Some(&target) && this.attachments_busy() {
+                    let same = this.attachment_origin().as_ref() == Some(&origin);
+                    if same && this.attachments_busy() {
                         return false;
                     }
                     this.preview.annotation.upload_settled = None;
-                    if this.target.as_ref() == Some(&target) {
+                    if same {
                         this.submit_with(Intent::Foreground, window, cx);
                     }
                     true
