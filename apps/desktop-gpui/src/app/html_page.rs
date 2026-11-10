@@ -17,16 +17,18 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, Context, FocusHandle, Image, InteractiveElement as _, IntoElement as _, KeyDownEvent,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Task, Window, div, px,
+    AnyElement, App, Context, FocusHandle, Image, InteractiveElement as _, IntoElement as _, KeyDownEvent, Keystroke,
+    Modifiers, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Task, Window, div, px,
 };
 use serde_json::{Value, json};
 
 use super::Workspace;
 use super::embed::{EmbedView, FRAME_CSS, FRAME_SCRIPT, Layer};
 use super::image_viewer::{Reference, ViewerImage};
+use super::keymap;
 use super::mermaid::css_color;
 use super::side_chat::{ChatPane, PaneOwner};
+use crate::keybindings::{Rule, Shortcut};
 use crate::theme::Tokens;
 use crate::themes::ThemeColors;
 use crate::timeline::{self, PAGE_MAX_HEIGHT, PAGE_MIN_HEIGHT, PageSize, clamp_page_height};
@@ -79,6 +81,181 @@ enum PageMessage {
     Image { src: String, name: String },
     /// The shell's "Open full screen" button.
     Expand,
+    /// `readHtmlRenderKeyDown`: a shortcut the page handed back.
+    Key(PageKeyDown),
+}
+
+/// A key the page reports pressing, which a page script can forge.
+#[derive(Debug, PartialEq)]
+struct PageKeyDown {
+    key: String,
+    code: String,
+    meta: bool,
+    ctrl: bool,
+    shift: bool,
+    alt: bool,
+    repeat: bool,
+}
+
+/// `HTML_RENDER_SHORTCUT_COMMANDS`, beside the thread and model picker jumps: commands that change
+/// what the reader sees, never a thread, since the page can report any key.
+fn page_shortcut_command(command: &str) -> bool {
+    const COMMANDS: [&str; 14] = [
+        "commandPalette.toggle",
+        "filePicker.toggle",
+        "projectSearch.toggle",
+        "chat.find",
+        "sidebar.toggle",
+        "rightPanel.toggle",
+        "rightPanel.toggleMaximized",
+        "threadPanel.toggle",
+        "terminal.toggle",
+        "preview.toggle",
+        "navigation.back",
+        "navigation.forward",
+        "thread.previous",
+        "thread.next",
+    ];
+    COMMANDS.contains(&command)
+        || keymap::jump_index(command, "thread").is_some()
+        || keymap::jump_index(command, "modelPicker").is_some()
+}
+
+/// `EVENT_CODE_SHORTCUT_KEYS`.
+const EVENT_CODE_KEYS: [(&str, &str); 21] = [
+    ("Backquote", "`"),
+    ("Backslash", "\\"),
+    ("BracketLeft", "["),
+    ("BracketRight", "]"),
+    ("Comma", ","),
+    ("Digit0", "0"),
+    ("Digit1", "1"),
+    ("Digit2", "2"),
+    ("Digit3", "3"),
+    ("Digit4", "4"),
+    ("Digit5", "5"),
+    ("Digit6", "6"),
+    ("Digit7", "7"),
+    ("Digit8", "8"),
+    ("Digit9", "9"),
+    ("Equal", "="),
+    ("Minus", "-"),
+    ("Period", "."),
+    ("Quote", "'"),
+    ("Semicolon", ";"),
+    ("Slash", "/"),
+];
+
+/// `normalizeEventKey`.
+fn normalize_key(key: &str) -> String {
+    let key = key.to_lowercase();
+    if key == "esc" { "escape".to_owned() } else { key }
+}
+
+/// `resolveEventKeys`: the typed key, a letter's physical key, and `shortcutKeyFromEvent`.
+fn event_keys(key: &str, code: &str) -> Vec<String> {
+    let typed = normalize_key(key);
+    let letter = typed.len() == 1 && typed.as_bytes()[0].is_ascii_lowercase();
+    let mut keys = vec![typed.clone()];
+    if let Some(physical) = code.strip_prefix("Key").filter(|c| c.len() == 1 && c.as_bytes()[0].is_ascii_uppercase())
+        && !letter
+    {
+        keys.push(physical.to_ascii_lowercase());
+    }
+    let mapped = EVENT_CODE_KEYS.iter().find(|(name, _)| *name == code).map(|(_, key)| (*key).to_owned());
+    keys.push(if letter { typed } else { mapped.unwrap_or(typed) });
+    keys
+}
+
+/// `HtmlRenderShortcut`: a shortcut with `mod` resolved for this platform.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PageShortcut {
+    key: String,
+    meta_key: bool,
+    ctrl_key: bool,
+    shift_key: bool,
+    alt_key: bool,
+}
+
+impl PageShortcut {
+    fn of(shortcut: &Shortcut, mac: bool) -> Self {
+        Self {
+            key: shortcut.key.clone(),
+            meta_key: shortcut.meta_key || (shortcut.mod_key && mac),
+            ctrl_key: shortcut.ctrl_key || (shortcut.mod_key && !mac),
+            shift_key: shortcut.shift_key,
+            alt_key: shortcut.alt_key,
+        }
+    }
+
+    /// `matchesKeybindingShortcut` with `mod` already resolved.
+    fn matches(&self, key: &PageKeyDown, keys: &[String]) -> bool {
+        (self.meta_key, self.ctrl_key, self.shift_key, self.alt_key) == (key.meta, key.ctrl, key.shift, key.alt)
+            && keys.contains(&self.key)
+    }
+}
+
+/// What a page hands back (`htmlRenderShortcutsMessage`): the Cmd/Ctrl chords of the allowed
+/// commands, and every other binding's chord, which a matching key must not also be.
+#[derive(Debug, Default, PartialEq)]
+struct PageShortcuts {
+    allowed: Vec<PageShortcut>,
+    blocked: Vec<PageShortcut>,
+}
+
+impl PageShortcuts {
+    /// From the primary's rules and the page's environment's (its project scripts).
+    fn of(primary: &[Rule], environment: &[Rule], mac: bool) -> Self {
+        let blocked = primary
+            .iter()
+            .chain(environment)
+            .filter(|rule| !page_shortcut_command(&rule.command))
+            .map(|rule| PageShortcut::of(&rule.shortcut, mac))
+            .collect();
+        let mut allowed: Vec<PageShortcut> = Vec::new();
+        for rule in primary {
+            let s = &rule.shortcut;
+            let shortcut = PageShortcut::of(s, mac);
+            if page_shortcut_command(&rule.command)
+                && (s.meta_key || s.ctrl_key || s.mod_key)
+                && !allowed.contains(&shortcut)
+            {
+                allowed.push(shortcut);
+            }
+        }
+        Self { allowed, blocked }
+    }
+
+    fn script(&self) -> String {
+        let message = json!({
+            "jsonrpc": "2.0",
+            "method": "t3/notifications/shortcuts",
+            "params": {"shortcuts": self.allowed, "blocked": self.blocked},
+        });
+        format!("window.t3Bridge&&t3Bridge('shortcuts',{});", script_json(&message))
+    }
+
+    /// `isShortcut`: the allowed shortcut `key` presses, unless it also presses a blocked one or
+    /// names a key no allowed shortcut does, as a forged key/code pair can.
+    fn admit(&self, key: &PageKeyDown) -> Option<&PageShortcut> {
+        let keys = event_keys(&key.key, &key.code);
+        let mut allowed = self.allowed.iter().filter(|shortcut| shortcut.matches(key, &keys)).peekable();
+        let first = allowed.peek().copied()?;
+        if self.blocked.iter().any(|shortcut| shortcut.matches(key, &keys)) {
+            return None;
+        }
+        let typed = normalize_key(&key.key);
+        let named = key.key.chars().count() == 1 || key.key == "Dead" || allowed.any(|s| s.key == typed);
+        named.then_some(first)
+    }
+}
+
+/// The keystroke an admitted key replays as, keyed by the shortcut it pressed.
+fn page_keystroke(key: &PageKeyDown, shortcut: &PageShortcut) -> Keystroke {
+    let modifiers =
+        Modifiers { control: key.ctrl, alt: key.alt, shift: key.shift, platform: key.meta, function: false };
+    Keystroke { modifiers, key: shortcut.key.clone(), key_char: None }
 }
 
 fn starts_with_ignore_case(text: &str, prefix: &str) -> bool {
@@ -125,6 +302,18 @@ fn page_message(body: &str) -> Option<PageMessage> {
                 src: src.to_owned(),
                 name: if name.is_empty() { "Image".to_owned() } else { name },
             })
+        }
+        "t3/notifications/keydown" => {
+            let flag = |name: &str| params[name] == true;
+            Some(PageMessage::Key(PageKeyDown {
+                key: params["key"].as_str()?.to_owned(),
+                code: params["code"].as_str()?.to_owned(),
+                meta: flag("metaKey"),
+                ctrl: flag("ctrlKey"),
+                shift: flag("shiftKey"),
+                alt: flag("altKey"),
+                repeat: flag("repeat"),
+            }))
         }
         _ => None,
     }
@@ -332,10 +521,29 @@ struct Page {
     dark: bool,
     /// The theme the page was last sent.
     theme: Option<Rc<PageTheme>>,
+    /// The shortcuts the page was last sent.
+    shortcuts: Option<ShownShortcuts>,
     /// The frame this page last drew in.
     used: u64,
     _task: Option<Task<()>>,
     _messages: Option<Task<()>>,
+}
+
+/// A page's [`PageShortcuts`] and the keymaps they were resolved from.
+struct ShownShortcuts {
+    keymap: Rc<[Rule]>,
+    environment: Option<Rc<[Rule]>>,
+    list: PageShortcuts,
+}
+
+impl ShownShortcuts {
+    fn from(&self, keymap: &Rc<[Rule]>, environment: Option<&Rc<[Rule]>>) -> bool {
+        Rc::ptr_eq(&self.keymap, keymap)
+            && match (&self.environment, environment) {
+                (Some(shown), Some(now)) => Rc::ptr_eq(shown, now),
+                (shown, now) => shown.is_none() && now.is_none(),
+            }
+    }
 }
 
 struct Dialog {
@@ -421,6 +629,37 @@ impl Workspace {
         }
     }
 
+    /// The shortcuts an inline page hands back, from the primary's keymap and the page's environment's.
+    fn page_shortcuts_now(&self, key: &PageKey) -> ShownShortcuts {
+        let environment = self.env_info(&key.owner.env).map(|info| info.keybindings.clone());
+        let list = PageShortcuts::of(&self.keymap, environment.as_deref().unwrap_or_default(), keymap::MAC);
+        ShownShortcuts { keymap: self.keymap.clone(), environment, list }
+    }
+
+    /// A shortcut a focused inline page handed back (`HtmlRenderDocument` replays it on the frame).
+    /// The page can post any key, so it runs only as an allowed chord no other binding claims, and
+    /// resolves as a key pressed with nothing in the app focused.
+    fn html_page_key(&mut self, page: &PageKey, key: &PageKeyDown, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(shown) = self.html_pages.pages.get(page).and_then(|page| page.shortcuts.as_ref()) else { return };
+        let Some(shortcut) = shown.list.admit(key) else { return };
+        let keystroke = page_keystroke(key, shortcut);
+        let context = keymap::ShortcutContext {
+            composer_focus: false,
+            composer_requires_modifier: false,
+            ..self.shortcut_context(&[], window, cx)
+        };
+        let keymap = self.keymap.clone();
+        let Some(command) = keymap::resolve(&keymap, &keystroke, &context) else { return };
+        let focused = window.focused(cx);
+        if self.run_command(command, key.repeat, &context, window, cx)
+            && window.focused(cx) != focused
+            && let Some(embed) = self.html_pages.pages.get(page).and_then(|page| page.embed.as_ref())
+        {
+            // The command moved focus (the palette, find), which the native page still holds.
+            let _ = embed.raw(cx).focus_parent();
+        }
+    }
+
     fn page_key(&self, pane: ChatPane, embed: &timeline::Embed) -> Option<PageKey> {
         Some(PageKey { owner: self.pane_owner(pane)?, attachment: embed.attachment_id.clone() })
     }
@@ -477,6 +716,7 @@ impl Workspace {
             content_height: None,
             dark: look.dark,
             theme: None,
+            shortcuts: None,
             used: self.embeds.frame(),
             _task: None,
             _messages: None,
@@ -494,10 +734,12 @@ impl Workspace {
             let _ = this.update_in(cx, |this, window, cx| match minted {
                 Some((url, expires)) => {
                     let theme = this.page_theme_now(cx);
+                    let shortcuts = this.page_shortcuts_now(&request);
                     let Some(page) = this.html_pages.pages.get_mut(&request) else { return };
                     page.url = Some((url.clone(), expires));
                     page.theme = Some(theme.clone());
-                    let shell = page_shell(&url, &title, &look, true, &theme, "");
+                    let shell = page_shell(&url, &title, &look, true, &theme, &shortcuts.list.script());
+                    page.shortcuts = Some(shortcuts);
                     this.build_page_view(Origin::Inline(request), shell, look.dark, window, cx);
                 }
                 None => this.html_page_failed(&request, cx),
@@ -661,6 +903,12 @@ impl Workspace {
             PageMessage::Expand => {
                 if let Origin::Inline(key) = origin {
                     self.open_html_dialog(key, window, cx);
+                }
+            }
+            // Full screen keeps its keys: the dialog draws over what the commands would open.
+            PageMessage::Key(key) => {
+                if let Origin::Inline(page) = origin {
+                    self.html_page_key(&page, &key, window, cx);
                 }
             }
         }
@@ -854,6 +1102,28 @@ impl Workspace {
                 let _ = embed.raw(cx).evaluate_script(&page_theme.script);
             }
         }
+        let keymap = &self.keymap;
+        let stale: Vec<PageKey> = self
+            .html_pages
+            .pages
+            .iter()
+            .filter(|(key, page)| {
+                let environment = self.env_info(&key.owner.env).map(|info| &info.keybindings);
+                page.embed.is_some() && page.shortcuts.as_ref().is_none_or(|shown| !shown.from(keymap, environment))
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in stale {
+            let next = self.page_shortcuts_now(&key);
+            let Some(page) = self.html_pages.pages.get_mut(&key) else { continue };
+            if let Some(embed) = &page.embed
+                && page.shortcuts.as_ref().is_none_or(|shown| shown.list != next.list)
+            {
+                let _ = embed.raw(cx).evaluate_script(&next.list.script());
+            }
+            page.shortcuts = Some(next);
+        }
+        let pages = &mut self.html_pages;
         if pages.pages.len() > KEPT_PAGES {
             let last = self.embeds.frame();
             let mut used: Vec<u64> = pages.pages.values().map(|page| page.used).collect();
@@ -1009,6 +1279,70 @@ impl Workspace {
 mod tests {
     use super::*;
 
+    fn press(key: &str, code: &str, ctrl: bool, shift: bool) -> PageKeyDown {
+        PageKeyDown { key: key.into(), code: code.into(), meta: false, ctrl, shift, alt: false, repeat: false }
+    }
+
+    fn chord(key: &str, shift: bool) -> PageShortcut {
+        PageShortcut { key: key.into(), meta_key: false, ctrl_key: true, shift_key: shift, alt_key: false }
+    }
+
+    #[test]
+    fn pages_hand_back_only_allowed_chords_no_other_binding_claims() {
+        let rule = |key: &str, command: &str| crate::keybindings::compile(key, command, None).unwrap();
+        let primary = [
+            rule("mod+k", "commandPalette.toggle"),
+            rule("mod+f", "chat.find"),
+            rule("mod+shift+k", "commandPalette.toggle"),
+            rule("mod+k", "commandPalette.toggle"),
+            rule("f6", "sidebar.toggle"),
+            rule("mod+2", "thread.jump.2"),
+            rule("mod+n", "chat.new"),
+            rule("mod+j", "terminal.toggle"),
+            rule("mod+j", "composer.focus"),
+        ];
+        let environment = [rule("mod+shift+f", "script.build.run")];
+        let shortcuts = PageShortcuts::of(&primary, &environment, false);
+        assert_eq!(
+            shortcuts.allowed,
+            [chord("k", false), chord("f", false), chord("k", true), chord("2", false), chord("j", false)],
+            "Cmd/Ctrl chords of the allowed commands, once each; F6 alone stays with the page"
+        );
+        assert_eq!(shortcuts.blocked, [chord("n", false), chord("j", false), chord("f", true)]);
+        let mac = PageShortcuts::of(&primary[..1], &[], true);
+        assert_eq!(mac.allowed, [PageShortcut { meta_key: true, ctrl_key: false, ..chord("k", false) }]);
+
+        assert_eq!(shortcuts.admit(&press("k", "KeyK", true, false)), Some(&chord("k", false)));
+        assert_eq!(shortcuts.admit(&press("K", "KeyK", true, true)), Some(&chord("k", true)));
+        assert_eq!(shortcuts.admit(&press("л", "KeyK", true, false)), Some(&chord("k", false)), "by its physical key");
+        assert_eq!(shortcuts.admit(&press("@", "Digit2", true, false)), Some(&chord("2", false)));
+        assert_eq!(shortcuts.admit(&press("Enter", "KeyK", true, false)), None, "a forged named key");
+        assert_eq!(shortcuts.admit(&press("k", "KeyK", false, false)), None, "the modifiers must match");
+        assert_eq!(shortcuts.admit(&press("j", "KeyJ", true, false)), None, "another binding claims it");
+        assert_eq!(shortcuts.admit(&press("n", "KeyN", true, false)), None);
+
+        // An admitted key replays through the keymap as the command it is bound to.
+        let defaults = PageShortcuts::of(crate::keybindings::defaults(), &[], keymap::MAC);
+        let context = keymap::ShortcutContext::default();
+        let replay = |key: PageKeyDown| {
+            let key = PageKeyDown { meta: keymap::MAC && key.ctrl, ctrl: !keymap::MAC && key.ctrl, ..key };
+            let shortcut = defaults.admit(&key).unwrap();
+            keymap::resolve(crate::keybindings::defaults(), &page_keystroke(&key, shortcut), &context)
+        };
+        assert_eq!(replay(press("[", "BracketLeft", true, false)), Some("navigation.back"));
+        assert_eq!(replay(press("B", "KeyB", true, true)), Some("threadPanel.toggle"));
+
+        let script = shortcuts.script();
+        let message = script.strip_prefix("window.t3Bridge&&t3Bridge('shortcuts',").and_then(|s| s.strip_suffix(");"));
+        let message: Value = serde_json::from_str(message.unwrap()).unwrap();
+        assert_eq!(message["method"], "t3/notifications/shortcuts");
+        assert_eq!(
+            message["params"]["shortcuts"][0],
+            json!({"key": "k", "metaKey": false, "ctrlKey": true, "shiftKey": false, "altKey": false})
+        );
+        assert_eq!(message["params"]["blocked"].as_array().map(Vec::len), Some(3));
+    }
+
     #[test]
     fn frames_fit_the_page_like_html_render_frame_height() {
         let plain = PageSize { height: 640., heights: vec![] };
@@ -1054,6 +1388,13 @@ mod tests {
             Some(PageMessage::Image { src: "data:image/png;base64,AA".into(), name: "Image".into() })
         );
         assert_eq!(page(true, rpc("t3/notifications/open-image", json!({"src": "file:///etc/passwd"}))), None);
+        let key = rpc("t3/notifications/keydown", json!({"key": "k", "code": "KeyK", "ctrlKey": true, "repeat": true}));
+        assert_eq!(page(false, key.clone()), None, "a page can't press keys without the reader");
+        assert_eq!(
+            page(true, key),
+            Some(PageMessage::Key(PageKeyDown { repeat: true, ..press("k", "KeyK", true, false) }))
+        );
+        assert_eq!(page(true, rpc("t3/notifications/keydown", json!({"key": "k"}))), None, "a key needs its code");
         assert_eq!(page(true, json!({"method": "ui/notifications/size-changed", "params": {"height": 9}})), None);
         assert_eq!(page_message(r#"{"type":"ready"}"#), Some(PageMessage::Ready));
         assert_eq!(page_message(r#"{"type":"expand"}"#), Some(PageMessage::Expand));
