@@ -1138,6 +1138,11 @@ impl Workspace {
     /// A hover over the page, or (`dragging`) a held press moving anywhere in the window.
     fn server_mouse_move(&mut self, tab: &TabRef, event: &MouseMoveEvent, dragging: bool) {
         let Some(stream) = self.preview.server.streams.get(tab) else { return };
+        // A release this window didn't see: the page gets its `up` before any more moves.
+        if dragging && stream.buttons != 0 && event.pressed_button.is_none() {
+            self.cancel_server_buttons(tab, event.position);
+            return;
+        }
         if !stream.control.as_ref().is_some_and(Control::mine) || (stream.buttons != 0) != dragging {
             return;
         }

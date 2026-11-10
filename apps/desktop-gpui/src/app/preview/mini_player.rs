@@ -185,10 +185,15 @@ impl Workspace {
 
     /// `handlePointerMove`: a move clamps into the canvas; a resize keeps the aspect ratio. The
     /// layout clears the composer when it next draws, without changing what is stored.
-    fn mini_gesture_move(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+    fn mini_gesture_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
         let ui = &mut self.preview.mini;
+        // A release the player didn't see ends the gesture where it is.
+        if event.pressed_button != Some(MouseButton::Left) {
+            ui.gesture = None;
+            return;
+        }
         let (Some(gesture), Some(canvas)) = (ui.gesture.as_mut(), ui.canvas) else { return };
-        let delta = delta(gesture.pointer, position);
+        let delta = delta(gesture.pointer, event.position);
         if !gesture.moved && delta.x.hypot(delta.y) < SLOP {
             return;
         }
@@ -455,7 +460,7 @@ impl Workspace {
             .rounded(radius)
             .occlude()
             .on_drag_move(cx.listener(|this, event: &DragMoveEvent<MiniDrag>, _, cx| {
-                this.mini_gesture_move(event.event.position, cx);
+                this.mini_gesture_move(&event.event, cx);
             }))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.preview.mini.gesture = None))
             .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, _, _| this.preview.mini.gesture = None))
