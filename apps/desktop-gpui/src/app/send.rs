@@ -335,8 +335,9 @@ impl Workspace {
                         project.workspace_root.clone(),
                     ))
                 });
-                // The draft keeps its terminals' thread until the launch lands: a failed one sends again with it.
-                let thread_id = self.terminals.draft_thread(&draft).unwrap_or_else(new_id);
+                // The draft's terminals and any opened while the launch is pending share its thread; a
+                // failed launch sends again with it.
+                let thread_id = self.draft_thread(&draft, cx).unwrap_or_else(new_id);
                 let launched_message = new_id();
                 let mut initial =
                     json!({"messageId": launched_message, "text": message_text, "attachments": attachments});
@@ -426,7 +427,6 @@ impl Workspace {
                             this.composer_selections.remove(&origin);
                             if let Some(draft) = origin.draft_id() {
                                 this.drafts.promote(draft);
-                                this.terminals.take_draft_thread(draft);
                             }
                             this.drafts_changed(cx);
                         }

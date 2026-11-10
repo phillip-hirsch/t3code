@@ -48,6 +48,9 @@ struct Session {
     created: i64,
     /// It launched its thread (`promotedTo`), so no project opens it again.
     promoted: bool,
+    /// The id its thread launches with (`DraftSessionState.threadId`), assigned once by its first
+    /// terminal or its send, so both share it; it goes when the draft launches or goes.
+    thread_id: Option<String>,
 }
 
 #[derive(Default)]
@@ -64,8 +67,29 @@ impl DraftSessions {
     pub(super) fn create(&mut self, project: ScopedId) -> DraftId {
         let id = DraftId::new();
         self.last_created = crate::timestamp::now_ms().max(self.last_created + 1);
-        self.sessions.insert(id.clone(), Session { project, created: self.last_created, promoted: false });
+        self.sessions
+            .insert(id.clone(), Session { project, created: self.last_created, promoted: false, thread_id: None });
         id
+    }
+
+    /// The id `draft`'s thread launches with, once assigned.
+    pub(super) fn thread_id(&self, draft: &DraftId) -> Option<&str> {
+        self.sessions.get(draft).filter(|session| !session.promoted)?.thread_id.as_deref()
+    }
+
+    /// The id `draft`'s thread launches with, assigned on first use, and whether this call
+    /// assigned it. `None` for a draft that launched or is gone.
+    pub(super) fn reserve_thread(&mut self, draft: &DraftId) -> Option<(String, bool)> {
+        let session = self.sessions.get_mut(draft).filter(|session| !session.promoted)?;
+        let assigned = session.thread_id.is_none();
+        let id = session.thread_id.get_or_insert_with(super::new_id).clone();
+        Some((id, assigned))
+    }
+
+    /// The unsent draft whose thread launches with `thread_id`.
+    pub(super) fn launching_with(&self, thread_id: &str) -> Option<&DraftId> {
+        let mut live = self.sessions.iter().filter(|(_, session)| !session.promoted);
+        live.find(|(_, session)| session.thread_id.as_deref() == Some(thread_id)).map(|(draft, _)| draft)
     }
 
     /// `project`'s draft, unless it launched its thread.
@@ -117,6 +141,7 @@ impl DraftSessions {
     pub(super) fn promote(&mut self, draft: &DraftId) {
         if let Some(session) = self.sessions.get_mut(draft) {
             session.promoted = true;
+            session.thread_id = None;
         }
         self.by_project.retain(|_, mapped| mapped != draft);
     }
@@ -145,6 +170,7 @@ impl DraftSessions {
                 project_id: session.project.id.clone(),
                 created_at: session.created,
                 project_draft: mapped(id),
+                thread_id: session.thread_id.clone(),
             })
             .collect();
         saved.sort_by_key(|session| session.created_at);
@@ -165,7 +191,8 @@ impl DraftSessions {
                 self.by_project.insert(project.clone(), id.clone());
             }
             self.last_created = self.last_created.max(saved.created_at);
-            self.sessions.insert(id.clone(), Session { project, created: saved.created_at, promoted: false });
+            let session = Session { project, created: saved.created_at, promoted: false, thread_id: saved.thread_id };
+            self.sessions.insert(id.clone(), session);
             restored.push(id);
         }
         restored
@@ -183,6 +210,8 @@ pub(super) struct SavedSession {
     /// The draft "New thread" opens in its project.
     #[serde(default)]
     project_draft: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thread_id: Option<String>,
 }
 
 impl SavedSession {
@@ -299,6 +328,30 @@ mod tests {
         drafts.restore(earlier.saved(|_| false));
         assert_eq!(drafts.of_project(&project("web")), Some(&now));
         assert!(drafts.is_live(&old));
+    }
+
+    #[test]
+    fn a_drafts_thread_id_is_assigned_once_and_kept_until_it_launches_or_goes() {
+        let mut drafts = DraftSessions::default();
+        let draft = drafts.create(project("web"));
+        drafts.assign(project("web"), &draft);
+        assert_eq!(drafts.thread_id(&draft), None, "none until a terminal or a send needs it");
+        let (id, assigned) = drafts.reserve_thread(&draft).unwrap();
+        assert!(assigned);
+        assert_eq!(drafts.reserve_thread(&draft), Some((id.clone(), false)), "a send reuses the terminals' id");
+        assert_eq!(drafts.launching_with(&id), Some(&draft));
+
+        let mut next = DraftSessions::default();
+        next.restore(drafts.saved(|_| false));
+        assert_eq!(next.thread_id(&draft), Some(id.as_str()), "it outlives a restart with the draft");
+        assert_eq!(next.launching_with(&id), Some(&draft));
+
+        drafts.promote(&draft);
+        assert_eq!(drafts.launching_with(&id), None, "the launched thread owns it now");
+        assert_eq!(drafts.reserve_thread(&draft), None, "a launched draft takes no new thread");
+        next.forget(&draft);
+        assert_eq!(next.launching_with(&id), None);
+        assert_eq!(drafts.reserve_thread(&DraftId::for_test("gone")), None);
     }
 
     #[test]

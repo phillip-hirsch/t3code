@@ -402,7 +402,5 @@ mod tests {
                 "threadId": "future", "terminalIds": ["term-1"], "activeTerminalId": "term-1", "splitDirection": "horizontal"
             }))
         );
-        let Target::Draft { draft: id, .. } = &draft else { unreachable!() };
-        assert_eq!(terminals.draft_thread(id).as_deref(), Some("future"), "the draft's terminals stay its own");
     }
 }

@@ -146,8 +146,6 @@ pub(super) struct Terminals {
     /// By environment, then thread, in server order; `None` until the first snapshot. Thread ids
     /// repeat across environments, and each environment's stream reports only its own.
     summaries: Option<HashMap<String, HashMap<String, Vec<Summary>>>>,
-    /// The id a draft's thread will launch with, so its terminals carry over.
-    draft_threads: HashMap<DraftId, String>,
     /// The terminal to focus once it mounts, by drawer: another thread's request never lands.
     focus_pending: Option<(DrawerKey, String)>,
     /// Right-panel terminal tabs, by surface id. A change sets `panel_changed`, so the panel layout
@@ -344,25 +342,10 @@ impl Terminals {
         self.drawers_changed = true;
     }
 
-    /// The thread id `draft` launches with, if its terminal drawer used one.
-    pub(super) fn draft_thread(&self, draft: &DraftId) -> Option<String> {
-        self.draft_threads.get(draft).cloned()
-    }
-
-    /// `draft` launched: its terminals and panel tabs now belong to the thread.
-    pub(super) fn take_draft_thread(&mut self, draft: &DraftId) -> Option<String> {
-        self.draft_threads.remove(draft)
-    }
-
-    /// The unsent draft that launches with `thread_id`.
-    fn draft_of(&self, thread_id: &str) -> Option<&DraftId> {
-        self.draft_threads.iter().find(|(_, id)| *id == thread_id).map(|(draft, _)| draft)
-    }
-
     /// Where `key`'s terminals and panel tabs belong: the unsent draft that launches with its
     /// thread, else that thread on its environment.
     fn owner(&self, drafts: &DraftSessions, key: &DrawerKey) -> Option<Target> {
-        match self.draft_of(&key.thread_id) {
+        match drafts.launching_with(&key.thread_id) {
             Some(draft) => drafts.target(draft),
             None => Some(Target::Thread { env: key.env.clone()?.into(), id: key.thread_id.clone() }),
         }
@@ -471,34 +454,35 @@ fn tooltip(text: SharedString) -> impl Fn(&mut Window, &mut App) -> AnyView {
 }
 
 impl Workspace {
-    /// The thread terminals belong to now: the open thread, or the id the
-    /// draft's thread will launch with (created on first use).
-    pub(in crate::app) fn terminal_thread(&mut self, create: bool) -> Option<String> {
-        match self.target.as_ref()? {
-            Target::Thread { id, .. } => Some(id.clone()),
-            Target::Draft { draft, .. } => match self.terminals.draft_threads.get(draft) {
-                Some(id) => Some(id.clone()),
-                None if create => {
-                    let id = super::new_id();
-                    self.terminals.draft_threads.insert(draft.clone(), id.clone());
-                    Some(id)
-                }
-                None => None,
-            },
+    /// The thread terminals belong to now: the open thread, or the id the draft's thread will
+    /// launch with.
+    pub(in crate::app) fn terminal_thread(&mut self, cx: &mut Context<Self>) -> Option<String> {
+        match self.target.clone()? {
+            Target::Thread { id, .. } => Some(id),
+            Target::Draft { draft, .. } => self.draft_thread(&draft, cx),
         }
+    }
+
+    /// The id `draft`'s thread launches with, assigned on first use and saved with the draft.
+    pub(in crate::app) fn draft_thread(&mut self, draft: &DraftId, cx: &mut Context<Self>) -> Option<String> {
+        let (id, assigned) = self.drafts.reserve_thread(draft)?;
+        if assigned {
+            self.drafts_changed(cx);
+        }
+        Some(id)
     }
 
     fn shown_terminal_thread(&self) -> Option<&str> {
         match self.target.as_ref()? {
             Target::Thread { id, .. } => Some(id),
-            Target::Draft { draft, .. } => self.terminals.draft_threads.get(draft).map(String::as_str),
+            Target::Draft { draft, .. } => self.drafts.thread_id(draft),
         }
     }
 
-    /// The drawer terminal commands act on: the open target's thread (a draft's, made on first use
-    /// when `create`) on the target's environment.
-    fn terminal_key(&mut self, create: bool) -> Option<DrawerKey> {
-        let thread_id = self.terminal_thread(create)?;
+    /// The drawer terminal commands act on: the open target's thread (a draft's, assigned on first
+    /// use) on the target's environment.
+    fn terminal_key(&mut self, cx: &mut Context<Self>) -> Option<DrawerKey> {
+        let thread_id = self.terminal_thread(cx)?;
         Some(DrawerKey::new(self.target.as_ref()?.environment(), &thread_id))
     }
 
@@ -599,7 +583,7 @@ impl Workspace {
 
     /// `toggleTerminalVisibility`.
     pub(super) fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(key) = self.terminal_key(true) else { return };
+        let Some(key) = self.terminal_key(cx) else { return };
         let drawer = self.terminals.drawer(&key);
         if drawer.open {
             drawer.open = false;
@@ -625,14 +609,14 @@ impl Workspace {
         cx.notify();
     }
 
-    fn open_drawer_for_action(&mut self) -> Option<DrawerKey> {
-        let key = self.terminal_key(true)?;
+    fn open_drawer_for_action(&mut self, cx: &mut Context<Self>) -> Option<DrawerKey> {
+        let key = self.terminal_key(cx)?;
         self.terminals.drawer(&key).open = true;
         Some(key)
     }
 
     fn split_terminal(&mut self, split: Split, cx: &mut Context<Self>) {
-        let Some(key) = self.open_drawer_for_action() else { return };
+        let Some(key) = self.open_drawer_for_action(cx) else { return };
         if self.terminals.drawer_ref(&key).is_some_and(DrawerLayout::split_limit_reached) {
             return;
         }
@@ -641,7 +625,7 @@ impl Workspace {
     }
 
     fn new_terminal(&mut self, cx: &mut Context<Self>) {
-        let Some(key) = self.open_drawer_for_action() else { return };
+        let Some(key) = self.open_drawer_for_action(cx) else { return };
         self.launch_terminal(key, Place::New, cx);
         cx.notify();
     }
@@ -656,7 +640,7 @@ impl Workspace {
     /// its cwd. A script that stops when the thread settles always gets a terminal of its own.
     /// Once the command is written, a script with `autoOpenPreview` opens its preview URL.
     fn run_in_terminal(&mut self, run: &super::RunInTerminal, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(key) = self.open_drawer_for_action() else { return };
+        let Some(key) = self.open_drawer_for_action(cx) else { return };
         let Some(mut launch) = self.terminal_launch() else { return };
         launch.cwd.clone_from(&run.cwd);
         launch.stop_on_settle = Some(run.stop_on_settle);
@@ -1641,26 +1625,17 @@ mod tests {
     }
 
     #[test]
-    fn a_drafts_future_thread_maps_back_to_its_draft_until_sent() {
-        let mut terminals = Terminals::default();
-        let draft = DraftId::for_test("draft");
-        terminals.draft_threads.insert(draft.clone(), "future".into());
-        assert_eq!(terminals.draft_of("future"), Some(&draft));
-        assert_eq!(terminals.draft_of("other"), None);
-        terminals.take_draft_thread(&draft);
-        assert_eq!(terminals.draft_of("future"), None, "a sent draft's thread is listed");
-    }
-
-    #[test]
     fn a_drafts_terminal_tabs_belong_to_the_draft_until_it_launches() {
         let mut drafts = DraftSessions::default();
         let draft = drafts.create(ScopedId::new("a", "p"));
-        let mut terminals = Terminals::default();
-        terminals.draft_threads.insert(draft.clone(), "future".into());
-        let key = DrawerKey::new("a", "future");
+        let (future, _) = drafts.reserve_thread(&draft).unwrap();
+        let terminals = Terminals::default();
+        let key = DrawerKey::new("a", &future);
         assert_eq!(terminals.owner(&drafts, &key), drafts.target(&draft), "not the thread it will launch");
-        terminals.take_draft_thread(&draft);
-        assert_eq!(terminals.owner(&drafts, &key), Some(Target::Thread { env: "a".into(), id: "future".into() }));
+        let other = DrawerKey::new("a", "other");
+        assert_eq!(terminals.owner(&drafts, &other), Some(Target::Thread { env: "a".into(), id: "other".into() }));
+        drafts.promote(&draft);
+        assert_eq!(terminals.owner(&drafts, &key), Some(Target::Thread { env: "a".into(), id: future }));
         assert_eq!(terminals.owner(&drafts, &key.legacy()), None, "an older build's drawer has no environment");
     }
 

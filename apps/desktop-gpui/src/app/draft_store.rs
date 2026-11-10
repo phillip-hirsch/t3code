@@ -559,6 +559,7 @@ mod tests {
         let mut sessions = DraftSessions::default();
         let id = sessions.create(ScopedId::new("local", "web"));
         sessions.assign(ScopedId::new("local", "web"), &id);
+        let (thread_id, _) = sessions.reserve_thread(&id).unwrap();
         let draft = sessions.target(&id).unwrap();
         let open = thread("t1");
         let attachments = [image("img-1")];
@@ -595,6 +596,7 @@ mod tests {
         let mut next = DraftSessions::default();
         assert_eq!(next.restore(loaded.file.sessions), std::slice::from_ref(&id));
         assert_eq!(next.of_project(&ScopedId::new("local", "web")), Some(&id));
+        assert_eq!(next.thread_id(&id), Some(thread_id.as_str()), "its terminals' thread comes back with it");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

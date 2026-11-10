@@ -77,13 +77,10 @@ impl super::Terminals {
         })
     }
 
-    /// Puts back a tab the last launch left on `target`; a draft's terminals keep the thread it
-    /// will launch with.
+    /// Puts back a tab the last launch left on `target`; a draft's run under the thread it will
+    /// launch with, which the draft keeps.
     pub(in crate::app) fn restore_group(&mut self, target: &Target, surface: String, group: StoredGroup) {
         let key = DrawerKey::new(target.environment(), &group.thread_id);
-        if let Target::Draft { draft, .. } = target {
-            self.draft_threads.entry(draft.clone()).or_insert_with(|| group.thread_id.clone());
-        }
         let group = PanelGroup {
             key,
             terminal_ids: group.terminal_ids,
@@ -193,7 +190,7 @@ impl Workspace {
 
     /// `addTerminalSurface`: a new terminal in a tab of its own.
     pub(in crate::app) fn add_terminal_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(key), Some(launch)) = (self.terminal_key(true), self.terminal_launch()) else { return };
+        let (Some(key), Some(launch)) = (self.terminal_key(cx), self.terminal_launch()) else { return };
         if self.drawer_client(&key).is_none() || !self.drawer_operable(&key) {
             return;
         }

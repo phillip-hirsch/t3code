@@ -325,7 +325,7 @@ impl Workspace {
         window.push_notification(Notification::info("").title(format!("Preparing the {term} checkout...")), cx);
         // The checkout is made for the thread, so the draft's thread id exists first.
         self.start_draft_in(request.environment_id.clone().into(), request.project_id.clone(), window, cx);
-        let Some(thread_id) = self.terminal_thread(true) else {
+        let Some(thread_id) = self.terminal_thread(cx) else {
             settled(self);
             return;
         };

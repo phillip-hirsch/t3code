@@ -127,7 +127,7 @@ impl Workspace {
         self.settings = None;
         self.start_draft_in(environment, project_id.clone(), window, cx);
         // The id the draft's thread launches with.
-        let outcome = match self.terminal_thread(true) {
+        let outcome = match self.terminal_thread(cx) {
             Some(thread_id) => Outcome::Opened { project_id, thread_id },
             None => failed(ErrorCode::ThreadOpenFailed, "T3 Code could not open a new thread for the project."),
         };
