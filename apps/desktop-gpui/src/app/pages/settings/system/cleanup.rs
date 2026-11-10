@@ -14,6 +14,7 @@ use gpui_kit::{
     prelude::FluentBuilder as _, px,
 };
 use serde_json::{Value, json};
+use std::collections::HashSet;
 
 use super::super::connections::logic::{ENVIRONMENT_MAINTAIN, SETTINGS_WRITE};
 use super::super::widgets::{RowFrame, card, loose_section, note, settings_section};
@@ -57,14 +58,33 @@ struct Machine {
     runs_cleanup: bool,
     report: Report,
     database: Option<Value>,
-    /// The web keeps this per environment in local storage; this client keeps it while Settings is open.
-    database_dismissed: bool,
+}
+
+/// What the user did on each machine's database row, by environment id: it outlives the
+/// machine's socket and its absence while disconnected (a reclaim restarts its server).
+#[derive(Default)]
+struct DatabaseMarks {
+    /// The web keeps these in local storage; this client keeps them while Settings is open.
+    dismissed: HashSet<String>,
     /// `server.reclaimDatabaseSpace` was sent; the row waits for the restart until a failure reports back.
-    reclaim_requested: bool,
+    reclaiming: HashSet<String>,
+}
+
+impl DatabaseMarks {
+    /// Starts one reclaim per machine; `false` while one is waiting.
+    fn begin_reclaim(&mut self, id: &str) -> bool {
+        self.reclaiming.insert(id.to_owned())
+    }
+
+    /// The row shows "Restarting…" until the restarted server reports a failure.
+    fn restarting(&self, id: &str, failure: Option<&str>) -> bool {
+        self.reclaiming.contains(id) && failure.is_none()
+    }
 }
 
 pub(super) struct StorageState {
     machines: Vec<Machine>,
+    marks: DatabaseMarks,
     running: bool,
     last_run_open: bool,
     _streams: Vec<Task<()>>,
@@ -105,23 +125,16 @@ impl StorageState {
                 runs_cleanup: spec.runs_cleanup,
                 report: Report::Loading,
                 database: None,
-                database_dismissed: false,
-                reclaim_requested: false,
             })
             .collect();
-        Self { machines, running: false, last_run_open: false, _streams: streams }
+        Self { machines, marks: DatabaseMarks::default(), running: false, last_run_open: false, _streams: streams }
     }
 
-    /// Follows the new sockets after a reconnect (a reclaim restarts the server), keeping what
-    /// the user did on each machine.
+    /// Follows the sockets of the machines connected now (a reclaim restarts the server),
+    /// keeping what the user did on each machine.
     fn reconnect(&mut self, specs: Vec<MachineSpec>, cx: &mut Context<Self>) {
         let mut next = Self::new(specs, cx);
-        for machine in &mut next.machines {
-            if let Some(old) = self.machines.iter().find(|old| old.id == machine.id) {
-                machine.database_dismissed = old.database_dismissed;
-                machine.reclaim_requested = old.reclaim_requested;
-            }
-        }
+        next.marks = std::mem::take(&mut self.marks);
         next.last_run_open = self.last_run_open;
         *self = next;
         cx.notify();
@@ -249,7 +262,8 @@ impl Workspace {
         let connected: Vec<&EnvironmentSession> =
             view.connected_environment_ids().iter().filter_map(|id| self.session(id)).collect();
         let cleanup = connected.iter().all(|s| s.server_info.capability("storageCleanup"));
-        let key = connected.iter().filter_map(|s| s.id.as_deref()).collect::<Vec<_>>().join("\u{1f}");
+        // Keyed by selection, not connection: a machine that drops out keeps its marks.
+        let key = view.selected_environments().iter().map(|e| e.id).collect::<Vec<_>>().join("\u{1f}");
         let specs: Vec<MachineSpec> = connected
             .iter()
             .filter_map(|s| {
@@ -430,7 +444,7 @@ impl Workspace {
             .machines
             .iter()
             .enumerate()
-            .filter(|(_, machine)| !machine.database_dismissed)
+            .filter(|(_, machine)| !storage.marks.dismissed.contains(&machine.id))
             .filter_map(|(index, machine)| {
                 let status = machine.database.as_ref()?;
                 let recommended = status["incrementalVacuumEnabled"] != true
@@ -455,13 +469,14 @@ impl Workspace {
             let amount = format_gib(status["reclaimableBytes"].as_f64().unwrap_or(0.));
             let title = format!("{amount} on {}", machine.label);
             let dismiss_state = state.downgrade();
+            let dismissed_id = machine.id.clone();
             let dismiss = Button::new(SharedString::from(format!("database-dismiss-{index}")))
                 .ghost()
                 .xsmall()
                 .label("Dismiss")
                 .on_click(move |_, _, cx| {
                     let _ = dismiss_state.update(cx, |state, cx| {
-                        state.machines[index].database_dismissed = true;
+                        state.marks.dismissed.insert(dismissed_id.clone());
                         cx.notify();
                     });
                 });
@@ -469,7 +484,7 @@ impl Workspace {
                 let failure = status["reclaimFailure"].as_str();
                 let minutes = reclaim_minutes(status);
                 // A failed repair reports back after the restart, which ends the wait.
-                let restarting = machine.reclaim_requested && failure.is_none();
+                let restarting = storage.marks.restarting(&machine.id, failure);
                 let description = failure.map_or_else(
                     || format!("Restarts T3 Code there. It is offline for about {minutes} min."),
                     |failure| format!("The last attempt failed: {failure}"),
@@ -568,13 +583,10 @@ fn start_reclaim(request: Reclaim, window: &mut Window, cx: &mut App) {
     // The grant can change on a reconnect while the dialog is open.
     let allowed = workspace.upgrade().is_some_and(|w| w.read(cx).environment_grants(&id, ENVIRONMENT_MAINTAIN));
     let started = state.update(cx, |state, cx| {
-        let Some(machine) = state.machines.iter_mut().find(|m| m.id == id && m.client.same_socket(&client)) else {
-            return false;
-        };
-        if !allowed || machine.reclaim_requested {
+        let connected = state.machines.iter().any(|m| m.id == id && m.client.same_socket(&client));
+        if !allowed || !connected || !state.marks.begin_reclaim(&id) {
             return false;
         }
-        machine.reclaim_requested = true;
         cx.notify();
         true
     });
@@ -592,8 +604,7 @@ fn start_reclaim(request: Reclaim, window: &mut Window, cx: &mut App) {
                 ),
                 Err(error) => {
                     let _ = state.update(cx, |state, cx| {
-                        if let Some(machine) = state.machines.iter_mut().find(|m| m.id == id) {
-                            machine.reclaim_requested = false;
+                        if state.marks.reclaiming.remove(&id) {
                             cx.notify();
                         }
                     });
@@ -758,6 +769,17 @@ fn fold_header(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reclaim_waits_once_per_machine_until_its_restarted_server_reports_a_failure() {
+        let mut marks = DatabaseMarks::default();
+        assert!(marks.begin_reclaim("a"));
+        assert!(!marks.begin_reclaim("a"), "one reclaim per machine while it restarts");
+        assert!(marks.begin_reclaim("b"), "another machine reclaims on its own");
+        assert!(marks.restarting("a", None));
+        assert!(!marks.restarting("a", Some("disk full")), "a reported failure ends the wait");
+        assert!(!marks.restarting("c", None));
+    }
 
     #[test]
     fn a_rule_is_on_from_retention_global_worktree_rules_or_a_custom_project() {
