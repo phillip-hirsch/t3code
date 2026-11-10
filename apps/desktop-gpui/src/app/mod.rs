@@ -228,7 +228,8 @@ pub struct Workspace {
     _working_tick: Option<Task<()>>,
     scroller: Entity<MessageScrollerState>,
     composer: Entity<TextareaState>,
-    sending: bool,
+    /// Targets whose send is in flight: each thread's or draft's own (`draftSendState`).
+    sending: HashSet<Target>,
     /// Threads whose rewind is still rolling back on the server; they take no sends.
     rewinding: HashSet<String>,
     /// Model picked in the composer; for an open thread it applies to the next message.
@@ -526,7 +527,7 @@ impl Workspace {
             _working_tick: None,
             scroller,
             composer,
-            sending: false,
+            sending: HashSet::new(),
             rewinding: HashSet::new(),
             model_override: None,
             model_explicit: false,

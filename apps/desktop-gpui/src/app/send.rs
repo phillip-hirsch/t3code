@@ -237,7 +237,7 @@ impl Workspace {
         // Read once: an arm made while this send is in flight belongs to the next message.
         let fresh_arm = self.fresh_session_arm().filter(|_| fresh_session);
         if (text.is_empty() && !self.has_attachments())
-            || self.sending
+            || self.target_sending()
             || self.target_rewinding()
             || self.runtime_mode_ceiling().is_some()
             || self.clone_send_block().is_some()
@@ -376,7 +376,7 @@ impl Workspace {
         if let Some(message_id) = started {
             self.anchor_new_turn(message_id.into(), cx);
         }
-        self.sending = true;
+        self.sending.insert(origin.clone());
         self.set_composer_text("", window, cx);
         self.release_typing_hold(false, window, cx);
         cx.spawn_in(window, async move |this, cx| {
@@ -417,7 +417,7 @@ impl Workspace {
                 }
             }
             let _ = this.update_in(cx, |this, window, cx| {
-                this.sending = false;
+                this.sending.remove(&origin);
                 match result {
                     Ok(_) => {
                         if !text_is_feedback {
@@ -487,12 +487,17 @@ impl Workspace {
             && self.open_projection().is_some_and(|p| p.resumable_run_id().is_some() || p.has_held_queued_runs())
     }
 
+    /// A send from the open target's composer is in flight; other targets' sends don't hold it.
+    pub(super) fn target_sending(&self) -> bool {
+        self.target.as_ref().is_some_and(|target| self.sending.contains(target))
+    }
+
     /// `useComposerResume`: "Continue where you left off." on the resumable run, then the
     /// held queue; with nothing to continue, only the queue.
     pub(super) fn resume_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(Target::Thread { id: thread_id, .. }) = self.target.clone() else { return };
         let (Some(client), Some(projection)) = (self.client(), self.open_projection()) else { return };
-        if self.sending || self.target_rewinding() || !self.target_can_operate() {
+        if self.target_sending() || self.target_rewinding() || !self.target_can_operate() {
             return;
         }
         let run = projection.resumable_run_id().map(str::to_owned);
@@ -525,9 +530,9 @@ impl Workspace {
                 }
             }
         }
-        self.sending = true;
         self.error = None;
         let origin = self.target.clone();
+        self.sending.extend(origin.clone());
         cx.spawn_in(window, async move |this, cx| {
             let mut result = Ok(Value::Null);
             for command in commands {
@@ -537,7 +542,9 @@ impl Workspace {
                 }
             }
             let _ = this.update(cx, |this, cx| {
-                this.sending = false;
+                if let Some(origin) = &origin {
+                    this.sending.remove(origin);
+                }
                 match (result, &origin) {
                     (Err(error), Some(origin)) => {
                         this.set_error_for(origin, format!("Could not resume thread. {error}").into());

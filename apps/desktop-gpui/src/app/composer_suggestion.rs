@@ -198,7 +198,7 @@ impl Workspace {
         let suggestion = self.prompt_suggestions.offered(&thread, run)?;
         let running = self.open_projection().is_some_and(crate::model::ThreadProjection::is_running);
         let held = running
-            || self.sending
+            || self.target_sending()
             || self.saving_queue_edit()
             || self.fresh_session_arm().is_some()
             || self.has_attachments()

@@ -1097,7 +1097,7 @@ impl Workspace {
     /// A message from the pane's composer is in flight.
     pub(super) fn pane_sending(&self, pane: ChatPane) -> bool {
         match pane {
-            ChatPane::Main => self.sending,
+            ChatPane::Main => self.target_sending(),
             ChatPane::Side => self.side_chat.view.as_ref().is_some_and(|view| view.sending),
         }
     }

@@ -1536,9 +1536,10 @@ impl Workspace {
         if running && !sendable && !editing {
             return stop().into_any_element();
         }
-        let busy = self.sending || self.saving_queue_edit();
+        let sending = self.target_sending();
+        let busy = sending || self.saving_queue_edit();
         if can_resume && !sendable {
-            let enabled = operate && !self.sending && !self.target_rewinding() && self.client().is_some();
+            let enabled = operate && !sending && !self.target_rewinding() && self.client().is_some();
             // The web's send button in its resume state: the same stage art, a filled play.
             let stage = self.stage_art();
             let (fill, icon) = if stage.is_some() {
@@ -1546,7 +1547,7 @@ impl Workspace {
             } else {
                 (t.primary, t.primary_foreground)
             };
-            let content = if self.sending {
+            let content = if sending {
                 Spinner::new().small().color(icon).into_any_element()
             } else {
                 Icon::empty().path("icons/app/play-filled.svg").with_size(px(16.)).text_color(icon).into_any_element()

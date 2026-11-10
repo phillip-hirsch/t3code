@@ -282,7 +282,7 @@ impl Workspace {
         let sent_attachments = std::mem::take(&mut self.attachments);
         let sent_records = self.take_context_records();
         self.error = None;
-        self.sending = true;
+        self.sending.insert(origin.clone());
         self.set_composer_text("", window, cx);
         self.release_typing_hold(false, window, cx);
         cx.spawn_in(window, async move |this, cx| {
@@ -290,7 +290,7 @@ impl Workspace {
                 launches.iter().map(|(.., input)| client.request("orchestration.launchThread", input.clone()));
             let results = join_all(requests).await;
             let _ = this.update_in(cx, |this, window, cx| {
-                this.sending = false;
+                this.sending.remove(&origin);
                 let mut failed = Vec::new();
                 let mut started = 0;
                 for ((selection, retry, _), result) in launches.into_iter().zip(results) {
