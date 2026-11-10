@@ -102,6 +102,25 @@ impl History {
     }
 }
 
+/// What a draft's history entry opens.
+#[derive(Debug, PartialEq)]
+enum HistoryDraft {
+    /// The draft itself, where it is now.
+    Open(Target),
+    /// The entry's project's draft, since the entry's draft was sent or removed.
+    ProjectDraft { env: SharedString, project_id: String },
+}
+
+/// `ThreadRouteView` on `/draft/$draftId`: an entry follows its unsent draft wherever it is now
+/// (`current`), unlike a closed tab's owner. `None` while the project it would open is unlisted.
+fn history_draft(entry: &Target, current: Option<Target>, listed: impl Fn(&Target) -> bool) -> Option<HistoryDraft> {
+    let Target::Draft { env, project_id, .. } = entry else { return None };
+    match current {
+        Some(current) => listed(&current).then_some(HistoryDraft::Open(current)),
+        None => listed(entry).then(|| HistoryDraft::ProjectDraft { env: env.clone(), project_id: project_id.clone() }),
+    }
+}
+
 impl Workspace {
     fn location(&self) -> Location {
         if let Some(section) = &self.settings {
@@ -208,6 +227,24 @@ impl Workspace {
         }
     }
 
+    /// Opens what a draft's history entry resolves to, and makes the entry name it, so the push that
+    /// follows lands on the entry instead of dropping the forward entries.
+    fn open_history_draft(&mut self, entry: &Target, window: &mut Window, cx: &mut Context<Self>) {
+        let current =
+            entry.draft_id().filter(|draft| self.drafts.is_live(draft)).and_then(|draft| self.drafts.target(draft));
+        let listed = |target: &Target| {
+            let Target::Draft { env, project_id, .. } = target else { return false };
+            self.shell.projects.iter().any(|p| &p.id == project_id && &p.environment_id == env)
+        };
+        let target = match history_draft(entry, current, listed) {
+            Some(HistoryDraft::Open(target)) => target,
+            Some(HistoryDraft::ProjectDraft { env, project_id }) => self.project_draft(env, project_id, cx),
+            None => return,
+        };
+        self.history.replace(Location::Chat(Some(target.clone())));
+        self.open_draft(target, window, cx);
+    }
+
     /// Shows a history entry. The push that follows each step lands on the
     /// entry itself, so history is left where the step put it.
     fn go_to(&mut self, location: Location, window: &mut Window, cx: &mut Context<Self>) {
@@ -219,7 +256,7 @@ impl Workspace {
         self.settings_ui.access_environment = None;
         match location {
             Location::Chat(Some(Target::Thread { env, id })) => self.select_thread_in(env, id, window, cx),
-            Location::Chat(Some(target @ Target::Draft { .. })) => self.open_draft_entry(target, window, cx),
+            Location::Chat(Some(entry @ Target::Draft { .. })) => self.open_history_draft(&entry, window, cx),
             Location::Chat(None) => {}
             Location::Page(page) => {
                 self.page_entered(page);
@@ -257,6 +294,22 @@ mod tests {
 
     fn draft(id: &str) -> Location {
         Location::Chat(Some(Target::draft("e".into(), id.into(), crate::app::draft_sessions::DraftId::for_test(id))))
+    }
+
+    #[test]
+    fn a_draft_entry_follows_its_draft_wherever_it_is_now() {
+        let id = crate::app::draft_sessions::DraftId::for_test("d");
+        let at = |env: &str, project: &str| Target::draft(env.into(), project.into(), id.clone());
+        let listed = |target: &Target| !matches!(target, Target::Draft { project_id, .. } if project_id == "gone");
+        let open = |target: Target| Some(HistoryDraft::Open(target));
+        assert_eq!(history_draft(&at("e", "p"), Some(at("e", "p")), listed), open(at("e", "p")));
+        assert_eq!(history_draft(&at("e", "p"), Some(at("e", "q")), listed), open(at("e", "q")), "moved projects");
+        assert_eq!(history_draft(&at("e", "p"), Some(at("f", "q")), listed), open(at("f", "q")), "moved machines");
+        assert_eq!(history_draft(&at("e", "gone"), Some(at("e", "q")), listed), open(at("e", "q")));
+        assert_eq!(history_draft(&at("e", "p"), Some(at("e", "gone")), listed), None, "its project is unlisted");
+        let fallback = Some(HistoryDraft::ProjectDraft { env: "e".into(), project_id: "p".into() });
+        assert_eq!(history_draft(&at("e", "p"), None, listed), fallback, "a sent draft opens its project's draft");
+        assert_eq!(history_draft(&at("e", "gone"), None, listed), None);
     }
 
     #[test]
