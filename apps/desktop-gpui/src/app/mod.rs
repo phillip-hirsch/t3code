@@ -838,9 +838,9 @@ impl Workspace {
     /// Leaves a thread that was deleted, as the web ends its view.
     fn close_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Its draft has nowhere to go: drop it rather than leave it in the editor.
-        if let Some(target) = self.target.take() {
-            self.composer_drafts.remove(&target);
-            self.composer_selections.remove(&target);
+        if let Some(target) = self.target.clone() {
+            self.drop_deleted_draft(&target, cx);
+            self.target = None;
         }
         self.attachments.clear();
         self.set_composer_text("", window, cx);

@@ -6,6 +6,7 @@ use serde_json::Value;
 
 use super::composer::ComposerDraft;
 use super::{Target, Workspace};
+use crate::model::ThreadShell;
 
 /// The side chats of `parent` in an `orchestration.getThreadFamily` reply.
 pub(in crate::app) fn family_side_chats(family: &Value, parent: &str) -> Vec<String> {
@@ -19,6 +20,12 @@ pub(in crate::app) fn family_side_chats(family: &Value, parent: &str) -> Vec<Str
         })
         .filter_map(|thread| thread["id"].as_str().map(str::to_owned))
         .collect()
+}
+
+/// Whether an environment other than `env` lists a thread `thread_id`. Side chat drafts and
+/// terminal drawers are kept by thread id alone, so such a thread still owns them.
+fn listed_elsewhere(threads: &[ThreadShell], env: &str, thread_id: &str) -> bool {
+    threads.iter().any(|t| t.id == thread_id && t.environment_id.as_ref() != env)
 }
 
 impl Workspace {
@@ -42,6 +49,22 @@ impl Workspace {
         self.env_info(env).is_some_and(|info| info.config["shellThreadFamilies"].as_bool() == Some(true))
     }
 
+    /// Drops `target`'s composer draft and lets its staged uploads go. Whichever of the delete
+    /// reply and the `thread.deleted` event comes first does it.
+    pub(in crate::app) fn drop_deleted_draft(&mut self, target: &Target, cx: &mut Context<Self>) {
+        if self.target.as_ref() == Some(target) {
+            for attachment in std::mem::take(&mut self.attachments) {
+                self.release_upload(&attachment, cx);
+            }
+        }
+        if let Some(ComposerDraft::Prompt(_, attachments)) = self.composer_drafts.remove(target) {
+            for attachment in &attachments {
+                self.release_upload(attachment, cx);
+            }
+        }
+        self.composer_selections.remove(target);
+    }
+
     /// Clears a deleted thread's and its side chats' composer drafts, releasing their staged
     /// uploads, and resets the thread's terminal drawer.
     pub(in crate::app) fn forget_deleted_thread(
@@ -52,21 +75,14 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         for id in std::iter::once(thread_id).chain(side_chats.iter().map(String::as_str)) {
-            let target = Target::Thread { env: env.clone(), id: id.to_owned() };
-            if self.target.as_ref() == Some(&target) {
-                for attachment in std::mem::take(&mut self.attachments) {
-                    self.release_upload(&attachment, cx);
-                }
+            self.drop_deleted_draft(&Target::Thread { env: env.clone(), id: id.to_owned() }, cx);
+            if !listed_elsewhere(&self.shell.threads, env, id) {
+                self.side_chat.forget(id);
             }
-            if let Some(ComposerDraft::Prompt(_, attachments)) = self.composer_drafts.remove(&target) {
-                for attachment in &attachments {
-                    self.release_upload(attachment, cx);
-                }
-            }
-            self.composer_selections.remove(&target);
-            self.side_chat.forget(id);
         }
-        self.terminals.forget_thread(thread_id, cx);
+        if !listed_elsewhere(&self.shell.threads, env, thread_id) {
+            self.terminals.forget_thread(thread_id, cx);
+        }
         cx.notify();
     }
 }
@@ -89,5 +105,21 @@ mod tests {
         assert_eq!(family_side_chats(&family, "root"), ["side"]);
         assert_eq!(family_side_chats(&family, "fork"), ["nested"]);
         assert!(family_side_chats(&json!({}), "root").is_empty(), "an unreadable reply names none");
+    }
+
+    #[test]
+    fn a_thread_id_another_environment_lists_keeps_its_state() {
+        let thread = |environment: &str, id: &str| {
+            let mut thread: ThreadShell = serde_json::from_value(json!({
+                "id": id, "projectId": "p", "title": "T", "status": "idle", "updatedAt": "2026-01-01T00:00:00Z",
+            }))
+            .unwrap();
+            thread.environment_id = environment.to_owned().into();
+            thread
+        };
+        let threads = [thread("a", "shared"), thread("b", "shared"), thread("a", "only")];
+        assert!(listed_elsewhere(&threads, "a", "shared"));
+        assert!(!listed_elsewhere(&threads, "a", "only"));
+        assert!(!listed_elsewhere(&threads, "a", "gone"), "an unlisted id belongs to the deleting environment");
     }
 }
