@@ -71,13 +71,12 @@ impl Workspace {
         let read_only = !self.settings_grants(PROVIDERS_MANAGE) || project_scoped;
         let empty = serde_json::Map::new();
         let providers = self.server_settings()["secretProviders"].as_object().unwrap_or(&empty);
-        let ids: Vec<String> = providers.keys().cloned().collect();
         let add = (!read_only).then(|| {
-            let (host, ids) = (host.clone(), ids.clone());
+            let host = host.clone();
             WebButton::new("add-secret-provider", "Add provider")
                 .icon(IconName::Plus)
                 .on_click(move |_, window, cx| {
-                    open_provider_dialog(host.clone(), ids.clone(), None, window, cx);
+                    open_provider_dialog(host.clone(), None, window, cx);
                 })
                 .into_any_element()
         });
@@ -121,13 +120,13 @@ impl Workspace {
                     };
                     let controls = (!read_only).then(|| {
                         let edit = account.is_some().then(|| {
-                            let (host, ids) = (host.clone(), ids.clone());
+                            let host = host.clone();
                             let editing = (id.clone(), provider.clone());
                             WebButton::new(ElementId::Name(format!("secret-provider-edit-{id}").into()), "Edit")
                                 .variant(Variant::Ghost)
                                 .on_click(move |_, window, cx| {
                                     let editing = Some(editing.clone());
-                                    open_provider_dialog(host.clone(), ids.clone(), editing, window, cx);
+                                    open_provider_dialog(host.clone(), editing, window, cx);
                                 })
                         });
                         let remove = {
@@ -244,12 +243,11 @@ fn confirm_remove(
 struct ProviderForm {
     name: Entity<InputState>,
     account: Entity<InputState>,
-    existing_ids: Vec<String>,
     /// The provider being edited: its id and stored config.
     editing: Option<(String, Value)>,
     submitted: bool,
     host: SettingsWriter,
-    _subscriptions: [Subscription; 2],
+    _subscriptions: Vec<Subscription>,
 }
 
 impl ProviderForm {
@@ -260,11 +258,26 @@ impl ProviderForm {
         }
     }
 
+    /// The destination's providers now, not at open: another client may have added or removed one.
+    fn existing_ids(&self, cx: &App) -> Vec<String> {
+        let Some(workspace) = self.host.workspace.upgrade() else { return Vec::new() };
+        let environment = self.host.environment.as_deref().unwrap_or_default();
+        let info = workspace.read(cx).env_info(environment);
+        info.and_then(|info| info.settings["secretProviders"].as_object())
+            .map(|providers| providers.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.submitted = true;
         cx.notify();
+        let existing_ids = self.existing_ids(cx);
         let editing = self.editing.as_ref().map(|(id, _)| id.as_str());
-        let Ok(entry) = logic::secret_provider_from_draft(&self.draft(cx), &self.existing_ids, editing) else { return };
+        // The web unmounts the edit dialog once its provider is gone; don't recreate it.
+        if editing.is_some_and(|id| !existing_ids.iter().any(|existing| existing == id)) {
+            return window.close_dialog(cx);
+        }
+        let Ok(entry) = logic::secret_provider_from_draft(&self.draft(cx), &existing_ids, editing) else { return };
         let patch = json!({ "secretProviders": { entry.id: {
             "kind": "one_password", "label": entry.label, "config": { "account": entry.account },
         } } });
@@ -277,7 +290,7 @@ impl Render for ProviderForm {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *theme::tokens(cx);
         let editing = self.editing.as_ref().map(|(id, _)| id.as_str());
-        let result = logic::secret_provider_from_draft(&self.draft(cx), &self.existing_ids, editing);
+        let result = logic::secret_provider_from_draft(&self.draft(cx), &self.existing_ids(cx), editing);
         let issues =
             if self.submitted { result.as_ref().err().cloned().unwrap_or_default() } else { Default::default() };
         let field =
@@ -321,13 +334,7 @@ impl Render for ProviderForm {
     }
 }
 
-fn open_provider_dialog(
-    host: SettingsWriter,
-    existing_ids: Vec<String>,
-    editing: Option<(String, Value)>,
-    window: &mut Window,
-    cx: &mut App,
-) {
+fn open_provider_dialog(host: SettingsWriter, editing: Option<(String, Value)>, window: &mut Window, cx: &mut App) {
     let draft = editing.as_ref().map(|(_, config)| SecretProviderDraft {
         name: config["label"].as_str().unwrap_or_default().to_owned(),
         account: logic::one_password_account(config).unwrap_or_default(),
@@ -358,10 +365,13 @@ fn open_provider_dialog(
             }
         };
         ProviderForm {
-            _subscriptions: [cx.subscribe_in(&name, window, on_input), cx.subscribe_in(&account, window, on_input)],
+            _subscriptions: [cx.subscribe_in(&name, window, on_input), cx.subscribe_in(&account, window, on_input)]
+                .into_iter()
+                // Re-validate when the destination's providers change, as the web's render does.
+                .chain(host.workspace.upgrade().map(|workspace| cx.observe(&workspace, |_, _, cx| cx.notify())))
+                .collect(),
             name,
             account,
-            existing_ids,
             editing,
             submitted: false,
             host,
