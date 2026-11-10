@@ -1170,8 +1170,9 @@ impl Workspace {
         Target::draft(env, project_id, draft)
     }
 
-    /// A history entry's draft: that draft while it is unsent, still in this project and the
-    /// project listed, else its project's draft on the entry's environment.
+    /// A stored draft (a closed tab's owner, a checkout's origin): that draft while it is unsent,
+    /// still in this project and the project listed, else its project's draft on the entry's
+    /// environment. History follows a moved draft instead (`open_history_draft`).
     fn open_draft_entry(&mut self, target: Target, window: &mut Window, cx: &mut Context<Self>) {
         let Target::Draft { env, project_id, draft } = &target else { return };
         if !self.shell.projects.iter().any(|p| p.id == *project_id && p.environment_id == *env) {
