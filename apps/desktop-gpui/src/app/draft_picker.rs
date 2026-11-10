@@ -220,7 +220,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.composer_has_user_content(cx) && matches!(self.target, Some(super::Target::Draft { .. })) {
+        let movable = matches!(self.target, Some(super::Target::Draft { .. })) && !self.target_sending();
+        if movable && self.composer_has_user_content(cx) {
             self.move_draft_to_project(env, project_id, cx);
         } else {
             self.start_draft_in(env, project_id, window, cx);

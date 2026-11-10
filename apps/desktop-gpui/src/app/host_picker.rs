@@ -231,6 +231,11 @@ impl Workspace {
     /// The picker opens for a draft with a machine to move to, or a machine to add its project to
     /// (`showEnvironmentPicker`).
     fn can_pick_host(&self, options: &[EnvironmentOption]) -> bool {
+        !self.target_sending() && self.has_host_choice(options)
+    }
+
+    /// The draft has somewhere to go, whether or not a send holds it in place for now.
+    fn has_host_choice(&self, options: &[EnvironmentOption]) -> bool {
         self.can_change_environment(options) || self.add_to_machine_project(options).is_some()
     }
 
@@ -294,6 +299,9 @@ impl Workspace {
     /// (`onEnvironmentChange`). A pick by hand turns load balancing off for this draft.
     fn change_environment(&mut self, option: EnvironmentOption, window: &mut Window, cx: &mut Context<Self>) {
         let Some(target @ Target::Draft { .. }) = self.target.clone() else { return };
+        if self.target_sending() {
+            return;
+        }
         self.host.open = false;
         self.host.selections.insert(target, Selection::Manual);
         self.host._sample = None;
@@ -309,6 +317,9 @@ impl Workspace {
     /// leaves it (`environmentSelection: "manual"`).
     pub(super) fn move_draft_by_hand(&mut self, env: SharedString, project_id: String, cx: &mut Context<Self>) {
         let Some(target @ Target::Draft { .. }) = self.target.clone() else { return };
+        if self.target_sending() {
+            return;
+        }
         self.host.open = false;
         self.host.selections.insert(target, Selection::Manual);
         self.host._sample = None;
@@ -317,14 +328,19 @@ impl Workspace {
     }
 
     /// The draft keeps its identity and text and moves to another checkout, becoming that
-    /// project's draft (`setLogicalProjectDraftThreadId`).
+    /// project's draft (`setLogicalProjectDraftThreadId`). A draft being sent stays put: the
+    /// launch promotes it where it started.
     pub(super) fn retarget_draft(&mut self, env: SharedString, project_id: String, cx: &mut Context<Self>) {
         let Some(from @ Target::Draft { .. }) = self.target.clone() else { return };
+        if self.target_sending() {
+            return;
+        }
         let Some(draft) = from.draft_id().cloned() else { return };
         self.drafts.assign(crate::model::ScopedId::new(env.clone(), project_id.as_str()), &draft);
         let to = Target::draft(env, project_id, draft);
         carry(&mut self.host.selections, &from, &to);
         self.carry_draft_panel(&from, &to);
+        self.retarget_closed_views(&from, &to);
         self.target = Some(to);
         self.sync_draft_workspace(cx);
         self.sync_attachment_uploads(cx);
@@ -340,7 +356,7 @@ impl Workspace {
     /// the project already holds stays as its own sidebar row.
     pub(super) fn move_draft_to_project(&mut self, env: SharedString, project_id: String, cx: &mut Context<Self>) {
         let Some(Target::Draft { env: from_env, project_id: from, .. }) = &self.target else { return };
-        if (from_env, from) == (&env, &project_id) {
+        if (from_env, from) == (&env, &project_id) || self.target_sending() {
             return;
         }
         let (model, explicit) = (self.model_override.take(), self.model_explicit);
@@ -378,7 +394,7 @@ impl Workspace {
     /// `onAutoEnvironment`: back to load balancing, which samples the machines again.
     fn choose_auto_environment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.host.open = false;
-        if !matches!(self.target, Some(Target::Draft { .. })) {
+        if !matches!(self.target, Some(Target::Draft { .. })) || self.target_sending() {
             return;
         }
         if !self.attachments.is_empty() {
@@ -563,7 +579,7 @@ impl Workspace {
     /// `composer.cycleHost`: the draft moves to the project's next machine.
     pub(super) fn cycle_host(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let options = self.logical_project_environments();
-        if !self.can_change_environment(&options) {
+        if !self.can_change_environment(&options) || self.target_sending() {
             return false;
         }
         let current = self.active_environment().cloned();
@@ -580,7 +596,7 @@ impl Workspace {
         let active = self.active_environment();
         let current = options.iter().find(|o| Some(&o.environment_id) == active);
         let can_pick = self.can_pick_host(&options);
-        let shown = can_pick || current.is_some_and(|o| !o.is_primary) || self.environment_remote;
+        let shown = self.has_host_choice(&options) || current.is_some_and(|o| !o.is_primary) || self.environment_remote;
         if !shown {
             return None;
         }

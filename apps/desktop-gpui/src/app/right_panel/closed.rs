@@ -5,7 +5,7 @@
 
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
-use gpui_kit::{Context, Window};
+use gpui_kit::{App, Context, Window};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -267,8 +267,12 @@ impl Workspace {
         });
     }
 
-    /// `draft` launched `thread`: its closed tabs reopen there.
+    /// `draft` launched `thread`, or moved to another project on its environment: its closed tabs
+    /// reopen there. The web keys them by environment and thread id, so a move off it leaves them.
     pub(in crate::app) fn retarget_closed_views(&mut self, draft: &Target, thread: &Target) {
+        if draft.environment() != thread.environment() {
+            return;
+        }
         let (from, to) = (StoredTarget::from(draft), StoredTarget::from(thread));
         self.right_panel.closed.update(|history| history.retarget(&from, &to));
     }
@@ -292,7 +296,14 @@ impl Workspace {
         });
     }
 
-    fn reopen_owner_state(&self, view: &ClosedView) -> OwnerState {
+    /// `environmentCatalog.isReady`: the saved environments are read, and the primary's id is
+    /// known unless the local environment is off and there is no primary.
+    fn environment_catalog_ready(&self, cx: &App) -> bool {
+        !self.saved_environments.read(cx).loading()
+            && (matches!(self.connection, crate::app::Connection::Off) || self.primary_environment().is_some())
+    }
+
+    fn reopen_owner_state(&self, view: &ClosedView, catalog_ready: bool) -> OwnerState {
         let Some(owner) = view.owner() else {
             // The Pull requests page is always there to reopen on.
             let ClosedView::PullRequestTab { reference } = view else { return OwnerState::default() };
@@ -329,7 +340,7 @@ impl Workspace {
         });
         OwnerState {
             environment_known: self.session(environment).is_some(),
-            catalog_ready: self.primary_environment().is_some(),
+            catalog_ready,
             owner_exists,
             side_chat_exists,
             shell_live: self.shell.has_snapshot(environment),
@@ -379,8 +390,10 @@ impl Workspace {
             closed.queued += 1;
             return true;
         }
-        let (drop, restore) =
-            plan_next_reopen(self.right_panel.closed.history.entries(), |view| self.reopen_owner_state(view));
+        let catalog_ready = self.environment_catalog_ready(cx);
+        let (drop, restore) = plan_next_reopen(self.right_panel.closed.history.entries(), |view| {
+            self.reopen_owner_state(view, catalog_ready)
+        });
         let restore = restore
             .and_then(|id| self.right_panel.closed.history.entries().iter().find(|entry| entry.id == id).cloned());
         self.right_panel.closed.update(|history| {
