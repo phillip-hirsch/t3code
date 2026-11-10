@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 
 use super::banners::{Variant, composer_banner, corner_action};
 use super::composer::{control_button, runtime_modes};
+use super::git::SOURCE_CONTROL_WRITE;
 use super::{Target, Workspace};
 use crate::model::ScopedId;
 use crate::new_thread::{self, DraftWorkspace, EnvMode, WorkspaceChoice};
@@ -215,6 +216,27 @@ enum BranchItem {
     Create(String),
 }
 
+/// What the picker's environment lets this client do with refs: `canWriteSourceControl`, and
+/// `canUpdateThreadBranch` (a started thread records its branch through orchestration).
+#[derive(Clone, Copy)]
+struct BranchGrants {
+    write: bool,
+    update: bool,
+}
+
+impl BranchGrants {
+    /// `canChangeThreadBranch`: creating a ref or checking out a pull request.
+    fn change(self) -> bool {
+        self.write && self.update
+    }
+
+    /// A ref row (`BranchPickerRefItem`'s `disabled`): a worktree base or a ref another worktree
+    /// has checked out is only recorded, anything else switches the checkout.
+    fn pick(self, records_only: bool) -> bool {
+        self.update && (self.write || records_only)
+    }
+}
+
 /// `shouldLoadNextBranchPageAfterScroll`'s distance from the end.
 const NEXT_PAGE_DISTANCE: f32 = 96.;
 
@@ -308,6 +330,10 @@ impl Workspace {
                 let Some(index) = self.draft_workspace.branch_highlight else { return false };
                 match self.branch_items().into_iter().nth(index) {
                     Some(BranchItem::Ref(item)) => {
+                        let (_, worktree_base, _) = self.branch_trigger();
+                        if !self.branch_grants().pick(worktree_base || item["worktreePath"].as_str().is_some()) {
+                            return true;
+                        }
                         let name = item["name"].as_str().unwrap_or_default().to_owned();
                         self.select_branch(name, window, cx);
                     }
@@ -332,10 +358,10 @@ impl Workspace {
         let query = state.branch_query.to_lowercase();
         let sanitized = new_thread::sanitize_new_ref_name(&query);
         let exact = refs.iter().any(|r| r["name"].as_str() == Some(state.branch_pages.query.as_str()));
-        let create =
-            (!query.is_empty() && !exact && !worktree_base).then(|| BranchItem::Create(state.branch_query.clone()));
-        let checkout = self
-            .can_checkout_pull_request()
+        let can_change = self.branch_grants().change();
+        let create = (can_change && !query.is_empty() && !exact && !worktree_base)
+            .then(|| BranchItem::Create(state.branch_query.clone()));
+        let checkout = (can_change && self.can_checkout_pull_request())
             .then(|| crate::pull_request_checkout::parse_reference(&state.branch_query))
             .flatten()
             .map(BranchItem::Checkout);
@@ -351,6 +377,19 @@ impl Workspace {
             )
             .chain(create)
             .collect()
+    }
+
+    /// [`BranchGrants`] on the environment of the picker's thread or draft.
+    fn branch_grants(&self) -> BranchGrants {
+        match &self.target {
+            Some(Target::Thread { env, .. }) => {
+                BranchGrants { write: self.env_grants(env, SOURCE_CONTROL_WRITE), update: self.can_operate(env) }
+            }
+            Some(Target::Draft { env, .. }) => {
+                BranchGrants { write: self.env_grants(env, SOURCE_CONTROL_WRITE), update: true }
+            }
+            None => BranchGrants { write: false, update: false },
+        }
     }
 
     /// "Checkout pull request" picked: the picker closes, the composer takes focus, and the
@@ -563,6 +602,10 @@ impl Workspace {
 
     /// Worktree mode just records the base; local mode switches the checkout (`vcs.switchRef`).
     fn select_branch(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let grants = self.branch_grants();
+        if !grants.update {
+            return;
+        }
         self.draft_workspace.branch_open = false;
         if let Some(thread) = self.target.as_ref().and_then(Target::thread_key) {
             self.select_thread_branch(thread, name, cx);
@@ -584,6 +627,9 @@ impl Workspace {
             cx.notify();
             return;
         }
+        if !grants.write {
+            return;
+        }
         self.run_ref_command("vcs.switchRef", json!({"cwd": root, "refName": name}), name, "Failed to switch ref.", cx);
     }
 
@@ -596,6 +642,9 @@ impl Workspace {
     }
 
     fn create_branch(&mut self, name: String, cx: &mut Context<Self>) {
+        if !self.branch_grants().change() {
+            return;
+        }
         self.draft_workspace.branch_open = false;
         let cwd = self.composer_cwd();
         if let Some(thread) = self.target.as_ref().and_then(Target::thread_key) {
@@ -700,6 +749,9 @@ impl Workspace {
             }
             return;
         }
+        if !self.branch_grants().write {
+            return;
+        }
         let next = active.filter(|_| !is_default);
         let checkout = next.clone().unwrap_or(root);
         let input = json!({"cwd": checkout, "refName": name});
@@ -764,6 +816,10 @@ impl Workspace {
         worktree: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        // The grant can be lost while the ref switched.
+        if !self.can_operate(&checkout.thread.env) {
+            return;
+        }
         let Some(client) = self.env_client(&checkout.thread.env) else { return };
         let thread_id = &checkout.thread.id;
         let mut commands = Vec::new();
@@ -1060,6 +1116,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let items = self.branch_items();
+        let grants = self.branch_grants();
         let highlight = self.draft_workspace.branch_highlight;
         let empty = items.is_empty();
         let rows = items.into_iter().enumerate().map(|(index, item)| {
@@ -1113,6 +1170,7 @@ impl Workspace {
                 None
             };
             let checked = selected == Some(name.as_str());
+            let enabled = grants.pick(worktree_base || r["worktreePath"].as_str().is_some());
             let pick = name.clone();
             let copy = name.clone();
             h_flex()
@@ -1123,7 +1181,8 @@ impl Workspace {
                 .gap(px(8.))
                 .rounded(px(4.))
                 .text_sm()
-                .cursor_pointer()
+                .when(enabled, gpui_kit::Styled::cursor_pointer)
+                .when(!enabled, |el| el.opacity(0.64))
                 .when(checked, |el| el.bg(t.foreground.opacity(0.08)))
                 .when(highlighted, |el| el.bg(t.foreground.opacity(0.09)))
                 .on_mouse_move(hover)
@@ -1137,7 +1196,9 @@ impl Workspace {
                         .text_color(t.muted_foreground)
                         .child(badge)
                 }))
-                .on_click(cx.listener(move |this, _, window, cx| this.select_branch(pick.clone(), window, cx)))
+                .when(enabled, |el| {
+                    el.on_click(cx.listener(move |this, _, window, cx| this.select_branch(pick.clone(), window, cx)))
+                })
                 .context_menu(copy_menu("Copy branch name", "Branch name copied", copy))
                 .into_any_element()
         });
@@ -1550,7 +1611,7 @@ mod tests {
     use super::super::Target;
     use super::super::draft_sessions::DraftId;
     use super::{
-        DraftWorkspaceState, RefSearch, clipboard_path, previous_worktree_seed, runtime_mode_denial,
+        BranchGrants, DraftWorkspaceState, RefSearch, clipboard_path, previous_worktree_seed, runtime_mode_denial,
         runtime_mode_fallback, step_highlight, step_permission,
     };
     use crate::model::ScopedId;
@@ -1656,6 +1717,17 @@ mod tests {
             "a denied focus restarts"
         );
         assert_eq!(step_permission(&[], None, "down"), None);
+    }
+
+    #[test]
+    fn ref_rows_need_the_grants_their_pick_uses() {
+        let grants = |write, update| BranchGrants { write, update };
+        assert!(grants(true, true).change() && grants(true, true).pick(false));
+        assert!(!grants(true, false).change(), "a thread without operate cannot record a new ref");
+        assert!(!grants(true, false).pick(true), "nor record a reused worktree");
+        assert!(!grants(false, true).change());
+        assert!(!grants(false, true).pick(false), "switching the checkout needs write");
+        assert!(grants(false, true).pick(true), "recording a base or reused worktree does not");
     }
 
     #[test]
