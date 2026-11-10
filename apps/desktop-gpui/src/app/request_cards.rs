@@ -23,6 +23,7 @@ use super::pages::settings::connections::linking::{
     ANOTHER_ADDRESS, LinkableMachine, initial_machine, machine_badge, mint_link_code, rank_machines_by_hint,
 };
 use super::pages::settings::machine_icon;
+use super::side_chat::ChatPane;
 use crate::rpc::{RpcClient, RpcError};
 use crate::theme::{self, Tokens};
 use crate::timeline::{self, RequestCard, RequestKind};
@@ -468,9 +469,8 @@ impl Workspace {
         .detach();
     }
 
-    fn decline_link(&mut self, card: &RequestCard, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(host) = self.thread_environment(&card.thread_id) else { return };
-        let Some(client) = self.env_client(&host).filter(|_| self.manages_access(&host)) else { return };
+    fn decline_link(&mut self, card: &RequestCard, host: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(client) = self.env_client(host).filter(|_| self.manages_access(host)) else { return };
         let id = card.item_id.clone();
         if !self.requests.busy.insert(id.clone()) {
             return;
@@ -496,6 +496,7 @@ impl Workspace {
 /// The pending card for a secret or link request.
 pub(super) fn request_row(
     card: &Rc<RequestCard>,
+    pane: ChatPane,
     this: &WeakEntity<Workspace>,
     t: &Tokens,
     window: &mut Window,
@@ -515,7 +516,11 @@ pub(super) fn request_row(
             });
             secret_card(card, label, url.as_ref(), *file, &input, &sources, &workspace, t, cx)
         }
-        RequestKind::Link { .. } => link_card(card, &workspace, t, cx),
+        RequestKind::Link { .. } => {
+            // Thread ids can repeat across environments, so the pane names the request's host.
+            let host = workspace.read(cx).pane_thread(pane).map(|(host, _)| host);
+            link_card(card, host, &workspace, t, cx)
+        }
     };
     super::chat::lane(8., body).into_any_element()
 }
@@ -649,12 +654,17 @@ fn source_picker(
     .into_any_element()
 }
 
-fn link_card(card: &Rc<RequestCard>, workspace: &Entity<Workspace>, t: &Tokens, cx: &mut App) -> AnyElement {
+fn link_card(
+    card: &Rc<RequestCard>,
+    host: Option<SharedString>,
+    workspace: &Entity<Workspace>,
+    t: &Tokens,
+    cx: &mut App,
+) -> AnyElement {
     let state = workspace.read(cx);
     let busy = state.requests.busy.contains(&card.item_id);
     let error = state.requests.errors.get(&card.item_id).cloned();
-    let host = state.thread_environment(&card.thread_id);
-    let can_answer = host.as_deref().is_some_and(|host| state.manages_access(host));
+    let answerable = host.filter(|host| state.manages_access(host));
     let RequestKind::Link { label, url, .. } = &card.kind else { return div().into_any_element() };
     let title = if card.picks_machine() {
         "Link a machine to this environment".to_owned()
@@ -663,7 +673,8 @@ fn link_card(card: &Rc<RequestCard>, workspace: &Entity<Workspace>, t: &Tokens, 
     };
     let (decline_card, review_card, view) = (card.clone(), card.clone(), workspace.downgrade());
     let review_view = view.clone();
-    let actions = if can_answer {
+    let actions = if let Some(host) = answerable {
+        let decline_host = host.clone();
         h_flex()
             .min_w_0()
             .justify_end()
@@ -676,7 +687,7 @@ fn link_card(card: &Rc<RequestCard>, workspace: &Entity<Workspace>, t: &Tokens, 
                     .label("Decline")
                     .disabled(busy)
                     .on_click(move |_, window, cx| {
-                        let _ = view.update(cx, |w, cx| w.decline_link(&decline_card, window, cx));
+                        let _ = view.update(cx, |w, cx| w.decline_link(&decline_card, &decline_host, window, cx));
                     }),
             )
             .child(
@@ -685,7 +696,9 @@ fn link_card(card: &Rc<RequestCard>, workspace: &Entity<Workspace>, t: &Tokens, 
                     .xsmall()
                     .label(if card.picks_machine() { "Choose machine…" } else { "Review link…" })
                     .disabled(busy)
-                    .on_click(move |_, window, cx| open_link_dialog(&review_card, &review_view, window, cx)),
+                    .on_click(move |_, window, cx| {
+                        open_link_dialog(&review_card, host.clone(), &review_view, window, cx);
+                    }),
             )
             .into_any_element()
     } else {
@@ -1338,15 +1351,16 @@ impl Render for LinkDialog {
     }
 }
 
-fn open_link_dialog(card: &Rc<RequestCard>, workspace: &WeakEntity<Workspace>, window: &mut Window, cx: &mut App) {
+fn open_link_dialog(
+    card: &Rc<RequestCard>,
+    host: SharedString,
+    workspace: &WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) {
     let Some(entity) = workspace.upgrade() else { return };
     let RequestKind::Link { url, requested_access, .. } = &card.kind else { return };
-    let (host, client) = {
-        let state = entity.read(cx);
-        let Some(host) = state.thread_environment(&card.thread_id) else { return };
-        let client = state.env_client(&host);
-        (host, client)
-    };
+    let client = entity.read(cx).env_client(&host);
     let address = cx.new(|cx| {
         let state = InputState::new(window, cx).placeholder("https://machine.tailnet.ts.net");
         match url {
