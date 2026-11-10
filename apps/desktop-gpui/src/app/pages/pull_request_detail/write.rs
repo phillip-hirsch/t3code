@@ -985,10 +985,17 @@ impl Workspace {
         let context_id = crate::composer_context::kind_scoped_id(crate::review_comment::KIND, &producer);
         let rows = file.map(crate::pull_request_diff::file_rows).unwrap_or_default();
         let record = crate::review_comment::diff_comment(&context_id, &section, path, &rows, start, end, &request);
-        let keep_guide = draft.excerpt.is_some();
-        self.cancel_pr_line_draft(cx);
-        if let Some(record) = record {
-            self.add_pr_selection_to_agent(record, &request, keep_guide, window, cx);
+        let (keep_guide, key, input) = (draft.excerpt.is_some(), panel.reference.key(), draft.input.clone());
+        let Some(record) = record else {
+            toast_error(window, cx, "Could not add these lines", "The diff changed. Pick the lines again.");
+            return;
+        };
+        // Cleared only once the request landed: this tab's own draft, which may be parked by then.
+        if self.add_pr_selection_to_agent(record, &request, keep_guide, window, cx)
+            && let Some(write) = self.pr_write_of(&key).filter(|w| w.draft.as_ref().is_some_and(|d| d.input == input))
+        {
+            write.draft = None;
+            cx.notify();
         }
     }
 
