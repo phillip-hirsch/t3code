@@ -850,6 +850,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> impl FnOnce(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
         let view = cx.entity();
+        // The tabs belong to this thread's panel; after navigating, the menu closes nothing.
+        let owner = self.target.clone();
         let surfaces = self.panel_state().map(|panel| panel.surfaces.clone()).unwrap_or_default();
         let index = surfaces.iter().position(|s| s == surface).unwrap_or(0);
         let surface = surface.clone();
@@ -877,23 +879,33 @@ impl Workspace {
             let right: Vec<Surface> = surfaces.iter().skip(index + 1).cloned().collect();
             let all = surfaces.clone();
             let (close, keep, keep_right) = (surface.clone(), surface.clone(), surface.clone());
-            menu.item(PopupMenuItem::new("Close").on_click(
-                window.listener_for(&view, move |this, _, window, cx| this.close_surface(close.clone(), window, cx)),
-            ))
+            let owned = |owner: &Option<Target>, this: &Workspace| this.target == *owner;
+            let (o1, o2, o3, o4) = (owner.clone(), owner.clone(), owner.clone(), owner.clone());
+            menu.item(PopupMenuItem::new("Close").on_click(window.listener_for(&view, move |this, _, window, cx| {
+                if owned(&o1, this) {
+                    this.close_surface(close.clone(), window, cx);
+                }
+            })))
             .item(PopupMenuItem::new("Close others").disabled(surfaces.len() <= 1).on_click(window.listener_for(
                 &view,
                 move |this, _, window, cx| {
-                    this.close_surfaces(others.clone(), Some(keep.clone()), window, cx);
+                    if owned(&o2, this) {
+                        this.close_surfaces(others.clone(), Some(keep.clone()), window, cx);
+                    }
                 },
             )))
             .item(PopupMenuItem::new("Close to the right").disabled(index + 1 >= surfaces.len()).on_click(
                 window.listener_for(&view, move |this, _, window, cx| {
-                    this.close_surfaces(right.clone(), Some(keep_right.clone()), window, cx);
+                    if owned(&o3, this) {
+                        this.close_surfaces(right.clone(), Some(keep_right.clone()), window, cx);
+                    }
                 }),
             ))
             .item(PopupMenuItem::new("Close all").disabled(surfaces.is_empty()).on_click(
                 window.listener_for(&view, move |this, _, window, cx| {
-                    this.close_surfaces(all.clone(), None, window, cx);
+                    if owned(&o4, this) {
+                        this.close_surfaces(all.clone(), None, window, cx);
+                    }
                 }),
             ))
         }
@@ -1239,6 +1251,13 @@ impl Workspace {
             cx.notify();
         }
         key.is_some()
+    }
+
+    /// `set_diff_scope` while `owner` is still the open thread.
+    fn set_diff_scope_of(&mut self, owner: Option<&Target>, scope: DiffScope, cx: &mut Context<Self>) {
+        if self.target.as_ref() == owner {
+            self.set_diff_scope(scope, cx);
+        }
     }
 
     fn set_diff_scope(&mut self, scope: DiffScope, cx: &mut Context<Self>) {
@@ -2638,6 +2657,8 @@ impl Workspace {
             }
             _ => None,
         };
+        // A menu still open after navigating never picks a turn of this thread on the next.
+        let scope_owner = self.target.clone();
         let scope_menu = Button::new("diff-scope")
             .custom(
                 ButtonCustomVariant::new(cx)
@@ -2657,9 +2678,13 @@ impl Workspace {
             .child(icon("icons/chevron-down.svg").with_size(px(14.)).opacity(0.7))
             .dropdown_menu(move |menu: PopupMenu, window, cx| {
                 let pick = |label: &str, value: DiffScope, checked: bool, window: &mut Window| {
-                    PopupMenuItem::new(label.to_owned()).checked(checked).on_click(
-                        window.listener_for(&view, move |this, _, _, cx| this.set_diff_scope(value.clone(), cx)),
-                    )
+                    let owner = scope_owner.clone();
+                    PopupMenuItem::new(label.to_owned()).checked(checked).on_click(window.listener_for(
+                        &view,
+                        move |this, _, _, cx| {
+                            this.set_diff_scope_of(owner.as_ref(), value.clone(), cx);
+                        },
+                    ))
                 };
                 let latest_checked = matches!(&menu_scope, DiffScope::Turn(run) if Some(run) == menu_latest.as_ref());
                 let mut menu = menu
@@ -2670,6 +2695,7 @@ impl Workspace {
                     menu = menu.item(pick("Latest turn", DiffScope::Turn(latest.clone()), latest_checked, window));
                 }
                 let (turns, scope, turn_view) = (menu_turns.clone(), menu_scope.clone(), view.clone());
+                let turn_owner = scope_owner.clone();
                 menu = menu.submenu("Turn", window, cx, move |mut menu, window, _| {
                     if turns.is_empty() {
                         return menu.item(PopupMenuItem::new("No completed turns yet.").disabled(true));
@@ -2690,12 +2716,10 @@ impl Workspace {
                                 )
                             })
                             .checked(checked)
-                            .on_click(window.listener_for(
-                                &turn_view,
-                                move |this, _, _, cx| {
-                                    this.set_diff_scope(value.clone(), cx);
-                                },
-                            )),
+                            .on_click(window.listener_for(&turn_view, {
+                                let owner = turn_owner.clone();
+                                move |this, _, _, cx| this.set_diff_scope_of(owner.as_ref(), value.clone(), cx)
+                            })),
                         );
                     }
                     menu
@@ -2703,6 +2727,7 @@ impl Workspace {
                 let (commits, scope, commit_view) = (commits.clone(), menu_scope.clone(), view.clone());
                 let identity = menu_identity.clone();
                 let source = commits_source.clone();
+                let commit_owner = scope_owner.clone();
                 menu.submenu("Commits", window, cx, move |mut menu, window, _| {
                     let list = match &commits {
                         None => return menu.item(PopupMenuItem::new("Loading commits...").disabled(true)),
@@ -2715,7 +2740,7 @@ impl Workspace {
                     let now = crate::timestamp::now_ms();
                     for commit in &list.commits {
                         let value = DiffScope::Commit(commit.sha.clone());
-                        let source = source.clone();
+                        let (source, owner) = (source.clone(), commit_owner.clone());
                         let checked = scope == value;
                         let url = identity.as_ref().and_then(|identity| commit_link::commit_url(identity, &commit.sha));
                         let time: SharedString = commit
@@ -2731,7 +2756,7 @@ impl Workspace {
                                 window.listener_for(&commit_view, move |this, _, _, cx| {
                                     // The list belongs to one checkout; a commit never lands on another.
                                     if this.branch_commits_source() == source {
-                                        this.set_diff_scope(value.clone(), cx);
+                                        this.set_diff_scope_of(owner.as_ref(), value.clone(), cx);
                                     }
                                 }),
                             ));
