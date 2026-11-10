@@ -45,10 +45,18 @@ pub(in crate::app) struct PickHost {
     pub environment: Option<SharedString>,
     pub current: Option<ModelSelection>,
     pub include: fn(&Provider) -> bool,
-    /// Listed after the environment's providers, replacing instances with the same id: the
-    /// text generators a settings writing picker offers (`useTextGenerationTargets`).
-    pub extra: Rc<[Provider]>,
+    /// `Some` for a settings writing picker: the enabled text generators it offers after the
+    /// environment's providers, in place of every instance a generator owns.
+    pub extra: Option<Rc<[Provider]>>,
     pub on_pick: OnPick,
+}
+
+/// Whether a writing picker drops coding agent `provider`: a text generator owns its id when it
+/// is configured in `configured` (the environment's `textGenerators`), even disabled, or offered
+/// in `extra` (`useTextGenerationTargets`; the server routes that id to the generator).
+pub(in crate::app) fn generator_owns(provider: &Provider, configured: &Value, extra: &[Provider]) -> bool {
+    let id = provider.instance_id.as_str();
+    configured.get(id).is_some() || extra.iter().any(|g| g.instance_id == id)
 }
 
 /// The providers a started thread may continue on when its provider cannot hand off
@@ -177,7 +185,7 @@ impl PickerState {
         if self.open.as_deref() == Some(id)
             && let Some(host) = &mut self.host
         {
-            host.extra = extra.clone();
+            host.extra = Some(extra.clone());
         }
     }
 }
@@ -287,11 +295,14 @@ impl Workspace {
     }
 
     /// The open picker's environment's providers, with its host's extra ones in place of
-    /// instances sharing their ids.
+    /// instances a text generator owns.
     fn picker_providers(&self) -> impl Iterator<Item = &Provider> {
-        let extra: &[Provider] = self.picker.host.as_ref().map_or(&[], |host| &host.extra);
-        let listed = self.picker_info().into_iter().flat_map(|info| info.providers.iter());
-        listed.filter(move |p| !extra.iter().any(|e| e.instance_id == p.instance_id)).chain(extra)
+        let extra = self.picker.host.as_ref().and_then(|host| host.extra.as_deref());
+        let listed = self.picker_info().into_iter().flat_map(move |info| {
+            let configured = info.settings.get("textGenerators");
+            info.providers.iter().filter(move |p| extra.is_none_or(|extra| !generator_owns(p, configured, extra)))
+        });
+        listed.chain(extra.into_iter().flatten())
     }
 
     fn picker_provider(&self, instance_id: &str) -> Option<&Provider> {
@@ -1766,11 +1777,11 @@ mod tests {
             environment: None,
             current: None,
             include: |_| true,
-            extra: loading.clone(),
+            extra: Some(loading.clone()),
             on_pick: Rc::new(|_, _, _, _| {}),
         };
         let mut state = PickerState { open: Some("writer".into()), host: Some(host), ..PickerState::default() };
-        let models = |state: &PickerState| state.host.as_ref().unwrap().extra[0].models.len();
+        let models = |state: &PickerState| state.host.as_ref().unwrap().extra.as_ref().unwrap()[0].models.len();
         state.refresh_extra("other", &loaded);
         assert_eq!(models(&state), 0, "another picker's render leaves it alone");
         state.refresh_extra("writer", &loaded);

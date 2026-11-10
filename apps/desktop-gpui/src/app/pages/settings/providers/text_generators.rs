@@ -27,7 +27,7 @@ use super::accounts::{failure_message, settings_row};
 use super::add::{black, footer, panel, white, wizard_steps};
 use super::instances::initials;
 use crate::app::Workspace;
-use crate::app::model_picker::{OnPick, PickHost};
+use crate::app::model_picker::{OnPick, PickHost, generator_owns};
 use crate::app::pages::settings::connections::logic::SETTINGS_WRITE;
 use crate::app::pages::settings::model_select::generates_text;
 use crate::app::pages::settings::widgets::{Switch, section_with_action};
@@ -343,14 +343,15 @@ fn snapshot(id: &str, config: &Value, list: Option<&ModelList>, selected: &[&str
 }
 
 /// `useTextGenerationTargets`' providers: `providers` that generate text, less any a generator
-/// replaces by id, then the generators.
+/// in `configured` (the environment's `textGenerators`) owns by id, then the enabled `generators`.
 pub(in crate::app::pages::settings) fn writing_providers<'a>(
     providers: &'a [Provider],
+    configured: &Value,
     generators: &'a [Provider],
 ) -> Vec<&'a Provider> {
     providers
         .iter()
-        .filter(|p| generates_text(p) && !generators.iter().any(|g| g.instance_id == p.instance_id))
+        .filter(|p| generates_text(p) && !generator_owns(p, configured, generators))
         .chain(generators)
         .collect()
 }
@@ -1217,7 +1218,8 @@ impl GeneratorWizard {
             let extra = w.text_generation_targets(Some(&environment), &[Some(&selection)], cx);
             let id = SharedString::from(format!("text-generator-task-{key}"));
             w.refresh_picker_extra(&id, &extra);
-            let trigger = w.picker_trigger_among(id.clone(), Some(&selection), None, Some(&environment), &extra, cx);
+            let trigger =
+                w.picker_trigger_among(id.clone(), Some(&selection), None, Some(&environment), Some(&extra), cx);
             let pick_environment = environment.clone();
             let on_pick: OnPick = Rc::new(
                 move |w: &mut Workspace, picked: ModelSelection, _: &mut Window, cx: &mut Context<Workspace>| {
@@ -1233,7 +1235,7 @@ impl GeneratorWizard {
                 environment: Some(environment.clone()),
                 current: Some(selection.clone()),
                 include: generates_text,
-                extra,
+                extra: Some(extra),
                 on_pick,
             };
             w.undocked_model_picker(id, trigger, host, cx)
@@ -1658,12 +1660,15 @@ mod tests {
         let providers: Vec<Provider> = serde_json::from_value(json!([
             {"instanceId": "codex", "driver": "codex", "enabled": true},
             {"instanceId": "openrouter", "driver": "opencode", "enabled": true},
+            {"instanceId": "claude", "driver": "claudeAgent", "enabled": true},
             {"instanceId": "replay", "driver": "acpRegistry", "supportsTextGeneration": false},
         ]))
         .unwrap();
         let config = json!({"kind": "openaiCompatible", "baseUrl": "https://openrouter.ai/api/v1"});
+        // A disabled generator lists no models but still owns its id, like the server's routing.
+        let configured = json!({"openrouter": config, "claude": {"kind": "anthropic", "enabled": false}});
         let generators = [snapshot("openrouter", &config, None, &[]).unwrap()];
-        let ids: Vec<(&str, &str)> = writing_providers(&providers, &generators)
+        let ids: Vec<(&str, &str)> = writing_providers(&providers, &configured, &generators)
             .iter()
             .map(|p| (p.instance_id.as_str(), p.driver.as_str()))
             .collect();
@@ -1702,7 +1707,8 @@ mod tests {
         let request = catalog.record(&environment, "g", &generators["g"], ModelList::Loading, false);
         let stored = ModelSelection { instance_id: "g".into(), model: "a".into(), options: None };
         let pick = ModelSelection { model: "b".into(), ..stored.clone() };
-        let resolve = |targets: &[Provider]| resolve_text_generation(Some(&pick), &writing_providers(&[], targets));
+        let resolve =
+            |targets: &[Provider]| resolve_text_generation(Some(&pick), &writing_providers(&[], &generators, targets));
         let opened = catalog.targets(&environment, &generators, &[Some(&stored)]);
         assert_eq!(resolve(&opened).unwrap().model, "a", "the catalog from opening lacks b");
         let models = ["a", "b"].map(|id| Model { id: id.into(), name: id.into() }).to_vec();

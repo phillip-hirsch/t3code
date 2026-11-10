@@ -1761,7 +1761,8 @@ impl Workspace {
         self.refresh_picker_extra("writer-model", &generators);
         let generator_config = |id: &str| self.settings_info().settings.get("textGenerators").get(id).cloned();
         let providers = &self.settings_info().providers;
-        let writer_providers = writing_providers(providers, &generators);
+        let configured = self.settings_info().settings.get("textGenerators");
+        let writer_providers = writing_providers(providers, configured, &generators);
         let runs = |list: &[&Provider], s: &ModelSelection| {
             list.iter().any(|p| p.instance_id == s.instance_id && p.is_selectable() && generates_text(p))
         };
@@ -1803,7 +1804,7 @@ impl Workspace {
                     check_enable: true,
                     dimmed: guide.is_none() && !can_guide,
                     note: None,
-                    extra: Rc::default(),
+                    extra: None,
                 },
                 cx,
             )
@@ -1824,7 +1825,7 @@ impl Workspace {
                     check_enable: false,
                     dimmed: false,
                     note,
-                    extra: generators.clone(),
+                    extra: Some(generators.clone()),
                 },
                 cx,
             )
@@ -2143,8 +2144,8 @@ struct DedicatedModel {
     check_enable: bool,
     dimmed: bool,
     note: Option<gpui_kit::Div>,
-    /// Text generators the picker offers beside the coding agents.
-    extra: Rc<[Provider]>,
+    /// `Some` for a writing picker: the text generators it offers beside the coding agents.
+    extra: Option<Rc<[Provider]>>,
 }
 
 /// `styleFieldMixed`: the selected targets differ in one writing-style field.

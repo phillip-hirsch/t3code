@@ -826,7 +826,7 @@ impl Render for TaskEditor {
                     environment: Some(self.environment.clone()),
                     current: selection.clone(),
                     include: |_| true,
-                    extra: Rc::default(),
+                    extra: None,
                     on_pick,
                 },
                 cx,

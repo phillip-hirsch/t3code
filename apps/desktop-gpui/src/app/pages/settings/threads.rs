@@ -646,8 +646,10 @@ impl Workspace {
         // Text generators from Providers can write this text too (`useTextGenerationTargets`).
         let generators = self.text_generation_targets(self.settings_environment().as_ref(), &[stored.as_ref()], cx);
         self.refresh_picker_extra("text-generation-model", &generators);
+        let info = self.settings_info();
+        let configured = info.settings.get("textGenerators");
         let selection =
-            resolve_text_generation(stored.as_ref(), &writing_providers(&self.settings_info().providers, &generators));
+            resolve_text_generation(stored.as_ref(), &writing_providers(&info.providers, configured, &generators));
         let connected = self.settings_client().is_some();
         let save = {
             let stored = stored.clone();
@@ -655,7 +657,8 @@ impl Workspace {
                 // Generator models can arrive while the picker is open: resolve against them now.
                 let environment = this.settings_environment();
                 let generators = this.text_generation_targets(environment.as_ref(), &[stored.as_ref()], cx);
-                let providers = writing_providers(&this.settings_info().providers, &generators);
+                let info = this.settings_info();
+                let providers = writing_providers(&info.providers, info.settings.get("textGenerators"), &generators);
                 let resolved = resolve_text_generation(Some(&pick), &providers).unwrap_or(pick);
                 this.save_scoped_model("textGenerationModelSelection", resolved, window, cx);
             }
@@ -670,7 +673,7 @@ impl Workspace {
                     Some(selection),
                     None,
                     generates_text,
-                    generators,
+                    Some(generators),
                     cx,
                     save.clone(),
                 ))

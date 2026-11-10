@@ -14,7 +14,7 @@ use gpui_kit::{
 use serde_json::Value;
 
 use crate::app::Workspace;
-use crate::app::model_picker::{OnPick, PickHost};
+use crate::app::model_picker::{OnPick, PickHost, generator_owns};
 use crate::model::{ModelSelection, OptionChoice, OptionDescriptor, Provider};
 use crate::model_label;
 use crate::theme::{Tokens, tokens};
@@ -58,7 +58,7 @@ impl Workspace {
         cx: &mut Context<Self>,
         on_pick: impl Fn(&mut Self, ModelSelection, &mut Window, &mut Context<Self>) + 'static,
     ) -> AnyElement {
-        self.model_picker_among(id, selection, label, include, Rc::default(), cx, on_pick)
+        self.model_picker_among(id, selection, label, include, None, cx, on_pick)
     }
 
     /// [`Self::model_picker`] that also offers `extra` providers, such as text generators,
@@ -69,13 +69,14 @@ impl Workspace {
         selection: Option<&ModelSelection>,
         label: Option<&str>,
         include: fn(&Provider) -> bool,
-        extra: Rc<[Provider]>,
+        extra: Option<Rc<[Provider]>>,
         cx: &mut Context<Self>,
         on_pick: impl Fn(&mut Self, ModelSelection, &mut Window, &mut Context<Self>) + 'static,
     ) -> AnyElement {
         let id = id.into();
         let environment = self.settings_environment();
-        let trigger = self.picker_trigger_among(id.clone(), selection, label, environment.as_deref(), &extra, cx);
+        let trigger =
+            self.picker_trigger_among(id.clone(), selection, label, environment.as_deref(), extra.as_deref(), cx);
         let on_pick: OnPick = Rc::new(on_pick);
         let host = PickHost { environment, current: selection.cloned(), include, extra, on_pick };
         self.undocked_model_picker(id, trigger, host, cx)
@@ -91,7 +92,7 @@ impl Workspace {
         environment: Option<&str>,
         cx: &App,
     ) -> Button {
-        self.picker_trigger_among(id, selection, label, environment, &[], cx)
+        self.picker_trigger_among(id, selection, label, environment, None, cx)
     }
 
     /// [`Self::model_picker_trigger`], finding the selection's provider in `extra` first.
@@ -101,13 +102,17 @@ impl Workspace {
         selection: Option<&ModelSelection>,
         label: Option<&str>,
         environment: Option<&str>,
-        extra: &[Provider],
+        extra: Option<&[Provider]>,
         cx: &App,
     ) -> Button {
         let t = *tokens(cx);
         let info = environment.and_then(|environment| self.env_info(environment));
         let provider = selection.and_then(|s| {
-            extra.iter().find(|p| p.instance_id == s.instance_id).or_else(|| info?.provider(&s.instance_id))
+            let listed = info?.provider(&s.instance_id);
+            let Some(extra) = extra else { return listed };
+            let configured = info?.settings.get("textGenerators");
+            let listed = listed.filter(|p| !generator_owns(p, configured, extra));
+            extra.iter().find(|p| p.instance_id == s.instance_id).or(listed)
         });
         let model = selection.zip(provider).and_then(|(s, p)| p.models.iter().find(|m| m.slug == s.model));
         let name: SharedString = match (label, provider.zip(model), selection) {
