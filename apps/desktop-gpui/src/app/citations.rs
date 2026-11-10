@@ -21,6 +21,7 @@ use gpui_kit::{
 };
 use serde_json::Value;
 
+use super::chat::view_pane;
 use super::send::Intent;
 use super::side_chat::ChatPane;
 use super::{Target, Workspace};
@@ -150,7 +151,7 @@ impl Workspace {
         let (env, thread_id) = self.pane_thread(pane)?;
         let rows = self.pane_rows(pane);
         let mut selected = self
-            .markdown_keys()
+            .markdown_keys(pane)
             .into_iter()
             .filter_map(|key| {
                 let view = self.markdown_view(&key)?;
@@ -158,10 +159,11 @@ impl Workspace {
                 let source = state.selected_source_range()?;
                 Some((key, state.is_selecting(), state.rendered_text(), source))
             })
-            .filter(|(key, ..)| rows.iter().any(|row| super::chat::shows_markdown(row, key)));
+            .filter(|(key, ..)| rows.iter().any(|row| super::chat::shows_markdown(row, view_pane(key).1)));
         // A selection that spans replies quotes neither.
         let (Some((key, false, rendered, source)), None) = (selected.next(), selected.next()) else { return None };
-        if !rows.iter().any(|row| matches!(row, Row::Assistant { id, .. } if *id == key)) {
+        let item = view_pane(&key).1;
+        if !rows.iter().any(|row| matches!(row, Row::Assistant { id, .. } if **id == *item)) {
             return None;
         }
         let range = rendered.range_for_source(source)?;
@@ -169,7 +171,7 @@ impl Workspace {
         let citation = AssistantCitation {
             environment_id: env.to_string(),
             thread_id,
-            message_id: self.message_id_of(pane, &key)?,
+            message_id: self.message_id_of(pane, item)?,
             text: selector.text,
             comment: None,
             start: selector.start,

@@ -526,16 +526,16 @@ impl Workspace {
     }
 
     fn paint_all_find(&mut self, cx: &mut Context<Self>) {
-        for key in self.markdown_keys() {
+        for key in self.markdown_keys(super::side_chat::ChatPane::Main) {
             self.paint_find(&key, cx);
         }
     }
 
-    /// Paints the find's matches in the markdown view under `key`; a no-op when nothing changed,
-    /// so the view's own notifications don't repaint it.
+    /// Paints the find's matches in the main timeline's markdown view under `key`; a no-op when
+    /// nothing changed, so the view's own notifications don't repaint it.
     pub(super) fn paint_find(&mut self, key: &SharedString, cx: &mut Context<Self>) {
         let open = self.open_find().is_some();
-        if !open {
+        if !open || super::chat::view_pane(key).0 != super::side_chat::ChatPane::Main {
             return;
         }
         let Some(view) = self.markdown_view(key) else { return };
