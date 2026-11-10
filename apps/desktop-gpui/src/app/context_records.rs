@@ -79,27 +79,6 @@ fn message_records(held: &ContextRecords, text: &str) -> Vec<Value> {
     records
 }
 
-/// `removeInlineContextReference`'s cuts: each chip with the space after it, else the one before.
-fn chip_removals(text: &str, mut spans: Vec<std::ops::Range<usize>>) -> Vec<std::ops::Range<usize>> {
-    spans.sort_by_key(|span| span.start);
-    let mut cuts: Vec<std::ops::Range<usize>> = Vec::with_capacity(spans.len());
-    for span in spans {
-        let previous_end = cuts.last().map_or(0, |cut| cut.end);
-        if span.start < previous_end {
-            continue;
-        }
-        let cut = if text[span.end..].starts_with(' ') {
-            span.start..span.end + 1
-        } else if span.start > previous_end && text[..span.start].ends_with(' ') {
-            span.start - 1..span.end
-        } else {
-            span
-        };
-        cuts.push(cut);
-    }
-    cuts
-}
-
 /// Where a chip goes into a set-aside prompt: after its text, a space apart.
 fn append_chip(prompt: &mut String, link: &str) {
     if !prompt.is_empty() && !prompt.ends_with(char::is_whitespace) {
@@ -199,15 +178,9 @@ impl Workspace {
     ) {
         let chip = Chip::Context { kind: kind.to_owned(), id: id.to_owned(), label: String::new() }.id();
         if self.target.as_ref() == Some(target) && self.question.is_none() {
-            let state = self.composer.read(cx);
-            let spans: Vec<_> = state
-                .tokens()
-                .iter()
-                .filter(|span| span.token().id().as_ref() == chip.as_str())
-                .map(gpui_kit::base::input::InlineTokenSpan::range)
-                .collect();
-            let removals = chip_removals(&state.value(), spans);
-            if let Some(first) = removals.first().map(|range| range.start) {
+            // Every reference, chip or not (rich text shows a fenced one as code), in one edit.
+            let removals = composer_text::context_reference_removals(&self.composer.read(cx).value(), &chip);
+            if let Some(first) = removals.last().map(|range| range.start) {
                 let edits: Vec<_> = removals.into_iter().map(|range| (range, String::new())).collect();
                 self.composer.update(cx, |state, cx| state.replace_ranges(&edits, first..first, window, cx));
                 self.sync_context_chips(cx);
@@ -215,12 +188,7 @@ impl Workspace {
             self.context.records.remove(id);
             self.sync_composer_empty(cx);
         } else if let Some((prompt, records)) = self.set_aside_prompt(target) {
-            let spans = composer_text::chips(prompt, |_| false)
-                .into_iter()
-                .filter(|(_, found)| found.id() == chip)
-                .map(|(range, _)| range)
-                .collect();
-            for range in chip_removals(prompt, spans).into_iter().rev() {
+            for range in composer_text::context_reference_removals(prompt, &chip) {
                 prompt.replace_range(range, "");
             }
             records.remove(id);
@@ -602,23 +570,6 @@ mod tests {
             import_slot(&a, "image_n2", (Some(&b), "", &none, &mut on_screen), &mut drafts).is_some(),
             "a set-aside draft's annotation keeps it too"
         );
-    }
-
-    #[test]
-    fn a_removed_chip_takes_one_space_with_it() {
-        let link = composer_text::context_link("review-comment", "rc", "a.ts L3");
-        let text = format!("fix {link} and {link}");
-        let first = 4..4 + link.len();
-        let second = text.len() - link.len()..text.len();
-        let cuts = chip_removals(&text, vec![second.clone(), first.clone()]);
-        assert_eq!(cuts, [first.start..first.end + 1, second.start - 1..second.end]);
-        let mut left = text;
-        for cut in cuts.into_iter().rev() {
-            left.replace_range(cut, "");
-        }
-        assert_eq!(left, "fix and");
-        let whole = 0..link.len();
-        assert_eq!(chip_removals(&link, std::iter::once(whole.clone()).collect()).first(), Some(&whole));
     }
 
     #[test]

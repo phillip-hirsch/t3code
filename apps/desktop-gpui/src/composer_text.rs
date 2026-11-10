@@ -1014,6 +1014,20 @@ mod tests {
         assert!(context_reference_ids("[x](t3-context://v1/Image/img_1)").is_empty(), "kind is lowercase");
         assert_eq!(remove(&format!("x\u{feff} {link}"), image), "x", "JavaScript's trimEnd set");
         assert!(context_reference_removals(&format!("a {link}"), "context:image/other").is_empty());
+        // Each cut is of the text as it stands, last first, so all of them go in as one edit.
+        for text in [
+            format!(
+                "a {link} b
+```
+{link}
+```"
+            ),
+            format!("{link} {link}KEEP"),
+            format!("x {link}  {link}"),
+        ] {
+            let cuts = context_reference_removals(&text, image);
+            assert!(cuts.windows(2).all(|pair| pair[1].end <= pair[0].start), "{text:?}: {cuts:?}");
+        }
         let (stale, fresh) = remount_chips(&fenced, false, &[], skill, codex_model);
         assert_eq!((stale, fresh.len()), (vec![], 2), "skills and models too");
 
