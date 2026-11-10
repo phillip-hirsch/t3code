@@ -14,13 +14,13 @@ use gpui_kit::{
 };
 
 use super::scripts::{
-    ScriptInput, command_for_project_script, has_project_scripts_override, importable_scripts, resolve_project_scripts,
+    ScriptInput, command_for_project_script, importable_scripts, resolve_project_scripts, scoped_scripts_state,
     script_icon, shortcut_label_for_command,
 };
 use crate::app::Workspace;
 use crate::app::pages::settings::connections::logic::SETTINGS_WRITE;
 use crate::app::pages::settings::widgets::{RowFrame, reset_button, settings_section};
-use crate::model::{ProjectScript, ScopedId, T3ProjectFile};
+use crate::model::{ProjectScript, ProjectShell, ScopedId, T3ProjectFile};
 use crate::theme::{self, Tokens};
 
 const ROW_GROUP: &str = "project-action-row";
@@ -37,16 +37,16 @@ impl Workspace {
         let Some(project) = self.shell.project(project_key) else {
             return div().into_any_element();
         };
-        let scripts = resolve_project_scripts(&self.settings_info().settings, project);
-        // Every checkout of the group is a target; differing lists are edited one environment at a time.
-        let targets = self.script_targets(project_key);
-        let mixed = targets.iter().any(|target| {
-            self.shell
-                .project(target)
-                .is_some_and(|p| resolve_project_scripts(&self.settings_info().settings, p) != scripts)
-        });
-        let overridden =
-            targets.iter().any(|target| has_project_scripts_override(&self.settings_info().settings, &target.id));
+        let scripts = resolve_project_scripts(&self.project_info(project).settings, project);
+        // Every scoped checkout is a target, read on its own environment; differing lists are
+        // edited one environment at a time.
+        let targets: Vec<(&serde_json::Value, &ProjectShell)> = self
+            .script_targets(project_key)
+            .iter()
+            .filter_map(|target| self.shell.project(target))
+            .map(|p| (&*self.project_info(p).settings, p))
+            .collect();
+        let (mixed, overridden) = scoped_scripts_state(&scripts, &targets);
         let (environment, root) = (project.environment_id.clone(), project.workspace_root.clone());
         let file = self.t3_project_file(&environment, &root, cx).clone();
         let importable: Vec<ScriptInput> =
@@ -169,10 +169,12 @@ impl Workspace {
             .children((script.run_on_settle == Some(true)).then(|| badge("on settle")))
             .children(script.preview_url.is_some().then(|| badge("preview · desktop only")));
         let command = div().max_w_full().truncate().font_family(t.fonts.mono).child(script.command.clone());
-        let shortcut = shortcut_label_for_command(
-            self.settings_info().keybindings_json(),
-            command_for_project_script(&script.id).as_deref(),
-        );
+        // Shortcuts live on the project's environment, like its list (`representativeConfig`).
+        let keybindings = self
+            .shell
+            .project(project_key)
+            .map_or(&serde_json::Value::Null, |project| self.project_info(project).keybindings_json());
+        let shortcut = shortcut_label_for_command(keybindings, command_for_project_script(&script.id).as_deref());
         let (pid, sid) = (project_key.clone(), script.id.clone());
         let edit = Button::new(SharedString::from(format!("edit-action-{}", script.id)))
             .ghost()
