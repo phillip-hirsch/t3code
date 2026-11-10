@@ -103,6 +103,8 @@ fn is_separator(c: Option<char>) -> bool {
 
 /// Pierre's `collectMatches`: every match of `query` across `files`, in render
 /// order. An empty or multi-line query, or an invalid pattern, finds nothing.
+/// `fancy_regex` gives the web's RegExp lookaround and backreferences, and
+/// runs any pattern without them on the plain `regex` engine.
 pub(crate) fn collect_matches(
     files: &[DiffFile],
     query: &str,
@@ -112,11 +114,11 @@ pub(crate) fn collect_matches(
         return Vec::new();
     }
     let pattern = if options.regex {
-        query.to_owned()
+        query.into()
     } else {
-        regex::escape(query)
+        fancy_regex::escape(query)
     };
-    let Ok(pattern) = regex::RegexBuilder::new(&pattern)
+    let Ok(pattern) = fancy_regex::RegexBuilder::new(&pattern)
         .case_insensitive(!options.case_sensitive)
         .build()
     else {
@@ -127,8 +129,9 @@ pub(crate) fn collect_matches(
         for (side, line, context) in unified_lines(file) {
             let source = &file.lines(side)[line];
             let text = source.text().as_str();
-            for found in pattern.find_iter(text) {
-                if found.is_empty()
+            // A line that exceeds the backtracking limit keeps the matches before it.
+            for found in pattern.find_iter(text).map_while(Result::ok) {
+                if found.range().is_empty()
                     || options.whole_word
                         && !(is_separator(text[..found.start()].chars().next_back())
                             && is_separator(text[found.end()..].chars().next()))
