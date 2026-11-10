@@ -70,13 +70,6 @@ fn thread_key(detail: &Detail) -> Option<(String, String, u64)> {
 }
 
 impl Workspace {
-    /// The shown pull request's stack and linked threads.
-    pub(super) fn read_pr_extras(&mut self, cx: &mut Context<Self>) {
-        if let Some(key) = self.pull_requests.panel.as_ref().map(|p| p.reference.key()) {
-            self.read_pr_extras_of(&key, cx);
-        }
-    }
-
     /// `key`'s stack and linked threads, read once the detail says what the host supports.
     pub(super) fn read_pr_extras_of(&mut self, key: &str, cx: &mut Context<Self>) {
         self.follow_pr_checks(key, cx);
@@ -343,7 +336,9 @@ impl Workspace {
     ) {
         // Both entry points list only threads on the pull request's environment.
         let Some(client) = self.pull_request_client() else { return };
-        let Some(detail) = self.pull_requests.panel.as_ref().and_then(|p| p.detail.clone()) else { return };
+        let Some(panel) = self.pull_requests.panel.as_ref() else { return };
+        let Some(detail) = panel.detail.clone() else { return };
+        let key = panel.reference.key();
         let Some((host, repository, number)) = thread_key(&detail) else { return };
         let term = logic::terminology(&detail.provider).0;
         let id = super::super::super::new_id();
@@ -361,7 +356,7 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let result = client.request("orchestration.dispatchCommand", command).await;
             let _ = this.update_in(cx, |this, window, cx| match result {
-                Ok(_) => this.read_pr_extras(cx),
+                Ok(_) => this.read_pr_extras_of(&key, cx),
                 Err(error) => {
                     let title = if link {
                         format!("Could not link the {term}")
@@ -681,8 +676,8 @@ impl Workspace {
                     ),
                     Ok(_) => toast_success(window, cx, "Stack rebased"),
                 }
-                this.read_pr_detail(cx);
-                this.read_pr_extras(cx);
+                this.read_pr_detail_of(&key, cx);
+                this.read_pr_extras_of(&key, cx);
                 this.read_pull_requests(false, cx);
                 cx.notify();
             });
