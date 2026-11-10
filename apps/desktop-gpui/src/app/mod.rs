@@ -83,6 +83,7 @@ mod snap_shot;
 mod subagents;
 mod terminal;
 mod theme_editor;
+mod theme_feed;
 mod thread_menu;
 mod thread_menu_actions;
 mod thread_now;
@@ -352,6 +353,8 @@ pub struct Workspace {
     keep_alive: keep_alive::KeepAlive,
     /// Paired remote environments and their background connections.
     saved_environments: Entity<environments::SavedEnvironments>,
+    /// The theme environment's published palettes and default theme.
+    theme_feed: theme_feed::ThemeFeed,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -540,10 +543,12 @@ impl Workspace {
             desktop,
             keep_alive: Default::default(),
             saved_environments,
+            theme_feed: Default::default(),
             _subscriptions: subscriptions,
         };
         workspace.sync_snap_shot(window, cx);
         workspace.sync_saved_sessions(window, cx);
+        workspace.start_theme_feed(window, cx);
         workspace
     }
 

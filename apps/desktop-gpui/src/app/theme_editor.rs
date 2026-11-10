@@ -1379,10 +1379,12 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        self.client_settings.set_themes(library.clone(), choice.clone())?;
+        self.client_settings.set_themes(library, choice)?;
+        // The stored library carries the current published palettes, not the caller's copy.
+        let choice = self.client_settings.theme_choice();
         if let Some(editor) = &self.theme_editor {
             editor.update(cx, |editor, cx| {
-                editor.library = library;
+                editor.library = choice.library.clone();
                 cx.notify();
             });
         }

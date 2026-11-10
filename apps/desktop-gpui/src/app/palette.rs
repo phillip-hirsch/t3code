@@ -1192,10 +1192,11 @@ impl Workspace {
     }
 
     /// "Change theme" (`useCommandPaletteThemeItems`): the standard card, the built-in themes,
-    /// then the saved ones.
+    /// the saved ones, then the theme environment's published ones.
     fn theme_rows(&self, dark: bool) -> Vec<Row> {
         let current = self.client_settings.theme_choice().owner(dark);
-        let saved = self.client_settings.themes.custom().iter();
+        let library = &self.client_settings.themes;
+        let saved = library.custom().iter().chain(library.published_cards());
         let cards = crate::themes::built_in().iter().chain(saved).map(|theme| {
             let only = theme.single_appearance().map(|dark| if dark { "For dark mode" } else { "For light mode" });
             (Some(theme.id.clone()), theme.label.clone(), only)
