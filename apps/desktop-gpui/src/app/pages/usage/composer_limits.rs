@@ -94,9 +94,10 @@ impl Workspace {
         let target = self.target.as_ref()?;
         let instance = self.composer_model()?.instance_id;
         let (thread, run, request) = match target {
-            Target::Thread { id, .. } => {
+            Target::Thread { env, id } => {
                 let projection = self.open_projection()?;
-                let run = self.shell.threads.iter().find(|t| &t.id == id).and_then(|t| t.latest_run_id.clone());
+                let shell = self.shell.thread(&crate::model::ScopedId::new(env.clone(), id.as_str()));
+                let run = shell.and_then(|t| t.latest_run_id.clone());
                 let request = projection
                     .pending_approvals()
                     .first()
