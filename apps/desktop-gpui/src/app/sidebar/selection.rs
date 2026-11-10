@@ -244,7 +244,7 @@ impl Workspace {
         let pick = |keep: &dyn Fn(&ThreadShell) -> bool| -> Vec<ScopedId> {
             threads.iter().filter(|t| keep(t)).map(|t| ScopedId::of_thread(t)).collect()
         };
-        let info = self.env_info(&key.env).unwrap_or_else(|| self.server_info());
+        let info = self.env_info(&key.env).unwrap_or(&self.unscoped_server_info);
         let settings = inbox::snooze_settings(info.settings.get("snoozePresets"));
         let presets = inbox::snooze_presets(&settings, &chrono::Local::now(), self.hour12());
         Some(BulkMenu {

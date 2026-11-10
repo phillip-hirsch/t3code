@@ -204,7 +204,8 @@ pub struct Workspace {
     connection: Connection,
     /// One per connected environment, the primary first.
     sessions: Vec<sessions::EnvironmentSession>,
-    /// What Settings reads while its scope selects no environment; see `settings_info`.
+    /// What Settings reads while its scope selects no environment, and what an environment that
+    /// is gone reads as (the contract defaults); see `settings_info`, `server_info`.
     unscoped_server_info: ServerInfo,
     /// Every environment's projects and threads.
     shell: ShellState,

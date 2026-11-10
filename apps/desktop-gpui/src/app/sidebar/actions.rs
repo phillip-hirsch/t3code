@@ -637,7 +637,7 @@ impl Workspace {
             self.client_settings.values.get("sidebarThreadSortOrder").as_str().unwrap_or_default().to_owned();
         let fallback = fallback_after_delete(&self.shell.threads, key, &sort_order, now_ms()).map(ScopedId::of_thread);
         let environment = thread.environment_id.clone();
-        let info = self.env_info(&environment).unwrap_or_else(|| self.server_info());
+        let info = self.env_info(&environment).unwrap_or(&self.unscoped_server_info);
         let project = self.shell.project(&ScopedId::thread_project(thread));
         let scratch_root = info.scratch_workspace_root.as_deref().map(crate::project_groups::normalize_path);
         let removable = project.filter(|p| {
@@ -816,7 +816,7 @@ impl Workspace {
         let requests = inbox::child_requests(&self.shell.threads);
         let facts = Facts::new(thread, &requests);
         // The thread's own machine: the menu can open on any listed thread.
-        let info = self.env_info(&thread.environment_id).unwrap_or_else(|| self.server_info());
+        let info = self.env_info(&thread.environment_id).unwrap_or(&self.unscoped_server_info);
         let project = self.shell.project(&ScopedId::thread_project(thread));
         let sidebar = origin == MenuOrigin::Sidebar;
         let groups = self.project_groups();
@@ -928,7 +928,7 @@ pub(super) struct SnoozeItems {
 impl SnoozeItems {
     fn new(workspace: &Workspace, key: &ScopedId, origin: MenuOrigin, inline_when: bool, cx: &gpui_kit::App) -> Self {
         // The thread's own machine's presets.
-        let info = workspace.env_info(&key.env).unwrap_or_else(|| workspace.server_info());
+        let info = workspace.env_info(&key.env).unwrap_or(&workspace.unscoped_server_info);
         let settings = inbox::snooze_settings(info.settings.get("snoozePresets"));
         let presets = inbox::snooze_presets(&settings, &chrono::Local::now(), workspace.hour12());
         let muted = crate::theme::tokens(cx).sidebar.secondary_label;
