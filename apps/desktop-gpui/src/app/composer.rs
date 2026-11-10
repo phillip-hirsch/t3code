@@ -707,15 +707,13 @@ impl Workspace {
             answer_locked: !self.question_takes_text(ChatPane::Main),
         };
         let Some(redirect) = focus_redirect(keystroke, gate) else { return false };
-        let (text, fold) = match redirect {
-            FocusRedirect::Type(text) => (text, false),
+        let (text, fold, item) = match redirect {
+            FocusRedirect::Type(text) => (text, false, None),
             FocusRedirect::Paste { as_text } => {
-                let item = cx.read_from_clipboard();
-                let only_text = item.as_ref().is_some_and(|item| {
-                    item.entries().iter().all(|e| matches!(e, gpui_kit::ClipboardEntry::String(_)))
-                });
-                match item.and_then(|item| item.text()).filter(|text| only_text && !text.is_empty()) {
-                    Some(text) => (text, !as_text),
+                let Some(item) = cx.read_from_clipboard() else { return false };
+                let only_text = item.entries().iter().all(|e| matches!(e, gpui_kit::ClipboardEntry::String(_)));
+                match item.text().filter(|text| only_text && !text.is_empty()) {
+                    Some(text) => (text, !as_text, Some(item)),
                     None => return false,
                 }
             }
@@ -725,6 +723,10 @@ impl Workspace {
             state.set_selected_range(end..end, cx);
         });
         self.composer.read(cx).focus_handle(cx).focus(window, cx);
+        // Copied context brings its records and attachments, as a paste into the editor does.
+        if item.is_some_and(|item| self.paste_context(&item, window, cx)) {
+            return true;
+        }
         if fold && self.fold_pasted_text(&text, window, cx) {
             return true;
         }
