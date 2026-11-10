@@ -996,8 +996,9 @@ impl Workspace {
             }
             None => Vec::new(),
         };
+        let env = self.target.as_ref().map(|target| target.environment().to_owned()).unwrap_or_default();
         let (sent, queued) = match self.thread.as_ref().and_then(|t| Some((&t.id, t.state.projection.as_ref()?))) {
-            Some((id, projection)) => send::pending_rows(&mut self.pending_sends, id, projection),
+            Some((id, projection)) => send::pending_rows(&mut self.pending_sends, &env, id, projection),
             None => Default::default(),
         };
         new_rows.extend(sent);

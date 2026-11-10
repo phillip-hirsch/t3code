@@ -1842,8 +1842,8 @@ impl Workspace {
 
     /// `modelFallbackBannerItem`: "Using X", why, and a way back to the default.
     fn render_fallback_banner(&self, joined: bool, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let Some(Target::Draft { project_id, .. }) = &self.target else { return None };
-        let project = self.shell.projects.iter().find(|p| &p.id == project_id);
+        let Some(Target::Draft { env, project_id, .. }) = &self.target else { return None };
+        let project = self.shell.projects.iter().find(|p| &p.environment_id == env && &p.id == project_id);
         let default = self.server_info().new_thread_model(project)?;
         let fallback = self.draft_usage_fallback(&default)?;
         let window = format!("{}:{}", fallback.exhausted_instance, fallback.resets_at.as_deref().unwrap_or_default());
