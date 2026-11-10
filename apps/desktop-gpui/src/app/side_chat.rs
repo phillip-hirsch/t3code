@@ -287,7 +287,7 @@ impl Workspace {
         });
         let text = prompt.map(|p| p.trim().to_owned()).filter(|p| !p.is_empty());
         // `readSettings().modelSelection`: the parent composer's model and reasoning go along.
-        let model = self.model_override.clone();
+        let model = self.dispatch_model();
         let asked = text.is_some();
         cx.spawn_in(window, async move |this, cx| {
             let forked = client.request("orchestration.dispatchCommand", fork).await;
@@ -1000,13 +1000,14 @@ impl Workspace {
         }
     }
 
-    /// The model the pane's next message runs on, when it was picked rather than kept.
-    pub(super) fn pane_model(&self, pane: ChatPane) -> Option<&ModelSelection> {
+    /// The model the pane's next message runs on, when it was picked rather than kept; the main
+    /// pane's goes through [`Self::dispatch_model`], so it never names the retired Plan agent.
+    pub(super) fn pane_model(&self, pane: ChatPane) -> Option<ModelSelection> {
         match pane {
-            ChatPane::Main => self.model_override.as_ref(),
+            ChatPane::Main => self.dispatch_model(),
             ChatPane::Side => {
                 let view = self.side_chat.view.as_ref()?;
-                self.side_chat.models.get(&(view.env.clone(), view.thread_id.clone()))
+                self.side_chat.models.get(&(view.env.clone(), view.thread_id.clone())).cloned()
             }
         }
     }
