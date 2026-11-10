@@ -1170,14 +1170,14 @@ impl Workspace {
         Target::draft(env, project_id, draft)
     }
 
-    /// A history entry's draft: that draft while it is unsent and its project listed, else its
-    /// project's draft on the entry's environment.
+    /// A history entry's draft: that draft while it is unsent, still in this project and the
+    /// project listed, else its project's draft on the entry's environment.
     fn open_draft_entry(&mut self, target: Target, window: &mut Window, cx: &mut Context<Self>) {
         let Target::Draft { env, project_id, draft } = &target else { return };
         if !self.shell.projects.iter().any(|p| p.id == *project_id && p.environment_id == *env) {
             return;
         }
-        if self.drafts.is_live(draft) {
+        if self.drafts.is_live(draft) && self.drafts.target(draft).as_ref() == Some(&target) {
             self.open_draft(target, window, cx);
         } else {
             self.start_draft_in(env.clone(), project_id.clone(), window, cx);

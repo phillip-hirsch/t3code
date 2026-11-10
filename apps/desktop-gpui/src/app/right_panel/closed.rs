@@ -229,6 +229,13 @@ pub(super) fn plan_next_reopen(
     (drop, None)
 }
 
+/// `getDraftThreadByRef`: the web keys a closed tab by its draft's environment and thread, so the
+/// draft owns it while unsent on the environment the tab closed on, wherever its project is now.
+/// `current` is the live draft's own target.
+fn owning_draft(environment_id: &str, current: Option<Target>) -> Option<Target> {
+    current.filter(|target| target.environment().as_ref() == environment_id)
+}
+
 /// The order a close records its tabs in: the one that was active last, so it reopens first.
 pub(super) fn closed_in_order<T: PartialEq>(mut closed: Vec<T>, active: Option<&T>) -> Vec<T> {
     if let Some(index) = active.and_then(|active| closed.iter().position(|s| s == active)) {
@@ -303,6 +310,24 @@ impl Workspace {
             && (matches!(self.connection, crate::app::Connection::Off) || self.primary_environment().is_some())
     }
 
+    /// The owner as it opens now: a listed thread, or the draft that still owns the tab, with its
+    /// project listed.
+    fn reopen_owner(&self, owner: &StoredTarget) -> Option<Target> {
+        match owner.target() {
+            Target::Thread { env, id } => {
+                let listed = self.shell.threads.iter().any(|t| t.id == id && t.environment_id == env);
+                listed.then_some(Target::Thread { env, id })
+            }
+            Target::Draft { env, draft, .. } => {
+                let current = self.drafts.is_live(&draft).then(|| self.drafts.target(&draft)).flatten();
+                owning_draft(&env, current).filter(|target| {
+                    let Target::Draft { env, project_id, .. } = target else { return false };
+                    self.shell.projects.iter().any(|p| &p.id == project_id && &p.environment_id == env)
+                })
+            }
+        }
+    }
+
     fn reopen_owner_state(&self, view: &ClosedView, catalog_ready: bool) -> OwnerState {
         let Some(owner) = view.owner() else {
             // The Pull requests page is always there to reopen on.
@@ -316,16 +341,11 @@ impl Workspace {
                 already_open: self.pull_request_tab_shown(reference),
             };
         };
-        let target = owner.target();
-        let environment = target.environment();
-        let owner_exists = match &target {
-            Target::Thread { env, id } => self.shell.threads.iter().any(|t| &t.id == id && &t.environment_id == env),
-            // `getDraftThreadByRef`: the draft itself, unsent, not its project's next one.
-            Target::Draft { env, project_id, draft } => {
-                self.drafts.is_live(draft)
-                    && self.shell.projects.iter().any(|p| &p.id == project_id && &p.environment_id == env)
-            }
-        };
+        let stored = owner.target();
+        let environment = stored.environment();
+        let resolved = self.reopen_owner(owner);
+        let owner_exists = resolved.is_some();
+        let target = resolved.unwrap_or_else(|| stored.clone());
         let side_chat_exists = match view {
             ClosedView::PanelTab { surface: Surface::SideChat(thread_id), .. } => {
                 self.shell.threads.iter().any(|t| &t.id == thread_id && &t.environment_id == environment)
@@ -404,7 +424,7 @@ impl Workspace {
         let Some(Entry { id, view }) = restore else { return true };
         match view {
             ClosedView::PanelTab { owner, surface } => {
-                let target = owner.target();
+                let target = self.reopen_owner(&owner).unwrap_or_else(|| owner.target());
                 let needs_workspace = matches!(surface, Surface::Files | Surface::File(_));
                 if needs_workspace && !self.owner_has_workspace(&target) {
                     self.right_panel.closed.update(|history| history.defer(id));
@@ -424,7 +444,7 @@ impl Workspace {
                 self.open_pull_request_panel(reference, None, cx);
             }
             ClosedView::Browser { owner, url, viewport, profile_id, .. } => {
-                let target = owner.target();
+                let target = self.reopen_owner(&owner).unwrap_or_else(|| owner.target());
                 let Target::Thread { env, id: thread_id } = &target else {
                     self.right_panel.closed.update(|history| history.remove(id));
                     return true;
@@ -579,6 +599,20 @@ mod tests {
             history.remember(tab("a", surface));
         }
         assert_eq!(history.entries()[0].view, tab("a", Surface::Files));
+    }
+
+    #[test]
+    fn a_draft_owns_its_tabs_only_on_the_environment_they_closed_on() {
+        let draft = |env: &str, project: &str| {
+            Target::draft(
+                env.to_owned().into(),
+                project.into(),
+                crate::app::draft_sessions::DraftId::from_saved("d".into()),
+            )
+        };
+        assert_eq!(owning_draft("a", Some(draft("b", "p"))), None, "the draft moved to another machine");
+        assert_eq!(owning_draft("a", Some(draft("a", "q"))), Some(draft("a", "q")), "it opens where it is now");
+        assert_eq!(owning_draft("a", None), None, "a sent or removed draft owns nothing");
     }
 
     #[test]
