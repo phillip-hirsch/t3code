@@ -433,7 +433,9 @@ impl Workspace {
     pub(super) fn release_side_chat(&mut self, thread_id: &str, cx: &mut Context<Self>) {
         let Some(env) = self.active_environment().cloned() else { return };
         self.side_chat.models.remove(&(env.clone(), thread_id.to_owned()));
+        // Without `orchestration:operate` the server keeps it, as the web leaves it.
         if self.side_shell(thread_id).is_some()
+            && self.can_operate(&env)
             && let Some(client) = self.env_client(&env)
         {
             self.dispatch_on(client, vec![delete_command(thread_id, true)], cx);
