@@ -31,7 +31,8 @@ pub fn format_relative(elapsed_ms: i64) -> String {
 /// (`IndexDraftLanding`): `sortScopedProjectsForSidebar(.., "updated_at")[0]`
 /// over unarchived projects. A project's time is its newest unarchived
 /// thread's latest user message (else updated, else created), or its own
-/// updated/created time without threads; ties go by title, then id.
+/// updated/created time without threads; ties go by title, then
+/// environment, then id.
 pub fn most_recent_project<'a>(projects: &'a [ProjectShell], threads: &[ThreadShell]) -> Option<&'a ProjectShell> {
     projects_by_recency(projects, threads).into_iter().next()
 }
@@ -56,7 +57,7 @@ pub fn projects_by_recency<'a>(projects: &'a [ProjectShell], threads: &[ThreadSh
             .unwrap_or(i64::MIN)
     };
     let mut sorted: Vec<&ProjectShell> = projects.iter().filter(|p| p.archived_at.is_none()).collect();
-    sorted.sort_by_cached_key(|p| (Reverse(project_time(p)), p.title.clone(), p.id.clone()));
+    sorted.sort_by_cached_key(|p| (Reverse(project_time(p)), p.title.clone(), p.environment_id.clone(), p.id.clone()));
     sorted
 }
 
@@ -1303,6 +1304,13 @@ mod tests {
         // Equal times fall back to the title.
         let tied = [project("y", "Yak", Some("2026-11-04T09:00:00.000Z"), false), projects[0].clone()];
         assert_eq!(most_recent_project(&tied, &[]).map(|p| p.id.as_str()), Some("a"));
+        // Then the environment, before the id, as `sortScopedProjectsForSidebar` breaks ties.
+        let twins = [
+            ProjectShell { environment_id: "env-b".into(), ..project("a", "Alpha", None, false) },
+            ProjectShell { environment_id: "env-a".into(), ..project("b", "Alpha", None, false) },
+        ];
+        let first = most_recent_project(&twins, &[]).map(|p| p.environment_id.as_ref());
+        assert_eq!(first, Some("env-a"));
         // Activity in project `b` on another environment says nothing about this one's `b`.
         let elsewhere = [ThreadShell { environment_id: "other".into(), ..thread("b", "2026-11-04T10:00:00.000Z") }];
         assert_eq!(most_recent_project(&projects, &elsewhere).map(|p| p.id.as_str()), Some("a"));
