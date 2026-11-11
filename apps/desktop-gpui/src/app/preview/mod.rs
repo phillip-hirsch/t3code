@@ -105,6 +105,7 @@ struct HostedTab {
     status: NavStatus,
     can_go_back: bool,
     can_go_forward: bool,
+    history: preview::SessionHistory,
     /// The last state sent with `preview.reportStatus`.
     reported: Option<(NavStatus, bool, bool)>,
     /// The page zoom and colour scheme last applied to the native view.
@@ -974,6 +975,7 @@ impl Workspace {
                 // Until the page reports its history; WebKit without the Navigation API never does.
                 can_go_back: !cfg!(windows),
                 can_go_forward: !cfg!(windows),
+                history: preview::SessionHistory::default(),
                 reported: None,
                 zoom: 1.,
                 appearance: None,
@@ -1070,7 +1072,7 @@ impl Workspace {
             // Same-document navigation (pushState, fragments) has no load events: take the page's
             // URL, which can't leave the origin the view is on.
             PageEvent::History(history) => {
-                (tab.can_go_back, tab.can_go_forward) = (history.back, history.forward);
+                (tab.can_go_back, tab.can_go_forward) = tab.history.report(&history);
                 let origin = |url: &str| url::Url::parse(url).ok().map(|url| url.origin());
                 let current = tab.view.read(cx).raw().url().ok();
                 if current.is_some_and(|current| origin(&current) == origin(&history.url))
@@ -1227,6 +1229,15 @@ impl Workspace {
                 NavStatus::LoadFailed { url, .. } if !url.is_empty() => hosted.view.read(cx).raw().load_url(url),
                 _ => hosted.view.read(cx).raw().reload(),
             };
+        }
+    }
+
+    /// Back (`-1`) or Forward (`1`) in the active hosted tab.
+    fn traverse_active_view(&mut self, delta: isize, cx: &App) {
+        let Some(tab) = self.active_tab() else { return };
+        if let Some(hosted) = self.preview.tabs.get_mut(&tab) {
+            hosted.history.traverse(delta);
+            let _ = hosted.view.read(cx).raw().evaluate_script(&format!("history.go({delta})"));
         }
     }
 
@@ -1515,9 +1526,7 @@ impl Workspace {
                                 Some(tab) => {
                                     this.send_server_input(tab, json!({"type": "history", "delta": -1}));
                                 }
-                                None => this.with_active_view(cx, |view| {
-                                    let _ = view.evaluate_script("history.back()");
-                                }),
+                                None => this.traverse_active_view(-1, cx),
                             }))
                         },
                     ))
@@ -1529,9 +1538,7 @@ impl Workspace {
                                     Some(tab) => {
                                         this.send_server_input(tab, json!({"type": "history", "delta": 1}));
                                     }
-                                    None => this.with_active_view(cx, |view| {
-                                        let _ = view.evaluate_script("history.forward()");
-                                    }),
+                                    None => this.traverse_active_view(1, cx),
                                 }))
                             }),
                     )
