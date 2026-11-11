@@ -1,0 +1,62 @@
+name: Desktop GPUI settings contract
+
+# Separate from desktop-gpui.yml so its broad path filter does not start the long Rust build:
+# the generator imports settings, keybinding and usage code across web, shared and client-runtime.
+on:
+  pull_request:
+    paths: &paths
+      - .github/workflows/desktop-gpui-settings-contract.yml
+      - apps/desktop-gpui/src/settings/**
+      - apps/desktop-gpui/tools/**
+      - apps/web/src/**
+      - packages/contracts/**
+      - packages/shared/src/**
+      - packages/client-runtime/src/**
+  push:
+    paths: *paths
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-gpui-settings-contract-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  settings-contract:
+    name: Settings contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            /*
+            !/.repos/
+            !/apps/mobile/modules/t3-terminal/Vendor/**/*.a
+          sparse-checkout-cone-mode: false
+
+      - name: Setup Vite+
+        uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --filter=@t3tools/web...
+
+      - name: Regenerate settings contract
+        working-directory: apps/web
+        env:
+          SETTINGS_CONTRACT_OUT: ${{ github.workspace }}/apps/desktop-gpui/src/settings/contract.json
+        run: |
+          cp ../desktop-gpui/tools/settings_data.test.ts src/
+          vp test run src/settings_data.test.ts
+
+      # The generator indents by one space; the committed file is in `vp fmt` shape.
+      - name: Format settings contract
+        run: vp fmt apps/desktop-gpui/src/settings/contract.json
+
+      - name: Check settings contract is current
+        run: |
+          if ! git diff --exit-code apps/desktop-gpui/src/settings/contract.json; then
+            echo "::error file=apps/desktop-gpui/src/settings/contract.json::contract.json is stale. Regenerate it as the header of apps/desktop-gpui/tools/settings_data.test.ts says, then commit it."
+            exit 1
+          fi

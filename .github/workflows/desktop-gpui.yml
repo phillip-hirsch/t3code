@@ -5,14 +5,9 @@ on:
     paths: &paths
       - .github/workflows/desktop-gpui.yml
       - apps/desktop-gpui/**
-      - packages/contracts/**
       # Read by the crate: include_str! in src/ssh/tunnel.rs and the license notice in build.rs.
       - apps/server/package.json
       - native/libghostty-vt/LICENSE
-      # Sources of src/settings/contract.json besides packages/contracts.
-      - apps/web/src/components/settings/settingsSearch.ts
-      - apps/web/src/components/settings/KeybindingsSettings.logic.ts
-      - packages/shared/src/keybindings.ts
   push:
     paths: *paths
 
@@ -66,7 +61,7 @@ jobs:
             libfontconfig-dev
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: rustfmt, clippy
 
@@ -89,41 +84,3 @@ jobs:
 
       - name: Test
         run: cargo test --locked
-
-  settings-contract:
-    name: Settings contract
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          sparse-checkout: |
-            /*
-            !/.repos/
-            !/apps/mobile/modules/t3-terminal/Vendor/**/*.a
-          sparse-checkout-cone-mode: false
-
-      - name: Setup Vite+
-        uses: ./.github/actions/setup-ci-deps
-        with:
-          install-args: --filter=@t3tools/web...
-
-      - name: Regenerate settings contract
-        working-directory: apps/web
-        env:
-          SETTINGS_CONTRACT_OUT: ${{ github.workspace }}/apps/desktop-gpui/src/settings/contract.json
-        run: |
-          cp ../desktop-gpui/tools/settings_data.test.ts src/
-          vp test run src/settings_data.test.ts
-
-      # The generator indents by one space; the committed file is in `vp fmt` shape.
-      - name: Format settings contract
-        run: vp fmt apps/desktop-gpui/src/settings/contract.json
-
-      - name: Check settings contract is current
-        run: |
-          if ! git diff --exit-code apps/desktop-gpui/src/settings/contract.json; then
-            echo "::error file=apps/desktop-gpui/src/settings/contract.json::contract.json is stale. Regenerate it as the header of apps/desktop-gpui/tools/settings_data.test.ts says, then commit it."
-            exit 1
-          fi
