@@ -727,31 +727,37 @@ impl Workspace {
             if this.update(cx, |this, cx| this.set_connection(Connection::Connecting, cx)).is_err() {
                 return;
             }
-            // The environment's id keys its threads, so it is read before the socket opens.
-            let known = this.update(cx, |this, _| this.primary_environment().is_some()).unwrap_or(true);
-            if !known {
-                let http_base = endpoint.http_base.clone();
-                let descriptor =
-                    runtime().spawn(async move { crate::environments::fetch_descriptor(&http_base).await }).await;
-                let failure: Option<SharedString> = match descriptor {
-                    Ok(Ok(descriptor)) => {
-                        let id = SharedString::from(descriptor.environment_id);
-                        if this.update(cx, |this, cx| this.set_primary_environment(id, cx)).is_err() {
+            // Identity before every attempt: the id keys the threads, and the token must not reach
+            // another environment that now answers at this address.
+            let Ok(known) = this.update(cx, |this, _| this.primary_environment().cloned()) else { return };
+            let http_base = endpoint.http_base.clone();
+            let descriptor =
+                runtime().spawn(async move { crate::environments::fetch_descriptor(&http_base).await }).await;
+            let failure: Option<SharedString> = match descriptor {
+                Ok(Ok(descriptor)) => match environments::primary_identity(known.as_deref(), &descriptor) {
+                    Ok(id) => {
+                        if this.update(cx, |this, cx| this.set_primary_environment(id.into(), cx)).is_err() {
                             return;
                         }
                         None
                     }
-                    Ok(Err(failure)) => Some(failure.detail.into()),
-                    Err(error) => Some(error.to_string().into()),
-                };
-                if let Some(failure) = failure {
-                    let disconnected = Connection::Disconnected(failure);
-                    if this.update(cx, |this, cx| this.set_connection(disconnected, cx)).is_err() {
+                    // Blocked, as a saved environment would be, until the backend changes.
+                    Err(refused) => {
+                        let message =
+                            format!("Not connecting to the server at {}: {}", endpoint.http_base, refused.detail);
+                        let _ = this.update(cx, |this, cx| this.set_connection(Connection::Failed(message.into()), cx));
                         return;
                     }
-                    cx.background_executor().timer(RECONNECT_DELAY).await;
-                    continue;
+                },
+                Ok(Err(failure)) => Some(failure.detail.into()),
+                Err(error) => Some(error.to_string().into()),
+            };
+            if let Some(failure) = failure {
+                if this.update(cx, |this, cx| this.set_connection(Connection::Disconnected(failure), cx)).is_err() {
+                    return;
                 }
+                cx.background_executor().timer(RECONNECT_DELAY).await;
+                continue;
             }
             let options = ConnectOptions { ws_url: endpoint.ws_url(), bearer_token: endpoint.bearer_token.clone() };
             match RpcClient::connect(runtime().handle(), options).await {
