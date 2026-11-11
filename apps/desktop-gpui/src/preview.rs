@@ -280,33 +280,117 @@ pub fn failed_load(result: &str) -> Option<(i64, &'static str)> {
     Some(NET_ERRORS.into_iter().find(|(_, known)| *known == name).unwrap_or((-2, "ERR_FAILED")))
 }
 
-/// Reports the top page's URL and back/forward state over wry's IPC on load and on each history
-/// change, through Chromium's Navigation API (WebView2; WebKit lacks it and reports nothing).
+/// Reports the top page's URL and history over wry's IPC on load and on each history change,
+/// through the Navigation API (WebView2, and WebKit where it has it; older WebKit reports nothing).
+/// A traversal's `delta` is known only between two entries on the page's own origin.
 pub const HISTORY_SCRIPT: &str = r#"(() => {
   if (window !== window.top || !window.navigation || !window.ipc) return;
-  const post = () => window.ipc.postMessage(JSON.stringify({ t3History: { url: location.href, back: navigation.canGoBack, forward: navigation.canGoForward } }));
-  post();
-  navigation.addEventListener("currententrychange", post);
-  addEventListener("pageshow", post);
+  const delta = (from, to) => (from && to && from.index >= 0 && to.index >= 0 ? to.index - from.index : null);
+  const post = (type, step) => window.ipc.postMessage(JSON.stringify({ t3History: {
+    url: location.href, back: navigation.canGoBack, forward: navigation.canGoForward,
+    length: history.length, type, delta: step } }));
+  const activation = () => navigation.activation || { navigationType: null, from: null, entry: null };
+  const activated = activation();
+  post(activated.navigationType, delta(activated.from, activated.entry));
+  navigation.addEventListener("currententrychange", (event) => post(event.navigationType, delta(event.from, navigation.currentEntry)));
+  addEventListener("pageshow", (event) => {
+    const restored = activation();
+    if (event.persisted) post("traverse", delta(restored.from, restored.entry));
+    else post(null, null);
+  });
 })();"#;
+
+/// How the page reached its current entry: the Navigation API's `NavigationType`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryStep {
+    Push,
+    Replace,
+    Reload,
+    Traverse,
+}
 
 /// [`HISTORY_SCRIPT`]'s message. The page can post one too, so its URL is only trusted within the
 /// page's own origin.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PageHistory {
     pub url: String,
+    /// The Navigation API's answers, which see only the page's own origin's entries.
     pub back: bool,
     pub forward: bool,
+    /// `history.length`: every entry, other origins' included.
+    pub length: usize,
+    /// `None` where the browser doesn't say (WebKit without `navigation.activation`, `pageshow`).
+    pub step: Option<HistoryStep>,
+    pub delta: Option<isize>,
 }
 
 pub fn history_message(body: &str) -> Option<PageHistory> {
     let message: serde_json::Value = serde_json::from_str(body).ok()?;
     let history = message.get("t3History")?;
+    let step = match history.get("type").and_then(serde_json::Value::as_str) {
+        Some("push") => Some(HistoryStep::Push),
+        Some("replace") => Some(HistoryStep::Replace),
+        Some("reload") => Some(HistoryStep::Reload),
+        Some("traverse") => Some(HistoryStep::Traverse),
+        _ => None,
+    };
     Some(PageHistory {
         url: history.get("url")?.as_str()?.to_owned(),
         back: history.get("back")?.as_bool()?,
         forward: history.get("forward")?.as_bool()?,
+        length: history
+            .get("length")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or(1),
+        step,
+        delta: history.get("delta").and_then(serde_json::Value::as_i64).and_then(|delta| isize::try_from(delta).ok()),
     })
+}
+
+/// Where a tab stands in its whole session history, as Electron's `navigationHistory` sees it.
+/// `navigation.canGoBack` leaves out other origins' entries, so after the address bar or a link
+/// loads another origin it says there is nothing to go back to. WebView2's and `WKWebView`'s own
+/// `canGoBack` are `unsafe` calls, so this follows the page's reports and the app's own traversals.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SessionHistory {
+    index: usize,
+    len: usize,
+    /// The step the app's Back or Forward asked for, until the page reports where it landed.
+    pending: Option<isize>,
+}
+
+impl SessionHistory {
+    /// The app asked the page to move `delta` entries.
+    pub fn traverse(&mut self, delta: isize) {
+        self.pending = Some(delta);
+    }
+
+    /// Takes a page's report; returns whether it can go back and forward.
+    pub fn report(&mut self, page: &PageHistory) -> (bool, bool) {
+        let len = page.length.max(1);
+        let pending = self.pending.take();
+        let moved = match page.step {
+            Some(HistoryStep::Traverse) => page.delta.or(pending),
+            Some(HistoryStep::Replace | HistoryStep::Reload) => None,
+            // A push drops the entries ahead; without a type, a new length is one.
+            Some(HistoryStep::Push) => {
+                self.index = len - 1;
+                None
+            }
+            None if pending.is_none() && len != self.len => {
+                self.index = len - 1;
+                None
+            }
+            None => pending,
+        };
+        if let Some(delta) = moved {
+            self.index = self.index.saturating_add_signed(delta);
+        }
+        self.len = len;
+        self.index = self.index.min(len - 1);
+        (page.back || self.index > 0, page.forward || self.index + 1 < len)
+    }
 }
 
 /// Hands the app's shell chords back from a focused page, as Electron's `before-input-event`
@@ -1571,11 +1655,67 @@ mod tests {
     fn reads_the_history_scripts_message() {
         assert_eq!(
             history_message(r#"{"t3History":{"url":"https://a.test/#b","back":true,"forward":false}}"#),
-            Some(PageHistory { url: "https://a.test/#b".into(), back: true, forward: false })
+            Some(PageHistory {
+                url: "https://a.test/#b".into(),
+                back: true,
+                forward: false,
+                length: 1,
+                step: None,
+                delta: None
+            })
+        );
+        assert_eq!(
+            history_message(
+                r#"{"t3History":{"url":"https://a.test/","back":false,"forward":true,"length":3,"type":"traverse","delta":-1}}"#
+            ),
+            Some(PageHistory {
+                url: "https://a.test/".into(),
+                back: false,
+                forward: true,
+                length: 3,
+                step: Some(HistoryStep::Traverse),
+                delta: Some(-1)
+            })
         );
         assert_eq!(history_message(r#"{"t3History":{"url":"https://a.test/","back":true}}"#), None);
         assert_eq!(history_message("not json"), None);
         assert_eq!(history_message(r#"{"other":1}"#), None);
+    }
+
+    fn report(length: usize, step: Option<HistoryStep>, delta: Option<isize>) -> PageHistory {
+        // What the Navigation API says on a page whose neighbours are on other origins.
+        PageHistory { url: "https://b.test/".into(), back: false, forward: false, length, step, delta }
+    }
+
+    #[test]
+    fn back_and_forward_count_entries_on_other_origins() {
+        let push = Some(HistoryStep::Push);
+        let mut history = SessionHistory::default();
+        assert_eq!(history.report(&report(1, push, None)), (false, false), "the first page (after its redirect)");
+        assert_eq!(history.report(&report(2, push, None)), (true, false), "a URL typed in the address bar");
+        history.traverse(-1);
+        assert_eq!(history.report(&report(2, Some(HistoryStep::Traverse), None)), (false, true), "Back");
+        history.traverse(1);
+        assert_eq!(history.report(&report(2, Some(HistoryStep::Traverse), None)), (true, false), "Forward");
+        assert_eq!(history.report(&report(2, Some(HistoryStep::Reload), None)), (true, false), "a reload stays put");
+        assert_eq!(history.report(&report(2, Some(HistoryStep::Replace), None)), (true, false), "so does a replace");
+
+        // A traversal the page measured on its own origin wins over the app's step.
+        history.traverse(-2);
+        assert_eq!(history.report(&report(2, Some(HistoryStep::Traverse), Some(-1))), (false, true));
+        assert_eq!(history.report(&report(2, push, None)), (true, false), "a push drops the entries ahead");
+
+        // WebKit without `navigation.activation`: a longer history is a push, the same one stays put.
+        let mut webkit = SessionHistory::default();
+        assert_eq!(webkit.report(&report(1, None, None)), (false, false));
+        assert_eq!(webkit.report(&report(2, None, None)), (true, false));
+        assert_eq!(webkit.report(&report(2, None, None)), (true, false), "pageshow repeats the report");
+        webkit.traverse(-1);
+        assert_eq!(webkit.report(&report(2, None, None)), (false, true));
+
+        // The page's own answer still counts.
+        let same_origin = PageHistory { back: true, ..report(1, push, None) };
+        assert_eq!(SessionHistory::default().report(&same_origin), (true, false));
     }
 
     #[test]
