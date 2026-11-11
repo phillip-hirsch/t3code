@@ -1,0 +1,1544 @@
+//! The Pull requests page's list logic: the `pullRequests.list` read model, the search
+//! qualifiers, and how rows are narrowed, grouped and sorted
+//! (`apps/web/src/components/pullRequest/pullRequestList.logic.ts`,
+//! `pullRequestListGroups.logic.ts`, `packages/client-runtime/src/pullRequestQuery.ts`).
+
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
+
+use serde::Deserialize;
+use serde_json::{Map, Value, json};
+
+use crate::rpc::RpcError;
+use crate::timestamp::parse_ms;
+
+/// One page from the host and no more: providers ask for one row beyond the page as their
+/// "is there more" probe, and GitHub serves a hundred per request.
+pub const PAGE_SIZE: u32 = 99;
+pub const MAX_PAGE_SIZE: u32 = 500;
+const MATCHED_ELSEWHERE_SCORE: u32 = 10;
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Actor {
+    pub login: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub avatar_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct Label {
+    pub name: String,
+    #[serde(default)]
+    pub color: Option<String>,
+}
+
+/// A change request's state (`PullRequestState`); one a newer server adds reads as `Unknown`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum State {
+    Open,
+    Closed,
+    Merged,
+    #[serde(other)]
+    Unknown,
+}
+
+impl State {
+    /// The wire name, as the list's state filter spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            State::Open => "open",
+            State::Closed => "closed",
+            State::Merged => "merged",
+            State::Unknown => "unknown",
+        }
+    }
+}
+
+/// `PullRequestStackMembership`: the row's place in a native stack.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct StackMembership {
+    pub number: u64,
+    pub position: u64,
+    pub size: u64,
+}
+
+/// `PullRequestListEntry`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Entry {
+    #[serde(default)]
+    pub stack: Option<StackMembership>,
+    /// The environment that answered for the row (`EnvironmentPullRequestEntry`).
+    #[serde(skip)]
+    pub environment_id: String,
+    pub provider: String,
+    pub host: String,
+    pub project_id: String,
+    pub repository: String,
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub author: Option<Actor>,
+    pub head_branch: String,
+    pub base_branch: String,
+    pub state: State,
+    pub is_draft: bool,
+    /// `mergeable`, `conflicting` or `unknown`.
+    pub mergeability: String,
+    pub additions: u64,
+    pub deletions: u64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub viewer_review_requested: bool,
+    #[serde(default)]
+    pub labels: Vec<Label>,
+    #[serde(default)]
+    pub review_decision: Option<String>,
+    #[serde(default)]
+    pub checks_state: Option<String>,
+    #[serde(default)]
+    pub observed_at: Option<f64>,
+    #[serde(skip)]
+    pub updated_ms: Option<i64>,
+    #[serde(skip)]
+    pub created_ms: Option<i64>,
+}
+
+impl Entry {
+    /// `pullRequestEntryKey`: unique across environments, hosts and repositories.
+    pub fn key(&self) -> String {
+        let scope = if self.environment_id.is_empty() { String::new() } else { format!("{}:", self.environment_id) };
+        format!("{scope}{}:{}#{}", self.host, self.repository, self.number)
+    }
+
+    /// `pullRequestDiffStatKey`, which `pullRequests.listStats` answers by.
+    pub fn stat_key(&self) -> String {
+        stat_key(&self.environment_id, &self.project_id, self.number)
+    }
+
+    pub fn reference(&self) -> Value {
+        json!({"projectId": self.project_id, "host": self.host, "repository": self.repository, "number": self.number})
+    }
+}
+
+/// `pullRequestDiffStatKey`: a project id names a project only within its environment.
+pub fn stat_key(environment_id: &str, project_id: &str, number: u64) -> String {
+    format!("{environment_id} {project_id} {number}")
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSummary {
+    pub host: String,
+    pub kind: String,
+    #[serde(default)]
+    pub searches_on_host: bool,
+    /// The actions the host can run on its change requests; absent from older servers.
+    #[serde(default)]
+    pub actions: Option<Vec<String>>,
+    #[serde(default)]
+    pub configured: bool,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectError {
+    pub project_id: String,
+}
+
+/// `PullRequestListResult`.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListResult {
+    #[serde(default)]
+    pub viewers: HashMap<String, String>,
+    #[serde(default)]
+    pub providers: Vec<ProviderSummary>,
+    #[serde(default, deserialize_with = "entries")]
+    pub entries: Vec<Rc<Entry>>,
+    #[serde(default)]
+    pub errors: Vec<ProjectError>,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub next_cursors: Map<String, Value>,
+}
+
+/// Rows that fail to decode are dropped rather than failing the page, as the web's forward-compatible arrays do.
+fn entries<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<Rc<Entry>>, D::Error> {
+    let values = Vec::<Value>::deserialize(deserializer)?;
+    Ok(values
+        .into_iter()
+        .filter_map(|value| serde_json::from_value::<Entry>(value).ok())
+        .map(|mut entry| {
+            entry.updated_ms = parse_ms(&entry.updated_at);
+            entry.created_ms = parse_ms(&entry.created_at);
+            Rc::new(entry)
+        })
+        .collect())
+}
+
+/// The listing's lead-in states (`PullRequestInvolvement`, `PullRequestListState`) and sorts.
+pub const INVOLVEMENTS: &[(&str, &str)] = &[("all", "All"), ("reviewing", "Reviewing"), ("authored", "Authored")];
+pub const STATES: &[(&str, &str)] = &[("all", "All"), ("open", "Open"), ("closed", "Closed"), ("merged", "Merged")];
+pub const SORTS: &[(&str, &str)] = &[
+    ("ready", "Merge readiness"),
+    ("blocked", "Blocked on me"),
+    ("updated", "Recently updated"),
+    ("newest", "Newest shown"),
+    ("oldest", "Oldest shown"),
+    ("largest", "Largest shown"),
+    ("smallest", "Smallest shown"),
+];
+pub const DRAFTS: &[(&str, &str)] = &[("all", "All"), ("only", "Drafts only"), ("hide", "Hide drafts")];
+pub const REVIEWS: &[(&str, &str)] = &[
+    ("all", "All"),
+    ("approved", "Approved"),
+    ("changes-requested", "Changes requested"),
+    ("review-required", "Review required"),
+    ("none", "No reviews"),
+];
+pub const CHECKS: &[(&str, &str)] = &[("all", "All"), ("passing", "Passing"), ("failing", "Failing")];
+
+/// `PullRequestListFilters`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Filters {
+    pub draft: Option<String>,
+    pub review: Option<String>,
+    pub checks: Option<String>,
+    pub author: Option<String>,
+    /// Every group must match; any name within a group suffices.
+    pub labels: Vec<Vec<String>>,
+    pub excluded_labels: Vec<String>,
+}
+
+impl Filters {
+    pub fn is_empty(&self) -> bool {
+        *self == Filters::default()
+    }
+
+    /// `{ ...self, ...over }`: a qualifier the reader typed outranks the menu.
+    pub fn merged(&self, over: &Filters) -> Filters {
+        Filters {
+            draft: over.draft.clone().or_else(|| self.draft.clone()),
+            review: over.review.clone().or_else(|| self.review.clone()),
+            checks: over.checks.clone().or_else(|| self.checks.clone()),
+            author: over.author.clone().or_else(|| self.author.clone()),
+            labels: if over.labels.is_empty() { self.labels.clone() } else { over.labels.clone() },
+            excluded_labels: if over.excluded_labels.is_empty() {
+                self.excluded_labels.clone()
+            } else {
+                over.excluded_labels.clone()
+            },
+        }
+    }
+
+    pub fn to_json(&self) -> Value {
+        let mut out = Map::new();
+        for (key, value) in
+            [("draft", &self.draft), ("review", &self.review), ("checks", &self.checks), ("author", &self.author)]
+        {
+            if let Some(value) = value {
+                out.insert(key.into(), json!(value));
+            }
+        }
+        if !self.labels.is_empty() {
+            out.insert("labels".into(), json!(self.labels));
+        }
+        if !self.excluded_labels.is_empty() {
+            out.insert("excludedLabels".into(), json!(self.excluded_labels));
+        }
+        Value::Object(out)
+    }
+}
+
+const MAX_QUALIFIER_VALUES: usize = 10;
+const MAX_QUALIFIER_LENGTH: usize = 200;
+
+/// Splits on `separator` outside double quotes, like `/(?:[^\s"]|"[^"]*")+/g`: an unclosed
+/// quote matches nothing and ends the run it interrupts.
+fn quoted_runs(raw: &str, separator: impl Fn(char) -> bool) -> Vec<&str> {
+    let mut runs = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut index = 0;
+    while index < raw.len() {
+        let c = raw[index..].chars().next().unwrap_or_default();
+        if c == '"'
+            && let Some(close) = raw[index + 1..].find('"')
+        {
+            start.get_or_insert(index);
+            index += close + 2;
+            continue;
+        }
+        if c == '"' || separator(c) {
+            if let Some(from) = start.take() {
+                runs.push(&raw[from..index]);
+            }
+        } else {
+            start.get_or_insert(index);
+        }
+        index += c.len_utf8();
+    }
+    if let Some(from) = start {
+        runs.push(&raw[from..]);
+    }
+    runs
+}
+
+fn qualifier_value(raw: &str) -> String {
+    raw.replace('"', "").trim().to_owned()
+}
+
+fn bounded_names(names: impl Iterator<Item = String>) -> Vec<String> {
+    names
+        .take(MAX_QUALIFIER_VALUES)
+        .map(|name| name.chars().take(MAX_QUALIFIER_LENGTH).collect::<String>().trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+fn split_list(raw: &str) -> impl Iterator<Item = String> + '_ {
+    quoted_runs(raw, |c| c == ',').into_iter().map(qualifier_value).filter(|part| !part.is_empty())
+}
+
+/// `-?name:rest`, where a name starts with a letter and then takes letters, digits, `_` or `-`.
+fn qualifier(token: &str) -> Option<(bool, &str, &str)> {
+    let (negated, body) = match token.strip_prefix('-') {
+        Some(body) => (true, body),
+        None => (false, token),
+    };
+    let (name, rest) = body.split_once(':')?;
+    let mut chars = name.chars();
+    let valid = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    valid.then_some((negated, name, rest))
+}
+
+/// `parsePullRequestQuery`: the free text and the filters its qualifiers name.
+pub fn parse_query(raw: &str) -> (String, Filters) {
+    let mut text = Vec::new();
+    let mut filters = Filters::default();
+    for token in quoted_runs(raw, char::is_whitespace) {
+        if let Some((negated, name, rest)) = qualifier(token) {
+            let value = qualifier_value(rest);
+            let lower = if value.is_empty() { String::new() } else { name.to_lowercase() };
+            let value_lower = value.to_lowercase();
+            match lower.as_str() {
+                "" => {}
+                "label" => {
+                    let names = bounded_names(split_list(rest));
+                    if !names.is_empty() {
+                        if negated {
+                            filters.excluded_labels.extend(names);
+                        } else {
+                            filters.labels.push(names);
+                        }
+                        continue;
+                    }
+                }
+                "author" if !negated => {
+                    filters.author =
+                        Some(value.chars().take(MAX_QUALIFIER_LENGTH).collect::<String>().trim().to_owned());
+                    continue;
+                }
+                "author" => {}
+                "draft" if !negated && (value_lower == "true" || value_lower == "false") => {
+                    filters.draft = Some(if value_lower == "true" { "only" } else { "hide" }.into());
+                    continue;
+                }
+                "draft" => {}
+                "review" => {
+                    let decision = match value_lower.as_str() {
+                        "approved" => Some("approved"),
+                        "changes_requested" | "changes-requested" => Some("changes-requested"),
+                        "required" | "review-required" => Some("review-required"),
+                        "none" => Some("none"),
+                        _ => None,
+                    };
+                    if let (false, Some(decision)) = (negated, decision) {
+                        filters.review = Some(decision.into());
+                        continue;
+                    }
+                }
+                "status" | "checks" => {
+                    let state = match value_lower.as_str() {
+                        "success" | "passing" => Some("passing"),
+                        "failure" | "failing" => Some("failing"),
+                        _ => None,
+                    };
+                    if let (false, Some(state)) = (negated, state) {
+                        filters.checks = Some(state.into());
+                        continue;
+                    }
+                }
+                // Any other qualifier names a scoped label, e.g. `area:ui`.
+                _ if !value.starts_with('/') => {
+                    let names = bounded_names(
+                        split_list(rest).map(|part| if part.contains(':') { part } else { format!("{name}:{part}") }),
+                    );
+                    if !names.is_empty() {
+                        if negated {
+                            filters.excluded_labels.extend(names);
+                        } else {
+                            filters.labels.push(names);
+                        }
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+        }
+        text.push(token);
+    }
+    filters.labels.truncate(MAX_QUALIFIER_VALUES);
+    filters.excluded_labels.truncate(MAX_QUALIFIER_VALUES);
+    (text.join(" "), filters)
+}
+
+/// `applyPullRequestDraftFilterChange`: picking a Draft value takes a typed `draft:` qualifier
+/// out of the query, which would otherwise keep outranking the menu.
+pub fn drop_draft_qualifier(query: &str) -> String {
+    quoted_runs(query, char::is_whitespace)
+        .into_iter()
+        .filter(|token| parse_query(token).1.draft.is_none())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn normalize(value: &str) -> Option<String> {
+    let trimmed = value.trim().to_lowercase();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
+/// `pullRequestViewerKey`: one host can be signed in as different people on different machines.
+fn viewer_key(environment_id: &str, host: &str) -> String {
+    format!("{environment_id} {host}")
+}
+
+/// `pullRequestEntryViewer`: the row's machine's viewer, else an unmerged answer's by host.
+pub fn viewer_for<'a>(entry: &Entry, viewers: &'a HashMap<String, String>) -> Option<&'a str> {
+    viewers
+        .get(&viewer_key(&entry.environment_id, &entry.host))
+        .or_else(|| viewers.get(&entry.host))
+        .map(String::as_str)
+        .filter(|viewer| !viewer.trim().is_empty())
+}
+
+fn authored_by_viewer(entry: &Entry, viewers: &HashMap<String, String>) -> bool {
+    let viewer = viewer_for(entry, viewers).and_then(normalize);
+    viewer.is_some() && entry.author.as_ref().and_then(|a| normalize(&a.login)) == viewer
+}
+
+/// `resolvePullRequestAuthorFilter`: `author:me` (or `@me`) is whoever is signed in to the host.
+fn resolve_author<'a>(author: &'a str, viewer: Option<&'a str>) -> &'a str {
+    let trimmed = author.trim();
+    let me = trimmed.trim_start_matches('@').eq_ignore_ascii_case("me") && trimmed.len() <= 3;
+    match (me, viewer) {
+        (true, Some(viewer)) if !viewer.trim().is_empty() => viewer,
+        _ => trimmed,
+    }
+}
+
+pub fn matches_filters(entry: &Entry, filters: &Filters, viewer: Option<&str>) -> bool {
+    let labels: Vec<String> = entry.labels.iter().map(|l| l.name.trim().to_lowercase()).collect();
+    let holds = |label: &String| labels.contains(&label.trim().to_lowercase());
+    filters.draft.as_ref().is_none_or(|draft| entry.is_draft == (draft == "only"))
+        && filters.review.as_ref().is_none_or(|review| match review.as_str() {
+            "none" => entry.review_decision.is_none(),
+            review => entry.review_decision.as_deref() == Some(review),
+        })
+        && filters.labels.iter().all(|group| group.iter().any(holds))
+        && !filters.excluded_labels.iter().any(holds)
+        && filters.author.as_ref().is_none_or(|author| {
+            entry.author.as_ref().is_some_and(|a| a.login.eq_ignore_ascii_case(resolve_author(author, viewer)))
+        })
+}
+
+pub fn matches_query(entry: &Entry, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    let author = entry.author.as_ref().map_or("", |a| a.login.as_str());
+    format!("#{} {} {} {} {}", entry.number, entry.title, entry.repository, entry.head_branch, author)
+        .to_lowercase()
+        .contains(&query)
+}
+
+/// `scorePullRequestMatch`: host search also matches bodies and commits a row does not show.
+pub fn score_match(entry: &Entry, query: &str) -> u32 {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return 0;
+    }
+    let number = needle.strip_prefix('#').unwrap_or(&needle);
+    if !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()) {
+        return if entry.number.to_string() == number { 100 } else { 0 };
+    }
+    let title = entry.title.to_lowercase();
+    let terms: Vec<&str> = needle.split_whitespace().collect();
+    if title == needle {
+        90
+    } else if title.contains(&needle) {
+        80
+    } else if terms.len() > 1 && terms.iter().all(|term| title.contains(term)) {
+        70
+    } else if entry.head_branch.to_lowercase().contains(&needle) {
+        60
+    } else if entry.author.as_ref().is_some_and(|a| a.login.to_lowercase().contains(&needle)) {
+        50
+    } else if entry.repository.to_lowercase().contains(&needle) {
+        40
+    } else if terms.iter().any(|term| title.contains(term)) {
+        30
+    } else {
+        10
+    }
+}
+
+/// A row the host matched by its description rather than anything it shows.
+pub fn matched_elsewhere(entry: &Entry, query: &str) -> bool {
+    !query.is_empty() && score_match(entry, query) <= MATCHED_ELSEWHERE_SCORE
+}
+
+/// `comparePullRequestsByRecency`: newest update first, undated last.
+pub fn by_recency(left: &Entry, right: &Entry) -> Ordering {
+    match (left.updated_ms, right.updated_ms) {
+        (Some(l), Some(r)) => r.cmp(&l),
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+pub fn rank_matches(entries: &mut [Rc<Entry>], query: &str) {
+    if query.trim().is_empty() {
+        return;
+    }
+    entries.sort_by(|l, r| score_match(r, query).cmp(&score_match(l, query)).then_with(|| by_recency(l, r)));
+}
+
+/// A group of rows under one heading; an unlabeled group has no header.
+#[derive(Clone, Debug)]
+pub struct Group {
+    /// `authored`, `reviewRequested` or `others`.
+    pub key: &'static str,
+    pub label: &'static str,
+    pub entries: Vec<Rc<Entry>>,
+}
+
+/// `groupPullRequestsByInvolvement`.
+pub fn group_by_involvement(entries: Vec<Rc<Entry>>, viewers: &HashMap<String, String>) -> Vec<Group> {
+    let mut groups = [
+        Group { key: "authored", label: "Authored", entries: Vec::new() },
+        Group { key: "reviewRequested", label: "Review requested", entries: Vec::new() },
+        Group { key: "others", label: "Others", entries: Vec::new() },
+    ];
+    for entry in entries {
+        let slot = if authored_by_viewer(&entry, viewers) {
+            0
+        } else if entry.viewer_review_requested {
+            1
+        } else {
+            2
+        };
+        groups[slot].entries.push(entry);
+    }
+    groups.into_iter().filter(|group| !group.entries.is_empty()).collect()
+}
+
+/// Diff sizes `pullRequests.listStats` measured for rows the listing left at zero.
+pub type Stats = HashMap<String, (u64, u64)>;
+
+pub fn diff_stat(entry: &Entry, stats: &Stats) -> Option<(u64, u64)> {
+    if entry.additions.saturating_add(entry.deletions) > 0 {
+        return Some((entry.additions, entry.deletions));
+    }
+    stats.get(&entry.stat_key()).copied()
+}
+
+fn size_of(entry: &Entry, stats: &Stats) -> (bool, u64) {
+    diff_stat(entry, stats).map_or((false, 0), |(a, d)| (true, a.saturating_add(d)))
+}
+
+fn readiness_tier(entry: &Entry) -> u8 {
+    if entry.mergeability == "conflicting" {
+        4
+    } else if entry.state != State::Open {
+        3
+    } else if entry.is_draft {
+        2
+    } else if entry.checks_state.as_deref() == Some("passing") && entry.review_decision.as_deref() == Some("approved") {
+        0
+    } else if entry.checks_state.as_deref() == Some("passing") {
+        1
+    } else {
+        2
+    }
+}
+
+fn blocked_on_author_tier(entry: &Entry) -> u8 {
+    if entry.state != State::Open {
+        6
+    } else if entry.mergeability == "conflicting" {
+        0
+    } else if entry.review_decision.as_deref() == Some("changes-requested") {
+        1
+    } else if entry.checks_state.as_deref() == Some("failing") {
+        2
+    } else if entry.is_draft {
+        3
+    } else if entry.checks_state.as_deref() == Some("passing") && entry.review_decision.as_deref() == Some("approved") {
+        5
+    } else {
+        4
+    }
+}
+
+/// `sortPullRequestGroups`. Sorting by readiness or blockers yields to search ranking while text is typed.
+pub fn sort_groups(groups: &mut [Group], sort: &str, text: &str, involvement: &str, stats: &Stats) {
+    let searching = !text.trim().is_empty();
+    let measured_then = |l: &Entry, r: &Entry, sized: Ordering| {
+        let (lm, ls) = size_of(l, stats);
+        let (rm, rs) = size_of(r, stats);
+        rm.cmp(&lm).then(match sized {
+            Ordering::Less => ls.cmp(&rs),
+            _ => rs.cmp(&ls),
+        })
+    };
+    let timestamp = |e: &Entry| e.updated_ms.or(e.created_ms).unwrap_or(0);
+    for group in groups.iter_mut() {
+        let entries = &mut group.entries;
+        match sort {
+            "ready" if !searching => entries.sort_by(|l, r| {
+                readiness_tier(l)
+                    .cmp(&readiness_tier(r))
+                    .then_with(|| measured_then(l, r, Ordering::Less))
+                    .then_with(|| by_recency(l, r))
+            }),
+            "blocked" if !searching => {
+                let role = match group.key {
+                    "others" => involvement,
+                    "authored" => "authored",
+                    _ => "reviewing",
+                };
+                match role {
+                    "authored" => entries.sort_by(|l, r| {
+                        blocked_on_author_tier(l).cmp(&blocked_on_author_tier(r)).then_with(|| by_recency(l, r))
+                    }),
+                    "reviewing" => entries.sort_by(|l, r| {
+                        (l.state != State::Open).cmp(&(r.state != State::Open)).then_with(|| by_recency(l, r))
+                    }),
+                    _ => {}
+                }
+            }
+            "newest" | "oldest" => entries.sort_by(|l, r| {
+                r.created_ms
+                    .is_some()
+                    .cmp(&l.created_ms.is_some())
+                    .then_with(|| {
+                        let dated = l.created_ms.unwrap_or(0).cmp(&r.created_ms.unwrap_or(0));
+                        if sort == "newest" { dated.reverse() } else { dated }
+                    })
+                    .then_with(|| timestamp(r).cmp(&timestamp(l)))
+            }),
+            "largest" | "smallest" => entries.sort_by(|l, r| {
+                let order = if sort == "largest" { Ordering::Greater } else { Ordering::Less };
+                measured_then(l, r, order).then_with(|| timestamp(r).cmp(&timestamp(l)))
+            }),
+            _ => {}
+        }
+    }
+}
+
+/// `partitionPullRequestsWithPriority`: the dedicated authored and review-requested reads lead,
+/// in the main list's copy of a row where it has one; the main list's other rows follow in order.
+pub fn partition_with_priority(entries: Vec<Rc<Entry>>, authored: &[Rc<Entry>], reviewing: &[Rc<Entry>]) -> Vec<Group> {
+    let mut lead: [Vec<Rc<Entry>>; 2] = [authored.to_vec(), Vec::new()];
+    let authored_keys: HashSet<String> = authored.iter().map(|e| e.key()).collect();
+    lead[1] = reviewing.iter().filter(|e| !authored_keys.contains(&e.key())).cloned().collect();
+    let mut others = Vec::new();
+    for entry in entries {
+        let key = entry.key();
+        match lead.iter_mut().find_map(|group| group.iter_mut().find(|held| held.key() == key)) {
+            Some(held) => *held = entry,
+            None => others.push(entry),
+        }
+    }
+    let [mut authored, mut reviewing] = lead;
+    authored.sort_by(|l, r| by_recency(l, r));
+    reviewing.sort_by(|l, r| by_recency(l, r));
+    [
+        Group { key: "authored", label: "Authored", entries: authored },
+        Group { key: "reviewRequested", label: "Review requested", entries: reviewing },
+        Group { key: "others", label: "Others", entries: others },
+    ]
+    .into_iter()
+    .filter(|group| !group.entries.is_empty())
+    .collect()
+}
+
+/// A live re-read asks for every row already loaded again, in one page (`collapsedPage`).
+pub fn collapsed_page_size(page_size: u32, loaded: usize) -> u32 {
+    let loaded = u32::try_from(loaded).unwrap_or(u32::MAX);
+    page_size.max(loaded.div_ceil(PAGE_SIZE).saturating_mul(PAGE_SIZE)).min(MAX_PAGE_SIZE)
+}
+
+/// What the page asked for and how it reads the answer.
+pub struct View<'a> {
+    /// The listing's state, project and host: rows held from an earlier answer are narrowed to
+    /// them while the new read travels (`narrowPullRequestsToFilters`).
+    pub state: &'a str,
+    pub project: Option<&'a str>,
+    pub host: Option<&'a str>,
+    /// The server the list is narrowed to.
+    pub environment: Option<&'a str>,
+    pub involvement: &'a str,
+    pub sort: &'a str,
+    /// Menu filters plus the qualifiers typed so far.
+    pub local_filters: &'a Filters,
+    /// The typed search text (qualifiers removed).
+    pub text: &'a str,
+    /// The host has answered the typed text: rows from hosts that search on the host stay even
+    /// when nothing they show matches.
+    pub answered_locally: bool,
+    /// The dedicated authored and review-requested reads for this scope, when the list shows
+    /// every involvement and nothing is typed.
+    pub partitions: Option<PartitionRows<'a>>,
+}
+
+/// The rows of the dedicated authored and review-requested reads.
+#[derive(Clone, Copy)]
+pub struct PartitionRows<'a> {
+    pub authored: &'a [Rc<Entry>],
+    pub reviewing: &'a [Rc<Entry>],
+}
+
+/// `pullRequestGroups` + `usePullRequestDisplayGroups`: the rows narrowed to what the reader
+/// asked for, grouped, and sorted.
+pub fn display_groups(list: &ListResult, view: &View, stats: &Stats) -> Vec<Group> {
+    let searching_hosts: Vec<&str> =
+        list.providers.iter().filter(|p| p.searches_on_host).map(|p| p.host.as_str()).collect();
+    let in_scope = |entry: &&Rc<Entry>| {
+        (view.state == "all" || entry.state.as_str() == view.state)
+            && view.project.is_none_or(|project| entry.project_id == project)
+            && view.host.is_none_or(|host| entry.host == host)
+            && view.environment.is_none_or(|environment| entry.environment_id == environment)
+            && (view.local_filters.is_empty()
+                || matches_filters(entry, view.local_filters, viewer_for(entry, &list.viewers)))
+    };
+    let mut entries: Vec<Rc<Entry>> = list
+        .entries
+        .iter()
+        .filter(|entry| {
+            (view.state == "all" || entry.state.as_str() == view.state)
+                && view.project.is_none_or(|project| entry.project_id == project)
+                && view.host.is_none_or(|host| entry.host == host)
+                && view.environment.is_none_or(|environment| entry.environment_id == environment)
+        })
+        .filter(|entry| match view.involvement {
+            "reviewing" => entry.viewer_review_requested,
+            "authored" => authored_by_viewer(entry, &list.viewers),
+            _ => true,
+        })
+        .filter(|entry| {
+            view.local_filters.is_empty()
+                || matches_filters(entry, view.local_filters, viewer_for(entry, &list.viewers))
+        })
+        .filter(|entry| {
+            view.text.is_empty()
+                || (view.answered_locally && searching_hosts.contains(&entry.host.as_str()))
+                || matches_query(entry, view.text)
+        })
+        .cloned()
+        .collect();
+    if view.text.is_empty() {
+        entries.sort_by(|l, r| by_recency(l, r));
+    }
+    let mut groups = if view.involvement == "all" {
+        match view.partitions.filter(|_| view.text.is_empty()) {
+            Some(rows) => {
+                let narrow = |rows: &[Rc<Entry>]| rows.iter().filter(in_scope).cloned().collect::<Vec<_>>();
+                partition_with_priority(entries, &narrow(rows.authored), &narrow(rows.reviewing))
+            }
+            None => group_by_involvement(entries, &list.viewers),
+        }
+    } else {
+        vec![Group { key: "others", label: "", entries }]
+    };
+    sort_groups(&mut groups, view.sort, view.text, view.involvement, stats);
+    groups
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuthorFacet {
+    pub login: String,
+    pub count: usize,
+    /// How many of the loaded rows it merged.
+    pub merged: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LabelFacet {
+    pub name: String,
+    pub color: Option<String>,
+    pub count: usize,
+}
+
+/// How many loaded matches lead the picker before the host's answers (`HOSTED_CHOICE_ROOM`).
+const HOSTED_CHOICE_ROOM: usize = 15;
+
+/// `pullRequestAuthorChoices`: loaded authors matching the search, then the host's answers.
+pub fn author_choices(facets: &[AuthorFacet], hosted: &[String], query: &str) -> Vec<AuthorFacet> {
+    let needle = normalize(query);
+    let loaded: Vec<AuthorFacet> = facets
+        .iter()
+        .filter(|f| needle.as_ref().is_none_or(|n| f.login.to_lowercase().contains(n.as_str())))
+        .cloned()
+        .collect();
+    let mut seen: Vec<String> = loaded.iter().filter_map(|f| normalize(&f.login)).collect();
+    let mut added = Vec::new();
+    for login in hosted {
+        let Some(key) = normalize(login) else { continue };
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key.clone());
+        let known = facets.iter().find(|f| normalize(&f.login).as_ref() == Some(&key)).cloned();
+        added.push(known.unwrap_or(AuthorFacet { login: login.clone(), count: 0, merged: 0 }));
+    }
+    let room = loaded.len().min(HOSTED_CHOICE_ROOM);
+    let mut choices: Vec<AuthorFacet> = loaded[..room].to_vec();
+    choices.extend(added);
+    choices.extend(loaded[room..].iter().cloned());
+    choices
+}
+
+/// `pullRequestLabelChoices`: loaded labels matching the search, then the host's answers.
+pub fn label_choices(facets: &[LabelFacet], hosted: &[(String, Option<String>)], query: &str) -> Vec<LabelFacet> {
+    let needle = normalize(query);
+    let mut choices: Vec<LabelFacet> = facets
+        .iter()
+        .filter(|f| needle.as_ref().is_none_or(|n| f.name.to_lowercase().contains(n.as_str())))
+        .cloned()
+        .collect();
+    let mut seen: Vec<String> = choices.iter().filter_map(|f| normalize(&f.name)).collect();
+    for (name, color) in hosted {
+        let Some(key) = normalize(name) else { continue };
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key.clone());
+        let known = facets.iter().find(|f| normalize(&f.name).as_ref() == Some(&key)).cloned();
+        choices.push(known.unwrap_or(LabelFacet { name: name.clone(), color: color.clone(), count: 0 }));
+    }
+    choices
+}
+
+/// `collectPullRequestListFacets`: who wrote the loaded rows and which labels they carry.
+pub fn facets(entries: &[Rc<Entry>], state: &str) -> (Vec<AuthorFacet>, Vec<LabelFacet>) {
+    let mut authors: Vec<(String, AuthorFacet, usize)> = Vec::new();
+    let mut labels: Vec<(String, LabelFacet)> = Vec::new();
+    for entry in entries {
+        let in_state = state == "all" || entry.state.as_str() == state;
+        if let Some(author) = &entry.author
+            && let Some(key) = normalize(&author.login)
+        {
+            match authors.iter_mut().find(|(k, ..)| *k == key) {
+                Some((_, facet, merged)) => {
+                    facet.count += usize::from(in_state);
+                    *merged += usize::from(entry.state == State::Merged);
+                }
+                None => authors.push((
+                    key,
+                    AuthorFacet { login: author.login.clone(), count: usize::from(in_state), merged: 0 },
+                    usize::from(entry.state == State::Merged),
+                )),
+            }
+        }
+        if !in_state {
+            continue;
+        }
+        for label in &entry.labels {
+            let Some(key) = normalize(&label.name) else { continue };
+            match labels.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, facet)) => facet.count += 1,
+                None => {
+                    labels.push((key, LabelFacet { name: label.name.clone(), color: label.color.clone(), count: 1 }));
+                }
+            }
+        }
+    }
+    authors.retain(|(_, facet, _)| facet.count > 0);
+    authors
+        .sort_by(|(_, l, lm), (_, r, rm)| rm.cmp(lm).then(r.count.cmp(&l.count)).then_with(|| l.login.cmp(&r.login)));
+    labels.sort_by(|(_, l), (_, r)| r.count.cmp(&l.count).then_with(|| l.name.cmp(&r.name)));
+    let authors = authors.into_iter().map(|(_, facet, merged)| AuthorFacet { merged, ..facet }).collect();
+    (authors, labels.into_iter().map(|(_, f)| f).collect())
+}
+
+/// `pullRequestLabelColor`: a six-digit hex color, else none.
+pub fn label_color(color: Option<&str>) -> Option<u32> {
+    let hex = color?.trim().trim_start_matches('#');
+    (hex.len() == 6).then(|| u32::from_str_radix(hex, 16).ok()).flatten()
+}
+
+/// Appends a continuation's rows the list does not hold yet, newest first and ranked by the
+/// search, after the rows already shown (a continuation never reorders what was read).
+pub fn append_page(held: &mut ListResult, mut next: ListResult, query: &str) {
+    let held_keys: HashSet<String> = held.entries.iter().map(|entry| entry.key()).collect();
+    let mut arrived: Vec<Rc<Entry>> =
+        next.entries.drain(..).filter(|entry| !held_keys.contains(&entry.key())).collect();
+    arrived.sort_by(|l, r| by_recency(l, r));
+    rank_matches(&mut arrived, query);
+    held.entries.extend(arrived);
+    held.truncated = next.truncated;
+    held.next_cursors = next.next_cursors;
+    held.errors = next.errors;
+    held.providers = next.providers;
+    held.viewers.extend(next.viewers);
+}
+
+/// A project the pull request list can ask about, on its environment.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AssignableProject {
+    pub id: String,
+    pub environment_id: String,
+    /// `repositoryIdentity.canonicalKey`; projects without one are always asked on their own machine.
+    pub repository: Option<String>,
+}
+
+/// `assignProjectsToEnvironments`: a repository checked out on several machines is asked about
+/// once, on the preferred machine, else the earliest listed; other projects stay on their own.
+pub fn assign_projects(
+    projects: &[AssignableProject],
+    environment_ids: &[&str],
+    preferred: Option<&str>,
+) -> HashMap<String, Vec<String>> {
+    let rank = |environment: &str| environment_ids.iter().position(|id| *id == environment);
+    let key = |project: &AssignableProject| project.repository.as_ref().map(|k| k.to_lowercase());
+    let mut owner: HashMap<String, &str> = HashMap::new();
+    for project in projects {
+        let (Some(key), Some(project_rank)) = (key(project), rank(&project.environment_id)) else { continue };
+        match owner.get(&key) {
+            None => {
+                owner.insert(key, &project.environment_id);
+            }
+            Some(current) if Some(*current) == preferred => {}
+            Some(current) => {
+                if Some(project.environment_id.as_str()) == preferred
+                    || rank(current).is_none_or(|current_rank| project_rank < current_rank)
+                {
+                    owner.insert(key, &project.environment_id);
+                }
+            }
+        }
+    }
+    let mut assignment: HashMap<String, Vec<String>> = HashMap::new();
+    for project in projects {
+        if rank(&project.environment_id).is_none() {
+            continue;
+        }
+        if key(project).is_some_and(|key| owner.get(&key) != Some(&project.environment_id.as_str())) {
+            continue;
+        }
+        assignment.entry(project.environment_id.clone()).or_default().push(project.id.clone());
+    }
+    assignment
+}
+
+/// `mergePullRequestLists`: every machine's answer as one list, newest first. Continuation
+/// cursors stay apart, keyed by environment id, so each machine carries on from its own.
+pub fn merge_lists(answers: Vec<(String, ListResult)>) -> ListResult {
+    let mut merged = ListResult::default();
+    for (environment_id, answer) in answers {
+        for (host, login) in answer.viewers {
+            merged.viewers.insert(viewer_key(&environment_id, &host), login);
+        }
+        for provider in answer.providers {
+            match merged.providers.iter_mut().find(|held| held.host == provider.host) {
+                Some(held) => {
+                    if !held.configured && provider.configured {
+                        let searches_on_host = held.searches_on_host;
+                        *held = ProviderSummary { searches_on_host, ..provider.clone() };
+                    }
+                    held.searches_on_host &= provider.searches_on_host;
+                    held.configured |= provider.configured;
+                }
+                None => merged.providers.push(provider),
+            }
+        }
+        merged.entries.extend(answer.entries.into_iter().map(|mut entry| {
+            Rc::make_mut(&mut entry).environment_id.clone_from(&environment_id);
+            entry
+        }));
+        merged.errors.extend(answer.errors);
+        merged.truncated |= answer.truncated;
+        if !answer.next_cursors.is_empty() {
+            merged.next_cursors.insert(environment_id, Value::Object(answer.next_cursors));
+        }
+    }
+    merged.entries.sort_by(|l, r| by_recency(l, r));
+    merged
+}
+
+/// One machine's part of a merged list, as it last answered: a machine whose read fails keeps
+/// showing it, as the web's per-environment query keeps its previous success.
+pub fn held_answer(held: &ListResult, environment_id: &str) -> ListResult {
+    let prefix = format!("{environment_id} ");
+    let next_cursors = held.next_cursors.get(environment_id).and_then(Value::as_object).cloned().unwrap_or_default();
+    ListResult {
+        viewers: (held.viewers.iter())
+            .filter_map(|(key, login)| Some((key.strip_prefix(&prefix)?.to_owned(), login.clone())))
+            .collect(),
+        providers: held.providers.clone(),
+        entries: held.entries.iter().filter(|e| e.environment_id == environment_id).cloned().collect(),
+        errors: Vec::new(),
+        truncated: !next_cursors.is_empty(),
+        next_cursors,
+    }
+}
+
+/// The error text the web shows for a failed read (`formatEnvironmentQueryError`, which reads
+/// each tagged error's `message` getter).
+pub fn error_message(error: &RpcError) -> String {
+    let RpcError::Failure(value) = error else { return "The environment request failed.".into() };
+    let field = |key: &str| value.get(key).and_then(Value::as_str);
+    match field("_tag") {
+        Some("PullRequestOperationError") => format!(
+            "Pull request operation {} failed: {}",
+            field("operation").unwrap_or_default(),
+            field("detail").unwrap_or_default()
+        ),
+        Some("PullRequestUnavailableError") => match field("reason") {
+            Some("cli-missing") => {
+                field("requirement").unwrap_or("The tool this host is read through is not installed or set up.").into()
+            }
+            Some("cli-unauthenticated") => {
+                field("requirement").unwrap_or("This host has no working credentials.").into()
+            }
+            _ => "Change requests cannot be browsed for this project's host yet.".into(),
+        },
+        _ => field("message").or(field("detail")).unwrap_or("The environment request failed.").into(),
+    }
+}
+
+/// "Open on GitHub", from the provider kind (`openOnHostLabel`).
+pub fn open_on_host_label(provider: &str) -> &'static str {
+    match provider {
+        "github" => "Open on GitHub",
+        "gitlab" => "Open on GitLab",
+        "bitbucket" => "Open on Bitbucket",
+        "azure-devops" => "Open on Azure DevOps",
+        "cursor-origin" => "Open on Cursor Origin",
+        _ => "Open on host",
+    }
+}
+
+pub fn provider_name(kind: &str) -> &'static str {
+    match kind {
+        "github" => "GitHub",
+        "gitlab" => "GitLab",
+        "bitbucket" => "Bitbucket",
+        "azure-devops" => "Azure DevOps",
+        "cursor-origin" => "Cursor Origin",
+        _ => "Source control",
+    }
+}
+
+/// Resyncs one follow per connected environment (`connected` pairs each with its socket): a
+/// follow whose socket was replaced or whose environment left is dropped, and the indexes of
+/// the connected environments left without one are returned, to start.
+pub fn resync_follows<K: Eq + std::hash::Hash, S, T>(
+    follows: &mut HashMap<K, (S, T)>,
+    connected: &[(K, S)],
+    same_socket: impl Fn(&S, &S) -> bool,
+) -> Vec<usize> {
+    follows.retain(|id, (socket, _)| connected.iter().any(|(c, s)| c == id && same_socket(s, socket)));
+    (0..connected.len()).filter(|&i| !follows.contains_key(&connected[i].0)).collect()
+}
+
+/// `pullRequestHostActions`: what the row's host reported it can do, else what its kind can do
+/// when a server does not say (`changeRequestActionsWhenUnreported`).
+pub fn host_actions<'a>(providers: &'a [ProviderSummary], entry: &Entry) -> Vec<&'a str> {
+    let reported =
+        providers.iter().find(|p| p.host.eq_ignore_ascii_case(&entry.host)).and_then(|p| p.actions.as_deref());
+    match reported {
+        Some(actions) => actions.iter().map(String::as_str).collect(),
+        None if entry.provider == "github" => vec!["close", "merge", "ready", "reopen"],
+        None => Vec::new(),
+    }
+}
+
+/// The quick actions among a host kind's `changeRequestActions`, for a change request known only
+/// by its URL (`sourceControlClients.findByChangeRequestUrl`); an unknown host offers none.
+pub fn kind_actions(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "github" | "gitlab" | "azure-devops" | "gitcafe" => &["merge", "ready", "close", "reopen"],
+        "forgejo" => &["merge", "close", "reopen"],
+        "bitbucket" => &["merge", "close"],
+        _ => &[],
+    }
+}
+
+/// `pullRequestQuickActions`: the Shift quick actions a row in this state offers.
+pub fn quick_actions(entry: &Entry, host_actions: &[&str]) -> Vec<&'static str> {
+    let for_state: &[&'static str] = match (entry.state, entry.is_draft) {
+        (State::Merged | State::Unknown, _) => &[],
+        (State::Closed, _) => &["reopen"],
+        (State::Open, true) => &["close", "ready"],
+        (State::Open, false) => &["close", "merge"],
+    };
+    for_state.iter().copied().filter(|action| host_actions.contains(action)).collect()
+}
+
+/// `resolveSidebarSweepKeys`: the rows from the sweep's origin to its target, in list order,
+/// that the sweep may act on.
+pub fn sweep_keys(ordered: &[String], origin: &str, target: &str, can_apply: impl Fn(&str) -> bool) -> Vec<String> {
+    let (Some(from), Some(to)) =
+        (ordered.iter().position(|key| key == origin), ordered.iter().position(|key| key == target))
+    else {
+        return Vec::new();
+    };
+    ordered[from.min(to)..=from.max(to)].iter().filter(|key| can_apply(key)).cloned().collect()
+}
+
+/// The row a sweep points at (`onMove`): of the rows in list order with their tops, the last one
+/// starting at or above `y`, else the first.
+pub fn row_at<K>(rows: impl IntoIterator<Item = (K, f32)>, y: f32) -> Option<K> {
+    let mut found = None;
+    for (key, top) in rows {
+        if found.is_some() && top > y {
+            break;
+        }
+        found = Some(key);
+    }
+    found
+}
+
+/// `usePullRequestCloseBatch`'s toast: whether any close failed, its title, and up to three
+/// failures (`#number: reason`) as its description.
+pub fn close_batch_toast(total: usize, failures: &[String]) -> (bool, String, Option<String>) {
+    let closed = total - failures.len();
+    if failures.is_empty() {
+        let plural = if closed == 1 { "" } else { "s" };
+        return (false, format!("Closed {closed} pull request{plural}"), None);
+    }
+    let description = failures.iter().take(3).map(String::as_str).collect::<Vec<_>>().join("\n");
+    (true, format!("Closed {closed} of {total} pull requests"), Some(description))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_shared_repository_is_asked_once_on_the_preferred_machine() {
+        let project = |id: &str, env: &str, repo: Option<&str>| AssignableProject {
+            id: id.into(),
+            environment_id: env.into(),
+            repository: repo.map(Into::into),
+        };
+        let projects = [
+            project("a1", "a", Some("GitHub.com/x/repo")),
+            project("b1", "b", Some("github.com/x/repo")),
+            project("b2", "b", None),
+            project("c1", "c", Some("github.com/x/other")),
+        ];
+        let sorted = |mut ids: Vec<String>| {
+            ids.sort();
+            ids
+        };
+        let assignment = assign_projects(&projects, &["a", "b"], Some("b"));
+        assert_eq!(sorted(assignment["b"].clone()), ["b1", "b2"], "the preferred machine keeps the shared repo");
+        assert!(!assignment.contains_key("a"), "a has nothing left to ask");
+        assert!(!assignment.contains_key("c"), "machines not asked are left out");
+        let earliest = assign_projects(&projects, &["a", "b"], None);
+        assert_eq!((earliest["a"].clone(), earliest["b"].clone()), (vec!["a1".to_owned()], vec!["b2".to_owned()]));
+    }
+
+    #[test]
+    fn merged_lists_keep_each_machines_cursors_and_sort_newest_first() {
+        let answer = |entries: Vec<Rc<Entry>>, cursors: Value| ListResult {
+            entries,
+            next_cursors: cursors.as_object().cloned().unwrap_or_default(),
+            providers: vec![ProviderSummary {
+                host: "github.com".into(),
+                searches_on_host: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let merged = merge_lists(vec![
+            ("a".into(), answer(vec![entry(1, json!({}))], json!({"github.com": "c1"}))),
+            ("b".into(), answer(vec![entry(2, json!({}))], json!({}))),
+        ]);
+        assert_eq!(merged.entries.iter().map(|e| e.number).collect::<Vec<_>>(), [2, 1]);
+        assert_eq!(merged.entries.iter().map(|e| e.environment_id.as_str()).collect::<Vec<_>>(), ["b", "a"]);
+        assert_eq!(merged.next_cursors, *json!({"a": {"github.com": "c1"}}).as_object().unwrap());
+        assert_eq!(merged.providers.len(), 1);
+    }
+
+    #[test]
+    fn each_machine_keeps_its_own_viewer_for_a_shared_host() {
+        let answer = |environment: &str, login: &str| {
+            let row = entry(1, json!({"author": {"login": "bob"}}));
+            let viewers = HashMap::from([("github.com".to_owned(), login.to_owned())]);
+            (environment.to_owned(), ListResult { entries: vec![row], viewers, ..Default::default() })
+        };
+        let merged = merge_lists(vec![answer("a", "alice"), answer("b", "bob")]);
+        let on = |environment: &str| merged.entries.iter().find(|e| e.environment_id == environment).unwrap();
+        assert_eq!(viewer_for(on("a"), &merged.viewers), Some("alice"));
+        assert_eq!(viewer_for(on("b"), &merged.viewers), Some("bob"));
+        let groups = group_by_involvement(merged.entries.clone(), &merged.viewers);
+        let authored: Vec<&str> = groups[0].entries.iter().map(|e| e.environment_id.as_str()).collect();
+        assert_eq!((groups[0].key, authored), ("authored", vec!["b"]));
+        // An unmerged answer still names its viewers by bare host.
+        let single = HashMap::from([("github.com".to_owned(), "carol".to_owned())]);
+        assert_eq!(viewer_for(on("a"), &single), Some("carol"));
+    }
+
+    #[test]
+    fn a_failed_machine_keeps_its_last_answer_beside_fresh_ones() {
+        let answer = |environment: &str, number: u64, cursors: Value| {
+            let viewers = HashMap::from([("github.com".to_owned(), format!("{environment}-login"))]);
+            let next_cursors = cursors.as_object().cloned().unwrap_or_default();
+            let entries = vec![entry(number, json!({}))];
+            (environment.to_owned(), ListResult { viewers, entries, next_cursors, ..Default::default() })
+        };
+        let held = merge_lists(vec![answer("a", 1, json!({})), answer("b", 2, json!({"github.com": "c2"}))]);
+        let merged = merge_lists(vec![answer("a", 3, json!({})), ("b".into(), held_answer(&held, "b"))]);
+        let rows: Vec<(&str, u64)> = merged.entries.iter().map(|e| (e.environment_id.as_str(), e.number)).collect();
+        assert_eq!(rows, [("a", 3), ("b", 2)], "a's fresh rows replace its old ones; b keeps its own");
+        assert_eq!(merged.next_cursors, *json!({"b": {"github.com": "c2"}}).as_object().unwrap());
+        assert!(merged.truncated, "b can still continue");
+        let on_b = merged.entries.iter().find(|e| e.environment_id == "b").unwrap();
+        assert_eq!(viewer_for(on_b, &merged.viewers), Some("b-login"));
+    }
+
+    #[test]
+    fn one_pull_request_listed_by_two_machines_stays_two_rows() {
+        let answer = |environment: &str| {
+            (environment.to_owned(), ListResult { entries: vec![entry(1, json!({}))], ..Default::default() })
+        };
+        let merged = merge_lists(vec![answer("a"), answer("b")]);
+        let keys: HashSet<String> = merged.entries.iter().map(|e| e.key()).collect();
+        let stat_keys: HashSet<String> = merged.entries.iter().map(|e| e.stat_key()).collect();
+        assert_eq!((keys.len(), stat_keys.len()), (2, 2), "the same project id names a project per machine");
+    }
+
+    #[test]
+    fn quick_actions_follow_the_state_and_what_the_host_can_do() {
+        let reported = |host: &str, actions: Option<&[&str]>| ProviderSummary {
+            host: host.into(),
+            actions: actions.map(|a| a.iter().map(|s| (*s).to_owned()).collect()),
+            ..Default::default()
+        };
+        let open = entry(1, json!({}));
+        let quick =
+            |entry: &Entry, providers: &[ProviderSummary]| quick_actions(entry, &host_actions(providers, entry));
+        assert_eq!(quick(&open, &[]), ["close", "merge"], "GitHub's actions when the server does not say");
+        assert_eq!(quick(&open, &[reported("GitHub.com", Some(&["close"]))]), ["close"], "what the host reported");
+        assert!(quick(&open, &[reported("github.com", Some(&[]))]).is_empty());
+        assert_eq!(quick(&entry(2, json!({"isDraft": true})), &[]), ["close", "ready"]);
+        assert_eq!(quick(&entry(3, json!({"state": "closed"})), &[]), ["reopen"]);
+        assert!(quick(&entry(4, json!({"state": "merged"})), &[]).is_empty());
+        assert!(quick(&entry(5, json!({"provider": "gitlab", "host": "gitlab.com"})), &[]).is_empty(), "unreported");
+    }
+
+    #[test]
+    fn a_close_sweep_takes_the_closable_rows_between_its_ends() {
+        let ordered: Vec<String> = ["a", "b", "c", "d", "e"].map(str::to_owned).to_vec();
+        let closable = |key: &str| key != "c";
+        assert_eq!(sweep_keys(&ordered, "b", "e", closable), ["b", "d", "e"]);
+        assert_eq!(sweep_keys(&ordered, "d", "a", closable), ["a", "b", "d"], "upward sweeps keep list order");
+        assert_eq!(sweep_keys(&ordered, "b", "b", closable), ["b"]);
+        assert!(sweep_keys(&ordered, "gone", "a", closable).is_empty(), "a row the list dropped ends it");
+    }
+
+    #[test]
+    fn a_sweep_points_at_the_row_the_pointer_is_over() {
+        let rows = [("a", 0.), ("b", 50.), ("c", 100.)];
+        assert_eq!(row_at(rows, 75.), Some("b"));
+        assert_eq!(row_at(rows, 100.), Some("c"), "a row's top edge is on it");
+        assert_eq!(row_at(rows, 400.), Some("c"));
+        assert_eq!(row_at(rows, -10.), Some("a"), "above the first row is the first row");
+        assert_eq!(row_at(Vec::<(&str, f32)>::new(), 0.), None);
+    }
+
+    #[test]
+    fn a_close_batch_reports_how_many_closed() {
+        assert_eq!(close_batch_toast(1, &[]), (false, "Closed 1 pull request".to_owned(), None));
+        assert_eq!(close_batch_toast(3, &[]).1, "Closed 3 pull requests");
+        let failures: Vec<String> = (1..=4).map(|n| format!("#{n}: refused")).collect();
+        let (error, title, description) = close_batch_toast(5, &failures);
+        assert!(error);
+        assert_eq!(title, "Closed 1 of 5 pull requests");
+        assert_eq!(description.as_deref(), Some("#1: refused\n#2: refused\n#3: refused"));
+    }
+
+    #[test]
+    fn host_answers_join_the_loaded_facets_after_their_room() {
+        let author = |login: &str| AuthorFacet { login: login.into(), count: 1, merged: 0 };
+        let facets = vec![author("alice"), author("bob")];
+        let hosted = vec!["Alice".to_owned(), "carol".to_owned()];
+        let logins = |c: Vec<AuthorFacet>| c.into_iter().map(|f| f.login).collect::<Vec<_>>();
+        assert_eq!(logins(author_choices(&facets, &hosted, "")), ["alice", "bob", "carol"]);
+        assert_eq!(logins(author_choices(&facets, &["carol".to_owned()], "car")), ["carol"]);
+        let label = |name: &str| LabelFacet { name: name.into(), color: None, count: 2 };
+        let hosted = vec![("bug".to_owned(), Some("d73a4a".to_owned())), ("docs".to_owned(), None)];
+        let names: Vec<String> = label_choices(&[label("Bug")], &hosted, "").into_iter().map(|f| f.name).collect();
+        assert_eq!(names, ["Bug", "docs"]);
+    }
+
+    fn entry(number: u64, patch: Value) -> Rc<Entry> {
+        let mut value = json!({
+            "provider": "github", "host": "github.com", "projectId": "p1", "repository": "acme/app",
+            "number": number, "title": format!("PR {number}"), "url": format!("https://github.com/acme/app/pull/{number}"),
+            "author": {"login": "octo", "name": null, "avatarUrl": null}, "headBranch": "feature", "baseBranch": "main",
+            "state": "open", "isDraft": false, "mergeability": "mergeable", "additions": 0, "deletions": 0,
+            "createdAt": "2026-10-01T00:00:00.000Z", "updatedAt": format!("2026-10-{:02}T00:00:00.000Z", number),
+            "viewerReviewRequested": false, "labels": [],
+        });
+        if let (Value::Object(target), Value::Object(fields)) = (&mut value, patch) {
+            target.extend(fields);
+        }
+        let list: ListResult = serde_json::from_value(json!({"entries": [value]})).unwrap();
+        list.entries[0].clone()
+    }
+
+    fn numbers(group: &Group) -> Vec<u64> {
+        group.entries.iter().map(|e| e.number).collect()
+    }
+
+    #[test]
+    fn a_row_keeps_its_stack_membership() {
+        let row = entry(1, json!({"stack": {"number": 7, "position": 2, "size": 3, "base": "main"}}));
+        assert_eq!(row.stack, Some(StackMembership { number: 7, position: 2, size: 3 }));
+        assert_eq!(entry(2, json!({"stack": null})).stack, None);
+    }
+
+    #[test]
+    fn a_state_a_newer_server_adds_still_decodes() {
+        let state = |s: &str| serde_json::from_value::<State>(serde_json::Value::from(s)).unwrap();
+        assert_eq!([state("open"), state("merged"), state("queued")], [State::Open, State::Merged, State::Unknown]);
+    }
+
+    #[test]
+    fn parses_qualifiers_out_of_the_search_text() {
+        let (text, filters) = parse_query(
+            r#"fix crash label:bug,"needs review" -label:wip author:@me draft:true review:changes_requested checks:failure area:ui"#,
+        );
+        assert_eq!(text, "fix crash");
+        assert_eq!(filters.labels, vec![vec!["bug".to_string(), "needs review".into()], vec!["area:ui".into()]]);
+        assert_eq!(filters.excluded_labels, vec!["wip".to_string()]);
+        assert_eq!(filters.author.as_deref(), Some("@me"));
+        assert_eq!(filters.draft.as_deref(), Some("only"));
+        assert_eq!(filters.review.as_deref(), Some("changes-requested"));
+        assert_eq!(filters.checks.as_deref(), Some("failing"));
+        // Unknown values, negations that mean nothing, empty values and paths stay text.
+        let (text, filters) = parse_query("draft:maybe -author:me label: http:/x");
+        assert_eq!(text, "draft:maybe -author:me label: http:/x");
+        assert!(filters.is_empty());
+    }
+
+    #[test]
+    fn picking_a_draft_value_drops_the_typed_qualifier() {
+        assert_eq!(drop_draft_qualifier("crash draft:true label:bug"), "crash label:bug");
+    }
+
+    #[test]
+    fn filters_match_labels_authors_and_reviews() {
+        let row = entry(1, json!({"labels": [{"name": "Bug", "color": "d73a4a"}], "reviewDecision": "approved"}));
+        let parse = |q: &str| parse_query(q).1;
+        assert!(matches_filters(&row, &parse("label:bug,docs review:approved author:me"), Some("Octo")));
+        assert!(!matches_filters(&row, &parse("-label:bug"), None));
+        assert!(!matches_filters(&row, &parse("review:none"), None));
+        assert!(!matches_filters(&row, &parse("author:me"), Some("someone")));
+        assert!(matches_filters(&row, &parse("draft:false"), None));
+    }
+
+    #[test]
+    fn groups_by_involvement_and_sorts_by_merge_readiness() {
+        let viewers = HashMap::from([("github.com".to_string(), "octo".to_string())]);
+        let list = ListResult {
+            viewers,
+            entries: vec![
+                entry(1, json!({"author": {"login": "other"}})),
+                entry(2, json!({"author": {"login": "other"}, "viewerReviewRequested": true})),
+                entry(3, json!({"checksState": "passing", "reviewDecision": "approved"})),
+                entry(4, json!({"mergeability": "conflicting"})),
+                entry(5, json!({"checksState": "passing"})),
+            ],
+            ..ListResult::default()
+        };
+        let filters = Filters::default();
+        let view = View {
+            state: "open",
+            project: None,
+            host: None,
+            environment: None,
+            involvement: "all",
+            sort: "ready",
+            local_filters: &filters,
+            text: "",
+            answered_locally: false,
+            partitions: None,
+        };
+        let groups = display_groups(&list, &view, &Stats::new());
+        let keys: Vec<&str> = groups.iter().map(|g| g.key).collect();
+        assert_eq!(keys, ["authored", "reviewRequested", "others"]);
+        assert_eq!(numbers(&groups[0]), [3, 5, 4], "approved and passing, then passing, conflicts last");
+
+        let view = View { involvement: "reviewing", ..view };
+        let groups = display_groups(&list, &view, &Stats::new());
+        assert_eq!((groups.len(), groups[0].label, numbers(&groups[0])), (1, "", vec![2]));
+
+        // Rows held from an open listing leave as soon as the state filter moves to merged.
+        let view = View { involvement: "all", state: "merged", ..view };
+        assert!(display_groups(&list, &view, &Stats::new()).is_empty());
+    }
+
+    #[test]
+    fn dedicated_partitions_lead_with_rows_beyond_the_main_page() {
+        let viewers = HashMap::from([("github.com".to_string(), "octo".to_string())]);
+        let other = |n: u64, patch: Value| {
+            let mut fields = json!({"author": {"login": "other"}});
+            if let (Value::Object(target), Value::Object(patch)) = (&mut fields, patch) {
+                target.extend(patch);
+            }
+            entry(n, fields)
+        };
+        let list = ListResult {
+            viewers,
+            entries: vec![other(1, json!({})), other(2, json!({"title": "main copy"}))],
+            ..ListResult::default()
+        };
+        // #3 is the viewer's but past the main page; #2 is both authored and review-requested.
+        let authored = vec![entry(3, json!({})), other(2, json!({}))];
+        let reviewing = vec![other(2, json!({})), other(4, json!({"labels": [{"name": "wip"}]}))];
+        let filters = Filters::default();
+        let view = View {
+            state: "open",
+            project: None,
+            host: None,
+            environment: None,
+            involvement: "all",
+            sort: "updated",
+            local_filters: &filters,
+            text: "",
+            answered_locally: false,
+            partitions: Some(PartitionRows { authored: &authored, reviewing: &reviewing }),
+        };
+        let groups = display_groups(&list, &view, &Stats::new());
+        let keys: Vec<&str> = groups.iter().map(|g| g.key).collect();
+        assert_eq!(keys, ["authored", "reviewRequested", "others"]);
+        assert_eq!((numbers(&groups[0]), numbers(&groups[1]), numbers(&groups[2])), (vec![3, 2], vec![4], vec![1]));
+        assert_eq!(groups[0].entries[1].title, "main copy", "the main list's copy of a row is shown");
+        // Menu filters narrow the partitions too, and typed text sets them aside.
+        let filters = Filters { excluded_labels: vec!["wip".into()], ..Filters::default() };
+        let narrowed = View { local_filters: &filters, ..view };
+        assert_eq!(display_groups(&list, &narrowed, &Stats::new()).len(), 2);
+        let typed = View { text: "PR", ..narrowed };
+        assert_eq!(display_groups(&list, &typed, &Stats::new()).iter().map(|g| g.key).collect::<Vec<_>>(), ["others"]);
+    }
+
+    #[test]
+    fn a_live_reread_asks_for_every_loaded_row() {
+        assert_eq!(collapsed_page_size(PAGE_SIZE, 0), PAGE_SIZE);
+        assert_eq!(collapsed_page_size(PAGE_SIZE, 150), 2 * PAGE_SIZE);
+        assert_eq!(collapsed_page_size(3 * PAGE_SIZE, 10), 3 * PAGE_SIZE);
+        assert_eq!(collapsed_page_size(PAGE_SIZE, 10_000), MAX_PAGE_SIZE);
+    }
+
+    #[test]
+    fn sorts_by_measured_size_and_creation() {
+        let mut stats = Stats::new();
+        let small = entry(1, json!({"additions": 3, "deletions": 1}));
+        let measured_later = entry(2, json!({}));
+        stats.insert(measured_later.stat_key(), (100, 50));
+        let unmeasured = entry(3, json!({}));
+        let mut groups = vec![Group { key: "others", label: "", entries: vec![small, measured_later, unmeasured] }];
+        sort_groups(&mut groups, "largest", "", "all", &stats);
+        assert_eq!(numbers(&groups[0]), [2, 1, 3], "unmeasured rows trail");
+        sort_groups(&mut groups, "smallest", "", "all", &stats);
+        assert_eq!(numbers(&groups[0]), [1, 2, 3]);
+
+        let older = entry(4, json!({"createdAt": "2026-01-01T00:00:00Z"}));
+        let newer = entry(5, json!({"createdAt": "2026-06-01T00:00:00Z"}));
+        let mut groups = vec![Group { key: "others", label: "", entries: vec![older, newer] }];
+        sort_groups(&mut groups, "newest", "", "all", &stats);
+        assert_eq!(numbers(&groups[0]), [5, 4]);
+        sort_groups(&mut groups, "oldest", "", "all", &stats);
+        assert_eq!(numbers(&groups[0]), [4, 5]);
+    }
+
+    #[test]
+    fn search_ranks_and_flags_description_matches() {
+        let crash = entry(1, json!({"title": "Fix crash on start"}));
+        let branch = entry(2, json!({"title": "Something", "headBranch": "crash-fix"}));
+        let body = entry(3, json!({"title": "Unrelated"}));
+        let mut rows = vec![body.clone(), branch, crash];
+        rank_matches(&mut rows, "crash");
+        assert_eq!(rows.iter().map(|e| e.number).collect::<Vec<_>>(), [1, 2, 3]);
+        assert!(matched_elsewhere(&body, "crash") && !matched_elsewhere(&rows[0], "crash"));
+        assert_eq!(score_match(&rows[0], "#1"), 100);
+        assert!(matches_query(&rows[1], "CRASH-fix") && !matches_query(&body, "crash"));
+    }
+
+    #[test]
+    fn a_continuation_appends_only_new_rows() {
+        let mut held = ListResult { entries: vec![entry(1, json!({})), entry(2, json!({}))], ..ListResult::default() };
+        let next = ListResult { entries: vec![entry(2, json!({})), entry(3, json!({}))], ..ListResult::default() };
+        append_page(&mut held, next, "");
+        assert_eq!(held.entries.iter().map(|e| e.number).collect::<Vec<_>>(), [1, 2, 3]);
+    }
+
+    #[test]
+    fn facets_count_authors_and_labels_in_state() {
+        let rows = vec![
+            entry(1, json!({"labels": [{"name": "bug", "color": null}]})),
+            entry(2, json!({"labels": [{"name": "Bug", "color": null}, {"name": "ui", "color": null}]})),
+            entry(
+                3,
+                json!({"state": "merged", "author": {"login": "merger"}, "labels": [{"name": "ui", "color": null}]}),
+            ),
+        ];
+        let (authors, labels) = facets(&rows, "open");
+        assert_eq!(authors.iter().map(|a| (a.login.as_str(), a.count)).collect::<Vec<_>>(), [("octo", 2)]);
+        assert_eq!(labels.iter().map(|l| (l.name.as_str(), l.count)).collect::<Vec<_>>(), [("bug", 2), ("ui", 1)]);
+    }
+
+    #[test]
+    fn reads_tagged_errors_like_their_message_getters() {
+        let failure = RpcError::Failure(
+            json!({"_tag": "PullRequestOperationError", "operation": "list", "detail": "gh timed out"}),
+        );
+        assert_eq!(error_message(&failure), "Pull request operation list failed: gh timed out");
+        let unavailable =
+            RpcError::Failure(json!({"_tag": "PullRequestUnavailableError", "reason": "cli-unauthenticated"}));
+        assert_eq!(error_message(&unavailable), "This host has no working credentials.");
+        assert_eq!(label_color(Some("#D73A4A")), Some(0xd73a4a));
+        assert_eq!(label_color(Some("red")), None);
+    }
+
+    #[test]
+    fn follows_restart_on_a_new_socket_and_stop_for_a_departed_environment() {
+        let mut follows: HashMap<&str, (u32, ())> = HashMap::from([("a", (1, ())), ("b", (2, ())), ("gone", (3, ()))]);
+        // `b` reconnected on socket 5; `c` is new; `gone` left.
+        let connected = [("a", 1), ("b", 5), ("c", 6)];
+        let start = resync_follows(&mut follows, &connected, |x, y| x == y);
+        assert_eq!(start, vec![1, 2]);
+        assert_eq!(follows.keys().copied().collect::<Vec<_>>(), vec!["a"]);
+        // Once started, the same sockets need nothing.
+        follows.extend(start.into_iter().map(|i| (connected[i].0, (connected[i].1, ()))));
+        assert!(resync_follows(&mut follows, &connected, |x, y| x == y).is_empty());
+    }
+}

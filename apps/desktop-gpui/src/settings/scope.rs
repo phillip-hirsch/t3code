@@ -1,0 +1,1411 @@
+//! Which environment or project a settings page applies to, where each value comes from,
+//! and the write a change becomes. Ports `settingsScope.ts`, `scopedSettings.ts`,
+//! `SettingInheritance.tsx` and `resolveProjectSettings` (`packages/shared/src/projectSettings.ts`)
+//! over the connected environments. A project scope is a project group (checkouts grouped by
+//! repository, as Settings groups them, across environments): it reads each checkout and writes
+//! them all, each on its own environment. A checkout pick narrows a project to one of them.
+
+use std::collections::HashMap;
+
+use serde_json::{Map, Value, json};
+
+use super::{Settings, contract};
+use crate::model::T3ProjectFile;
+
+/// The scope picked in the scope sentence (`SettingsScopeSearch`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScopeSearch {
+    pub project: Option<String>,
+    pub machine: Option<String>,
+    /// One checkout of `project`, by its physical project key.
+    pub checkout: Option<String>,
+}
+
+impl ScopeSearch {
+    /// `selectEnvironmentAxis`: `None` is "All environments". Drops a checkout narrowing.
+    pub fn with_machine(&self, machine: Option<String>) -> Self {
+        Self { project: self.project.clone(), machine, checkout: None }
+    }
+
+    /// `selectProjectAxis`: `None` is "All projects". Drops a checkout narrowing.
+    pub fn with_project(&self, project: Option<String>) -> Self {
+        Self { project, machine: self.machine.clone(), checkout: None }
+    }
+}
+
+/// An environment the scope can select, the primary first.
+#[derive(Clone, Copy)]
+pub struct Environment<'a> {
+    pub id: &'a str,
+    pub label: &'a str,
+    /// `None` while disconnected.
+    pub settings: Option<&'a Settings>,
+}
+
+/// One checkout of a project group, as the scope layer needs it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Project {
+    pub id: String,
+    pub environment_id: String,
+    pub name: String,
+    /// The checkout's root, where its `t3.json` is read.
+    pub workspace_root: String,
+    /// The project's legacy `defaultModelSelection`, used until settings fold it.
+    pub legacy_model_selection: Option<Value>,
+    /// The project's legacy `defaultThreadEnvMode`, used until settings fold it.
+    pub legacy_thread_env_mode: Option<String>,
+}
+
+/// A project group (`SidebarProjectSnapshot`): its key, name and checkouts.
+#[derive(Clone, Debug)]
+pub struct Group {
+    pub key: String,
+    pub name: String,
+    pub members: Vec<Project>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScopeKind {
+    All,
+    Environment,
+    Project { members: Vec<Project> },
+    Unavailable { message: &'static str },
+}
+
+/// `ResolvedSettingsScope`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Scope {
+    pub kind: ScopeKind,
+    pub label: String,
+    /// The selected environments (`environmentIds`), in the order they were given.
+    pub environment_ids: Vec<String>,
+    /// `kind: "checkout"`: a project scope narrowed to one checkout, on this environment.
+    pub checkout_environment: Option<String>,
+}
+
+impl Scope {
+    /// A project, or one of its checkouts.
+    pub fn is_project(&self) -> bool {
+        matches!(self.kind, ScopeKind::Project { .. })
+    }
+}
+
+/// `resolveSettingsScope`. A stale selection reads as unavailable, never as "all".
+pub fn resolve(search: &ScopeSearch, groups: &[Group], environments: &[Environment]) -> Scope {
+    let unavailable = |message| Scope {
+        kind: ScopeKind::Unavailable { message },
+        label: "Unavailable selection".into(),
+        environment_ids: Vec::new(),
+        checkout_environment: None,
+    };
+    if search.checkout.is_some() && search.project.is_none() {
+        return unavailable("Select a project to choose one of its checkouts.");
+    }
+    let machine = match search.machine.as_deref() {
+        Some(id) => match environments.iter().find(|e| e.id == id) {
+            Some(environment) => Some(environment),
+            None => return unavailable("This environment is no longer available."),
+        },
+        None => None,
+    };
+    if let Some(key) = &search.project {
+        let Some(group) = groups.iter().find(|g| &g.key == key) else {
+            return unavailable("This project is no longer available.");
+        };
+        let checkout_key = |m: &Project| crate::project_groups::physical_key(&m.environment_id, &m.workspace_root);
+        let members: Vec<Project> = group
+            .members
+            .iter()
+            .filter(|m| machine.is_none_or(|e| e.id == m.environment_id))
+            .filter(|m| search.checkout.as_ref().is_none_or(|key| *key == checkout_key(m)))
+            .cloned()
+            .collect();
+        let Some(first) = members.first() else {
+            return unavailable(match search.checkout {
+                Some(_) => "This checkout is no longer available in the selected project and environment.",
+                None => "This project has no checkout on this environment.",
+            });
+        };
+        if search.checkout.is_some() {
+            let Some(environment) = environments.iter().find(|e| e.id == first.environment_id) else {
+                return unavailable("This checkout's environment is no longer available.");
+            };
+            let shares_environment = group
+                .members
+                .iter()
+                .any(|m| m.environment_id == first.environment_id && checkout_key(m) != checkout_key(first));
+            let root = if shares_environment { format!(" \u{b7} {}", first.workspace_root) } else { String::new() };
+            let environment_id = first.environment_id.clone();
+            return Scope {
+                label: format!("{} / {}{root}", group.name, environment.label),
+                kind: ScopeKind::Project { members },
+                environment_ids: vec![environment_id.clone()],
+                checkout_environment: Some(environment_id),
+            };
+        }
+        let mut environment_ids: Vec<String> = Vec::new();
+        for member in &members {
+            if !environment_ids.contains(&member.environment_id) {
+                environment_ids.push(member.environment_id.clone());
+            }
+        }
+        let place = machine.map_or("All checkouts", |e| e.label);
+        return Scope {
+            kind: ScopeKind::Project { members },
+            label: format!("{} / {place}", group.name),
+            environment_ids,
+            checkout_environment: None,
+        };
+    }
+    match machine {
+        Some(environment) => Scope {
+            kind: ScopeKind::Environment,
+            label: environment.label.to_owned(),
+            environment_ids: vec![environment.id.to_owned()],
+            checkout_environment: None,
+        },
+        None => Scope {
+            kind: ScopeKind::All,
+            label: "All environments".into(),
+            environment_ids: environments.iter().map(|e| e.id.to_owned()).collect(),
+            checkout_environment: None,
+        },
+    }
+}
+
+/// `selectSingleEnvironmentScope`: a page that edits one environment (Providers, Secrets)
+/// narrows "all" to the primary among the selected environments, else a connected one, else
+/// the first. `environments` lists the primary first.
+pub fn single_environment(search: &ScopeSearch, groups: &[Group], environments: &[Environment]) -> ScopeSearch {
+    let scope = resolve(search, groups, environments);
+    if search.machine.is_some() || matches!(scope.kind, ScopeKind::Unavailable { .. }) {
+        return search.clone();
+    }
+    let candidates: Vec<&Environment> =
+        environments.iter().filter(|e| scope.environment_ids.iter().any(|id| id == e.id)).collect();
+    let primary = environments.first().map(|e| e.id);
+    let selected = candidates
+        .iter()
+        .find(|e| Some(e.id) == primary)
+        .or_else(|| candidates.iter().find(|e| e.settings.is_some()))
+        .or(candidates.first());
+    selected.map_or_else(|| search.clone(), |e| ScopeSearch { machine: Some(e.id.to_owned()), ..search.clone() })
+}
+
+/// An environment as scope labels name it: `(id, label, address url)`.
+pub type Labeled<'a> = (&'a str, &'a str, Option<&'a str>);
+
+/// `settingsScopeEnvironmentAddress`: the address's host, else the id.
+pub fn environment_address(id: &str, url: Option<&str>) -> String {
+    match url {
+        Some(url) => url.split_once("://").map_or(url, |(_, rest)| rest.split('/').next().unwrap_or(rest)).to_owned(),
+        None => id.to_owned(),
+    }
+}
+
+/// `settingsScopeEnvironmentLabels`' secondary line: what tells `id` apart from another
+/// environment with its label, `None` when no other shares it.
+pub fn environment_secondary(id: &str, environments: &[Labeled]) -> Option<String> {
+    let &(_, label, url) = environments.iter().find(|e| e.0 == id)?;
+    let mine = environment_address(id, url);
+    let duplicates: Vec<_> = environments.iter().filter(|e| e.0 != id && e.1 == label).collect();
+    if duplicates.is_empty() {
+        return None;
+    }
+    let collides = duplicates.iter().any(|e| environment_address(e.0, e.2) == mine);
+    Some(if collides { url.unwrap_or(id).to_owned() } else { mine })
+}
+
+/// The environment a page reads and its environment-wide controls act on
+/// (`selectScopedSettingsEnvironments().environment`): the primary while it is selected and
+/// connected, else the first connected selected one, else the first selected (so a page on an
+/// offline machine still names that machine and acts nowhere else). `environments` lists the
+/// primary first.
+pub fn representative<'s>(scope: &'s Scope, environments: &[Environment]) -> Option<&'s str> {
+    let selected = |id: &&String| environments.iter().any(|e| e.id == id.as_str() && e.settings.is_some());
+    let primary = environments.first().map(|e| e.id);
+    let connected: Vec<&String> = scope.environment_ids.iter().filter(selected).collect();
+    connected
+        .iter()
+        .find(|id| Some(id.as_str()) == primary)
+        .or(connected.first())
+        .copied()
+        .or(scope.environment_ids.first())
+        .map(String::as_str)
+}
+
+/// The selected environments that are connected, in the given order (`connectedEnvironments`).
+fn connected<'s, 'env>(
+    scope: &'s Scope,
+    environments: &'s [Environment<'env>],
+) -> impl Iterator<Item = (&'s Environment<'env>, &'env Settings)> {
+    environments
+        .iter()
+        .filter(|e| scope.environment_ids.iter().any(|id| id == e.id))
+        .filter_map(|e| Some((e, e.settings?)))
+}
+
+/// Where a project-scoped value comes from (`ProjectSettingSource`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    Environment,
+    Project,
+    /// The repository's `t3.json`.
+    ProjectFile,
+}
+
+/// The settings one write target sees (`ScopedSettingsTarget`).
+#[derive(Clone, Debug)]
+pub struct Target {
+    pub environment_id: String,
+    pub project_id: Option<String>,
+    pub settings: Settings,
+    /// Project-scoped keys only; other keys always come from the environment.
+    pub sources: HashMap<String, Source>,
+}
+
+impl Target {
+    pub fn source(&self, key: &str) -> Source {
+        self.sources.get(key).copied().unwrap_or(Source::Environment)
+    }
+}
+
+/// `resolveScopedSettingsTargets`: one per connected environment, or per connected checkout at
+/// project scope. The first is the representative a row shows. `file` gives a checkout's
+/// `t3.json` once it has loaded; until then a checkout has no file tier.
+pub fn targets<'f>(
+    scope: &Scope,
+    environments: &[Environment],
+    file: impl Fn(&Project) -> Option<&'f T3ProjectFile>,
+) -> Vec<Target> {
+    match &scope.kind {
+        ScopeKind::Unavailable { .. } => Vec::new(),
+        ScopeKind::Project { members } => members
+            .iter()
+            .filter_map(|project| {
+                let environment = environments.iter().find(|e| e.id == project.environment_id)?;
+                Some(resolve_project_settings(environment.id, environment.settings?, Some(project), file(project)))
+            })
+            .collect(),
+        ScopeKind::All | ScopeKind::Environment => connected(scope, environments)
+            .map(|(environment, settings)| resolve_project_settings(environment.id, settings, None, None))
+            .collect(),
+    }
+}
+
+/// `resolveProjectSettings`: a project's overrides over the environment's settings, then for
+/// file-backed keys still unset, the checkout's `t3.json` (a missing or invalid file gives the
+/// built-in value). Overrides naming a provider instance the project disables are skipped, like
+/// the web; the web's text generation fallback for that case is not ported.
+pub fn resolve_project_settings(
+    environment_id: &str,
+    settings: &Settings,
+    project: Option<&Project>,
+    file: Option<&T3ProjectFile>,
+) -> Target {
+    let overrides = project_overrides(settings, project);
+    let mut effective = settings.clone();
+    let mut sources = HashMap::new();
+    for (key, value) in overrides {
+        sources.insert(key.clone(), Source::Project);
+        effective.set(key, value);
+    }
+    if let Some(file) = file {
+        for (key, built_in) in &contract().file_backed_built_ins {
+            if !effective.get(key).is_null() {
+                continue;
+            }
+            let (value, source) = match file.setting(key) {
+                Some(value) => (value.clone(), Source::ProjectFile),
+                None => (built_in.clone(), Source::Environment),
+            };
+            sources.insert(key.clone(), source);
+            effective.set(key.clone(), value);
+        }
+    }
+    Target {
+        environment_id: environment_id.to_owned(),
+        project_id: project.map(|p| p.id.clone()),
+        settings: effective,
+        sources,
+    }
+}
+
+/// One key of `resolve_project_settings`, without copying the whole document.
+pub fn resolve_project_setting(settings: &Settings, project: Option<&Project>, key: &str) -> Value {
+    project_overrides(settings, project).remove(key).unwrap_or_else(|| settings.get(key).clone())
+}
+
+/// The project-scoped values a project overrides.
+fn project_overrides(settings: &Settings, project: Option<&Project>) -> Map<String, Value> {
+    let project_id = project.map(|p| p.id.as_str());
+    let stored = project_id.and_then(|id| settings.get("projectSettingsOverrides").get(id)).and_then(Value::as_object);
+    let mut overrides = Map::new();
+    if let Some(project) = project.filter(|_| !settings.bool("projectSettingsFolded")) {
+        if let Some(model) = project.legacy_model_selection.as_ref().filter(|m| !m.is_null()) {
+            overrides.insert("defaultModelSelection".into(), model.clone());
+        }
+        if let Some(mode) = &project.legacy_thread_env_mode {
+            overrides.insert("defaultThreadEnvMode".into(), mode.as_str().into());
+        }
+    }
+    if let Some(stored) = stored {
+        overrides.extend(stored.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+    let mut resolved = Map::new();
+    for key in &contract().project_scoped_keys {
+        let Some(value) = overrides.remove(key) else { continue };
+        let enabled = |instance: &str| match key.as_str() {
+            "textGenerationModelSelection" => text_generation_selection_enabled(settings, project_id, instance),
+            _ => provider_instance_enabled(settings, project_id, instance),
+        };
+        let names_disabled_instance = matches!(key.as_str(), "textGenerationModelSelection" | "defaultModelSelection")
+            && value.get("instanceId").and_then(Value::as_str).is_some_and(|instance| !enabled(instance));
+        if !names_disabled_instance {
+            resolved.insert(key.clone(), value);
+        }
+    }
+    resolved
+}
+
+/// Drivers that start disabled (`DEFAULT_DISABLED_PROVIDER_DRIVERS`).
+const DEFAULT_DISABLED_DRIVERS: &[&str] = &["cursor", "grok", "fx", "kiro", "muse", "pi", "opencode", "antigravity"];
+
+/// `resolveProviderInstanceEnabled`: an explicit `false` on the instance or its config wins.
+pub fn instance_enabled(instance: &Value) -> bool {
+    let config_enabled = instance.pointer("/config/enabled").and_then(Value::as_bool);
+    let enabled = instance.get("enabled").and_then(Value::as_bool);
+    if enabled == Some(false) || config_enabled == Some(false) {
+        return false;
+    }
+    enabled.or(config_enabled).unwrap_or_else(|| {
+        !DEFAULT_DISABLED_DRIVERS.contains(&instance.get("driver").and_then(Value::as_str).unwrap_or_default())
+    })
+}
+
+/// A project's own `enabled` for a provider instance, `None` when it inherits.
+pub fn provider_instance_override(settings: &Settings, project_id: &str, instance: &str) -> Option<bool> {
+    settings
+        .get("projectSettingsOverrides")
+        .get(project_id)?
+        .get("providerInstances")?
+        .get(instance)?
+        .get("enabled")?
+        .as_bool()
+}
+
+/// `resolveProjectProviderInstanceEnabled`.
+pub fn provider_instance_enabled(settings: &Settings, project_id: Option<&str>, instance: &str) -> bool {
+    if let Some(enabled) = project_id.and_then(|id| provider_instance_override(settings, id, instance)) {
+        return enabled;
+    }
+    match settings.get("providerInstances").get(instance) {
+        Some(config) => instance_enabled(config),
+        // `isUnconfiguredDefaultInstanceEnabled`.
+        None => matches!(instance, "codex" | "claudeAgent"),
+    }
+}
+
+/// `resolveTextGenerationSelectionEnabled`: a text generator by that id decides, ahead of any
+/// provider instance.
+pub fn text_generation_selection_enabled(settings: &Settings, project_id: Option<&str>, instance: &str) -> bool {
+    match settings.get("textGenerators").get(instance) {
+        Some(generator) => generator.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+        None => provider_instance_enabled(settings, project_id, instance),
+    }
+}
+
+/// `buildProviderInstanceOverridePatch`: sets (or with `None` clears) each project's `enabled`
+/// for `instance`, keeping its other overrides. Always sends `providerInstances`, since an
+/// omitted map keeps the stored one.
+pub fn provider_override_patch(
+    settings: &Settings,
+    project_ids: &[String],
+    instance: &str,
+    value: Option<bool>,
+) -> Map<String, Value> {
+    let entries = project_ids.iter().map(|id| {
+        let mut rest =
+            settings.get("projectSettingsOverrides").get(id).and_then(Value::as_object).cloned().unwrap_or_default();
+        let mut instances = match rest.remove("providerInstances") {
+            Some(Value::Object(instances)) => instances,
+            _ => Map::new(),
+        };
+        let mut entry = match instances.remove(instance) {
+            Some(Value::Object(entry)) => entry,
+            _ => Map::new(),
+        };
+        match value {
+            Some(enabled) => entry.insert("enabled".into(), enabled.into()),
+            None => entry.remove("enabled"),
+        };
+        if !entry.is_empty() {
+            instances.insert(instance.to_owned(), Value::Object(entry));
+        }
+        let next = if rest.is_empty() && instances.is_empty() {
+            Value::Null
+        } else {
+            rest.insert("providerInstances".into(), Value::Object(instances));
+            Value::Object(rest)
+        };
+        (id.clone(), next)
+    });
+    single("projectSettingsOverrides", Value::Object(entries.collect()))
+}
+
+/// `scopedSettingsAreMixed`: the targets disagree on any of `keys`.
+pub fn are_mixed(targets: &[Target], keys: &[&str]) -> bool {
+    let Some(first) = targets.first() else { return false };
+    targets.iter().any(|target| keys.iter().any(|key| target.settings.get(key) != first.settings.get(key)))
+}
+
+/// Where a row's value comes from across targets (`ScopedSettingSource`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowSource {
+    Environment,
+    Project,
+    ProjectFile,
+    Mixed,
+}
+
+/// `scopedSettingsSource`.
+pub fn row_source(targets: &[Target], keys: &[&str]) -> RowSource {
+    let scoped: Vec<&str> = keys.iter().copied().filter(|k| contract().is_project_scoped(k)).collect();
+    let mut sources = targets.iter().flat_map(|t| scoped.iter().map(|k| t.source(k)));
+    let Some(first) = sources.next() else { return RowSource::Environment };
+    if sources.any(|source| source != first) {
+        return RowSource::Mixed;
+    }
+    match first {
+        Source::Environment => RowSource::Environment,
+        Source::Project => RowSource::Project,
+        Source::ProjectFile => RowSource::ProjectFile,
+    }
+}
+
+/// The marker beside a row's title (`SettingInheritanceState`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InheritanceState {
+    Default,
+    Environment,
+    Inherited,
+    Overridden,
+    Mixed,
+}
+
+/// The inheritance state and tooltip of a server-scoped row, as `SettingsRow` derives them.
+pub fn row_inheritance(
+    scope: &Scope,
+    targets: &[Target],
+    environment: &Environment,
+    keys: &[&str],
+) -> (InheritanceState, String) {
+    let project_scope = scope.is_project();
+    let has_scoped = keys.iter().any(|k| contract().is_project_scoped(k));
+    let source = project_scope.then(|| row_source(targets, keys));
+    let customized = environment
+        .settings
+        .is_some_and(|env| !targets.is_empty() && keys.iter().any(|k| env.get(k) != contract().default_value(k)));
+    if are_mixed(targets, keys) {
+        (InheritanceState::Mixed, "Mixed across selected environments".into())
+    } else if source == Some(RowSource::Project) {
+        (InheritanceState::Overridden, "Overridden for this project".into())
+    } else if source == Some(RowSource::ProjectFile) {
+        (InheritanceState::Inherited, "Inherited from the repository's t3.json".into())
+    } else if source == Some(RowSource::Environment) && has_scoped {
+        (InheritanceState::Inherited, format!("Inherited from {}", environment.label))
+    } else if customized {
+        (InheritanceState::Environment, "Set on the environment".into())
+    } else {
+        (InheritanceState::Default, "Built-in default".into())
+    }
+}
+
+/// One row of the "where this value comes from" popover.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Layer {
+    pub label: String,
+    pub value: String,
+    pub effective: bool,
+    pub set: bool,
+}
+
+/// `settingInheritanceLayers`: project, environment, `t3.json`, then the built-in default.
+pub fn inheritance_layers(target: &Target, environment_settings: &Settings, key: &str) -> Vec<Layer> {
+    let contract = contract();
+    let scoped = contract.is_project_scoped(key);
+    let source = if scoped { target.source(key) } else { Source::Environment };
+    let environment_value = environment_settings.get(key);
+    let environment_set = environment_value != contract.default_value(key);
+    let file_backed = contract.file_backed_built_ins.get(key);
+    let mut layers = Vec::new();
+    if target.project_id.is_some() && scoped {
+        let set = source == Source::Project;
+        let value = if set { format_value(key, target.settings.get(key)) } else { "Inherits".into() };
+        layers.push(Layer { label: "Project".into(), value, effective: set, set });
+    }
+    layers.push(Layer {
+        label: "Environment".into(),
+        value: if environment_set { format_value(key, environment_value) } else { "Inherits".into() },
+        effective: source == Source::Environment && environment_set,
+        set: environment_set,
+    });
+    if file_backed.is_some() && target.project_id.is_some() {
+        let set = source == Source::ProjectFile;
+        let value = if set { format_value(key, target.settings.get(key)) } else { "Inherits".into() };
+        layers.push(Layer { label: "t3.json".into(), value, effective: set, set });
+    }
+    layers.push(Layer {
+        label: "Default".into(),
+        value: format_value(key, file_backed.unwrap_or_else(|| contract.default_value(key))),
+        effective: source == Source::Environment && !environment_set,
+        set: true,
+    });
+    layers
+}
+
+/// `formatValue` in `SettingInheritance.tsx`.
+pub fn format_value(key: &str, value: &Value) -> String {
+    match value {
+        Value::Null => match key {
+            "pullRequestMergeMethod" => "Last selected",
+            "sidebarAutoSettleAfterDays" => "Never",
+            "defaultModelSelection" => "Automatic",
+            "sourceControlWriterModelSelection" => "Text generation model",
+            "reviewGuideModelSelection" => "Source control writer model",
+            "defaultThreadEnvMode" | "worktreeSubmodules" => "Inherit",
+            _ => "Not set",
+        }
+        .into(),
+        Value::Bool(on) => if *on { "On" } else { "Off" }.into(),
+        Value::Number(n) if key == "sidebarAutoSettleAfterDays" => {
+            format!("{n} {}", if n.as_f64() == Some(1.) { "day" } else { "days" })
+        }
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => match (key, s.as_str()) {
+            ("defaultThreadEnvMode", "worktree") => "New worktree".into(),
+            ("defaultThreadEnvMode", "local") => "Current checkout".into(),
+            ("worktreeSubmodules", "recursive") => "Recursive".into(),
+            ("worktreeSubmodules", "top-level") => "Top level only".into(),
+            ("worktreeSubmodules", "none") => "Skip".into(),
+            ("pullRequestMergeMethod", "merge") => "Merge".into(),
+            ("pullRequestMergeMethod", "squash") => "Squash and merge".into(),
+            ("pullRequestMergeMethod", "rebase") => "Rebase and merge".into(),
+            (_, "") => "Empty".into(),
+            _ => s.clone(),
+        },
+        Value::Array(items) => format!("{} {}", items.len(), if items.len() == 1 { "item" } else { "items" }),
+        Value::Object(object) => {
+            let text = |field: &str| object.get(field).and_then(Value::as_str);
+            if let (Some(profile), "backgroundActivity") = (text("profile"), key) {
+                return match profile {
+                    "balanced" => "Balanced",
+                    "performance" => "Performance",
+                    "battery-saver" => "Battery saver",
+                    "custom" => "Advanced",
+                    other => other,
+                }
+                .into();
+            }
+            if let Some(model) = text("model") {
+                return model.into();
+            }
+            match (key, text("mode")) {
+                ("worktreeCleanup", Some(mode)) => if mode == "off" { "Off" } else { "Custom" }.into(),
+                ("sourceControlWritingStyle", Some(mode)) => match mode {
+                    "repo_conventions" => "Repository conventions",
+                    "conventional_commits" => "Conventional Commits",
+                    "custom" => "Custom instructions",
+                    other => other,
+                }
+                .into(),
+                (_, Some(mode)) => mode.into(),
+                _ => "Custom".into(),
+            }
+        }
+    }
+}
+
+/// `listProjectOverrides`: projects that override any of `keys`.
+pub fn overriding_projects(settings: &Settings, keys: &[&str]) -> Vec<String> {
+    let scoped: Vec<&str> = keys.iter().copied().filter(|k| contract().is_project_scoped(k)).collect();
+    let Some(overrides) = settings.get("projectSettingsOverrides").as_object() else { return Vec::new() };
+    overrides
+        .iter()
+        .filter(|(_, entry)| scoped.iter().any(|key| entry.get(key).is_some()))
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// What a change writes: the device's part, and each environment's (`planScopedSettingsPatch`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Plan {
+    pub client_patch: Map<String, Value>,
+    pub server_writes: Vec<ServerWrite>,
+    /// Why nothing could be written, shown as "Setting not saved".
+    pub unavailable: Option<String>,
+}
+
+/// One environment's `server.updateSettings` (`ScopedServerWrite`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ServerWrite {
+    pub environment_id: String,
+    pub patch: Map<String, Value>,
+}
+
+/// The project-override writes for `members`, one per environment they live on.
+fn per_environment(
+    members: &[Project],
+    environments: &[Environment],
+    write: impl Fn(&Settings, &[&Project]) -> Map<String, Value>,
+) -> Vec<ServerWrite> {
+    let mut writes = Vec::new();
+    for environment in environments {
+        let ours: Vec<&Project> = members.iter().filter(|m| m.environment_id == environment.id).collect();
+        if let (Some(settings), false) = (environment.settings, ours.is_empty()) {
+            writes.push(ServerWrite { environment_id: environment.id.to_owned(), patch: write(settings, &ours) });
+        }
+    }
+    writes
+}
+
+/// Splits a unified patch into the device's keys and a write to each selected environment or
+/// to every checkout's overrides.
+pub fn plan_patch(scope: &Scope, environments: &[Environment], patch: &Map<String, Value>) -> Plan {
+    let contract = contract();
+    let client_patch: Map<String, Value> =
+        patch.iter().filter(|(k, _)| contract.is_client_key(k)).map(|(k, v)| (k.clone(), v.clone())).collect();
+    let server_patch: Map<String, Value> =
+        patch.iter().filter(|(k, _)| contract.is_server_key(k)).map(|(k, v)| (k.clone(), v.clone())).collect();
+    let unscopable = scope.is_project() && server_patch.keys().any(|k| !contract.is_project_scoped(k));
+    let writes = match &scope.kind {
+        _ if server_patch.is_empty() => Vec::new(),
+        ScopeKind::Project { members } if !unscopable => {
+            per_environment(members, environments, |settings, ours| override_patch(settings, ours, &server_patch))
+        }
+        ScopeKind::All | ScopeKind::Environment => connected(scope, environments)
+            .map(|(environment, settings)| ServerWrite {
+                environment_id: environment.id.to_owned(),
+                patch: for_destination(settings, server_patch.clone()),
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let unavailable = (client_patch.is_empty() && writes.is_empty() && !patch.is_empty()).then(|| match &scope.kind {
+        ScopeKind::Unavailable { message } => (*message).to_owned(),
+        _ if unscopable => "This setting is environment-wide and cannot be overridden by a project.".into(),
+        ScopeKind::Project { .. } => {
+            "Connect the selected checkouts, or update their environments, to save a project override.".into()
+        }
+        ScopeKind::Environment => format!("Connect {} to save this setting.", scope.label),
+        ScopeKind::All => "Connect an environment to save this setting.".into(),
+    });
+    Plan { client_patch, server_writes: writes, unavailable }
+}
+
+/// `planScopedSettingsClear`: removes every checkout's overrides of `keys`.
+pub fn plan_clear(scope: &Scope, environments: &[Environment], keys: &[&str]) -> Plan {
+    let writes = match &scope.kind {
+        ScopeKind::Project { members } => per_environment(members, environments, |settings, ours| {
+            let ids: Vec<&str> = ours.iter().map(|m| m.id.as_str()).collect();
+            clear_overrides_patch(settings, &ids, keys)
+        }),
+        _ => Vec::new(),
+    };
+    let unavailable = writes
+        .is_empty()
+        .then(|| "Connect the selected checkouts, or update their environments, to reset this override.".into());
+    Plan { client_patch: Map::new(), server_writes: writes, unavailable }
+}
+
+/// `planProjectOverridesClear`: removes the overrides of `keys` in each of `project_ids`, all on
+/// `environment`.
+pub fn plan_clear_projects(environment: &Environment, project_ids: &[&str], keys: &[&str]) -> Plan {
+    let writes: Vec<ServerWrite> = environment
+        .settings
+        .map(|settings| ServerWrite {
+            environment_id: environment.id.to_owned(),
+            patch: clear_overrides_patch(settings, project_ids, keys),
+        })
+        .into_iter()
+        .collect();
+    let unavailable = writes.is_empty().then(|| "Connect the environments to reset these overrides.".into());
+    Plan { client_patch: Map::new(), server_writes: writes, unavailable }
+}
+
+fn clear_overrides_patch(settings: &Settings, project_ids: &[&str], keys: &[&str]) -> Map<String, Value> {
+    let entries: Map<String, Value> = project_ids
+        .iter()
+        .map(|id| {
+            // `clearProjectSettingsOverrides`: null once nothing is left.
+            let next =
+                settings.get("projectSettingsOverrides").get(id).and_then(Value::as_object).and_then(|current| {
+                    let mut next = current.clone();
+                    for key in keys {
+                        next.remove(*key);
+                    }
+                    (!next.is_empty()).then_some(Value::Object(next))
+                });
+            ((*id).to_owned(), next.unwrap_or(Value::Null))
+        })
+        .collect();
+    single("projectSettingsOverrides", Value::Object(entries))
+}
+
+/// Each checkout's override entry with `patch` folded in, in one write (`projectOverrideWrites`).
+fn override_patch(settings: &Settings, members: &[&Project], patch: &Map<String, Value>) -> Map<String, Value> {
+    let entries = members.iter().map(|project| (project.id.clone(), override_entry(settings, project, patch)));
+    single("projectSettingsOverrides", Value::Object(entries.collect()))
+}
+
+/// The project's override entry with `patch` folded in. Entries store whole values, so a
+/// partial object patch is completed from the project's effective value.
+fn override_entry(settings: &Settings, project: &Project, patch: &Map<String, Value>) -> Value {
+    let contract = contract();
+    let mut next = settings
+        .get("projectSettingsOverrides")
+        .get(&project.id)
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    for (key, value) in patch {
+        let base = resolve_project_setting(settings, Some(project), key);
+        if key == "worktreeCleanup" && value.get("mode").and_then(Value::as_str) == Some("custom") {
+            let mut rules = worktree_cleanup_rules(settings, Some(project));
+            merge_into(&mut rules, value.get("rules"));
+            next.insert(key.clone(), json!({"mode": "custom", "rules": rules}));
+        } else if value.is_null() && !contract.nullable_override_keys.contains(key) {
+            next.remove(key);
+        } else if let (Some(value), Some(base)) = (value.as_object(), base.as_object()) {
+            let model_selection = matches!(
+                key.as_str(),
+                "defaultModelSelection"
+                    | "sourceControlWriterModelSelection"
+                    | "reviewGuideModelSelection"
+                    | "textGenerationModelSelection"
+            ) && (value.contains_key("instanceId") || value.contains_key("model"));
+            // A new model must not inherit the previous model's options.
+            let mut merged = if model_selection {
+                ["instanceId", "model"]
+                    .into_iter()
+                    .filter_map(|field| Some((field.to_owned(), base.get(field)?.clone())))
+                    .collect()
+            } else {
+                base.clone()
+            };
+            merged.extend(value.iter().map(|(k, v)| (k.clone(), v.clone())));
+            next.insert(key.clone(), Value::Object(merged));
+        } else {
+            next.insert(key.clone(), value.clone());
+        }
+    }
+    Value::Object(next)
+}
+
+/// Environment writes, in the form the destination reads: the idle compaction mode by the
+/// server's version, and storage cleanup's worktree rules mirrored into a custom
+/// `worktreeCleanup` while one is set (`forDestination` and its caller).
+fn for_destination(previous: &Settings, mut patch: Map<String, Value>) -> Map<String, Value> {
+    let worktree_rules = patch
+        .get("storageCleanup")
+        .and_then(Value::as_object)
+        .map(|cleanup| {
+            cleanup
+                .iter()
+                .filter(|(k, _)| k.starts_with("worktree"))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<Map<_, _>>()
+        })
+        .filter(|rules| !rules.is_empty());
+    if let Some(rules) = worktree_rules.filter(|_| !previous.get("worktreeCleanup").is_null()) {
+        let mut merged = worktree_cleanup_rules(previous, None);
+        merge_into(&mut merged, Some(&Value::Object(rules)));
+        patch.insert("worktreeCleanup".into(), json!({"mode": "custom", "rules": merged}));
+    }
+    if let Some(mode) = patch.remove("idleCompaction") {
+        patch.remove("compactIdleThreads");
+        let has_modes = previous.as_map().contains_key("idleCompaction");
+        if has_modes {
+            patch.insert("idleCompaction".into(), mode);
+        } else if previous.get("compactIdleThreads").is_string() {
+            patch.insert("compactIdleThreads".into(), mode);
+        } else {
+            patch.insert("compactIdleThreads".into(), (mode == "beforeCacheExpires").into());
+        }
+    }
+    patch
+}
+
+/// `resolveWorktreeCleanup`: the worktree rules a project's cleanup mode resolves to.
+pub fn worktree_cleanup_rules(settings: &Settings, project: Option<&Project>) -> Map<String, Value> {
+    const RULES: [&str; 6] = [
+        "worktreeKeepWhen",
+        "worktreeAfterDays",
+        "worktreeSettledAfterDays",
+        "worktreeOnMerge",
+        "worktreeOnDelete",
+        "worktreeUnchanged",
+    ];
+    let policy = resolve_project_setting(settings, project, "worktreeCleanup");
+    let storage = settings.get("storageCleanup");
+    match policy.get("mode").and_then(Value::as_str) {
+        Some("custom") => policy.get("rules").and_then(Value::as_object).cloned().unwrap_or_default(),
+        Some("off") => {
+            let mut rules: Map<String, Value> = RULES[1..].iter().map(|k| ((*k).to_owned(), Value::Null)).collect();
+            rules.insert("worktreeKeepWhen".into(), storage["worktreeKeepWhen"].clone());
+            for flag in ["worktreeOnMerge", "worktreeOnDelete", "worktreeUnchanged"] {
+                rules.insert(flag.into(), false.into());
+            }
+            rules
+        }
+        _ => RULES.iter().map(|k| ((*k).to_owned(), storage.get(*k).cloned().unwrap_or(Value::Null))).collect(),
+    }
+}
+
+fn merge_into(target: &mut Map<String, Value>, source: Option<&Value>) {
+    if let Some(source) = source.and_then(Value::as_object) {
+        target.extend(source.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+}
+
+fn single(key: &str, value: Value) -> Map<String, Value> {
+    Map::from_iter([(key.to_owned(), value)])
+}
+
+/// Keys of `patch` an older server silently dropped (`droppedSettingKeys`): the saved
+/// value still equals the previous one although the patch changed it.
+pub fn dropped_keys(patch: &Map<String, Value>, previous: &Settings, saved: &Settings) -> Vec<String> {
+    patch
+        .iter()
+        .filter(|(key, value)| was_dropped(value, previous.get(key), saved.get(key)))
+        .map(|(key, _)| key.clone())
+        .collect()
+}
+
+fn was_dropped(value: &Value, before: &Value, saved: &Value) -> bool {
+    match value {
+        Value::Null => !before.is_null() && saved == before,
+        Value::Object(fields) if !before.is_array() && !saved.is_array() => fields.iter().any(|(key, next)| {
+            was_dropped(next, before.get(key).unwrap_or(&Value::Null), saved.get(key).unwrap_or(&Value::Null))
+        }),
+        _ => {
+            let unchanged = match (value, before) {
+                (Value::String(value), Value::String(before)) => value.trim() == before,
+                _ => value == before,
+            };
+            !unchanged && saved == before
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn settings(patch: Value) -> Settings {
+        let mut settings = Settings::server_defaults();
+        settings.apply(patch.as_object().unwrap());
+        settings
+    }
+
+    fn project(id: &str) -> Project {
+        Project {
+            id: id.into(),
+            environment_id: "env-1".into(),
+            name: "Repo".into(),
+            workspace_root: format!("/{id}"),
+            legacy_model_selection: None,
+            legacy_thread_env_mode: None,
+        }
+    }
+
+    /// A group keyed by its first checkout's id.
+    fn group(ids: &[&str]) -> Group {
+        Group { key: ids[0].into(), name: "Repo".into(), members: ids.iter().map(|id| project(id)).collect() }
+    }
+
+    fn env(settings: &Settings) -> Environment<'_> {
+        Environment { id: "env-1", label: "Studio", settings: Some(settings) }
+    }
+
+    /// The only environment's write.
+    fn patch_of(plan: &Plan) -> Option<Map<String, Value>> {
+        assert!(plan.server_writes.len() <= 1, "one environment: {plan:?}");
+        plan.server_writes.first().map(|write| write.patch.clone())
+    }
+
+    fn search(project: Option<&str>, machine: Option<&str>) -> ScopeSearch {
+        ScopeSearch { project: project.map(Into::into), machine: machine.map(Into::into), checkout: None }
+    }
+
+    #[test]
+    fn single_environment_pages_pick_the_primary_then_a_connected_one() {
+        let s = settings(json!({}));
+        let primary = Environment { settings: None, ..env(&s) };
+        let laptop = Environment { id: "env-2", label: "Laptop", settings: Some(&s) };
+        let single = |search: &ScopeSearch, groups: &[Group], environments: &[Environment]| {
+            single_environment(search, groups, environments).machine
+        };
+        assert_eq!(single(&search(None, None), &[], &[primary, laptop]).as_deref(), Some("env-1"), "even offline");
+        assert_eq!(single(&search(None, Some("env-2")), &[], &[primary, laptop]).as_deref(), Some("env-2"));
+        let mut remote = group(&["p1"]);
+        remote.members[0].environment_id = "env-2".into();
+        let other = Environment { id: "env-3", label: "Cloud", settings: None };
+        let environments = [primary, other, laptop];
+        assert_eq!(single(&search(Some("p1"), None), &[remote], &environments).as_deref(), Some("env-2"));
+        assert_eq!(single(&search(Some("gone"), None), &[], &environments), None, "unavailable stays");
+        assert_eq!(single(&search(None, None), &[], &[]), None);
+    }
+
+    #[test]
+    fn pages_act_on_the_environment_their_scope_names() {
+        let s = settings(json!({}));
+        let primary = env(&s);
+        let laptop = Environment { id: "env-2", label: "Laptop", settings: Some(&s) };
+        let mut remote = group(&["p1"]);
+        remote.members[0].environment_id = "env-2".into();
+        let groups = [remote];
+        let page = |search: &ScopeSearch, environments: &[Environment]| {
+            let search = single_environment(search, &groups, environments);
+            let scope = resolve(&search, &groups, environments);
+            representative(&scope, environments).map(str::to_owned)
+        };
+        let (all, project) = (search(None, None), search(Some("p1"), None));
+        assert_eq!(page(&project, &[primary, laptop]).as_deref(), Some("env-2"), "the project's only machine");
+        assert_eq!(page(&all, &[primary, laptop]).as_deref(), Some("env-1"));
+        let offline = Environment { settings: None, ..primary };
+        assert_eq!(page(&all, &[offline, laptop]).as_deref(), Some("env-1"), "the named machine, though offline");
+        let all_scope = resolve(&all, &groups, &[offline, laptop]);
+        assert_eq!(representative(&all_scope, &[offline, laptop]), Some("env-2"), "a connected one on other pages");
+        assert_eq!(representative(&resolve(&all, &[], &[]), &[]), None);
+    }
+
+    #[test]
+    fn scope_resolves_each_axis_and_stale_ids_never_broaden() {
+        let s = Settings::server_defaults();
+        let (e, projects) = (env(&s), [group(&["p1"])]);
+        assert_eq!(resolve(&search(None, None), &projects, &[e]).kind, ScopeKind::All);
+        let environment = resolve(&search(None, Some("env-1")), &projects, &[e]);
+        assert_eq!((environment.kind, environment.label.as_str()), (ScopeKind::Environment, "Studio"));
+        assert_eq!(resolve(&search(Some("p1"), None), &projects, &[e]).label, "Repo / All checkouts");
+        assert_eq!(resolve(&search(Some("p1"), Some("env-1")), &projects, &[e]).label, "Repo / Studio");
+        assert!(matches!(resolve(&search(Some("gone"), None), &projects, &[e]).kind, ScopeKind::Unavailable { .. }));
+        assert!(matches!(resolve(&search(None, Some("other")), &projects, &[e]).kind, ScopeKind::Unavailable { .. }));
+        let picked = search(Some("p1"), Some("env-1"));
+        assert_eq!(picked.with_project(None), search(None, Some("env-1")));
+        assert_eq!(picked.with_machine(None), search(Some("p1"), None));
+    }
+
+    #[test]
+    fn a_checkout_narrows_a_project_to_one_member_and_either_axis_drops_it() {
+        let s = Settings::server_defaults();
+        let environments = [env(&s), Environment { id: "env-2", label: "Laptop", settings: Some(&s) }];
+        let mut remote = project("b");
+        remote.environment_id = "env-2".into();
+        let groups =
+            [Group { key: "a".into(), name: "Repo".into(), members: vec![project("a"), remote, project("c")] }];
+        let pick = |checkout: &str, machine: Option<&str>| ScopeSearch {
+            checkout: Some(checkout.into()),
+            ..search(Some("a"), machine)
+        };
+        let message = |scope: Scope| match scope.kind {
+            ScopeKind::Unavailable { message } => message,
+            other => panic!("expected an unavailable scope, got {other:?}"),
+        };
+
+        let laptop = resolve(&pick("env-2:/b", Some("env-2")), &groups, &environments);
+        assert_eq!(
+            (laptop.label.as_str(), laptop.environment_ids.as_slice()),
+            ("Repo / Laptop", ["env-2".to_owned()].as_slice())
+        );
+        assert_eq!(laptop.checkout_environment.as_deref(), Some("env-2"));
+        assert!(laptop.is_project());
+        assert!(matches!(&laptop.kind, ScopeKind::Project { members } if members.len() == 1 && members[0].id == "b"));
+        // Another checkout on its environment: the label names this one's root.
+        let studio = resolve(&pick("env-1:/a", None), &groups, &environments);
+        assert_eq!(studio.label, "Repo / Studio \u{b7} /a");
+        let plan = plan_patch(&studio, &environments, json!({"defaultRuntimeMode": "auto"}).as_object().unwrap());
+        assert_eq!(
+            plan.server_writes.iter().map(|w| Value::Object(w.patch.clone())).collect::<Vec<_>>(),
+            [json!({"projectSettingsOverrides": {"a": {"defaultRuntimeMode": "auto"}}})],
+            "only the picked checkout gets the override"
+        );
+        // A page on one environment keeps the narrowing while it fills in the machine.
+        let single = single_environment(&pick("env-2:/b", None), &groups, &environments);
+        assert_eq!((single.machine.as_deref(), single.checkout.as_deref()), (Some("env-2"), Some("env-2:/b")));
+
+        let checkout_only = ScopeSearch { checkout: Some("env-1:/a".into()), ..ScopeSearch::default() };
+        assert_eq!(
+            message(resolve(&checkout_only, &groups, &environments)),
+            "Select a project to choose one of its checkouts."
+        );
+        let gone = "This checkout is no longer available in the selected project and environment.";
+        assert_eq!(message(resolve(&pick("env-1:/gone", None), &groups, &environments)), gone);
+        assert_eq!(message(resolve(&pick("env-2:/b", Some("env-1")), &groups, &environments)), gone);
+        assert_eq!(
+            message(resolve(&pick("env-2:/b", None), &groups, &environments[..1])),
+            "This checkout's environment is no longer available."
+        );
+        let local_only = [group(&["p1"])];
+        assert_eq!(
+            message(resolve(&search(Some("p1"), Some("env-2")), &local_only, &environments)),
+            "This project has no checkout on this environment."
+        );
+
+        let picked = pick("env-2:/b", Some("env-2"));
+        assert_eq!(picked.with_machine(Some("env-1".into())), search(Some("a"), Some("env-1")));
+        assert_eq!(picked.with_project(Some("a".into())), search(Some("a"), Some("env-2")));
+    }
+
+    #[test]
+    fn project_overrides_win_and_record_their_source() {
+        let s = settings(json!({
+            "defaultThreadEnvMode": "local",
+            "projectSettingsOverrides": {"p1": {"defaultThreadEnvMode": "worktree"}},
+        }));
+        let target = resolve_project_settings("env-1", &s, Some(&project("p1")), None);
+        assert_eq!(target.settings.get("defaultThreadEnvMode"), "worktree");
+        assert_eq!(target.source("defaultThreadEnvMode"), Source::Project);
+        assert_eq!(target.source("defaultRuntimeMode"), Source::Environment);
+        let other = resolve_project_settings("env-1", &s, Some(&project("p2")), None);
+        assert_eq!(other.settings.get("defaultThreadEnvMode"), "local");
+        assert_eq!(resolve_project_setting(&s, Some(&project("p1")), "defaultThreadEnvMode"), "worktree");
+        assert_eq!(resolve_project_setting(&s, None, "defaultThreadEnvMode"), "local");
+    }
+
+    #[test]
+    fn a_checkouts_t3_json_backs_settings_neither_the_project_nor_environment_sets() {
+        let file = T3ProjectFile::parse(r#"{"defaultThreadEnvMode": "worktree"}"#);
+        let unset = settings(json!({}));
+        let target = resolve_project_settings("env-1", &unset, Some(&project("p1")), Some(&file));
+        assert_eq!(target.settings.get("defaultThreadEnvMode"), "worktree");
+        assert_eq!(target.source("defaultThreadEnvMode"), Source::ProjectFile);
+        assert_eq!(target.settings.get("worktreeSubmodules"), "recursive", "unset in the file: built in");
+        assert_eq!(target.source("worktreeSubmodules"), Source::Environment);
+
+        let set = settings(json!({"defaultThreadEnvMode": "local"}));
+        let target = resolve_project_settings("env-1", &set, Some(&project("p1")), Some(&file));
+        assert_eq!(target.settings.get("defaultThreadEnvMode"), "local", "the environment outranks the file");
+        assert_eq!(target.source("defaultThreadEnvMode"), Source::Environment);
+
+        let invalid = T3ProjectFile::parse(r#"{"defaultThreadEnvMode": "cloud"}"#);
+        assert_eq!(invalid, T3ProjectFile::Invalid);
+        let target = resolve_project_settings("env-1", &unset, Some(&project("p1")), Some(&invalid));
+        assert_eq!(target.settings.get("defaultThreadEnvMode"), "local", "an invalid file gives the built-in value");
+
+        let unloaded = resolve_project_settings("env-1", &unset, Some(&project("p1")), None);
+        assert!(unloaded.settings.get("defaultThreadEnvMode").is_null(), "no tier before the file loads");
+
+        let scope = Scope {
+            kind: ScopeKind::Project { members: vec![project("p1")] },
+            label: String::new(),
+            environment_ids: vec!["env-1".into()],
+            checkout_environment: None,
+        };
+        let t = targets(&scope, &[env(&unset)], |member| (member.workspace_root == "/p1").then_some(&file));
+        assert_eq!(row_source(&t, &["defaultThreadEnvMode"]), RowSource::ProjectFile);
+    }
+
+    #[test]
+    fn legacy_project_fields_apply_until_folded() {
+        let legacy = Project { legacy_thread_env_mode: Some("worktree".into()), ..project("p1") };
+        let unfolded =
+            resolve_project_settings("env-1", &settings(json!({"projectSettingsFolded": false})), Some(&legacy), None);
+        assert_eq!(unfolded.source("defaultThreadEnvMode"), Source::Project);
+        let folded =
+            resolve_project_settings("env-1", &settings(json!({"projectSettingsFolded": true})), Some(&legacy), None);
+        assert_eq!(folded.source("defaultThreadEnvMode"), Source::Environment);
+    }
+
+    #[test]
+    fn overrides_naming_a_disabled_provider_instance_are_skipped() {
+        let s = settings(json!({
+            "projectSettingsFolded": true,
+            "providerInstances": {"codex_2": {"enabled": false}},
+            "projectSettingsOverrides": {"p1": {"defaultModelSelection": {"instanceId": "codex_2", "model": "m"}}},
+        }));
+        let target = resolve_project_settings("env-1", &s, Some(&project("p1")), None);
+        assert_eq!(target.source("defaultModelSelection"), Source::Environment);
+
+        // A text generator names no provider instance; its own switch decides.
+        let generator = |enabled: bool| {
+            settings(json!({
+                "projectSettingsFolded": true,
+                "textGenerators": {"openrouter": {"kind": "openaiCompatible", "baseUrl": "https://openrouter.ai/api/v1", "enabled": enabled}},
+                "projectSettingsOverrides": {"p1": {"textGenerationModelSelection": {"instanceId": "openrouter", "model": "m"}}},
+            }))
+        };
+        let on = resolve_project_settings("env-1", &generator(true), Some(&project("p1")), None);
+        assert_eq!(on.source("textGenerationModelSelection"), Source::Project);
+        let off = resolve_project_settings("env-1", &generator(false), Some(&project("p1")), None);
+        assert_eq!(off.source("textGenerationModelSelection"), Source::Environment);
+    }
+
+    #[test]
+    fn provider_instances_resolve_like_the_contract() {
+        assert!(instance_enabled(&json!({"driver": "codex"})));
+        assert!(!instance_enabled(&json!({"driver": "grok"})));
+        assert!(instance_enabled(&json!({"driver": "grok", "config": {"enabled": true}})));
+        assert!(!instance_enabled(&json!({"driver": "codex", "enabled": true, "config": {"enabled": false}})));
+        let s = settings(json!({
+            "providerInstances": {"grok": {"driver": "grok"}, "codex_2": {"driver": "codex", "enabled": false}},
+            "projectSettingsOverrides": {"p1": {"providerInstances": {"codex_2": {"enabled": true}}}},
+        }));
+        assert!(provider_instance_enabled(&s, None, "codex"));
+        assert!(!provider_instance_enabled(&s, None, "cursor"));
+        assert!(!provider_instance_enabled(&s, None, "grok"));
+        assert!(!provider_instance_enabled(&s, Some("p2"), "codex_2"));
+        assert!(provider_instance_enabled(&s, Some("p1"), "codex_2"));
+        assert_eq!(provider_instance_override(&s, "p1", "codex_2"), Some(true));
+        assert_eq!(provider_instance_override(&s, "p1", "grok"), None);
+    }
+
+    #[test]
+    fn provider_overrides_set_and_clear_per_project() {
+        let s = settings(json!({"projectSettingsOverrides": {
+            "p1": {"defaultRuntimeMode": "full-access", "providerInstances": {"codex": {"enabled": true}}},
+            "p2": {"providerInstances": {"codex": {"enabled": true}}},
+        }}));
+        let ids = ["p1".to_owned(), "p2".to_owned(), "p3".to_owned()];
+        let set = provider_override_patch(&s, &ids, "grok", Some(false));
+        assert_eq!(
+            Value::Object(set),
+            json!({"projectSettingsOverrides": {
+                "p1": {"defaultRuntimeMode": "full-access", "providerInstances": {"codex": {"enabled": true}, "grok": {"enabled": false}}},
+                "p2": {"providerInstances": {"codex": {"enabled": true}, "grok": {"enabled": false}}},
+                "p3": {"providerInstances": {"grok": {"enabled": false}}},
+            }})
+        );
+        let cleared = provider_override_patch(&s, &ids, "codex", None);
+        assert_eq!(
+            Value::Object(cleared),
+            json!({"projectSettingsOverrides": {
+                "p1": {"defaultRuntimeMode": "full-access", "providerInstances": {}},
+                "p2": null,
+                "p3": null,
+            }})
+        );
+    }
+
+    #[test]
+    fn mixed_and_source_compare_every_target() {
+        let a = resolve_project_settings("env-1", &settings(json!({"defaultRuntimeMode": "a"})), None, None);
+        let mut b = a.clone();
+        b.settings.set("defaultRuntimeMode", "b".into());
+        b.sources.insert("defaultRuntimeMode".into(), Source::Project);
+        assert!(are_mixed(&[a.clone(), b.clone()], &["defaultRuntimeMode"]));
+        assert!(!are_mixed(&[a.clone(), a.clone()], &["defaultRuntimeMode"]));
+        assert_eq!(row_source(&[a.clone(), b.clone()], &["defaultRuntimeMode"]), RowSource::Mixed);
+        assert_eq!(row_source(&[b], &["defaultRuntimeMode"]), RowSource::Project);
+        // Keys a project cannot override always come from the environment.
+        assert_eq!(row_source(&[a], &["enableDeviceSupport"]), RowSource::Environment);
+    }
+
+    #[test]
+    fn row_inheritance_explains_the_winning_tier() {
+        let s = settings(json!({"projectSettingsOverrides": {"p1": {"defaultRuntimeMode": "approval-required"}}}));
+        let e = env(&s);
+        let projects = [group(&["p1"]), group(&["p2"])];
+        let state = |search: ScopeSearch, keys: &[&str]| {
+            let scope = resolve(&search, &projects, &[e]);
+            row_inheritance(&scope, &targets(&scope, &[e], |_| None), &e, keys).0
+        };
+        assert_eq!(state(search(Some("p1"), None), &["defaultRuntimeMode"]), InheritanceState::Overridden);
+        let (inherited, summary) = {
+            let scope = resolve(&search(Some("p2"), None), &projects, &[e]);
+            row_inheritance(&scope, &targets(&scope, &[e], |_| None), &e, &["defaultRuntimeMode"])
+        };
+        assert_eq!((inherited, summary.as_str()), (InheritanceState::Inherited, "Inherited from Studio"));
+        assert_eq!(state(search(None, None), &["defaultRuntimeMode"]), InheritanceState::Default);
+        let customized = settings(
+            json!({"enableDeviceSupport": !contract().default_value("enableDeviceSupport").as_bool().unwrap()}),
+        );
+        let e = env(&customized);
+        let scope = resolve(&search(None, None), &projects, &[e]);
+        let t = targets(&scope, &[e], |_| None);
+        assert_eq!(row_inheritance(&scope, &t, &e, &["enableDeviceSupport"]).0, InheritanceState::Environment);
+    }
+
+    #[test]
+    fn inheritance_layers_follow_resolution_order() {
+        let s = settings(json!({
+            "defaultThreadEnvMode": "worktree",
+            "projectSettingsOverrides": {"p1": {"defaultThreadEnvMode": "local"}},
+        }));
+        let overridden = resolve_project_settings("env-1", &s, Some(&project("p1")), None);
+        let layers = inheritance_layers(&overridden, &s, "defaultThreadEnvMode");
+        let summary: Vec<_> = layers.iter().map(|l| (l.label.as_str(), l.value.as_str(), l.effective)).collect();
+        assert_eq!(
+            summary,
+            [
+                ("Project", "Current checkout", true),
+                ("Environment", "New worktree", false),
+                ("t3.json", "Inherits", false),
+                ("Default", "Current checkout", false),
+            ]
+        );
+        let environment = resolve_project_settings("env-1", &Settings::server_defaults(), None, None);
+        let layers = inheritance_layers(&environment, &Settings::server_defaults(), "defaultRuntimeMode");
+        assert_eq!(
+            layers.iter().map(|l| (l.label.as_str(), l.effective)).collect::<Vec<_>>(),
+            [("Environment", false), ("Default", true)]
+        );
+    }
+
+    #[test]
+    fn patches_split_by_owner_and_scope() {
+        let s = Settings::server_defaults();
+        let e = env(&s);
+        let projects = [group(&["p1"])];
+        let patch = json!({"confirmThreadDelete": false, "defaultRuntimeMode": "full-access"});
+        let all = plan_patch(&resolve(&search(None, None), &projects, &[e]), &[e], patch.as_object().unwrap());
+        assert_eq!(all.client_patch, *json!({"confirmThreadDelete": false}).as_object().unwrap());
+        assert_eq!(patch_of(&all), json!({"defaultRuntimeMode": "full-access"}).as_object().cloned());
+
+        let scope = resolve(&search(Some("p1"), None), &projects, &[e]);
+        let project = plan_patch(&scope, &[e], json!({"defaultRuntimeMode": "full-access"}).as_object().unwrap());
+        assert_eq!(
+            patch_of(&project),
+            json!({"projectSettingsOverrides": {"p1": {"defaultRuntimeMode": "full-access"}}}).as_object().cloned()
+        );
+        let wide = plan_patch(&scope, &[e], json!({"enableDeviceSupport": true}).as_object().unwrap());
+        assert_eq!(patch_of(&wide), None);
+        assert_eq!(
+            wide.unavailable.as_deref(),
+            Some("This setting is environment-wide and cannot be overridden by a project.")
+        );
+        let offline = Environment { settings: None, ..env(&s) };
+        let disconnected = plan_patch(&scope, &[offline], json!({"defaultRuntimeMode": "x"}).as_object().unwrap());
+        assert!(disconnected.unavailable.is_some());
+    }
+
+    #[test]
+    fn project_overrides_complete_partial_objects_and_clear_to_null() {
+        let s = settings(json!({
+            "defaultModelSelection": {"instanceId": "codex", "model": "gpt", "options": [{"id": "effort"}]},
+            "projectSettingsOverrides": {"p1": {"defaultRuntimeMode": "full-access"}},
+        }));
+        let e = env(&s);
+        let projects = [group(&["p1"])];
+        let scope = resolve(&search(Some("p1"), None), &projects, &[e]);
+        let plan = plan_patch(&scope, &[e], json!({"defaultModelSelection": {"model": "o3"}}).as_object().unwrap());
+        assert_eq!(
+            patch_of(&plan).unwrap()["projectSettingsOverrides"]["p1"],
+            json!({"defaultRuntimeMode": "full-access", "defaultModelSelection": {"instanceId": "codex", "model": "o3"}})
+        );
+        let clear = plan_clear(&scope, &[e], &["defaultRuntimeMode"]);
+        assert_eq!(patch_of(&clear), json!({"projectSettingsOverrides": {"p1": null}}).as_object().cloned());
+        assert_eq!(overriding_projects(&s, &["defaultRuntimeMode"]), ["p1"]);
+        assert!(overriding_projects(&s, &["enableDeviceSupport"]).is_empty());
+
+        // An override this client has no page for (the web's per-project dictionary) survives writes.
+        let s = settings(json!({"projectSettingsOverrides": {"p1": {"speechProjectCustomWords": ["Ghostty"]}}}));
+        let e = env(&s);
+        let scope = resolve(&search(Some("p1"), None), &projects, &[e]);
+        let plan = plan_patch(&scope, &[e], json!({"defaultRuntimeMode": "approval-required"}).as_object().unwrap());
+        assert_eq!(
+            patch_of(&plan).unwrap()["projectSettingsOverrides"]["p1"],
+            json!({"speechProjectCustomWords": ["Ghostty"], "defaultRuntimeMode": "approval-required"})
+        );
+        let clear = plan_clear(&scope, &[e], &["defaultRuntimeMode"]);
+        assert_eq!(
+            patch_of(&clear).unwrap()["projectSettingsOverrides"]["p1"],
+            json!({"speechProjectCustomWords": ["Ghostty"]})
+        );
+
+        // A project's first custom worktree rule starts from the rules it inherited.
+        let s = settings(json!({"storageCleanup": {"worktreeOnDelete": true, "worktreeAfterDays": 14}}));
+        let e = env(&s);
+        let scope = resolve(&search(Some("p1"), None), &projects, &[e]);
+        let rule = json!({"worktreeCleanup": {"mode": "custom", "rules": {"worktreeOnMerge": true}}});
+        let plan = plan_patch(&scope, &[e], rule.as_object().unwrap());
+        let rules = &patch_of(&plan).unwrap()["projectSettingsOverrides"]["p1"]["worktreeCleanup"]["rules"];
+        assert_eq!((&rules["worktreeOnDelete"], &rules["worktreeAfterDays"]), (&json!(true), &json!(14)));
+        assert_eq!(rules["worktreeOnMerge"], true);
+    }
+
+    #[test]
+    fn a_project_group_reads_every_checkout_and_writes_them_all() {
+        let s = settings(json!({
+            "projectSettingsOverrides": {"a": {"defaultRuntimeMode": "auto", "defaultAutoPull": true}},
+        }));
+        let e = env(&s);
+        let groups = [group(&["a", "b"])];
+        let scope = resolve(&search(Some("a"), None), &groups, &[e]);
+        let t = targets(&scope, &[e], |_| None);
+        assert_eq!(t.iter().map(|t| t.project_id.as_deref()).collect::<Vec<_>>(), [Some("a"), Some("b")]);
+        assert_eq!(row_inheritance(&scope, &t, &e, &["defaultRuntimeMode"]).0, InheritanceState::Mixed);
+        let plan = plan_patch(&scope, &[e], json!({"defaultRuntimeMode": "full-access"}).as_object().unwrap());
+        assert_eq!(
+            patch_of(&plan).unwrap()["projectSettingsOverrides"],
+            json!({
+                "a": {"defaultRuntimeMode": "full-access", "defaultAutoPull": true},
+                "b": {"defaultRuntimeMode": "full-access"},
+            })
+        );
+        let clear = plan_clear(&scope, &[e], &["defaultRuntimeMode"]);
+        assert_eq!(
+            patch_of(&clear).unwrap()["projectSettingsOverrides"],
+            json!({"a": {"defaultAutoPull": true}, "b": null})
+        );
+    }
+
+    #[test]
+    fn writes_fan_out_to_each_selected_environment() {
+        let (one, two) = (settings(json!({})), settings(json!({"defaultRuntimeMode": "auto"})));
+        let environments = [env(&one), Environment { id: "env-2", label: "Laptop", settings: Some(&two) }];
+        let mut other = project("b");
+        other.environment_id = "env-2".into();
+        let groups = [Group { key: "a".into(), name: "Repo".into(), members: vec![project("a"), other] }];
+        let ids = |plan: &Plan| plan.server_writes.iter().map(|w| w.environment_id.clone()).collect::<Vec<_>>();
+        let patch = json!({"defaultRuntimeMode": "full-access"});
+        let patch = patch.as_object().unwrap();
+
+        let all = resolve(&search(None, None), &groups, &environments);
+        assert_eq!(ids(&plan_patch(&all, &environments, patch)), ["env-1", "env-2"]);
+        let t = targets(&all, &environments, |_| None);
+        assert_eq!(t[0].environment_id, "env-1", "the primary represents the selection");
+        assert!(are_mixed(&t, &["defaultRuntimeMode"]));
+
+        let laptop = resolve(&search(None, Some("env-2")), &groups, &environments);
+        assert_eq!(ids(&plan_patch(&laptop, &environments, patch)), ["env-2"]);
+
+        // A project group writes each checkout's override on the environment it lives on.
+        let group = resolve(&search(Some("a"), None), &groups, &environments);
+        let plan = plan_patch(&group, &environments, patch);
+        assert_eq!(ids(&plan), ["env-1", "env-2"]);
+        assert_eq!(
+            plan.server_writes[1].patch["projectSettingsOverrides"],
+            json!({"b": {"defaultRuntimeMode": "full-access"}})
+        );
+        let checkout = resolve(&search(Some("a"), Some("env-2")), &groups, &environments);
+        assert_eq!(
+            (checkout.label.as_str(), ids(&plan_clear(&checkout, &environments, &["x"]))),
+            ("Repo / Laptop", vec!["env-2".to_owned()])
+        );
+
+        // An offline environment is skipped; the others still save.
+        let offline = [env(&one), Environment { settings: None, ..environments[1] }];
+        assert_eq!(ids(&plan_patch(&all, &offline, patch)), ["env-1"]);
+    }
+
+    #[test]
+    fn idle_compaction_is_written_in_the_form_the_server_reads() {
+        let patch = json!({"idleCompaction": "beforeCacheExpires"});
+        let legacy =
+            for_destination(&settings(json!({"compactIdleThreads": false})), patch.as_object().unwrap().clone());
+        assert_eq!(legacy, *json!({"compactIdleThreads": true}).as_object().unwrap());
+        let modern =
+            for_destination(&settings(json!({"idleCompaction": "onReturn"})), patch.as_object().unwrap().clone());
+        assert_eq!(modern, *patch.as_object().unwrap());
+    }
+
+    #[test]
+    fn dropped_keys_find_writes_an_older_server_ignored() {
+        let before = settings(json!({"defaultRuntimeMode": "a"}));
+        let patch = json!({"defaultRuntimeMode": "b"});
+        assert_eq!(dropped_keys(patch.as_object().unwrap(), &before, &before), ["defaultRuntimeMode"]);
+        let saved = settings(json!({"defaultRuntimeMode": "b"}));
+        assert!(dropped_keys(patch.as_object().unwrap(), &before, &saved).is_empty());
+    }
+}

@@ -1,0 +1,1079 @@
+//! The web app's default theme (`apps/web/src/index.css`), as GPUI colors.
+//!
+//! Alpha tokens stay translucent, as in CSS, so they composite over whatever
+//! surface they sit on.
+
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
+
+use gpui_kit::component::theme::{Theme, ThemeMode};
+use gpui_kit::{App, Global, Hsla, SharedString, Window, WindowAppearance, hsla, px, rgb};
+
+use crate::settings::{Settings, TYPOGRAPHY_ADVANCED_KEY};
+use crate::themes::{ThemeChoice, ThemeColors};
+
+/// The face the web app's `--font-sans` stack renders on each OS: `-apple-system` (SF Pro) on
+/// macOS, the bundled Inter elsewhere. GPUI maps `.SystemUIFont` to the platform UI font.
+pub const FONT_SANS: &str = if cfg!(target_os = "macos") { ".SystemUIFont" } else { "Inter" };
+/// What Settings › Appearance calls that default (`resolveDefaultFamilyLabel`).
+pub const FONT_SANS_LABEL: &str = if cfg!(target_os = "macos") { "SF Pro" } else { "Inter Variable" };
+/// The first family of the web app's `--font-mono` stack each OS has by name: macOS doesn't
+/// expose SF Mono (`ui-monospace`) by name, and Linux's `monospace` is usually DejaVu Sans Mono.
+pub const FONT_MONO: &str = if cfg!(target_os = "macos") {
+    "Menlo"
+} else if cfg!(windows) {
+    "Consolas"
+} else {
+    "DejaVu Sans Mono"
+};
+
+/// Static Inter 4.1 weights, the version `@fontsource-variable/inter` ships.
+pub const FONTS: [&[u8]; 4] = [
+    include_bytes!("../assets/fonts/Inter-Regular.ttf"),
+    include_bytes!("../assets/fonts/Inter-Medium.ttf"),
+    include_bytes!("../assets/fonts/Inter-SemiBold.ttf"),
+    include_bytes!("../assets/fonts/Inter-Bold.ttf"),
+];
+
+#[derive(Clone, Copy)]
+pub struct Tokens {
+    pub dark: bool,
+    pub background: Hsla,
+    pub foreground: Hsla,
+    pub card: Hsla,
+    pub popover: Hsla,
+    pub primary: Hsla,
+    pub primary_foreground: Hsla,
+    pub primary_hover: Hsla,
+    pub secondary: Hsla,
+    pub muted: Hsla,
+    pub muted_foreground: Hsla,
+    pub accent: Hsla,
+    pub message_surface: Hsla,
+    pub border: Hsla,
+    pub input: Hsla,
+    pub ring: Hsla,
+    pub error: Hsla,
+    pub error_foreground: Hsla,
+    pub info: Hsla,
+    pub info_foreground: Hsla,
+    pub success_foreground: Hsla,
+    pub warning: Hsla,
+    pub warning_foreground: Hsla,
+    pub indigo_foreground: Hsla,
+    pub scrollbar_thumb: Hsla,
+    pub scrollbar_thumb_hover: Hsla,
+    /// `--app-chrome-background`: the window behind every pane.
+    pub chrome: Hsla,
+    pub toolbar: ToolbarTokens,
+    /// `--surface-raised`: the composer's glass in dark and themed palettes.
+    pub surface_raised: Hsla,
+    pub secondary_foreground: Hsla,
+    pub placeholder: Hsla,
+    /// `--accent-foreground`: text on [`Self::accent`].
+    pub accent_foreground: Hsla,
+    pub error_surface: Hsla,
+    pub warning_surface: Hsla,
+    pub update: Hsla,
+    pub update_foreground: Hsla,
+    /// `--message-foreground`: text in a user message bubble.
+    pub message_foreground: Hsla,
+    /// `--code-background` and `--code-foreground`: code blocks and diffs.
+    pub code_background: Hsla,
+    pub code_foreground: Hsla,
+    pub search_match: SearchMatchTokens,
+    pub terminal: TerminalTokens,
+    pub sidebar: SidebarTokens,
+    /// A theme library palette paints the app (`html[data-theme-id]`), which some surfaces
+    /// (the chat header, code blocks, the composer outline) style differently.
+    pub themed: bool,
+    /// That palette is T3 Chat's (`html[data-theme-id="t3-chat"]`).
+    pub t3_chat: bool,
+    /// `--glass-opacity`: the alpha of glass surfaces such as the composer.
+    pub glass: f32,
+    /// `--appearance-contrast-boost` as a fraction: 0 up to 100% contrast, 1 at 200%.
+    pub contrast_boost: f32,
+    pub fonts: Fonts,
+    /// The window's side of the web's `sm` breakpoint, which sizes controls.
+    pub breakpoint: Breakpoint,
+}
+
+/// Which side of Tailwind's `sm` breakpoint (`min-width: 40rem`, 640px) the window is on. The web's
+/// controls grow below it (`h-9 sm:h-8`, `text-base sm:text-sm`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Breakpoint {
+    /// Narrower than 640px.
+    Base,
+    #[default]
+    Sm,
+}
+
+impl Breakpoint {
+    /// Tailwind's `--breakpoint-sm`, in CSS px. Media queries use the root's default 16px rem, so the
+    /// interface font size doesn't move it.
+    const SM: f32 = 640.;
+
+    pub fn of(viewport_width: gpui_kit::Pixels) -> Self {
+        if viewport_width < px(Self::SM) { Self::Base } else { Self::Sm }
+    }
+
+    /// `base` below `sm`, `sm` from it up, as a `<base> sm:<sm>` class pair picks.
+    pub fn pick<T>(self, base: T, sm: T) -> T {
+        match self {
+            Self::Base => base,
+            Self::Sm => sm,
+        }
+    }
+
+    /// `text-base sm:text-sm`, the controls' text.
+    pub fn control_text<E: gpui_kit::Styled>(self, element: E) -> E {
+        match self {
+            Self::Base => element.text_base(),
+            Self::Sm => element.text_sm(),
+        }
+    }
+}
+
+/// The `[data-app-sidebar]` palette override (`index.css:1234-1278`).
+#[derive(Clone, Copy)]
+pub struct SidebarTokens {
+    pub background: Hsla,
+    /// The page's own `--sidebar` outside `[data-app-sidebar]`, which the narrow window's sheet
+    /// paints behind the rows (`SheetPopup` is portaled out of the sidebar).
+    pub sheet: Hsla,
+    pub foreground: Hsla,
+    pub muted_foreground: Hsla,
+    pub secondary_label: Hsla,
+    pub border: Hsla,
+    pub row_hover: Hsla,
+    pub row_active: Hsla,
+    /// The page's `--sidebar-row-hover` and `--sidebar-row-selected`, which rows on [`Self::sheet`]
+    /// (the settings nav) use.
+    pub sheet_row_hover: Hsla,
+    pub sheet_row_selected: Hsla,
+    /// `--sidebar-row-selected` inside the sidebar: a selected thread row.
+    pub row_selected: Hsla,
+    /// `--sidebar-control-surface`: the update and provider pills.
+    pub control_surface: Hsla,
+    pub icon: Hsla,
+}
+
+/// The chat header's palette (`--toolbar-*`, `index.css`), which themes set apart from the canvas.
+#[derive(Clone, Copy)]
+pub struct ToolbarTokens {
+    pub background: Hsla,
+    pub foreground: Hsla,
+    pub border: Hsla,
+    pub control: Hsla,
+    pub control_foreground: Hsla,
+    pub control_hover: Hsla,
+}
+
+impl ToolbarTokens {
+    /// The unthemed defaults, which follow the page's own tokens.
+    fn over(background: Hsla, foreground: Hsla, border: Hsla, popover: Hsla, accent: Hsla) -> Self {
+        Self { background, foreground, border, control: popover, control_foreground: foreground, control_hover: accent }
+    }
+}
+
+/// Find-in-thread highlights (`::highlight(t3-thread-find)` and its active match). The text view
+/// paints a range highlight behind its glyphs only, so the search-match text roles have no use.
+#[derive(Clone, Copy)]
+pub struct SearchMatchTokens {
+    pub background: Hsla,
+    pub active_background: Hsla,
+}
+
+/// `--terminal-*`, which `terminalThemeFromApp` reads.
+#[derive(Clone, Copy)]
+pub struct TerminalTokens {
+    pub background: Hsla,
+    pub foreground: Hsla,
+    pub cursor: Hsla,
+    pub selection: Hsla,
+}
+
+impl Global for Tokens {}
+
+fn hex(value: u32) -> Hsla {
+    rgb(value).into()
+}
+
+fn with_alpha(color: Hsla, alpha: f32) -> Hsla {
+    Hsla { a: alpha, ..color }
+}
+
+fn white(alpha: f32) -> Hsla {
+    hsla(0., 0., 1., alpha)
+}
+
+impl Tokens {
+    pub fn dark() -> Self {
+        let foreground = hex(0xf5f5f5);
+        let sidebar_foreground = hex(0xf1f3f7);
+        let (background, card, popover, accent, border) =
+            (hex(0x000000), hex(0x111111), hex(0x111111), white(0.04), white(0.08));
+        let (primary, muted_foreground, error, warning) = (hex(0x346bf1), hex(0xa1a1a1), hex(0xfb414a), hex(0xfe9a00));
+        Self {
+            dark: true,
+            background,
+            foreground,
+            card,
+            popover,
+            primary,
+            primary_foreground: hex(0xffffff),
+            primary_hover: hex(0x2f60d9),
+            secondary: white(0.03),
+            muted: white(0.03),
+            muted_foreground,
+            accent,
+            message_surface: hex(0x1e1e1e),
+            border,
+            input: white(0.11),
+            ring: hex(0x346bf1),
+            error,
+            error_foreground: hex(0xff6467),
+            info: hex(0x2b7fff),
+            info_foreground: hex(0x51a2ff),
+            success_foreground: hex(0x00d492),
+            warning,
+            warning_foreground: hex(0xffb900),
+            indigo_foreground: hex(0xa3b3ff),
+            scrollbar_thumb: white(0.08),
+            scrollbar_thumb_hover: white(0.12),
+            chrome: background,
+            toolbar: ToolbarTokens::over(background, foreground, border, popover, accent),
+            // `color-mix(in srgb, neutral-950 97%, white)`.
+            surface_raised: card,
+            secondary_foreground: foreground,
+            placeholder: muted_foreground,
+            accent_foreground: foreground,
+            error_surface: with_alpha(error, 0.16),
+            warning_surface: with_alpha(warning, 0.16),
+            update: primary,
+            update_foreground: hex(0x51a2ff),
+            message_foreground: foreground,
+            code_background: mix_srgb(background, card, 0.9),
+            code_foreground: foreground,
+            search_match: SearchMatchTokens { background: hex(0x8c6c1f), active_background: hex(0xeea52b) },
+            terminal: TerminalTokens {
+                background,
+                foreground,
+                cursor: hex(0xb4cbff),
+                selection: with_alpha(hex(0xb4cbff), 0.25),
+            },
+            themed: false,
+            t3_chat: false,
+            sidebar: SidebarTokens {
+                background: hex(0x000000),
+                sheet: hex(0x111111),
+                foreground: sidebar_foreground,
+                muted_foreground: hex(0xa3a3a3),
+                secondary_label: hex(0x8f8f8f),
+                border: white(0.08),
+                row_hover: with_alpha(sidebar_foreground, 0.08),
+                row_active: with_alpha(sidebar_foreground, 0.11),
+                // `--accent` and `--muted`.
+                sheet_row_hover: white(0.04),
+                sheet_row_selected: white(0.03),
+                row_selected: with_alpha(sidebar_foreground, 0.07),
+                control_surface: hex(0x0a0a0a),
+                icon: hex(0x8b8b8b),
+            },
+            glass: 0.8,
+            contrast_boost: 0.,
+            fonts: Fonts::default(),
+            breakpoint: Breakpoint::Sm,
+        }
+    }
+
+    pub fn light() -> Self {
+        let foreground = hex(0x18181b);
+        let (background, card, popover, accent, border) =
+            (hex(0xfcfcfc), hex(0xffffff), hex(0xffffff), hex(0xf4f4f5), hex(0xe4e4e7));
+        let (primary, muted_foreground, error, warning) = (hex(0x1b4ed8), hex(0x71717b), hex(0xfb2c36), hex(0xfe9a00));
+        Self {
+            dark: false,
+            background,
+            foreground,
+            card,
+            popover,
+            primary,
+            primary_foreground: hex(0xffffff),
+            primary_hover: hex(0x3160db),
+            secondary: hex(0xfafafa),
+            muted: hex(0xfafafa),
+            muted_foreground,
+            accent,
+            message_surface: hex(0xebebed),
+            border,
+            input: hex(0xd4d4d8),
+            ring: hex(0x1b4ed8),
+            error,
+            error_foreground: hex(0xc10007),
+            info: hex(0x2b7fff),
+            info_foreground: hex(0x1447e6),
+            success_foreground: hex(0x007a55),
+            warning,
+            warning_foreground: hex(0xbb4d00),
+            indigo_foreground: hex(0x4f39f6),
+            scrollbar_thumb: hex(0xd9d9d9),
+            scrollbar_thumb_hover: hex(0xbfbfbf),
+            chrome: background,
+            toolbar: ToolbarTokens::over(background, foreground, border, popover, accent),
+            // `color-mix(in srgb, var(--card) 20%, transparent)`.
+            surface_raised: with_alpha(card, 0.2),
+            secondary_foreground: hex(0x27272a),
+            placeholder: muted_foreground,
+            accent_foreground: foreground,
+            error_surface: with_alpha(error, 0.08),
+            warning_surface: with_alpha(warning, 0.08),
+            update: primary,
+            update_foreground: primary,
+            message_foreground: foreground,
+            code_background: mix_srgb(background, card, 0.9),
+            code_foreground: foreground,
+            search_match: SearchMatchTokens { background: hex(0xffde8b), active_background: hex(0xeea52b) },
+            terminal: TerminalTokens {
+                background,
+                foreground,
+                cursor: hex(0x26384e),
+                selection: with_alpha(hex(0x253f63), 0.2),
+            },
+            themed: false,
+            t3_chat: false,
+            sidebar: SidebarTokens {
+                background: hex(0xfafafa),
+                sheet: hex(0xfafafa),
+                foreground,
+                muted_foreground: hex(0x71717b),
+                secondary_label: hex(0x71717b),
+                border: hex(0xe4e4e7),
+                row_hover: hex(0xfcfcfc),
+                row_active: hex(0xffffff),
+                sheet_row_hover: hex(0xfcfcfc),
+                sheet_row_selected: hex(0xffffff),
+                row_selected: hex(0xffffff),
+                control_surface: hex(0xf4f4f5),
+                icon: hex(0x86858e),
+            },
+            glass: 0.8,
+            contrast_boost: 0.,
+            fonts: Fonts::default(),
+            breakpoint: Breakpoint::Sm,
+        }
+    }
+}
+
+/// The client settings that restyle the tokens (`startClientAppearance` in `appInit.tsx`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Appearance {
+    /// `appearanceContrast`, 50-200 percent.
+    pub contrast: f32,
+    /// `glassOpacity`, 40-100 percent.
+    pub glass: f32,
+    pub fonts: Fonts,
+    /// `fontSmoothing`: thin grayscale text smoothing instead of the macOS default.
+    pub thin_smoothing: bool,
+}
+
+impl Default for Appearance {
+    fn default() -> Self {
+        Self { contrast: 100., glass: 80., fonts: Fonts::default(), thin_smoothing: true }
+    }
+}
+
+impl Global for Appearance {}
+
+impl Appearance {
+    pub fn from_settings(settings: &Settings) -> Self {
+        #[expect(clippy::cast_possible_truncation, reason = "a font percentage; f32 is plenty")]
+        let percent = |key, default| settings.get(key).as_f64().map_or(default, |value| value as f32);
+        Self {
+            // The contract's bounds (`AppearanceContrast`, `GlassOpacity`): a hand-edited 0 would blank the UI.
+            contrast: percent("appearanceContrast", 100.).clamp(50., 200.),
+            glass: percent("glassOpacity", 80.).clamp(40., 100.),
+            fonts: Fonts::from_settings(settings),
+            thin_smoothing: settings.get("fontSmoothing").as_bool().unwrap_or(true),
+        }
+    }
+}
+
+/// The typography settings as the app paints them (`applyAppearanceFontVariables` in
+/// `appearanceFonts.ts`). Families are interned so the tokens stay `Copy`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Fonts {
+    /// `--font-sans`: everything outside code and the terminal.
+    pub sans: &'static str,
+    /// `--font-mono`: every monospace label, code block, diff and file preview.
+    pub mono: &'static str,
+    /// `--font-composer`: the prompt box.
+    pub composer: &'static str,
+    pub terminal: &'static str,
+    /// The root font size, which every rem scales with.
+    pub interface_size: f32,
+    /// `--font-size-prompt`, in px.
+    pub prompt_size: f32,
+    /// `--font-size-code` and `--diffs-font-size`, in px.
+    pub code_size: f32,
+    pub terminal_size: f32,
+}
+
+impl Default for Fonts {
+    /// `DEFAULT_CLIENT_SETTINGS`, without separate fonts.
+    fn default() -> Self {
+        Self {
+            sans: FONT_SANS,
+            mono: FONT_MONO,
+            composer: FONT_SANS,
+            terminal: FONT_MONO,
+            interface_size: INTERFACE_SIZES.2,
+            prompt_size: INTERFACE_SIZES.2 * 0.875,
+            code_size: CODE_SIZES.2,
+            terminal_size: CODE_SIZES.2,
+        }
+    }
+}
+
+/// `MIN_*_FONT_SIZE`, `MAX_*_FONT_SIZE` and the default, from `packages/contracts/src/settings.ts`.
+const INTERFACE_SIZES: (f32, f32, f32) = (12., 20., 16.);
+const PROMPT_SIZES: (f32, f32, f32) = (12., 20., 14.);
+const CODE_SIZES: (f32, f32, f32) = (10., 18., 13.);
+const TERMINAL_SIZES: (f32, f32, f32) = (8., 20., 12.);
+
+impl Fonts {
+    #[expect(clippy::cast_possible_truncation, reason = "a font size; f32 is plenty")]
+    pub fn from_settings(settings: &Settings) -> Self {
+        let family = |key: &str| first_family(settings.get(key).as_str().unwrap_or_default());
+        let size = |key: &str, (min, max, fallback): (f32, f32, f32)| {
+            settings.get(key).as_f64().map_or(fallback, |value| (value as f32).round().clamp(min, max))
+        };
+        let separate = settings.bool(TYPOGRAPHY_ADVANCED_KEY);
+        let sans = family("fontFamilySans").unwrap_or(FONT_SANS);
+        let mono = family("fontFamilyCode").unwrap_or(FONT_MONO);
+        let interface_size = size("fontSizeInterface", INTERFACE_SIZES);
+        let code_size = size("fontSizeCode", CODE_SIZES);
+        Self {
+            sans,
+            mono,
+            composer: separate.then(|| family("fontFamilyComposer")).flatten().unwrap_or(sans),
+            // `resolveTerminalFontPreference`: the code font, or its own (default stack when unset).
+            terminal: if separate { family("fontFamilyTerminal").unwrap_or(FONT_MONO) } else { mono },
+            interface_size,
+            // `var(--text-sm)` unless set separately.
+            prompt_size: if separate { size("fontSizePrompt", PROMPT_SIZES) } else { interface_size * 0.875 },
+            code_size,
+            terminal_size: if separate { size("fontSizeTerminal", TERMINAL_SIZES) } else { code_size },
+        }
+    }
+
+    /// A family no installed font has falls back to the default, as the CSS stack does.
+    fn installed_or_default(mut self, cx: &mut App) -> Self {
+        let installed = installed_fonts(cx);
+        let known = |name: &str| name == FONT_SANS || installed.iter().any(|font| font.as_ref() == name);
+        let sans = if known(self.sans) { self.sans } else { FONT_SANS };
+        let mono = if known(self.mono) { self.mono } else { FONT_MONO };
+        if self.composer == self.sans || !known(self.composer) {
+            self.composer = sans;
+        }
+        if !known(self.terminal) {
+            self.terminal = if self.terminal == self.mono { mono } else { FONT_MONO };
+        }
+        (self.sans, self.mono) = (sans, mono);
+        self
+    }
+}
+
+/// The first family of a CSS family list, unquoted (`cssFontFamilies`).
+fn first_family(list: &str) -> Option<&'static str> {
+    static NAMES: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let name =
+        list.split(',').map(|name| name.trim().trim_matches(['"', '\'']).trim()).find(|name| !name.is_empty())?;
+    let mut names = NAMES.get_or_init(Mutex::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    Some(names.get(name).copied().unwrap_or_else(|| {
+        let interned: &'static str = Box::leak(name.to_owned().into_boxed_str());
+        names.insert(interned);
+        interned
+    }))
+}
+
+/// The platform's font families, listed once (`queryInstalledFontFamilies`).
+struct InstalledFonts(Vec<SharedString>);
+
+impl Global for InstalledFonts {}
+
+pub fn installed_fonts(cx: &mut App) -> &[SharedString] {
+    if cx.try_global::<InstalledFonts>().is_none() {
+        let names = cx.text_system().all_font_names().into_iter().filter(|name| !name.starts_with('.'));
+        cx.set_global(InstalledFonts(names.map(SharedString::from).collect()));
+    }
+    &cx.global::<InstalledFonts>().0
+}
+
+/// `isMonospaceFamily`: every probe glyph has the same advance.
+pub fn is_monospace(family: &str, cx: &App) -> bool {
+    let text_system = cx.text_system();
+    let id = text_system.resolve_font(&gpui_kit::font(SharedString::from(family.to_owned())));
+    let size = gpui_kit::px(32.);
+    let advances: Vec<f32> = ['i', 'M', 'W', '0', '@', '#', '.']
+        .into_iter()
+        .filter_map(|glyph| text_system.advance(id, size, glyph).ok().map(|advance| f32::from(advance.width)))
+        .collect();
+    advances.windows(2).all(|pair| (pair[0] - pair[1]).abs() < 0.01)
+}
+
+impl Tokens {
+    /// A theme library palette over the standard tokens (`html[data-theme-id]` in `index.css`).
+    fn themed(mut self, c: &ThemeColors) -> Self {
+        self.background = c.canvas;
+        self.foreground = c.text;
+        self.card = c.surface;
+        self.popover = c.surface_overlay;
+        self.primary = c.message_action;
+        self.primary_foreground = c.message_action_foreground;
+        self.primary_hover = c.message_action_hover;
+        self.secondary = c.secondary;
+        self.muted = c.muted;
+        self.muted_foreground = c.muted_foreground;
+        self.accent = c.accent_surface;
+        self.message_surface = c.message_surface;
+        self.border = c.border;
+        self.input = c.input;
+        self.ring = c.focus;
+        self.error = c.error;
+        self.error_foreground = c.error_foreground;
+        self.warning = c.warning;
+        self.warning_foreground = c.warning_foreground;
+        self.chrome = c.chrome;
+        self.toolbar = ToolbarTokens {
+            background: c.toolbar,
+            foreground: c.toolbar_foreground,
+            border: c.toolbar_border,
+            control: c.toolbar_control,
+            control_foreground: c.toolbar_control_foreground,
+            control_hover: c.toolbar_control_hover,
+        };
+        self.surface_raised = c.surface_raised;
+        self.secondary_foreground = c.secondary_foreground;
+        self.placeholder = c.placeholder;
+        self.accent_foreground = c.accent_surface_foreground;
+        self.error_surface = c.error_surface;
+        self.warning_surface = c.warning_surface;
+        self.update = c.update;
+        self.update_foreground = c.update_foreground;
+        self.message_foreground = c.message_foreground;
+        self.code_background = c.code_background;
+        self.code_foreground = c.code_foreground;
+        self.search_match = SearchMatchTokens {
+            background: c.search_match_background,
+            active_background: c.search_match_active_background,
+        };
+        self.terminal = TerminalTokens {
+            background: c.terminal_background,
+            foreground: c.terminal_foreground,
+            cursor: c.terminal_cursor,
+            selection: c.terminal_selection,
+        };
+        self.themed = true;
+        self.sidebar = SidebarTokens {
+            background: c.sidebar,
+            sheet: c.sidebar,
+            foreground: c.sidebar_foreground,
+            muted_foreground: c.sidebar_muted_foreground,
+            secondary_label: c.secondary_label,
+            border: c.sidebar_border,
+            row_hover: c.sidebar_row_hover,
+            row_active: c.sidebar_row_active,
+            sheet_row_hover: c.sidebar_row_hover,
+            sheet_row_selected: c.sidebar_row_selected,
+            row_selected: c.sidebar_row_selected,
+            control_surface: c.sidebar_control_surface,
+            icon: c.icon_muted,
+        };
+        self
+    }
+
+    /// The tokens a theme choice paints with, before the contrast and glass settings.
+    pub fn for_choice(choice: &ThemeChoice, system_dark: bool) -> Self {
+        let (dark, colors) = choice.resolve(system_dark);
+        let base = if dark { Self::dark() } else { Self::light() };
+        let Some(colors) = colors else { return base };
+        Self { t3_chat: choice.owner(dark).as_deref() == Some("t3-chat"), ..base.themed(&colors) }
+    }
+
+    /// A panel layout toggle's icon: the themed toolbar text (55% toward the toolbar when
+    /// disabled), otherwise the ghost toggle's own.
+    pub fn titlebar_toggle_ink(&self, enabled: bool) -> Hsla {
+        match (self.themed, enabled) {
+            (true, true) => self.toolbar.foreground,
+            (true, false) => mix_oklab(self.toolbar.background, self.toolbar.foreground, 0.55),
+            (false, true) => self.foreground.opacity(0.8),
+            (false, false) => self.muted_foreground,
+        }
+    }
+
+    /// `--chat-composer-glass-surface`: the card in the light default, the raised surface otherwise.
+    pub fn composer_glass(&self) -> Hsla {
+        if self.themed || self.dark { self.surface_raised } else { self.card }
+    }
+
+    /// `--chat-composer-highlight`, the dark composer's inset top edge.
+    pub fn composer_highlight(&self) -> Hsla {
+        match (self.themed, self.t3_chat) {
+            (true, true) => with_alpha(hex(0x432d48), 0.12),
+            (true, false) => self.input.opacity(0.12),
+            (false, _) => white(0.03),
+        }
+    }
+
+    /// `--chat-composer-outline` (`ComposerSurface.tsx`), which attached banners share.
+    pub fn composer_outline(&self) -> Hsla {
+        match (self.themed, self.dark) {
+            (true, true) if self.t3_chat => hex(0x241e28),
+            (true, true) => mix_srgb(self.background, self.input, 0.3),
+            (true, false) => self.toolbar.border,
+            (false, true) => white(0.05),
+            (false, false) => hsla(0., 0., 0., 0.08),
+        }
+    }
+
+    /// Chat body text: `text-foreground/[calc(90%+var(--appearance-contrast-boost)/10)]`.
+    pub fn chat_text(&self) -> Hsla {
+        self.foreground.opacity(0.9 + self.contrast_boost / 10.)
+    }
+
+    /// The `--contrast-*` tokens (`index.css`): below 100% text fades toward its surface and
+    /// borders toward transparent; above it text moves toward black (light) or white
+    /// (dark) and borders toward the text color.
+    fn with_appearance(mut self, appearance: Appearance) -> Self {
+        let base = appearance.contrast.min(100.) / 100.;
+        let boost = (appearance.contrast - 100.).max(0.) / 100.;
+        let target = if self.dark { white(1.) } else { hsla(0., 0., 0., 1.) };
+        let text = |color: Hsla, surface: Hsla| mix_oklab(mix_oklab(surface, color, base), target, boost);
+        let line = |color: Hsla, ink: Hsla| mix_srgb(color.opacity(base), ink, boost / 4.);
+        let (foreground, sidebar_foreground) = (self.foreground, self.sidebar.foreground);
+        self.foreground = text(foreground, self.background);
+        self.muted_foreground = text(self.muted_foreground, self.background);
+        self.border = line(self.border, foreground);
+        self.input = line(self.input, foreground);
+        self.placeholder = text(self.placeholder, self.background);
+        self.secondary_foreground = text(self.secondary_foreground, self.secondary);
+        self.accent_foreground = text(self.accent_foreground, self.accent);
+        self.message_foreground = text(self.message_foreground, self.message_surface);
+        let toolbar = &mut self.toolbar;
+        let toolbar_foreground = toolbar.foreground;
+        toolbar.foreground = text(toolbar_foreground, toolbar.background);
+        toolbar.control_foreground = text(toolbar.control_foreground, toolbar.control);
+        toolbar.border = line(toolbar.border, toolbar_foreground);
+        let sidebar = &mut self.sidebar;
+        sidebar.foreground = text(sidebar_foreground, sidebar.background);
+        sidebar.muted_foreground = text(sidebar.muted_foreground, sidebar.background);
+        sidebar.secondary_label = text(sidebar.secondary_label, self.background);
+        sidebar.icon = text(sidebar.icon, self.background);
+        sidebar.border = line(sidebar.border, sidebar_foreground);
+        // The unthemed dark sidebar tints its rows from its contrast-adjusted text; a theme's own
+        // row roles win (`html[data-theme-id] [data-app-sidebar]`).
+        if self.dark && !self.themed {
+            sidebar.row_hover = with_alpha(sidebar.foreground, 0.08);
+            sidebar.row_active = with_alpha(sidebar.foreground, 0.11);
+            sidebar.row_selected = with_alpha(sidebar.foreground, 0.07);
+        }
+        self.glass = appearance.glass / 100.;
+        self.contrast_boost = boost;
+        self.fonts = appearance.fonts;
+        self
+    }
+}
+
+/// CSS `color-mix(in srgb, from, to t)`, with premultiplied alpha.
+pub(crate) fn mix_srgb(from: Hsla, to: Hsla, t: f32) -> Hsla {
+    let (a, b) = (from.to_rgb(), to.to_rgb());
+    let alpha = a.a * (1. - t) + b.a * t;
+    if alpha <= 0. {
+        return gpui_kit::transparent_black();
+    }
+    let channel = |x: f32, y: f32| (x * a.a * (1. - t) + y * b.a * t) / alpha;
+    gpui_kit::Rgba { r: channel(a.r, b.r), g: channel(a.g, b.g), b: channel(a.b, b.b), a: alpha }.into()
+}
+
+/// CSS `color-mix(in oklab, from, to t)` for opaque colors.
+pub(crate) fn mix_oklab(from: Hsla, to: Hsla, t: f32) -> Hsla {
+    if t <= 0. {
+        return from;
+    }
+    let (a, b) = (oklab(from.to_rgb()), oklab(to.to_rgb()));
+    let lab = [0, 1, 2].map(|i| a[i] + (b[i] - a[i]) * t);
+    let mut rgb = srgb_from_oklab(lab);
+    rgb.a = from.a + (to.a - from.a) * t;
+    rgb.into()
+}
+
+fn oklab(color: gpui_kit::Rgba) -> [f32; 3] {
+    let linear = |c: f32| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+    let (r, g, b) = (linear(color.r), linear(color.g), linear(color.b));
+    let l = (0.412_221_46 * r + 0.536_332_55 * g + 0.051_445_995 * b).cbrt();
+    let m = (0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b).cbrt();
+    let s = (0.088_302_46 * r + 0.281_718_85 * g + 0.629_978_7 * b).cbrt();
+    [
+        0.210_454_26 * l + 0.793_617_8 * m - 0.004_072_047 * s,
+        1.977_998_5 * l - 2.428_592_2 * m + 0.450_593_7 * s,
+        0.025_904_037 * l + 0.782_771_77 * m - 0.808_675_77 * s,
+    ]
+}
+
+pub(crate) fn srgb_from_oklab([l, a, b]: [f32; 3]) -> gpui_kit::Rgba {
+    let l_ = (l + 0.396_337_78 * a + 0.215_803_76 * b).powi(3);
+    let m_ = (l - 0.105_561_346 * a - 0.063_854_17 * b).powi(3);
+    let s_ = (l - 0.089_484_18 * a - 1.291_485_5 * b).powi(3);
+    let gamma = |c: f32| {
+        let c = c.clamp(0., 1.);
+        if c <= 0.003_130_8 { c * 12.92 } else { 1.055 * c.powf(1. / 2.4) - 0.055 }
+    };
+    gpui_kit::Rgba {
+        r: gamma(4.076_741_7 * l_ - 3.307_711_6 * m_ + 0.230_969_94 * s_),
+        g: gamma(-1.268_438 * l_ + 2.609_757_4 * m_ - 0.341_319_38 * s_),
+        b: gamma(-0.004_196_086_3 * l_ - 0.703_418_6 * m_ + 1.707_614_7 * s_),
+        a: 1.,
+    }
+}
+
+/// Applies the contrast, glass and typography settings now and on every later `sync`.
+pub fn set_appearance(appearance: Appearance, window: &mut Window, cx: &mut App) {
+    if cx.try_global::<Appearance>() == Some(&appearance) {
+        return;
+    }
+    cx.set_global(appearance);
+    sync(window, cx);
+    window.refresh();
+}
+
+pub fn tokens(cx: &App) -> &Tokens {
+    cx.global::<Tokens>()
+}
+
+/// `dialog-backdrop` (`index.css`): the background at 60% (64% dark) over a 4px blur. Without the
+/// blur no single alpha matches both what Electron lets through on average (36%, as 64% gives) and
+/// on text (~9%, as ~91% gives); 82% splits the miss evenly, about 2x each way.
+pub fn dialog_backdrop(t: &Tokens) -> Hsla {
+    t.background.opacity(0.82)
+}
+
+/// The theme library pick: the appearance mode, the theme and the light/dark mix.
+#[derive(Clone, Default)]
+struct Preference(ThemeChoice);
+
+impl Global for Preference {}
+
+/// Applies the theme library pick now and on every later `sync`.
+pub fn set_preference(choice: ThemeChoice, window: &mut Window, cx: &mut App) {
+    cx.set_global(Preference(choice));
+    sync(window, cx);
+    window.refresh();
+}
+
+/// The theme editor's draft (`applyThemeColorPreview`): its colors and appearance paint the
+/// app until it is cleared, over the stored pick.
+#[derive(Clone, Copy, Default)]
+struct EditorPreview(Option<(bool, ThemeColors)>);
+
+impl Global for EditorPreview {}
+
+#[expect(clippy::large_types_passed_by_value, reason = "the preview moves into a global")]
+pub fn set_editor_preview(preview: Option<(bool, ThemeColors)>, window: &mut Window, cx: &mut App) {
+    if cx.try_global::<EditorPreview>().and_then(|p| p.0) == preview {
+        return;
+    }
+    cx.set_global(EditorPreview(preview));
+    sync(window, cx);
+    window.refresh();
+}
+
+/// The palette the tokens are painted from (`resolveActiveThemeColors`): the theme editor's draft,
+/// the theme pick's, or the standard one, with whether it is dark.
+#[derive(Clone, Copy)]
+struct Palette(bool, Option<ThemeColors>);
+
+impl Global for Palette {}
+
+/// The active [`Palette`]'s roles, which rendered pages read as their theme (`htmlRenderTheme`).
+pub fn palette(cx: &App) -> Option<(bool, &ThemeColors)> {
+    let Palette(dark, colors) = cx.try_global::<Palette>()?;
+    Some((*dark, colors.as_ref()?))
+}
+
+/// `getStandardThemeColors`.
+fn standard_colors(dark: bool) -> Option<ThemeColors> {
+    static COLORS: OnceLock<[Option<ThemeColors>; 2]> = OnceLock::new();
+    COLORS.get_or_init(|| [false, true].map(|dark| ThemeColors::from_roles(crate::themes::standard_roles(dark), None)))
+        [usize::from(dark)]
+}
+
+pub fn system_dark(window: &Window) -> bool {
+    matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark)
+}
+
+/// Installs the tokens for the preferred appearance and points the
+/// component library's palette at them. Call again when the appearance changes.
+pub fn sync(window: &mut Window, cx: &mut App) {
+    let choice = cx.try_global::<Preference>().map(|preference| preference.0.clone()).unwrap_or_default();
+    let mut appearance = cx.try_global::<Appearance>().copied().unwrap_or_default();
+    appearance.fonts = appearance.fonts.installed_or_default(cx);
+    cx.text_system().set_thin_font_smoothing(appearance.thin_smoothing);
+    let preview = cx.try_global::<EditorPreview>().and_then(|preview| preview.0);
+    let base = match preview {
+        Some((dark, colors)) => if dark { Tokens::dark() } else { Tokens::light() }.themed(&colors),
+        None => Tokens::for_choice(&choice, system_dark(window)),
+    };
+    let (dark, colors) = preview.map_or_else(|| choice.resolve(system_dark(window)), |(dark, c)| (dark, Some(c)));
+    cx.set_global(Palette(dark, colors.or_else(|| standard_colors(dark))));
+    let tokens =
+        Tokens { breakpoint: Breakpoint::of(window.viewport_size().width), ..base.with_appearance(appearance) };
+    let (dark, fonts) = (tokens.dark, tokens.fonts);
+    Theme::change(if dark { ThemeMode::Dark } else { ThemeMode::Light }, None, cx);
+    Theme::update(cx, |theme| {
+        theme.font_family = fonts.sans.into();
+        theme.mono_font_family = fonts.mono.into();
+        // gpui-component's root sets the window's rem from this, like the web's `html` font size.
+        theme.font_size = gpui_kit::px(fonts.interface_size);
+        theme.mono_font_size = gpui_kit::px(fonts.code_size);
+        theme.radius = gpui_kit::px(8.);
+        theme.radius_lg = gpui_kit::px(12.);
+        theme.cursor_blink = crate::caret::blink();
+        // The toast viewport: 22.5rem wide, 2rem in from the right and below the 52px
+        // (macOS) or 40px title bar (`toast.tsx`, `--workspace-topbar-height`).
+        let titlebar = if cfg!(target_os = "macos") { 52. } else { 40. };
+        theme.notification.width = px(360.);
+        theme.notification.margins.top = px(titlebar + 32.);
+        theme.notification.margins.right = px(32.);
+        let colors = &mut theme.colors;
+        colors.background = tokens.background;
+        colors.foreground = tokens.foreground;
+        colors.border = tokens.border;
+        colors.input = tokens.input;
+        colors.ring = tokens.ring;
+        colors.caret = tokens.foreground;
+        colors.selection = with_alpha(tokens.primary, 0.35);
+        colors.primary = tokens.primary;
+        colors.primary_hover = tokens.primary_hover;
+        colors.primary_active = tokens.primary_hover;
+        colors.primary_foreground = tokens.primary_foreground;
+        colors.button_primary = tokens.primary;
+        colors.button_primary_hover = tokens.primary_hover;
+        colors.button_primary_active = tokens.primary_hover;
+        colors.button_primary_foreground = tokens.primary_foreground;
+        colors.secondary = tokens.secondary;
+        colors.secondary_hover = tokens.accent;
+        colors.secondary_active = tokens.accent;
+        colors.secondary_foreground = tokens.secondary_foreground;
+        colors.muted = tokens.muted;
+        colors.muted_foreground = tokens.muted_foreground;
+        colors.accent = tokens.accent;
+        colors.accent_foreground = tokens.accent_foreground;
+        colors.popover = tokens.popover;
+        colors.popover_foreground = tokens.foreground;
+        colors.list_hover = tokens.accent;
+        colors.list_active = tokens.accent;
+        colors.overlay = dialog_backdrop(&tokens);
+        colors.danger = tokens.error;
+        colors.danger_foreground = tokens.primary_foreground;
+        // The `destructive` Button: a solid red fill with white text, `bg-destructive/90` on hover.
+        colors.button_danger = tokens.error;
+        colors.button_danger_hover = with_alpha(tokens.error, 0.9);
+        colors.button_danger_active = with_alpha(tokens.error, 0.9);
+        colors.button_danger_foreground = white(1.);
+        colors.warning = tokens.warning;
+        colors.info = tokens.info;
+        colors.link = tokens.info_foreground;
+        colors.scrollbar = gpui_kit::transparent_black();
+        colors.scrollbar_thumb = tokens.scrollbar_thumb;
+        colors.scrollbar_thumb_hover = tokens.scrollbar_thumb_hover;
+        colors.sidebar = tokens.sidebar.background;
+        colors.sidebar_foreground = tokens.sidebar.foreground;
+        colors.sidebar_border = tokens.sidebar.border;
+        colors.sidebar_accent = tokens.sidebar.row_active;
+        colors.sidebar_accent_foreground = tokens.sidebar.foreground;
+    });
+    web_scrollbar(&tokens, cx);
+    cx.set_global(gpui_kit::component::diff::DiffCodeColors {
+        background: tokens.code_background,
+        foreground: tokens.code_foreground,
+    });
+    cx.set_global(tokens);
+}
+
+/// `::-webkit-scrollbar` (`index.css`): a 6px thumb with 3px corners at the edge, on no track,
+/// shown whenever the content overflows, as Chromium shows styled scrollbars. Set on the base
+/// layer after `Theme::update`, which projects its own wider, hover-only bar.
+fn web_scrollbar(tokens: &Tokens, cx: &mut App) {
+    use gpui_kit::base::{ScrollbarMode, ScrollbarStyles, ScrollbarTheme, ScrollbarThumbStyle};
+    let thumb =
+        |color: Hsla| move |style: ScrollbarThumbStyle| style.bg(color).width(px(6.)).inset(px(0.)).radius(px(3.));
+    let styles = ScrollbarStyles::default()
+        .track(|style| style.width(px(6.)))
+        .track_hover(|style| style.width(px(6.)))
+        .track_active(|style| style.width(px(6.)))
+        .thumb(thumb(tokens.scrollbar_thumb))
+        .thumb_hover(thumb(tokens.scrollbar_thumb_hover))
+        .thumb_active(thumb(tokens.scrollbar_thumb_hover));
+    gpui_kit::base::Theme::global_mut(cx).scrollbar =
+        ScrollbarTheme::new().with_mode(ScrollbarMode::Always).with_styles(styles);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hex_of(color: Hsla) -> (u32, f32) {
+        let rgb = color.to_rgb();
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a 0..=1 channel scaled to a byte")]
+        let byte = |c: f32| (c * 255.).round() as u32;
+        ((byte(rgb.r) << 16) | (byte(rgb.g) << 8) | byte(rgb.b), (rgb.a * 1000.).round() / 1000.)
+    }
+
+    #[test]
+    fn controls_take_their_larger_size_only_below_640px() {
+        assert_eq!(Breakpoint::of(px(639.5)), Breakpoint::Base);
+        assert_eq!(Breakpoint::of(px(640.)), Breakpoint::Sm);
+        assert_eq!(Breakpoint::of(px(639.5)).pick(36, 32), 36, "base below sm");
+    }
+
+    #[test]
+    fn contrast_and_glass_follow_the_web_tokens() {
+        let at = |contrast, dark| {
+            let base = if dark { Tokens::dark() } else { Tokens::light() };
+            base.with_appearance(Appearance { contrast, glass: 64., ..Appearance::default() })
+        };
+        let default = at(100., true);
+        assert_eq!(hex_of(default.foreground), hex_of(Tokens::dark().foreground), "100% changes nothing");
+        assert_eq!(hex_of(default.border), hex_of(Tokens::dark().border));
+        assert_eq!(default.glass, 0.64);
+        assert_eq!(default.chat_text().a, 0.9, "chat text sits at 90% of the foreground");
+        assert_eq!(at(200., true).chat_text().a, 1., "and reaches 100% at full contrast");
+        // 50%: text halfway to its surface (oklab), borders at half alpha.
+        let low = at(50., true);
+        assert_eq!(hex_of(low.border).1, 0.04);
+        let low_text = hex_of(low.foreground).0 & 0xff;
+        assert_eq!(low_text, 0x5f, "oklab midpoint of #f5f5f5 and black");
+        // 200%: dark text all the way to white, light text to black.
+        assert_eq!(hex_of(at(200., true).muted_foreground).0, 0xffffff);
+        assert_eq!(hex_of(at(200., false).foreground).0, 0x000000);
+    }
+
+    #[test]
+    fn fonts_follow_the_typography_settings() {
+        let fonts = |stored: serde_json::Value| {
+            Fonts::from_settings(&Settings::layered(&crate::settings::contract().client_defaults, &stored))
+        };
+        assert_eq!(fonts(serde_json::Value::Null), Fonts::default());
+        // One monospace font for code and the terminal unless set separately; the prompt is `text-sm`.
+        let simple = fonts(serde_json::json!({
+            "fontFamilyCode": " \"JetBrains Mono\", monospace",
+            "fontFamilyTerminal": "Cascadia Mono",
+            "fontSizeInterface": 18,
+            "fontSizeCode": 99,
+        }));
+        assert_eq!((simple.mono, simple.terminal, simple.composer), ("JetBrains Mono", "JetBrains Mono", FONT_SANS));
+        assert_eq!(
+            (simple.interface_size, simple.prompt_size, simple.code_size, simple.terminal_size),
+            (18., 15.75, 18., 18.)
+        );
+        let separate = fonts(serde_json::json!({
+            TYPOGRAPHY_ADVANCED_KEY: true,
+            "fontFamilyCode": "Courier New",
+            "fontFamilyTerminal": "Cascadia Mono",
+            "fontSizePrompt": 16,
+            "fontSizeTerminal": 11,
+        }));
+        assert_eq!((separate.terminal, separate.composer), ("Cascadia Mono", FONT_SANS));
+        let unset = fonts(serde_json::json!({ TYPOGRAPHY_ADVANCED_KEY: true, "fontFamilyCode": "Courier New" }));
+        assert_eq!(unset.terminal, FONT_MONO, "an unset terminal font is the default stack, not the code font");
+        assert_eq!((separate.prompt_size, separate.terminal_size), (16., 11.));
+        let thin = |stored: serde_json::Value| {
+            Appearance::from_settings(&Settings::layered(&crate::settings::contract().client_defaults, &stored))
+                .thin_smoothing
+        };
+        assert!(thin(serde_json::Value::Null), "thin smoothing is the default, as on the web");
+        assert!(!thin(serde_json::json!({ "fontSmoothing": false })));
+    }
+
+    #[test]
+    fn a_theme_repaints_the_tokens_it_maps() {
+        let grove = crate::themes::ThemeChoice { base: Some("grove".into()), ..Default::default() };
+        let colors = crate::themes::built_in()[1].colors_for(true).unwrap();
+        let tokens = Tokens::for_choice(&grove, true);
+        assert!(tokens.dark);
+        assert_eq!(hex_of(tokens.background), hex_of(colors.canvas));
+        assert_eq!(hex_of(tokens.primary), hex_of(colors.message_action));
+        assert_eq!(hex_of(tokens.sidebar.row_active), hex_of(colors.sidebar_row_active));
+        assert_eq!(hex_of(tokens.sidebar.sheet_row_selected), hex_of(colors.sidebar_row_selected));
+        assert_eq!(
+            hex_of(Tokens::for_choice(&Default::default(), false).background),
+            hex_of(Tokens::light().background)
+        );
+    }
+
+    #[test]
+    fn every_painted_role_reaches_its_token() {
+        type Pick = fn(&Tokens) -> Hsla;
+        let cases: [(&str, Pick); 26] = [
+            ("chrome", |t| t.chrome),
+            ("toolbar", |t| t.toolbar.background),
+            ("toolbarForeground", |t| t.toolbar.foreground),
+            ("toolbarBorder", |t| t.toolbar.border),
+            ("toolbarControl", |t| t.toolbar.control),
+            ("toolbarControlForeground", |t| t.toolbar.control_foreground),
+            ("toolbarControlHover", |t| t.toolbar.control_hover),
+            ("surfaceRaised", |t| t.surface_raised),
+            ("secondaryForeground", |t| t.secondary_foreground),
+            ("placeholder", |t| t.placeholder),
+            ("accentSurfaceForeground", |t| t.accent_foreground),
+            ("errorSurface", |t| t.error_surface),
+            ("warningSurface", |t| t.warning_surface),
+            ("update", |t| t.update),
+            ("updateForeground", |t| t.update_foreground),
+            ("messageForeground", |t| t.message_foreground),
+            ("codeBackground", |t| t.code_background),
+            ("codeForeground", |t| t.code_foreground),
+            ("searchMatchBackground", |t| t.search_match.background),
+            ("searchMatchActiveBackground", |t| t.search_match.active_background),
+            ("sidebarControlSurface", |t| t.sidebar.control_surface),
+            ("sidebarRowSelected", |t| t.sidebar.row_selected),
+            ("terminalBackground", |t| t.terminal.background),
+            ("terminalForeground", |t| t.terminal.foreground),
+            ("terminalCursor", |t| t.terminal.cursor),
+            ("terminalSelection", |t| t.terminal.selection),
+        ];
+        for (role, pick) in cases {
+            let mut roles = crate::themes::default_roles(true).clone();
+            roles.set(role, "#123456".into());
+            let colors = ThemeColors::from_roles(&roles, None).unwrap();
+            // Through the contrast and glass settings too, at their defaults.
+            let tokens = Tokens::dark().themed(&colors).with_appearance(Appearance::default());
+            assert_eq!(hex_of(pick(&tokens)), (0x123456, 1.), "{role}");
+        }
+    }
+
+    #[test]
+    fn themed_surfaces_follow_the_theme_not_the_default_look() {
+        let picked = |id: &str, dark| {
+            let choice = crate::themes::ThemeChoice { base: Some(id.into()), ..Default::default() };
+            Tokens::for_choice(&choice, dark).with_appearance(Appearance::default())
+        };
+        let grove = picked("grove", true);
+        let colors = crate::themes::built_in()[1].colors_for(true).unwrap();
+        assert!(grove.themed && !grove.t3_chat);
+        // A dark theme keeps its own sidebar rows instead of the default's tints.
+        assert_eq!(hex_of(grove.sidebar.row_hover), hex_of(colors.sidebar_row_hover));
+        assert_eq!(hex_of(grove.composer_glass()), hex_of(colors.surface_raised));
+        assert_eq!(hex_of(grove.composer_outline()), hex_of(mix_srgb(grove.background, grove.input, 0.3)));
+        assert_eq!(hex_of(picked("t3-chat", true).composer_outline()).0, 0x241e28);
+        let light = picked("grove", false);
+        assert_eq!(hex_of(light.composer_outline()), hex_of(light.toolbar.border));
+        // The default look: the light composer glass is the card; dark is the raised surface.
+        assert_eq!(hex_of(Tokens::light().composer_glass()), hex_of(Tokens::light().card));
+        assert_eq!(hex_of(Tokens::dark().composer_glass()).0, 0x111111);
+        let ghost = Tokens::dark();
+        assert_eq!(hex_of(ghost.titlebar_toggle_ink(true)), hex_of(ghost.foreground.opacity(0.8)));
+        assert_eq!(hex_of(grove.titlebar_toggle_ink(true)), hex_of(grove.toolbar.foreground));
+    }
+}

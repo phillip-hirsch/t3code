@@ -1,0 +1,2830 @@
+//! Wire shapes and reducers for the orchestration read model.
+//!
+//! Mirrors `packages/client-runtime/src/state/shellReducer.ts` and
+//! `orchestrationV2Projection.ts`. Enum-like fields stay strings so new server
+//! values never fail a whole frame; only fields the UI reads are typed.
+
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
+
+use gpui_kit::SharedString;
+
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
+use serde_json::Value;
+
+/// Decodes an array element by element, skipping elements that fail, like the
+/// TS `ForwardCompatibleArray`, so one new-shaped record never drops a frame.
+pub(crate) fn lossy<'de, D: serde::Deserializer<'de>, T: DeserializeOwned>(
+    deserializer: D,
+) -> Result<Vec<T>, D::Error> {
+    let values = Vec::<Value>::deserialize(deserializer)?;
+    Ok(values
+        .into_iter()
+        .filter_map(|value| {
+            T::deserialize(value).map_err(|error| log::warn!("skipping undecodable element: {error}")).ok()
+        })
+        .collect())
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelSelection {
+    #[serde(alias = "provider")]
+    pub instance_id: String,
+    pub model: String,
+    #[serde(default)]
+    pub options: Option<Vec<Value>>,
+}
+
+impl ModelSelection {
+    pub fn to_json(&self) -> Value {
+        let mut value = serde_json::json!({"instanceId": self.instance_id, "model": self.model});
+        if let Some(options) = &self.options {
+            value["options"] = Value::Array(options.clone());
+        }
+        value
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderModel {
+    pub slug: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub is_custom: bool,
+    #[serde(default)]
+    pub is_default: Option<bool>,
+    #[serde(default)]
+    pub short_name: Option<String>,
+    #[serde(default)]
+    pub sub_provider: Option<String>,
+    #[serde(default)]
+    pub capabilities: Option<ModelCapabilities>,
+    /// `"new"` shows a NEW badge in the model picker.
+    #[serde(default)]
+    pub badge: Option<String>,
+    #[serde(default)]
+    pub is_legacy: bool,
+    #[serde(default)]
+    pub is_unavailable: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCapabilities {
+    #[serde(default)]
+    pub option_descriptors: Vec<OptionDescriptor>,
+}
+
+/// A model option such as reasoning effort (`ProviderOptionDescriptor`).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OptionDescriptor {
+    pub id: String,
+    pub label: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub options: Vec<OptionChoice>,
+    #[serde(default)]
+    pub current_value: Option<Value>,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub prompt_injected_values: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OptionChoice {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub is_default: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Continuation {
+    pub group_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Provider {
+    pub instance_id: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub driver: String,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub availability: Option<String>,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub models: Vec<ProviderModel>,
+    #[serde(default)]
+    pub usage_limits: Option<UsageLimits>,
+    #[serde(default)]
+    pub auth: ProviderAuth,
+    #[serde(default)]
+    pub setup: Option<ProviderSetup>,
+    #[serde(default)]
+    pub installed: bool,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub runtime_paths: Option<RuntimePaths>,
+    #[serde(default)]
+    pub supports_text_generation: Option<bool>,
+    #[serde(default)]
+    pub accent_color: Option<String>,
+    /// `versionAdvisory`, `compatibilityAdvisory` and `updateState` (`packages/contracts/src/server.ts`).
+    #[serde(default)]
+    pub version_advisory: Option<Value>,
+    #[serde(default)]
+    pub compatibility_advisory: Option<Value>,
+    #[serde(default)]
+    pub update_state: Option<Value>,
+    #[serde(default)]
+    pub native_sessions: Option<NativeSessions>,
+    #[serde(default)]
+    pub configurable_providers: bool,
+    /// Instances sharing a `groupKey` continue one conversation, so switching needs no handoff.
+    #[serde(default)]
+    pub continuation: Option<Continuation>,
+    #[serde(default)]
+    pub supports_conversation_rollback: Option<bool>,
+    #[serde(default, deserialize_with = "lossy")]
+    pub skills: Vec<ProviderSkill>,
+    #[serde(default, deserialize_with = "lossy")]
+    pub slash_commands: Vec<SlashCommand>,
+    #[serde(default, deserialize_with = "lossy")]
+    pub workspace_snapshots: Vec<WorkspaceSnapshot>,
+    /// Empty means every runtime mode.
+    #[serde(default)]
+    pub supported_runtime_modes: Vec<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub checked_at: Option<String>,
+}
+
+/// `ServerProviderAuth` (`packages/contracts/src/server.ts`).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderAuth {
+    #[serde(default)]
+    pub status: String,
+    #[serde(default, rename = "type")]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub can_logout: Option<bool>,
+    #[serde(default)]
+    pub subscription_sharing: Option<bool>,
+    #[serde(default)]
+    pub profile_id: Option<String>,
+    /// The plan, e.g. "Claude Max".
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSetup {
+    pub can_authenticate: bool,
+    pub can_install: bool,
+    #[serde(default)]
+    pub documentation_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimePaths {
+    pub home_path: String,
+    #[serde(default)]
+    pub shadow_home_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeSessions {
+    #[serde(default)]
+    pub can_list: bool,
+    #[serde(default)]
+    pub can_load: bool,
+    #[serde(default)]
+    pub can_resume: bool,
+    #[serde(default)]
+    pub can_delete: bool,
+}
+
+/// `ServerProviderSkill` (`packages/contracts/src/server.ts`).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSkill {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub short_description: Option<String>,
+    #[serde(default)]
+    pub user_invocable: Option<bool>,
+}
+
+/// `ServerProviderSlashCommand`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlashCommand {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub input: Option<Value>,
+}
+
+/// `ServerProviderWorkspaceSnapshot`: skills and commands as seen from one checkout.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceSnapshot {
+    pub cwd: String,
+    #[serde(default, deserialize_with = "lossy")]
+    pub slash_commands: Vec<SlashCommand>,
+    #[serde(default, deserialize_with = "lossy")]
+    pub skills: Vec<ProviderSkill>,
+}
+
+/// `ServerProviderUsageLimits` (`packages/contracts/src/providerUsageLimits.ts`).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageLimits {
+    #[serde(default)]
+    pub windows: Vec<UsageWindow>,
+    #[serde(default)]
+    pub unavailable: Option<Value>,
+    #[serde(default)]
+    pub checked_at: Option<String>,
+    #[serde(default)]
+    pub credential_fingerprint: Option<String>,
+    #[serde(default)]
+    pub external_usage: Option<ExternalUsage>,
+    #[serde(default)]
+    pub reset_credits: Option<ResetCredits>,
+}
+
+/// `ServerProviderResetCredits`: banked credits that clear the rate-limit windows.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResetCredits {
+    #[serde(default)]
+    pub available_count: u32,
+    #[serde(default)]
+    pub next_expires_at: Option<String>,
+    #[serde(default)]
+    pub next_credit_id: Option<String>,
+}
+
+/// A host that shows usage on its own site instead of reporting windows.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ExternalUsage {
+    pub label: String,
+    pub url: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageWindow {
+    pub id: String,
+    pub label: String,
+    pub used_percent: f64,
+    /// `session`, `weekly`, `monthly` or `other`.
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub resets_at: Option<String>,
+    #[serde(default)]
+    pub window_duration_mins: Option<f64>,
+}
+
+impl UsageWindow {
+    /// `remainingPercent` in `packages/shared/src/usageLimits.ts`.
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a percentage clamped to 0..=100")]
+    pub fn remaining_percent(&self) -> u32 {
+        (100. - self.used_percent.clamp(0., 100.)).round() as u32
+    }
+}
+
+impl Provider {
+    pub fn is_selectable(&self) -> bool {
+        self.enabled && self.availability.as_deref() != Some("unavailable")
+    }
+
+    /// `getDefaultProviderInstanceModel` in `apps/web/src/providerInstances.ts`.
+    pub fn default_model(&self) -> Option<&str> {
+        self.models
+            .iter()
+            .find(|m| m.is_default == Some(true) && !m.is_custom)
+            .or_else(|| self.models.iter().find(|m| !m.is_custom))
+            .or_else(|| self.models.first())
+            .map(|m| m.slug.as_str())
+    }
+}
+
+/// What the client needs from `subscribeServerConfig`.
+#[derive(Default)]
+pub struct ServerInfo {
+    /// Bumped on every applied config event, so views can cache what they derive from it.
+    pub revision: u64,
+    pub providers: Vec<Provider>,
+    pub default_model_selection: Option<ModelSelection>,
+    /// The environment's name, e.g. the machine's host name.
+    pub environment_label: Option<String>,
+    platform_machine: Option<String>,
+    pub new_projects_root: Option<String>,
+    /// The full `ServerSettings` over the contract's defaults; see `crate::settings`.
+    pub settings: crate::settings::Settings,
+    pub environment_id: Option<String>,
+    /// The raw `config` of the last snapshot; read `settings` and `capabilities` instead of its copies.
+    pub config: Value,
+    /// The raw `ServerProvider` records, for settings pages that edit them.
+    pub providers_json: Vec<Value>,
+    pub platform_os: Option<String>,
+    /// `environment.capabilities` from the config snapshot.
+    pub capabilities: Value,
+    /// `config.keybindings`, the server's resolved rules (defaults not merged in).
+    pub keybindings: Rc<[crate::keybindings::Rule]>,
+    pub keybindings_config_path: Option<String>,
+    /// `config.availableEditors`, editor ids that can open a path on the server's host.
+    pub available_editors: Vec<String>,
+    /// The "No project" workspace; a project rooted there is the scratch project.
+    pub scratch_workspace_root: Option<String>,
+    /// `ManagedPolicySummary`, or null when no administrator policy applies.
+    pub managed_policy: Value,
+    /// `settings.providerInstances`, keyed by instance id.
+    pub provider_instances: Value,
+    /// Model picker favorites as `(instanceId, model)`.
+    pub favorites: Vec<(String, String)>,
+    /// `config.environmentThemes`, the palettes it publishes, or null for none. Only the theme
+    /// stream sends them, so a snapshot keeps the last set.
+    pub environment_themes: Value,
+}
+
+impl ServerInfo {
+    pub fn apply(&mut self, event: &Value) -> Result<(), serde_json::Error> {
+        self.revision += 1;
+        match event.get("type").and_then(Value::as_str).unwrap_or_default() {
+            "snapshot" => {
+                let config = &event["config"];
+                self.config = config.clone();
+                self.providers = lossy(&config["providers"])?;
+                self.providers_json = config["providers"].as_array().cloned().unwrap_or_default();
+                self.apply_settings(&config["settings"])?;
+                let text = |pointer| config.pointer(pointer).and_then(Value::as_str).map(str::to_owned);
+                self.environment_label = text("/environment/label");
+                self.environment_id = text("/environment/environmentId");
+                self.platform_machine = text("/environment/platform/machine");
+                self.new_projects_root = text("/newProjectsRoot");
+                self.platform_os = text("/environment/platform/os");
+                self.capabilities = config.pointer("/environment/capabilities").cloned().unwrap_or_default();
+                self.keybindings = Rc::from(crate::keybindings::decode_rules(&config["keybindings"]));
+                self.keybindings_config_path = text("/keybindingsConfigPath");
+                self.available_editors = config["availableEditors"]
+                    .as_array()
+                    .map(|ids| ids.iter().filter_map(|id| id.as_str().map(str::to_owned)).collect())
+                    .unwrap_or_default();
+                self.scratch_workspace_root = text("/scratchWorkspaceRoot");
+                self.managed_policy = config.get("managedPolicy").cloned().unwrap_or_default();
+            }
+            "keybindingsUpdated" => {
+                let keybindings = &event["payload"]["keybindings"];
+                self.keybindings = Rc::from(crate::keybindings::decode_rules(keybindings));
+                if let Some(config) = self.config.as_object_mut() {
+                    config.insert("keybindings".into(), keybindings.clone());
+                }
+            }
+            "providerStatuses" => {
+                self.providers = lossy(&event["payload"]["providers"])?;
+                self.providers_json = event["payload"]["providers"].as_array().cloned().unwrap_or_default();
+            }
+            "settingsUpdated" => self.apply_settings(&event["payload"]["settings"])?,
+            "environmentThemesUpdated" => {
+                let themes = &event["payload"]["themes"];
+                let published = themes.as_array().is_some_and(|themes| !themes.is_empty());
+                self.environment_themes = if published { themes.clone() } else { Value::Null };
+            }
+            "usageLimitSourcesUpdated" => {
+                if let Some(config) = self.config.as_object_mut() {
+                    config.insert("usageLimitSources".into(), event["payload"]["sources"].clone());
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Takes a full `ServerSettings`, from a snapshot, `settingsUpdated` or `server.updateSettings`.
+    pub fn apply_settings(&mut self, settings: &Value) -> Result<(), serde_json::Error> {
+        self.settings = crate::settings::Settings::layered(&crate::settings::contract().server_defaults, settings);
+        self.default_model_selection =
+            Option::deserialize(settings.get("defaultModelSelection").unwrap_or(&Value::Null))?;
+        self.provider_instances = settings.get("providerInstances").cloned().unwrap_or_default();
+        self.favorites = settings
+            .get("favorites")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|f| Some((f.get("provider")?.as_str()?.to_owned(), f.get("model")?.as_str()?.to_owned())))
+            .collect();
+        Ok(())
+    }
+
+    pub fn capability(&self, name: &str) -> bool {
+        self.capabilities.get(name).and_then(Value::as_bool) == Some(true)
+    }
+
+    /// `capabilities.fileAttachments.maxUploadBytes`; `None` refuses files.
+    pub fn file_upload_limit(&self) -> Option<u64> {
+        self.capabilities.pointer("/fileAttachments/maxUploadBytes").and_then(Value::as_u64)
+    }
+
+    /// `ResolvedKeybindingsConfig` as sent, for project actions' shortcut labels and edits.
+    pub fn keybindings_json(&self) -> &Value {
+        &self.config["keybindings"]
+    }
+
+    /// `resolveEnvironmentMachineKind` in `packages/contracts/src/server.ts`.
+    pub fn machine_kind(&self) -> &str {
+        self.settings.get("environmentIcon").as_str().or(self.platform_machine.as_deref()).unwrap_or("server")
+    }
+
+    /// Every model of every usable provider, labelled for a picker.
+    pub fn model_choices(&self) -> Vec<(gpui_kit::SharedString, ModelSelection)> {
+        self.providers
+            .iter()
+            .filter(|p| p.is_selectable())
+            .flat_map(|provider| {
+                let provider_name = provider.display_name.as_deref().unwrap_or(&provider.instance_id);
+                provider.models.iter().map(move |model| {
+                    let label = format!("{provider_name} · {}", model.name.as_deref().unwrap_or(&model.slug));
+                    let selection = ModelSelection {
+                        instance_id: provider.instance_id.clone(),
+                        model: model.slug.clone(),
+                        options: None,
+                    };
+                    (label.into(), selection)
+                })
+            })
+            .collect()
+    }
+
+    pub fn model(&self, selection: &ModelSelection) -> Option<&ProviderModel> {
+        self.provider(&selection.instance_id)?.models.iter().find(|m| m.slug == selection.model)
+    }
+
+    pub fn provider(&self, instance_id: &str) -> Option<&Provider> {
+        self.providers.iter().find(|p| p.instance_id == instance_id)
+    }
+
+    /// A project-scoped setting as the project's threads see it (`resolveProjectSettings`).
+    pub fn project_setting(&self, project: Option<&ProjectShell>, key: &str) -> Value {
+        let project = project.map(ProjectShell::scope_project);
+        crate::settings::scope::resolve_project_setting(&self.settings, project.as_ref(), key)
+    }
+
+    /// Model for a new thread: the project's or the user's default when its
+    /// provider is usable, else the first ready provider's default model.
+    /// Mirrors `resolveDefaultProviderModelSelection`.
+    pub fn new_thread_model(&self, project: Option<&ProjectShell>) -> Option<ModelSelection> {
+        let preferred = ModelSelection::deserialize(self.project_setting(project, "defaultModelSelection")).ok();
+        if let Some(selection) = preferred
+            && self.provider(&selection.instance_id).is_some_and(Provider::is_selectable)
+        {
+            return Some(selection);
+        }
+        self.automatic_model()
+    }
+
+    /// The model new threads get when no usable default is set: a ready provider's default.
+    pub fn automatic_model(&self) -> Option<ModelSelection> {
+        let provider = self
+            .providers
+            .iter()
+            .find(|p| p.is_selectable() && p.status == "ready")
+            .or_else(|| self.providers.iter().find(|p| p.is_selectable() && p.status != "error"))?;
+        Some(ModelSelection {
+            instance_id: provider.instance_id.clone(),
+            model: provider.default_model()?.to_owned(),
+            options: None,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryIdentity {
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// The source control host kind ("github", "gitlab", ...).
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub web_url: Option<String>,
+    #[serde(default)]
+    pub canonical_key: Option<String>,
+    /// Work tree root, or the git dir for a bare repository.
+    #[serde(default)]
+    pub root_path: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub origin: Option<RepositoryOrigin>,
+    #[serde(default)]
+    pub locator: Option<RepositoryLocator>,
+}
+
+/// The git remote a repository was identified from.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryLocator {
+    pub remote_url: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryOrigin {
+    pub canonical_key: String,
+    #[serde(default)]
+    pub remote_url: Option<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectShell {
+    /// The environment this project lives on; set by [`ShellState::apply`], not the wire.
+    #[serde(skip)]
+    pub environment_id: SharedString,
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    pub workspace_root: String,
+    #[serde(default)]
+    pub repository_identity: Option<RepositoryIdentity>,
+    #[serde(default)]
+    pub default_model_selection: Option<ModelSelection>,
+    /// Legacy per-project env mode, used until settings fold it into `projectSettingsOverrides`.
+    #[serde(default)]
+    pub default_thread_env_mode: Option<String>,
+    #[serde(default)]
+    pub archived_at: Option<String>,
+    #[serde(default)]
+    pub pinned_at: Option<String>,
+    /// Forward-compatible union keyed by `kind` (`packages/contracts/src/project.ts`).
+    #[serde(default)]
+    pub project_icon: Option<Value>,
+    /// The repo favicon the server found, relative to the workspace root.
+    #[serde(default)]
+    pub favicon_path: Option<String>,
+    /// Legacy project-record scripts; settings overrides win (`resolveProjectScripts`).
+    #[serde(default, deserialize_with = "lossy")]
+    pub scripts: Vec<ProjectScript>,
+}
+
+impl ProjectShell {
+    /// The project's identity across environments, borrowed.
+    pub fn project_ref(&self) -> ThreadRef<'_> {
+        (&self.environment_id, &self.id)
+    }
+
+    pub fn scope_project(&self) -> crate::settings::scope::Project {
+        crate::settings::scope::Project {
+            id: self.id.clone(),
+            environment_id: self.environment_id.to_string(),
+            name: self.title.clone(),
+            workspace_root: self.workspace_root.clone(),
+            legacy_model_selection: self.default_model_selection.as_ref().map(ModelSelection::to_json),
+            legacy_thread_env_mode: self.default_thread_env_mode.clone(),
+        }
+    }
+}
+
+/// `ProjectScript` (`packages/contracts/src/project.ts`).
+#[derive(Clone, Debug, Deserialize, serde::Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectScript {
+    pub id: String,
+    pub name: String,
+    pub command: String,
+    pub icon: String,
+    pub run_on_worktree_create: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_on_settle: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_on_settle: Option<bool>,
+    #[serde(default, rename = "async", skip_serializing_if = "Option::is_none")]
+    pub run_async: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_open_preview: Option<bool>,
+}
+
+/// The icons a project script may use (`ProjectScriptIcon`).
+pub const PROJECT_SCRIPT_ICONS: [&str; 6] = ["play", "test", "lint", "configure", "build", "debug"];
+
+/// What a checkout's `t3.json` declares (`useT3ProjectFileState` in `apps/web/src/hooks`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum T3ProjectFile {
+    Loading,
+    Missing,
+    /// Present but fails to decode, so everything it declares is ignored.
+    Invalid,
+    Valid {
+        scripts: Vec<T3ProjectFileScript>,
+        /// The settings it backs (`PROJECT_FILE_BACKED_SETTINGS`) that it sets, by key.
+        settings: serde_json::Map<String, Value>,
+    },
+}
+
+/// `T3ProjectFileScript` (`packages/contracts/src/t3ProjectFile.ts`).
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct T3ProjectFileScript {
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub icon: Option<String>,
+    #[serde(default)]
+    pub run_on_worktree_create: Option<bool>,
+    #[serde(default)]
+    pub run_on_settle: Option<bool>,
+    #[serde(default)]
+    pub stop_on_settle: Option<bool>,
+    #[serde(default, rename = "async")]
+    pub run_async: Option<bool>,
+    #[serde(default)]
+    pub preview_url: Option<String>,
+    #[serde(default)]
+    pub auto_open_preview: Option<bool>,
+}
+
+impl T3ProjectFile {
+    /// `parseT3ProjectFile`: one bad script invalidates the whole file, like the schema decode.
+    pub fn parse(contents: &str) -> Self {
+        let Ok(Value::Object(file)) = serde_json::from_str::<Value>(contents) else { return Self::Invalid };
+        let literal = |key: &str, allowed: &[&str]| {
+            file.get(key).is_none_or(|value| value.as_str().is_some_and(|value| allowed.contains(&value)))
+        };
+        let fields_valid = file.get("$schema").is_none_or(Value::is_string)
+            && file.get("iconPath").is_none_or(|path| {
+                path.as_str().is_some_and(|path| !path.trim().is_empty() && path.chars().count() <= 512)
+            })
+            && literal("defaultThreadEnvMode", &["local", "worktree"])
+            && literal("worktreeSubmodules", &["recursive", "top-level", "none"]);
+        if !fields_valid {
+            return Self::Invalid;
+        }
+        let settings = ["defaultThreadEnvMode", "worktreeSubmodules"]
+            .into_iter()
+            .filter_map(|key| Some((key.to_owned(), file.get(key)?.clone())))
+            .collect();
+        let Some(scripts) = file.get("scripts") else { return Self::Valid { scripts: Vec::new(), settings } };
+        let Ok(scripts) = Vec::<T3ProjectFileScript>::deserialize(scripts) else { return Self::Invalid };
+        let valid = scripts.len() <= 50
+            && scripts.iter().all(|script| {
+                !script.name.trim().is_empty()
+                    && !script.command.trim().is_empty()
+                    && script.icon.as_deref().is_none_or(|icon| PROJECT_SCRIPT_ICONS.contains(&icon))
+                    && script.preview_url.as_deref().is_none_or(|url| !url.trim().is_empty())
+            });
+        if valid { Self::Valid { scripts, settings } } else { Self::Invalid }
+    }
+
+    pub fn scripts(&self) -> &[T3ProjectFileScript] {
+        match self {
+            Self::Valid { scripts, .. } => scripts,
+            _ => &[],
+        }
+    }
+
+    /// The value it sets for file-backed setting `key`.
+    pub fn setting(&self, key: &str) -> Option<&Value> {
+        match self {
+            Self::Valid { settings, .. } => settings.get(key),
+            _ => None,
+        }
+    }
+}
+
+/// `OrchestrationV2LinkOrigin`: the linked environment whose agent started a thread.
+#[derive(Clone, Debug, Deserialize)]
+pub struct LinkOrigin {
+    pub label: String,
+}
+
+/// `OrchestrationV2DelegatedFrom`: the thread on a linked environment whose agent delegated this one.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DelegatedFrom {
+    pub environment_id: String,
+    pub thread_id: String,
+    pub title: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Lineage {
+    #[serde(default)]
+    pub parent_thread_id: Option<String>,
+    #[serde(default)]
+    pub relationship_to_parent: Option<String>,
+    #[serde(default)]
+    pub side_chat: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingRequestSummary {
+    pub kind: String,
+    #[serde(default)]
+    pub created_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingBackgroundTask {
+    pub kind: String,
+    #[serde(default)]
+    pub awaited: Option<bool>,
+    #[serde(default)]
+    pub task_id: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub child_thread_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadGoal {
+    pub status: String,
+    #[serde(default)]
+    pub objective: String,
+    #[serde(default)]
+    pub tokens_used: Option<u64>,
+    #[serde(default)]
+    pub token_budget: Option<u64>,
+    #[serde(default)]
+    pub time_used_seconds: Option<u64>,
+    #[serde(default)]
+    pub checks: Option<u64>,
+}
+
+/// Keeps "absent" (`None`) apart from an explicit `null` (`Some(None)`).
+fn present<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(deserializer: D) -> Result<Option<T>, D::Error> {
+    T::deserialize(deserializer).map(Some)
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadShell {
+    /// The environment this thread lives on; set by [`ShellState::apply`], not the wire.
+    #[serde(skip)]
+    pub environment_id: SharedString,
+    pub id: String,
+    pub project_id: String,
+    pub title: String,
+    pub status: String,
+    /// Absent from older servers, which fall back to `status`; `null` means no activity run.
+    #[serde(default, deserialize_with = "present")]
+    pub activity_run_status: Option<Option<String>>,
+    #[serde(default)]
+    pub creation_source: Option<String>,
+    #[serde(default)]
+    pub blocked_on_thread_wait: Option<bool>,
+    #[serde(default)]
+    pub pending_runtime_request: Option<PendingRequestSummary>,
+    #[serde(default)]
+    pub lineage: Lineage,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub last_error_class: Option<String>,
+    #[serde(default)]
+    pub last_error_code: Option<String>,
+    #[serde(default)]
+    pub usage_limit_reset_at: Option<String>,
+    /// `OrchestrationV2LimitRecovery`: auto-resume or snooze set for a usage-limited run.
+    #[serde(default)]
+    pub limit_recovery: Option<Value>,
+    #[serde(default)]
+    pub has_actionable_proposed_plan: bool,
+    #[serde(default)]
+    pub pinned_at: Option<String>,
+    #[serde(default)]
+    pub archived_at: Option<String>,
+    #[serde(default)]
+    pub deleted_at: Option<String>,
+    pub updated_at: String,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub provider_instance_id: Option<String>,
+    /// `linkOrigin`: an agent on a linked environment started this thread.
+    #[serde(default)]
+    pub link_origin: Option<LinkOrigin>,
+    #[serde(default)]
+    pub delegated_from: Option<DelegatedFrom>,
+    /// `{type: "run", threadId, runId}` for a fork at a run, which names its parent.
+    #[serde(default)]
+    pub forked_from: Option<Value>,
+    #[serde(default, deserialize_with = "lossy")]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub model_selection: Option<ModelSelection>,
+    #[serde(default)]
+    pub interaction_mode: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub worktree_path: Option<String>,
+    #[serde(default)]
+    pub active_provider_thread_id: Option<String>,
+    #[serde(default)]
+    pub latest_run_id: Option<String>,
+    #[serde(default)]
+    pub active_run_id: Option<String>,
+    #[serde(default)]
+    pub latest_run_requested_at: Option<String>,
+    #[serde(default)]
+    pub latest_run_started_at: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    pub latest_run_completed_at: Option<Option<String>>,
+    /// The user stopped the latest run, which then completes without a notification.
+    #[serde(default)]
+    pub latest_run_stop_requested: Option<bool>,
+    #[serde(default, deserialize_with = "present")]
+    pub activity_run_started_at: Option<Option<String>>,
+    #[serde(default)]
+    pub latest_user_message_at: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    pub latest_user_authored_message_at: Option<Option<String>>,
+    #[serde(default)]
+    pub pending_guest_message_count: u32,
+    #[serde(default, deserialize_with = "lossy")]
+    pub pending_background_tasks: Vec<PendingBackgroundTask>,
+    #[serde(default)]
+    pub goal: Option<ThreadGoal>,
+    #[serde(default)]
+    pub title_regeneration: Option<Value>,
+    #[serde(default)]
+    pub settled_override: Option<String>,
+    #[serde(default)]
+    pub settled_at: Option<String>,
+    #[serde(default)]
+    pub unsettled_at: Option<String>,
+    #[serde(default)]
+    pub snoozed_until: Option<String>,
+    #[serde(default)]
+    pub snoozed_at: Option<String>,
+    #[serde(default)]
+    pub auto_settle_disabled_at: Option<String>,
+    #[serde(default)]
+    pub pin_order_key: Option<String>,
+    #[serde(default)]
+    pub active_order_key: Option<String>,
+    /// Absent on servers without visit tracking; `Some(None)` when never visited.
+    #[serde(default, deserialize_with = "present")]
+    pub last_visited_at: Option<Option<String>>,
+    #[serde(default)]
+    pub linked_pull_request: Option<crate::thread_pull_requests::LinkedPullRequest>,
+    #[serde(default, deserialize_with = "lossy")]
+    pub pull_requests: Vec<crate::thread_pull_requests::PullRequestLink>,
+    #[serde(default)]
+    pub branch_pull_request: Option<crate::thread_pull_requests::LinkedPullRequest>,
+    /// Open stats only rank search results, so an unreadable value reads as none (`LenientThreadOpens`).
+    #[serde(default, deserialize_with = "lenient")]
+    pub opens: Option<ThreadOpens>,
+}
+
+/// `OrchestrationV2ThreadOpens`: when the thread was last opened (epoch ms), a decaying open
+/// count, and the latest palette queries that picked it.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadOpens {
+    pub opened_at: f64,
+    pub score: f64,
+    #[serde(default)]
+    pub picks: Vec<ThreadPick>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct ThreadPick {
+    pub query: String,
+    pub at: f64,
+}
+
+fn lenient<'de, D: serde::Deserializer<'de>, T: DeserializeOwned>(deserializer: D) -> Result<Option<T>, D::Error> {
+    Ok(T::deserialize(Value::deserialize(deserializer)?).ok())
+}
+
+impl ThreadShell {
+    pub fn last_visited(&self) -> Option<&str> {
+        self.last_visited_at.as_ref()?.as_deref()
+    }
+
+    /// The server keeps a read watermark for this thread.
+    pub fn tracks_visits(&self) -> bool {
+        self.last_visited_at.is_some()
+    }
+}
+
+impl ThreadShell {
+    /// Subagents and side chats live under their parent, not in the main list.
+    pub fn is_listed(&self) -> bool {
+        self.lineage.relationship_to_parent.as_deref() != Some("subagent") && self.lineage.side_chat != Some(true)
+    }
+
+    /// The thread's identity across environments, borrowed.
+    pub fn thread_ref(&self) -> ThreadRef<'_> {
+        (&self.environment_id, &self.id)
+    }
+
+    /// The thread's project's identity across environments, borrowed.
+    pub fn project_ref(&self) -> ThreadRef<'_> {
+        (&self.environment_id, &self.project_id)
+    }
+}
+
+/// `(environment id, thread id)`, a thread's identity across environments.
+pub type ThreadRef<'a> = (&'a str, &'a str);
+
+/// A thread's or project's id on its environment (`ScopedThreadRef`, `ScopedProjectRef`): ids
+/// repeat across environments, so a bare id can name the wrong record.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ScopedId {
+    pub env: SharedString,
+    pub id: String,
+}
+
+impl ScopedId {
+    pub fn new(env: impl Into<SharedString>, id: impl Into<String>) -> Self {
+        Self { env: env.into(), id: id.into() }
+    }
+
+    pub fn of_thread(thread: &ThreadShell) -> Self {
+        Self::new(thread.environment_id.clone(), thread.id.clone())
+    }
+
+    pub fn of_project(project: &ProjectShell) -> Self {
+        Self::new(project.environment_id.clone(), project.id.clone())
+    }
+
+    /// The thread's project on the thread's environment.
+    pub fn thread_project(thread: &ThreadShell) -> Self {
+        Self::new(thread.environment_id.clone(), thread.project_id.clone())
+    }
+
+    pub fn is_thread(&self, thread: &ThreadShell) -> bool {
+        self.env == thread.environment_id && self.id == thread.id
+    }
+
+    pub fn is_project(&self, project: &ProjectShell) -> bool {
+        self.env == project.environment_id && self.id == project.id
+    }
+
+    /// `(environment, id)`, borrowed.
+    pub fn pair(&self) -> ThreadRef<'_> {
+        (&self.env, &self.id)
+    }
+}
+
+/// `hiddenThreadTagsAtom`: the tags an environment's tag filter hides, `None` while it is off.
+pub fn hidden_thread_tags(settings: &crate::settings::Settings) -> Option<Vec<String>> {
+    if !settings.bool("hideTaggedThreads") {
+        return None;
+    }
+    // Trimmed, so a hand-edited " private" still matches.
+    let tags: Vec<String> = settings
+        .get("hiddenThreadTags")
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_owned)
+        .collect();
+    (!tags.is_empty()).then_some(tags)
+}
+
+/// `hiddenThreadKeys`: the threads the tag filter hides, given each hiding environment's tags.
+/// Subagents, side chats and delegated tasks follow their parent; while any environment hides
+/// tags, one whose parent isn't loaded stays hidden.
+pub fn hidden_threads<'a>(
+    threads: &'a [ThreadShell],
+    hidden_tags: &HashMap<&str, Vec<String>>,
+) -> HashSet<ThreadRef<'a>> {
+    if hidden_tags.is_empty() {
+        return HashSet::new();
+    }
+    let by_ref: HashMap<ThreadRef, &ThreadShell> =
+        threads.iter().map(|t| ((t.environment_id.as_ref(), t.id.as_str()), t)).collect();
+    let mut known = HashMap::new();
+    by_ref.keys().copied().filter(|key| is_hidden(*key, &by_ref, hidden_tags, &mut known)).collect()
+}
+
+fn is_hidden<'a>(
+    key: ThreadRef<'a>,
+    by_ref: &HashMap<ThreadRef<'a>, &'a ThreadShell>,
+    hidden_tags: &HashMap<&str, Vec<String>>,
+    known: &mut HashMap<ThreadRef<'a>, bool>,
+) -> bool {
+    if let Some(hidden) = known.get(&key) {
+        return *hidden;
+    }
+    let Some(thread) = by_ref.get(&key) else { return false };
+    let parent = match (&thread.lineage.parent_thread_id, &thread.delegated_from) {
+        (Some(parent), _) if !thread.is_listed() => Some((key.0, parent.as_str())),
+        (_, Some(from)) => Some((from.environment_id.as_str(), from.thread_id.as_str())),
+        _ => None,
+    };
+    let hidden = match parent {
+        Some(parent) if by_ref.contains_key(&parent) => {
+            // Seeded first, so a malformed cycle ends visible.
+            known.insert(key, false);
+            is_hidden(parent, by_ref, hidden_tags, known)
+        }
+        Some(_) => true,
+        None => hidden_tags.get(key.0).is_some_and(|tags| tags.iter().any(|tag| thread.tags.contains(tag))),
+    };
+    known.insert(key, hidden);
+    hidden
+}
+
+pub fn is_active_run_status(status: &str) -> bool {
+    matches!(status, "preparing" | "queued" | "starting" | "running" | "waiting")
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ShellSnapshot {
+    snapshot_sequence: u64,
+    #[serde(default, deserialize_with = "lossy")]
+    projects: Vec<ProjectShell>,
+    #[serde(default, deserialize_with = "lossy")]
+    threads: Vec<ThreadShell>,
+    /// Present when the subscription asked to leave older settled threads out.
+    #[serde(default, deserialize_with = "lenient")]
+    older_settled: Option<crate::older_settled::CutWire>,
+}
+
+/// Thread rows read outside the shell: an older settled page, a search's older matches, or a
+/// thread family (`OrchestrationV2ThreadFamily`).
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadRows {
+    #[serde(default)]
+    pub snapshot_sequence: u64,
+    #[serde(default, deserialize_with = "lossy")]
+    pub threads: Vec<ThreadShell>,
+}
+
+/// Every environment's projects and threads in one list (the web's merged shell selectors),
+/// each tagged with its environment and fed by that environment's own subscription.
+#[derive(Default)]
+pub struct ShellState {
+    pub projects: Vec<ProjectShell>,
+    pub threads: Vec<ThreadShell>,
+    /// Counts applied elements, so views can cache what they derive from projects and threads.
+    pub revision: u64,
+    cursors: HashMap<SharedString, ShellCursor>,
+}
+
+#[derive(Default)]
+struct ShellCursor {
+    sequence: u64,
+    live: bool,
+    /// A full snapshot failed to decode, so deltas wait for the next one.
+    needs_snapshot: bool,
+    /// A full snapshot was applied; a fresh environment's is valid at sequence 0.
+    has_snapshot: bool,
+    /// Counts full snapshots, so reads made before the latest one can tell they are stale.
+    generation: u64,
+    /// Where the snapshot cut older settled threads, when it left them out.
+    older: Option<crate::older_settled::Cut>,
+    /// The sequence of each thread's latest removal since the snapshot.
+    removed_at: HashMap<String, u64>,
+    /// Threads the subscription removed, so lookups of threads it leaves out ask again.
+    removals: u64,
+}
+
+impl ShellState {
+    /// The last applied sequence of one environment's subscription, 0 before its snapshot.
+    pub fn sequence(&self, environment_id: &str) -> u64 {
+        self.cursors.get(environment_id).map_or(0, |cursor| cursor.sequence)
+    }
+
+    /// `environmentShell.hasSnapshotAtom`: the environment's shell snapshot arrived.
+    pub fn has_snapshot(&self, environment_id: &str) -> bool {
+        self.cursors.get(environment_id).is_some_and(|cursor| cursor.has_snapshot)
+    }
+
+    /// `environmentShell` status `live`: this environment's subscription caught up with its server.
+    pub fn is_live(&self, environment_id: &str) -> bool {
+        self.cursors.get(environment_id).is_some_and(|cursor| cursor.live)
+    }
+
+    /// How many threads `environment_id`'s subscription removed.
+    pub fn removals(&self, environment_id: &str) -> u64 {
+        self.cursors.get(environment_id).map_or(0, |cursor| cursor.removals)
+    }
+
+    /// Some environment's subscription caught up with its server.
+    pub fn live(&self) -> bool {
+        self.cursors.values().any(|cursor| cursor.live)
+    }
+
+    /// The thread with this id on this environment.
+    pub fn thread(&self, key: &ScopedId) -> Option<&ThreadShell> {
+        self.threads.iter().find(|t| key.is_thread(t))
+    }
+
+    /// The project with this id on this environment.
+    pub fn project(&self, key: &ScopedId) -> Option<&ProjectShell> {
+        self.projects.iter().find(|p| key.is_project(p))
+    }
+
+    /// Counts the environment's full snapshots; a read made under an older one must not merge.
+    pub fn generation(&self, environment_id: &str) -> u64 {
+        self.cursors.get(environment_id).map_or(0, |cursor| cursor.generation)
+    }
+
+    /// The environment's older settled cut, when its shell leaves those threads out.
+    pub fn older_settled(&self, environment_id: &str) -> Option<&crate::older_settled::Cut> {
+        self.cursors.get(environment_id)?.older.as_ref()
+    }
+
+    /// Every environment whose shell leaves older settled threads out, with its cut.
+    pub fn older_settled_cuts(&self) -> impl Iterator<Item = (&SharedString, &crate::older_settled::Cut)> {
+        self.cursors.iter().filter_map(|(id, cursor)| Some((id, cursor.older.as_ref()?)))
+    }
+
+    /// The environment's [`crate::older_settled::count_key`] now, when it has a cut.
+    pub fn older_settled_count_key(&self, environment_id: &str) -> Option<u64> {
+        let cursor = self.cursors.get(environment_id)?;
+        let cut = cursor.older.as_ref()?;
+        let threads = self.threads.iter().filter(|t| t.environment_id == environment_id);
+        Some(crate::older_settled::count_key(threads, cut, &cursor.removed_at))
+    }
+
+    /// Takes a count read (`getOlderSettledThreads`, `limit: 0`) made for `key` under `generation`.
+    pub fn set_older_settled_counts(
+        &mut self,
+        environment_id: &str,
+        generation: u64,
+        key: u64,
+        counts: HashMap<String, usize>,
+    ) {
+        let Some(cursor) = self.cursors.get_mut(environment_id).filter(|c| c.generation == generation) else { return };
+        let Some(cut) = cursor.older.as_mut() else { return };
+        cut.set_counts(counts, key);
+        self.revision += 1;
+    }
+
+    /// `unloadedOlderSettledCount`: older settled threads of these projects (all for `None`) on
+    /// the environment that this client does not hold: the server's count minus the older rows
+    /// it has, in any section.
+    pub fn unloaded_older_settled(&self, environment_id: &str, projects: Option<&[String]>) -> usize {
+        let Some(cut) = self.older_settled(environment_id) else { return 0 };
+        let held = self
+            .threads
+            .iter()
+            .filter(|t| t.environment_id == environment_id)
+            .filter(|t| projects.is_none_or(|ids| ids.contains(&t.project_id)))
+            .filter(|t| crate::older_settled::is_older_settled(t, cut.before_ms))
+            .count();
+        cut.count(projects).saturating_sub(held)
+    }
+
+    /// The project has threads, counting older settled ones the shell left out.
+    pub fn project_has_threads(&self, project: &ProjectShell) -> bool {
+        self.threads.iter().any(|t| t.project_ref() == project.project_ref())
+            || self.unloaded_older_settled(&project.environment_id, Some(std::slice::from_ref(&project.id))) > 0
+    }
+
+    /// `threadFamilyRowsMissingFromShell`: merges rows read outside the shell behind its own,
+    /// which win since deltas carry every change. A row the shell removed after the read is
+    /// stale, and a read made under an earlier snapshot merges nothing. Merged rows then follow
+    /// deltas like any other, until the next snapshot replaces them.
+    pub fn mount_rows(&mut self, environment_id: &SharedString, generation: u64, read: ThreadRows) -> bool {
+        let Some(cursor) = self.cursors.get(environment_id.as_ref()) else { return false };
+        let cut_sequence = cursor.older.as_ref().map_or(0, |cut| cut.as_of_sequence);
+        if cursor.generation != generation || read.snapshot_sequence < cut_sequence {
+            return false;
+        }
+        let mut added = false;
+        for mut thread in read.threads {
+            let removed = cursor.removed_at.get(&thread.id).is_some_and(|&at| at > read.snapshot_sequence);
+            if removed || self.threads.iter().any(|t| t.environment_id == *environment_id && t.id == thread.id) {
+                continue;
+            }
+            thread.environment_id = environment_id.clone();
+            self.threads.push(thread);
+            added = true;
+        }
+        if added {
+            self.revision += 1;
+        }
+        added
+    }
+
+    /// Drops an environment that was removed or switched off.
+    pub fn remove_environment(&mut self, environment_id: &str) {
+        self.projects.retain(|p| p.environment_id != environment_id);
+        self.threads.retain(|t| t.environment_id != environment_id);
+        self.cursors.remove(environment_id);
+        self.revision += 1;
+    }
+
+    /// Applies one `orchestration.subscribeShell` element of `environment_id`'s subscription.
+    pub fn apply(&mut self, environment_id: &SharedString, item: &Value) -> Result<(), serde_json::Error> {
+        let kind = item.get("kind").and_then(Value::as_str).unwrap_or_default();
+        let sequence = item.get("sequence").and_then(Value::as_u64);
+        let cursor = self.cursors.entry(environment_id.clone()).or_default();
+        if let Some(sequence) = sequence
+            && (sequence <= cursor.sequence || cursor.needs_snapshot)
+        {
+            return Ok(());
+        }
+        self.revision += 1;
+        let ours = |id: &SharedString| id == environment_id;
+        match kind {
+            "synchronized" => cursor.live = true,
+            "snapshot" => {
+                let roots = item.get("resolvedRepositoryIdentityRoots").and_then(Value::as_array);
+                let snapshot = match ShellSnapshot::deserialize(&item["snapshot"]) {
+                    Ok(snapshot) => snapshot,
+                    // An enrichment patch only refines names; the list stays usable without it.
+                    Err(error) if roots.is_some() => {
+                        log::warn!("skipping undecodable shell enrichment: {error}");
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        // Resume from scratch, so a resubscribe fetches a fresh snapshot.
+                        cursor.sequence = 0;
+                        cursor.needs_snapshot = true;
+                        return Err(error);
+                    }
+                };
+                match roots {
+                    // Enrichment patch: only repository identity changes, for these roots.
+                    Some(roots) => {
+                        for root in roots.iter().filter_map(Value::as_str) {
+                            let identity = snapshot
+                                .projects
+                                .iter()
+                                .find(|p| p.workspace_root == root)
+                                .and_then(|p| p.repository_identity.clone());
+                            for project in
+                                self.projects.iter_mut().filter(|p| ours(&p.environment_id) && p.workspace_root == root)
+                            {
+                                project.repository_identity = identity.clone();
+                            }
+                        }
+                    }
+                    None => {
+                        let mut projects = snapshot.projects;
+                        for project in &mut projects {
+                            project.environment_id = environment_id.clone();
+                            if project.repository_identity.is_none() {
+                                project.repository_identity = self
+                                    .projects
+                                    .iter()
+                                    .find(|old| {
+                                        ours(&old.environment_id) && old.workspace_root == project.workspace_root
+                                    })
+                                    .and_then(|old| old.repository_identity.clone());
+                            }
+                        }
+                        let mut threads = snapshot.threads;
+                        for thread in &mut threads {
+                            thread.environment_id = environment_id.clone();
+                        }
+                        self.projects.retain(|p| !ours(&p.environment_id));
+                        self.projects.extend(projects);
+                        self.threads.retain(|t| !ours(&t.environment_id));
+                        self.threads.extend(threads);
+                        cursor.sequence = snapshot.snapshot_sequence;
+                        cursor.needs_snapshot = false;
+                        cursor.has_snapshot = true;
+                        cursor.generation += 1;
+                        cursor.removed_at.clear();
+                        cursor.older = snapshot.older_settled.and_then(crate::older_settled::Cut::from_wire);
+                        if let Some(cut) = cursor.older.as_mut()
+                            && snapshot.snapshot_sequence == cut.as_of_sequence
+                        {
+                            // Exact as of this snapshot, until a later change moves the key.
+                            let held = self.threads.iter().filter(|t| ours(&t.environment_id));
+                            cut.counts_key = Some(crate::older_settled::count_key(held, cut, &cursor.removed_at));
+                        }
+                    }
+                }
+            }
+            // An undecodable delta is skipped but still advances the cursor, like the
+            // thread reducer: replaying it after a resubscribe would fail the same way.
+            "project.updated" => match ProjectShell::deserialize(&item["project"]) {
+                Err(error) => log::warn!("skipping undecodable project update: {error}"),
+                Ok(mut project) => {
+                    project.environment_id = environment_id.clone();
+                    match self.projects.iter_mut().find(|p| ours(&p.environment_id) && p.id == project.id) {
+                        Some(existing) => {
+                            if project.repository_identity.is_none() {
+                                project.repository_identity = existing.repository_identity.take();
+                            }
+                            *existing = project;
+                        }
+                        None => self.projects.push(project),
+                    }
+                }
+            },
+            "project.removed" => {
+                let id = item["projectId"].as_str().unwrap_or_default();
+                self.projects.retain(|p| !(ours(&p.environment_id) && p.id == id));
+            }
+            "thread.updated" => match ThreadShell::deserialize(&item["thread"]) {
+                Err(error) => log::warn!("skipping undecodable thread update: {error}"),
+                Ok(mut thread) => {
+                    thread.environment_id = environment_id.clone();
+                    let active = item.get("location").and_then(Value::as_str) == Some("active");
+                    let index = self.threads.iter().position(|t| ours(&t.environment_id) && t.id == thread.id);
+                    match (index, active) {
+                        (Some(index), true) => self.threads[index] = thread,
+                        (None, true) => self.threads.push(thread),
+                        (Some(index), false) => {
+                            self.threads.remove(index);
+                            cursor.removed_at.insert(thread.id, sequence.unwrap_or(cursor.sequence));
+                        }
+                        (None, false) => {
+                            cursor.removed_at.insert(thread.id, sequence.unwrap_or(cursor.sequence));
+                        }
+                    }
+                }
+            },
+            "thread.removed" => {
+                let id = item["threadId"].as_str().unwrap_or_default();
+                self.threads.retain(|t| !(ours(&t.environment_id) && t.id == id));
+                cursor.removed_at.insert(id.to_owned(), sequence.unwrap_or(cursor.sequence));
+                cursor.removals += 1;
+            }
+            _ => {}
+        }
+        if let Some(sequence) = sequence {
+            cursor.sequence = sequence;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppThread {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub model_selection: Option<ModelSelection>,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub runtime_mode: Option<String>,
+    #[serde(default)]
+    pub interaction_mode: Option<String>,
+    #[serde(default)]
+    pub worktree_path: Option<String>,
+    #[serde(default)]
+    pub active_provider_thread_id: Option<String>,
+    /// The instance its provider session runs on (`runtime.providerInstanceId`).
+    #[serde(default)]
+    pub provider_instance_id: Option<String>,
+    /// `"v1_import"` for a thread brought over from the old event store.
+    #[serde(default)]
+    pub history_origin: Option<String>,
+    /// Where it was forked from: `{type: "run", threadId, runId}` for a fork at a run.
+    #[serde(default)]
+    pub forked_from: Option<Value>,
+    /// Why the last `checkpoint.rollback` failed, keyed by its command id.
+    #[serde(default)]
+    pub rollback_failure: Option<RollbackFailure>,
+    /// The thread's guest link, kept after it expires until the owner stops sharing.
+    #[serde(default)]
+    pub guest_share: Option<GuestShare>,
+}
+
+/// `ThreadGuestShare`: what the header shows of a guest link.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuestShare {
+    pub expires_at: String,
+    /// Set once the guest redeems the link.
+    #[serde(default)]
+    pub guest_name: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RollbackFailure {
+    pub request_id: String,
+    pub message: String,
+}
+
+/// A context window's token counts: `ThreadTokenUsageSnapshot` on a
+/// provider thread, `OrchestrationV2ProviderTurnTokenUsage` on a provider turn.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsage {
+    pub used_tokens: u64,
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
+    #[serde(default)]
+    pub auto_compact_threshold: Option<u64>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    /// How long the provider keeps the prompt cache; a live turn's usage reports it.
+    #[serde(default)]
+    pub prompt_cache_ttl_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderThread {
+    pub id: String,
+    #[serde(default)]
+    pub context_usage: Option<TokenUsage>,
+    #[serde(default)]
+    pub provider_session_id: Option<String>,
+    #[serde(default)]
+    pub provider_instance_id: Option<String>,
+    #[serde(default)]
+    pub app_thread_id: Option<String>,
+    /// The provider's own thread, which a handoff resumes from.
+    #[serde(default)]
+    pub native_thread_ref: Option<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSession {
+    pub id: String,
+    pub status: String,
+    #[serde(default)]
+    pub driver: Option<String>,
+    /// `OrchestrationV2ProviderCapabilities`.
+    #[serde(default)]
+    pub capabilities: Value,
+    #[serde(default)]
+    pub provider_instance_id: Option<String>,
+    /// Transient status lines a provider extension shows, such as Pi's.
+    #[serde(default, deserialize_with = "lossy")]
+    pub extension_statuses: Vec<ExtensionStatus>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct ExtensionStatus {
+    pub key: String,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderTurn {
+    pub id: String,
+    #[serde(default)]
+    pub token_usage: Option<TokenUsage>,
+    #[serde(default)]
+    pub provider_thread_id: Option<String>,
+    #[serde(default)]
+    pub run_attempt_id: Option<String>,
+    #[serde(default)]
+    pub ordinal: i64,
+    #[serde(default)]
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Run {
+    pub id: String,
+    pub status: String,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub completed_at: Option<String>,
+    #[serde(default)]
+    pub ordinal: i64,
+    #[serde(default)]
+    pub active_attempt_id: Option<String>,
+    #[serde(default)]
+    pub provider_thread_id: Option<String>,
+    #[serde(default)]
+    pub user_message_id: Option<String>,
+    #[serde(default)]
+    pub queue_position: Option<i64>,
+    /// Set on the run that delivers subagent results back, which the user can't edit.
+    #[serde(default)]
+    pub delegated_completion: Option<Value>,
+    #[serde(default)]
+    pub workspace_preparation: Option<Value>,
+    #[serde(default)]
+    pub root_node_id: Option<String>,
+    /// A queued run the server holds until the thread is resumed.
+    #[serde(default)]
+    pub queue_held: bool,
+    /// Starts a new provider conversation; earlier runs stay visible but never reach the provider.
+    #[serde(default)]
+    pub fresh_context: bool,
+    #[serde(default)]
+    pub provider_instance_id: Option<String>,
+    #[serde(default)]
+    pub model_selection: Option<ModelSelection>,
+    #[serde(default)]
+    pub context_handoff_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunAttempt {
+    pub id: String,
+    pub run_id: String,
+    #[serde(default)]
+    pub root_node_id: Option<String>,
+    pub status: String,
+    #[serde(default)]
+    pub provider_turn_id: Option<String>,
+    #[serde(default)]
+    pub completed_at: Option<String>,
+}
+
+/// A captured checkpoint, the target of `checkpoint.rollback`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Checkpoint {
+    pub id: String,
+    pub scope_id: String,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub ordinal_within_scope: i64,
+    #[serde(default)]
+    pub app_run_ordinal: Option<i64>,
+    pub status: String,
+    #[serde(default)]
+    pub captured_at: String,
+    #[serde(default)]
+    pub files: Vec<CheckpointFile>,
+    /// Sent when `files` is a prefix; covers the full list.
+    #[serde(default)]
+    pub files_total: Option<CheckpointFileTotals>,
+}
+
+impl Checkpoint {
+    /// `checkpointFileTotals`.
+    pub fn file_totals(&self) -> CheckpointFileTotals {
+        self.files_total.clone().unwrap_or_else(|| CheckpointFileTotals {
+            count: self.files.len() as u64,
+            additions: self.files.iter().map(|f| f.additions).sum(),
+            deletions: self.files.iter().map(|f| f.deletions).sum(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckpointFile {
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub additions: u64,
+    #[serde(default)]
+    pub deletions: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct CheckpointFileTotals {
+    pub count: u64,
+    pub additions: u64,
+    pub deletions: u64,
+}
+
+/// An execution node; items reach their run attempt through `parentNodeId`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionNode {
+    pub id: String,
+    #[serde(default)]
+    pub parent_node_id: Option<String>,
+    #[serde(default)]
+    pub root_node_id: Option<String>,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub completed_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeRequest {
+    pub id: String,
+    pub kind: String,
+    pub status: String,
+    #[serde(default)]
+    pub response_capability: Value,
+    /// A resolved question's answers, keyed by question.
+    #[serde(default)]
+    pub answers: Value,
+}
+
+impl RuntimeRequest {
+    pub fn is_live(&self) -> bool {
+        self.capability() == Some("live")
+    }
+
+    pub fn capability(&self) -> Option<&str> {
+        self.response_capability.get("type").and_then(Value::as_str)
+    }
+
+    pub fn supports_feedback(&self) -> bool {
+        self.is_live() && self.response_capability.get("supportsFeedback").and_then(Value::as_bool) == Some(true)
+    }
+}
+
+/// A turn item. `raw` holds the whole record for type-specific fields.
+#[derive(Clone, Debug)]
+pub struct TurnItem {
+    pub id: String,
+    pub item_type: String,
+    pub thread_id: String,
+    pub run_id: Option<String>,
+    pub node_id: Option<String>,
+    pub ordinal: i64,
+    pub status: String,
+    /// The stream sequence that last wrote this item; 0 when unknown.
+    pub revision: u64,
+    pub raw: Value,
+}
+
+impl<'de> Deserialize<'de> for TurnItem {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = Value::deserialize(deserializer)?;
+        let text = |key: &str| raw.get(key).and_then(Value::as_str).map(str::to_owned);
+        let id = text("id").ok_or_else(|| serde::de::Error::missing_field("id"))?;
+        Ok(Self {
+            id,
+            item_type: text("type").unwrap_or_default(),
+            thread_id: text("threadId").unwrap_or_default(),
+            run_id: text("runId"),
+            node_id: text("nodeId"),
+            ordinal: raw.get("ordinal").and_then(Value::as_i64).unwrap_or_default(),
+            status: text("status").unwrap_or_default(),
+            revision: 0,
+            raw,
+        })
+    }
+}
+
+impl TurnItem {
+    pub fn str(&self, key: &str) -> Option<&str> {
+        self.raw.get(key).and_then(Value::as_str)
+    }
+
+    pub fn bool(&self, key: &str) -> bool {
+        self.raw.get(key).and_then(Value::as_bool) == Some(true)
+    }
+
+    /// A bare `/compact` prompt (`isCompactCommandMessage`): it runs a compaction, not a turn.
+    pub fn is_bare_compact(&self) -> bool {
+        self.str("text").is_some_and(|text| text.trim().eq_ignore_ascii_case("/compact"))
+            && self.raw.get("attachments").and_then(Value::as_array).is_none_or(Vec::is_empty)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VisibleRow {
+    pub visibility: String,
+    pub source_thread_id: String,
+    pub source_item_id: String,
+    /// Shared with `turn_items`: a streamed update is stored once.
+    pub item: Rc<TurnItem>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadProjection {
+    pub thread: AppThread,
+    /// `contextTransfers`: context carried between threads, such as a fork's source usage.
+    #[serde(default, deserialize_with = "lossy")]
+    pub context_transfers: Vec<Value>,
+    #[serde(default, deserialize_with = "lossy")]
+    pub runs: Vec<Run>,
+    #[serde(default, deserialize_with = "lossy")]
+    pub attempts: Vec<RunAttempt>,
+    #[serde(default, deserialize_with = "lossy")]
+    pub runtime_requests: Vec<RuntimeRequest>,
+    #[serde(default, deserialize_with = "lossy")]
+    pub turn_items: Vec<Rc<TurnItem>>,
+    /// The user's `messages`: a queued run's message is only here until the run starts.
+    #[serde(default, deserialize_with = "user_messages")]
+    pub messages: Vec<TurnItem>,
+    /// The timeline, in render order.
+    #[serde(default, deserialize_with = "lossy")]
+    pub visible_turn_items: Vec<VisibleRow>,
+    #[serde(default, deserialize_with = "lossy")]
+    pub provider_threads: Vec<ProviderThread>,
+    #[serde(default, deserialize_with = "lossy")]
+    pub provider_turns: Vec<ProviderTurn>,
+    #[serde(default, deserialize_with = "lossy")]
+    pub checkpoints: Vec<Checkpoint>,
+    #[serde(default, deserialize_with = "lossy")]
+    pub nodes: Vec<ExecutionNode>,
+    #[serde(default, deserialize_with = "lossy")]
+    pub provider_sessions: Vec<ProviderSession>,
+    #[serde(default, deserialize_with = "lossy")]
+    pub subagents: Vec<Subagent>,
+}
+
+/// `OrchestrationV2Subagent`, as far as Thread details reads it.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Subagent {
+    pub id: String,
+    pub thread_id: String,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub child_thread_id: Option<String>,
+    /// `provider_native` or `app_owned`.
+    pub origin: String,
+    pub driver: String,
+    #[serde(default)]
+    pub native_task_ref: Option<NativeTaskRef>,
+    #[serde(default)]
+    pub title: Option<String>,
+    pub status: String,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub completed_at: Option<String>,
+    /// A provider-native workflow coordinator's plan and agents (`OrchestrationV2SubagentWorkflow`).
+    #[serde(default)]
+    pub workflow: Option<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeTaskRef {
+    #[serde(default)]
+    pub native_id: Option<String>,
+    pub strength: String,
+}
+
+impl ThreadProjection {
+    /// `latestExecutedRun`: the run that ran last, unfinished runs counting as latest.
+    pub fn latest_executed_run(&self) -> Option<&Run> {
+        let end = |run: &Run| run.completed_at.as_deref().and_then(crate::timestamp::parse_ms).unwrap_or(i64::MAX);
+        self.runs
+            .iter()
+            .filter(|run| run.status != "queued" && !(run.status == "cancelled" && run.started_at.is_none()))
+            .max_by(|a, b| end(a).cmp(&end(b)).then(a.ordinal.cmp(&b.ordinal)))
+    }
+
+    /// `deriveResumableRunId`: an interrupted last run, or one its provider failed for usage limits.
+    pub fn resumable_run_id(&self) -> Option<&str> {
+        let run = self.latest_executed_run()?;
+        if run.status == "interrupted" {
+            return Some(&run.id);
+        }
+        if run.status != "failed" {
+            return None;
+        }
+        let failure = self
+            .turn_items
+            .iter()
+            .filter(|item| {
+                item.item_type == "error"
+                    && item.status == "failed"
+                    && item.run_id.as_deref() == Some(&run.id)
+                    && item.node_id.is_some()
+                    && item.node_id == run.root_node_id
+            })
+            .max_by(|a, b| {
+                let at =
+                    |item: &TurnItem| item.str("updatedAt").and_then(crate::timestamp::parse_ms).unwrap_or_default();
+                at(a).cmp(&at(b)).then(a.ordinal.cmp(&b.ordinal)).then(a.id.cmp(&b.id))
+            })?;
+        (failure.raw["failure"]["class"] == "usage_limit").then_some(run.id.as_str())
+    }
+
+    /// Queued runs the server holds until the thread resumes.
+    pub fn has_held_queued_runs(&self) -> bool {
+        self.runs.iter().any(|run| run.status == "queued" && run.queue_held)
+    }
+
+    /// The newest turn report, else a native fork's source usage, else the active provider
+    /// thread's snapshot, else the last compaction's counts, as `latestProviderTurnTokenUsage` +
+    /// `deriveLatestContextWindowSnapshot` in `packages/client-runtime/src/state/contextWindow.ts`.
+    pub fn context_usage(&self) -> Option<Cow<'_, TokenUsage>> {
+        self.context_window().map(|(usage, _)| usage)
+    }
+
+    /// `context_usage` and whether it is a live turn report.
+    pub fn context_window(&self) -> Option<(Cow<'_, TokenUsage>, bool)> {
+        let mut latest: Option<&TokenUsage> = None;
+        for usage in self.provider_turns.iter().filter_map(|turn| turn.token_usage.as_ref()) {
+            // Ties go to the later entry, since live upserts append.
+            if latest.is_none_or(|current| usage.updated_at >= current.updated_at) {
+                latest = Some(usage);
+            }
+        }
+        if let Some(usage) = latest {
+            return Some((Cow::Borrowed(usage), true));
+        }
+        let active = self.thread.active_provider_thread_id.as_ref();
+        let snapshot = active
+            .and_then(|active| self.provider_threads.iter().find(|thread| &thread.id == active))
+            .and_then(|thread| thread.context_usage.as_ref());
+        match snapshot {
+            Some(usage) => Some((Cow::Borrowed(usage), false)),
+            None => match self.fork_source_usage() {
+                Some(usage) => Some((Cow::Owned(usage), true)),
+                None => self.compaction_usage().map(|usage| (Cow::Owned(usage), false)),
+            },
+        }
+    }
+
+    /// A fork's first context: the usage its source run had, until its own provider reports.
+    fn fork_source_usage(&self) -> Option<TokenUsage> {
+        let forked = self.thread.forked_from.as_ref().filter(|forked| forked["type"] == "run")?;
+        let instance = self.thread.model_selection.as_ref()?.instance_id.as_str();
+        let (source, run) = (forked["threadId"].as_str()?, forked["runId"].as_str()?);
+        let transfer = self.context_transfers.iter().find(|transfer| {
+            transfer["type"] == "fork"
+                && transfer["targetThreadId"] == self.thread.id.as_str()
+                && transfer["sourceThreadId"] == source
+                && transfer["sourcePoint"]["runId"] == run
+                && transfer["sourceProviderInstanceId"] == instance
+                && (transfer["status"] == "pending" || transfer["resolution"]["strategy"] == "native_fork")
+        })?;
+        serde_json::from_value(transfer["sourceTokenUsage"].clone()).ok()
+    }
+
+    /// The newest compaction's after count.
+    fn compaction_usage(&self) -> Option<TokenUsage> {
+        self.visible_turn_items.iter().rev().filter(|row| row.item.item_type == "compaction").find_map(|row| {
+            let item = &row.item.raw;
+            Some(TokenUsage {
+                used_tokens: item["afterTokenCount"].as_u64()?,
+                max_tokens: None,
+                auto_compact_threshold: None,
+                updated_at: item["startedAt"].as_str().or_else(|| item["updatedAt"].as_str()).map(str::to_owned),
+                prompt_cache_ttl_ms: None,
+            })
+        })
+    }
+
+    /// `deriveProviderExtensionStatuses`: only the selected provider's current session can supply them.
+    pub fn provider_extension_statuses(&self) -> &[ExtensionStatus] {
+        let Some(instance_id) = self.thread.model_selection.as_ref().map(|s| &s.instance_id) else { return &[] };
+        let active =
+            self.provider_threads.iter().find(|t| Some(&t.id) == self.thread.active_provider_thread_id.as_ref());
+        if active.is_some_and(|t| t.provider_instance_id.as_ref() != Some(instance_id)) {
+            return &[];
+        }
+        let session = self.provider_sessions.iter().rev().find(|session| {
+            session.provider_instance_id.as_ref() == Some(instance_id)
+                && active.is_none_or(|t| t.provider_session_id.as_ref() == Some(&session.id))
+        });
+        match session {
+            Some(session) if session.status != "stopped" => &session.extension_statuses,
+            _ => &[],
+        }
+    }
+
+    /// `threadHasStarted`: it ran, holds items, or has a provider session.
+    pub fn has_started(&self) -> bool {
+        !self.runs.is_empty() || !self.turn_items.is_empty() || self.provider_session().is_some()
+    }
+
+    /// `threadSupportsProviderHandoff`: its next turn may move to another provider.
+    pub fn supports_provider_handoff(&self) -> bool {
+        if let Some(session) = self.provider_session() {
+            return session.capabilities["sessions"]["supportsProviderSwitchingViaHandoff"].as_bool() == Some(true);
+        }
+        if self.runs.iter().any(|run| is_active_run_status(&run.status)) {
+            return false;
+        }
+        if self.thread.history_origin.as_deref() == Some("v1_import") || self.runs.is_empty() {
+            return true;
+        }
+        // A stopped session leaves the projection, but its native thread can still hand off.
+        let instance = self.thread.model_selection.as_ref().map(|s| &s.instance_id);
+        self.provider_threads.iter().any(|thread| {
+            Some(&thread.id) == self.thread.active_provider_thread_id.as_ref()
+                && thread.app_thread_id.as_ref() == Some(&self.thread.id)
+                && thread.provider_instance_id.as_ref() == instance
+                && thread.native_thread_ref.as_ref().is_some_and(|r| !r.is_null())
+        })
+    }
+
+    /// A user message by id: from `messages`, like the web, else from its `user_message` item.
+    pub fn user_message(&self, message_id: &str) -> Option<&TurnItem> {
+        self.messages.iter().rev().find(|message| message.id == message_id).or_else(|| {
+            let item = self
+                .turn_items
+                .iter()
+                .rev()
+                .find(|item| item.item_type == "user_message" && item.str("messageId") == Some(message_id));
+            item.map(Rc::as_ref)
+        })
+    }
+
+    /// `resolveThreadProviderSession` in `packages/client-runtime/src/state/threadWorkflows.ts`.
+    pub fn provider_session(&self) -> Option<&ProviderSession> {
+        let active = self.runs.iter().rev().find(|run| is_active_run_status(&run.status));
+        let provider_thread_id =
+            active.and_then(|run| run.provider_thread_id.as_ref()).or(self.thread.active_provider_thread_id.as_ref());
+        let attached = provider_thread_id
+            .and_then(|id| self.provider_threads.iter().find(|thread| &thread.id == id))
+            .or_else(|| {
+                self.provider_threads.iter().find(|thread| {
+                    thread.app_thread_id.as_ref() == Some(&self.thread.id) && thread.provider_session_id.is_some()
+                })
+            });
+        match attached.and_then(|thread| thread.provider_session_id.as_ref()) {
+            Some(id) => self.provider_sessions.iter().find(|session| &session.id == id),
+            None => self.provider_sessions.iter().rev().find(|s| !matches!(s.status.as_str(), "stopped" | "error")),
+        }
+    }
+
+    /// `turnEnded`: the provider finished this active run's latest turn, though the run has not settled yet.
+    pub fn turn_ended(&self, run: &Run) -> bool {
+        let activity = matches!(run.status.as_str(), "preparing" | "starting" | "running" | "waiting");
+        let Some(attempt) = run.active_attempt_id.as_ref().filter(|_| activity) else { return false };
+        // `latestProviderTurnForAttempt`: the first turn with the highest ordinal.
+        let latest = self.provider_turns.iter().filter(|turn| turn.run_attempt_id.as_ref() == Some(attempt)).fold(
+            None,
+            |latest: Option<&ProviderTurn>, turn| match latest {
+                Some(latest) if turn.ordinal <= latest.ordinal => Some(latest),
+                _ => Some(turn),
+            },
+        );
+        latest.is_some_and(|turn| !matches!(turn.status.as_str(), "pending" | "running"))
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.runs.iter().any(|run| is_active_run_status(&run.status))
+    }
+
+    /// `isCompacting` in `ChatView.tsx`: the active run is compacting, so it cannot take steering.
+    pub fn is_compacting(&self) -> bool {
+        let Some(run) = self.interruptible_run().map(|run| Some(&run.id)) else { return false };
+        let compaction = |done: bool| {
+            self.visible_turn_items.iter().any(|row| {
+                let item = &row.item;
+                item.item_type == "compaction"
+                    && item.run_id.as_ref() == run
+                    && if done {
+                        matches!(item.status.as_str(), "completed" | "failed" | "interrupted" | "cancelled")
+                    } else {
+                        item.status == "running"
+                    }
+            })
+        };
+        let compact_request = self
+            .visible_turn_items
+            .iter()
+            .rfind(|row| row.item.item_type == "user_message")
+            .is_some_and(|row| row.item.is_bare_compact() && row.item.run_id.as_ref() == run);
+        compaction(false) || (compact_request && !compaction(true))
+    }
+
+    /// The run `run.interrupt` should target: the last unfinished one.
+    pub fn interruptible_run(&self) -> Option<&Run> {
+        self.runs
+            .iter()
+            .rev()
+            .find(|run| matches!(run.status.as_str(), "preparing" | "starting" | "running" | "waiting"))
+    }
+
+    /// Pending approvals joined to their `approval_request` item, oldest first.
+    pub fn pending_approvals(&self) -> Vec<(&RuntimeRequest, Option<&TurnItem>)> {
+        self.pending_requests(
+            |kind| !matches!(kind, "user_input" | "auth_refresh" | "dynamic_tool_call"),
+            "approval_request",
+        )
+    }
+
+    /// Pending questions joined to their `user_input_request` item; requests
+    /// whose item has not arrived yet are skipped, as `derivePendingThreadRequests` does.
+    pub fn pending_user_inputs(&self) -> Vec<(&RuntimeRequest, &TurnItem)> {
+        self.pending_requests(|kind| kind == "user_input", "user_input_request")
+            .into_iter()
+            .filter_map(|(request, item)| Some((request, item?)))
+            .collect()
+    }
+
+    fn pending_requests(
+        &self,
+        kind: impl Fn(&str) -> bool,
+        item_type: &str,
+    ) -> Vec<(&RuntimeRequest, Option<&TurnItem>)> {
+        self.runtime_requests
+            .iter()
+            .filter(|request| request.status == "pending" && kind(&request.kind))
+            .map(|request| {
+                let item = self
+                    .turn_items
+                    .iter()
+                    .rev()
+                    .find(|item| item.item_type == item_type && item.str("requestId") == Some(request.id.as_str()));
+                (request, item.map(Rc::as_ref))
+            })
+            .collect()
+    }
+
+    fn apply_event(&mut self, event: &Value, sequence: u64) -> Result<(), serde_json::Error> {
+        let event_type = event.get("type").and_then(Value::as_str).unwrap_or_default();
+        let payload = &event["payload"];
+        match event_type {
+            "run.created" | "run.updated" => {
+                upsert(&mut self.runs, Run::deserialize(payload)?, |r| &r.id);
+                self.refilter_visible();
+            }
+            "run-attempt.created" | "run-attempt.updated" => {
+                upsert(&mut self.attempts, RunAttempt::deserialize(payload)?, |a| &a.id);
+                self.refilter_visible();
+            }
+            "runtime-request.updated" => {
+                upsert(&mut self.runtime_requests, RuntimeRequest::deserialize(payload)?, |r| &r.id);
+            }
+            "message.updated" => {
+                if let Some(message) = user_message_record(payload.clone()) {
+                    upsert(&mut self.messages, message, |m| &m.id);
+                }
+            }
+            "turn-item.updated" => {
+                let mut item = TurnItem::deserialize(payload)?;
+                item.revision = sequence;
+                self.apply_turn_item(item);
+            }
+            "provider-thread.updated" => {
+                upsert(&mut self.provider_threads, ProviderThread::deserialize(payload)?, |t| &t.id);
+            }
+            "provider-turn.updated" => {
+                let mut turn = ProviderTurn::deserialize(payload)?;
+                if turn.token_usage.is_none() {
+                    let previous = self.provider_turns.iter().find(|t| t.id == turn.id);
+                    turn.token_usage = previous.and_then(|t| t.token_usage.clone());
+                }
+                upsert(&mut self.provider_turns, turn, |t| &t.id);
+            }
+            "checkpoint.captured" => upsert(&mut self.checkpoints, Checkpoint::deserialize(payload)?, |c| &c.id),
+            "node.updated" => upsert(&mut self.nodes, ExecutionNode::deserialize(payload)?, |n| &n.id),
+            "subagent.updated" => upsert(&mut self.subagents, Subagent::deserialize(payload)?, |a| &a.id),
+            "provider-session.attached" | "provider-session.updated" => {
+                upsert(&mut self.provider_sessions, ProviderSession::deserialize(payload)?, |s| &s.id);
+            }
+            "provider-session.detached" => {
+                let id = payload["providerSessionId"].as_str().unwrap_or_default();
+                if let Some(session) = self.provider_sessions.iter_mut().find(|s| s.id == id) {
+                    session.status = "stopped".into();
+                }
+            }
+            "thread.pull-request-link-updated" => {}
+            kind if kind.starts_with("thread.") => self.thread = AppThread::deserialize(payload)?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn apply_turn_item(&mut self, item: TurnItem) {
+        let item = Rc::new(item);
+        let was_interrupt_request = self
+            .turn_items
+            .iter()
+            .any(|existing| existing.id == item.id && existing.item_type == "run_interrupt_request");
+        let is_interrupt_request = item.item_type == "run_interrupt_request";
+        upsert(&mut self.turn_items, item.clone(), |i| &i.id);
+        // Only interrupt requests change other rows' visibility.
+        if is_interrupt_request || was_interrupt_request {
+            self.refilter_visible();
+        }
+        if self.is_visible(&item) {
+            self.upsert_visible(item);
+        } else {
+            self.visible_turn_items.retain(|row| row.source_item_id != item.id);
+        }
+    }
+
+    /// `isOrchestrationV2TurnItemVisible` in `packages/shared/src/orchestrationV2Timeline.ts`.
+    fn is_visible(&self, item: &TurnItem) -> bool {
+        let run_status = item
+            .run_id
+            .as_ref()
+            .and_then(|id| self.runs.iter().find(|run| &run.id == id))
+            .map(|run| run.status.as_str());
+        if run_status == Some("rolled_back") {
+            return false;
+        }
+        if run_status == Some("cancelled")
+            && item.item_type == "user_message"
+            && item.str("inputIntent") == Some("queued_turn")
+        {
+            return false;
+        }
+        if item.item_type == "run_interrupt_result"
+            && let (Some(run_id), Some(node_id)) = (&item.run_id, &item.node_id)
+        {
+            let superseded = self.attempts.iter().any(|attempt| {
+                &attempt.run_id == run_id
+                    && attempt.root_node_id.as_ref() == Some(node_id)
+                    && attempt.status == "superseded"
+            });
+            let has_request = self.turn_items.iter().any(|candidate| {
+                candidate.item_type == "run_interrupt_request" && candidate.run_id.as_ref() == Some(run_id)
+            });
+            if superseded && !has_request {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn refilter_visible(&mut self) {
+        let hidden: Vec<String> = self
+            .visible_turn_items
+            .iter()
+            .filter(|row| row.visibility == "local" && !self.is_visible(&row.item))
+            .map(|row| row.source_item_id.clone())
+            .collect();
+        if !hidden.is_empty() {
+            self.visible_turn_items.retain(|row| !hidden.contains(&row.source_item_id));
+        }
+    }
+
+    /// `upsertVisibleTurnItem`: replace in place when the ordinal is unchanged,
+    /// else insert before the first later local row.
+    fn upsert_visible(&mut self, item: Rc<TurnItem>) {
+        let rows = &mut self.visible_turn_items;
+        let existing = rows.iter().rposition(|row| row.source_item_id == item.id);
+        if let Some(index) = existing {
+            let row = &rows[index];
+            if row.visibility == "local" && row.source_thread_id == item.thread_id && row.item.ordinal == item.ordinal {
+                rows[index].item = item;
+                return;
+            }
+            rows.remove(index);
+        }
+        let insertion = rows
+            .iter()
+            .position(|row| {
+                row.visibility == "local"
+                    && (row.item.ordinal > item.ordinal || (row.item.ordinal == item.ordinal && row.item.id > item.id))
+            })
+            .unwrap_or(rows.len());
+        let row = VisibleRow {
+            visibility: "local".into(),
+            source_thread_id: item.thread_id.clone(),
+            source_item_id: item.id.clone(),
+            item,
+        };
+        rows.insert(insertion, row);
+    }
+}
+
+/// A `messages` record the projection keeps: a user's, read like its `user_message` item, so
+/// `messageId` is its `id`. Assistant messages stream, and their turn items already hold them.
+fn user_message_record(mut raw: Value) -> Option<TurnItem> {
+    if raw.get("role").and_then(Value::as_str) != Some("user") {
+        return None;
+    }
+    let id = raw.get("id")?.clone();
+    raw.as_object_mut()?.insert("messageId".to_owned(), id);
+    TurnItem::deserialize(raw).map_err(|error| log::warn!("skipping undecodable message: {error}")).ok()
+}
+
+fn user_messages<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<TurnItem>, D::Error> {
+    Ok(Vec::<Value>::deserialize(deserializer)?.into_iter().filter_map(user_message_record).collect())
+}
+
+fn upsert<T>(items: &mut Vec<T>, item: T, id: impl Fn(&T) -> &String) {
+    match items.iter().position(|existing| id(existing) == id(&item)) {
+        Some(index) => items[index] = item,
+        None => items.push(item),
+    }
+}
+
+/// One open thread's projection and resume cursor.
+#[derive(Default)]
+pub struct ThreadState {
+    pub projection: Option<ThreadProjection>,
+    pub sequence: u64,
+    pub live: bool,
+    /// Set by `thread.deleted`; the view should close.
+    pub deleted: bool,
+}
+
+impl ThreadState {
+    /// Applies one `orchestration.subscribeThread` element.
+    pub fn apply(&mut self, item: &Value) -> Result<(), serde_json::Error> {
+        match item.get("kind").and_then(Value::as_str).unwrap_or_default() {
+            "synchronized" => self.live = true,
+            "snapshot" => {
+                let sequence = item["snapshotSequence"].as_u64().unwrap_or_default();
+                match ThreadProjection::deserialize(&item["projection"]) {
+                    Ok(mut projection) => {
+                        // Freshly decoded, so every item is still unique and can be stamped.
+                        for item in &mut projection.turn_items {
+                            if let Some(item) = Rc::get_mut(item) {
+                                item.revision = sequence;
+                            }
+                        }
+                        // Rows share the table's item, so later updates replace one allocation.
+                        let by_id: std::collections::HashMap<&str, &Rc<TurnItem>> =
+                            projection.turn_items.iter().map(|item| (item.id.as_str(), item)).collect();
+                        let shared: Vec<Option<Rc<TurnItem>>> = projection
+                            .visible_turn_items
+                            .iter()
+                            .map(|row| by_id.get(row.item.id.as_str()).map(|item| Rc::clone(item)))
+                            .collect();
+                        for (row, shared) in projection.visible_turn_items.iter_mut().zip(shared) {
+                            match shared {
+                                Some(item) if item.thread_id == row.item.thread_id => row.item = item,
+                                _ => {
+                                    if let Some(item) = Rc::get_mut(&mut row.item) {
+                                        item.revision = sequence;
+                                    }
+                                }
+                            }
+                        }
+                        self.projection = Some(projection);
+                        self.sequence = sequence;
+                    }
+                    Err(error) => {
+                        // Resume from scratch, so a resubscribe fetches a fresh snapshot.
+                        self.projection = None;
+                        self.sequence = 0;
+                        return Err(error);
+                    }
+                }
+            }
+            "event" => {
+                let sequence = item["sequence"].as_u64().unwrap_or_default();
+                // Without a projection the cursor stays put, so a resubscribe refetches the snapshot.
+                let Some(projection) = self.projection.as_mut().filter(|_| !self.deleted) else { return Ok(()) };
+                if sequence <= self.sequence {
+                    return Ok(());
+                }
+                self.sequence = sequence;
+                let event = &item["event"];
+                if event.get("type").and_then(Value::as_str) == Some("thread.deleted") {
+                    self.deleted = true;
+                } else if let Err(error) = projection.apply_event(event, sequence) {
+                    // An event we cannot decode still advances the cursor, like `unknown-event`.
+                    log::warn!("skipping undecodable thread event {sequence}: {error}");
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    const ENV: &str = "env-a";
+
+    fn thread(id: &str, updated_at: &str) -> Value {
+        json!({"id": id, "projectId": "p", "title": id, "status": "idle", "updatedAt": updated_at, "lineage": {"rootThreadId": id}})
+    }
+
+    fn project(root: &str, identity: Option<&str>) -> Value {
+        json!({"id": root, "title": root, "workspaceRoot": root, "repositoryIdentity": identity.map(|name| json!({"displayName": name, "canonicalKey": name})), "scripts": []})
+    }
+
+    #[test]
+    fn tagged_threads_hide_with_their_children_and_delegated_tasks() {
+        let shell = |env: &str, id: &str, fields: Value| {
+            let mut value = thread(id, "1");
+            value.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
+            let mut shell: ThreadShell = serde_json::from_value(value).unwrap();
+            shell.environment_id = env.to_owned().into();
+            shell
+        };
+        let subagent = |parent: &str| json!({"lineage": {"rootThreadId": parent, "parentThreadId": parent, "relationshipToParent": "subagent"}});
+        let threads = [
+            shell("a", "private", json!({"tags": ["private"]})),
+            shell("a", "plain", json!({"tags": ["work"]})),
+            shell("a", "child", subagent("private")),
+            shell("a", "orphan", subagent("missing")),
+            // A listed fork keeps its own visibility.
+            shell(
+                "a",
+                "fork",
+                json!({"lineage": {"rootThreadId": "private", "parentThreadId": "private", "relationshipToParent": "fork"}}),
+            ),
+            shell(
+                "b",
+                "delegated",
+                json!({"delegatedFrom": {"environmentId": "a", "threadId": "private", "title": "p"}}),
+            ),
+            // Environment b hides nothing, so its own tags stay visible.
+            shell("b", "private", json!({"tags": ["private"]})),
+        ];
+        let tags = HashMap::from([("a", vec!["private".to_owned()])]);
+        let mut hidden: Vec<_> = hidden_threads(&threads, &tags).into_iter().collect();
+        hidden.sort_unstable();
+        assert_eq!(hidden, [("a", "child"), ("a", "orphan"), ("a", "private"), ("b", "delegated")]);
+        assert!(hidden_threads(&threads, &HashMap::new()).is_empty());
+
+        let mut settings = crate::settings::Settings::server_defaults();
+        settings.set("hiddenThreadTags", json!([" private ", ""]));
+        assert_eq!(hidden_thread_tags(&settings), None);
+        settings.set("hideTaggedThreads", json!(true));
+        assert_eq!(hidden_thread_tags(&settings), Some(vec!["private".to_owned()]));
+        settings.set("hiddenThreadTags", json!([" "]));
+        assert_eq!(hidden_thread_tags(&settings), None);
+    }
+
+    #[test]
+    fn shell_enrichment_snapshot_only_patches_identity() {
+        let mut shell = ShellState::default();
+        shell.apply(&ENV.into(), &json!({"kind":"snapshot","snapshot":{"snapshotSequence":5,"projects":[project("a", None), project("b", None)],"threads":[thread("t", "1")]}}))
+            .unwrap();
+        shell.apply(&ENV.into(), &json!({"kind":"snapshot","resolvedRepositoryIdentityRoots":["a"],"snapshot":{"snapshotSequence":5,"projects":[project("a", Some("repo"))],"threads":[]}}))
+            .unwrap();
+        assert_eq!(shell.threads.len(), 1);
+        assert_eq!(shell.projects.len(), 2);
+        assert_eq!(shell.projects[0].repository_identity.as_ref().unwrap().display_name.as_deref(), Some("repo"));
+    }
+
+    #[test]
+    fn an_undecodable_shell_delta_is_skipped_but_advances_the_cursor() {
+        let mut shell = ShellState::default();
+        shell.apply(&ENV.into(), &json!({"kind":"snapshot","snapshot":{"snapshotSequence":5,"projects":[],"threads":[thread("t", "1")]}})).unwrap();
+        // Not an error: only a failed full snapshot asks for a resubscribe.
+        shell
+            .apply(&ENV.into(), &json!({"kind":"thread.updated","sequence":6,"location":"active","thread":{"id": 1}}))
+            .unwrap();
+        assert_eq!(shell.sequence(ENV), 6);
+        assert_eq!(shell.threads.len(), 1);
+    }
+
+    #[test]
+    fn shell_deltas_respect_sequence_and_location() {
+        let mut shell = ShellState::default();
+        shell.apply(&ENV.into(), &json!({"kind":"snapshot","snapshot":{"snapshotSequence":5,"projects":[],"threads":[thread("t", "1")]}})).unwrap();
+        shell
+            .apply(
+                &ENV.into(),
+                &json!({"kind":"thread.updated","sequence":4,"location":"active","thread":thread("old", "1")}),
+            )
+            .unwrap();
+        assert_eq!(shell.threads.len(), 1, "stale delta is skipped");
+        shell
+            .apply(
+                &ENV.into(),
+                &json!({"kind":"thread.updated","sequence":6,"location":"active","thread":thread("u", "2")}),
+            )
+            .unwrap();
+        shell
+            .apply(
+                &ENV.into(),
+                &json!({"kind":"thread.updated","sequence":7,"location":"archive","thread":thread("t", "3")}),
+            )
+            .unwrap();
+        let ids: Vec<_> = shell.threads.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, ["u"]);
+        assert_eq!(shell.sequence(ENV), 7);
+    }
+
+    #[test]
+    fn rows_read_outside_the_shell_merge_behind_it_and_count_against_the_cut() {
+        let env: SharedString = ENV.into();
+        let older = |id: &str, project: &str| {
+            let mut row = thread(id, "1");
+            row["projectId"] = json!(project);
+            row["settledOverride"] = json!("settled");
+            row["settledAt"] = json!("2024-01-01T00:00:00.000Z");
+            row
+        };
+        let cut = json!({"before": "2024-02-01T00:00:00.000Z", "asOfSequence": 5, "counts": [{"projectId": "p", "count": 3}, {"projectId": "q", "count": 1}]});
+        let mut shell = ShellState::default();
+        shell_snapshot(&mut shell, &env, json!([older("held", "p")]), Some(cut));
+        let generation = shell.generation(ENV);
+        assert_eq!(shell.older_settled(ENV).map(|cut| cut.count(None)), Some(4));
+        assert_eq!(shell.unloaded_older_settled(ENV, None), 3, "the held older row is loaded");
+        assert_eq!(shell.unloaded_older_settled(ENV, Some(&["q".into()])), 1);
+        let key = shell.older_settled_count_key(ENV);
+        assert_eq!(key, shell.older_settled(ENV).and_then(|cut| cut.counts_key), "exact as of the snapshot");
+
+        shell.apply(&env, &json!({"kind":"thread.removed","sequence":7,"threadId":"gone"})).unwrap();
+        assert_ne!(shell.older_settled_count_key(ENV), key, "a removal asks for fresh counts");
+        let rows = |sequence: u64, ids: &[&str]| ThreadRows {
+            snapshot_sequence: sequence,
+            threads: ids.iter().map(|id| serde_json::from_value(older(id, "p")).unwrap()).collect(),
+        };
+        // Read before the removal: the removed row is stale; the held row stays the shell's.
+        assert!(shell.mount_rows(&env, generation, rows(6, &["gone", "held", "page"])));
+        let ids: Vec<_> = shell.threads.iter().map(|t| (t.environment_id.as_ref(), t.id.as_str())).collect();
+        assert_eq!(ids, [(ENV, "held"), (ENV, "page")]);
+        assert_eq!(shell.unloaded_older_settled(ENV, None), 2);
+        assert!(!shell.mount_rows(&env, generation, rows(8, &["page"])), "already held");
+        assert!(shell.mount_rows(&env, generation, rows(8, &["gone"])), "read after the removal");
+        assert!(!shell.mount_rows(&env, generation, rows(4, &["early"])), "read before the cut's snapshot");
+        assert!(!shell.mount_rows(&env, generation + 1, rows(9, &["later"])), "another snapshot's read");
+
+        shell.set_older_settled_counts(ENV, generation, 1, HashMap::from([("p".to_owned(), 9)]));
+        assert_eq!(shell.unloaded_older_settled(ENV, None), 6);
+        // A fresh snapshot replaces the merged rows and the counts with its own.
+        shell_snapshot(&mut shell, &env, json!([]), None);
+        assert!(shell.older_settled(ENV).is_none() && shell.threads.is_empty());
+        assert_eq!(shell.generation(ENV), generation + 1);
+    }
+
+    fn shell_snapshot(shell: &mut ShellState, env: &SharedString, threads: Value, cut: Option<Value>) {
+        let mut snapshot = json!({"snapshotSequence": 5, "projects": [], "threads": threads});
+        if let Some(cut) = cut {
+            snapshot["olderSettled"] = cut;
+        }
+        shell.apply(env, &json!({"kind": "snapshot", "snapshot": snapshot})).unwrap();
+    }
+
+    #[test]
+    fn a_scoped_lookup_tells_equal_ids_on_two_environments_apart() {
+        let mut shell = ShellState::default();
+        let (a, b): (SharedString, SharedString) = ("env-a".into(), "env-b".into());
+        let snapshot = |title: &str| {
+            let mut thread = thread("t", "1");
+            thread["title"] = json!(title);
+            json!({"kind":"snapshot","snapshot":{"snapshotSequence":1,"projects":[project("/r", None)],"threads":[thread]}})
+        };
+        shell.apply(&a, &snapshot("on a")).unwrap();
+        shell.apply(&b, &snapshot("on b")).unwrap();
+        let title = |env: &SharedString| shell.thread(&ScopedId::new(env.clone(), "t")).map(|t| t.title.as_str());
+        assert_eq!((title(&a), title(&b)), (Some("on a"), Some("on b")));
+        assert!(shell.thread(&ScopedId::new("env-c", "t")).is_none());
+        let on_b = shell.project(&ScopedId::new(b.clone(), "/r")).map(|p| &p.environment_id);
+        assert_eq!(on_b, Some(&b));
+        let key = ScopedId::of_thread(&shell.threads[1]);
+        assert_eq!((key.env.as_ref(), key.is_thread(&shell.threads[0])), ("env-b", false));
+    }
+
+    #[test]
+    fn each_environment_keeps_its_own_projects_threads_and_cursor() {
+        let mut shell = ShellState::default();
+        let (a, b): (SharedString, SharedString) = ("env-a".into(), "env-b".into());
+        let snapshot = |sequence: u64, thread_id: &str| json!({"kind":"snapshot","snapshot":{"snapshotSequence":sequence,"projects":[project("/r", None)],"threads":[thread(thread_id, "1")]}});
+        shell.apply(&a, &snapshot(5, "t1")).unwrap();
+        shell.apply(&b, &snapshot(2, "t2")).unwrap();
+        assert_eq!((shell.projects.len(), shell.threads.len()), (2, 2));
+        assert!(shell.thread(&ScopedId::new(b.clone(), "t2")).is_some());
+        // Sequences are per subscription: b's 3 is new even though a is at 5.
+        shell
+            .apply(&b, &json!({"kind":"thread.updated","sequence":3,"location":"active","thread":thread("t3", "2")}))
+            .unwrap();
+        assert_eq!((shell.sequence("env-a"), shell.sequence("env-b")), (5, 3));
+        // A fresh snapshot of a replaces only a's part.
+        shell.apply(&a, &snapshot(9, "t4")).unwrap();
+        let mut ids: Vec<_> = shell.threads.iter().map(|t| t.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["t2", "t3", "t4"]);
+        shell.remove_environment("env-b");
+        assert_eq!((shell.projects.len(), shell.threads.len(), shell.sequence("env-b")), (1, 1, 0));
+        assert!(!shell.has_snapshot("env-b"));
+    }
+
+    #[test]
+    fn a_fresh_environments_empty_snapshot_at_sequence_zero_counts_as_received() {
+        let mut shell = ShellState::default();
+        assert!(!shell.has_snapshot(ENV));
+        shell
+            .apply(
+                &ENV.into(),
+                &json!({"kind":"snapshot","snapshot":{"snapshotSequence":0,"projects":[],"threads":[]}}),
+            )
+            .unwrap();
+        assert!(shell.has_snapshot(ENV));
+    }
+
+    fn item(id: &str, item_type: &str, run_id: &str, ordinal: i64) -> Value {
+        json!({"id": id, "type": item_type, "threadId": "t", "runId": run_id, "nodeId": null, "ordinal": ordinal, "status": "completed", "updatedAt": "x"})
+    }
+
+    fn projection(items: &[Value]) -> Value {
+        let rows: Vec<_> = items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| json!({"position": i, "visibility": "local", "sourceThreadId": "t", "sourceItemId": item["id"], "item": item}))
+            .collect();
+        json!({"thread": {"id": "t", "projectId": "p", "title": "t"}, "runs": [{"id": "r1", "status": "running", "ordinal": 1}], "turnItems": items, "visibleTurnItems": rows})
+    }
+
+    fn event(sequence: u64, event_type: &str, payload: Value) -> Value {
+        json!({"kind": "event", "sequence": sequence, "event": {"type": event_type, "threadId": "t", "occurredAt": "x", "payload": payload}})
+    }
+
+    fn timeline(state: &ThreadState) -> Vec<String> {
+        state.projection.as_ref().unwrap().visible_turn_items.iter().map(|row| row.source_item_id.clone()).collect()
+    }
+
+    #[test]
+    fn an_update_is_stored_once_for_the_table_and_the_timeline() {
+        let mut state = ThreadState::default();
+        state
+            .apply(&json!({"kind":"snapshot","snapshotSequence":1,"projection": projection(&[item("a", "user_message", "r1", 1)])}))
+            .unwrap();
+        let shared = |state: &ThreadState, id: &str| {
+            let p = state.projection.as_ref().unwrap();
+            let row = p.visible_turn_items.iter().find(|row| row.source_item_id == id).unwrap();
+            let entry = p.turn_items.iter().find(|item| item.id == id).unwrap();
+            Rc::ptr_eq(&row.item, entry)
+        };
+        assert!(shared(&state, "a"), "a snapshot's rows share the table's items");
+        state.apply(&event(2, "turn-item.updated", item("b", "assistant_message", "r1", 2))).unwrap();
+        assert!(shared(&state, "b"), "an update shares one allocation");
+    }
+
+    #[test]
+    fn turn_items_insert_in_ordinal_order_and_replace_in_place() {
+        let mut state = ThreadState::default();
+        state
+            .apply(&json!({"kind":"snapshot","snapshotSequence":1,"projection": projection(&[item("a", "user_message", "r1", 1), item("c", "assistant_message", "r1", 3)])}))
+            .unwrap();
+        state.apply(&event(2, "turn-item.updated", item("b", "reasoning", "r1", 2))).unwrap();
+        assert_eq!(timeline(&state), ["a", "b", "c"]);
+        let mut updated = item("c", "assistant_message", "r1", 3);
+        updated["text"] = json!("done");
+        state.apply(&event(3, "turn-item.updated", updated)).unwrap();
+        assert_eq!(timeline(&state), ["a", "b", "c"]);
+        assert_eq!(state.projection.as_ref().unwrap().visible_turn_items[2].item.str("text"), Some("done"));
+        state.apply(&event(3, "turn-item.updated", item("z", "reasoning", "r1", 9))).unwrap();
+        assert_eq!(timeline(&state).len(), 3, "replayed sequence is ignored");
+    }
+
+    #[test]
+    fn thread_snapshots_skip_bad_elements_and_reset_the_cursor_on_failure() {
+        let mut state = ThreadState::default();
+        let mut value = projection(&[item("a", "user_message", "r1", 1)]);
+        value["turnItems"].as_array_mut().unwrap().push(json!({"type": "future"}));
+        value["visibleTurnItems"].as_array_mut().unwrap().push(json!({"position": 9}));
+        value["runs"].as_array_mut().unwrap().push(json!({"id": "r2"}));
+        state.apply(&json!({"kind": "snapshot", "snapshotSequence": 4, "projection": value})).unwrap();
+        let projection = state.projection.as_ref().unwrap();
+        assert_eq!((projection.turn_items.len(), projection.runs.len()), (1, 1));
+        assert_eq!(timeline(&state), ["a"]);
+        assert_eq!(projection.turn_items[0].revision, 4);
+
+        assert!(state.apply(&json!({"kind": "snapshot", "snapshotSequence": 6, "projection": {"runs": []}})).is_err());
+        state.apply(&event(7, "turn-item.updated", item("b", "reasoning", "r1", 2))).unwrap();
+        assert!(state.projection.is_none());
+        assert_eq!(state.sequence, 0, "a resubscribe refetches the snapshot");
+    }
+
+    #[test]
+    fn shell_snapshots_skip_bad_threads_and_reset_the_cursor_on_failure() {
+        let mut shell = ShellState::default();
+        let snapshot = |sequence: Value| json!({"kind": "snapshot", "snapshot": {"snapshotSequence": sequence, "projects": [project("a", None), {"id": "x"}], "threads": [thread("t", "1"), {"id": "bad"}]}});
+        shell.apply(&ENV.into(), &snapshot(json!(5))).unwrap();
+        assert_eq!((shell.projects.len(), shell.threads.len()), (1, 1));
+
+        assert!(shell.apply(&ENV.into(), &snapshot(json!(null))).is_err());
+        shell
+            .apply(
+                &ENV.into(),
+                &json!({"kind":"thread.updated","sequence":9,"location":"active","thread":thread("u", "2")}),
+            )
+            .unwrap();
+        assert_eq!((shell.sequence(ENV), shell.threads.len()), (0, 1), "deltas wait for a fresh snapshot");
+        shell.apply(&ENV.into(), &snapshot(json!(10))).unwrap();
+        shell
+            .apply(
+                &ENV.into(),
+                &json!({"kind":"thread.updated","sequence":11,"location":"active","thread":thread("u", "2")}),
+            )
+            .unwrap();
+        assert_eq!((shell.sequence(ENV), shell.threads.len()), (11, 2));
+    }
+
+    #[test]
+    fn deleting_the_thread_ends_the_stream() {
+        let mut state = ThreadState::default();
+        state.apply(&json!({"kind":"snapshot","snapshotSequence":1,"projection": projection(&[])})).unwrap();
+        state.apply(&event(2, "thread.deleted", json!({"threadId": "t", "deletedAt": "x"}))).unwrap();
+        state.apply(&event(3, "turn-item.updated", item("a", "user_message", "r1", 1))).unwrap();
+        assert!(state.deleted);
+        assert!(timeline(&state).is_empty());
+        assert_eq!(state.projection.as_ref().unwrap().thread.title, "t", "the payload is not decoded as a thread");
+    }
+
+    #[test]
+    fn rolled_back_runs_leave_the_timeline() {
+        let mut state = ThreadState::default();
+        state.apply(&json!({"kind":"snapshot","snapshotSequence":1,"projection": projection(&[item("a", "user_message", "r1", 1)])})).unwrap();
+        state.apply(&event(2, "run.updated", json!({"id": "r1", "status": "rolled_back", "ordinal": 1}))).unwrap();
+        assert!(timeline(&state).is_empty());
+    }
+
+    #[test]
+    fn new_thread_model_falls_back_to_a_ready_provider() {
+        let mut info = ServerInfo::default();
+        info.apply(&json!({"version": 1, "type": "snapshot", "config": {
+            "providers": [
+                {"instanceId": "off", "driver": "codex", "enabled": false, "status": "ready", "models": [{"slug": "a"}]},
+                {"driver": "future", "enabled": true, "status": "ready"},
+                {"instanceId": "claude", "driver": "claudeAgent", "enabled": true, "status": "ready",
+                 "models": [{"slug": "custom", "isCustom": true}, {"slug": "haiku"}, {"slug": "opus", "isDefault": true}]}
+            ],
+            "settings": {
+                "defaultModelSelection": {"instanceId": "off", "model": "a"},
+                "providerInstances": {"claude": {"driver": "claudeAgent"}},
+                "projectSettingsOverrides": {"p": {"defaultModelSelection": {"instanceId": "claude", "model": "haiku"}}}
+            },
+            "environment": {"capabilities": {"threadStop": true}}
+        }}))
+        .unwrap();
+        assert!(info.capability("threadStop"));
+        assert_eq!(info.providers.len(), 2, "an undecodable provider is skipped");
+        let selection = info.new_thread_model(None).unwrap();
+        assert_eq!((selection.instance_id.as_str(), selection.model.as_str()), ("claude", "opus"));
+        let project: ProjectShell =
+            serde_json::from_value(json!({"id": "p", "title": "P", "workspaceRoot": "/p"})).unwrap();
+        assert_eq!(info.new_thread_model(Some(&project)).unwrap().model, "haiku", "the project's override wins");
+
+        let themes =
+            json!([{"id": "aurora", "name": "Aurora", "appearance": "dark", "canvas": "#000", "accent": "#f0f"}]);
+        info.apply(&json!({"version": 1, "type": "environmentThemesUpdated", "payload": {"themes": themes}})).unwrap();
+        info.apply(&json!({"version": 1, "type": "snapshot", "config": {"providers": []}})).unwrap();
+        assert_eq!(info.environment_themes, themes, "snapshots never carry themes, so the last set stays");
+        info.apply(&json!({"version": 1, "type": "environmentThemesUpdated", "payload": {"themes": []}})).unwrap();
+        assert_eq!(info.environment_themes, Value::Null);
+    }
+
+    #[test]
+    fn a_compacting_run_cannot_take_steering() {
+        let compacting = |items: &[Value]| {
+            let mut state = ThreadState::default();
+            state.apply(&json!({"kind":"snapshot","snapshotSequence":1,"projection": projection(items)})).unwrap();
+            state.projection.unwrap().is_compacting()
+        };
+        let mut compact = item("u", "user_message", "r1", 1);
+        compact["text"] = json!(" /Compact ");
+        let mut prompt = item("u2", "user_message", "r1", 3);
+        prompt["text"] = json!("hi");
+        let compaction = |status: &str| {
+            let mut item = item("c", "compaction", "r1", 2);
+            item["status"] = json!(status);
+            item
+        };
+        assert!(compacting(&[compact.clone()]), "a bare /compact before its compaction item lands");
+        assert!(!compacting(&[compact.clone(), compaction("completed")]));
+        assert!(compacting(&[prompt.clone(), compaction("running")]), "an automatic compaction mid-turn");
+        assert!(!compacting(&[compact, compaction("completed"), prompt.clone()]));
+        assert!(!compacting(&[prompt]));
+    }
+
+    #[test]
+    fn the_context_window_falls_back_to_a_fork_source_then_the_last_compaction() {
+        let item = |id: &str, after: Value| {
+            json!({"visibility": "visible", "sourceThreadId": "t", "sourceItemId": id,
+                "item": {"id": id, "type": "compaction", "threadId": "t", "startedAt": "2026-01-01T00:00:00Z",
+                    "beforeTokenCount": 9000, "afterTokenCount": after}})
+        };
+        let projection = |extra: Value| -> ThreadProjection {
+            let mut value = json!({
+                "thread": {"id": "t", "title": "t", "modelSelection": {"instanceId": "codex", "model": "m"},
+                    "forkedFrom": {"type": "run", "threadId": "src", "runId": "r1"}},
+                "visibleTurnItems": [item("c1", json!(1200)), item("c2", Value::Null)],
+            });
+            value.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(value).unwrap()
+        };
+        let compacted = projection(json!({}));
+        let (usage, live) = compacted.context_window().unwrap();
+        assert_eq!((usage.used_tokens, live), (1200, false), "a compaction without counts is skipped");
+        let transfer = |status: &str, strategy: &str| {
+            json!({"contextTransfers": [{"type": "fork", "targetThreadId": "t", "sourceThreadId": "src",
+                "sourcePoint": {"runId": "r1"}, "sourceProviderInstanceId": "codex", "status": status,
+                "resolution": {"strategy": strategy}, "sourceTokenUsage": {"usedTokens": 500, "maxTokens": 1000}}]})
+        };
+        let forked = projection(transfer("pending", ""));
+        let (usage, live) = forked.context_window().unwrap();
+        assert_eq!((usage.used_tokens, usage.max_tokens, live), (500, Some(1000), true));
+        let resolved = projection(transfer("resolved", "native_fork"));
+        assert_eq!(resolved.context_usage().unwrap().used_tokens, 500);
+        let replayed = projection(transfer("resolved", "replay"));
+        assert_eq!(replayed.context_usage().unwrap().used_tokens, 1200, "only a native fork carries usage");
+    }
+
+    #[test]
+    fn resumable_runs_are_interrupted_or_out_of_usage() {
+        let projection = |runs: Value, items: Value| {
+            let projection = json!({"thread": {"id": "t", "title": "t"}, "runs": runs, "turnItems": items});
+            let mut state = ThreadState::default();
+            state.apply(&json!({"kind": "snapshot", "snapshotSequence": 1, "projection": projection})).unwrap();
+            state.projection.unwrap()
+        };
+        let runs = json!([
+            {"id": "r1", "status": "interrupted", "ordinal": 1, "completedAt": "2026-01-01T00:00:02Z"},
+            {"id": "r2", "status": "completed", "ordinal": 2, "completedAt": "2026-01-01T00:00:01Z"},
+            {"id": "r3", "status": "queued", "ordinal": 3, "queueHeld": true},
+        ]);
+        let interrupted = projection(runs, json!([]));
+        assert_eq!(interrupted.resumable_run_id(), Some("r1"), "the run that ended last, not the highest ordinal");
+        assert!(interrupted.has_held_queued_runs());
+        let failed = json!([{"id": "r1", "status": "failed", "ordinal": 1, "rootNodeId": "n", "completedAt": "2026-01-01T00:00:00Z"}]);
+        let error = |class: &str, node: &str| {
+            json!([{"id": "e", "type": "error", "threadId": "t", "runId": "r1", "nodeId": node, "status": "failed",
+                    "updatedAt": "2026-01-01T00:00:00Z", "failure": {"class": class}}])
+        };
+        assert_eq!(projection(failed.clone(), error("usage_limit", "n")).resumable_run_id(), Some("r1"));
+        assert_eq!(projection(failed.clone(), error("provider_error", "n")).resumable_run_id(), None);
+        assert_eq!(
+            projection(failed, error("usage_limit", "child")).resumable_run_id(),
+            None,
+            "a child node's failure"
+        );
+    }
+
+    #[test]
+    fn pending_approvals_join_their_request_item() {
+        let mut approval = item("i", "approval_request", "r1", 2);
+        approval["requestId"] = json!("q");
+        let mut value = projection(&[approval]);
+        value["runtimeRequests"] = json!([
+            {"id": "q", "kind": "command", "status": "pending", "responseCapability": {"type": "live", "providerSessionId": "s"}},
+            {"id": "u", "kind": "user_input", "status": "pending", "responseCapability": {"type": "live", "providerSessionId": "s"}},
+            {"id": "done", "kind": "command", "status": "resolved", "responseCapability": {"type": "live", "providerSessionId": "s"}}
+        ]);
+        let projection = ThreadProjection::deserialize(&value).unwrap();
+        let approvals = projection.pending_approvals();
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals[0].1.map(|item| item.id.as_str()), Some("i"));
+    }
+
+    #[test]
+    fn extension_statuses_come_from_the_selected_providers_live_session() {
+        let mut value = projection(&[]);
+        value["thread"]["modelSelection"] = json!({"instanceId": "pi", "model": "m"});
+        value["thread"]["activeProviderThreadId"] = json!("pt");
+        let session = |id: &str, instance: &str, status: &str| {
+            json!({"id": id, "status": status, "providerInstanceId": instance,
+                   "extensionStatuses": [{"key": "k", "text": format!("{id} ready")}]})
+        };
+        value["providerSessions"] = json!([session("s1", "pi", "running"), session("s2", "pi", "running")]);
+        value["providerThreads"] = json!([{"id": "pt", "providerSessionId": "s1", "providerInstanceId": "pi"}]);
+        let texts = |value: &Value| {
+            let projection = ThreadProjection::deserialize(value).unwrap();
+            projection.provider_extension_statuses().iter().map(|s| s.text.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(texts(&value), ["s1 ready"], "the active provider thread's session");
+        value["providerSessions"][0]["status"] = json!("stopped");
+        assert!(texts(&value).is_empty(), "a stopped session shows nothing");
+        value["providerThreads"][0]["providerInstanceId"] = json!("codex");
+        value["providerSessions"][0]["status"] = json!("running");
+        assert!(texts(&value).is_empty(), "another provider's thread shows nothing");
+    }
+}
