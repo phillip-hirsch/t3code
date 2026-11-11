@@ -156,6 +156,7 @@ impl WindowsWindowInner {
             WM_INPUTLANGCHANGE => self.handle_input_language_changed(),
             WM_SHOWWINDOW => self.handle_window_visibility_changed(handle, wparam),
             DM_POINTERHITTEST => self.handle_dm_pointer_hit_test(wparam),
+            WM_POINTERCAPTURECHANGED => self.handle_pointer_capture_changed(),
             WM_GETOBJECT => self.handle_wm_getobject(wparam, lparam),
             WM_GPUI_CURSOR_STYLE_CHANGED
             | WM_GPUI_FORCE_UPDATE_WINDOW
@@ -1347,6 +1348,13 @@ impl WindowsWindowInner {
     fn handle_dm_pointer_hit_test(&self, wparam: WPARAM) -> Option<isize> {
         self.state.direct_manipulation.on_pointer_hit_test(wparam);
         self.state.frames.contact(std::time::Instant::now());
+        None
+    }
+
+    /// Direct Manipulation sends this when it recognizes a manipulation, which can come after
+    /// the contact's grace ran out: wake so its per-paint updates run. Default processing follows.
+    fn handle_pointer_capture_changed(&self) -> Option<isize> {
+        self.state.frames.wake();
         None
     }
 

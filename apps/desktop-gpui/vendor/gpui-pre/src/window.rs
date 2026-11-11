@@ -1958,9 +1958,9 @@ impl Window {
                         )
                     })
                     .log_err();
-                // T3 patch: the App is borrowed (a nested Windows message loop), so this frame
-                // can't run. Keep a forced render and ask platforms that pause idle windows to
-                // retry, instead of failing every update below and dropping the demand.
+                // T3 patch: the window can't be updated (the App is borrowed by a nested Windows
+                // message loop, or the window is going away), so neither can anything below. Keep
+                // a forced render and ask platforms that pause idle windows to retry.
                 if power_state.is_none() {
                     deferred_force_render |= force_render;
                     invalidator.wake_platform();
