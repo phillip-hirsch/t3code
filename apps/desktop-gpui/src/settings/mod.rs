@@ -426,7 +426,13 @@ pub(crate) fn write_atomically(path: &Path, document: &Value) -> std::io::Result
         file.write_all(format!("{}\n", serde_json::to_string_pretty(document)?).as_bytes())?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&temp, path)
+        std::fs::rename(&temp, path)?;
+        // The rename lives in the directory entry; Unix needs the directory synced to keep it.
+        #[cfg(unix)]
+        if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+            std::fs::File::open(dir)?.sync_all()?;
+        }
+        Ok(())
     })();
     if written.is_err() {
         let _ = std::fs::remove_file(&temp);
