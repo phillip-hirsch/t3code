@@ -2023,11 +2023,11 @@ impl Window {
                     return;
                 }
 
-                let pending_next_frame_callbacks = next_frame_callbacks.take();
+                let mut pending_next_frame_callbacks = next_frame_callbacks.take();
                 if !pending_next_frame_callbacks.is_empty() {
-                    handle
+                    let ran = handle
                         .update(&mut cx, |_, window, cx| {
-                            for callback in pending_next_frame_callbacks {
+                            for callback in pending_next_frame_callbacks.drain(..) {
                                 callback(window, cx);
                             }
                         })
@@ -2038,6 +2038,13 @@ impl Window {
                             )
                         })
                         .log_err();
+                    // T3 patch: the App was busy (a nested Windows message loop); keep the
+                    // callbacks, ahead of any added since, for the next frame.
+                    if ran.is_none() {
+                        let mut queued = next_frame_callbacks.borrow_mut();
+                        pending_next_frame_callbacks.append(&mut queued);
+                        *queued = pending_next_frame_callbacks;
+                    }
                 }
 
                 let should_draw = invalidator.is_dirty() || force_render;
@@ -9189,6 +9196,33 @@ mod tests {
             test_window.frame_wake_count() > baseline || callback_ran.get(),
             "a frame request with pending next-frame callbacks must either run them or re-arm the frame source"
         );
+    }
+
+    /// T3 patch: a frame request delivered while the App is borrowed (a nested
+    /// Windows message loop) can't run next-frame callbacks; the next frame must.
+    #[gpui::test]
+    fn test_next_frame_callbacks_survive_a_frame_that_cannot_borrow_the_app(
+        cx: &mut TestAppContext,
+    ) {
+        let window = cx.add_window(|_, _| EmptyView);
+        let test_window = cx.test_window(window.into());
+        let ran = Rc::new(Cell::new(0));
+        window
+            .update(cx, {
+                let ran = ran.clone();
+                move |_, window, _| window.on_next_frame(move |_, _| ran.set(ran.get() + 1))
+            })
+            .unwrap();
+        let unthrottled = RequestFrameOptions {
+            require_presentation: true,
+            ..Default::default()
+        };
+
+        cx.update(|_| test_window.simulate_frame_request(unthrottled));
+        assert_eq!(ran.get(), 0, "the busy frame cannot run the callback");
+
+        test_window.simulate_frame_request(unthrottled);
+        assert_eq!(ran.get(), 1, "the next frame runs the kept callback");
     }
 
     #[gpui::test]
