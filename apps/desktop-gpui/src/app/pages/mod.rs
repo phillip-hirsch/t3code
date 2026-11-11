@@ -1,0 +1,366 @@
+//! Where the window is: a chat target, a page beside the chat (Pull requests,
+//! Usage), or the Settings modal on top, plus back/forward history over them.
+
+mod pull_request_checkout;
+mod pull_request_detail;
+pub(super) use pull_request_detail::{avatar as pr_avatar, state_glyph as pr_state_glyph};
+mod pull_request_surface;
+mod pull_requests;
+pub(super) mod settings;
+mod thread_card_pull_requests;
+mod thread_pull_request_badge;
+mod usage;
+
+use gpui_kit::{AnyElement, Context, SharedString, Window};
+
+pub(super) use pull_requests::PullRequestsState;
+pub(super) use thread_pull_request_badge::terminal_running_color;
+pub(super) use usage::{UsageLimitsPanel, UsageState};
+
+use super::{Target, Workspace};
+
+/// Every setting this client offers, with its section's label, for the palette's search.
+pub(super) fn palette_settings() -> impl Iterator<Item = (&'static crate::settings::SearchItem, &'static str)> {
+    settings::searchable_settings()
+}
+
+/// A page that replaces the chat in the main column (`/_chat/pull-requests`, `/_chat/usage`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Page {
+    PullRequests,
+    Usage,
+    /// An app link being opened (`/_chat/new`); its state is `DesktopShell::link_page`.
+    Link,
+    /// First-run setup (`/welcome`), without the sidebar.
+    Welcome,
+}
+
+impl Page {
+    pub(super) fn title(self) -> &'static str {
+        match self {
+            Page::PullRequests => "Pull requests",
+            Page::Usage => "Usage",
+            Page::Link => "T3 Code",
+            Page::Welcome => "Welcome",
+        }
+    }
+
+    /// Usage opens as a modal over the last main view (`AppRouteModal`), as Settings does.
+    pub(super) fn is_modal(self) -> bool {
+        self == Page::Usage
+    }
+}
+
+/// One entry in the back/forward history.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum Location {
+    Chat(Option<Target>),
+    Page(Page),
+    /// The Settings modal on one section (its route segment, e.g. "general").
+    Settings(SharedString),
+}
+
+/// Browser-style history: navigating truncates the forward entries.
+pub(super) struct History {
+    entries: Vec<Location>,
+    index: usize,
+}
+
+impl Default for History {
+    fn default() -> Self {
+        Self { entries: vec![Location::Chat(None)], index: 0 }
+    }
+}
+
+impl History {
+    pub(super) fn push(&mut self, location: Location) {
+        if self.entries.get(self.index) == Some(&location) {
+            return;
+        }
+        self.entries.truncate(self.index + 1);
+        self.entries.push(location);
+        self.index = self.entries.len() - 1;
+    }
+
+    /// `navigate({ replace: true })`: the current entry becomes `location`.
+    pub(super) fn replace(&mut self, location: Location) {
+        self.entries[self.index] = location;
+    }
+
+    pub(super) fn can_go_back(&self) -> bool {
+        self.index > 0
+    }
+
+    pub(super) fn can_go_forward(&self) -> bool {
+        self.index + 1 < self.entries.len()
+    }
+
+    fn step(&mut self, delta: isize) -> Option<Location> {
+        let index = self.index.checked_add_signed(delta).filter(|i| *i < self.entries.len())?;
+        self.index = index;
+        Some(self.entries[index].clone())
+    }
+}
+
+/// What a draft's history entry opens.
+#[derive(Debug, PartialEq)]
+enum HistoryDraft {
+    /// The draft itself, where it is now, or the thread it launched.
+    Open(Target),
+    /// The entry's project's draft, since the entry's draft was removed.
+    ProjectDraft { env: SharedString, project_id: String },
+}
+
+/// `ThreadRouteView` on `/draft/$draftId`: an entry follows its unsent draft wherever it is now
+/// (`current`), unlike a closed tab's owner, and a sent one to the thread it launched (`promoted`),
+/// whose own route then judges it. `None` while the project it would open is unlisted.
+fn history_draft(
+    entry: &Target,
+    current: Option<Target>,
+    promoted: Option<Target>,
+    listed: impl Fn(&Target) -> bool,
+) -> Option<HistoryDraft> {
+    let Target::Draft { env, project_id, .. } = entry else { return None };
+    match (current, promoted) {
+        (Some(current), _) => listed(&current).then_some(HistoryDraft::Open(current)),
+        (None, Some(thread)) => Some(HistoryDraft::Open(thread)),
+        (None, None) => {
+            listed(entry).then(|| HistoryDraft::ProjectDraft { env: env.clone(), project_id: project_id.clone() })
+        }
+    }
+}
+
+impl Workspace {
+    fn location(&self) -> Location {
+        if let Some(section) = &self.settings {
+            return Location::Settings(section.clone());
+        }
+        match self.page {
+            Some(page) => Location::Page(page),
+            None => Location::Chat(self.target.clone()),
+        }
+    }
+
+    /// Records where the window is now; navigation calls this after it lands.
+    pub(super) fn record_location(&mut self) {
+        self.sidebar_open.close_sheet();
+        let location = self.location();
+        self.history.push(location);
+    }
+
+    pub(super) fn open_page(&mut self, page: Page, cx: &mut Context<Self>) {
+        self.settings = None;
+        if self.page != Some(page) {
+            self.page_entered(page);
+        }
+        self.page = Some(page);
+        self.record_location();
+        self.page_opened(cx);
+        self.notify_sidebar(cx);
+        cx.notify();
+    }
+
+    /// Arriving on a page from elsewhere: the Pull requests page takes focus (`startWorkspaceFocus`).
+    /// A page that replaces the chat unmounts its question cards, and with them their auto-advance.
+    fn page_entered(&mut self, page: Page) {
+        if !page.is_modal() {
+            self.cancel_question_advances();
+        }
+        if page == Page::PullRequests {
+            self.pull_requests.focus_on_render = true;
+        }
+    }
+
+    /// Starts the open page's reads.
+    pub(super) fn page_opened(&mut self, cx: &mut Context<Self>) {
+        match self.page {
+            Some(Page::PullRequests) => self.pull_requests_opened(cx),
+            Some(Page::Usage) => self.usage_opened(cx),
+            Some(Page::Link | Page::Welcome) | None => {}
+        }
+    }
+
+    /// Leaves a page for the chat it covered.
+    pub(super) fn close_page(&mut self, cx: &mut Context<Self>) {
+        self.page = None;
+        self.record_location();
+        self.notify_sidebar(cx);
+        cx.notify();
+    }
+
+    pub(super) fn open_settings(&mut self, section: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.focus_settings_on_open();
+        let section = section.into();
+        // Each visit to Sharing & access starts on the primary, as the web's picker state does.
+        if self.settings.as_ref() != Some(&section) {
+            self.settings_ui.access_environment = None;
+        }
+        self.settings = Some(section);
+        self.record_location();
+        cx.notify();
+    }
+
+    pub(super) fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.is_some() {
+            self.flush_settings_field(window, cx);
+            self.settings = None;
+            self.record_location();
+            cx.notify();
+        }
+    }
+
+    /// The brand's link to `/`: the index route, which opens a draft in the most recently active
+    /// project (`IndexDraftLanding`), out of Settings or any page.
+    pub(super) fn go_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings = None;
+        // Until setup is finished, home is the Welcome page (`FirstRunGate`).
+        if self.welcome_is_home() {
+            return self.open_page(Page::Welcome, cx);
+        }
+        let recent = crate::inbox::most_recent_project(&self.shell.projects, &self.shell.threads);
+        match recent.map(|p| (p.environment_id.clone(), p.id.clone())) {
+            Some((env, project_id)) => self.start_draft_in(env, project_id, window, cx),
+            None => self.close_page(cx),
+        }
+    }
+
+    pub(super) fn go_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(location) = self.history.step(-1) {
+            self.go_to(location, window, cx);
+        }
+    }
+
+    pub(super) fn go_forward(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(location) = self.history.step(1) {
+            self.go_to(location, window, cx);
+        }
+    }
+
+    /// Opens what a draft's history entry resolves to, and makes the entry name it, so the push that
+    /// follows lands on the entry instead of dropping the forward entries.
+    fn open_history_draft(&mut self, entry: &Target, window: &mut Window, cx: &mut Context<Self>) {
+        let current =
+            entry.draft_id().filter(|draft| self.drafts.is_live(draft)).and_then(|draft| self.drafts.target(draft));
+        let promoted = entry.draft_id().and_then(|draft| self.drafts.promoted_to(draft)).cloned();
+        let listed = |target: &Target| {
+            let Target::Draft { env, project_id, .. } = target else { return false };
+            self.shell.projects.iter().any(|p| &p.id == project_id && &p.environment_id == env)
+        };
+        let target = match history_draft(entry, current, promoted, listed) {
+            Some(HistoryDraft::Open(target)) => target,
+            Some(HistoryDraft::ProjectDraft { env, project_id }) => self.project_draft(env, project_id, cx),
+            None => return,
+        };
+        self.history.replace(Location::Chat(Some(target.clone())));
+        match target {
+            Target::Thread { env, id } => self.select_thread_in(env, id, window, cx),
+            draft @ Target::Draft { .. } => self.open_draft(draft, window, cx),
+        }
+    }
+
+    /// Shows a history entry. The push that follows each step lands on the
+    /// entry itself, so history is left where the step put it.
+    fn go_to(&mut self, location: Location, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.is_some() {
+            self.flush_settings_field(window, cx);
+        }
+        self.settings = None;
+        self.page = None;
+        self.settings_ui.access_environment = None;
+        match location {
+            Location::Chat(Some(Target::Thread { env, id })) => self.select_thread_in(env, id, window, cx),
+            Location::Chat(Some(entry @ Target::Draft { .. })) => self.open_history_draft(&entry, window, cx),
+            Location::Chat(None) => {}
+            Location::Page(page) => {
+                self.page_entered(page);
+                self.page = Some(page);
+                self.page_opened(cx);
+            }
+            Location::Settings(section) => {
+                self.focus_settings_on_open();
+                self.settings = Some(section);
+            }
+        }
+        self.notify_sidebar(cx);
+        cx.notify();
+    }
+
+    /// The main column while a page covers the chat.
+    pub(super) fn render_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        match self.page? {
+            Page::PullRequests => Some(self.render_pull_requests(window, cx)),
+            Page::Usage => None,
+            Page::Link => Some(self.render_link_page(window, cx)),
+            Page::Welcome => Some(self.render_welcome(window, cx)),
+        }
+    }
+
+    /// The modal layer of a page that opens over the main view.
+    pub(super) fn render_page_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.page.filter(|page| page.is_modal()).map(|_| self.render_usage_modal(window, cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn draft(id: &str) -> Location {
+        Location::Chat(Some(Target::draft("e".into(), id.into(), crate::app::draft_sessions::DraftId::for_test(id))))
+    }
+
+    #[test]
+    fn a_draft_entry_follows_its_draft_wherever_it_is_now() {
+        let id = crate::app::draft_sessions::DraftId::for_test("d");
+        let at = |env: &str, project: &str| Target::draft(env.into(), project.into(), id.clone());
+        let listed = |target: &Target| !matches!(target, Target::Draft { project_id, .. } if project_id == "gone");
+        let open = |target: Target| Some(HistoryDraft::Open(target));
+        assert_eq!(history_draft(&at("e", "p"), Some(at("e", "p")), None, listed), open(at("e", "p")));
+        assert_eq!(
+            history_draft(&at("e", "p"), Some(at("e", "q")), None, listed),
+            open(at("e", "q")),
+            "moved projects"
+        );
+        assert_eq!(
+            history_draft(&at("e", "p"), Some(at("f", "q")), None, listed),
+            open(at("f", "q")),
+            "moved machines"
+        );
+        assert_eq!(history_draft(&at("e", "gone"), Some(at("e", "q")), None, listed), open(at("e", "q")));
+        assert_eq!(history_draft(&at("e", "p"), Some(at("e", "gone")), None, listed), None, "its project is unlisted");
+        let launched = Target::Thread { env: "e".into(), id: "t".into() };
+        let sent = history_draft(&at("e", "p"), None, Some(launched.clone()), listed);
+        assert_eq!(sent, open(launched.clone()), "a promoted draft opens the thread it launched");
+        let sent = history_draft(&at("e", "gone"), None, Some(launched.clone()), listed);
+        assert_eq!(sent, open(launched), "the thread's own route judges it");
+        let fallback = Some(HistoryDraft::ProjectDraft { env: "e".into(), project_id: "p".into() });
+        assert_eq!(
+            history_draft(&at("e", "p"), None, None, listed),
+            fallback,
+            "a removed draft opens its project's draft"
+        );
+        assert_eq!(history_draft(&at("e", "gone"), None, None, listed), None);
+    }
+
+    #[test]
+    fn history_walks_back_and_forward_and_truncates_on_a_new_visit() {
+        let mut history = History::default();
+        history.push(draft("a"));
+        history.push(Location::Page(Page::Usage));
+        history.push(Location::Page(Page::Usage));
+        assert!(history.can_go_back() && !history.can_go_forward());
+        assert_eq!(history.step(-1), Some(draft("a")));
+        // Landing on the entry it stepped to records nothing new.
+        history.push(draft("a"));
+        assert_eq!(history.step(1), Some(Location::Page(Page::Usage)));
+        history.step(-1);
+        history.push(Location::Settings("general".into()));
+        assert!(!history.can_go_forward(), "a new visit drops the forward entries");
+        assert_eq!(history.step(-1), Some(draft("a")));
+        assert_eq!(history.step(-5), None);
+        // A replaced entry is the one stepping back reaches.
+        history.replace(Location::Page(Page::Welcome));
+        assert_eq!(history.step(1), Some(Location::Settings("general".into())));
+        assert_eq!(history.step(-1), Some(Location::Page(Page::Welcome)));
+    }
+}

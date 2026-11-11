@@ -1,0 +1,298 @@
+//! Settings sections in the connections group; see `SETTINGS` in `mod.rs`.
+//!
+//! Environments (`ConnectionsSettings view="environments"`), Sharing & access
+//! (`ConnectionsSettings view="access"`) and Secrets (`SecretsSettingsPanel`).
+//! This app keeps a catalog of paired remote environments (`saved.rs`) but has no
+//! network/Tailscale/WSL controls and no T3 Connect account, so it renders what the
+//! web renders without them: no network exposure or T3 Connect rows. None of these
+//! sections has a plain scoped setting row; secret providers are environment-wide
+//! (read-only under a project scope in the web).
+//!
+//! Each section keeps its state in keyed element state, so it lives while the
+//! section is on screen, like the web's mounted component.
+
+mod access;
+mod add_environment;
+mod environments;
+mod exposure;
+pub(in crate::app) mod linking;
+mod load_balancing;
+pub(in crate::app) mod logic;
+mod pairing;
+mod pull_request_routing;
+mod routes;
+mod saved;
+pub(super) use saved::empty_media;
+mod secrets;
+pub(in crate::app) mod ui;
+
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::notification::Notification;
+use gpui_kit::{AnyElement, App, Context, SharedString, Task, WeakEntity, Window};
+use serde_json::{Value, json};
+
+use crate::app::Workspace;
+use crate::app::pages::settings::widgets::SettingsView;
+use crate::backend::Endpoint;
+use crate::rpc::RpcClient;
+use crate::rpc_permissions::Grants;
+
+use self::logic::Session;
+
+/// How long a failed session check waits before it asks again.
+const SESSION_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// This client's `/api/auth/session` answer, as a page sees it.
+#[derive(Default)]
+pub(in crate::app) enum SessionLoad {
+    #[default]
+    Pending,
+    Ready(Session),
+    /// The check failed; it is retried.
+    Failed,
+}
+
+impl SessionLoad {
+    pub(in crate::app) fn session(&self) -> Option<&Session> {
+        match self {
+            Self::Ready(session) => Some(session),
+            _ => None,
+        }
+    }
+
+    /// A failed or pending check grants nothing, like `resolveRemoteOperateAccess`.
+    pub(in crate::app) fn grants(&self, scope: &str) -> bool {
+        self.session().is_some_and(|session| session.grants(scope))
+    }
+
+    /// `permissionAtom`: whether a control that sends `method` with `payload` may be used.
+    pub(in crate::app) fn permits(&self, method: &str, payload: &Value) -> bool {
+        crate::rpc_permissions::permits(method, payload, |scope| self.grants(scope))
+    }
+
+    /// What the environment's socket checks guarded requests against.
+    pub(in crate::app) fn rpc_grants(&self) -> Grants {
+        match self {
+            Self::Pending => Grants::Pending,
+            Self::Ready(session) => Grants::ready(|scope| session.grants(scope)),
+            Self::Failed => Grants::Failed,
+        }
+    }
+}
+
+/// `useEnvironmentScope` for views outside Settings: whether this client's session on
+/// `endpoint` grants `scope`, answered as `check_session` answers (a failed check grants nothing).
+pub(in crate::app) fn check_scope<T: 'static>(
+    endpoint: Endpoint,
+    scope: &'static str,
+    cx: &mut Context<T>,
+    apply: impl Fn(&mut T, bool, &mut Context<T>) + 'static,
+) -> Task<()> {
+    check_session(endpoint, cx, move |this, load, cx| apply(this, load.grants(scope), cx))
+}
+
+/// The session check every page that gates on grants uses: `apply` gets each answer, and a
+/// failure is retried every few seconds until one succeeds or the task is dropped.
+pub(in crate::app) fn check_session<T: 'static>(
+    endpoint: Endpoint,
+    cx: &mut Context<T>,
+    apply: impl Fn(&mut T, SessionLoad, &mut Context<T>) + 'static,
+) -> Task<()> {
+    cx.spawn(async move |this, cx| {
+        loop {
+            let result = auth_request(Some(endpoint.clone()), "/api/auth/session", None).await;
+            let ready = result.is_ok();
+            let load = result.map_or(SessionLoad::Failed, |value| SessionLoad::Ready(Session::from_json(&value)));
+            let applied = this.update(cx, |this, cx| {
+                apply(this, load, cx);
+                cx.notify();
+            });
+            if ready || applied.is_err() {
+                return;
+            }
+            cx.background_executor().timer(SESSION_RETRY).await;
+        }
+    })
+}
+
+/// `useFilesystemReadAccess`: whether this client's session may read host files on `endpoint`.
+/// `apply` gets `None` while the check fails, and it is retried.
+pub(in crate::app) fn check_filesystem_read<T: 'static>(
+    endpoint: Endpoint,
+    cx: &mut Context<T>,
+    apply: impl Fn(&mut T, Option<bool>, &mut Context<T>) + 'static,
+) -> Task<()> {
+    check_session(endpoint, cx, move |this, load, cx| {
+        apply(this, load.session().map(|session| session.grants(logic::FILESYSTEM_READ)), cx);
+    })
+}
+
+/// Whether a session may operate terminals (`terminal:operate`): only one that answered
+/// without the grant says no.
+pub(in crate::app) fn operates_terminals(load: &SessionLoad) -> bool {
+    load.session().is_none_or(|session| session.grants(logic::TERMINAL_OPERATE))
+}
+
+impl Workspace {
+    /// `useEnvironmentScope` on the Settings environment: this client's current session there
+    /// grants `scope`. A pending or failed check grants nothing.
+    fn settings_grants(&self, scope: &str) -> bool {
+        self.settings_auth().is_some_and(|auth| auth.grants(scope))
+    }
+
+    pub(super) fn render_settings_connections(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.render_environments(view, window, cx)
+    }
+
+    pub(super) fn render_settings_access(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.render_access(view, window, cx)
+    }
+
+    pub(super) fn render_settings_secrets(
+        &mut self,
+        view: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.render_secrets(view, window, cx)
+    }
+
+    /// The environment's name, as the web's `EnvironmentPresentation.label`.
+    fn environment_label(&self) -> Option<&str> {
+        self.settings_info().environment_label.as_deref()
+    }
+
+    fn server_settings(&self) -> &Value {
+        &self.settings_info().settings
+    }
+}
+
+/// Calls one of the server's `/api/auth/*` routes with this client's bearer session.
+pub(super) async fn auth_request(
+    endpoint: Option<Endpoint>,
+    path: &'static str,
+    body: Option<Value>,
+) -> Result<Value, String> {
+    let endpoint = endpoint.ok_or("Not connected to the environment.")?;
+    let request = async move {
+        let client = crate::app::pages::settings::http();
+        let url = format!("{}{path}", endpoint.http_base);
+        let request = match &body {
+            Some(body) => client.post(url).json(body),
+            None => client.get(url),
+        };
+        let response = request
+            .bearer_auth(&endpoint.bearer_token)
+            .timeout(std::time::Duration::from_secs(8))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let status = response.status();
+        let value = response.json::<Value>().await;
+        if status.is_success() {
+            value.map_err(|error| format!("The environment sent an unreadable response to {path}: {error}"))
+        } else {
+            let value = value.unwrap_or(Value::Null);
+            Err(value["message"].as_str().map_or_else(|| format!("Request failed ({status})."), str::to_owned))
+        }
+    };
+    crate::runtime().spawn(request).await.map_err(|error| error.to_string())?
+}
+
+/// The environment a dialog or menu opened on, whose socket and grants are read when it saves:
+/// either can stay open through a reconnect.
+#[derive(Clone)]
+struct SettingsWriter {
+    workspace: WeakEntity<Workspace>,
+    environment: Option<SharedString>,
+    label: String,
+}
+
+impl SettingsWriter {
+    /// `useUpdateEnvironmentSettings`: a session without `scopes` there saves nothing.
+    fn save(&self, patch: Value, scopes: &[&str], window: &mut Window, cx: &mut App) {
+        let Some(workspace) = self.workspace.upgrade() else { return };
+        let workspace = workspace.read(cx);
+        let environment = self.environment.as_deref().unwrap_or_default();
+        if !scopes.iter().all(|scope| workspace.env_grants(environment, scope)) {
+            let reason = format!("This connection lacks permission to change settings on {}.", self.label);
+            return window.push_notification(Notification::warning(reason).title("Setting not saved"), cx);
+        }
+        let client = workspace.env_client(environment);
+        window
+            .spawn(cx, async move |cx| {
+                if let Err(error) = update_settings(client, patch).await {
+                    let _ = cx.update(|window, cx| error_toast(window, cx, "Could not update settings", error));
+                }
+            })
+            .detach();
+    }
+}
+
+/// `server.updateSettings` with a plain environment-wide patch.
+async fn update_settings(client: Option<RpcClient>, patch: Value) -> Result<(), String> {
+    let client = client.ok_or("Not connected to the environment.")?;
+    client.request("server.updateSettings", json!({ "patch": patch })).await.map(drop).map_err(|e| e.to_string())
+}
+
+/// The web's `stackedThreadToast({ type: "error", title, description })`.
+fn error_toast(
+    window: &mut Window,
+    cx: &mut App,
+    title: impl Into<SharedString>,
+    description: impl Into<SharedString>,
+) {
+    window.push_notification(Notification::error(description).title(title), cx);
+}
+
+fn success_toast(
+    window: &mut Window,
+    cx: &mut App,
+    title: impl Into<SharedString>,
+    description: impl Into<SharedString>,
+) {
+    window.push_notification(Notification::success(description).title(title), cx);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_session_without_the_grant_stops_terminal_operation() {
+        let session =
+            |scopes: Value| SessionLoad::Ready(Session::from_json(&json!({"authenticated": true, "scopes": scopes})));
+        assert!(operates_terminals(&session(json!(["terminal:operate", "terminal:read"]))));
+        assert!(!operates_terminals(&session(json!(["terminal:read"]))));
+        assert!(operates_terminals(&SessionLoad::Pending), "the server still checks every write");
+        assert!(operates_terminals(&SessionLoad::Failed));
+    }
+
+    #[test]
+    fn exact_empty_permissions_grant_nothing_and_legacy_parents_still_grant() {
+        let load = |session: Value| SessionLoad::Ready(Session::from_json(&session));
+        let exact = load(json!({"authenticated": true, "scopes": ["orchestration:operate"], "permissions": []}));
+        let legacy = load(json!({"authenticated": true, "scopes": ["orchestration:operate"]}));
+        let signed_out = load(json!({"authenticated": false, "scopes": ["orchestration:operate"]}));
+        for (load, allowed) in [(&exact, false), (&legacy, true), (&signed_out, false), (&SessionLoad::Pending, false)]
+        {
+            assert_eq!(load.permits("vcs.init", &json!({"cwd": "/repo"})), allowed);
+            let answer = load.rpc_grants().authorize("vcs.init", &Value::Null);
+            match load {
+                SessionLoad::Pending => assert_eq!(answer, None, "a guarded request waits for the first answer"),
+                _ => assert_eq!(answer, Some(if allowed { Ok(()) } else { Err("source-control:write") })),
+            }
+        }
+        assert!(SessionLoad::Failed.rpc_grants().authorize("vcs.init", &Value::Null).is_some_and(|r| r.is_err()));
+    }
+}

@@ -1,0 +1,2200 @@
+//! Writing from the panel: the comment and review composer (`PullRequestComposer`,
+//! `PullRequestCommentForm`, `PullRequestReviewForm`), line comments drafted in the Code tab
+//! (`DiffCommentAnnotation`, `pullRequestReviewStore`), replies, resolving, edits
+//! (`PullRequestMarkdownEditor`, `PullRequestTitleEditor`), reactions (`PullRequestReactions`)
+//! and the reviewer and label pickers (`PullRequestCandidatePicker`).
+
+use std::cell::Cell;
+
+use gpui_kit::Focusable as _;
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_kit::component::popover::Popover;
+
+use super::*;
+use crate::pull_request_detail::Reaction;
+use crate::pull_request_diff::Position;
+use crate::pull_request_reviewers as reviewer_search;
+
+/// `useDebouncedValue(query.trim(), 250)` in `PullRequestReviewerPicker`.
+const REVIEWER_SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// `PULL_REQUEST_REACTION_ORDER`, with each reaction's emoji and name.
+const REACTIONS: [(&str, &str, &str); 8] = [
+    ("thumbs-up", "👍", "thumbs up"),
+    ("thumbs-down", "👎", "thumbs down"),
+    ("laugh", "😄", "laugh"),
+    ("hooray", "🎉", "hooray"),
+    ("confused", "😕", "confused"),
+    ("heart", "❤️", "heart"),
+    ("rocket", "🚀", "rocket"),
+    ("eyes", "👀", "eyes"),
+];
+
+/// `VERDICTS`: the value, its label and the toast once sent.
+const VERDICTS: [(&str, &str); 3] =
+    [("comment", "Comment"), ("approve", "Approve"), ("request-changes", "Request changes")];
+
+/// A line comment waiting for the review (`PendingReviewComment`).
+#[derive(Clone, Debug)]
+pub(in crate::app) struct PendingComment {
+    id: u64,
+    path: String,
+    old_path: Option<String>,
+    position: Position,
+    start: Option<Position>,
+    body: String,
+}
+
+impl PendingComment {
+    /// `PullRequestReviewCommentDraft`.
+    fn to_json(&self) -> Value {
+        let mut value = json!({"path": self.path, "position": self.position.to_json(), "body": self.body});
+        if let Some(old) = &self.old_path {
+            value["oldPath"] = json!(old);
+        }
+        if let Some(start) = self.start {
+            value["startPosition"] = start.to_json();
+        }
+        value
+    }
+
+    pub(super) fn anchor(&self) -> (crate::pull_request_diff::Side, u64) {
+        self.position.anchor()
+    }
+
+    pub(super) fn path(&self) -> &str {
+        &self.path
+    }
+}
+
+/// An unsent review, kept per pull request across panels (`usePullRequestReviewStore`).
+#[derive(Default)]
+pub(in crate::app) struct ReviewDraft {
+    comments: Vec<PendingComment>,
+    summary: Option<Entity<TextareaState>>,
+    next_id: u64,
+}
+
+/// A line comment being written under its line in the Code tab or a guide excerpt.
+pub(super) struct LineDraft {
+    pub(super) path: String,
+    old_path: Option<String>,
+    position: Position,
+    start: Option<Position>,
+    /// The picked lines as picked, which a handoff to an agent quotes whole.
+    pub(super) picked: (Point, Point),
+    /// The guide excerpt it was opened under; `None` in the Code tab.
+    pub(super) excerpt: Option<String>,
+    input: Entity<TextareaState>,
+}
+
+impl LineDraft {
+    pub(super) fn anchor(&self) -> Point {
+        self.position.anchor()
+    }
+}
+
+/// A diff line: its side and number.
+pub(super) type Point = (crate::pull_request_diff::Side, u64);
+
+/// An edit in progress: a comment (`kind` is its endpoint) or the description.
+struct Editing {
+    subject: String,
+    kind: &'static str,
+    input: Entity<TextareaState>,
+    preview: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PickerKind {
+    Reviewers,
+    Labels,
+}
+
+struct Picker {
+    kind: PickerKind,
+    search: Entity<InputState>,
+    candidates: Option<Result<Value, String>>,
+    /// The candidates read in flight; a newer read replaces it, so an older answer never lands last.
+    _candidates: Option<Task<()>>,
+    pending: Option<String>,
+    /// The reviewer query once typing settles.
+    debounced: String,
+    _debounce: Option<Task<()>>,
+    /// The host's answers past the first page, by query (`reviewerSearch`), and those in flight.
+    searches: HashMap<String, Result<Value, String>>,
+    searching: HashSet<String>,
+    /// Bumped when a pick makes the searches stale, so one still in flight is dropped.
+    searches_epoch: u64,
+    /// The candidate the arrow keys rest on, which Enter picks; the first after each keystroke.
+    highlight: Option<usize>,
+    scroll: ScrollHandle,
+}
+
+/// What the picker lists for what is typed: the matching candidates, whether a host search is
+/// in flight, its error, and a note on candidates left out.
+struct Matches {
+    candidates: Vec<Value>,
+    pending: bool,
+    error: Option<String>,
+    truncated: Option<String>,
+}
+
+#[derive(Default)]
+pub(super) struct WriteState {
+    composer_open: bool,
+    review_mode: bool,
+    verdict: Option<&'static str>,
+    comment: Option<Entity<TextareaState>>,
+    submitting: Option<&'static str>,
+    /// Open reply boxes, one per conversation (`PullRequestReviewAnnotation`'s own `reply`).
+    replies: HashMap<String, Entity<TextareaState>>,
+    editing: Option<Editing>,
+    saving: bool,
+    /// The title's own save, apart from the description's and comments' (`PullRequestTitleEditor`).
+    title_saving: bool,
+    /// Conversations whose resolve or reply is in flight, each on its own like the web's cards.
+    thread_pending: HashSet<String>,
+    /// Reactions pressed and not yet read back, by subject and content.
+    pub(super) reactions: HashMap<(String, String), bool>,
+    reaction_picker: Option<String>,
+    pub(super) draft: Option<LineDraft>,
+    picker: Option<Picker>,
+    /// The `@`/`#`/`!` suggestions open under a composer, and an Escape that hid one.
+    pub(super) completion: Option<super::completions::Completing>,
+    pub(super) dismissed: Option<(gpui_kit::EntityId, usize)>,
+    title: Option<Entity<InputState>>,
+    _watch: Vec<Subscription>,
+}
+
+/// `applyPendingPullRequestReactions`: pressed reactions shown before the host confirms them.
+pub(super) fn apply_pending(reactions: &[Reaction], pending: &[(String, bool)]) -> Vec<Reaction> {
+    let mut shown: Vec<Reaction> = reactions.to_vec();
+    for (content, reacted) in pending {
+        match shown.iter().position(|r| &r.content == content) {
+            None if *reacted => shown.push(Reaction { content: content.clone(), count: 1, viewer_has_reacted: true }),
+            None => {}
+            Some(index) if shown[index].viewer_has_reacted != *reacted => {
+                let count = if *reacted { shown[index].count + 1 } else { shown[index].count.saturating_sub(1) };
+                if count == 0 {
+                    shown.remove(index);
+                } else {
+                    shown[index].count = count;
+                    shown[index].viewer_has_reacted = *reacted;
+                }
+            }
+            Some(_) => {}
+        }
+    }
+    shown.sort_by_key(|r| REACTIONS.iter().position(|(c, _, _)| *c == r.content).unwrap_or(usize::MAX));
+    shown
+}
+
+/// `canSubmit`: a review needs a summary or line comments, except an approval.
+pub(super) fn can_submit_review(verdict: &str, summary: &str, comments: usize, summary_required: bool) -> bool {
+    if verdict == "request-changes" && summary_required {
+        !summary.trim().is_empty()
+    } else {
+        verdict == "approve" || !summary.trim().is_empty() || comments > 0
+    }
+}
+
+/// `offered`: the verdicts this host takes and this viewer may give, in `VERDICTS` order.
+fn offered_verdicts(detail: &Detail) -> Vec<(&'static str, &'static str)> {
+    VERDICTS
+        .iter()
+        .copied()
+        .filter(|(v, _)| detail.capabilities.review.verdicts.iter().any(|c| c == v))
+        .filter(|(v, _)| detail.viewer_permissions.verdicts.iter().any(|c| c == v))
+        .collect()
+}
+
+/// `selectedVerdict`: the one picked while it is still offered, else the first offered.
+fn selected_verdict(
+    offered: &[(&'static str, &'static str)],
+    picked: Option<&'static str>,
+) -> Option<(&'static str, &'static str)> {
+    offered.iter().copied().find(|(v, _)| Some(*v) == picked).or_else(|| offered.first().copied())
+}
+
+/// Mod+Enter in the review summary: the selected verdict, when it can be submitted.
+fn summary_shortcut_verdict(
+    offered: &[(&'static str, &'static str)],
+    picked: Option<&'static str>,
+    summary: &str,
+    comments: usize,
+    summary_required: bool,
+) -> Option<&'static str> {
+    let (verdict, _) = selected_verdict(offered, picked)?;
+    can_submit_review(verdict, summary, comments, summary_required).then_some(verdict)
+}
+
+/// Forgejo needs a summary to request changes (`reviewSummaryRequired`).
+fn summary_required(provider: &str) -> bool {
+    provider == "forgejo"
+}
+
+/// A conversation's Fix waits while that conversation's resolve or reply is in flight.
+fn finding_pending(write: &WriteState, finding: &logic::Finding) -> bool {
+    matches!(finding, logic::Finding::Thread(thread) if write.thread_pending.contains(&thread.id))
+}
+
+/// Where a line draft opens: path, old path, anchor, range start, picked lines and excerpt.
+type DraftPlace = (String, Option<String>, Position, Option<Position>, (Point, Point), Option<String>);
+
+/// `canCommentOnLines`: the host takes line comments and this viewer may write them.
+pub(super) fn pr_can_comment(detail: &Detail) -> bool {
+    detail.capabilities.review.inline_comment && detail.viewer_permissions.comment
+}
+
+fn text_of(input: &Entity<TextareaState>, cx: &App) -> String {
+    input.read(cx).value().to_string()
+}
+
+/// The group an edit pencil appears on hover in.
+pub(super) const EDIT_GROUP: &str = "pr-edit";
+
+/// Shown while the pointer is over its `EDIT_GROUP` (`PullRequestEditButton`).
+pub(super) fn hover_only(child: impl IntoElement) -> AnyElement {
+    div().flex_none().opacity(0.).group_hover(EDIT_GROUP, |s| s.opacity(1.)).child(child).into_any_element()
+}
+
+/// Notifies the workspace only when an input turns empty or stops being so, which is all the
+/// buttons beside it read; Ctrl+Enter runs `submit`.
+/// A composer's edits, Mod+Enter, and the caret moves and blur its completions follow.
+fn watch(
+    input: &Entity<TextareaState>,
+    submit: Option<fn(&mut Workspace, &mut Window, &mut Context<Workspace>)>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> [Subscription; 3] {
+    let empty = Rc::new(Cell::new(true));
+    let id = input.entity_id();
+    let focus = input.focus_handle(cx);
+    [
+        cx.subscribe_in(input, window, move |this, input, event: &InputEvent, window, cx| match event {
+            InputEvent::Change => {
+                let now = input.read(cx).value().trim().is_empty();
+                if empty.replace(now) != now {
+                    cx.notify();
+                }
+                let focused = input.focus_handle(cx).is_focused(window);
+                this.sync_pr_completion(input, focused, true, cx);
+            }
+            InputEvent::PressEnter { secondary: true, .. } => {
+                if let Some(submit) = submit {
+                    submit(this, window, cx);
+                }
+            }
+            _ => {}
+        }),
+        cx.observe_in(input, window, |this, input, window, cx| {
+            let focused = input.focus_handle(cx).is_focused(window);
+            this.sync_pr_completion(&input, focused, false, cx);
+        }),
+        cx.on_blur(&focus, window, move |this, _, cx| this.close_pr_completion(id, cx)),
+    ]
+}
+
+impl Workspace {
+    pub(super) fn pr_write(&mut self) -> Option<&mut WriteState> {
+        self.pull_requests.panel.as_mut().map(|p| &mut p.write)
+    }
+
+    /// The write state of the pull request `key` names, shown or parked.
+    fn pr_write_of(&mut self, key: &str) -> Option<&mut WriteState> {
+        self.pr_panel(key).map(|p| &mut p.write)
+    }
+
+    fn pr_review(&mut self) -> Option<&mut ReviewDraft> {
+        let key = self.pull_requests.panel.as_ref()?.reference.key();
+        Some(self.pull_requests.reviews.entry(key).or_default())
+    }
+
+    pub(super) fn pr_pending_comments(&self) -> Vec<PendingComment> {
+        self.pull_requests
+            .panel
+            .as_ref()
+            .and_then(|p| self.pull_requests.reviews.get(&p.reference.key()))
+            .map(|r| r.comments.clone())
+            .unwrap_or_default()
+    }
+
+    /// Runs one write RPC for the shown pull request; success reads it again, failure toasts
+    /// `failure`. `done` gets that pull request's key, which stays right if another tab shows meanwhile.
+    pub(super) fn run_pr_write(
+        &mut self,
+        method: &'static str,
+        input: Value,
+        failure: String,
+        hint: Option<&'static str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        done: impl FnOnce(&mut Workspace, &str, bool, &mut Window, &mut Context<Workspace>) + 'static,
+    ) {
+        let Some(key) = self.shown_pr_key() else { return };
+        // Offline, the write fails like any other, so the caller's pending marks clear.
+        let Some(client) = self.pull_request_client() else {
+            toast_error(window, cx, failure, "The pull request's environment is not connected.");
+            done(self, &key, false, window, cx);
+            cx.notify();
+            return;
+        };
+        // The write grant can be lost while an editor or form stays open (`permissionAtom`).
+        if !self.pr_panel_permits(&key, method, Some(&input)) {
+            done(self, &key, false, window, cx);
+            cx.notify();
+            return;
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            let result = client.request(method, input).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                match &result {
+                    Ok(_) => this.read_pr_detail_of(&key, cx),
+                    Err(error) => {
+                        let message = match hint {
+                            Some(hint) => logic::readable_failure(&list_logic::error_message(error), hint),
+                            None => list_logic::error_message(error),
+                        };
+                        toast_error(window, cx, failure, message);
+                    }
+                }
+                done(this, &key, result.is_ok(), window, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn pr_ref_json(&self) -> Option<Value> {
+        self.pull_requests.panel.as_ref().map(|p| p.reference.to_json())
+    }
+
+    // The composer.
+
+    fn toggle_pr_composer(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let started = self.pr_review().is_some_and(|r| {
+            !r.comments.is_empty() || r.summary.as_ref().is_some_and(|s| !text_of(s, cx).trim().is_empty())
+        });
+        if open {
+            self.ensure_pr_composer_inputs(window, cx);
+        }
+        if let Some(write) = self.pr_write() {
+            if open {
+                write.review_mode = started;
+            }
+            write.composer_open = open;
+        }
+        if open {
+            self.sync_pr_review_placeholder(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// "Finish review": the composer opens on its review.
+    pub(super) fn open_pr_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_pr_composer(true, window, cx);
+        if let Some(write) = self.pr_write() {
+            write.review_mode = true;
+        }
+        cx.notify();
+    }
+
+    fn ensure_pr_composer_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pr_write().is_some_and(|w| w.comment.is_none()) {
+            let input = cx.new(|cx| TextareaState::new(window, cx).rows(3).placeholder("Leave a comment"));
+            let sub = watch(&input, Some(|this, window, cx| this.post_pr_comment("comment", window, cx)), window, cx);
+            if let Some(write) = self.pr_write() {
+                write.comment = Some(input);
+                write._watch.extend(sub);
+            }
+        }
+        if self.pr_review().is_some_and(|r| r.summary.is_none()) {
+            let input = cx.new(|cx| TextareaState::new(window, cx).rows(3));
+            let sub = watch(&input, Some(crate::app::Workspace::submit_pr_review_from_summary), window, cx);
+            if let Some(review) = self.pr_review() {
+                review.summary = Some(input);
+            }
+            if let Some(write) = self.pr_write() {
+                write._watch.extend(sub);
+            }
+        }
+    }
+
+    /// The summary's placeholder says whether this verdict needs it.
+    fn sync_pr_review_placeholder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.pull_requests.panel.as_ref() else { return };
+        let Some(detail) = panel.detail.clone() else { return };
+        let verdict = panel.write.verdict;
+        let pending = self.pr_pending_comments().len();
+        let Some(summary) = self.pr_review().and_then(|r| r.summary.clone()) else { return };
+        let selected = selected_verdict(&offered_verdicts(&detail), verdict).map(|(v, _)| v);
+        let required = summary_required(&detail.provider);
+        let placeholder = match selected {
+            None => "Summarize your review (optional)",
+            Some(v) if can_submit_review(v, "", pending, required) => "Summarize your review (optional)",
+            Some("request-changes") if required => "Summarize your review (required to request changes)",
+            _ => "Summarize your review or add line comments",
+        };
+        summary.update(cx, |input, cx| input.set_placeholder(placeholder, window, cx));
+    }
+
+    /// `PullRequestCommentForm.submit`: a comment, optionally followed by closing or reopening.
+    fn post_pr_comment(&mut self, action: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.pull_requests.panel.as_ref() else { return };
+        let Some(input) = panel.write.comment.clone() else { return };
+        let body = text_of(&input, cx).trim().to_owned();
+        if body.is_empty() || panel.write.submitting.is_some() || panel.pending.is_some() {
+            return;
+        }
+        let Some(mut payload) = self.pr_ref_json() else { return };
+        payload["body"] = json!(body);
+        if let Some(write) = self.pr_write() {
+            write.submitting = Some(action);
+        }
+        self.run_pr_write(
+            "pullRequests.comment",
+            payload,
+            "Could not post the comment".into(),
+            None,
+            window,
+            cx,
+            move |this, key, ok, window, cx| {
+                let Some(panel) = this.pr_panel(key) else { return };
+                panel.write.submitting = None;
+                if !ok {
+                    return;
+                }
+                panel.write.composer_open = false;
+                if let Some(input) = panel.write.comment.clone() {
+                    input.update(cx, |input, cx| input.set_value("", window, cx));
+                }
+                if action != "comment" {
+                    this.perform_pr_action_on(key, action, None, None, window, cx);
+                }
+            },
+        );
+        cx.notify();
+    }
+
+    /// Mod+Enter in the summary submits the selected verdict (`isCommentSubmitShortcut`).
+    fn submit_pr_review_from_summary(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.pull_requests.panel.as_ref() else { return };
+        let Some(detail) = panel.detail.clone() else { return };
+        let picked = panel.write.verdict;
+        let comments = self.pr_pending_comments().len();
+        let summary = self.pr_review().and_then(|r| r.summary.clone()).map(|s| text_of(&s, cx)).unwrap_or_default();
+        let required = summary_required(&detail.provider);
+        if let Some(verdict) =
+            summary_shortcut_verdict(&offered_verdicts(&detail), picked, &summary, comments, required)
+        {
+            self.submit_pr_review(verdict, window, cx);
+        }
+    }
+
+    /// `PullRequestReviewForm.submit`.
+    fn submit_pr_review(&mut self, verdict: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.pull_requests.panel.as_ref() else { return };
+        if panel.write.submitting.is_some() {
+            return;
+        }
+        let term = logic::terminology(panel.provider()).0;
+        let key = panel.reference.key();
+        let Some(mut payload) = self.pr_ref_json() else { return };
+        let Some(review) = self.pr_review() else { return };
+        let summary = review.summary.as_ref().map(|s| text_of(s, cx)).unwrap_or_default();
+        let sent: Vec<u64> = review.comments.iter().map(|c| c.id).collect();
+        payload["verdict"] = json!(verdict);
+        payload["body"] = json!(summary);
+        payload["comments"] = Value::Array(review.comments.iter().map(PendingComment::to_json).collect());
+        if let Some(write) = self.pr_write() {
+            write.submitting = Some("review");
+        }
+        let toast = match verdict {
+            "approve" => format!("{} approved", logic::capitalize(term)),
+            "request-changes" => "Changes requested".into(),
+            _ => "Review submitted".into(),
+        };
+        self.run_pr_write(
+            "pullRequests.submitReview",
+            payload,
+            "The review could not be submitted".into(),
+            Some("The host refused the review. Your draft is still here to try again."),
+            window,
+            cx,
+            move |this, _, ok, window, cx| {
+                if let Some(panel) = this.pr_panel(&key) {
+                    panel.write.submitting = None;
+                    if ok {
+                        panel.write.composer_open = false;
+                    }
+                }
+                if !ok {
+                    return;
+                }
+                // Comments and summary edits made while it was sending stay.
+                if let Some(review) = this.pull_requests.reviews.get_mut(&key) {
+                    review.comments.retain(|c| !sent.contains(&c.id));
+                    if let Some(input) = review.summary.clone()
+                        && text_of(&input, cx) == summary
+                    {
+                        input.update(cx, |input, cx| input.set_value("", window, cx));
+                    }
+                }
+                toast_success(window, cx, toast);
+            },
+        );
+        cx.notify();
+    }
+
+    /// The floating composer button and its popover, bottom right of the panel.
+    pub(super) fn render_pr_composer(
+        &mut self,
+        detail: &Detail,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let term = logic::terminology(&detail.provider).0;
+        let can_comment = detail.capabilities.comment && detail.viewer_permissions.comment;
+        let verdicts = offered_verdicts(detail);
+        if !can_comment && verdicts.is_empty() {
+            return None;
+        }
+        let pending = self.pr_pending_comments();
+        let panel = self.pull_requests.panel.as_ref()?;
+        let write = &panel.write;
+        let open = write.composer_open;
+        let review_mode = if can_comment { !verdicts.is_empty() && write.review_mode } else { true };
+        // The suggestion list draws past the popover, so a click on it must not count as outside.
+        let completing = write.completion.is_some();
+        let view = cx.entity();
+        let badge = (!pending.is_empty()).then(|| {
+            div()
+                .absolute()
+                .top(px(-4.))
+                .right(px(-4.))
+                .h(px(14.))
+                .min_w(px(14.))
+                .px(px(4.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .bg(t.info)
+                .text_size(px(9.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(gpui_kit::white())
+                .child(pending.len().to_string())
+        });
+        let tip: SharedString = if !pending.is_empty() {
+            format!("Review {term}, {} pending", pending.len())
+        } else if !can_comment {
+            format!("Review {term}")
+        } else {
+            format!("Comment on {term}")
+        }
+        .into();
+        let trigger = Button::new("pr-composer")
+            .outline()
+            .bg(t.background)
+            .size(px(36.))
+            .p_0()
+            .rounded(px(8.))
+            .tooltip(tip)
+            .child(Icon::new(Lucide::MessageSquare).with_size(px(16.)))
+            .children(badge);
+        let body =
+            open.then(|| self.render_pr_composer_body(detail, can_comment, &verdicts, review_mode, &pending, t, cx));
+        Some(
+            Popover::new("pr-composer-popover")
+                .anchor(gpui_kit::Anchor::BottomRight)
+                .open(open)
+                .overlay_closable(!completing)
+                .on_open_change(move |open, window, cx| {
+                    let open = *open;
+                    view.update(cx, |this, cx| this.toggle_pr_composer(open, window, cx));
+                })
+                .trigger(trigger)
+                .w(px(448.))
+                .p(px(16.))
+                .children(body)
+                .into_any_element(),
+        )
+    }
+
+    fn render_pr_composer_body(
+        &self,
+        detail: &Detail,
+        can_comment: bool,
+        verdicts: &[(&'static str, &'static str)],
+        review_mode: bool,
+        pending: &[PendingComment],
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let term = logic::terminology(&detail.provider).0;
+        let panel = self.pull_requests.panel.as_ref().expect("a panel is open");
+        let write = &panel.write;
+        let submitting = write.submitting;
+        let review_label = if pending.is_empty() { "Review".to_owned() } else { format!("Review ({})", pending.len()) };
+        let heading = if can_comment && !verdicts.is_empty() {
+            let view = cx.entity();
+            [(false, "comment", "Comment".to_owned()), (true, "review", review_label)]
+                .into_iter()
+                .fold(Segmented::new("pr-composer-mode"), |group, (mode, key, label)| {
+                    let view = view.clone();
+                    group.segment(key, label, review_mode == mode, move |_, cx| {
+                        view.update(cx, |this, cx| {
+                            if let Some(write) = this.pr_write() {
+                                write.review_mode = mode;
+                            }
+                            cx.notify();
+                        });
+                    })
+                })
+                .into_any_element()
+        } else {
+            div()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(if review_mode { format!("Review {term}") } else { format!("Comment on {term}") })
+                .into_any_element()
+        };
+        let discard = (review_mode && !pending.is_empty()).then(|| {
+            ghost_button("pr-composer-discard", t)
+                .tooltip("Discard pending line comments")
+                .disabled(submitting.is_some())
+                .child(Icon::new(Lucide::Trash).with_size(px(14.)))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if let Some(review) = this.pr_review() {
+                        review.comments.clear();
+                    }
+                    cx.notify();
+                }))
+        });
+        let close = ghost_button("pr-composer-close", t)
+            .tooltip("Close composer")
+            .child(Icon::new(Lucide::X).with_size(px(14.)))
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_pr_composer(false, window, cx)));
+        let header = h_flex()
+            .mb(px(12.))
+            .justify_between()
+            .gap(px(8.))
+            .child(heading)
+            .child(h_flex().gap(px(4.)).children(discard).child(close));
+        let form = if review_mode {
+            self.render_pr_review_form(detail, verdicts, pending.len(), t, cx)
+        } else {
+            self.render_pr_comment_form(detail, t, cx)
+        };
+        v_flex().child(header).child(form).into_any_element()
+    }
+
+    fn render_pr_comment_form(&self, detail: &Detail, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+        let panel = self.pull_requests.panel.as_ref().expect("a panel is open");
+        let write = &panel.write;
+        let Some(input) = write.comment.clone() else { return div().into_any_element() };
+        let busy = write.submitting.is_some() || panel.pending.is_some();
+        let empty = text_of(&input, cx).trim().is_empty();
+        let follow_up = if detail.state == list_logic::State::Open && logic::can(detail, "close") {
+            Some("close")
+        } else if detail.state == list_logic::State::Closed && logic::can(detail, "reopen") {
+            Some("reopen")
+        } else {
+            None
+        };
+        let follow = follow_up.map(|action| {
+            let label = match (action, write.submitting, panel.armed) {
+                ("close", Some("close"), _) => "Closing...",
+                ("close", _, Some("comment-close")) => "Confirm close?",
+                ("close", _, _) => "Close with comment",
+                (_, Some("reopen"), _) => "Reopening...",
+                _ => "Reopen with comment",
+            };
+            let button = xs_outline("pr-comment-follow-up", t)
+                .disabled(empty || busy)
+                .child(
+                    Icon::new(if action == "close" {
+                        Lucide::GitPullRequestClosed
+                    } else {
+                        Lucide::GitPullRequestArrow
+                    })
+                    .with_size(px(14.)),
+                )
+                .child(label);
+            let button = if action == "close" {
+                button.text_color(t.error).border_color(Hsla { a: 0.4, ..t.error })
+            } else {
+                button
+            };
+            button.on_click(cx.listener(move |this, _, window, cx| {
+                if action == "reopen" {
+                    return this.post_pr_comment("reopen", window, cx);
+                }
+                // The inline confirm: the first press arms, a second within three seconds acts.
+                let armed = this.pull_requests.panel.as_ref().is_some_and(|p| p.armed == Some("comment-close"));
+                if armed {
+                    if let Some(panel) = this.pull_requests.panel.as_mut() {
+                        panel.armed = None;
+                    }
+                    this.post_pr_comment("close", window, cx);
+                } else {
+                    this.arm_pr_confirm("comment-close", cx);
+                }
+            }))
+        });
+        v_flex()
+            .gap(px(8.))
+            .child(Textarea::new(&input).disabled(busy))
+            .children(self.render_pr_completions(&input, t, cx))
+            .child(
+                h_flex().flex_wrap().justify_end().gap(px(8.)).children(follow).child(
+                    xs_outline("pr-comment-send", t)
+                        .disabled(empty || busy)
+                        .child(Icon::new(Lucide::Send).with_size(px(14.)))
+                        .child(if write.submitting == Some("comment") { "Posting..." } else { "Comment" })
+                        .on_click(cx.listener(|this, _, window, cx| this.post_pr_comment("comment", window, cx))),
+                ),
+            )
+            .into_any_element()
+    }
+
+    fn render_pr_review_form(
+        &self,
+        detail: &Detail,
+        verdicts: &[(&'static str, &'static str)],
+        pending: usize,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let panel = self.pull_requests.panel.as_ref().expect("a panel is open");
+        let Some(summary) = self.pull_requests.reviews.get(&panel.reference.key()).and_then(|r| r.summary.clone())
+        else {
+            return div().into_any_element();
+        };
+        let required = summary_required(&detail.provider);
+        let selected = selected_verdict(verdicts, panel.write.verdict);
+        let text = text_of(&summary, cx);
+        let busy = panel.write.submitting.is_some();
+        let view = cx.entity();
+        let verdict_icon = |v: &str| match v {
+            "approve" => Lucide::Check,
+            "request-changes" => Lucide::CircleX,
+            _ => Lucide::MessageSquare,
+        };
+        let picker = (verdicts.len() > 1).then(|| {
+            let options = verdicts.to_vec();
+            let (value, label) = selected.unwrap_or(("comment", "Comment"));
+            Button::new("pr-review-verdict")
+                .outline()
+                .xsmall()
+                .mr_auto()
+                .disabled(busy)
+                .child(Icon::new(verdict_icon(value)).with_size(px(12.)))
+                .child(label)
+                .child(Icon::new(Lucide::ChevronDown).with_size(px(12.)))
+                .dropdown_menu(move |mut menu: PopupMenu, window, _| {
+                    for (value, label) in &options {
+                        let value: &'static str = value;
+                        menu = menu.item(PopupMenuItem::new(*label).icon(verdict_icon(value)).on_click(
+                            window.listener_for(&view, move |this, _, window, cx| {
+                                if let Some(write) = this.pr_write() {
+                                    write.verdict = Some(value);
+                                }
+                                this.sync_pr_review_placeholder(window, cx);
+                                cx.notify();
+                            }),
+                        ));
+                    }
+                    menu
+                })
+        });
+        let can = selected.is_some_and(|(v, _)| can_submit_review(v, &text, pending, required));
+        v_flex()
+            .child(Textarea::new(&summary))
+            .children(self.render_pr_completions(&summary, t, cx))
+            .child(
+                h_flex().mt(px(8.)).justify_end().gap(px(8.)).children(picker).child(
+                    Button::new("pr-review-submit")
+                        .primary()
+                        .xsmall()
+                        .disabled(busy || !can)
+                        .child(if busy { "Submitting..." } else { "Submit review" })
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if let Some((verdict, _)) = selected {
+                                this.submit_pr_review(verdict, window, cx);
+                            }
+                        })),
+                ),
+            )
+            .into_any_element()
+    }
+
+    /// Arms an inline confirm for three seconds (`useInlineActionConfirm`).
+    fn arm_pr_confirm(&mut self, action: &'static str, cx: &mut Context<Self>) {
+        let Some(panel) = self.pull_requests.panel.as_mut() else { return };
+        panel.armed = Some(action);
+        let key = panel.reference.key();
+        panel._disarm = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(CONFIRM_WINDOW).await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(panel) = this.pr_panel(&key) {
+                    panel.armed = None;
+                    cx.notify();
+                }
+            });
+        }));
+        cx.notify();
+    }
+
+    // Line comments in the Code tab and the guide's excerpts.
+
+    /// `beginComment` in the Code tab: a line or selection gets a draft under its last line.
+    pub(super) fn begin_pr_line_comment(
+        &mut self,
+        path: String,
+        start: Point,
+        end: Point,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = self.pull_requests.panel.as_ref() else { return };
+        let Some(detail) = panel.detail.as_ref() else { return };
+        let Some(code) = panel.code.as_ref() else { return };
+        if code.commit_selected() || panel.write.draft.is_some() || !pr_can_comment(detail) {
+            return;
+        }
+        let ranged = detail.capabilities.review.range_comment == Some(true);
+        let Some(file) = code.patch(&path) else { return };
+        let old_path = file.old_path.clone().filter(|old| *old != path);
+        let Some((position, first)) = crate::pull_request_diff::review_anchor(file, start, end, ranged) else { return };
+        let draft = (path, old_path, position, first, (start, end), None);
+        self.open_pr_line_draft(draft, "Leave a comment", window, cx);
+    }
+
+    /// `ExcerptDiff`'s `beginComment`: lines picked in a guide excerpt get a draft that goes to
+    /// the review, or only to an agent when this viewer may not comment.
+    pub(super) fn begin_pr_excerpt_comment(
+        &mut self,
+        excerpt: String,
+        path: String,
+        picked: (Point, Point),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let can_ask = self.pr_can_ask();
+        let Some(panel) = self.pull_requests.panel.as_ref() else { return };
+        let Some(detail) = panel.detail.as_ref() else { return };
+        let can_comment = pr_can_comment(detail);
+        if panel.write.draft.is_some() || !(can_comment || can_ask) {
+            return;
+        }
+        let ranged = detail.capabilities.review.range_comment == Some(true);
+        let Some(file) = panel.guide_diff.file(&path) else { return };
+        let old_path = file.old_path.clone().filter(|old| *old != path);
+        let Some((position, first)) = crate::pull_request_diff::review_anchor(file, picked.0, picked.1, ranged) else {
+            return;
+        };
+        let placeholder = if can_comment { "Add a comment…" } else { "Ask the agent about these lines…" };
+        self.open_pr_line_draft((path, old_path, position, first, picked, Some(excerpt)), placeholder, window, cx);
+    }
+
+    fn open_pr_line_draft(
+        &mut self,
+        (path, old_path, position, start, picked, excerpt): DraftPlace,
+        placeholder: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = cx.new(|cx| TextareaState::new(window, cx).rows(3).placeholder(placeholder));
+        input.update(cx, |input, cx| input.focus(window, cx));
+        let sub = watch(&input, Some(Self::submit_pr_line_draft), window, cx);
+        if let Some(write) = self.pr_write() {
+            write.draft = Some(LineDraft { path, old_path, position, start, picked, excerpt, input });
+            write._watch.extend(sub);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn cancel_pr_line_draft(&mut self, cx: &mut Context<Self>) {
+        if let Some(write) = self.pr_write() {
+            write.draft = None;
+        }
+        cx.notify();
+    }
+
+    /// The draft's own submit: the review, or an agent where the viewer may only ask.
+    fn submit_pr_line_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.pull_requests.panel.as_ref() else { return };
+        let comments = panel.detail.as_ref().is_some_and(|d| pr_can_comment(d));
+        if comments {
+            self.add_pr_line_comment(cx);
+        } else if panel.write.draft.as_ref().is_some_and(|d| d.excerpt.is_some()) {
+            self.send_pr_draft_to_agent(window, cx);
+        }
+    }
+
+    fn add_pr_line_comment(&mut self, cx: &mut Context<Self>) {
+        let Some(draft) = self.pr_write().and_then(|w| w.draft.take()) else { return };
+        let body = text_of(&draft.input, cx);
+        if body.trim().is_empty() {
+            if let Some(write) = self.pr_write() {
+                write.draft = Some(draft);
+            }
+            return;
+        }
+        if let Some(review) = self.pr_review() {
+            review.next_id += 1;
+            review.comments.push(PendingComment {
+                id: review.next_id,
+                path: draft.path,
+                old_path: draft.old_path,
+                position: draft.position,
+                start: draft.start,
+                body: body.trim().to_owned(),
+            });
+        }
+        cx.notify();
+    }
+
+    /// "Add to agent" and "Ask agent": the picked lines, quoted from the file's diff, and the
+    /// request go to an agent instead of the review (`finishSelection`, `askAgent`).
+    fn send_pr_draft_to_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.pull_requests.panel.as_ref() else { return };
+        let (Some(detail), Some(draft)) = (panel.detail.as_ref(), panel.write.draft.as_ref()) else { return };
+        let request = text_of(&draft.input, cx);
+        if request.trim().is_empty() {
+            return;
+        }
+        let ((start, end), number, path) = (draft.picked, detail.number, draft.path.as_str());
+        let (producer, section_id, section_title, file) = match &draft.excerpt {
+            None => (
+                format!("pull-request-selection:{path}:{}:{}", start.1, end.1),
+                format!("pull-request:{number}"),
+                format!("PR #{number} review"),
+                panel.code.as_ref().and_then(|code| code.patch(path)),
+            ),
+            Some(_) => (
+                format!("pull-request-guide:{path}:{}:{}", start.1, end.1),
+                format!("pull-request-guide:{path}"),
+                "Review guide".to_owned(),
+                panel.guide_diff.file(path),
+            ),
+        };
+        let section = crate::review_comment::Section { id: &section_id, title: &section_title };
+        let context_id = crate::composer_context::kind_scoped_id(crate::review_comment::KIND, &producer);
+        let rows = file.map(crate::pull_request_diff::file_rows).unwrap_or_default();
+        let record = crate::review_comment::diff_comment(&context_id, &section, path, &rows, start, end, &request);
+        let (keep_guide, key, input) = (draft.excerpt.is_some(), panel.reference.key(), draft.input.clone());
+        let Some(record) = record else {
+            toast_error(window, cx, "Could not add these lines", "The diff changed. Pick the lines again.");
+            return;
+        };
+        // Cleared only once the request landed: this tab's own draft, which may be parked by then.
+        if self.add_pr_selection_to_agent(record, &request, keep_guide, window, cx)
+            && let Some(write) = self.pr_write_of(&key).filter(|w| w.draft.as_ref().is_some_and(|d| d.input == input))
+        {
+            write.draft = None;
+            cx.notify();
+        }
+    }
+
+    /// `DiffCommentAnnotation kind="draft"`: in the Code tab "Add to review" with "Add to agent"
+    /// beside it; in an excerpt "Ask agent" beside it, or alone when the viewer may not comment.
+    pub(super) fn render_pr_line_draft(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let panel = self.pull_requests.panel.as_ref()?;
+        let draft = panel.write.draft.as_ref()?;
+        let can_comment = panel.detail.as_ref().is_some_and(|d| pr_can_comment(d));
+        let (_, line) = draft.position.anchor();
+        let empty = text_of(&draft.input, cx).trim().is_empty();
+        let in_guide = draft.excerpt.is_some();
+        let agent_label = if in_guide { "Ask agent" } else { "Add to agent" };
+        let agent = (can_comment && (!in_guide || self.pr_can_ask())).then(|| {
+            xs_outline("pr-draft-agent", t)
+                .disabled(empty)
+                .child(agent_label)
+                .on_click(cx.listener(|this, _, window, cx| this.send_pr_draft_to_agent(window, cx)))
+        });
+        let submit = Button::new("pr-draft-add")
+            .primary()
+            .xsmall()
+            .disabled(empty)
+            .child(if can_comment { "Add to review" } else { agent_label })
+            .on_click(cx.listener(|this, _, window, cx| this.submit_pr_line_draft(window, cx)));
+        Some(
+            v_flex()
+                .id("pr-draft")
+                .mx(px(12.))
+                .my(px(8.))
+                .p(px(12.))
+                .gap(px(8.))
+                .rounded(px(12.))
+                .border_1()
+                .border_color(Hsla { a: t.border.a * 0.7, ..t.border })
+                .bg(t.background)
+                .shadow_sm()
+                .font_family(theme::FONT_SANS)
+                .capture_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| {
+                    if event.keystroke.key == "escape" {
+                        cx.stop_propagation();
+                        this.cancel_pr_line_draft(cx);
+                    }
+                }))
+                .child(
+                    div()
+                        .text_xs()
+                        .font_family(FONT_MONO)
+                        .text_color(t.muted_foreground)
+                        .child(format!("{}:{line}", draft.path)),
+                )
+                .child(Textarea::new(&draft.input))
+                .children(can_comment.then(|| self.render_pr_completions(&draft.input, t, cx)).flatten())
+                .child(
+                    h_flex()
+                        .justify_end()
+                        .gap(px(8.))
+                        .child(
+                            ghost_button("pr-draft-cancel", t)
+                                .child("Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| this.cancel_pr_line_draft(cx))),
+                        )
+                        .children(agent)
+                        .child(submit),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// `PendingReviewCommentCard`.
+    pub(super) fn render_pr_pending_comment(
+        &self,
+        comment: &PendingComment,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = comment.id;
+        v_flex()
+            .mx(px(12.))
+            .my(px(8.))
+            .p(px(12.))
+            .rounded(px(12.))
+            .border_1()
+            .border_dashed()
+            .border_color(Hsla { a: t.border.a * 0.7, ..t.border })
+            .bg(t.background)
+            .text_sm()
+            .child(
+                h_flex()
+                    .gap(px(8.))
+                    .text_xs()
+                    .text_color(t.muted_foreground)
+                    .child(Icon::new(Lucide::MessageSquare).with_size(px(14.)))
+                    .child("Pending. Sent when you submit the review")
+                    .child(
+                        ghost_button(ElementId::Name(format!("pr-pending-discard:{id}").into()), t)
+                            .ml_auto()
+                            .tooltip("Discard this comment")
+                            .child(Icon::new(Lucide::Trash).with_size(px(14.)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(review) = this.pr_review() {
+                                    review.comments.retain(|c| c.id != id);
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(div().mt(px(8.)).text_color(t.foreground).child(comment.body.clone()))
+            .into_any_element()
+    }
+
+    // Threads: reply and resolve.
+
+    pub(super) fn render_pr_thread_actions(
+        &self,
+        thread: &crate::pull_request_detail::ReviewThread,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let panel = self.pull_requests.panel.as_ref()?;
+        let detail = panel.detail.as_ref()?;
+        let resolve = detail.capabilities.review.resolve && logic::can_resolve_thread(detail, thread);
+        resolve.then(|| {
+            let (id, resolved) = (thread.id.clone(), thread.is_resolved);
+            ghost_button(ElementId::Name(format!("pr-thread-resolve:{id}").into()), t)
+                .disabled(panel.write.thread_pending.contains(&thread.id))
+                .child(if resolved { "Unresolve" } else { "Resolve" })
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.set_pr_thread_resolved(id.clone(), !resolved, window, cx);
+                }))
+                .into_any_element()
+        })
+    }
+
+    /// A finding's Fix (`onFixFinding`): the remark's label, or a failing check's.
+    pub(super) fn render_pr_fix(&self, finding: logic::Finding, t: &Tokens, cx: &mut Context<Self>) -> Option<Button> {
+        let panel = self.pull_requests.panel.as_ref()?;
+        let detail = panel.detail.as_ref()?;
+        if !self.pr_can_fix(detail) {
+            return None;
+        }
+        let attaches = self.pr_attaches_to_composer();
+        let labels = super::handoff::fix_labels(attaches);
+        let label = if matches!(finding, logic::Finding::Check(_)) { labels.check } else { labels.finding };
+        let key = finding.key();
+        let preparing = panel.handoff.as_deref() == Some(key.as_str());
+        Some(
+            ghost_button(ElementId::Name(format!("pr-fix:{key}").into()), t)
+                .flex_none()
+                .disabled(finding_pending(&panel.write, &finding) || panel.handoff.is_some())
+                .child(Icon::new(Lucide::Hammer).with_size(px(12.)))
+                .child(if preparing { "Preparing..." } else { label })
+                .on_click(cx.listener(move |this, _, window, cx| this.fix_pr_finding(&finding, window, cx))),
+        )
+    }
+
+    /// `AddToChatButton`: only beside a thread's composer; `icon` is the Timeline's bare one.
+    pub(super) fn render_pr_add_to_chat(
+        &self,
+        id: &str,
+        chat: Option<logic::ChatSubject>,
+        icon: bool,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let chat = chat.filter(|_| self.pr_attaches_to_composer())?;
+        let button = ghost_button(ElementId::Name(format!("pr-chat:{id}").into()), t)
+            .flex_none()
+            .child(Icon::new(Lucide::MessageSquarePlus).with_size(px(12.)))
+            .on_click(cx.listener(move |this, _, window, cx| this.add_pr_to_chat(&chat, window, cx)));
+        Some(if icon {
+            button.size(px(24.)).p_0().text_color(t.muted_foreground).tooltip("Add to chat").into_any_element()
+        } else {
+            button.child("Add to chat").into_any_element()
+        })
+    }
+
+    fn set_pr_thread_resolved(
+        &mut self,
+        thread_id: String,
+        resolved: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut input) = self.pr_ref_json() else { return };
+        let Some(write) = self.pr_write().filter(|w| !w.thread_pending.contains(&thread_id)) else { return };
+        write.thread_pending.insert(thread_id.clone());
+        input["threadId"] = json!(thread_id);
+        input["resolved"] = json!(resolved);
+        self.run_pr_write(
+            "pullRequests.setThreadResolution",
+            input,
+            "The conversation could not be updated".into(),
+            None,
+            window,
+            cx,
+            move |this, key, _, _, _| {
+                if let Some(write) = this.pr_write_of(key) {
+                    write.thread_pending.remove(&thread_id);
+                }
+            },
+        );
+    }
+
+    /// The Reply button, or the open reply box, under a thread.
+    pub(super) fn render_pr_thread_reply(
+        &self,
+        thread: &crate::pull_request_detail::ReviewThread,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let panel = self.pull_requests.panel.as_ref()?;
+        let detail = panel.detail.as_ref()?;
+        if !(detail.capabilities.review.reply && detail.viewer_permissions.comment) {
+            return None;
+        }
+        let id = thread.id.clone();
+        match panel.write.replies.get(&thread.id) {
+            Some(input) => {
+                let empty = text_of(input, cx).trim().is_empty();
+                let pending = panel.write.thread_pending.contains(&thread.id);
+                let (cancel, send) = (id.clone(), id.clone());
+                Some(
+                    v_flex()
+                        .mt(px(8.))
+                        .gap(px(8.))
+                        .child(Textarea::new(input))
+                        .children(self.render_pr_completions(input, t, cx))
+                        .child(
+                            h_flex()
+                                .justify_end()
+                                .gap(px(8.))
+                                .child(
+                                    ghost_button(ElementId::Name(format!("pr-reply-cancel:{id}").into()), t)
+                                        .child("Cancel")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if let Some(write) = this.pr_write() {
+                                                write.replies.remove(&cancel);
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    Button::new(ElementId::Name(format!("pr-reply-send:{id}").into()))
+                                        .primary()
+                                        .xsmall()
+                                        .disabled(pending || empty)
+                                        .child("Reply")
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.send_pr_reply(&send, window, cx);
+                                        })),
+                                ),
+                        )
+                        .into_any_element(),
+                )
+            }
+            None => Some(
+                ghost_button(ElementId::Name(format!("pr-thread-reply:{id}").into()), t)
+                    .mt(px(8.))
+                    .child("Reply")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        let input = cx.new(|cx| TextareaState::new(window, cx).rows(2).placeholder("Reply"));
+                        input.update(cx, |input, cx| input.focus(window, cx));
+                        let sub = watch(&input, Some(crate::app::Workspace::send_focused_pr_reply), window, cx);
+                        if let Some(write) = this.pr_write() {
+                            write.replies.insert(id.clone(), input);
+                            write._watch.extend(sub);
+                        }
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            ),
+        }
+    }
+
+    /// Mod+Enter in a reply box sends that conversation's reply.
+    fn send_focused_pr_reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(write) = self.pr_write() else { return };
+        let focused = write.replies.iter().find(|(_, input)| input.focus_handle(cx).is_focused(window));
+        if let Some(thread_id) = focused.map(|(id, _)| id.clone()) {
+            self.send_pr_reply(&thread_id, window, cx);
+        }
+    }
+
+    /// Posts one conversation's reply; only that conversation's box closes once it lands.
+    fn send_pr_reply(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(mut payload) = self.pr_ref_json() else { return };
+        let Some(write) = self.pr_write().filter(|w| !w.thread_pending.contains(thread_id)) else { return };
+        let Some(input) = write.replies.get(thread_id).cloned() else { return };
+        let body = text_of(&input, cx).trim().to_owned();
+        if body.is_empty() {
+            return;
+        }
+        write.thread_pending.insert(thread_id.to_owned());
+        payload["threadId"] = json!(thread_id);
+        payload["body"] = json!(body);
+        let thread_id = thread_id.to_owned();
+        self.run_pr_write(
+            "pullRequests.replyToThread",
+            payload,
+            "Reply could not be posted".into(),
+            None,
+            window,
+            cx,
+            move |this, key, ok, _, _| {
+                if let Some(write) = this.pr_write_of(key) {
+                    write.thread_pending.remove(&thread_id);
+                    if ok && write.replies.get(&thread_id) == Some(&input) {
+                        write.replies.remove(&thread_id);
+                    }
+                }
+            },
+        );
+    }
+
+    // Edits: comments and the description.
+
+    /// The pencil that opens an edit (`PullRequestEditButton`).
+    pub(super) fn pr_edit_button(
+        &self,
+        subject: String,
+        kind: &'static str,
+        body: String,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let label = if kind == "description" { "Edit description" } else { "Edit comment" };
+        let button = ghost_button(ElementId::Name(format!("pr-edit:{subject}").into()), t)
+            .size(px(20.))
+            .p_0()
+            .tooltip(label)
+            .child(Icon::new(Lucide::Pencil).with_size(px(12.)))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                let input = cx.new(|cx| TextareaState::new(window, cx).rows(6).default_value(body.clone()));
+                input.update(cx, |input, cx| input.focus(window, cx));
+                let sub = watch(&input, Some(crate::app::Workspace::save_pr_edit), window, cx);
+                if let Some(panel) = this.pull_requests.panel.as_mut() {
+                    panel.write.editing = Some(Editing { subject: subject.clone(), kind, input, preview: false });
+                    panel.write._watch.extend(sub);
+                    // A Timeline card grows into its editor.
+                    panel.timeline.remeasure();
+                }
+                cx.notify();
+            }));
+        hover_only(button)
+    }
+
+    pub(super) fn pr_editing(&self, subject: &str) -> bool {
+        self.pull_requests.panel.as_ref().and_then(|p| p.write.editing.as_ref()).is_some_and(|e| e.subject == subject)
+    }
+
+    fn save_pr_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(mut payload) = self.pr_ref_json() else { return };
+        let Some(write) = self.pr_write().filter(|w| !w.saving) else { return };
+        let Some(editing) = write.editing.as_ref() else { return };
+        let body = text_of(&editing.input, cx);
+        let description = editing.kind == "description";
+        if body.trim().is_empty() && !description {
+            return;
+        }
+        let (method, failure) = if description {
+            payload["body"] = json!(body);
+            ("pullRequests.update", "Could not save the description")
+        } else {
+            payload["commentId"] = json!(editing.subject);
+            payload["kind"] = json!(editing.kind);
+            payload["body"] = json!(body);
+            ("pullRequests.updateComment", "Could not save the comment")
+        };
+        write.saving = true;
+        let draft_key = if description { self.start_pr_description_save(body) } else { None };
+        self.run_pr_write(method, payload, failure.into(), None, window, cx, move |this, key, ok, _, _| {
+            if let Some(panel) = this.pr_panel(key) {
+                panel.write.saving = false;
+                if ok {
+                    panel.write.editing = None;
+                }
+                if let Some(url) = &draft_key {
+                    panel.description_draft = logic::DescriptionDraft::settle(panel.description_draft.take(), url, ok);
+                }
+            }
+        });
+    }
+
+    /// `PullRequestMarkdownEditor`: Write and Preview, then Cancel and Save.
+    pub(super) fn render_pr_editor(&mut self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let editing = self.pull_requests.panel.as_ref()?.write.editing.as_ref()?;
+        let method = if editing.kind == "description" { "pullRequests.update" } else { "pullRequests.updateComment" };
+        let writable = self.shown_pr_key().is_some_and(|key| self.pr_panel_permits(&key, method, None));
+        let (input, preview, description, saving) = (
+            editing.input.clone(),
+            editing.preview,
+            editing.kind == "description",
+            self.pull_requests.panel.as_ref()?.write.saving,
+        );
+        let text = text_of(&input, cx);
+        let empty = text.trim().is_empty();
+        let view = cx.entity();
+        let modes = [(false, "write", "Write"), (true, "preview", "Preview")].into_iter().fold(
+            Segmented::new("pr-editor-mode").disabled(saving),
+            |group, (value, key, label)| {
+                let view = view.clone();
+                group.segment(key, label, preview == value, move |_, cx| {
+                    view.update(cx, |this, cx| {
+                        if let Some(editing) = this.pr_write().and_then(|w| w.editing.as_mut()) {
+                            editing.preview = value;
+                        }
+                        cx.notify();
+                    });
+                })
+            },
+        );
+        let body = if preview {
+            let rendered = (!empty).then(|| self.pr_body("editor-preview", &text, false, t, cx)).flatten();
+            div()
+                .rounded(px(8.))
+                .border_1()
+                .border_color(Hsla { a: t.border.a * 0.6, ..t.border })
+                .px(px(12.))
+                .py(px(8.))
+                .child(match rendered {
+                    Some(markdown) => markdown,
+                    None => {
+                        div().text_xs().text_color(t.muted_foreground).child("Nothing to preview.").into_any_element()
+                    }
+                })
+                .into_any_element()
+        } else {
+            v_flex()
+                .child(Textarea::new(&input).disabled(saving))
+                .children(self.render_pr_completions(&input, t, cx))
+                .into_any_element()
+        };
+        Some(
+            v_flex()
+                .w_full()
+                .gap(px(8.))
+                .child(modes)
+                .child(body)
+                .child(
+                    h_flex()
+                        .justify_end()
+                        .gap(px(8.))
+                        .child(ghost_button("pr-editor-cancel", t).disabled(saving).child("Cancel").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                if let Some(panel) = this.pull_requests.panel.as_mut() {
+                                    panel.write.editing = None;
+                                    panel.timeline.remeasure();
+                                }
+                                cx.notify();
+                            }),
+                        ))
+                        .child(
+                            xs_outline("pr-editor-save", t)
+                                .disabled(saving || !writable || (empty && !description))
+                                .child(if saving { "Saving..." } else { "Save" })
+                                .on_click(cx.listener(|this, _, window, cx| this.save_pr_edit(window, cx))),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    // The title (`PullRequestTitleEditor`).
+
+    pub(super) fn begin_pr_title_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(title) = self.pull_requests.panel.as_ref().and_then(|p| p.detail.as_ref()).map(|d| d.title.clone())
+        else {
+            return;
+        };
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(title));
+        input.update(cx, |input, cx| input.focus(window, cx));
+        let sub = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| match event {
+            InputEvent::PressEnter { .. } => this.save_pr_title(window, cx),
+            InputEvent::Change => cx.notify(),
+            _ => {}
+        });
+        if let Some(write) = self.pr_write() {
+            write.title = Some(input);
+            write._watch.push(sub);
+        }
+        cx.notify();
+    }
+
+    fn save_pr_title(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.pull_requests.panel.as_ref().and_then(|p| p.detail.as_ref()).map(|d| d.title.clone());
+        let Some(mut payload) = self.pr_ref_json() else { return };
+        let Some(write) = self.pr_write().filter(|w| !w.title_saving) else { return };
+        let Some(input) = write.title.clone() else { return };
+        let title = input.read(cx).value().trim().to_owned();
+        if title.is_empty() || Some(&title) == current.as_ref() {
+            write.title = None;
+            cx.notify();
+            return;
+        }
+        write.title_saving = true;
+        payload["title"] = json!(title);
+        self.run_pr_write(
+            "pullRequests.update",
+            payload,
+            "The title could not be saved".into(),
+            Some("The host refused the new title."),
+            window,
+            cx,
+            // A refused title stays in the editor to try again.
+            |this, key, ok, _, _| {
+                if let Some(write) = this.pr_write_of(key) {
+                    write.title_saving = false;
+                    if ok {
+                        write.title = None;
+                    }
+                }
+            },
+        );
+    }
+
+    fn cancel_pr_title_edit(&mut self, cx: &mut Context<Self>) {
+        if let Some(write) = self.pr_write().filter(|w| !w.title_saving) {
+            write.title = None;
+            cx.notify();
+        }
+    }
+
+    /// The title being renamed, with Cancel and Save under it; Escape cancels.
+    pub(super) fn render_pr_title_input(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let panel = self.pull_requests.panel.as_ref()?;
+        let writable = self.pr_panel_permits(&panel.reference.key(), "pullRequests.update", None);
+        let write = &panel.write;
+        let input = write.title.as_ref()?;
+        let saving = write.title_saving;
+        let empty = input.read(cx).value().trim().is_empty();
+        Some(
+            v_flex()
+                .min_w_0()
+                .gap(px(8.))
+                .capture_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| {
+                    if event.keystroke.key == "escape" {
+                        this.cancel_pr_title_edit(cx);
+                        cx.stop_propagation();
+                    }
+                }))
+                .child(Input::new(input).small().disabled(saving))
+                .child(
+                    h_flex()
+                        .justify_end()
+                        .gap(px(8.))
+                        .child(
+                            ghost_button("pr-title-cancel", t)
+                                .text_color(t.foreground)
+                                .disabled(saving)
+                                .child("Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| this.cancel_pr_title_edit(cx))),
+                        )
+                        .child(
+                            xs_outline("pr-title-save", t)
+                                .disabled(saving || !writable || empty)
+                                .child(if saving { "Saving..." } else { "Save" })
+                                .on_click(cx.listener(|this, _, window, cx| this.save_pr_title(window, cx))),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    // Reactions.
+
+    /// `PullRequestReactionBar` for a comment (`subject`) or the description (`None`).
+    pub(super) fn render_pr_reactions(
+        &self,
+        subject: Option<&str>,
+        reactions: &[Reaction],
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let panel = self.pull_requests.panel.as_ref()?;
+        let can_react = panel.detail.as_ref().is_some_and(|d| d.capabilities.reactions == Some(true));
+        let key = subject.unwrap_or("").to_owned();
+        let pending: Vec<(String, bool)> =
+            panel.write.reactions.iter().filter(|((s, _), _)| *s == key).map(|((_, c), r)| (c.clone(), *r)).collect();
+        let shown = apply_pending(reactions, &pending);
+        if shown.is_empty() && !can_react {
+            return None;
+        }
+        // `focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring`
+        let ring = t.ring;
+        let focus_ring = move |s: gpui_kit::StyleRefinement| {
+            s.shadow(vec![gpui_kit::BoxShadow::new(px(0.), px(0.), ring).spread_radius(px(2.)).inset()])
+        };
+        let pill = |id: String| {
+            gpui_kit::base::Button::new(ElementId::Name(id.into()))
+                .focus_visible(focus_ring)
+                .h(px(24.))
+                .flex_none()
+                .gap(px(4.))
+                .px(px(8.))
+                .rounded_full()
+                .border_1()
+                .text_xs()
+        };
+        let mut bar = h_flex().min_w_0().flex_wrap().gap(px(4.));
+        for reaction in &shown {
+            let (emoji, name) = REACTIONS.iter().find(|r| r.0 == reaction.content).map_or(("", ""), |r| (r.1, r.2));
+            let content = reaction.content.clone();
+            let next = !reaction.viewer_has_reacted;
+            let subject = subject.map(str::to_owned);
+            let tip: SharedString = format!("{} reacted with {name} emoji", reaction.count).into();
+            bar = bar.child(
+                pill(format!("pr-reaction:{key}:{content}"))
+                    .map(|el| {
+                        if reaction.viewer_has_reacted {
+                            el.border_color(Hsla { a: 0.6, ..t.primary })
+                                .bg(Hsla { a: 0.1, ..t.primary })
+                                .text_color(t.foreground)
+                        } else {
+                            el.border_color(Hsla { a: t.border.a * 0.7, ..t.border })
+                                .bg(Hsla { a: t.muted.a * 0.4, ..t.muted })
+                                .text_color(t.muted_foreground)
+                        }
+                    })
+                    .when(can_react, |el| el.cursor_pointer().hover(|s| s.border_color(Hsla { a: 0.6, ..t.primary })))
+                    .disabled(!can_react)
+                    .accessibility_label(format!("{name}, {}", reaction.count))
+                    .child(emoji)
+                    .child(reaction.count.to_string())
+                    .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                    .when(can_react, |el| {
+                        el.on_click(cx.listener(move |this, _, window, cx| {
+                            this.set_pr_reaction(subject.clone(), content.clone(), next, window, cx);
+                        }))
+                    }),
+            );
+        }
+        if can_react {
+            let open = panel.write.reaction_picker.as_deref() == Some(key.as_str());
+            let view = cx.entity();
+            let picker_key = key.clone();
+            let reacted: Vec<(String, bool)> =
+                shown.iter().map(|r| (r.content.clone(), r.viewer_has_reacted)).collect();
+            let subject = subject.map(str::to_owned);
+            let trigger = Button::new(ElementId::Name(format!("pr-react:{key}").into()))
+                .ghost()
+                .xsmall()
+                .h(px(24.))
+                .px(px(6.))
+                .rounded_full()
+                .border_1()
+                .border_color(Hsla { a: t.border.a * 0.7, ..t.border })
+                .tooltip("Add a reaction")
+                .child(Icon::new(Lucide::FaceSlightlySmilingPlus).with_size(px(14.)).text_color(t.muted_foreground));
+            let body = open.then(|| {
+                h_flex()
+                    .gap(px(2.))
+                    .children(REACTIONS.iter().map(|(content, emoji, _)| {
+                        let pressed = reacted.iter().any(|(c, r)| c == content && *r);
+                        let (subject, content) = (subject.clone(), (*content).to_owned());
+                        let name = REACTIONS.iter().find(|r| r.0 == content).map_or("", |r| r.2);
+                        gpui_kit::base::Button::new(ElementId::Name(format!("pr-react-pick:{content}").into()))
+                            .focus_visible(focus_ring)
+                            .accessibility_label(name)
+                            .size(px(28.))
+                            .rounded(px(6.))
+                            .text_base()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(t.accent))
+                            .when(pressed, |el| el.bg(Hsla { a: 0.1, ..t.primary }))
+                            .child(*emoji)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if let Some(write) = this.pr_write() {
+                                    write.reaction_picker = None;
+                                }
+                                this.set_pr_reaction(subject.clone(), content.clone(), !pressed, window, cx);
+                            }))
+                    }))
+                    .into_any_element()
+            });
+            bar = bar.child(
+                Popover::new(ElementId::Name(format!("pr-react-popover:{key}").into()))
+                    .anchor(gpui_kit::Anchor::BottomLeft)
+                    .open(open)
+                    .on_open_change(move |open, _, cx| {
+                        let (open, key) = (*open, picker_key.clone());
+                        view.update(cx, |this, cx| {
+                            if let Some(write) = this.pr_write() {
+                                write.reaction_picker = open.then_some(key);
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .trigger(trigger)
+                    .p(px(4.))
+                    .children(body),
+            );
+        }
+        Some(bar.into_any_element())
+    }
+
+    fn set_pr_reaction(
+        &mut self,
+        subject: Option<String>,
+        content: String,
+        reacted: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut payload) = self.pr_ref_json() else { return };
+        if let Some(subject) = &subject {
+            payload["subjectId"] = json!(subject);
+        }
+        payload["content"] = json!(content);
+        payload["reacted"] = json!(reacted);
+        let key = (subject.unwrap_or_default(), content);
+        if let Some(write) = self.pr_write() {
+            write.reactions.insert(key.clone(), reacted);
+        }
+        self.run_pr_write(
+            "pullRequests.setReaction",
+            payload,
+            "The reaction could not be saved".into(),
+            None,
+            window,
+            cx,
+            move |this, pr, ok, _, _| {
+                if !ok && let Some(write) = this.pr_write_of(pr) {
+                    write.reactions.remove(&key);
+                }
+            },
+        );
+    }
+
+    // Reviewers and labels (`PullRequestReviewerPicker`, `PullRequestLabelPicker`).
+
+    fn open_pr_picker(&mut self, kind: PickerKind, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pull_request_client().is_none() || self.pull_requests.panel.is_none() {
+            return;
+        }
+        let placeholder = if kind == PickerKind::Reviewers { "Search people with access" } else { "Search labels" };
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
+        search.update(cx, |input, cx| input.focus(window, cx));
+        let sub = cx.subscribe(&search, move |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                if kind == PickerKind::Reviewers {
+                    this.debounce_pr_reviewer_search(cx);
+                }
+                if let Some(picker) = this.pr_write().and_then(|w| w.picker.as_mut()) {
+                    picker.highlight = Some(0);
+                }
+                cx.notify();
+            }
+        });
+        if let Some(write) = self.pr_write() {
+            write.picker = Some(Picker {
+                kind,
+                search,
+                candidates: None,
+                _candidates: None,
+                pending: None,
+                debounced: String::new(),
+                _debounce: None,
+                searches: HashMap::new(),
+                searching: HashSet::new(),
+                searches_epoch: 0,
+                highlight: Some(0),
+                scroll: ScrollHandle::new(),
+            });
+            write._watch.push(sub);
+        }
+        self.read_pr_picker_candidates(kind, cx);
+    }
+
+    /// The first page of candidates; one already shown stays while it is read again.
+    fn read_pr_picker_candidates(&mut self, kind: PickerKind, cx: &mut Context<Self>) {
+        let Some(client) = self.pull_request_client() else { return };
+        let Some(panel) = self.pull_requests.panel.as_ref() else { return };
+        let (key, input) = (panel.reference.key(), panel.reference.to_json());
+        let method = if kind == PickerKind::Reviewers {
+            "pullRequests.reviewerCandidates"
+        } else {
+            "pullRequests.labelCandidates"
+        };
+        let read = cx.spawn(async move |this, cx| {
+            let result = client.request(method, input).await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(picker) = this.pr_panel(&key).and_then(|p| p.write.picker.as_mut()).filter(|p| p.kind == kind)
+                else {
+                    return;
+                };
+                picker.candidates = Some(result.map_err(|error| list_logic::error_message(&error)));
+                this.search_pr_reviewers(&key, cx);
+                cx.notify();
+            });
+        });
+        if let Some(picker) = self.pr_write().and_then(|w| w.picker.as_mut()).filter(|p| p.kind == kind) {
+            picker._candidates = Some(read);
+        }
+        cx.notify();
+    }
+
+    fn debounce_pr_reviewer_search(&mut self, cx: &mut Context<Self>) {
+        let Some(key) = self.shown_pr_key() else { return };
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(REVIEWER_SEARCH_DEBOUNCE).await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(picker) = this.pr_write_of(&key).and_then(|w| w.picker.as_mut()) else { return };
+                picker.debounced = picker.search.read(cx).value().trim().to_owned();
+                this.search_pr_reviewers(&key, cx);
+                cx.notify();
+            });
+        });
+        if let Some(picker) = self.pr_write().and_then(|w| w.picker.as_mut()) {
+            picker._debounce = Some(task);
+        }
+    }
+
+    /// Whether the host of the pull request `key` names matches reviewer queries past the first page.
+    fn pr_reviewers_searchable(&self, key: &str) -> bool {
+        self.pr_panel_ref(key)
+            .and_then(|p| p.detail.as_ref())
+            .is_some_and(|d| d.capabilities.reviewers.search_candidates)
+    }
+
+    /// Asks the host for the settled query when the loaded page cannot answer it; the pull
+    /// request `key` names, shown or parked, owns the search.
+    fn search_pr_reviewers(&mut self, key: &str, cx: &mut Context<Self>) {
+        let searchable = self.pr_reviewers_searchable(key);
+        let Some(client) = self.pull_request_client_of(key) else { return };
+        let Some(panel) = self.pr_panel(key) else { return };
+        let (key, mut input) = (panel.reference.key(), panel.reference.to_json());
+        let Some(picker) = panel.write.picker.as_mut().filter(|p| p.kind == PickerKind::Reviewers) else { return };
+        let loaded = picker.candidates.as_ref().and_then(|c| c.as_ref().ok());
+        let search = reviewer_search::SearchInput { loaded, searchable, query: "", debounced: &picker.debounced };
+        let Some(query) = reviewer_search::host_query(&search) else { return };
+        if picker.searches.contains_key(&query) || !picker.searching.insert(query.clone()) {
+            return;
+        }
+        input["query"] = json!(query);
+        let epoch = picker.searches_epoch;
+        cx.spawn(async move |this, cx| {
+            let result = client.request("pullRequests.reviewerCandidates", input).await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(picker) = this.pr_write_of(&key).and_then(|w| w.picker.as_mut()) else { return };
+                if picker.searches_epoch != epoch {
+                    return;
+                }
+                picker.searching.remove(&query);
+                picker.searches.insert(query, result.map_err(|error| list_logic::error_message(&error)));
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn pick_pr_candidate(&mut self, kind: PickerKind, candidate: Value, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(mut payload) = self.pr_ref_json() else { return };
+        let Some(picker) = self.pr_write().and_then(|w| w.picker.as_mut()).filter(|p| p.pending.is_none()) else {
+            return;
+        };
+        let (method, failure, hint, id) = if kind == PickerKind::Reviewers {
+            let login = candidate["login"].as_str().unwrap_or_default().to_owned();
+            let requested = candidate["isRequested"].as_bool() == Some(true);
+            payload["reviewers"] = json!([{"id": candidate["id"], "kind": candidate["kind"]}]);
+            payload["requested"] = json!(!requested);
+            let failure = if requested {
+                format!("Could not take back the review request to {login}")
+            } else {
+                format!("Could not ask {login} for a review")
+            };
+            (
+                "pullRequests.requestReviewers",
+                failure,
+                "The host refused it. Check that you have write access on this repository, and that they still have access to it.",
+                candidate["id"].as_str().unwrap_or_default().to_owned(),
+            )
+        } else {
+            let name = candidate["name"].as_str().unwrap_or_default().to_owned();
+            let applied = candidate["isApplied"].as_bool() == Some(true);
+            payload["labels"] = json!([name]);
+            payload["applied"] = json!(!applied);
+            let failure =
+                if applied { format!("Could not take {name} off") } else { format!("Could not put {name} on") };
+            (
+                "pullRequests.setLabels",
+                failure,
+                "The host refused it. Check that you have triage access on this repository.",
+                name,
+            )
+        };
+        picker.pending = Some(id);
+        self.run_pr_write(method, payload, failure, Some(hint), window, cx, move |this, key, ok, window, cx| {
+            if let Some(picker) = this.pr_write_of(key).and_then(|w| w.picker.as_mut()) {
+                picker.pending = None;
+            }
+            // Reads for the shown pull request; a parked one's ticks read again when reopened.
+            if ok && this.shown_pr_key().as_deref() == Some(key) {
+                // The lists read again so the ticks follow the host; a search answer is keyed by
+                // what was typed, so the one on screen is read again too.
+                if let Some(picker) = this.pr_write_of(key).and_then(|w| w.picker.as_mut()) {
+                    picker.searches.clear();
+                    picker.searching.clear();
+                    picker.searches_epoch += 1;
+                }
+                this.read_pr_picker_candidates(kind, cx);
+            }
+            let _ = window;
+        });
+    }
+
+    /// The icon button beside Reviewers or Labels and its searchable list.
+    pub(super) fn render_pr_picker(
+        &self,
+        reviewers: bool,
+        allowed: bool,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let kind = if reviewers { PickerKind::Reviewers } else { PickerKind::Labels };
+        let (icon, label, refused) = if reviewers {
+            (Lucide::UserPlus, "Request a review", "Asking someone to review needs write access on this repository")
+        } else {
+            (Lucide::Tag, "Change labels", "Changing labels needs triage access on this repository")
+        };
+        let id = if reviewers { "pr-pick-reviewers" } else { "pr-pick-labels" };
+        let trigger = ghost_button(id, t)
+            .size(px(20.))
+            .p_0()
+            .tooltip(if allowed { label } else { refused })
+            .child(Icon::new(icon).with_size(px(14.)));
+        if !allowed {
+            return trigger.disabled(true).into_any_element();
+        }
+        let picker = self.pull_requests.panel.as_ref().and_then(|p| p.write.picker.as_ref()).filter(|p| p.kind == kind);
+        let open = picker.is_some();
+        let body = picker.map(|picker| self.render_pr_picker_list(picker, t, cx));
+        let view = cx.entity();
+        Popover::new(ElementId::Name(format!("{id}-popover").into()))
+            .anchor(gpui_kit::Anchor::TopLeft)
+            .open(open)
+            .on_open_change(move |open, window, cx| {
+                let open = *open;
+                view.update(cx, |this, cx| {
+                    if open {
+                        this.open_pr_picker(kind, window, cx);
+                    } else if let Some(write) = this.pr_write() {
+                        write.picker = None;
+                        cx.notify();
+                    }
+                });
+            })
+            .trigger(trigger)
+            .w(px(288.))
+            .p_0()
+            .children(body)
+            .into_any_element()
+    }
+
+    fn pr_picker_matches(&self, picker: &Picker, value: &Value, cx: &App) -> Matches {
+        let typed = picker.search.read(cx).value().to_string();
+        let query = typed.trim().to_lowercase();
+        if picker.kind == PickerKind::Reviewers {
+            let input = reviewer_search::SearchInput {
+                loaded: Some(value),
+                searchable: self.shown_pr_key().is_some_and(|key| self.pr_reviewers_searchable(&key)),
+                query: &typed,
+                debounced: &picker.debounced,
+            };
+            let search = reviewer_search::host_query(&input)
+                .and_then(|q| picker.searches.get(&q))
+                .map(|answer| answer.as_ref().map_err(String::as_str));
+            let view = reviewer_search::candidate_view(&input, search);
+            let error = view.candidates.is_empty().then(|| view.search_error.clone()).flatten();
+            let truncated = view.truncation.map(|why| why.label(view.search_error.as_deref()));
+            Matches { candidates: view.candidates, pending: view.search_pending, error, truncated }
+        } else {
+            let text = |c: &Value, key: &str| c[key].as_str().unwrap_or_default().to_lowercase();
+            let matching: Vec<Value> = value["candidates"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|c| {
+                    query.is_empty() || text(c, "name").contains(&query) || text(c, "description").contains(&query)
+                })
+                .cloned()
+                .collect();
+            let truncated = (value["truncated"].as_bool() == Some(true)).then(|| {
+                "This repository has more labels than are listed here. Apply the rest on the host.".to_owned()
+            });
+            Matches { candidates: matching, pending: false, error: None, truncated }
+        }
+    }
+
+    /// The combobox's keys: the arrows move the highlight, Enter picks the highlighted candidate.
+    fn pr_picker_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !matches!(key, "up" | "down" | "enter") {
+            return false;
+        }
+        let Some(picker) = self.pull_requests.panel.as_ref().and_then(|p| p.write.picker.as_ref()) else {
+            return false;
+        };
+        let Some(Ok(value)) = picker.candidates.as_ref() else { return true };
+        let matches = self.pr_picker_matches(picker, value, cx);
+        let (kind, highlight) = (picker.kind, picker.highlight.filter(|i| *i < matches.candidates.len()));
+        if key == "enter" {
+            if let Some(candidate) = highlight.and_then(|i| matches.candidates.get(i)).cloned() {
+                self.pick_pr_candidate(kind, candidate, window, cx);
+            }
+            return true;
+        }
+        let Some(picker) = self.pr_write().and_then(|w| w.picker.as_mut()) else { return true };
+        picker.highlight =
+            super::super::pull_requests::facets::step_highlight(highlight, matches.candidates.len(), key == "down");
+        if let Some(index) = picker.highlight {
+            // A search in flight shows its "Loading..." row above the candidates.
+            picker.scroll.scroll_to_item(index + usize::from(matches.pending));
+        }
+        cx.notify();
+        true
+    }
+
+    fn render_pr_picker_list(&self, picker: &Picker, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+        let reviewers = picker.kind == PickerKind::Reviewers;
+        let typed = picker.search.read(cx).value().to_string();
+        let query = typed.trim().to_lowercase();
+        let note =
+            |text: String| div().p(px(8.)).text_xs().text_color(t.muted_foreground).child(text).into_any_element();
+        let error_label =
+            if reviewers { "The people with access could not be read." } else { "The labels could not be read." };
+        let rows: Vec<AnyElement> = match &picker.candidates {
+            None => vec![note("Loading...".into())],
+            Some(Err(error)) => vec![note(format!("{error_label} {error}"))],
+            Some(Ok(value)) => {
+                let Matches { candidates: matching, pending, error, truncated } =
+                    self.pr_picker_matches(picker, value, cx);
+                let mut rows: Vec<AnyElement> = Vec::new();
+                if pending {
+                    rows.push(note("Loading...".into()));
+                } else if let Some(error) = error {
+                    rows.push(note(format!("{error_label} {error}")));
+                } else if matching.is_empty() {
+                    rows.push(note(
+                        match (reviewers, query.is_empty()) {
+                            (true, true) => "Nobody else has access to this repository.",
+                            (true, false) => "Nobody with access matches that.",
+                            (false, true) => "This repository has no labels.",
+                            (false, false) => "No label matches that.",
+                        }
+                        .into(),
+                    ));
+                }
+                let highlight = picker.highlight.filter(|i| *i < matching.len());
+                for (index, candidate) in matching.into_iter().enumerate() {
+                    let key = if reviewers {
+                        format!(
+                            "{}:{}",
+                            candidate["kind"].as_str().unwrap_or_default(),
+                            candidate["id"].as_str().unwrap_or_default()
+                        )
+                    } else {
+                        candidate["name"].as_str().unwrap_or_default().to_owned()
+                    };
+                    let checked =
+                        candidate[if reviewers { "isRequested" } else { "isApplied" }].as_bool() == Some(true);
+                    let content: AnyElement = if reviewers {
+                        let actor: Actor = serde_json::from_value(candidate.clone()).unwrap_or_default();
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(px(6.))
+                            .child(actor_label(Some(&actor), t))
+                            .when(candidate["kind"] == "team", |el| {
+                                el.child(div().text_color(t.muted_foreground).child("team"))
+                            })
+                            .into_any_element()
+                    } else {
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(label_chip(
+                                candidate["name"].as_str().unwrap_or_default(),
+                                candidate["color"].as_str(),
+                                0,
+                                t,
+                            ))
+                            .into_any_element()
+                    };
+                    let busy = picker.pending.is_some();
+                    let kind = picker.kind;
+                    rows.push(
+                        h_flex()
+                            .id(ElementId::Name(format!("pr-candidate:{key}").into()))
+                            .gap(px(8.))
+                            .px(px(8.))
+                            .py(px(6.))
+                            .rounded(px(4.))
+                            .text_xs()
+                            .when(!busy, gpui_kit::Styled::cursor_pointer)
+                            .when(highlight == Some(index), |el| el.bg(t.accent))
+                            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                                let Some(picker) = this.pr_write().and_then(|w| w.picker.as_mut()) else { return };
+                                if *hovered && picker.highlight != Some(index) {
+                                    picker.highlight = Some(index);
+                                    cx.notify();
+                                }
+                            }))
+                            .child(content)
+                            .when(checked, |el| el.child(Icon::new(Lucide::Check).with_size(px(14.))))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.pick_pr_candidate(kind, candidate.clone(), window, cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
+                rows.extend(truncated.map(note));
+                rows
+            }
+        };
+        v_flex()
+            .capture_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
+                if this.pr_picker_key(event.keystroke.key.as_str(), window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .child(div().p(px(8.)).border_b_1().border_color(t.border).child(Input::new(&picker.search).small()))
+            .child(
+                v_flex()
+                    .id("pr-candidates")
+                    .max_h(px(288.))
+                    .overflow_y_scroll()
+                    .track_scroll(&picker.scroll)
+                    .p(px(4.))
+                    .children(rows),
+            )
+            .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reaction(content: &str, count: u64, mine: bool) -> Reaction {
+        Reaction { content: content.into(), count, viewer_has_reacted: mine }
+    }
+
+    #[test]
+    fn pressed_reactions_show_before_the_host_confirms_them() {
+        let held = [reaction("heart", 2, false), reaction("thumbs-up", 1, true)];
+        let shown = apply_pending(&held, &[("heart".into(), true), ("thumbs-up".into(), false), ("eyes".into(), true)]);
+        let shape: Vec<(&str, u64, bool)> =
+            shown.iter().map(|r| (r.content.as_str(), r.count, r.viewer_has_reacted)).collect();
+        assert_eq!(
+            shape,
+            [("heart", 3, true), ("eyes", 1, true)],
+            "a last reaction taken back disappears; order is the host's"
+        );
+        assert_eq!(
+            apply_pending(&held, &[("eyes".into(), false)]).len(),
+            2,
+            "taking back one never given changes nothing"
+        );
+    }
+
+    #[test]
+    fn a_review_needs_a_summary_or_comments_unless_it_approves() {
+        assert!(can_submit_review("approve", "", 0, false));
+        assert!(!can_submit_review("comment", "  ", 0, false));
+        assert!(can_submit_review("comment", "", 2, false));
+        assert!(can_submit_review("request-changes", "", 1, false));
+        assert!(!can_submit_review("request-changes", "", 1, true), "Forgejo wants a summary to request changes");
+    }
+
+    #[test]
+    fn the_summary_shortcut_submits_the_selected_verdict_when_it_can() {
+        let offered = [("comment", "Comment"), ("approve", "Approve"), ("request-changes", "Request changes")];
+        assert_eq!(summary_shortcut_verdict(&offered, Some("approve"), "", 0, false), Some("approve"));
+        assert_eq!(summary_shortcut_verdict(&offered, None, "", 0, false), None, "a bare comment needs a summary");
+        assert_eq!(summary_shortcut_verdict(&offered, None, "looks good", 0, false), Some("comment"));
+        assert_eq!(
+            summary_shortcut_verdict(&offered[..1], Some("approve"), "ok", 0, false),
+            Some("comment"),
+            "a verdict no longer offered falls back to the first"
+        );
+        assert_eq!(summary_shortcut_verdict(&[], None, "ok", 0, false), None);
+    }
+
+    #[test]
+    fn a_pending_comment_sends_its_paths_and_range() {
+        let comment = PendingComment {
+            id: 1,
+            path: "b.rs".into(),
+            old_path: Some("a.rs".into()),
+            position: Position::Added { new: 4 },
+            start: Some(Position::Added { new: 2 }),
+            body: "hm".into(),
+        };
+        assert_eq!(
+            comment.to_json(),
+            json!({
+                "path": "b.rs", "oldPath": "a.rs", "body": "hm",
+                "position": {"kind": "added", "newLine": 4}, "startPosition": {"kind": "added", "newLine": 2},
+            })
+        );
+    }
+}
