@@ -1,5 +1,7 @@
 // Writes src/settings/contract.json from the TypeScript sources it mirrors.
-// Regenerate: copy this file to apps/web/src/ and run `vp test run src/settings_data.test.ts` from apps/web.
+// Regenerate: copy this file to apps/web/src/ and, from apps/web, run
+// `SETTINGS_CONTRACT_OUT=$PWD/../desktop-gpui/src/settings/contract.json vp test run src/settings_data.test.ts`,
+// then `vp fmt apps/desktop-gpui/src/settings/contract.json` from the repo root.
 import * as NodeFS from "node:fs";
 import * as NodeURL from "node:url";
 import * as Schema from "effect/Schema";
