@@ -1,0 +1,1 @@
+# Upstream's defaults, so rustfmt never applies the app's settings to vendored crates.
