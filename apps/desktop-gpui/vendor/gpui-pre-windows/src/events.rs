@@ -1373,8 +1373,9 @@ impl WindowsWindowInner {
         self.state.direct_manipulation.update();
 
         let events = self.state.direct_manipulation.drain_events();
-        // A running touchpad gesture or its inertia only advances on these per-frame updates.
-        let gesture = !events.is_empty();
+        // A touchpad gesture, its inertia and its final Ended event only advance on these
+        // per-paint updates.
+        let gesture = !events.is_empty() || self.state.direct_manipulation.manipulating();
         if !events.is_empty() {
             if let Some(mut func) = self.state.callbacks.input.take() {
                 for event in events {

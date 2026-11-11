@@ -804,6 +804,8 @@ impl Platform for WindowsPlatform {
             frame_signal: window.state.frame_signal.clone(),
             paused: window.state.frames.paused_flag(),
         });
+        // A parked vsync thread must start serving the new, unpaused window.
+        crate::frame_pause::unpark_vsync_thread();
 
         Ok(Box::new(window))
     }
