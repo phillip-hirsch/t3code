@@ -1958,6 +1958,14 @@ impl Window {
                         )
                     })
                     .log_err();
+                // T3 patch: the App is borrowed (a nested Windows message loop), so this frame
+                // can't run. Keep a forced render and ask platforms that pause idle windows to
+                // retry, instead of failing every update below and dropping the demand.
+                if power_state.is_none() {
+                    deferred_force_render |= force_render;
+                    invalidator.wake_platform();
+                    return;
+                }
 
                 // Keep presenting briefly after high-rate input to prevent display
                 // underclocking, but subject to the same power limits as redraws.

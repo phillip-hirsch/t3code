@@ -26,6 +26,8 @@ pub(crate) struct DirectManipulationHandler {
     window: HWND,
     scale_factor: Rc<Cell<f32>>,
     pending_events: Rc<RefCell<Vec<PlatformInput>>>,
+    /// T3 patch: whether the viewport is `RUNNING` or in `INERTIA`, so it still needs updates.
+    manipulating: Rc<Cell<bool>>,
 }
 
 impl DirectManipulationHandler {
@@ -65,12 +67,14 @@ impl DirectManipulationHandler {
 
             let scale_factor = Rc::new(Cell::new(scale_factor));
             let pending_events = Rc::new(RefCell::new(Vec::new()));
+            let manipulating = Rc::new(Cell::new(false));
 
             let event_handler: IDirectManipulationViewportEventHandler =
                 DirectManipulationEventHandler::new(
                     window,
                     Rc::clone(&scale_factor),
                     Rc::clone(&pending_events),
+                    Rc::clone(&manipulating),
                 )
                 .into();
 
@@ -86,8 +90,14 @@ impl DirectManipulationHandler {
                 window,
                 scale_factor,
                 pending_events,
+                manipulating,
             })
         }
+    }
+
+    /// Whether a gesture or its inertia is in progress: it only advances on [`Self::update`].
+    pub fn manipulating(&self) -> bool {
+        self.manipulating.get()
     }
 
     pub fn set_scale_factor(&self, scale_factor: f32) {
@@ -143,6 +153,7 @@ struct DirectManipulationEventHandler {
     last_y_offset: Cell<f32>,
     scroll_phase: Cell<TouchPhase>,
     pending_events: Rc<RefCell<Vec<PlatformInput>>>,
+    manipulating: Rc<Cell<bool>>,
 }
 
 impl DirectManipulationEventHandler {
@@ -150,6 +161,7 @@ impl DirectManipulationEventHandler {
         window: HWND,
         scale_factor: Rc<Cell<f32>>,
         pending_events: Rc<RefCell<Vec<PlatformInput>>>,
+        manipulating: Rc<Cell<bool>>,
     ) -> Self {
         Self {
             window,
@@ -160,6 +172,7 @@ impl DirectManipulationEventHandler {
             last_y_offset: Cell::new(0.0),
             scroll_phase: Cell::new(TouchPhase::Started),
             pending_events,
+            manipulating,
         }
     }
 
@@ -214,6 +227,8 @@ impl IDirectManipulationViewportEventHandler_Impl for DirectManipulationEventHan
         if current == previous {
             return Ok(());
         }
+        self.manipulating
+            .set(current == DIRECTMANIPULATION_RUNNING || current == DIRECTMANIPULATION_INERTIA);
 
         // A new gesture interrupted inertia, so end the old sequence.
         if current == DIRECTMANIPULATION_RUNNING && previous == DIRECTMANIPULATION_INERTIA {

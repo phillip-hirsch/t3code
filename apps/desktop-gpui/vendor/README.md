@@ -150,10 +150,12 @@ the window's next-frame callbacks first and dropped them when `handle.update` fa
 waiting on them stalled until an unrelated repaint. The patch, in `src/window.rs`'s frame request
 handler, puts them back ahead of any added since, so the next frame runs them.
 
-**A skipped re-entrant frame request wakes the platform.** The frame request handler skips a
-request that arrives while a draw is on the stack (only Windows does this, from a nested message
-loop) and relied on the platform asking again. With gpui-pre-windows' idle pause below, a paused
-window would never ask again, so the skip now calls `wake_platform()`. File: `src/window.rs`.
+**Skipped frame requests wake the platform.** The frame request handler skips a request that
+arrives while a draw is on the stack, and fails every step of one that arrives while the App is
+borrowed (both only on Windows, from a nested message loop); either way it relied on the platform
+asking again. With gpui-pre-windows' idle pause below, a paused window would never ask again. Both
+cases now call `wake_platform()`, and the borrowed case returns early, keeping a forced render for
+the retry. File: `src/window.rs`.
 
 The crate's tests need `--features test-support`; run them from a scratch copy outside this
 repository (`cargo test --features test-support --lib`). The copy needs the published crate's
@@ -201,15 +203,20 @@ vblank, so an idle window wakes the UI thread for nothing at the display's refre
 of a core at 144 Hz). The patch ports macOS's `MetalFrames` pause: after a paint in which GPUI
 neither drew nor asked for another frame, the window's frames pause; GPUI's frame waker
 (`frame_waker`, `schedule_frame`) resumes them. The vsync thread skips paused windows and parks
-while all are paused, waking once a second to check for a lost device. Direct Manipulation only
-advances on the per-paint `Update`, so a paint that delivered touchpad events, or a touchpad
-contact in the last 500 ms, keeps frames running. No new `unsafe`. Files:
+while all are paused, waking once a second to check for a lost device; opening a window wakes it.
+Direct Manipulation only advances on the per-paint `Update`, so frames keep running while its
+viewport is `RUNNING` or in `INERTIA`, in a paint that delivered touchpad events (the final Ended
+event comes after `READY`), and for 500 ms after a touchpad contact, before DM reports `RUNNING`.
+No new `unsafe` operations (the DM handler's constructor call, inside an existing `unsafe` block,
+gains one safe argument). Files:
 
 - `src/frame_pause.rs`: `WindowFrames` and the vsync thread handle, with tests.
 - `src/window.rs`: `WindowsWindowState::frames`; `draw`, `frame_waker` and `schedule_frame`.
 - `src/events.rs`: `draw_window` begins and ends the frame and wakes on a deferred draw;
   `handle_dm_pointer_hit_test` records the contact.
-- `src/platform.rs`: `TrackedWindow::paused`, the vsync loop, and unparking it on stop.
+- `src/direct_manipulation.rs`: `DirectManipulationHandler::manipulating`, set from
+  `OnViewportStatusChanged`.
+- `src/platform.rs`: `TrackedWindow::paused`, the vsync loop, and unparking it on open and stop.
 
 ## gpui-pre-linux 0.3.11
 
