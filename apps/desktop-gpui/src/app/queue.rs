@@ -300,11 +300,7 @@ impl Workspace {
         {
             return;
         }
-        let item = self.pane_projection(pane).and_then(|projection| {
-            projection.turn_items.iter().rev().find(|item| {
-                item.item_type == "user_message" && item.str("messageId") == Some(message.message_id.as_ref())
-            })
-        });
+        let item = self.pane_projection(pane).and_then(|projection| projection.user_message(&message.message_id));
         let attachments =
             item.and_then(|i| i.raw.get("attachments")).and_then(Value::as_array).cloned().unwrap_or_default();
         let records =
