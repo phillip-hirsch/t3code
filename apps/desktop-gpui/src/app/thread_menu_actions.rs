@@ -1,0 +1,88 @@
+//! Thread menu actions beyond the shared ones in `sidebar::actions` (`useThreadActionMenu.ts`,
+//! `Sidebar.tsx`): a new thread on the thread's branch and turning a No project thread into a
+//! project. The draft row's menu is in `sidebar::drafts`.
+
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::notification::Notification;
+use gpui_kit::{Context, Window};
+use serde_json::json;
+
+use super::Workspace;
+use crate::model::ScopedId;
+use crate::new_thread::{EnvMode, WorkspaceChoice};
+
+/// The draft's workspace for "New thread on `branch`": the thread's worktree, else its branch locally.
+fn branch_choice(branch: Option<String>, worktree_path: Option<String>) -> WorkspaceChoice {
+    match worktree_path {
+        Some(path) => WorkspaceChoice {
+            mode: Some(EnvMode::Worktree),
+            existing_worktree: Some(path),
+            start_from_origin: Some(false),
+            branch,
+        },
+        None => WorkspaceChoice {
+            mode: Some(EnvMode::Local),
+            branch,
+            start_from_origin: Some(false),
+            existing_worktree: None,
+        },
+    }
+}
+
+impl Workspace {
+    /// A draft in the thread's project on its checkout: its worktree, else its branch locally.
+    pub(in crate::app) fn new_thread_on_branch(&mut self, key: &ScopedId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(thread) = self.shell.thread(key) else { return };
+        let choice = branch_choice(thread.branch.clone(), thread.worktree_path.clone());
+        self.start_draft_in(key.env.clone(), thread.project_id.clone(), window, cx);
+        self.sync_draft_workspace(cx);
+        self.draft_workspace.choice = choice;
+        cx.notify();
+    }
+
+    /// `projects.createFromThread`: the thread's folder becomes a project.
+    pub(in crate::app) fn turn_thread_into_project(
+        &mut self,
+        key: &ScopedId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = json!({"threadId": key.id});
+        if !self.env_permits(&key.env, "projects.createFromThread", &input) {
+            return;
+        }
+        let Some(client) = self.env_client(&key.env) else { return };
+        let title = self.shell.thread(key).map(|t| t.title.clone()).unwrap_or_default();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = client.request("projects.createFromThread", input).await;
+            let _ = this.update_in(cx, |_, window, cx| {
+                let note = match result {
+                    Ok(_) => Notification::success(title).title("Project created"),
+                    Err(error) => Notification::error(error.to_string()).title("Could not turn thread into a project"),
+                };
+                window.push_notification(note, cx);
+            });
+        })
+        .detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_branch_thread_reuses_its_worktree_or_switches_locally() {
+        let worktree = branch_choice(Some("feat".into()), Some("C:/wt/feat".into()));
+        assert_eq!(worktree.mode, Some(EnvMode::Worktree));
+        assert_eq!(
+            (worktree.existing_worktree.as_deref(), worktree.branch.as_deref()),
+            (Some("C:/wt/feat"), Some("feat"))
+        );
+        let local = branch_choice(Some("feat".into()), None);
+        assert_eq!(
+            (local.mode, local.branch.as_deref(), local.start_from_origin),
+            (Some(EnvMode::Local), Some("feat"), Some(false))
+        );
+    }
+}

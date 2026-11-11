@@ -1,0 +1,1020 @@
+//! The Files tree (`FileBrowserPanel.tsx`, `useDirectoryEntries.ts`): folders list as they open
+//! (`projects.listEntries`), a search box finds paths anywhere (`projects.searchEntries`), and a
+//! right click offers the editors, Copy mention and Add to chat.
+
+use std::cell::Cell;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::rc::Rc;
+use std::time::Duration;
+
+use gpui_kit::assets::IconName;
+use gpui_kit::component::input::{InlineToken, Input, InputEvent, InputState};
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::notification::Notification;
+use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::component::{Icon, WindowExt as _, h_flex, v_flex};
+use gpui_kit::{
+    AnyElement, AppContext as _, ClipboardItem, Context, ElementId, Entity, FocusHandle, InteractiveElement as _,
+    IntoElement, ParentElement as _, ScrollStrategy, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Subscription, Task, UniformListScrollHandle, Window, div, prelude::FluentBuilder as _, px, uniform_list,
+};
+use serde_json::json;
+
+use super::Checkout;
+use super::logic::{self, Entry, EntryKind, TreeRow};
+use crate::app::Workspace;
+use crate::composer_text::{self, Chip};
+use crate::theme::Tokens;
+
+const ROW_HEIGHT: f32 = 24.;
+
+/// A tree row dragged toward the composer, which drops it in as a mention (`composerMentionDrag.ts`).
+pub(in crate::app) struct MentionDrag {
+    pub path: String,
+}
+
+/// What follows the pointer during a [`MentionDrag`]: the row's name.
+struct MentionDragPreview(SharedString);
+
+impl gpui_kit::Render for MentionDragPreview {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = crate::theme::tokens(cx);
+        div()
+            .px(px(8.))
+            .py(px(2.))
+            .rounded(px(6.))
+            .border_1()
+            .border_color(t.border)
+            .bg(t.popover)
+            .text_xs()
+            .text_color(t.foreground)
+            .child(self.0.clone())
+    }
+}
+/// `useDirectoryEntries` reads at most four folders at once.
+const MAX_LOADS: usize = 4;
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
+const SEARCH_LIMIT: usize = 200;
+
+#[derive(Default)]
+struct PathSearch {
+    /// What the box holds, lowercased, for the tree's own filter.
+    typed: String,
+    /// The trimmed query sent to the server.
+    query: String,
+    hits: Vec<Entry>,
+    truncated: bool,
+    pending: bool,
+    error: Option<String>,
+    /// The socket the search last went out on; `None` while it waits for one.
+    on: Option<crate::rpc::SocketId>,
+    generation: u64,
+    _task: Option<Task<()>>,
+}
+
+impl PathSearch {
+    /// A search that is still waiting, or failed, runs again on a new socket, as the tree's
+    /// failed folders do ([`Failure::retries_on`]).
+    fn retries_on(&self, socket: &crate::rpc::SocketId) -> bool {
+        !self.query.is_empty() && (self.pending || self.error.is_some()) && self.on.as_ref() != Some(socket)
+    }
+}
+
+pub(super) struct TreeState {
+    /// Each listed folder's own entries; `""` is the root.
+    listed: HashMap<String, Vec<Entry>>,
+    /// Folders asked for, for Refresh.
+    requested: HashSet<String>,
+    /// Shared with the rows the last frame drew; copied only when it changes while they hold it.
+    loading: Rc<HashSet<String>>,
+    queue: VecDeque<String>,
+    in_flight: usize,
+    errors: HashMap<String, Failure>,
+    expanded: HashSet<String>,
+    /// "Expand all" keeps opening folders as they list.
+    expand_all: bool,
+    query: Entity<InputState>,
+    search: PathSearch,
+    rows: Rc<[TreeRow]>,
+    rows_dirty: bool,
+    /// Derived with the rows: the first folder error still in the tree, whether every folder
+    /// "Expand all" would open is open, and whether any folder shows.
+    error: Option<String>,
+    all_open: bool,
+    has_folders: bool,
+    scroll: UniformListScrollHandle,
+    /// Keyboard focus and the row it is on (the web tree's roving focus).
+    focus: FocusHandle,
+    focused: Option<String>,
+    /// Where the focused row last drew, so the keyboard opens its menu below it.
+    focused_bounds: Rc<Cell<Option<gpui_kit::Bounds<gpui_kit::Pixels>>>>,
+    reveal: Reveal,
+    mutation: Option<(Option<String>, Option<String>)>,
+    _subscription: Subscription,
+}
+
+/// A folder that did not list, and the socket it failed on.
+struct Failure {
+    message: String,
+    on: Option<crate::rpc::SocketId>,
+}
+
+impl Failure {
+    /// A failure stands until a new socket, so folders that failed offline list once the
+    /// environment reconnects, as the web's do on a new session.
+    fn retries_on(&self, socket: &crate::rpc::SocketId) -> bool {
+        self.on.as_ref() != Some(socket)
+    }
+}
+
+/// Which selections the tree reveals (`handledRevealRef`, `treeSelectionPathRef`).
+#[derive(Default)]
+struct Reveal {
+    /// The selection last revealed, with its request.
+    handled: Option<(String, u64)>,
+    /// The file the tree itself just opened.
+    from_tree: Option<String>,
+}
+
+impl Reveal {
+    /// Whether `request` still needs revealing. A file opened from the tree shows already, and
+    /// revealing it would close the search it was found with.
+    fn wants(&mut self, request: &(String, u64)) -> bool {
+        if self.handled.as_ref() == Some(request) {
+            return false;
+        }
+        if self.from_tree.take().is_some_and(|path| path == request.0) {
+            self.handled = Some(request.clone());
+            return false;
+        }
+        true
+    }
+}
+
+impl TreeState {
+    /// Every listed entry reachable from the root.
+    fn reachable(&self) -> Vec<Entry> {
+        let mut out = Vec::new();
+        let mut stack = vec![String::new()];
+        while let Some(folder) = stack.pop() {
+            for entry in self.listed.get(&folder).into_iter().flatten() {
+                if entry.kind == EntryKind::Directory {
+                    stack.push(entry.path.clone());
+                }
+                out.push(entry.clone());
+            }
+        }
+        out
+    }
+
+    /// The rows; while searching, the matching paths with their folders open. Server hits join
+    /// the listed entries once they arrive (`buildTreeEntries`).
+    fn rebuild_rows(&mut self) {
+        let entries = self.reachable();
+        let folders: HashSet<&str> = std::iter::once("")
+            .chain(entries.iter().filter(|e| e.kind == EntryKind::Directory).map(|e| e.path.as_str()))
+            .collect();
+        self.error =
+            self.errors.iter().find(|(path, _)| folders.contains(path.as_str())).map(|(_, e)| e.message.clone());
+        let expandable = self.expandable_in(&entries);
+        self.all_open =
+            self.expand_all || (!expandable.is_empty() && expandable.iter().all(|p| self.expanded.contains(p)));
+        self.has_folders = folders.len() > 1;
+        self.rows = Rc::from(if self.search.query.is_empty() {
+            logic::tree_rows(&entries, &self.expanded, None)
+        } else {
+            let hits: &[Entry] = if self.search.pending { &[] } else { &self.search.hits };
+            let merged = logic::merge_search_entries(&entries, hits);
+            self.has_folders |= merged.iter().any(|e| e.kind == EntryKind::Directory);
+            let matches = logic::tree_search_matches(&merged, &self.search.typed);
+            logic::tree_rows(&merged, &self.expanded, Some(&logic::search_paths(&matches)))
+        });
+        self.rows_dirty = false;
+    }
+
+    /// The folders "Expand all" opens: every listed one but ignored folders such as `node_modules`.
+    fn expandable_in(&self, entries: &[Entry]) -> Vec<String> {
+        entries.iter().filter(|e| e.kind == EntryKind::Directory && !e.ignored).map(|e| e.path.clone()).collect()
+    }
+}
+
+/// How a tree row draws: the open file, the keyboard focus, and a folder still listing.
+#[derive(Clone, Copy)]
+struct RowLook {
+    selected: bool,
+    focused: bool,
+    loading: bool,
+}
+
+impl TreeState {
+    /// A folder's listed entries, or its load error.
+    pub(super) fn folder(&self, folder: &str) -> Result<Option<&[Entry]>, &str> {
+        match (self.listed.get(folder), self.errors.get(folder)) {
+            (Some(entries), _) => Ok(Some(entries)),
+            (None, Some(error)) => Err(&error.message),
+            (None, None) => Ok(None),
+        }
+    }
+}
+
+impl Workspace {
+    pub(super) fn tree_state(&self, root: &Checkout) -> Option<&TreeState> {
+        self.files.trees.get(root)
+    }
+
+    fn tree(&mut self, root: &Checkout) -> Option<&mut TreeState> {
+        self.files.trees.get_mut(root)
+    }
+
+    /// The tree for `root`, created (and its root folder listed) on first use.
+    pub(super) fn ensure_tree(&mut self, root: &Checkout, window: &mut Window, cx: &mut Context<Self>) {
+        if self.files.trees.contains_key(root) {
+            return;
+        }
+        let query = cx.new(|cx| InputState::new(window, cx).placeholder("Search files"));
+        let key = root.clone();
+        let subscription = cx.subscribe_in(&query, window, move |this, input, event: &InputEvent, _, cx| {
+            if matches!(event, InputEvent::Change) {
+                let value = input.read(cx).value().to_string();
+                this.search_tree(&key, value, cx);
+            }
+        });
+        self.files.trees.insert(
+            root.clone(),
+            TreeState {
+                listed: HashMap::new(),
+                requested: HashSet::new(),
+                loading: Rc::default(),
+                queue: VecDeque::new(),
+                in_flight: 0,
+                errors: HashMap::new(),
+                expanded: HashSet::new(),
+                expand_all: false,
+                query,
+                search: PathSearch::default(),
+                rows: Rc::default(),
+                rows_dirty: true,
+                error: None,
+                all_open: false,
+                has_folders: false,
+                scroll: UniformListScrollHandle::new(),
+                focus: cx.focus_handle().tab_stop(true),
+                focused: None,
+                focused_bounds: Rc::default(),
+                reveal: Reveal::default(),
+                mutation: None,
+                _subscription: subscription,
+            },
+        );
+        self.load_folder(root, String::new(), false, cx);
+    }
+
+    /// Lists `folder` once (or again with `refresh`), at most four at a time.
+    pub(super) fn load_folder(&mut self, root: &Checkout, folder: String, refresh: bool, cx: &mut Context<Self>) {
+        let Some(tree) = self.tree(root) else { return };
+        if tree.loading.contains(&folder) || (!refresh && tree.listed.contains_key(&folder)) {
+            return;
+        }
+        tree.requested.insert(folder.clone());
+        Rc::make_mut(&mut tree.loading).insert(folder.clone());
+        tree.queue.push_back(folder);
+        self.pump_folder_loads(root, cx);
+    }
+
+    fn pump_folder_loads(&mut self, root: &Checkout, cx: &mut Context<Self>) {
+        let client = self.env_client(&root.env);
+        let Some(tree) = self.tree(root) else { return };
+        while tree.in_flight < MAX_LOADS {
+            let Some(folder) = tree.queue.pop_front() else { break };
+            let Some(client) = client.clone() else {
+                Rc::make_mut(&mut tree.loading).remove(&folder);
+                tree.errors.insert(folder, Failure { message: "Not connected.".into(), on: None });
+                continue;
+            };
+            tree.in_flight += 1;
+            let socket = client.socket_id();
+            let root = root.clone();
+            let input = logic::list_entries_input(&root.cwd, &folder);
+            cx.spawn(async move |this, cx| {
+                let result = client.request("projects.listEntries", input).await;
+                let _ = this.update(cx, |this, cx| {
+                    let Some(tree) = this.tree(&root) else { return };
+                    tree.in_flight -= 1;
+                    Rc::make_mut(&mut tree.loading).remove(&folder);
+                    match result {
+                        Ok(value) => {
+                            let entries: Vec<Entry> = logic::entries_from_json(&value)
+                                .into_iter()
+                                .filter(|e| logic::parent_of(&e.path) == folder)
+                                .collect();
+                            let opens: Vec<String> = if tree.expand_all {
+                                entries
+                                    .iter()
+                                    .filter(|e| e.kind == EntryKind::Directory && !e.ignored)
+                                    .map(|e| e.path.clone())
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+                            tree.expanded.extend(opens);
+                            tree.listed.insert(folder.clone(), entries);
+                            tree.errors.remove(&folder);
+                        }
+                        Err(error) => {
+                            let message = logic::error_message(&error);
+                            tree.errors.insert(folder.clone(), Failure { message, on: Some(socket) });
+                        }
+                    }
+                    tree.rows_dirty = true;
+                    this.pump_folder_loads(&root, cx);
+                    this.load_open_folders(&root, cx);
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+    }
+
+    /// Lists every open folder not listed yet (a chain grows as its folders list).
+    fn load_open_folders(&mut self, root: &Checkout, cx: &mut Context<Self>) {
+        let Some(tree) = self.tree(root) else { return };
+        if tree.rows_dirty {
+            tree.rebuild_rows();
+        }
+        let missing: Vec<String> = tree
+            .rows
+            .iter()
+            .filter(|row| row.expanded && !tree.listed.contains_key(&row.path) && !tree.errors.contains_key(&row.path))
+            .map(|row| row.path.clone())
+            .collect();
+        for folder in missing {
+            self.load_folder(root, folder, false, cx);
+        }
+    }
+
+    fn toggle_tree_folder(&mut self, root: &Checkout, row: &TreeRow, cx: &mut Context<Self>) {
+        let Some(tree) = self.tree(root) else { return };
+        if row.expanded {
+            let (top, path) = (row.top.clone(), row.path.clone());
+            tree.expanded.retain(|p| !(p == &path || (p.starts_with(&top) && path.starts_with(&format!("{p}/")))));
+            tree.expand_all = false;
+        } else {
+            tree.expanded.insert(row.path.clone());
+        }
+        tree.rows_dirty = true;
+        self.load_open_folders(root, cx);
+        cx.notify();
+    }
+
+    fn toggle_all_folders(&mut self, root: &Checkout, cx: &mut Context<Self>) {
+        let Some(tree) = self.tree(root) else { return };
+        let expandable = tree.expandable_in(&tree.reachable());
+        let all_open = tree.expand_all || expandable.iter().all(|p| tree.expanded.contains(p));
+        if all_open {
+            tree.expanded.clear();
+            tree.expand_all = false;
+        } else {
+            tree.expand_all = true;
+            tree.expanded.extend(expandable);
+        }
+        tree.rows_dirty = true;
+        self.load_open_folders(root, cx);
+        cx.notify();
+    }
+
+    /// Refresh: lists every requested folder still in the tree again, and the search.
+    fn refresh_tree(&mut self, root: &Checkout, cx: &mut Context<Self>) {
+        let Some(tree) = self.tree(root) else { return };
+        let reachable: HashSet<String> = std::iter::once(String::new())
+            .chain(tree.reachable().into_iter().filter(|e| e.kind == EntryKind::Directory).map(|e| e.path))
+            .collect();
+        let folders: Vec<String> = tree.requested.iter().filter(|p| reachable.contains(*p)).cloned().collect();
+        let query = std::mem::take(&mut tree.search.query);
+        for folder in folders {
+            self.load_folder(root, folder, true, cx);
+        }
+        self.search_tree(root, query, cx);
+    }
+
+    /// `useProjectPathSearch` for the tree's search box.
+    fn search_tree(&mut self, root: &Checkout, value: String, cx: &mut Context<Self>) {
+        let client = self.env_client(&root.env);
+        let Some(tree) = self.tree(root) else { return };
+        let query: String = value.chars().take(256).collect::<String>().trim().to_owned();
+        tree.search.typed = value.to_lowercase();
+        tree.rows_dirty = true;
+        if tree.search.query == query {
+            cx.notify();
+            return;
+        }
+        tree.search.generation += 1;
+        let generation = tree.search.generation;
+        tree.search.query = query.clone();
+        tree.search._task = None;
+        tree.search.error = None;
+        tree.search.on = None;
+        tree.rows_dirty = true;
+        if query.is_empty() {
+            tree.search.pending = false;
+            tree.search.hits.clear();
+            cx.notify();
+            return;
+        }
+        // Offline, the search stays pending (as the web's waits on the connection) until
+        // `sync_tree` sees a socket.
+        tree.search.pending = true;
+        let Some(client) = client else { return };
+        tree.search.on = Some(client.socket_id());
+        let root = root.clone();
+        let payload = json!({"cwd": root.cwd, "query": query, "limit": SEARCH_LIMIT});
+        tree.search._task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SEARCH_DEBOUNCE).await;
+            let result = client.request("projects.searchEntries", payload).await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(tree) = this.tree(&root).filter(|t| t.search.generation == generation) else { return };
+                tree.search.pending = false;
+                match result {
+                    Ok(value) => {
+                        tree.search.hits = logic::entries_from_json(&value);
+                        tree.search.truncated = value["truncated"].as_bool().unwrap_or(false);
+                    }
+                    Err(error) => tree.search.error = Some(logic::error_message(&error)),
+                }
+                tree.rows_dirty = true;
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    fn clear_tree_search(&mut self, root: &Checkout, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tree) = self.tree(root) else { return };
+        let input = tree.query.clone();
+        input.update(cx, |input, cx| input.set_value("", window, cx));
+        self.search_tree(root, String::new(), cx);
+        window.blur(cx);
+    }
+
+    /// Keeps the tree current: a new workspace mutation lists the open folders again, a new socket
+    /// lists the failed ones again, and a new selection opens the folders above it and scrolls to it.
+    fn sync_tree(
+        &mut self,
+        root: &Checkout,
+        selected: Option<&str>,
+        reveal: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mutation = self.files.mutation.clone();
+        let socket = self.env_client(&root.env).map(|client| client.socket_id());
+        let Some(tree) = self.tree(root) else { return };
+        let previous = tree.mutation.replace(mutation.clone());
+        let failed: Vec<String> = socket
+            .as_ref()
+            .map(|socket| tree.errors.iter().filter(|(_, f)| f.retries_on(socket)).map(|(p, _)| p.clone()).collect())
+            .unwrap_or_default();
+        let search_retries = socket.is_some_and(|socket| tree.search.retries_on(&socket));
+        if previous.is_some_and(|p| p != mutation) {
+            self.refresh_tree(root, cx);
+        } else if search_retries && let Some(tree) = self.tree(root) {
+            let value = tree.query.read(cx).value().to_string();
+            tree.search.query.clear();
+            self.search_tree(root, value, cx);
+        }
+        for folder in failed {
+            self.load_folder(root, folder, true, cx);
+        }
+        let Some(selected) = selected.filter(|s| !s.is_empty()) else { return };
+        let Some(tree) = self.tree(root) else { return };
+        let request = (selected.to_owned(), reveal);
+        if !tree.reveal.wants(&request) {
+            return;
+        }
+        let ancestors = logic::ancestors(selected);
+        // Revealing a selection made elsewhere closes the search, as the web's tree does.
+        if !tree.search.query.is_empty() {
+            let input = tree.query.clone();
+            input.update(cx, |input, cx| input.set_value("", window, cx));
+            self.search_tree(root, String::new(), cx);
+        }
+        let Some(tree) = self.tree(root) else { return };
+        tree.expanded.extend(ancestors.iter().cloned());
+        tree.rows_dirty = true;
+        let known = ancestors.iter().all(|a| tree.listed.contains_key(a)) && tree.listed.contains_key("");
+        if tree.rows_dirty {
+            tree.rebuild_rows();
+        }
+        if let Some(index) = tree.rows.iter().position(|r| r.path == selected) {
+            tree.scroll.scroll_to_item(index, ScrollStrategy::Center);
+            tree.reveal.handled = Some(request);
+        } else if known {
+            tree.reveal.handled = Some(request);
+        }
+        self.load_open_folders(root, cx);
+    }
+
+    /// The tree pane: the search bar, status lines and the rows.
+    pub(super) fn render_tree(
+        &mut self,
+        root: &Checkout,
+        selected: Option<&str>,
+        reveal: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.ensure_tree(root, window, cx);
+        self.sync_tree(root, selected, reveal, window, cx);
+        let tokens = *crate::theme::tokens(cx);
+        let host = self.is_host_tree(root);
+        let Some(tree) = self.tree(root) else { return div().into_any_element() };
+        if tree.rows_dirty {
+            tree.rebuild_rows();
+        }
+        let rows = tree.rows.clone();
+        let ready = tree.listed.contains_key("");
+        let pending = !tree.loading.is_empty();
+        let error = tree.error.clone().or_else(|| tree.search.error.clone());
+        let searching = !tree.search.query.is_empty();
+        let (has_folders, all_open) = (tree.has_folders, tree.all_open);
+        let no_matches = searching && rows.is_empty();
+        let truncated = searching && tree.search.truncated && !tree.search.pending;
+        let loading_line = (!ready || tree.search.pending) && (rows.is_empty() || no_matches);
+        let query = tree.query.clone();
+        let loading_folders = tree.loading.clone();
+        let scroll = tree.scroll.clone();
+        let muted = tokens.muted_foreground;
+        let key = root.clone();
+        let icon_button = |id: &'static str, icon: IconName, label: SharedString| {
+            crate::app::chat::focusable(div().id(id), &tokens)
+                .size(px(24.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .text_color(muted)
+                .hover(|s| s.bg(tokens.accent).text_color(tokens.foreground))
+                .child(Icon::new(icon).size(px(14.)))
+                .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+        };
+        let refresh_key = key.clone();
+        let refresh_selected = selected.map(str::to_owned);
+        let toggle_key = key.clone();
+        let clear_key = key.clone();
+        let subheader = h_flex()
+            .flex_none()
+            .h(px(36.))
+            .mb(px(4.))
+            .gap(px(4.))
+            .px(px(8.))
+            .child(
+                icon_button(
+                    "files-refresh",
+                    IconName::RefreshCw,
+                    if pending { "Refreshing…" } else { "Refresh files" }.into(),
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.refresh_tree(&refresh_key, cx);
+                    if let Some(path) = &refresh_selected {
+                        let key = super::FileKey::new(refresh_key.clone(), path.clone());
+                        this.refresh_selected_file(&key, window, cx);
+                    }
+                })),
+            )
+            .child(
+                div()
+                    .id("files-search")
+                    .flex_1()
+                    .min_w_0()
+                    .h(px(28.))
+                    .on_key_down(cx.listener(move |this, event: &gpui_kit::KeyDownEvent, window, cx| {
+                        if event.keystroke.key == "escape" {
+                            this.clear_tree_search(&clear_key, window, cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+                    // `InputGroupInput size="sm"` in a `sm:text-sm` group.
+                    .child(Input::new(&query).appearance(false).text_sm().h(px(28.)).px(px(8.))),
+            )
+            .when(has_folders && !host, |el| {
+                el.child(
+                    icon_button(
+                        "files-expand-all",
+                        if all_open { IconName::ChevronsDownUp } else { IconName::ChevronsUpDown },
+                        if all_open { "Collapse all folders" } else { "Expand all folders" }.into(),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_all_folders(&toggle_key, cx))),
+                )
+            });
+        let retry_key = key.clone();
+        let settled = ready && !pending && !tree.search.pending && error.is_none();
+        let list: AnyElement = if no_matches {
+            div()
+                .when(settled, |el| el.px(px(12.)).py(px(16.)).text_xs().text_color(muted).child("No matching files."))
+                .into_any_element()
+        } else {
+            let selected = selected.map(str::to_owned);
+            // Tabbing in lands on the selected row, or the first, like the web tree's roving stop.
+            if tree.focused.is_none() && tree.focus.is_focused(window) {
+                tree.focused = selected
+                    .clone()
+                    .filter(|path| rows.iter().any(|row| &row.path == path))
+                    .or_else(|| rows.first().map(|row| row.path.clone()));
+            }
+            let focused = tree.focused.clone().filter(|_| tree.focus.is_focused(window));
+            let list_key = key.clone();
+            uniform_list(
+                ElementId::Name(format!("files-tree:{}", root.cwd).into()),
+                rows.len(),
+                cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                    let tokens = *crate::theme::tokens(cx);
+                    range
+                        .map(|index| {
+                            let row = &rows[index];
+                            let loading = row.expanded && loading_folders.contains(&row.path);
+                            let look = RowLook {
+                                selected: selected.as_deref() == Some(row.path.as_str()),
+                                focused: focused.as_deref() == Some(row.path.as_str()),
+                                loading,
+                            };
+                            this.tree_row(&list_key, row, look, &tokens, cx)
+                        })
+                        .collect::<Vec<_>>()
+                }),
+            )
+            .track_scroll(&scroll)
+            .flex_1()
+            .px(px(8.))
+            .pb(px(8.))
+            .into_any_element()
+        };
+        let focus = tree.focus.clone();
+        let keys_key = key;
+        v_flex()
+            .size_full()
+            .min_h_0()
+            .bg(tokens.background)
+            .child(subheader)
+            .children(error.map(|error| {
+                crate::app::chat::focusable(div().id("files-error"), &tokens)
+                    .p(px(16.))
+                    .text_xs()
+                    .line_height(gpui_kit::relative(1.625))
+                    .text_color(tokens.error)
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| this.refresh_tree(&retry_key, cx)))
+                    .child(format!("{error} Click to retry."))
+            }))
+            .when(truncated, |el| {
+                el.child(
+                    div()
+                        .px(px(12.))
+                        .py(px(4.))
+                        .text_xs()
+                        .text_color(muted)
+                        .child("More matches available. Refine your search."),
+                )
+            })
+            .when(loading_line, |el| {
+                el.child(div().px(px(12.)).py(px(4.)).text_xs().text_color(muted).child("Loading files…"))
+            })
+            .child(
+                div()
+                    .id(ElementId::Name(format!("files-tree-keys:{}", root.cwd).into()))
+                    .track_focus(&focus)
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .on_key_down(cx.listener(move |this, event: &gpui_kit::KeyDownEvent, window, cx| {
+                        let keystroke = &event.keystroke;
+                        if gpui_kit::component::menu::opens_context_menu(keystroke) {
+                            this.open_focused_row_menu(&keys_key, window, cx);
+                            cx.stop_propagation();
+                            return;
+                        }
+                        if keystroke.modifiers.modified() {
+                            return;
+                        }
+                        if this.tree_key(&keys_key, &keystroke.key, window, cx) {
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .child(list),
+            )
+            .into_any_element()
+    }
+
+    /// The web tree's keys: arrows move or open and close folders, Home and End jump,
+    /// Enter and Space open the row.
+    fn tree_key(&mut self, root: &Checkout, key: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(tree) = self.tree(root) else { return false };
+        let rows = tree.rows.clone();
+        if rows.is_empty() {
+            return false;
+        }
+        let at = tree.focused.as_ref().and_then(|path| rows.iter().position(|r| &r.path == path));
+        let row = at.map(|at| rows[at].clone());
+        let folder = row.clone().filter(|r| r.kind == EntryKind::Directory);
+        let next = match (key, at) {
+            ("down", None) | ("home", _) => Some(0),
+            ("up", None) | ("end", _) => Some(rows.len() - 1),
+            ("down", Some(at)) => Some((at + 1).min(rows.len() - 1)),
+            ("up", Some(at)) => Some(at.saturating_sub(1)),
+            ("right", Some(at)) => match folder {
+                Some(row) if !row.expanded => {
+                    self.toggle_tree_folder(root, &row, cx);
+                    None
+                }
+                _ => Some((at + 1).min(rows.len() - 1)),
+            },
+            ("left", Some(at)) => match folder {
+                Some(row) if row.expanded => {
+                    self.toggle_tree_folder(root, &row, cx);
+                    None
+                }
+                _ => logic::parent_row(&rows, at),
+            },
+            ("enter" | "space", Some(_)) => {
+                if let Some(row) = row {
+                    if row.kind == EntryKind::Directory {
+                        self.toggle_tree_folder(root, &row, cx);
+                    } else {
+                        self.open_tree_file(root, &row.path, window, cx);
+                    }
+                }
+                None
+            }
+            _ => return false,
+        };
+        if let (Some(next), Some(tree)) = (next, self.tree(root)) {
+            tree.focused = Some(rows[next].path.clone());
+            tree.scroll.scroll_to_item(next, ScrollStrategy::Nearest);
+        }
+        cx.notify();
+        true
+    }
+
+    /// The menu key or Shift+F10: the focused row's menu, below the row as the web's
+    /// `contextmenu` on a focused tree item.
+    fn open_focused_row_menu(&mut self, root: &Checkout, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tree) = self.tree(root) else { return };
+        let (Some(path), Some(bounds)) = (tree.focused.clone(), tree.focused_bounds.get()) else { return };
+        let menu = self.tree_context_menu(root, &path, cx);
+        self.open_chat_menu(None, bounds.bottom_left(), window, cx, menu);
+    }
+
+    fn open_tree_file(&mut self, root: &Checkout, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tree) = self.tree(root) {
+            tree.reveal.from_tree = Some(path.to_owned());
+        }
+        let path = if self.is_host_tree(root) { logic::absolute_path(&root.cwd, path) } else { path.to_owned() };
+        self.open_file(&path, None, window, cx);
+    }
+
+    fn tree_row(
+        &mut self,
+        root: &Checkout,
+        row: &TreeRow,
+        look: RowLook,
+        tokens: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let RowLook { selected, focused, loading } = look;
+        let folder = row.kind == EntryKind::Directory;
+        let glyph = match (folder, row.expanded, loading) {
+            (true, true, true) => Icon::new(IconName::LoaderCircle),
+            (true, true, false) => Icon::new(IconName::ChevronDown),
+            (true, false, _) => Icon::new(IconName::ChevronRight),
+            (false, _, _) => {
+                let (asset, color) = crate::file_icons::file_icon(&row.path, self.dark_theme(cx));
+                Icon::empty().path(asset).text_color(color)
+            }
+        };
+        let fg = tokens.foreground;
+        // Pierre trees' `--trees-git-ignored-color` (`light-dark(#adadb1, #4a4a4e)`); its icon cell fades to half.
+        let ignored = gpui_kit::rgb(if tokens.dark { 0x4a4a4e } else { 0xadadb1 });
+        let (click_key, click_row) = (root.clone(), row.clone());
+        let menu = self.tree_context_menu(root, &row.path, cx);
+        let measured = focused.then(|| self.tree(root).map(|tree| tree.focused_bounds.clone())).flatten();
+        let mention_path = self.tree_mention_path(root, &row.path);
+        h_flex()
+            .id(ElementId::Name(format!("files-row:{}", row.path).into()))
+            .h(px(ROW_HEIGHT))
+            .w_full()
+            .min_w_0()
+            .gap(px(4.))
+            .pl(px(6. + row.depth as f32 * 16.))
+            .pr(px(6.))
+            .rounded(px(6.))
+            .border_1()
+            .border_color(if focused { tokens.ring } else { gpui_kit::transparent_black() })
+            .cursor_pointer()
+            .text_xs()
+            .text_color(if row.ignored { ignored.into() } else { fg })
+            .when(selected, |el| el.bg(fg.opacity(0.12)))
+            .when(!selected, |el| el.hover(move |s| s.bg(fg.opacity(0.07))))
+            // A drag never counts as the click that would open the row.
+            .on_drag(MentionDrag { path: mention_path }, {
+                let label = SharedString::from(row.label.clone());
+                move |_, _, _, cx| cx.new(|_| MentionDragPreview(label.clone()))
+            })
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if let Some(tree) = this.tree(&click_key) {
+                    tree.focused = Some(click_row.path.clone());
+                    let focus = tree.focus.clone();
+                    window.focus(&focus, cx);
+                }
+                if click_row.kind == EntryKind::Directory {
+                    this.toggle_tree_folder(&click_key, &click_row, cx);
+                } else {
+                    this.open_tree_file(&click_key, &click_row.path, window, cx);
+                }
+            }))
+            .child(
+                glyph
+                    .size(px(16.))
+                    .flex_none()
+                    .when(folder, |el| el.text_color(tokens.muted_foreground))
+                    .when(loading, |el| el.opacity(0.6))
+                    .when(row.ignored, |el| el.opacity(0.5)),
+            )
+            .child(div().min_w_0().truncate().child(row.label.clone()))
+            .children(measured.map(|measured| {
+                gpui_kit::canvas(move |bounds, _, _| measured.set(Some(bounds)), |_, (), _, _| {})
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+            }))
+            .context_menu(menu)
+            .into_any_element()
+    }
+
+    /// The row's menu: Open, Reveal, Open with, then Copy mention and Add to chat.
+    fn tree_context_menu(
+        &self,
+        root: &Checkout,
+        path: &str,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        let view = cx.entity();
+        let editors = self.server_info().available_editors.clone();
+        let config = &self.server_info().config;
+        let file_manager = editors.iter().any(|e| e == "file-manager");
+        let reveal = (file_manager && config["shellRevealInFileManager"] == true).then(|| {
+            logic::reveal_label(
+                config["shellRevealInFileManagerKind"].as_str(),
+                self.server_info().platform_os.as_deref(),
+            )
+        });
+        let environment = root.env.clone();
+        let absolute = logic::absolute_path(&root.cwd, path);
+        let mention_path = self.tree_mention_path(root, path);
+        move |mut menu, window, cx| {
+            super::track_menu(&view, cx);
+            let open_in = |editor: String, reveal: bool, title: String| {
+                let (absolute, environment) = (absolute.clone(), environment.clone());
+                window.listener_for(&view, move |this: &mut Workspace, _, window, cx| {
+                    let (path, editor, title) = (absolute.clone(), editor.clone(), title.clone());
+                    this.open_path_in_editor(&environment, path, editor, reveal, title, window, cx);
+                })
+            };
+            if file_manager {
+                menu = menu.item(PopupMenuItem::new("Open").icon(IconName::Pencil).on_click(open_in(
+                    "file-manager".into(),
+                    false,
+                    "Could not open file".into(),
+                )));
+            }
+            if let Some(label) = reveal {
+                menu = menu.item(PopupMenuItem::new(label).icon(IconName::FolderTree).on_click(open_in(
+                    "file-manager".into(),
+                    true,
+                    "Unable to reveal file".into(),
+                )));
+            }
+            let others: Vec<&String> = editors.iter().filter(|e| *e != "file-manager").collect();
+            if !others.is_empty() {
+                let items: Vec<(String, String)> =
+                    others.iter().map(|e| ((*e).clone(), crate::app::details::editor_label(e).to_owned())).collect();
+                let view = view.clone();
+                let (absolute, environment) = (absolute.clone(), environment.clone());
+                menu = menu.submenu("Open with", window, cx, move |mut sub, window, _| {
+                    for (editor, label) in &items {
+                        let (editor, absolute, environment) = (editor.clone(), absolute.clone(), environment.clone());
+                        let title = format!("Could not open in {label}");
+                        sub = sub.item(PopupMenuItem::new(label.clone()).on_click(window.listener_for(
+                            &view,
+                            move |this: &mut Workspace, _, window, cx| {
+                                this.open_path_in_editor(
+                                    &environment,
+                                    absolute.clone(),
+                                    editor.clone(),
+                                    false,
+                                    title.clone(),
+                                    window,
+                                    cx,
+                                );
+                            },
+                        )));
+                    }
+                    sub
+                });
+            }
+            let mention = composer_text::file_link(&mention_path);
+            let (copy_path, add_path) = (mention_path.clone(), mention_path.clone());
+            menu.item(PopupMenuItem::new("Copy mention").on_click(move |_, window, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(mention.clone()));
+                window.push_notification(Notification::success(copy_path.clone()).title("Mention copied"), cx);
+            }))
+            .item(PopupMenuItem::new("Add to chat").on_click(window.listener_for(
+                &view,
+                move |this: &mut Workspace, _, window, cx| {
+                    this.add_file_to_chat(&add_path, window, cx);
+                },
+            )))
+        }
+    }
+
+    /// The path a row's mention carries: a host folder's rows by their host paths, as opening them.
+    fn tree_mention_path(&self, root: &Checkout, path: &str) -> String {
+        if self.is_host_tree(root) { logic::absolute_path(&root.cwd, path) } else { path.to_owned() }
+    }
+
+    /// Add to chat: the file's mention at the end of the composer, after a space.
+    pub(in crate::app) fn add_file_to_chat(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.question_takes_text(crate::app::side_chat::ChatPane::Main) {
+            let notification =
+                Notification::error("The chat isn't ready to accept input right now.").title("Unable to add to chat");
+            window.push_notification(notification, cx);
+            return;
+        }
+        let chip = Chip::File { path: path.to_owned() };
+        let link = composer_text::file_link(path);
+        self.composer.update(cx, |state, cx| {
+            let end = state.value().len();
+            state.set_selected_range(end..end, cx);
+            if end > 0 && !state.value().ends_with(char::is_whitespace) {
+                state.insert(" ", window, cx);
+            }
+            let at = state.value().len();
+            let token = InlineToken::new(chip.id(), link).with_label(chip.label().to_owned());
+            if state.replace_range_with_token(at..at, token, window, cx).is_ok() {
+                state.insert(" ", window, cx);
+            }
+        });
+        self.sync_composer_empty(cx);
+        cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Failure, PathSearch, Reveal};
+
+    #[test]
+    fn a_failed_folder_lists_again_on_a_new_socket() {
+        let (first, second) = (crate::rpc::RpcClient::unopened(), crate::rpc::RpcClient::unopened());
+        let offline = Failure { message: "Not connected.".into(), on: None };
+        assert!(offline.retries_on(&first.socket_id()), "failed with no socket: the first one reads");
+        let failed = Failure { message: "closed".into(), on: Some(first.socket_id()) };
+        assert!(!failed.retries_on(&first.socket_id()), "the failure stands on that socket");
+        assert!(failed.retries_on(&second.socket_id()), "a reconnect reads again");
+    }
+
+    #[test]
+    fn a_search_that_found_no_socket_or_failed_runs_again_on_a_new_one() {
+        let (first, second) = (crate::rpc::RpcClient::unopened(), crate::rpc::RpcClient::unopened());
+        let offline = PathSearch { query: "readme".into(), pending: true, ..PathSearch::default() };
+        assert!(offline.retries_on(&first.socket_id()), "typed offline: the first socket searches");
+        let sent = PathSearch { on: Some(first.socket_id()), ..offline };
+        assert!(!sent.retries_on(&first.socket_id()), "in flight on this socket");
+        assert!(sent.retries_on(&second.socket_id()), "its socket closed under it");
+        let failed = PathSearch { pending: false, error: Some("closed".into()), ..sent };
+        assert!(!failed.retries_on(&first.socket_id()), "the failure stands on that socket");
+        assert!(failed.retries_on(&second.socket_id()), "a reconnect searches again");
+        let answered = PathSearch { error: None, ..failed };
+        assert!(!answered.retries_on(&second.socket_id()), "answered searches stay");
+        assert!(!PathSearch::default().retries_on(&second.socket_id()), "no query, no search");
+    }
+
+    #[test]
+    fn files_opened_from_the_tree_are_not_revealed_again() {
+        let mut reveal = Reveal::default();
+        let request = |path: &str, id: u64| (path.to_owned(), id);
+        // A file opened elsewhere is revealed once per request.
+        assert!(reveal.wants(&request("a.rs", 1)));
+        reveal.handled = Some(request("a.rs", 1));
+        assert!(!reveal.wants(&request("a.rs", 1)));
+        // A search result the tree opened stays put, so the search stays open.
+        reveal.from_tree = Some("src/b.rs".into());
+        assert!(!reveal.wants(&request("src/b.rs", 1)));
+        assert!(!reveal.wants(&request("src/b.rs", 1)));
+        // The mark lasts one selection: a later outside one is revealed.
+        reveal.from_tree = Some("src/b.rs".into());
+        assert!(reveal.wants(&request("c.rs", 2)));
+        assert!(reveal.from_tree.is_none());
+    }
+}

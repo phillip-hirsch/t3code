@@ -1,0 +1,2014 @@
+//! The row under a draft's composer (`BranchToolbar.tsx`, `ComposerSurface.ContextStrip`):
+//! the environment chip, the workspace mode and branch pickers, and the
+//! permissions control (`ComposerContextPermissions.tsx`), which the composer
+//! footer reuses for started threads.
+
+use gpui_kit::assets::IconName as Lucide;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::notification::Notification;
+use gpui_kit::component::popover::Popover;
+use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::component::{Disableable as _, Icon, Selectable as _, Sizable as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::{
+    AnyElement, AppContext as _, Context, ElementId, Entity, Focusable as _, FontWeight, InteractiveElement as _,
+    IntoElement, Keystroke, ParentElement as _, ScrollHandle, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Subscription, Task, Window, div, prelude::FluentBuilder as _, px,
+};
+use serde_json::{Value, json};
+
+use super::banners::{Variant, composer_banner, corner_action};
+use super::composer::{control_button, runtime_modes};
+use super::{Target, Workspace};
+use crate::model::ScopedId;
+use crate::new_thread::{self, DraftWorkspace, EnvMode, WorkspaceChoice};
+use crate::theme::Tokens;
+
+/// `formatFilePathForClipboard`: Windows paths copy with backslashes.
+fn clipboard_path(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let windows = path.starts_with("\\\\")
+        || (bytes.len() >= 2
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes.get(2).is_none_or(|c| matches!(c, b'/' | b'\\')));
+    if windows { path.replace('/', "\\") } else { path.to_owned() }
+}
+
+fn with_copy_menu(
+    el: gpui_kit::Stateful<gpui_kit::Div>,
+    text: Option<String>,
+    label: &'static str,
+    toast: &'static str,
+) -> AnyElement {
+    match text {
+        Some(text) => el.context_menu(copy_menu(label, toast, text)).into_any_element(),
+        None => el.into_any_element(),
+    }
+}
+
+/// A one-item context menu that copies `text` and confirms it in a toast
+/// (`showWorkspaceContextMenu`, `handleBranchContextMenu`).
+fn copy_menu(
+    label: &'static str,
+    toast: &'static str,
+    text: String,
+) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+    move |menu, _, _| {
+        let text = text.clone();
+        menu.item(PopupMenuItem::new(label).icon(Icon::new(Lucide::Copy)).on_click(move |_, window, cx| {
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text.clone()));
+            window.push_notification(Notification::success(text.clone()).title(toast), cx);
+        }))
+    }
+}
+
+/// `runtimeModeConfig.ts` descriptions, in `runtime_modes()` order.
+const MODE_DESCRIPTIONS: [&str; 4] = [
+    "Ask before commands and file changes.",
+    "Auto-approve edits, ask before other actions.",
+    "Supported providers approve routine actions; others still ask.",
+    "Allow commands and edits without prompts.",
+];
+
+/// Where the permissions trigger sits: the draft's strip, the footer chip (with or without its
+/// label), the footer's overflow menu, or the model picker's footer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum PermissionsForm {
+    Strip,
+    Chip { label: bool },
+    Overflow,
+    Picker,
+}
+
+/// The draft's workspace: what the controls picked and what they read.
+#[derive(Default)]
+pub(super) struct DraftWorkspaceState {
+    env: Option<SharedString>,
+    project_id: Option<String>,
+    /// The draft the picks belong to; another draft of the project starts without them.
+    draft: Option<super::draft_sessions::DraftId>,
+    pub(super) choice: WorkspaceChoice,
+    default_mode: Option<EnvMode>,
+    start_from_origin_default: bool,
+    /// `vcs.listRefs` for the project's checkout.
+    refs: Option<Value>,
+    /// The socket the defaults and refs were last asked on, and whether that read still runs.
+    read_on: Option<crate::rpc::SocketId>,
+    reading: bool,
+    _load: Option<Task<()>>,
+    branch_open: bool,
+    /// The open branch picker hangs off the details card's branch row, not the strip's.
+    pub(super) branch_in_card: bool,
+    branch_search: Option<Entity<InputState>>,
+    branch_query: String,
+    _branch_search_changes: Option<Subscription>,
+    /// The open picker's `vcs.listRefs` pages for its search (`usePaginatedBranches`).
+    branch_pages: RefSearch,
+    /// The picker row Enter picks (`autoHighlight`); `None` until a search or the arrows set one.
+    branch_highlight: Option<usize>,
+    /// Where the highlighted row last drew, so the keyboard opens its menu below it.
+    branch_highlight_bounds: std::rc::Rc<std::cell::Cell<Option<gpui_kit::Bounds<gpui_kit::Pixels>>>>,
+    branch_scroll: ScrollHandle,
+    /// "Start from remote" in the picker's footer, which Tab reaches from the search.
+    origin_focus: Option<gpui_kit::FocusHandle>,
+    /// The permissions popover that is open, by element id, and the mode it previews.
+    permissions_open: Option<&'static str>,
+    permissions_preview: Option<&'static str>,
+    /// The Workspace menu is open (`composer.workspace` opens it too).
+    env_mode_open: bool,
+    /// The mode the arrows have reached in the open popover (`data-highlighted`).
+    permissions_focus: Option<&'static str>,
+    /// `vcs.listRefs` for an open thread's checkout, by environment and cwd (`persistComposerContextStrip`).
+    thread_refs: Option<(Option<SharedString>, String, Value)>,
+}
+
+impl DraftWorkspaceState {
+    /// Whether these picks are `target`'s: the same draft, in the same project on the same environment.
+    pub(super) fn is_for(&self, target: Option<&Target>) -> bool {
+        matches!(target, Some(Target::Draft { env, project_id, draft })
+            if self.env.as_ref() == Some(env)
+                && self.project_id.as_ref() == Some(project_id)
+                && self.draft.as_ref() == Some(draft))
+    }
+
+    /// The existing worktree `target`'s draft picked (the web draft's `worktreePath`).
+    pub(super) fn existing_worktree(&self, target: Option<&Target>) -> Option<&str> {
+        let path = self.choice.existing_worktree.as_ref()?;
+        self.is_for(target).then_some(path.as_str())
+    }
+
+    /// Whether to read the defaults and refs on `socket`: neither has landed and no read runs, and
+    /// a failure stands until a new socket, as the web's queries rerun when their session changes.
+    fn needs_read(&self, socket: &crate::rpc::SocketId) -> bool {
+        let loaded = self.default_mode.is_some() && self.refs.is_some();
+        !loaded && !self.reading && self.read_on.as_ref() != Some(socket)
+    }
+}
+
+/// The ref pages loaded for the branch picker's search, merged by name like `usePaginatedBranches`.
+#[derive(Default)]
+struct RefSearch {
+    /// The sanitized query the pages answer; empty lists every ref.
+    query: String,
+    pages: Vec<Value>,
+    /// The page in flight, and whether it is a next page.
+    loading: Option<(Task<()>, bool)>,
+}
+
+impl RefSearch {
+    /// The refs of every page in order, a later page's copy of a name replacing the earlier one.
+    fn refs(&self) -> Vec<&Value> {
+        let mut refs: Vec<&Value> = Vec::new();
+        for item in self.pages.iter().filter_map(|page| page["refs"].as_array()).flatten() {
+            match refs.iter_mut().find(|known| known["name"] == item["name"]) {
+                Some(known) => *known = item,
+                None => refs.push(item),
+            }
+        }
+        refs
+    }
+
+    fn next_cursor(&self) -> Option<u64> {
+        self.pages.last().and_then(|page| page["nextCursor"].as_u64())
+    }
+
+    /// `statusText`: the first page loading, a next page loading, or how many refs show.
+    fn status(&self) -> Option<String> {
+        match (&self.loading, self.next_cursor()) {
+            (Some((_, false)), _) if self.pages.is_empty() => Some("Loading refs...".into()),
+            (Some((_, true)), _) => Some("Loading more refs...".into()),
+            (_, Some(_)) => {
+                let total = self.pages.iter().filter_map(|page| page["totalCount"].as_u64()).max().unwrap_or(0);
+                Some(format!("Showing {} of {total} refs", self.refs().len()))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// A started thread's checkout when a branch change began: the change lands on it, wherever
+/// the user went meanwhile (`setThreadBranch`'s captured thread).
+struct ThreadCheckout {
+    thread: ScopedId,
+    worktree: Option<String>,
+    live_sessions: Vec<String>,
+}
+
+/// `resolvePreviousWorktreeSeed` over the threads of `project` (on its environment): the newest
+/// open one in a worktree other than `current`, with its branch.
+fn previous_worktree_seed(
+    threads: &[crate::model::ThreadShell],
+    project: &ScopedId,
+    current: Option<&str>,
+) -> Option<(String, Option<String>)> {
+    threads
+        .iter()
+        .filter(|t| {
+            t.environment_id == project.env
+                && t.project_id == project.id
+                && t.archived_at.is_none()
+                && t.deleted_at.is_none()
+        })
+        .filter_map(|t| {
+            let path = t.worktree_path.as_deref().filter(|path| Some(*path) != current)?;
+            Some((t.updated_at.as_str(), path.to_owned(), t.branch.clone()))
+        })
+        .max_by(|a, b| a.0.cmp(b.0))
+        .map(|(_, path, branch)| (path, branch))
+}
+
+/// One row of the branch picker: "Checkout pull request" for the reference the search names, a
+/// ref, or "Create new ref".
+enum BranchItem {
+    Checkout(String),
+    Ref(Value),
+    Create(String),
+}
+
+/// What the picker's environment lets this client do with refs: `canWriteSourceControl`, and
+/// `canUpdateThreadBranch` (a started thread records its branch through orchestration).
+#[derive(Clone, Copy)]
+struct BranchGrants {
+    write: bool,
+    update: bool,
+}
+
+impl BranchGrants {
+    /// `canChangeThreadBranch`: creating a ref or checking out a pull request.
+    fn change(self) -> bool {
+        self.write && self.update
+    }
+
+    /// A ref row (`BranchPickerRefItem`'s `disabled`): a worktree base or a ref another worktree
+    /// has checked out is only recorded, anything else switches the checkout.
+    fn pick(self, records_only: bool) -> bool {
+        self.update && (self.write || records_only)
+    }
+}
+
+/// `shouldLoadNextBranchPageAfterScroll`'s distance from the end.
+const NEXT_PAGE_DISTANCE: f32 = 96.;
+
+impl Workspace {
+    /// Loads the draft's default workspace mode and refs when the draft or its project changes,
+    /// and again after a reconnect while they are missing.
+    pub(super) fn sync_draft_workspace(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.target.clone() else { return };
+        let Target::Draft { env, project_id, draft } = &target else { return };
+        if !self.draft_workspace.is_for(Some(&target)) {
+            // Reset first, so nothing from the previous draft survives but the picks this draft made;
+            // send.rs resolves the workspace itself when this never loads.
+            self.stash_draft_workspace();
+            self.draft_workspace = DraftWorkspaceState {
+                env: Some(env.clone()),
+                project_id: Some(project_id.clone()),
+                choice: self.drafts.workspace(draft),
+                draft: Some(draft.clone()),
+                ..Default::default()
+            };
+        }
+        let key = crate::model::ScopedId::new(env.clone(), project_id.as_str());
+        let (Some(client), Some(project)) = (self.env_client(env), self.shell.project(&key)) else {
+            return;
+        };
+        if !self.draft_workspace.needs_read(&client.socket_id()) {
+            return;
+        }
+        let has_threads = self.shell.project_has_threads(project);
+        let workspace = DraftWorkspace::new(self.server_info(), project, has_threads);
+        self.draft_workspace.start_from_origin_default = workspace.start_from_origin();
+        self.draft_workspace.read_on = Some(client.socket_id());
+        self.draft_workspace.reading = true;
+        let cwd = project.workspace_root.clone();
+        self.draft_workspace._load = Some(cx.spawn(async move |this, cx| {
+            let mode = workspace.default_mode(&client).await;
+            let refs = new_thread::list_refs(&client, &cwd).await;
+            let _ = this.update(cx, |this, cx| {
+                if !this.draft_workspace.is_for(Some(&target)) {
+                    return;
+                }
+                this.draft_workspace.reading = false;
+                this.draft_workspace.default_mode = Some(mode);
+                match refs {
+                    Ok(refs) => this.draft_workspace.refs = Some(refs),
+                    Err(error) => log::warn!("could not list refs: {error}"),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Hands the open draft's workspace picks to its session, which keeps and saves them.
+    pub(super) fn stash_draft_workspace(&mut self) {
+        let state = &self.draft_workspace;
+        let (Some(env), Some(project_id), Some(draft)) = (&state.env, &state.project_id, &state.draft) else {
+            return;
+        };
+        let project = crate::model::ScopedId::new(env.clone(), project_id.as_str());
+        self.drafts.set_workspace(draft, &project, state.choice.clone());
+    }
+
+    /// The branch picker's combobox keys: Escape closes it, Up and Down highlight, Enter picks.
+    pub(super) fn draft_workspace_key(
+        &mut self,
+        keystroke: &Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.draft_workspace.branch_open && gpui_kit::component::menu::opens_context_menu(keystroke) {
+            return self.open_highlighted_branch_menu(window, cx);
+        }
+        if !self.draft_workspace.branch_open || keystroke.modifiers.modified() {
+            return false;
+        }
+        // Enter and Space on the focused "Start from remote" are that switch's.
+        let on_origin = self.draft_workspace.origin_focus.as_ref().is_some_and(|f| f.is_focused(window));
+        if on_origin && matches!(keystroke.key.as_str(), "enter" | "space") {
+            return false;
+        }
+        match keystroke.key.as_str() {
+            "escape" => {
+                self.draft_workspace.branch_open = false;
+                self.focus_composer(window, cx);
+            }
+            "down" | "up" => {
+                let count = self.branch_items().len();
+                if count == 0 {
+                    return true;
+                }
+                let state = &mut self.draft_workspace;
+                let next = step_highlight(state.branch_highlight, count, keystroke.key == "down");
+                state.branch_highlight = Some(next);
+                state.branch_scroll.scroll_to_item(next);
+                if next + 4 >= count {
+                    self.load_next_branch_page(cx);
+                }
+            }
+            "enter" => {
+                let Some(index) = self.draft_workspace.branch_highlight else { return false };
+                match self.branch_items().into_iter().nth(index) {
+                    Some(BranchItem::Ref(item)) => {
+                        let (_, worktree_base, _) = self.branch_trigger();
+                        if !self.branch_grants().pick(worktree_base || item["worktreePath"].as_str().is_some()) {
+                            return true;
+                        }
+                        let name = item["name"].as_str().unwrap_or_default().to_owned();
+                        self.select_branch(name, window, cx);
+                    }
+                    Some(BranchItem::Create(name)) => self.create_branch(name, cx),
+                    Some(BranchItem::Checkout(reference)) => self.pick_checkout_item(reference, window, cx),
+                    None => return false,
+                }
+            }
+            _ => return false,
+        }
+        cx.notify();
+        true
+    }
+
+    /// The picker's rows: "Checkout pull request" when the search names one and the draft can
+    /// check it out, its loaded refs that match the search, then "Create new ref" when no ref has
+    /// that exact name (`branchPickerItems`, `shouldIncludeBranchPickerItem`).
+    fn branch_items(&self) -> Vec<BranchItem> {
+        let state = &self.draft_workspace;
+        let (_, worktree_base, _) = self.branch_trigger();
+        let refs = state.branch_pages.refs();
+        let query = state.branch_query.to_lowercase();
+        let sanitized = new_thread::sanitize_new_ref_name(&query);
+        let exact = refs.iter().any(|r| r["name"].as_str() == Some(state.branch_pages.query.as_str()));
+        let can_change = self.branch_grants().change();
+        let create = (can_change && !query.is_empty() && !exact && !worktree_base)
+            .then(|| BranchItem::Create(state.branch_query.clone()));
+        let checkout = (can_change && self.can_checkout_pull_request())
+            .then(|| crate::pull_request_checkout::parse_reference(&state.branch_query))
+            .flatten()
+            .map(BranchItem::Checkout);
+        checkout
+            .into_iter()
+            .chain(
+                refs.into_iter()
+                    .filter(|r| {
+                        let name = r["name"].as_str().unwrap_or_default().to_lowercase();
+                        query.is_empty() || name.contains(&query) || name.contains(&sanitized)
+                    })
+                    .map(|r| BranchItem::Ref(r.clone())),
+            )
+            .chain(create)
+            .collect()
+    }
+
+    /// [`BranchGrants`] on the environment of the picker's thread or draft.
+    fn branch_grants(&self) -> BranchGrants {
+        // `permissionAtom` for the `vcs.switchRef` a ref row sends; `vcs.createRef` needs the same.
+        let write = |env: &str| self.env_permits(env, "vcs.switchRef", &json!({"cwd": self.composer_cwd()}));
+        match &self.target {
+            Some(Target::Thread { env, .. }) => BranchGrants { write: write(env), update: self.can_operate(env) },
+            Some(Target::Draft { env, .. }) => BranchGrants { write: write(env), update: true },
+            None => BranchGrants { write: false, update: false },
+        }
+    }
+
+    /// "Checkout pull request" picked: the picker closes, the composer takes focus, and the
+    /// checkout dialog opens on the reference.
+    fn pick_checkout_item(&mut self, reference: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.draft_workspace.branch_open = false;
+        self.focus_composer(window, cx);
+        self.open_pull_request_checkout(Some(reference), window, cx);
+    }
+
+    /// Fetches the picker's first page for its current search, or the next page after the last.
+    fn load_branch_page(&mut self, next: bool, cx: &mut Context<Self>) {
+        let cursor = if next {
+            match (&self.draft_workspace.branch_pages.loading, self.draft_workspace.branch_pages.next_cursor()) {
+                (None, Some(cursor)) => Some(cursor),
+                _ => return,
+            }
+        } else {
+            None
+        };
+        let (Some(client), Some(cwd)) = (self.client(), self.composer_cwd()) else { return };
+        let query = self.draft_workspace.branch_pages.query.clone();
+        let origin = self.target.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let page = new_thread::list_ref_page(&client, &cwd, &query, cursor).await;
+            let _ = this.update(cx, |this, cx| {
+                // The picker's search or its thread or draft moved on while the page loaded.
+                if this.target != origin || this.composer_cwd().as_ref() != Some(&cwd) {
+                    return;
+                }
+                let pages = &mut this.draft_workspace.branch_pages;
+                if pages.query != query {
+                    return;
+                }
+                pages.loading = None;
+                match page {
+                    Ok(page) => {
+                        if cursor.is_none() {
+                            pages.pages.clear();
+                        }
+                        pages.pages.push(page);
+                    }
+                    Err(error) => log::warn!("could not list refs: {error}"),
+                }
+                cx.notify();
+            });
+        });
+        self.draft_workspace.branch_pages.loading = Some((task, next));
+        cx.notify();
+    }
+
+    fn load_next_branch_page(&mut self, cx: &mut Context<Self>) {
+        self.load_branch_page(true, cx);
+    }
+
+    /// The search changed: a new query starts over from its first page.
+    fn search_branches(&mut self, raw: &str, cx: &mut Context<Self>) {
+        let state = &mut self.draft_workspace;
+        state.branch_query = raw.trim().to_owned();
+        state.branch_highlight = (!state.branch_query.is_empty()).then_some(0);
+        state.branch_scroll.scroll_to_item(0);
+        let query = new_thread::sanitize_new_ref_name(raw);
+        if query == state.branch_pages.query {
+            return;
+        }
+        state.branch_pages = RefSearch { query, ..Default::default() };
+        self.load_branch_page(false, cx);
+    }
+
+    pub(super) fn draft_workspace_open_permissions(&mut self, cx: &mut Context<Self>) {
+        self.draft_workspace.permissions_open = Some("strip-permissions");
+        // `focusCheckedPermission`: a shortcut lands on the current mode.
+        let current = self.runtime_mode();
+        let focus = self.permission_options().into_iter().find(|o| o.mode == current && o.enabled()).map(|o| o.mode);
+        self.draft_workspace.permissions_focus = focus;
+        self.draft_workspace.permissions_preview = focus;
+        cx.notify();
+    }
+
+    /// `composer.workspace`: opens the Workspace menu while the draft's strip shows it.
+    pub(super) fn open_workspace_picker(&mut self, cx: &mut Context<Self>) {
+        let shown =
+            matches!(self.target, Some(Target::Draft { .. })) && self.target_project().is_some() && self.is_git_repo();
+        if shown {
+            self.draft_workspace.env_mode_open = true;
+            cx.notify();
+        }
+    }
+
+    fn refresh_refs(&mut self, cx: &mut Context<Self>) {
+        let (Some(client), Some(cwd)) = (self.client(), self.composer_cwd()) else { return };
+        let thread = matches!(self.target, Some(Target::Thread { .. }));
+        let origin = self.target.clone();
+        let environment = self.active_environment().cloned();
+        cx.spawn(async move |this, cx| {
+            let refs = new_thread::list_refs(&client, &cwd).await;
+            let _ = this.update(cx, |this, cx| {
+                let refs = match refs {
+                    Ok(refs) => refs,
+                    Err(error) => {
+                        log::warn!("could not list refs: {error}");
+                        return;
+                    }
+                };
+                if !thread && !this.draft_workspace.is_for(origin.as_ref()) {
+                    return;
+                }
+                // The open picker is still the one these refs were read for.
+                let here = this.target == origin && this.composer_cwd().as_ref() == Some(&cwd);
+                let state = &mut this.draft_workspace;
+                // An open picker without a search or further pages lists the fresh first page.
+                if here
+                    && state.branch_open
+                    && state.branch_pages.query.is_empty()
+                    && state.branch_pages.pages.len() <= 1
+                {
+                    state.branch_pages.pages = vec![refs.clone()];
+                }
+                if thread {
+                    state.thread_refs = Some((environment, cwd, refs));
+                } else {
+                    state.refs = Some(refs);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The refs the branch picker lists: the thread checkout's, or the draft project's.
+    fn refs(&self) -> Option<&Value> {
+        match &self.target {
+            Some(Target::Thread { .. }) => {
+                let (environment, cwd, refs) = self.draft_workspace.thread_refs.as_ref()?;
+                let here = environment.as_ref() == self.active_environment();
+                (here && Some(cwd) == self.composer_cwd().as_ref()).then_some(refs)
+            }
+            _ => self.draft_workspace.refs.as_ref(),
+        }
+    }
+
+    pub(super) fn draft_env_mode(&self) -> EnvMode {
+        let state = &self.draft_workspace;
+        state.choice.mode.or(state.default_mode).unwrap_or(EnvMode::Local)
+    }
+
+    pub(super) fn draft_start_from_origin(&self) -> bool {
+        self.draft_workspace.choice.start_from_origin.unwrap_or(self.draft_workspace.start_from_origin_default)
+    }
+
+    /// The draft launch's `workspaceStrategy`, once the controls have loaded.
+    pub(super) fn draft_launch_strategy(&self) -> Option<Result<Value, String>> {
+        let state = &self.draft_workspace;
+        let mode = state.choice.mode.or(state.default_mode)?;
+        let refs = state.refs.as_ref()?;
+        Some(new_thread::launch_strategy(mode, &state.choice, refs, self.draft_start_from_origin()))
+    }
+
+    /// `isGitRepo` as `ChatView` reads it: the checkout's live status, not its refs reply.
+    pub(super) fn is_git_repo(&self) -> bool {
+        self.vcs.is_repo()
+    }
+
+    /// `name`'s ref from the picker's pages, else the checkout's first page.
+    fn find_ref(&self, name: &str) -> Option<Value> {
+        let named = |r: &&Value| r["name"].as_str() == Some(name);
+        self.draft_workspace
+            .branch_pages
+            .refs()
+            .into_iter()
+            .find(named)
+            .or_else(|| self.ref_list().iter().find(named))
+            .cloned()
+    }
+
+    fn ref_list(&self) -> &[Value] {
+        self.refs().and_then(|r| r.get("refs")).and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default()
+    }
+
+    fn set_env_mode(&mut self, mode: EnvMode, cx: &mut Context<Self>) {
+        // Several models each take a new worktree, whatever the mode (`onEnvModeChange`).
+        if self.model_fanout().is_some() {
+            return;
+        }
+        let choice = &mut self.draft_workspace.choice;
+        choice.mode = Some(mode);
+        choice.existing_worktree = None;
+        choice.branch = None;
+        cx.notify();
+    }
+
+    /// The newest other thread of the draft's project that ran in a worktree.
+    fn previous_worktree(&self) -> Option<(String, Option<String>)> {
+        let Some(Target::Draft { env, project_id, .. }) = &self.target else { return None };
+        let current = self.draft_workspace.existing_worktree(self.target.as_ref());
+        previous_worktree_seed(&self.shell.threads, &ScopedId::new(env.clone(), project_id.as_str()), current)
+    }
+
+    fn pick_previous_worktree(&mut self, path: String, branch: Option<String>, cx: &mut Context<Self>) {
+        self.draft_workspace.choice = WorkspaceChoice {
+            mode: Some(EnvMode::Worktree),
+            branch,
+            existing_worktree: Some(path),
+            start_from_origin: None,
+        };
+        cx.notify();
+    }
+
+    /// `composer.previousWorktree` (`BranchToolbarHandle.usePreviousWorktree`): a draft reuses the
+    /// newest worktree of its project, then the composer takes focus.
+    pub(super) fn use_previous_worktree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((path, branch)) = self.previous_worktree() else { return };
+        self.pick_previous_worktree(path, branch, cx);
+        self.focus_composer(window, cx);
+    }
+
+    /// Worktree mode just records the base; local mode switches the checkout (`vcs.switchRef`).
+    fn select_branch(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let grants = self.branch_grants();
+        if !grants.update {
+            return;
+        }
+        self.draft_workspace.branch_open = false;
+        if let Some(thread) = self.target.as_ref().and_then(Target::thread_key) {
+            self.select_thread_branch(thread, name, cx);
+            self.focus_composer(window, cx);
+            return;
+        }
+        if self.draft_env_mode() == EnvMode::Worktree && self.draft_workspace.choice.existing_worktree.is_none() {
+            self.draft_workspace.choice.branch = Some(name);
+            self.focus_composer(window, cx);
+            cx.notify();
+            return;
+        }
+        let active = self.draft_workspace.existing_worktree(self.target.as_ref()).map(str::to_owned);
+        let Some(selection) = self.branch_selection_target(&name, active.as_deref()) else { return };
+        if selection.reuse_existing_worktree {
+            self.set_draft_worktree(selection.next_worktree_path);
+            self.draft_workspace.choice.branch = Some(name);
+            cx.notify();
+            return;
+        }
+        if !grants.write {
+            return;
+        }
+        let input = json!({"cwd": selection.checkout_cwd, "refName": name});
+        let worktree = selection.next_worktree_path;
+        self.run_ref_command("vcs.switchRef", input, name, worktree, "Failed to switch ref.", cx);
+    }
+
+    /// `resolveBranchSelectionTarget` for the open thread or draft, checked out at `active`, and the ref `name`.
+    fn branch_selection_target(&self, name: &str, active: Option<&str>) -> Option<BranchSelectionTarget> {
+        let project = self.target_project()?;
+        let picked = self.find_ref(name);
+        Some(resolve_branch_selection_target(
+            &project.workspace_root,
+            project.repository_identity.as_ref().and_then(|identity| identity.root_path.as_deref()),
+            active,
+            picked.as_ref().is_some_and(|r| r["isDefault"].as_bool() == Some(true)),
+            picked.as_ref().and_then(|r| r["worktreePath"].as_str()),
+        ))
+    }
+
+    /// `setDraftThreadContext` with a branch change's worktree and the mode it implies.
+    fn set_draft_worktree(&mut self, next: Option<String>) {
+        let mode = self.draft_env_mode();
+        let choice = &mut self.draft_workspace.choice;
+        choice.mode = Some(draft_mode_after_branch_change(next.as_deref(), choice.existing_worktree.as_deref(), mode));
+        choice.existing_worktree = next;
+    }
+
+    /// `setDraftThreadContext` after a git action created `branch` for `draft`.
+    pub(super) fn set_draft_branch(&mut self, draft: &Target, branch: String, cx: &mut Context<Self>) {
+        if self.draft_workspace.is_for(Some(draft)) {
+            self.draft_workspace.choice.branch = Some(branch);
+            cx.notify();
+        }
+    }
+
+    fn create_branch(&mut self, name: String, cx: &mut Context<Self>) {
+        if !self.branch_grants().change() {
+            return;
+        }
+        self.draft_workspace.branch_open = false;
+        let cwd = self.composer_cwd();
+        if let Some(thread) = self.target.as_ref().and_then(Target::thread_key) {
+            let worktree = self.open_projection().and_then(|p| p.thread.worktree_path.clone());
+            let input = json!({"cwd": cwd, "refName": name, "switchRef": true});
+            self.run_thread_ref_command(thread, "vcs.createRef", input, name, worktree, cx);
+            return;
+        }
+        let worktree = self.draft_workspace.existing_worktree(self.target.as_ref()).map(str::to_owned);
+        self.run_ref_command(
+            "vcs.createRef",
+            json!({"cwd": cwd, "refName": name, "switchRef": true}),
+            name,
+            worktree,
+            "Failed to create and switch ref.",
+            cx,
+        );
+    }
+
+    /// Runs a ref command for the draft, which then records the ref and `worktree`.
+    fn run_ref_command(
+        &mut self,
+        method: &'static str,
+        input: Value,
+        name: String,
+        worktree: Option<String>,
+        failure: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(env) = self.target.as_ref().map(Target::environment) else { return };
+        if !self.env_permits(env, method, &input) {
+            return;
+        }
+        let Some(client) = self.env_client(env) else { return };
+        self.draft_workspace.choice.branch = Some(name.clone());
+        let origin = self.target.clone();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = client.request(method, input).await;
+            let _ = this.update(cx, |this, cx| {
+                // The draft moved on while the ref switched.
+                if !this.draft_workspace.is_for(origin.as_ref()) {
+                    return;
+                }
+                match result {
+                    Ok(value) => {
+                        let switched = value.get("refName").and_then(Value::as_str).map(str::to_owned);
+                        this.draft_workspace.choice.branch = Some(switched.unwrap_or(name));
+                        this.set_draft_worktree(worktree);
+                        this.refresh_refs(cx);
+                    }
+                    Err(error) => {
+                        log::warn!("{method} failed: {error}");
+                        this.draft_workspace.choice.branch = None;
+                        this.set_error_from(origin.as_ref(), failure.into());
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn open_branch_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let search = match self.draft_workspace.branch_search.clone() {
+            Some(search) => search,
+            None => {
+                let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search refs..."));
+                self.draft_workspace._branch_search_changes =
+                    Some(cx.subscribe_in(&search, window, |this, search, event, _, cx| {
+                        if let InputEvent::Change = event {
+                            let raw = search.read(cx).value().to_string();
+                            this.search_branches(&raw, cx);
+                            cx.notify();
+                        }
+                    }));
+                self.draft_workspace.branch_search = Some(search.clone());
+                search
+            }
+        };
+        search.update(cx, |search, cx| {
+            search.set_value("", window, cx);
+            search.focus(window, cx);
+        });
+        // The checkout's first page until `refresh_refs` brings a fresh one.
+        let pages = self.refs().cloned().into_iter().collect();
+        let state = &mut self.draft_workspace;
+        if state.origin_focus.is_none() {
+            state.origin_focus = Some(cx.focus_handle().tab_stop(true));
+        }
+        state.branch_query.clear();
+        state.branch_highlight = None;
+        state.branch_open = true;
+        state.branch_pages = RefSearch { pages, ..Default::default() };
+        self.refresh_refs(cx);
+        cx.notify();
+    }
+
+    /// `selectBranch` on a started thread: reuse the worktree that has the ref checked
+    /// out, else switch the thread's checkout (`resolveBranchSelectionTarget`).
+    fn select_thread_branch(&mut self, thread: ScopedId, name: String, cx: &mut Context<Self>) {
+        let active = self.open_projection().and_then(|p| p.thread.worktree_path.clone());
+        let Some(selection) = self.branch_selection_target(&name, active.as_deref()) else { return };
+        if selection.reuse_existing_worktree {
+            if let Some(checkout) = self.thread_checkout(&thread) {
+                self.set_thread_branch(&checkout, &name, selection.next_worktree_path, cx);
+            }
+            return;
+        }
+        if !self.branch_grants().write {
+            return;
+        }
+        let input = json!({"cwd": selection.checkout_cwd, "refName": name});
+        self.run_thread_ref_command(thread, "vcs.switchRef", input, name, selection.next_worktree_path, cx);
+    }
+
+    fn run_thread_ref_command(
+        &mut self,
+        thread: ScopedId,
+        method: &'static str,
+        input: Value,
+        name: String,
+        worktree: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.env_permits(&thread.env, method, &input) {
+            return;
+        }
+        let (Some(client), Some(checkout)) = (self.env_client(&thread.env), self.thread_checkout(&thread)) else {
+            return;
+        };
+        let origin = Some(Target::Thread { env: thread.env, id: thread.id });
+        cx.spawn(async move |this, cx| {
+            let result = client.request(method, input).await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(value) => {
+                        let switched = value.get("refName").and_then(Value::as_str).map(str::to_owned);
+                        this.set_thread_branch(&checkout, &switched.unwrap_or(name), worktree, cx);
+                        this.refresh_refs(cx);
+                    }
+                    Err(error) => {
+                        log::warn!("{method} failed: {error}");
+                        let failure = match method {
+                            "vcs.createRef" => "Failed to create and switch ref.",
+                            _ => "Failed to switch ref.",
+                        };
+                        this.set_error_from(origin.as_ref(), failure.into());
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The open thread's checkout as a branch change starts on it.
+    fn thread_checkout(&self, thread: &ScopedId) -> Option<ThreadCheckout> {
+        let open = self.target.as_ref().and_then(Target::thread_key);
+        let projection = self.open_projection().filter(|_| open.as_ref() == Some(thread))?;
+        let live = projection.provider_sessions.iter().filter(|s| !matches!(s.status.as_str(), "stopped" | "error"));
+        Some(ThreadCheckout {
+            thread: thread.clone(),
+            worktree: projection.thread.worktree_path.clone(),
+            live_sessions: live.map(|s| s.id.clone()).collect(),
+        })
+    }
+
+    /// `setThreadBranch`: a move to another checkout detaches the live provider
+    /// sessions first, then the thread records its branch and worktree, on its own environment.
+    fn set_thread_branch(
+        &mut self,
+        checkout: &ThreadCheckout,
+        branch: &str,
+        worktree: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        // The grant can be lost while the ref switched.
+        if !self.can_operate(&checkout.thread.env) {
+            return;
+        }
+        let Some(client) = self.env_client(&checkout.thread.env) else { return };
+        let thread_id = &checkout.thread.id;
+        let mut commands = Vec::new();
+        if worktree != checkout.worktree {
+            let command_id = super::new_id();
+            for session in &checkout.live_sessions {
+                commands.push(json!({
+                    "type": "provider-session.detach",
+                    "commandId": format!("{command_id}:detach:{session}"),
+                    "threadId": thread_id,
+                    "providerSessionId": session,
+                    "reason": "client-requested",
+                }));
+            }
+        }
+        commands.push(json!({
+            "type": "thread.metadata.update",
+            "commandId": super::new_id(),
+            "threadId": thread_id,
+            "branch": branch,
+            "worktreePath": worktree,
+        }));
+        self.dispatch_in_order(client, commands, cx);
+    }
+
+    /// `shouldShowComposerContextStrip`: always under a draft; under a started thread
+    /// only with `persistComposerContextStrip`, and then without permissions.
+    pub(super) fn render_context_strip(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.target_project()?;
+        if matches!(self.target, Some(Target::Thread { .. })) {
+            return self.render_thread_context_strip(t, cx);
+        }
+        let git = self.is_git_repo();
+        let environment = self.render_host_picker(t, cx);
+        let separated = git && environment.is_some();
+        let mode = self.runtime_mode();
+        let (_, label, icon) = runtime_modes().into_iter().find(|(id, ..)| *id == mode).unwrap_or(runtime_modes()[3]);
+        Some(
+            h_flex()
+                .w_full()
+                .px(px(8.))
+                .pt(px(8.))
+                .gap(px(4.))
+                .text_xs()
+                .text_color(t.muted_foreground)
+                .when(git || environment.is_some(), |el| {
+                    el.child(
+                        h_flex()
+                            .flex_1()
+                            .min_w(px(40.))
+                            .min_h(px(24.))
+                            .gap(px(4.))
+                            .children(environment)
+                            .when(separated, |el| el.child(div().w(px(1.)).h(px(14.)).mx(px(2.)).bg(t.border)))
+                            .when(git, |el| el.child(self.render_env_mode_selector(t, cx))),
+                    )
+                })
+                .when(git, |el| el.child(self.render_branch_selector(t, cx)))
+                .child(div().ml_auto().child(self.render_permissions_control(
+                    "strip-permissions",
+                    icon,
+                    label,
+                    PermissionsForm::Strip,
+                    t,
+                    cx,
+                )))
+                .into_any_element(),
+        )
+    }
+
+    fn render_thread_context_strip(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let git = self.is_git_repo();
+        let persist = self.client_settings.values.bool("persistComposerContextStrip");
+        let environment = self.render_host_picker(t, cx);
+        if !persist || !(git || environment.is_some()) {
+            return None;
+        }
+        let separated = git && environment.is_some();
+        // A started thread keeps its workspace (`resolveLockedWorkspaceLabel`).
+        let worktree = self.git_cwd() != self.target_project().map(|p| p.workspace_root.clone());
+        let (icon, label) = if worktree { (Lucide::FolderGit, "Worktree") } else { (Lucide::Folder, "Local checkout") };
+        // A tab stop, so the keyboard opens its Copy full path menu.
+        let locked = super::chat::focusable(h_flex().id("env-mode-locked"), t)
+            .min_w_0()
+            .h(px(24.))
+            .px(px(7.))
+            .gap(px(6.))
+            .text_color(t.muted_foreground.opacity(0.7))
+            .child(Icon::new(icon).with_size(px(12.)).flex_none())
+            .child(div().max_w(px(240.)).truncate().child(label))
+            .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
+            .map(|el| {
+                with_copy_menu(el, self.composer_cwd().map(|p| clipboard_path(&p)), "Copy full path", "Path copied")
+            });
+        Some(
+            h_flex()
+                .w_full()
+                .px(px(8.))
+                .pt(px(8.))
+                .gap(px(4.))
+                .text_xs()
+                .text_color(t.muted_foreground)
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w(px(40.))
+                        .min_h(px(24.))
+                        .gap(px(4.))
+                        .children(environment)
+                        .when(separated, |el| el.child(div().w(px(1.)).h(px(14.)).mx(px(2.)).bg(t.border)))
+                        .when(git, |el| el.child(locked)),
+                )
+                .when(git, |el| el.child(self.render_branch_selector(t, cx)))
+                .into_any_element(),
+        )
+    }
+
+    /// The draft's workspace choice as the selectors show it (`resolveEnvModeLabel`).
+    pub(super) fn env_mode_choice(&self) -> (Lucide, &'static str) {
+        match (&self.draft_workspace.choice.existing_worktree, self.draft_env_mode()) {
+            (Some(_), _) => (Lucide::FolderGit, "Previous worktree"),
+            (None, EnvMode::Worktree) => (Lucide::FolderGit2, "New worktree"),
+            (None, EnvMode::Local) => (Lucide::Folder, "Current checkout"),
+        }
+    }
+
+    /// The Workspace menu: current checkout, a new worktree, or the previous worktree.
+    pub(super) fn env_mode_menu(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        let (_, label) = self.env_mode_choice();
+        let previous = self.previous_worktree();
+        let view = cx.entity();
+        move |menu, window, _| {
+            let mut menu = menu
+                .label("Workspace")
+                .item(
+                    PopupMenuItem::new("Current checkout")
+                        .icon(Icon::new(Lucide::Folder))
+                        .checked(label == "Current checkout")
+                        .on_click(window.listener_for(&view, |this, _, _, cx| this.set_env_mode(EnvMode::Local, cx))),
+                )
+                .item(
+                    PopupMenuItem::new("New worktree")
+                        .icon(Icon::new(Lucide::FolderGit2))
+                        .checked(label == "New worktree")
+                        .on_click(
+                            window.listener_for(&view, |this, _, _, cx| this.set_env_mode(EnvMode::Worktree, cx)),
+                        ),
+                );
+            if let Some((path, branch)) = previous.clone() {
+                let text = match &branch {
+                    Some(branch) => format!("Previous worktree · {branch}"),
+                    None => "Previous worktree".into(),
+                };
+                menu = menu.item(
+                    PopupMenuItem::new(text)
+                        .icon(Icon::new(Lucide::RotateCcwClock))
+                        .checked(label == "Previous worktree")
+                        .on_click(window.listener_for(&view, move |this, _, _, cx| {
+                            this.pick_previous_worktree(path.clone(), branch.clone(), cx);
+                        })),
+                );
+            }
+            menu
+        }
+    }
+
+    fn render_env_mode_selector(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+        let (icon, label) = self.env_mode_choice();
+        let path = self.composer_cwd();
+        let menu = self.env_mode_menu(cx);
+        let view = cx.entity();
+        let button = strip_button("env-mode", t)
+            .child(Icon::new(icon).with_size(px(12.)))
+            .child(div().max_w(px(240.)).truncate().child(label))
+            .tooltip(match self.shortcut_label("composer.workspace") {
+                Some(keys) => format!("{label} · {keys}"),
+                None => label.to_owned(),
+            })
+            .dropdown_menu_with_anchor(gpui_kit::Anchor::BottomLeft, menu)
+            .open(self.draft_workspace.env_mode_open)
+            .on_open_change(move |open, _, cx| {
+                view.update(cx, |this, cx| {
+                    this.draft_workspace.env_mode_open = *open;
+                    cx.notify();
+                });
+            });
+        let wrap = div().id("env-mode-wrap").min_w_0().child(button);
+        with_copy_menu(wrap, path.map(|p| clipboard_path(&p)), "Copy full path", "Path copied")
+    }
+
+    /// The branch the selectors show, whether it is a new worktree's base, and the trigger
+    /// label (`resolveBranchTriggerLabel`).
+    pub(super) fn branch_trigger(&self) -> (Option<&str>, bool, SharedString) {
+        let state = &self.draft_workspace;
+        let thread = matches!(self.target, Some(Target::Thread { .. }));
+        let worktree_base =
+            !thread && self.draft_env_mode() == EnvMode::Worktree && state.choice.existing_worktree.is_none();
+        let current =
+            self.ref_list().iter().find(|r| r["current"].as_bool() == Some(true)).and_then(|r| r["name"].as_str());
+        let thread_branch = self
+            .open_projection()
+            .and_then(|p| p.thread.branch.as_deref())
+            .or_else(|| self.vcs.status.as_ref().and_then(|s| s.local.ref_name.as_deref()));
+        let branch = match (thread, worktree_base) {
+            (true, _) => thread_branch.or(current),
+            (false, true) => {
+                state.choice.branch.as_deref().or_else(|| state.refs.as_ref().and_then(new_thread::default_base))
+            }
+            (false, false) => state.choice.branch.as_deref().or(current),
+        };
+        let is_remote = branch
+            .and_then(|b| self.ref_list().iter().find(|r| r["name"].as_str() == Some(b)))
+            .map(|r| r["isRemote"].as_bool() == Some(true));
+        let label: SharedString = match (branch, worktree_base) {
+            (None, _) => "Select ref".into(),
+            (Some(b), true) if self.draft_start_from_origin() && is_remote == Some(false) => {
+                format!("From {b} (remote)").into()
+            }
+            (Some(b), true) => format!("From {b}").into(),
+            (Some(b), false) => b.to_owned().into(),
+        };
+        (branch, worktree_base, label)
+    }
+
+    /// Whether the branch picker can open: a draft waits for its refs.
+    pub(super) fn branch_picker_ready(&self) -> bool {
+        matches!(self.target, Some(Target::Thread { .. })) || self.draft_workspace.refs.is_some()
+    }
+
+    /// The branch picker as a popover on `trigger`; `in_card` places it under the details card's row.
+    pub(super) fn branch_popover<T: gpui_kit::component::Selectable + IntoElement + 'static>(
+        &self,
+        id: &'static str,
+        trigger: T,
+        in_card: bool,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> Popover {
+        let state = &self.draft_workspace;
+        let open = state.branch_open && state.branch_in_card == in_card;
+        let (branch, worktree_base, _) = self.branch_trigger();
+        let view = cx.entity();
+        let mut popover = Popover::new(id)
+            .anchor(if in_card { gpui_kit::Anchor::TopLeft } else { gpui_kit::Anchor::BottomRight })
+            .open(open)
+            .on_open_change(move |open, window, cx| {
+                view.update(cx, |this, cx| {
+                    if *open {
+                        this.draft_workspace.branch_in_card = in_card;
+                        this.open_branch_picker(window, cx);
+                    } else {
+                        this.draft_workspace.branch_open = false;
+                        cx.notify();
+                    }
+                });
+            })
+            .trigger(trigger)
+            .p_0()
+            .rounded(px(8.));
+        if let Some(search) = &state.branch_search {
+            popover = popover.track_focus(&search.focus_handle(cx));
+        }
+        if open {
+            popover = popover.child(self.render_branch_popover(branch, worktree_base, t, cx));
+        }
+        popover
+    }
+
+    fn render_branch_selector(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+        let state = &self.draft_workspace;
+        let (branch, _, label) = self.branch_trigger();
+        let trigger = strip_button("branch-selector", t)
+            .disabled(!self.branch_picker_ready())
+            .selected(state.branch_open && !state.branch_in_card)
+            .child(Icon::new(Lucide::GitBranch).with_size(px(12.)))
+            .child(div().max_w(px(240.)).truncate().child(label));
+        let popover = self.branch_popover("branch-popover", trigger, false, t, cx);
+        let wrap = div().id("branch-selector-wrap").min_w_0().child(popover);
+        let selector = with_copy_menu(wrap, branch.map(str::to_owned), "Copy branch name", "Branch name copied");
+        match self.render_composer_pull_request_badge(branch, cx) {
+            Some(badge) => h_flex().min_w_0().gap(px(4.)).child(badge).child(selector).into_any_element(),
+            None => selector,
+        }
+    }
+
+    /// The menu key or Shift+F10 in the picker: the highlighted ref's Copy branch name menu,
+    /// below its row, as a right click on it opens.
+    fn open_highlighted_branch_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let state = &self.draft_workspace;
+        let (Some(index), Some(bounds)) = (state.branch_highlight, state.branch_highlight_bounds.get()) else {
+            return false;
+        };
+        let Some(BranchItem::Ref(item)) = self.branch_items().into_iter().nth(index) else { return false };
+        let name = item["name"].as_str().unwrap_or_default().to_owned();
+        let menu = copy_menu("Copy branch name", "Branch name copied", name);
+        self.open_chat_menu(None, bounds.bottom_left(), window, cx, menu);
+        true
+    }
+
+    fn render_branch_popover(
+        &self,
+        selected: Option<&str>,
+        worktree_base: bool,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let items = self.branch_items();
+        let grants = self.branch_grants();
+        let highlight = self.draft_workspace.branch_highlight;
+        let highlight_bounds = self.draft_workspace.branch_highlight_bounds.clone();
+        let empty = items.is_empty();
+        let rows = items.into_iter().enumerate().map(|(index, item)| {
+            let highlighted = highlight == Some(index);
+            let hover = cx.listener(move |this, _: &gpui_kit::MouseMoveEvent, _, cx| {
+                if this.draft_workspace.branch_highlight != Some(index) {
+                    this.draft_workspace.branch_highlight = Some(index);
+                    cx.notify();
+                }
+            });
+            let r = match item {
+                BranchItem::Ref(r) => r,
+                BranchItem::Checkout(reference) => {
+                    let row = self.render_checkout_branch_item(&reference, highlighted, t);
+                    return row
+                        .on_mouse_move(hover)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.pick_checkout_item(reference.clone(), window, cx);
+                        }))
+                        .into_any_element();
+                }
+                BranchItem::Create(name) => {
+                    let label = format!("Create new ref \"{name}\"");
+                    return div()
+                        .id("create-ref")
+                        .h(px(28.))
+                        .flex_none()
+                        .px(px(8.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(4.))
+                        .text_sm()
+                        .cursor_pointer()
+                        .when(highlighted, |el| el.bg(t.foreground.opacity(0.09)))
+                        .on_mouse_move(hover)
+                        .child(label)
+                        .on_click(cx.listener(move |this, _, _, cx| this.create_branch(name.clone(), cx)))
+                        .into_any_element();
+                }
+            };
+            let name = r["name"].as_str().unwrap_or_default().to_owned();
+            let badge = if r["current"].as_bool() == Some(true) {
+                Some("current")
+            } else if r["worktreePath"].as_str().is_some() {
+                Some("worktree")
+            } else if r["isRemote"].as_bool() == Some(true) {
+                Some("remote")
+            } else if r["isDefault"].as_bool() == Some(true) {
+                Some("default")
+            } else {
+                None
+            };
+            let checked = selected == Some(name.as_str());
+            let enabled = grants.pick(worktree_base || r["worktreePath"].as_str().is_some());
+            let pick = name.clone();
+            let copy = name.clone();
+            h_flex()
+                .id(ElementId::Name(format!("ref-{name}").into()))
+                .h(px(28.))
+                .flex_none()
+                .px(px(8.))
+                .gap(px(8.))
+                .rounded(px(4.))
+                .text_sm()
+                .when(enabled, gpui_kit::Styled::cursor_pointer)
+                .when(!enabled, |el| el.opacity(0.64))
+                .when(checked, |el| el.bg(t.foreground.opacity(0.08)))
+                .when(highlighted, |el| el.bg(t.foreground.opacity(0.09)))
+                .on_mouse_move(hover)
+                .child(div().flex_1().min_w_0().truncate().text_color(t.foreground).child(name))
+                .children(badge.map(|badge| {
+                    div()
+                        .px(px(4.))
+                        .rounded(px(4.))
+                        .bg(t.muted.opacity(0.45))
+                        .text_size(px(10.))
+                        .text_color(t.muted_foreground)
+                        .child(badge)
+                }))
+                .when(enabled, |el| {
+                    el.on_click(cx.listener(move |this, _, window, cx| this.select_branch(pick.clone(), window, cx)))
+                })
+                .when(highlighted, |el| {
+                    let measured = highlight_bounds.clone();
+                    el.child(
+                        gpui_kit::canvas(move |bounds, _, _| measured.set(Some(bounds)), |_, (), _, _| {})
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full(),
+                    )
+                })
+                .context_menu(copy_menu("Copy branch name", "Branch name copied", copy))
+                .into_any_element()
+        });
+        let rows: Vec<AnyElement> = rows.collect();
+        let start_from_origin = self.draft_start_from_origin();
+        v_flex()
+            .id("branch-popover-body")
+            .w(px(320.))
+            .bg(t.popover)
+            .child(div().px(px(12.)).pt(px(10.)).pb(px(6.)).border_b_1().border_color(t.border).children(
+                self.draft_workspace.branch_search.clone().map(|search| {
+                    div().child(Input::new(&search).appearance(false).small().text_sm())
+                }),
+            ))
+            .child(
+                v_flex()
+                    .id("branch-list")
+                    .track_scroll(&self.draft_workspace.branch_scroll)
+                    .max_h(px(224.))
+                    .overflow_y_scroll()
+                    .py(px(8.))
+                    .px(px(4.))
+                    .on_scroll(cx.listener(|_, _: &gpui_kit::ScrollEvent, window, cx| {
+                        // After the list applies the scroll (`maybeFetchNextBranchPage`).
+                        cx.defer_in(window, |this, _, cx| {
+                            let scroll = &this.draft_workspace.branch_scroll;
+                            if f32::from(scroll.max_offset().y + scroll.offset().y) <= NEXT_PAGE_DISTANCE {
+                                this.load_next_branch_page(cx);
+                            }
+                        });
+                    }))
+                    .when(empty, |el| {
+                        el.child(div().p(px(8.)).text_sm().text_color(t.muted_foreground).child("No refs found."))
+                    })
+                    .children(rows),
+            )
+            .children(self.draft_workspace.branch_pages.status().map(|status| {
+                div()
+                    .px(px(12.))
+                    .py(px(8.))
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(t.muted_foreground)
+                    .child(status)
+            }))
+            .when(worktree_base, |el| {
+                el.child(
+                    h_flex()
+                        .id("start-from-remote")
+                        .when_some(self.draft_workspace.origin_focus.as_ref(), |el, focus| {
+                            let ring = gpui_kit::BoxShadow::new(px(0.), px(0.), t.ring).spread_radius(px(1.)).inset();
+                            el.track_focus(focus).focus_visible(move |s| s.shadow(vec![ring]))
+                        })
+                        .px(px(12.))
+                        .py(px(8.))
+                        .gap(px(6.))
+                        .border_t_1()
+                        .border_color(t.border.opacity(0.6))
+                        .text_xs()
+                        .cursor_pointer()
+                        .child(Icon::new(Lucide::RefreshCw).with_size(px(12.)))
+                        .child(div().flex_1().child("Start from remote"))
+                        .child(mini_switch(start_from_origin, t))
+                        .tooltip(|window, cx| {
+                            Tooltip::new("Uses the latest commit of the base branch’s tracked remote branch, even if its name differs. Otherwise uses the same-named branch on origin. Uses your local branch if that remote branch is missing.").build(window, cx)
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.draft_workspace.choice.start_from_origin = Some(!start_from_origin);
+                            cx.notify();
+                        })),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// The permissions trigger and its popover (`ComposerPermissionsSection`), in `form`.
+    pub(super) fn render_permissions_control(
+        &self,
+        id: &'static str,
+        icon: Lucide,
+        label: &'static str,
+        form: PermissionsForm,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let open = self.draft_workspace.permissions_open == Some(id);
+        let trigger = match form {
+            PermissionsForm::Strip | PermissionsForm::Picker => {
+                let picker = form == PermissionsForm::Picker;
+                strip_button(id, t)
+                    .when(picker, |b| b.h(px(28.)).px(px(8.)).rounded(px(6.)))
+                    .selected(open)
+                    .child(Icon::new(icon).with_size(px(if picker { 14. } else { 12. })))
+                    .child(div().max_w(px(240.)).truncate().child(label))
+                    .when(picker, |b| b.child(Icon::new(Lucide::ChevronUp).with_size(px(12.))))
+                    .when(!picker, |b| {
+                        b.tooltip(match self.shortcut_label("composer.mode") {
+                            Some(keys) => format!("Permissions · {keys}"),
+                            None => "Permissions".to_owned(),
+                        })
+                    })
+            }
+            // `ComposerFooterModeControls`' chip (`ps-1.5`); it shows only off the default, so its
+            // icon takes the label colour (`emphasized`).
+            PermissionsForm::Chip { label: labelled } => {
+                let description =
+                    runtime_modes().iter().position(|(_, l, _)| *l == label).map_or("", |i| MODE_DESCRIPTIONS[i]);
+                control_button(id, t)
+                    .pl(px(6.))
+                    .selected(open)
+                    .child(
+                        h_flex()
+                            .gap(px(6.))
+                            .child(Icon::new(icon).with_size(px(16.)))
+                            .when(labelled, |row| row.child(label)),
+                    )
+                    .tooltip(format!("Permissions: {label}. {description}"))
+            }
+            // `CompactComposerControlsMenu`'s "More composer controls" trigger.
+            PermissionsForm::Overflow => control_button(id, t)
+                .selected(open)
+                .child(Icon::new(Lucide::Ellipsis).with_size(px(16.)).text_color(t.muted_foreground))
+                .tooltip("More composer controls"),
+        };
+        let view = cx.entity();
+        let mut popover = Popover::new(SharedString::from(format!("{id}-popover")))
+            .anchor(gpui_kit::Anchor::BottomRight)
+            .open(open)
+            .on_open_change(move |open, _, cx| {
+                view.update(cx, |this, cx| {
+                    this.draft_workspace.permissions_open = open.then_some(id);
+                    this.draft_workspace.permissions_preview = None;
+                    this.draft_workspace.permissions_focus = None;
+                    cx.notify();
+                });
+            })
+            .trigger(trigger)
+            .p_0()
+            .rounded(px(8.));
+        if open {
+            popover = popover.child(self.render_permissions_section(t, cx));
+        }
+        popover.into_any_element()
+    }
+
+    /// The four modes with what the composer's provider runs and the administrator allows.
+    fn permission_options(&self) -> Vec<PermissionOption> {
+        let supported = self
+            .composer_model()
+            .and_then(|s| self.server_info().provider(&s.instance_id))
+            .map(|p| p.supported_runtime_modes.clone())
+            .unwrap_or_default();
+        let policy = &self.server_info().managed_policy;
+        runtime_modes()
+            .into_iter()
+            .zip(MODE_DESCRIPTIONS)
+            .map(|((mode, label, icon), description)| PermissionOption {
+                mode,
+                label,
+                icon,
+                description,
+                supported: supported.is_empty() || supported.iter().any(|m| m == mode),
+                denial: runtime_mode_denial(policy, mode),
+            })
+            .collect()
+    }
+
+    /// `runtimeModeCeilingDenial`: the thread's mode (`resolveCompatibleRuntimeMode`) is above the
+    /// administrator's ceiling, so a send would be refused; with the broadest mode left to switch to.
+    pub(super) fn runtime_mode_ceiling(&self) -> Option<(String, Option<&'static str>)> {
+        let options = self.permission_options();
+        let modes: Vec<&'static str> = options.iter().filter(|o| o.supported).map(|o| o.mode).collect();
+        let current = self.runtime_mode();
+        let mode = modes.iter().find(|m| **m == current).or(modes.first()).copied().unwrap_or(current.as_str());
+        let policy = &self.server_info().managed_policy;
+        let denial = runtime_mode_denial(policy, mode)?;
+        Some((denial, runtime_mode_fallback(policy, &modes)))
+    }
+
+    /// The `managed-runtime-mode` banner: why sending is refused, and the switch down.
+    pub(super) fn render_runtime_mode_ceiling_banner(
+        &self,
+        joined: bool,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if self.question.is_some() {
+            return None;
+        }
+        let (denial, fallback) = self.runtime_mode_ceiling()?;
+        let actions = fallback.map(|mode| {
+            let label = runtime_modes().iter().find(|(id, ..)| *id == mode).map_or(mode, |(_, label, _)| label);
+            let switch = Button::new("runtime-mode-ceiling-switch")
+                .ghost()
+                .xsmall()
+                .label(format!("Switch to {label}"))
+                .on_click(cx.listener(move |this, _, _, cx| this.set_runtime_mode(mode, cx)));
+            corner_action(switch, joined).into_any_element()
+        });
+        Some(composer_banner(Variant::Warning, Icon::new(Lucide::Building), denial, None, actions, joined, t))
+    }
+
+    /// The open permissions popover's keys (`ComposerPermissionsSection`'s radio items): the
+    /// arrows move between the modes it allows, Enter and Space pick one, Escape closes it.
+    pub(super) fn permissions_key(
+        &mut self,
+        keystroke: &Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.draft_workspace.permissions_open.is_none() || keystroke.modifiers.modified() {
+            return false;
+        }
+        let enabled: Vec<&'static str> =
+            self.permission_options().into_iter().filter(PermissionOption::enabled).map(|o| o.mode).collect();
+        let state = &mut self.draft_workspace;
+        match keystroke.key.as_str() {
+            "escape" => {
+                state.permissions_open = None;
+                state.permissions_focus = None;
+                state.permissions_preview = None;
+                self.focus_composer(window, cx);
+            }
+            key @ ("left" | "right" | "up" | "down") => {
+                state.permissions_focus = step_permission(&enabled, state.permissions_focus, key);
+                state.permissions_preview = state.permissions_focus;
+            }
+            "enter" | "space" => {
+                let Some(mode) = state.permissions_focus.filter(|mode| enabled.contains(mode)) else { return false };
+                self.pick_permission(mode, window, cx);
+            }
+            _ => return false,
+        }
+        cx.notify();
+        true
+    }
+
+    fn pick_permission(&mut self, mode: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let state = &mut self.draft_workspace;
+        state.permissions_open = None;
+        state.permissions_focus = None;
+        state.permissions_preview = None;
+        self.set_runtime_mode(mode, cx);
+        self.focus_composer(window, cx);
+    }
+
+    fn render_permissions_section(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+        let current = self.runtime_mode();
+        let options = self.permission_options();
+        let focus = self.draft_workspace.permissions_focus;
+        let shown = self.draft_workspace.permissions_preview.map_or_else(|| current.clone(), str::to_owned);
+        let shown_option = options.iter().find(|o| o.mode == shown).unwrap_or(&options[0]);
+        let shown_label = shown_option.label;
+        let shown_description: SharedString =
+            shown_option.denial.clone().map_or(shown_option.description.into(), SharedString::from);
+        let count = options.len();
+        let segments = options.iter().enumerate().map(|(i, option)| {
+            let PermissionOption { mode, label, icon, .. } = *option;
+            let checked = mode == current;
+            let enabled = option.enabled();
+            let highlighted = focus == Some(mode);
+            h_flex()
+                .id(ElementId::Name(format!("mode-{mode}").into()))
+                .flex_1()
+                .h(px(24.))
+                .justify_center()
+                .when(i == 0, |el| el.rounded_l(px(6.)))
+                .when(i + 1 == count, |el| el.rounded_r(px(6.)))
+                .text_color(if checked || highlighted { t.foreground } else { t.muted_foreground })
+                .when(checked, |el| el.bg(t.input.opacity(0.72)))
+                .when(highlighted && !checked, |el| el.bg(t.accent))
+                // `focus-visible:ring-2 ring-ring ring-inset`.
+                .when(highlighted, |el| el.border_2().border_color(t.ring))
+                .when(!enabled, |el| el.opacity(0.4).cursor_not_allowed())
+                .when(enabled && !checked, |el| el.cursor_pointer().hover(|s| s.bg(t.accent).text_color(t.foreground)))
+                .child(Icon::new(icon).with_size(px(14.)))
+                .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    let preview = hovered.then_some(mode);
+                    if this.draft_workspace.permissions_preview != preview {
+                        this.draft_workspace.permissions_preview = preview;
+                        cx.notify();
+                    }
+                }))
+                .when(enabled, |el| {
+                    el.on_click(cx.listener(move |this, _, window, cx| this.pick_permission(mode, window, cx)))
+                })
+        });
+        v_flex()
+            .w(px(288.))
+            .gap(px(6.))
+            .px(px(8.))
+            .py(px(6.))
+            .bg(t.popover)
+            .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(t.muted_foreground).child("Permissions"))
+            .child(h_flex().p(px(2.)).rounded(px(8.)).bg(t.input.opacity(0.4)).children(segments))
+            .child(
+                v_flex()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(if shown == current { t.foreground } else { t.muted_foreground })
+                            .child(shown_label),
+                    )
+                    .child(
+                        div()
+                            .min_h(px(32.))
+                            .text_xs()
+                            .line_height(px(16.))
+                            .text_color(t.muted_foreground)
+                            .child(shown_description),
+                    ),
+            )
+            .into_any_element()
+    }
+}
+
+/// `workspaceRelativeFilePath(path, root)`: `path` relative to `root`, `"."` for the root itself,
+/// `None` outside it. Windows and UNC roots compare case-insensitively, POSIX roots do not.
+pub(super) fn workspace_relative_file_path(path: &str, root: &str) -> Option<String> {
+    if root.is_empty() {
+        return None;
+    }
+    let is_drive = |p: &str| {
+        let p = p.as_bytes();
+        p.len() >= 2 && p[0].is_ascii_alphabetic() && p[1] == b':' && p.get(2).is_none_or(|c| matches!(c, b'/' | b'\\'))
+    };
+    let strip_slash_drive = |p: &str| -> String {
+        let b = p.as_bytes();
+        let prefixed = b.len() >= 4 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':';
+        if prefixed && matches!(b[3], b'/' | b'\\') { p[1..].to_owned() } else { p.to_owned() }
+    };
+    let is_unc = |p: &str| p.starts_with("\\\\");
+    let is_network = |p: &str| p.len() >= 2 && p.as_bytes()[..2].iter().all(|c| matches!(c, b'/' | b'\\'));
+    let stripped_root = strip_slash_drive(root);
+    let case_insensitive = is_unc(&stripped_root) || is_drive(&stripped_root) || (is_network(root) && is_unc(path));
+    let (path, root) = if case_insensitive {
+        (strip_slash_drive(&path.replace('\\', "/")), strip_slash_drive(&root.replace('\\', "/")))
+    } else {
+        (path.to_owned(), root.to_owned())
+    };
+    let root = root.trim_end_matches('/');
+    let fold = |p: &str| if case_insensitive { p.to_lowercase() } else { p.to_owned() };
+    let (path_key, root_key) = (fold(&path), fold(root));
+    if path_key.trim_end_matches('/') == root_key {
+        return Some(".".into());
+    }
+    if !path_key.starts_with(&format!("{root_key}/")) {
+        return None;
+    }
+    let relative = path.get(root.len() + 1..)?;
+    // `/repo/../x` starts with the root but escapes it.
+    let mut depth = 0_usize;
+    for segment in relative.split('/') {
+        match segment {
+            ".." => depth = depth.checked_sub(1)?,
+            "" | "." => {}
+            _ => depth += 1,
+        }
+    }
+    Some(relative.to_owned())
+}
+
+/// `resolveDraftEnvModeAfterBranchChange`: a draft moved to a worktree runs there; one moved back
+/// to the main checkout runs locally.
+fn draft_mode_after_branch_change(next: Option<&str>, current: Option<&str>, mode: EnvMode) -> EnvMode {
+    if next.is_some() || (mode == EnvMode::Worktree && current.is_none()) { EnvMode::Worktree } else { EnvMode::Local }
+}
+
+/// Where a picked ref is checked out, and the worktree the thread records (`resolveBranchSelectionTarget`).
+#[derive(Debug, PartialEq, Eq)]
+struct BranchSelectionTarget {
+    checkout_cwd: String,
+    next_worktree_path: Option<String>,
+    reuse_existing_worktree: bool,
+}
+
+fn resolve_branch_selection_target(
+    project_cwd: &str,
+    project_checkout_root: Option<&str>,
+    active_worktree_path: Option<&str>,
+    is_default: bool,
+    ref_worktree_path: Option<&str>,
+) -> BranchSelectionTarget {
+    if let Some(path) = ref_worktree_path {
+        // Until the project's checkout root loads, a checkout containing the project counts as its own.
+        let is_project_checkout = match project_checkout_root {
+            None => workspace_relative_file_path(project_cwd, path).is_some(),
+            Some(root) => workspace_relative_file_path(root, path).as_deref() == Some("."),
+        };
+        return BranchSelectionTarget {
+            checkout_cwd: path.to_owned(),
+            next_worktree_path: (!is_project_checkout).then(|| path.to_owned()),
+            reuse_existing_worktree: true,
+        };
+    }
+    let next = active_worktree_path.filter(|_| !is_default).map(str::to_owned);
+    BranchSelectionTarget {
+        checkout_cwd: next.clone().unwrap_or_else(|| project_cwd.to_owned()),
+        next_worktree_path: next,
+        reuse_existing_worktree: false,
+    }
+}
+
+/// `ComposerControl size="xs"`: `h-7 text-sm sm:h-6 sm:text-xs`, 7px padding, 6px gap, muted
+/// until hovered.
+pub(super) fn strip_button(id: &'static str, t: &Tokens) -> Button {
+    let button =
+        Button::new(id).ghost().xsmall().h(px(t.breakpoint.pick(28., 24.))).px(px(7.)).gap(px(6.)).rounded(px(8.));
+    let button = match t.breakpoint {
+        crate::theme::Breakpoint::Base => button.text_sm(),
+        crate::theme::Breakpoint::Sm => button.text_xs(),
+    };
+    button.font_weight(FontWeight::NORMAL).text_color(t.muted_foreground)
+}
+
+fn mini_switch(on: bool, t: &Tokens) -> impl IntoElement {
+    div()
+        .w(px(22.))
+        .h(px(12.))
+        .p(px(2.))
+        .rounded_full()
+        .flex()
+        .when(on, |el| el.justify_end().bg(t.primary))
+        .when(!on, |el| el.bg(t.input))
+        .child(div().size(px(8.)).rounded_full().bg(if on { t.primary_foreground } else { t.muted_foreground }))
+}
+
+/// One permissions segment (`resolveRuntimeModeOptions`).
+struct PermissionOption {
+    mode: &'static str,
+    label: &'static str,
+    icon: Lucide,
+    description: &'static str,
+    /// The composer's provider runs it.
+    supported: bool,
+    /// Why an administrator's ceiling rules it out.
+    denial: Option<String>,
+}
+
+impl PermissionOption {
+    fn enabled(&self) -> bool {
+        self.supported && self.denial.is_none()
+    }
+}
+
+/// `managedRuntimeModeDenial`: why `policy`'s ceiling rules `mode` out, as
+/// "Example Corp limits threads to Auto-accept edits."
+fn runtime_mode_denial(policy: &Value, mode: &str) -> Option<String> {
+    let organization = policy["organization"].as_str()?;
+    let ceiling = policy.pointer("/limits/maxRuntimeMode")?.as_str()?;
+    let rank = |mode: &str| runtime_modes().iter().position(|(id, ..)| *id == mode);
+    let (_, label, _) = runtime_modes()[rank(ceiling)?];
+    (rank(mode)? > rank(ceiling)?).then(|| format!("{organization} limits threads to {label}."))
+}
+
+/// `clampManagedRuntimeMode`'s fallback: the broadest of `modes` (narrowest first) the policy allows.
+fn runtime_mode_fallback<'a>(policy: &Value, modes: &[&'a str]) -> Option<&'a str> {
+    modes.iter().rev().copied().find(|mode| runtime_mode_denial(policy, mode).is_none())
+}
+
+/// The permissions menu's arrows over its enabled `modes`: Left and Right stop at the ends,
+/// Up and Down wrap; from no highlight they start at the first or last.
+fn step_permission(modes: &[&'static str], focus: Option<&str>, key: &str) -> Option<&'static str> {
+    let last = modes.len().checked_sub(1)?;
+    let next = match (modes.iter().position(|mode| Some(*mode) == focus), key) {
+        (None, "down" | "right") => 0,
+        (None, _) => last,
+        (Some(i), "right") => (i + 1).min(last),
+        (Some(i), "left") => i.saturating_sub(1),
+        (Some(i), "down") => (i + 1) % modes.len(),
+        (Some(i), _) => i.checked_sub(1).unwrap_or(last),
+    };
+    Some(modes[next])
+}
+
+/// `Combobox` arrows: the first or last row from none, wrapping at either end.
+fn step_highlight(current: Option<usize>, count: usize, down: bool) -> usize {
+    match (down, current) {
+        (true, None) => 0,
+        (true, Some(i)) => (i + 1) % count,
+        (false, None | Some(0)) => count - 1,
+        (false, Some(i)) => (i - 1).min(count - 1),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::Target;
+    use super::super::draft_sessions::DraftId;
+    use super::{
+        BranchGrants, BranchSelectionTarget, DraftWorkspaceState, RefSearch, clipboard_path,
+        draft_mode_after_branch_change, previous_worktree_seed, resolve_branch_selection_target, runtime_mode_denial,
+        runtime_mode_fallback, step_highlight, step_permission,
+    };
+    use crate::model::ScopedId;
+    use crate::new_thread::EnvMode;
+    use serde_json::json;
+
+    #[test]
+    fn a_draft_leaving_its_worktree_runs_locally() {
+        let worktree = Some("/repo/.t3/worktrees/feature-a");
+        assert_eq!(draft_mode_after_branch_change(None, worktree, EnvMode::Worktree), EnvMode::Local);
+        assert_eq!(draft_mode_after_branch_change(worktree, None, EnvMode::Local), EnvMode::Worktree);
+        assert_eq!(
+            draft_mode_after_branch_change(None, None, EnvMode::Worktree),
+            EnvMode::Worktree,
+            "a new worktree's base"
+        );
+        assert_eq!(draft_mode_after_branch_change(None, None, EnvMode::Local), EnvMode::Local);
+    }
+
+    fn target(checkout_cwd: &str, next_worktree_path: Option<&str>, reuse: bool) -> BranchSelectionTarget {
+        BranchSelectionTarget {
+            checkout_cwd: checkout_cwd.into(),
+            next_worktree_path: next_worktree_path.map(Into::into),
+            reuse_existing_worktree: reuse,
+        }
+    }
+
+    #[test]
+    fn a_ref_in_another_worktree_reuses_it() {
+        assert_eq!(
+            resolve_branch_selection_target(
+                "/repo/nested-checkout/packages/app",
+                Some("/repo/nested-checkout"),
+                None,
+                true,
+                Some("/repo"),
+            ),
+            target("/repo", Some("/repo"), true),
+        );
+        let feature_b = "/repo/.t3/worktrees/feature-b";
+        assert_eq!(
+            resolve_branch_selection_target(
+                "/repo",
+                None,
+                Some("/repo/.t3/worktrees/feature-a"),
+                false,
+                Some(feature_b)
+            ),
+            target(feature_b, Some(feature_b), true),
+        );
+        // regression: a worktree nested under the project is not the project's own checkout
+        for root in [None, Some("/repo")] {
+            assert_eq!(
+                resolve_branch_selection_target("/repo", root, None, false, Some("/repo/.worktrees/feature")),
+                target("/repo/.worktrees/feature", Some("/repo/.worktrees/feature"), true),
+            );
+        }
+    }
+
+    #[test]
+    fn a_ref_in_the_projects_own_checkout_switches_back_to_it() {
+        // A subdirectory project's own checkout is reported at the repository root; the
+        // checkout root is unknown until the project's status loads.
+        for (project_cwd, active, root) in [
+            ("/repo", Some("/repo/.t3/worktrees/feature-a"), Some("/repo")),
+            ("/repo/packages/app", Some("/repo/.t3/worktrees/feature-a"), Some("/repo")),
+            ("/repo/packages/app", None, Some("/repo")),
+            ("/repo/packages/app", Some("/repo/.t3/worktrees/feature-a"), None),
+            ("/repo/packages/app", None, None),
+        ] {
+            assert_eq!(
+                resolve_branch_selection_target(project_cwd, root, active, true, Some("/repo")),
+                target("/repo", None, true),
+            );
+        }
+        // Windows paths compare without case or separator differences.
+        assert_eq!(
+            resolve_branch_selection_target("C:\\Repo\\app", Some("C:\\Repo"), None, true, Some("c:/repo")),
+            target("c:/repo", None, true),
+        );
+    }
+
+    #[test]
+    fn a_ref_without_a_worktree_switches_in_the_current_checkout() {
+        let feature_a = "/repo/.t3/worktrees/feature-a";
+        assert_eq!(
+            resolve_branch_selection_target("/repo", None, Some(feature_a), false, None),
+            target(feature_a, Some(feature_a), false),
+        );
+        assert_eq!(
+            resolve_branch_selection_target("/repo", None, Some(feature_a), true, None),
+            target("/repo", None, false),
+            "the default ref returns to the project's checkout",
+        );
+    }
+
+    #[test]
+    fn a_draft_uses_the_worktree_it_picked_for_itself_only() {
+        let draft = |env: &str, project: &str, id: &str| {
+            Some(Target::Draft {
+                env: env.to_owned().into(),
+                project_id: project.into(),
+                draft: DraftId::from_saved(id.into()),
+            })
+        };
+        let mut state = DraftWorkspaceState {
+            env: Some("a".into()),
+            project_id: Some("p".into()),
+            draft: Some(DraftId::from_saved("d1".into())),
+            ..Default::default()
+        };
+        assert_eq!(state.existing_worktree(draft("a", "p", "d1").as_ref()), None);
+        state.choice.existing_worktree = Some("/repo/wt".into());
+        assert_eq!(state.existing_worktree(draft("a", "p", "d1").as_ref()), Some("/repo/wt"));
+        assert_eq!(state.existing_worktree(draft("a", "other", "d1").as_ref()), None, "another project keeps its root");
+        assert_eq!(state.existing_worktree(draft("a", "p", "d2").as_ref()), None, "another draft keeps its root");
+        assert_eq!(state.existing_worktree(draft("b", "p", "d1").as_ref()), None, "another environment keeps its root");
+        assert!(!state.is_for(None));
+    }
+
+    #[test]
+    fn a_draft_reads_its_workspace_again_on_a_new_socket_until_it_has_it() {
+        let (first, second) = (crate::rpc::RpcClient::unopened(), crate::rpc::RpcClient::unopened());
+        let mut state = DraftWorkspaceState::default();
+        assert!(state.needs_read(&first.socket_id()), "opened offline: nothing read yet");
+        state.read_on = Some(first.socket_id());
+        state.reading = true;
+        assert!(!state.needs_read(&first.socket_id()), "a read is running");
+        state.reading = false;
+        state.default_mode = Some(EnvMode::Local);
+        assert!(!state.needs_read(&first.socket_id()), "refs failed: the failure stands on that socket");
+        assert!(state.needs_read(&second.socket_id()), "a reconnect reads again");
+        state.refs = Some(json!({"refs": []}));
+        assert!(!state.needs_read(&second.socket_id()), "both loaded");
+    }
+
+    #[test]
+    fn the_previous_worktree_comes_from_the_drafts_own_environment() {
+        let thread = |env: &str, id: &str, updated: &str, worktree: Option<&str>| -> crate::model::ThreadShell {
+            let value = json!({
+                "id": id, "projectId": "p", "title": id, "status": "idle", "worktreePath": worktree,
+                "branch": format!("{env}-{id}"), "createdAt": updated, "updatedAt": updated,
+                "lineage": {"rootThreadId": id},
+            });
+            crate::model::ThreadShell {
+                environment_id: env.to_owned().into(),
+                ..serde_json::from_value(value).unwrap()
+            }
+        };
+        let threads = [
+            thread("a", "old", "2026-11-01T00:00:00.000Z", Some("/a/old")),
+            thread("a", "plain", "2026-11-04T00:00:00.000Z", None),
+            thread("a", "open", "2026-11-02T00:00:00.000Z", Some("/a/open")),
+            thread("b", "newest", "2026-11-03T00:00:00.000Z", Some("/b/newest")),
+        ];
+        let on_a = ScopedId::new("a", "p");
+        let seed = previous_worktree_seed(&threads, &on_a, None);
+        assert_eq!(seed, Some(("/a/open".into(), Some("a-open".into()))), "not B's newer worktree");
+        let seed = previous_worktree_seed(&threads, &on_a, Some("/a/open"));
+        assert_eq!(seed, Some(("/a/old".into(), Some("a-old".into()))), "not the worktree it already uses");
+        assert_eq!(previous_worktree_seed(&threads, &ScopedId::new("c", "p"), None), None);
+    }
+
+    #[test]
+    fn ref_pages_merge_by_name_and_say_how_many_show() {
+        let mut search = RefSearch::default();
+        assert_eq!(search.status(), None);
+        search.pages.push(json!({"refs": [{"name": "a"}, {"name": "b"}], "nextCursor": 2, "totalCount": 3}));
+        assert_eq!(search.next_cursor(), Some(2));
+        assert_eq!(search.status().as_deref(), Some("Showing 2 of 3 refs"));
+        search.pages.push(
+            json!({"refs": [{"name": "b", "current": true}, {"name": "c"}], "nextCursor": null, "totalCount": 3}),
+        );
+        let refs = search.refs();
+        let names: Vec<&str> = refs.iter().filter_map(|r| r["name"].as_str()).collect();
+        assert_eq!(names, ["a", "b", "c"]);
+        assert_eq!(refs[1]["current"], true, "the later page's copy wins");
+        assert_eq!(search.next_cursor(), None);
+        assert_eq!(search.status(), None, "every ref shows");
+    }
+
+    #[test]
+    fn a_managed_ceiling_denies_broader_modes_and_falls_back_to_the_broadest_left() {
+        let policy =
+            json!({"organization": "Acme", "lockedSettings": [], "limits": {"maxRuntimeMode": "auto-accept-edits"}});
+        assert_eq!(runtime_mode_denial(&policy, "auto-accept-edits"), None);
+        assert_eq!(
+            runtime_mode_denial(&policy, "full-access").as_deref(),
+            Some("Acme limits threads to Auto-accept edits.")
+        );
+        assert_eq!(runtime_mode_denial(&json!({"organization": "Acme", "lockedSettings": []}), "full-access"), None);
+        assert_eq!(runtime_mode_denial(&serde_json::Value::Null, "full-access"), None, "unmanaged");
+        let modes = ["approval-required", "auto-accept-edits", "auto", "full-access"];
+        assert_eq!(runtime_mode_fallback(&policy, &modes), Some("auto-accept-edits"));
+        assert_eq!(runtime_mode_fallback(&policy, &modes[2..]), None, "nothing the provider runs is allowed");
+    }
+
+    #[test]
+    fn permission_arrows_skip_nothing_they_are_given() {
+        let modes = ["approval-required", "auto-accept-edits", "auto"];
+        assert_eq!(step_permission(&modes, None, "right"), Some("approval-required"));
+        assert_eq!(step_permission(&modes, None, "up"), Some("auto"));
+        assert_eq!(step_permission(&modes, Some("auto"), "right"), Some("auto"), "the row stops at its end");
+        assert_eq!(step_permission(&modes, Some("auto"), "down"), Some("approval-required"), "the menu wraps");
+        assert_eq!(step_permission(&modes, Some("approval-required"), "up"), Some("auto"));
+        assert_eq!(step_permission(&modes, Some("approval-required"), "left"), Some("approval-required"));
+        assert_eq!(
+            step_permission(&modes, Some("full-access"), "down"),
+            Some("approval-required"),
+            "a denied focus restarts"
+        );
+        assert_eq!(step_permission(&[], None, "down"), None);
+    }
+
+    #[test]
+    fn ref_rows_need_the_grants_their_pick_uses() {
+        let grants = |write, update| BranchGrants { write, update };
+        assert!(grants(true, true).change() && grants(true, true).pick(false));
+        assert!(!grants(true, false).change(), "a thread without operate cannot record a new ref");
+        assert!(!grants(true, false).pick(true), "nor record a reused worktree");
+        assert!(!grants(false, true).change());
+        assert!(!grants(false, true).pick(false), "switching the checkout needs write");
+        assert!(grants(false, true).pick(true), "recording a base or reused worktree does not");
+    }
+
+    #[test]
+    fn branch_arrows_wrap() {
+        assert_eq!(step_highlight(None, 3, true), 0);
+        assert_eq!(step_highlight(None, 3, false), 2);
+        assert_eq!(step_highlight(Some(2), 3, true), 0);
+        assert_eq!(step_highlight(Some(0), 3, false), 2);
+        assert_eq!(step_highlight(Some(5), 3, false), 2, "a highlight past a shrunk list comes back");
+    }
+
+    #[test]
+    fn windows_paths_copy_with_backslashes() {
+        assert_eq!(clipboard_path("C:/Users/me/repo"), r"C:\Users\me\repo");
+        assert_eq!(clipboard_path(r"\\server\share/a"), r"\\server\share\a");
+        assert_eq!(clipboard_path("C:"), "C:");
+        assert_eq!(clipboard_path("/home/me/repo"), "/home/me/repo");
+    }
+}

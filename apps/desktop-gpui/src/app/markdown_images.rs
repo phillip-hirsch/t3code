@@ -1,0 +1,998 @@
+//! Images in chat markdown (`ChatMarkdown`'s `img`, `classifyMarkdownImageSource`): web
+//! images load directly, workspace files through a signed `assets.createUrl` URL, and
+//! anything else stays blank. `TextView` asks for each image synchronously, so loads are
+//! started when a message parses and the view reads them from a shared cache.
+
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
+
+use gpui_kit::{Context, Image, ImageFormat, ImageSource, SharedString, SharedUri};
+use markdown::mdast::Node;
+use serde_json::{Value, json};
+
+use super::Workspace;
+use super::chat::view_pane;
+use super::image_viewer::{Reference, ViewerImage, file_reference};
+use super::side_chat::ChatPane;
+
+/// A 1×1 transparent PNG, drawn while an image loads or when it cannot.
+static BLANK: LazyLock<Arc<Image>> = LazyLock::new(|| {
+    const PNG: [u8; 67] = [
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00,
+        0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00,
+        0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D,
+        0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+    Arc::new(Image::from_bytes(ImageFormat::Png, PNG.to_vec()))
+});
+
+/// Loaded images by the destination the markdown wrote, for one thread: a relative
+/// destination resolves against that thread's checkout. A slot remembers which panes asked for
+/// it, so a side chat's images go with it ([`Self::release_side`]).
+#[derive(Clone, Default)]
+pub(super) struct ImageCache(Arc<Mutex<Slots>>);
+
+#[derive(Default)]
+struct Slots {
+    slots: HashMap<String, Slot>,
+    /// The side chat has claimed a slot since it last released.
+    side_claimed: bool,
+    /// The generation the next new slot takes.
+    next: u64,
+}
+
+struct Slot {
+    /// `None` while it loads or when it could not.
+    image: Option<Arc<Image>>,
+    main: bool,
+    side: bool,
+    generation: u64,
+    /// The workspace mutation each pane's thread was at when it last read a workspace file, by
+    /// [`pane_index`]; `None` for a source that cannot change or a pane that has not asked.
+    revisions: [Option<Revision>; 2],
+    /// The rows (by view key) that show it, to remeasure once it loads.
+    rows: Vec<SharedString>,
+    /// How to load it again, for a source an environment serves.
+    reload: Option<Reload>,
+    /// Its load failed; one an environment serves loads again once that environment reconnects.
+    failed: bool,
+}
+
+/// `workspaceMutationId`: the thread's last settled file-writing item and newest turn completion.
+pub(super) type Revision = (Option<String>, Option<String>);
+
+/// A load to start again, from the environment `env`.
+#[derive(Clone, Debug)]
+pub(super) enum Reload {
+    /// An image a markdown or tool row (by its view key) shows.
+    Row { env: SharedString, key: SharedString, destination: String, source: Source },
+    /// An image attachment, whose tile asks for it again once its slot is gone.
+    Attachment { env: SharedString },
+}
+
+impl Reload {
+    fn env(&self) -> &str {
+        match self {
+            Self::Row { env, .. } | Self::Attachment { env } => env,
+        }
+    }
+}
+
+fn pane_index(pane: ChatPane) -> usize {
+    match pane {
+        ChatPane::Main => 0,
+        ChatPane::Side => 1,
+    }
+}
+
+/// The load a new slot started, which fills that slot and no later one at its destination.
+#[derive(Clone, Debug)]
+pub(super) struct Claim {
+    destination: String,
+    generation: u64,
+}
+
+impl ImageCache {
+    /// The loaded image for `destination`, if it has loaded.
+    pub(super) fn get(&self, destination: &str) -> Option<Arc<Image>> {
+        self.0.lock().ok()?.slots.get(destination)?.image.clone()
+    }
+
+    /// Whether `destination` has loaded, is loading, or could not load.
+    fn contains(&self, destination: &str) -> bool {
+        self.0.lock().is_ok_and(|cache| cache.slots.contains_key(destination))
+    }
+
+    /// Marks `destination` loading, in a cache no pane releases ([`Self::store`]); false when
+    /// the cache has already seen it.
+    pub(super) fn claim(&self, destination: &str) -> bool {
+        self.claim_for(ChatPane::Main, destination).is_some()
+    }
+
+    /// [`Self::claim`] for an image `pane` shows, which it then holds until it releases: the
+    /// load to start, or `None` when the cache has already seen it.
+    pub(super) fn claim_for(&self, pane: ChatPane, destination: &str) -> Option<Claim> {
+        self.claim_with(pane, destination, None, None, None)
+    }
+
+    /// [`Self::claim_for`] for a source read at `revision`, as the web keys a workspace file's
+    /// URL by it: a slot `pane` read at another revision loads again, keeping its image
+    /// meanwhile. Each pane is its own thread with its own revisions, as the web's side chat is
+    /// its own `ChatView`. `row` is the row that shows it.
+    fn claim_with(
+        &self,
+        pane: ChatPane,
+        destination: &str,
+        revision: Option<&Revision>,
+        reload: Option<Reload>,
+        row: Option<&SharedString>,
+    ) -> Option<Claim> {
+        let mut cache = self.0.lock().ok()?;
+        cache.side_claimed |= pane == ChatPane::Side;
+        let (main, side) = (pane == ChatPane::Main, pane == ChatPane::Side);
+        let generation = cache.next;
+        if let Some(slot) = cache.slots.get_mut(destination) {
+            slot.main |= main;
+            slot.side |= side;
+            if let Some(row) = row.filter(|row| !slot.rows.contains(row)) {
+                slot.rows.push(row.clone());
+            }
+            let read_at = &mut slot.revisions[pane_index(pane)];
+            if revision.is_none() || read_at.as_ref() == revision {
+                return None;
+            }
+            *read_at = revision.cloned();
+            slot.generation = generation;
+            slot.failed = false;
+        } else {
+            let mut revisions = [None, None];
+            revisions[pane_index(pane)] = revision.cloned();
+            let rows = row.into_iter().cloned().collect();
+            let slot = Slot { image: None, main, side, generation, revisions, rows, reload, failed: false };
+            cache.slots.insert(destination.to_owned(), slot);
+        }
+        cache.next += 1;
+        Some(Claim { destination: destination.to_owned(), generation })
+    }
+
+    /// The workspace files `pane` read before `revision`, to load again through one of its rows.
+    fn stale(&self, pane: ChatPane, revision: &Revision) -> Vec<Reload> {
+        let Ok(cache) = self.0.lock() else { return Vec::new() };
+        let stale = cache
+            .slots
+            .values()
+            .filter(|slot| slot.revisions[pane_index(pane)].as_ref().is_some_and(|r| r != revision));
+        stale
+            .filter_map(|slot| {
+                let Some(Reload::Row { env, destination, source, .. }) = slot.reload.clone() else { return None };
+                let key = slot.rows.iter().find(|row| view_pane(row).0 == pane)?.clone();
+                Some(Reload::Row { env, key, destination, source })
+            })
+            .collect()
+    }
+
+    /// Fills the slot `claim` started, naming the rows that show it; a load whose slot was
+    /// released, or claimed again since, keeps nothing.
+    pub(super) fn fill(&self, claim: Claim, image: Arc<Image>) -> Vec<SharedString> {
+        let Ok(mut cache) = self.0.lock() else { return Vec::new() };
+        let Some(slot) = cache.slots.get_mut(&claim.destination).filter(|s| s.generation == claim.generation) else {
+            return Vec::new();
+        };
+        slot.image = Some(image);
+        slot.rows.clone()
+    }
+
+    /// Marks the slot `claim` started failed, so parses do not retry it until a reconnect.
+    fn fail(&self, claim: Claim) {
+        if let Ok(mut cache) = self.0.lock()
+            && let Some(slot) = cache.slots.get_mut(&claim.destination).filter(|s| s.generation == claim.generation)
+        {
+            slot.failed = true;
+        }
+    }
+
+    /// Forgets the failed loads `environment` serves, for the caller to start again.
+    fn take_failed(&self, environment: &str) -> Vec<Reload> {
+        let Ok(mut cache) = self.0.lock() else { return Vec::new() };
+        let mut retries = Vec::new();
+        cache.slots.retain(|_, slot| match &slot.reload {
+            Some(reload) if slot.failed && reload.env() == environment => {
+                retries.push(reload.clone());
+                false
+            }
+            _ => true,
+        });
+        retries
+    }
+
+    /// Fills a slot [`Self::claim`] started.
+    pub(super) fn store(&self, destination: String, image: Arc<Image>) {
+        if let Ok(mut cache) = self.0.lock()
+            && let Some(slot) = cache.slots.get_mut(&destination)
+        {
+            slot.image = Some(image);
+        }
+    }
+
+    /// Drops the images only the side chat held, once it shows another chat or none.
+    pub(super) fn release_side(&self) {
+        let Ok(mut cache) = self.0.lock() else { return };
+        if !std::mem::take(&mut cache.side_claimed) {
+            return;
+        }
+        cache.slots.retain(|_, slot| {
+            slot.side = false;
+            slot.revisions[pane_index(ChatPane::Side)] = None;
+            slot.rows.retain(|row| view_pane(row).0 == ChatPane::Main);
+            slot.main
+        });
+    }
+
+    pub(super) fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// `TextView`'s `image_source`: the loaded image, else a blank one.
+    pub(super) fn resolver(&self) -> impl Fn(&SharedUri) -> ImageSource + Send + Sync + 'static {
+        let cache = self.0.clone();
+        move |uri| {
+            let image = cache.lock().ok().and_then(|cache| cache.slots.get(uri.as_ref())?.image.clone());
+            ImageSource::Image(image.unwrap_or_else(|| BLANK.clone()))
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum Source {
+    Direct(String),
+    Data(ImageFormat, Vec<u8>),
+    WorkspaceFile(String),
+    /// An `assets.createUrl` resource, such as a tool's output image.
+    Asset(Value),
+    Blocked,
+}
+
+/// Whether `markdown` can hold an image at all, so most messages skip parsing for one.
+fn may_hold_images(markdown: &str) -> bool {
+    markdown.contains("![") || markdown.to_ascii_lowercase().contains("<img")
+}
+
+/// The destinations of the images the parsed `markdown` shows, in order and once each: inline
+/// `![alt](dest)`, reference `![alt][id]` (by its definition) and raw HTML `<img src>`.
+pub(super) fn image_destinations(markdown: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for image in markdown_images(markdown) {
+        if !found.contains(&image.destination) {
+            found.push(image.destination);
+        }
+    }
+    found
+}
+
+/// One image a message shows.
+#[derive(Debug, PartialEq)]
+pub(super) struct MarkdownImage {
+    pub destination: String,
+    pub alt: String,
+    /// The link it sits in, which a click follows instead of expanding the image.
+    pub link: Option<String>,
+}
+
+/// Every image `markdown` shows, in order.
+pub(super) fn markdown_images(markdown: &str) -> Vec<MarkdownImage> {
+    let mut options = markdown::ParseOptions::gfm();
+    options.constructs.math_text = true;
+    options.constructs.math_flow = true;
+    let Ok(root) = markdown::to_mdast(markdown, &options) else { return Vec::new() };
+    let mut definitions = HashMap::new();
+    collect_definitions(&root, &mut definitions);
+    let mut found = Vec::new();
+    collect_images(&root, &definitions, None, &mut found);
+    found
+}
+
+fn collect_definitions<'a>(node: &'a Node, definitions: &mut HashMap<&'a str, &'a str>) {
+    if let Node::Definition(definition) = node {
+        // The first definition of a label wins, as CommonMark resolves it.
+        definitions.entry(definition.identifier.as_str()).or_insert(definition.url.as_str());
+    }
+    for child in node.children().into_iter().flatten() {
+        collect_definitions(child, definitions);
+    }
+}
+
+fn collect_images(node: &Node, definitions: &HashMap<&str, &str>, link: Option<&str>, found: &mut Vec<MarkdownImage>) {
+    let mut push = |dest: &str, alt: &str| {
+        if !dest.is_empty() {
+            let link = link.map(str::to_owned);
+            found.push(MarkdownImage { destination: dest.to_owned(), alt: alt.to_owned(), link });
+        }
+    };
+    match node {
+        Node::Image(image) => push(&image.url, &image.alt),
+        Node::ImageReference(image) => {
+            if let Some(url) = definitions.get(image.identifier.as_str()) {
+                push(url, &image.alt);
+            }
+        }
+        Node::Html(html) => html_image_sources(&html.value).iter().for_each(|src| push(src, "")),
+        _ => {}
+    }
+    let link = match node {
+        Node::Link(link) => Some(link.url.as_str()),
+        Node::LinkReference(link) => Some(definitions.get(link.identifier.as_str()).copied().unwrap_or_default()),
+        _ => link,
+    };
+    for child in node.children().into_iter().flatten() {
+        collect_images(child, definitions, link, found);
+    }
+}
+
+/// The `src` of each `<img>` tag in a raw HTML fragment.
+fn html_image_sources(html: &str) -> Vec<String> {
+    let lower = html.to_ascii_lowercase();
+    let mut sources = Vec::new();
+    let mut from = 0;
+    while let Some(start) = lower[from..].find("<img").map(|i| from + i + 4) {
+        let end = lower[start..].find('>').map_or(lower.len(), |i| start + i);
+        from = end;
+        if !lower[start..].starts_with(|c: char| c.is_ascii_whitespace() || c == '/') {
+            continue;
+        }
+        let tag = &lower[start..end];
+        let Some(attr) = tag.match_indices("src").map(|(i, _)| i).find(|&i| {
+            i > 0 && tag.as_bytes()[i - 1].is_ascii_whitespace() && tag[i + 3..].trim_start().starts_with('=')
+        }) else {
+            continue;
+        };
+        let value_at = start + attr + 3;
+        let value = html[value_at..end].trim_start().trim_start_matches('=').trim_start();
+        let src = match value.chars().next() {
+            Some(quote @ ('"' | '\'')) => value[1..].split(quote).next().unwrap_or_default(),
+            _ => value.split_ascii_whitespace().next().unwrap_or_default(),
+        };
+        if !src.is_empty() {
+            sources.push(decode_entities(src));
+        }
+    }
+    sources
+}
+
+/// The HTML parser decodes these in an attribute, so the cache key must too.
+fn decode_entities(value: &str) -> String {
+    value.replace("&quot;", "\"").replace("&#39;", "'").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+}
+
+/// `isWindowsAbsolutePath`: a UNC share, or a drive (`C:`, `C:\`, `C:/`).
+fn is_windows_absolute(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with("\\\\")
+        || (bytes.len() > 1
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes.get(2).is_none_or(|b| matches!(b, b'\\' | b'/')))
+}
+
+/// `stripSlashPrefixedWindowsDrive`: a file URL writes `C:/x` as `/C:/x`.
+fn strip_slash_drive(path: String) -> String {
+    let bytes = path.as_bytes();
+    let prefixed = bytes.len() > 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':';
+    if prefixed && matches!(bytes[3], b'\\' | b'/') { path[1..].to_owned() } else { path }
+}
+
+/// `parseFileUrlHref`'s path: another host than this one names a UNC share.
+fn file_url_path(href: &str) -> Option<String> {
+    let url = url::Url::parse(href).ok()?;
+    let path = match url.host_str().filter(|host| !host.is_empty() && !host.eq_ignore_ascii_case("localhost")) {
+        Some(host) => format!("\\\\{host}{}", url.path().replace('/', "\\")),
+        None => url.path().to_owned(),
+    };
+    (!path.is_empty()).then_some(path)
+}
+
+/// `markdownDestinationHostPath`: the percent-decoded path a destination names on the host, or
+/// `None` for a `file:` URL that does not parse.
+fn host_path(source: &str, file_url: bool) -> Option<String> {
+    let path =
+        if file_url { file_url_path(source)? } else { source.split(['?', '#']).next().unwrap_or_default().to_owned() };
+    let decoded = crate::thread_links::decode_uri_component(&path).unwrap_or(path);
+    Some(strip_slash_drive(decoded))
+}
+
+/// `hostFileSource`: rendering is not a click, so a network path loads only from the project's own share.
+fn host_file(path: String, workspace_root: Option<&str>) -> Source {
+    let network = path.len() > 1 && path.as_bytes()[..2].iter().all(|b| matches!(b, b'\\' | b'/'));
+    let inside =
+        || workspace_root.is_some_and(|root| super::context_strip::workspace_relative_file_path(&path, root).is_some());
+    if network && !inside() { Source::Blocked } else { Source::WorkspaceFile(path) }
+}
+
+/// `classifyMarkdownImageSource`, plus decoding data URLs for the native view.
+pub(super) fn classify(destination: &str, workspace_root: Option<&str>) -> Source {
+    let trimmed = destination.trim();
+    let source = trimmed.strip_prefix('<').and_then(|rest| rest.strip_suffix('>')).unwrap_or(trimmed);
+    if source.is_empty() || source.starts_with('#') || source.starts_with('?') {
+        return Source::Blocked;
+    }
+    let lower = source.to_ascii_lowercase();
+    if lower.starts_with("http:") || lower.starts_with("https:") {
+        return Source::Direct(source.to_owned());
+    }
+    if let Some(rest) = source.strip_prefix("//") {
+        return Source::Direct(format!("https://{rest}"));
+    }
+    if lower.starts_with("data:") {
+        return data_url(source).map_or(Source::Blocked, |(format, bytes)| Source::Data(format, bytes));
+    }
+    let file_url = lower.starts_with("file:");
+    let Some(path) = host_path(source, file_url) else { return Source::Blocked };
+    if file_url {
+        return host_file(path, workspace_root);
+    }
+    if path.is_empty() {
+        return Source::Blocked;
+    }
+    if path.starts_with('/') || is_windows_absolute(&path) {
+        return host_file(path, workspace_root);
+    }
+    let has_scheme = path.split_once(':').is_some_and(|(scheme, _)| {
+        scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
+    });
+    if has_scheme || path.starts_with("~/") || path.starts_with("~\\") {
+        return Source::Blocked;
+    }
+    let Some(root) = workspace_root else { return Source::Blocked };
+    let separator = if is_windows_absolute(root) { '\\' } else { '/' };
+    let relative = path.trim_start_matches(['/', '\\']).replace(['/', '\\'], &separator.to_string());
+    Source::WorkspaceFile(format!("{}{separator}{relative}", root.trim_end_matches(['/', '\\'])))
+}
+
+fn format_for(mime: &str) -> Option<ImageFormat> {
+    ImageFormat::from_mime_type(mime)
+}
+
+/// `data:image/png;base64,...`.
+pub(super) fn data_url(url: &str) -> Option<(ImageFormat, Vec<u8>)> {
+    let (meta, payload) = url.strip_prefix("data:")?.split_once(',')?;
+    let mime = meta.split(';').next()?;
+    let format = format_for(mime)?;
+    if !meta.ends_with(";base64") {
+        return None;
+    }
+    Some((format, base64(payload)?))
+}
+
+/// Padding is optional and whitespace is ignored, as browsers do.
+fn base64(text: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    let compact: String = text.split_ascii_whitespace().collect();
+    base64::engine::general_purpose::STANDARD_NO_PAD.decode(compact.trim_end_matches('=')).ok()
+}
+
+impl Workspace {
+    /// Starts loading the images `markdown` shows that the cache has not seen yet.
+    pub(super) fn load_markdown_images(&mut self, key: &SharedString, markdown: &str, cx: &mut Context<Self>) {
+        if !may_hold_images(markdown) {
+            return;
+        }
+        self.load_images(key, image_destinations(markdown), cx);
+    }
+
+    /// Starts loading the image at each destination the cache has not seen yet, for the row
+    /// that shows `key` to remeasure once it lands.
+    pub(super) fn load_images(&mut self, key: &SharedString, destinations: Vec<String>, cx: &mut Context<Self>) {
+        let root = self.git_cwd();
+        // Audio and video play in their own players (`super::markdown_media`), never as images.
+        let sources = destinations
+            .into_iter()
+            .filter(|destination| super::markdown_media::media_kind(destination).is_none())
+            .map(|destination| {
+                let source = classify(&destination, root.as_deref());
+                (destination, source)
+            })
+            .collect();
+        self.load_sources(key, sources, cx);
+    }
+
+    /// Starts loading each asset image (`ChatMarkdownAssetImage`), cached under its destination.
+    pub(super) fn load_asset_images(
+        &mut self,
+        key: &SharedString,
+        assets: Vec<(String, Value)>,
+        cx: &mut Context<Self>,
+    ) {
+        let sources =
+            assets.into_iter().map(|(destination, resource)| (destination, Source::Asset(resource))).collect();
+        self.load_sources(key, sources, cx);
+    }
+
+    /// Loads again the workspace images each pane read before its thread's latest workspace
+    /// mutation, as the web mints a new URL for each `workspaceMutationId`.
+    pub(super) fn refresh_workspace_images(&mut self, cx: &mut Context<Self>) {
+        for pane in [ChatPane::Main, ChatPane::Side] {
+            let stale = self.markdown_images.stale(pane, &self.pane_workspace_mutation(pane));
+            self.reload_images(stale, cx);
+        }
+    }
+
+    /// The workspace mutation of the thread `pane` shows: the side chat is a thread of its own.
+    fn pane_workspace_mutation(&self, pane: ChatPane) -> Revision {
+        match pane {
+            ChatPane::Main => self.current_workspace_mutation(),
+            ChatPane::Side => {
+                self.side_chat_projection().map_or((None, None), super::right_panel::projection_workspace_mutation)
+            }
+        }
+    }
+
+    /// `environment` reconnected: the images it could not serve load again, as the web's asset
+    /// URL queries run again once their connection settles.
+    pub(super) fn retry_failed_images(&mut self, environment: &str, cx: &mut Context<Self>) {
+        let retries = self.markdown_images.take_failed(environment);
+        self.reload_images(retries, cx);
+    }
+
+    fn reload_images(&mut self, reloads: Vec<Reload>, cx: &mut Context<Self>) {
+        for reload in reloads {
+            if let Reload::Row { key, destination, source, .. } = reload {
+                self.load_sources(&key, vec![(destination, source)], cx);
+            }
+        }
+    }
+
+    fn load_sources(&mut self, key: &SharedString, sources: Vec<(String, Source)>, cx: &mut Context<Self>) {
+        let cache = self.markdown_images.clone();
+        let pane = view_pane(key).0;
+        let revision = self.pane_workspace_mutation(pane);
+        let (env, thread_id) = match pane {
+            ChatPane::Main => (
+                self.target.as_ref().map(|target| target.environment().clone()),
+                self.thread.as_ref().map(|t| t.id.clone()),
+            ),
+            ChatPane::Side => self.pane_thread(ChatPane::Side).unzip(),
+        };
+        for (destination, source) in sources {
+            let revision = matches!(source, Source::WorkspaceFile(_)).then_some(&revision);
+            let served = matches!(source, Source::WorkspaceFile(_) | Source::Asset(_));
+            let reload = env.clone().filter(|_| served).map(|env| {
+                let (key, destination, source) = (key.clone(), destination.clone(), source.clone());
+                Reload::Row { env, key, destination, source }
+            });
+            let Some(claim) = cache.claim_with(pane, &destination, revision, reload, Some(key)) else { continue };
+            let resource = match &source {
+                Source::WorkspaceFile(path) => {
+                    thread_id.as_ref().map(|id| json!({"_tag": "media-file", "threadId": id, "path": path}))
+                }
+                Source::Asset(resource) => Some(resource.clone()),
+                _ => None,
+            };
+            let (client, base) = (self.client(), self.http_base().map(str::to_owned));
+            let (key, cache) = (key.clone(), cache.clone());
+            cx.spawn(async move |this, cx| {
+                let fetched: Option<(Option<String>, Vec<u8>)> = match source {
+                    Source::Blocked => None,
+                    Source::Data(format, bytes) => {
+                        let image = Arc::new(Image::from_bytes(format, bytes));
+                        let _ = this.update(cx, |this, cx| this.image_loaded(&cache, claim, Some(image), &key, cx));
+                        return;
+                    }
+                    Source::Direct(url) => fetch(url).await,
+                    Source::WorkspaceFile(_) | Source::Asset(_) => match (client, base, resource) {
+                        (Some(client), Some(base), Some(resource)) => {
+                            match client.request("assets.createUrl", json!({"resource": resource})).await {
+                                Ok(signed) => match signed["relativeUrl"].as_str() {
+                                    Some(relative) => fetch(format!("{base}{relative}")).await,
+                                    None => None,
+                                },
+                                Err(error) => {
+                                    log::debug!("assets.createUrl for a chat image: {error}");
+                                    None
+                                }
+                            }
+                        }
+                        _ => None,
+                    },
+                };
+                let image = fetched.and_then(|(mime, bytes)| {
+                    let format = mime.as_deref().and_then(format_for).or_else(|| sniff(&bytes))?;
+                    Some(Arc::new(Image::from_bytes(format, bytes)))
+                });
+                let _ = this.update(cx, |this, cx| this.image_loaded(&cache, claim, image, &key, cx));
+            })
+            .detach();
+        }
+    }
+
+    /// Stores a finished load in the cache it started from; a load that outlived its
+    /// thread changes nothing on screen.
+    fn image_loaded(
+        &mut self,
+        cache: &ImageCache,
+        claim: Claim,
+        image: Option<Arc<Image>>,
+        key: &SharedString,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(image) = image else { return cache.fail(claim) };
+        let rows = cache.fill(claim, image);
+        if !cache.same(&self.markdown_images) {
+            return;
+        }
+        self.remeasure_item_rows(key, cx);
+        for row in rows.iter().filter(|row| *row != key) {
+            self.remeasure_item_rows(row, cx);
+        }
+        cx.notify();
+    }
+}
+
+impl Workspace {
+    /// The gallery a click on the image at `url` opens (`markdownImageGallery`): the loaded
+    /// images of `markdown`, less those linking somewhere other than an image, and where `url`
+    /// is among them.
+    pub(super) fn markdown_gallery(&self, markdown: &str, url: &str) -> Option<(Vec<ViewerImage>, usize)> {
+        gallery(&self.markdown_images, self.git_cwd().as_deref(), markdown, url)
+    }
+}
+
+/// [`Workspace::markdown_gallery`] over the images `cache` holds, with relative files under `root`.
+pub(super) fn gallery(
+    cache: &ImageCache,
+    root: Option<&str>,
+    markdown: &str,
+    url: &str,
+) -> Option<(Vec<ViewerImage>, usize)> {
+    let mut items = Vec::new();
+    let mut index = None;
+    for image in markdown_images(markdown) {
+        if image.link.as_deref().is_some_and(|link| !links_to_image(link)) {
+            continue;
+        }
+        let Some(loaded) = cache.get(&image.destination) else { continue };
+        if index.is_none() && image.link.is_none() && image.destination == url {
+            index = Some(items.len());
+        }
+        // An image linking to a web image names that image, as its menu copies it.
+        let web_link = image.link.filter(|link| link.starts_with("https://") || link.starts_with("http://"));
+        let reference = match web_link {
+            Some(link) => Some(Reference::Url(link)),
+            None => match classify(&image.destination, root) {
+                Source::Direct(url) => Some(Reference::Url(url)),
+                Source::WorkspaceFile(path) => Some(file_reference(&path, root)),
+                Source::Data(..) | Source::Asset(_) | Source::Blocked => None,
+            },
+        };
+        let name = image.alt.trim();
+        let name = if name.is_empty() { "image" } else { name };
+        items.push(ViewerImage { image: loaded, name: name.to_owned().into(), reference });
+    }
+    Some((items, index?))
+}
+
+/// `mediaKindFromPath(href) === "image"`: the link's path ends in an image extension.
+fn links_to_image(link: &str) -> bool {
+    let path = link.split(['?', '#']).next().unwrap_or_default();
+    !path.is_empty() && super::files::is_image(path)
+}
+
+/// An attachment's place in the image cache, apart from any markdown destination.
+fn attachment_key(id: &str) -> String {
+    format!("t3-attachment:{id}")
+}
+
+impl Workspace {
+    /// Starts loading the image attachments `ids` names that the cache has not seen yet
+    /// (`useAssetUrls`). Their tiles keep their size, so a finished load only repaints.
+    pub(super) fn load_attachment_images<'a>(
+        &mut self,
+        pane: ChatPane,
+        ids: impl IntoIterator<Item = &'a str>,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(client), Some(base)) = (self.client(), self.http_base().map(str::to_owned)) else { return };
+        let Some(env) = self.target.as_ref().map(|target| target.environment().clone()) else { return };
+        let cache = self.markdown_images.clone();
+        for id in ids {
+            let key = attachment_key(id);
+            let reload = Reload::Attachment { env: env.clone() };
+            let Some(claim) = cache.claim_with(pane, &key, None, Some(reload), None) else { continue };
+            let resource = json!({"_tag": "attachment", "attachmentId": id});
+            let (client, base, cache) = (client.clone(), base.clone(), cache.clone());
+            cx.spawn(async move |this, cx| {
+                let fetched = match client.request("assets.createUrl", json!({"resource": resource})).await {
+                    Ok(signed) => match signed["relativeUrl"].as_str() {
+                        Some(relative) => fetch(format!("{base}{relative}")).await,
+                        None => None,
+                    },
+                    Err(error) => {
+                        log::debug!("assets.createUrl for an attachment image: {error}");
+                        None
+                    }
+                };
+                let image = fetched.and_then(|(mime, bytes)| {
+                    let format = mime.as_deref().and_then(format_for).or_else(|| sniff(&bytes))?;
+                    Some(Arc::new(Image::from_bytes(format, bytes)))
+                });
+                let Some(image) = image else { return cache.fail(claim) };
+                cache.fill(claim, image);
+                let _ = this.update(cx, |this, cx| {
+                    if cache.same(&this.markdown_images) {
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
+    }
+
+    /// A loaded image attachment; `None` while it loads or when it could not.
+    pub(super) fn attachment_image(&self, id: &str) -> Option<Arc<Image>> {
+        self.markdown_images.get(&attachment_key(id))
+    }
+
+    /// The image attachment has loaded, is loading, or could not load.
+    pub(super) fn attachment_image_requested(&self, id: &str) -> bool {
+        self.markdown_images.contains(&attachment_key(id))
+    }
+}
+
+/// The bytes' format when the server named none.
+pub(super) fn sniff(bytes: &[u8]) -> Option<ImageFormat> {
+    match bytes {
+        [0x89, b'P', b'N', b'G', ..] => Some(ImageFormat::Png),
+        [0xFF, 0xD8, ..] => Some(ImageFormat::Jpeg),
+        [b'G', b'I', b'F', ..] => Some(ImageFormat::Gif),
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => Some(ImageFormat::Webp),
+        _ if bytes.starts_with(b"<svg") || bytes.starts_with(b"<?xml") => Some(ImageFormat::Svg),
+        _ => None,
+    }
+}
+
+/// The web image at `url`, decoded by its type or its bytes; `None` when it fails to load.
+pub(super) async fn fetch_image(url: String) -> Option<Arc<Image>> {
+    let (mime, bytes) = fetch(url).await?;
+    let format = mime.as_deref().and_then(format_for).or_else(|| sniff(&bytes))?;
+    Some(Arc::new(Image::from_bytes(format, bytes)))
+}
+
+/// The largest image a message loads: an agent can link any URL.
+const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+
+/// The image's MIME type and bytes, or `None` when it fails or passes [`MAX_IMAGE_BYTES`].
+pub(super) async fn fetch(url: String) -> Option<(Option<String>, Vec<u8>)> {
+    crate::runtime()
+        .spawn(async move {
+            let mut response = reqwest::get(url).await?.error_for_status()?;
+            if response.content_length().is_some_and(|length| length > MAX_IMAGE_BYTES as u64) {
+                return Ok(None);
+            }
+            let mime = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.split(';').next().unwrap_or_default().trim().to_owned());
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response.chunk().await? {
+                if bytes.len() + chunk.len() > MAX_IMAGE_BYTES {
+                    return Ok(None);
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok::<_, reqwest::Error>(Some((mime, bytes)))
+        })
+        .await
+        .ok()?
+        .ok()
+        .flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn images_outside_code_are_found_once() {
+        let markdown = "![a](shot.png) and ![b](<my shot.png> \"t\")\n```\n![c](x.png)\n```\n![a](shot.png)";
+        assert_eq!(image_destinations(markdown), vec!["shot.png", "my shot.png"]);
+        let markdown =
+            "![ref][Logo] then <img alt=\"x\" src='html.png?a=1&amp;b=2'>\n\n`![no](code.png)`\n\n[logo]: ref.png";
+        assert_eq!(image_destinations(markdown), vec!["ref.png", "html.png?a=1&b=2"]);
+    }
+
+    #[test]
+    fn a_gallery_knows_alt_text_and_linked_images() {
+        let markdown = "![one](a.png) [![two](b.png)](https://x.dev) ![](a.png) [![big][t]][full]\n\n[t]: t.png\n[full]: https://x.dev/full.png?s=1";
+        let images = markdown_images(markdown);
+        let summary: Vec<_> =
+            images.iter().map(|i| (i.destination.as_str(), i.alt.as_str(), i.link.as_deref())).collect();
+        assert_eq!(
+            summary,
+            [
+                ("a.png", "one", None),
+                ("b.png", "two", Some("https://x.dev")),
+                ("a.png", "", None),
+                ("t.png", "big", Some("https://x.dev/full.png?s=1"))
+            ]
+        );
+        assert!(!links_to_image("https://x.dev"));
+        assert!(links_to_image("https://x.dev/full.png?s=1"));
+    }
+
+    #[test]
+    fn a_side_chat_releases_only_the_images_it_alone_asked_for() {
+        let png = || BLANK.clone();
+        let cache = ImageCache::default();
+        let main = cache.claim_for(ChatPane::Main, "main.png").unwrap();
+        let side = cache.claim_for(ChatPane::Side, "side.png").unwrap();
+        let both = cache.claim_for(ChatPane::Side, "both.png").unwrap();
+        assert!(cache.claim_for(ChatPane::Main, "both.png").is_none());
+        let late = cache.claim_for(ChatPane::Side, "late.png").unwrap();
+        for claim in [main, side, both] {
+            cache.fill(claim, png());
+        }
+        cache.release_side();
+        assert!(cache.get("main.png").is_some() && cache.get("both.png").is_some());
+        assert!(cache.get("side.png").is_none());
+        // A load that lands after its side chat left keeps nothing.
+        cache.fill(late.clone(), png());
+        assert!(cache.get("late.png").is_none());
+        assert!(cache.claim_for(ChatPane::Side, "side.png").is_some());
+        // Nor once another side chat claimed the same destination: that claim loads its own.
+        let again = cache.claim_for(ChatPane::Side, "late.png").unwrap();
+        cache.fill(late, png());
+        assert!(cache.get("late.png").is_none(), "an obsolete load fills a newer claim");
+        cache.fill(again, png());
+        assert!(cache.get("late.png").is_some());
+    }
+
+    fn plot_reload(env: &str) -> Reload {
+        let source = Source::WorkspaceFile("/repo/plot.png".into());
+        Reload::Row { env: env.to_owned().into(), key: "main:reply".into(), destination: "plot.png".into(), source }
+    }
+
+    fn reload_destination(reload: &Reload) -> &str {
+        match reload {
+            Reload::Row { destination, .. } => destination,
+            Reload::Attachment { .. } => "attachment",
+        }
+    }
+
+    #[test]
+    fn a_failed_load_from_an_environment_retries_when_it_reconnects() {
+        let cache = ImageCache::default();
+        let revision: Revision = (None, None);
+        let plot =
+            cache.claim_with(ChatPane::Main, "plot.png", Some(&revision), Some(plot_reload("remote")), None).unwrap();
+        cache.fail(plot);
+        let attachment = Some(Reload::Attachment { env: "remote".into() });
+        cache.fail(cache.claim_with(ChatPane::Main, "t3-attachment:a", None, attachment, None).unwrap());
+        cache.fail(cache.claim_for(ChatPane::Main, "https://x.dev/a.png").unwrap());
+        assert!(
+            cache.claim_with(ChatPane::Main, "plot.png", Some(&revision), Some(plot_reload("remote")), None).is_none(),
+            "a failed load waits for a reconnect, not the next parse"
+        );
+        assert!(cache.take_failed("local").is_empty(), "another environment's reconnect retries nothing");
+        let mut retried: Vec<_> =
+            cache.take_failed("remote").iter().map(reload_destination).map(str::to_owned).collect();
+        retried.sort();
+        assert_eq!(retried, ["attachment", "plot.png"]);
+        assert!(
+            cache.claim_with(ChatPane::Main, "plot.png", Some(&revision), Some(plot_reload("remote")), None).is_some()
+        );
+        assert!(cache.claim_for(ChatPane::Main, "t3-attachment:a").is_some());
+        assert!(cache.claim_for(ChatPane::Main, "https://x.dev/a.png").is_none(), "a web image stays failed");
+    }
+
+    #[test]
+    fn a_workspace_file_loads_again_after_a_workspace_mutation() {
+        let png = || Arc::new(Image::from_bytes(ImageFormat::Png, BLANK.bytes().to_vec()));
+        let cache = ImageCache::default();
+        let (before, after): (Revision, Revision) = ((Some("edit-1".into()), None), (Some("edit-2".into()), None));
+        let reload = || Some(plot_reload("local"));
+        let row = SharedString::from("reply");
+        let first = cache.claim_with(ChatPane::Main, "plot.png", Some(&before), reload(), Some(&row)).unwrap();
+        let old = png();
+        cache.fill(first.clone(), old.clone());
+        assert!(cache.claim_with(ChatPane::Main, "plot.png", Some(&before), reload(), Some(&row)).is_none());
+        assert!(cache.stale(ChatPane::Main, &before).is_empty());
+        let web = cache.claim_for(ChatPane::Main, "https://x.dev/a.png").unwrap();
+        cache.fill(web, png());
+        let stale: Vec<_> =
+            cache.stale(ChatPane::Main, &after).iter().map(reload_destination).map(str::to_owned).collect();
+        assert_eq!(stale, ["plot.png"], "only the workspace file reloads");
+        let again = cache.claim_with(ChatPane::Main, "plot.png", Some(&after), reload(), Some(&row)).unwrap();
+        assert!(cache.stale(ChatPane::Main, &after).is_empty());
+        assert!(Arc::ptr_eq(&cache.get("plot.png").unwrap(), &old), "the old image shows while it reloads");
+        cache.fill(first, png());
+        assert!(Arc::ptr_eq(&cache.get("plot.png").unwrap(), &old), "the earlier read keeps nothing");
+        let new = png();
+        cache.fill(again, new.clone());
+        assert!(Arc::ptr_eq(&cache.get("plot.png").unwrap(), &new));
+    }
+
+    #[test]
+    fn each_pane_reloads_a_workspace_file_on_its_own_mutations() {
+        let cache = ImageCache::default();
+        let (main, side) = (SharedString::from("reply"), super::super::chat::view_key(ChatPane::Side, "reply"));
+        let (main_at, side_at, side_later): (Revision, Revision, Revision) =
+            ((Some("main-1".into()), None), (Some("side-1".into()), None), (Some("side-2".into()), None));
+        let first =
+            cache.claim_with(ChatPane::Main, "plot.png", Some(&main_at), Some(plot_reload("local")), Some(&main));
+        cache.fill(first.unwrap(), BLANK.clone());
+        let side_read = cache.claim_with(ChatPane::Side, "plot.png", Some(&side_at), None, Some(&side));
+        assert!(side_read.is_some(), "the side chat reads the file at its own revision");
+        cache.fill(side_read.unwrap(), BLANK.clone());
+        assert!(cache.stale(ChatPane::Main, &main_at).is_empty());
+        assert!(cache.stale(ChatPane::Side, &side_at).is_empty(), "the panes do not undo each other's reads");
+        let stale = cache.stale(ChatPane::Side, &side_later);
+        let keys = stale.iter().map(|r| match r {
+            Reload::Row { key, destination, .. } => (key.clone(), destination.as_str()),
+            Reload::Attachment { .. } => unreachable!(),
+        });
+        assert_eq!(keys.collect::<Vec<_>>(), [(side.clone(), "plot.png")], "a side edit reloads through a side row");
+        assert!(cache.claim_with(ChatPane::Side, "plot.png", Some(&side_later), None, Some(&side)).is_some());
+        assert!(cache.claim_with(ChatPane::Main, "plot.png", Some(&main_at), None, Some(&main)).is_none());
+    }
+
+    #[test]
+    fn a_finished_load_names_every_row_that_shows_it() {
+        let cache = ImageCache::default();
+        let (first, second) = (SharedString::from("reply-1"), SharedString::from("reply-2"));
+        let claim = cache.claim_with(ChatPane::Main, "https://x.dev/a.png", None, None, Some(&first)).unwrap();
+        assert!(cache.claim_with(ChatPane::Main, "https://x.dev/a.png", None, None, Some(&second)).is_none());
+        assert!(cache.claim_with(ChatPane::Main, "https://x.dev/a.png", None, None, Some(&first)).is_none());
+        assert_eq!(cache.fill(claim, BLANK.clone()), [first, second]);
+    }
+
+    #[test]
+    fn sources_classify_like_the_web() {
+        assert_eq!(classify("https://x.dev/a.png", None), Source::Direct("https://x.dev/a.png".into()));
+        assert_eq!(classify("//x.dev/a.png", None), Source::Direct("https://x.dev/a.png".into()));
+        assert_eq!(classify("docs/a.png", Some("/repo")), Source::WorkspaceFile("/repo/docs/a.png".into()));
+        assert_eq!(classify("docs/a.png", Some("C:\\repo")), Source::WorkspaceFile("C:\\repo\\docs\\a.png".into()));
+        assert_eq!(classify("/tmp/a.png", None), Source::WorkspaceFile("/tmp/a.png".into()));
+        assert_eq!(classify("docs/a.png", None), Source::Blocked);
+        assert_eq!(classify("~/a.png", Some("/repo")), Source::Blocked);
+        assert_eq!(classify("javascript:alert(1)", Some("/repo")), Source::Blocked);
+        let share = Some(r"\\srv\proj");
+        assert_eq!(classify(r"\\srv\proj\a.png", share), Source::WorkspaceFile(r"\\srv\proj\a.png".into()));
+        assert_eq!(classify(r"\\srv\proj-secrets\a.png", share), Source::Blocked);
+        assert_eq!(classify(r"\\srv\proj\..\secrets\a.png", share), Source::Blocked);
+        assert_eq!(classify("docs/a.png", share), Source::WorkspaceFile(r"\\srv\proj\docs\a.png".into()));
+        assert_eq!(
+            classify("file:///workspace/project/image%20one.png", None),
+            Source::WorkspaceFile("/workspace/project/image one.png".into())
+        );
+        assert_eq!(
+            classify("docs/plot%20one.png", Some("/repo")),
+            Source::WorkspaceFile("/repo/docs/plot one.png".into())
+        );
+        assert_eq!(classify("/repo/100%.png", None), Source::WorkspaceFile("/repo/100%.png".into()));
+        assert_eq!(classify("file:///C:/repo/a%20b.png", None), Source::WorkspaceFile("C:/repo/a b.png".into()));
+        assert_eq!(classify("/C:/repo/a.png", None), Source::WorkspaceFile("C:/repo/a.png".into()));
+        assert_eq!(classify("<docs/a b.png>", Some("/repo")), Source::WorkspaceFile("/repo/docs/a b.png".into()));
+        assert_eq!(
+            classify("file://server/share/image.png", Some(r"\\server\share")),
+            Source::WorkspaceFile(r"\\server\share\image.png".into())
+        );
+        assert_eq!(classify("image.png", None), Source::Blocked);
+        assert_eq!(classify("file://%", None), Source::Blocked);
+        // Loading these makes Windows send the user's NTLM credentials to the named host.
+        let project = Some(r"\\server\share\project");
+        for source in [
+            "file://attacker.test/share/cat.jpg",
+            r"\\attacker.test\share\cat.jpg",
+            r"/\attacker.test\share\cat.jpg",
+            "file:/%5Cattacker.test%5Cshare%5Ccat.jpg",
+            "/%5C%5Cattacker.test/share/cat.jpg",
+            r"\\server\other\cat.jpg",
+        ] {
+            assert_eq!(classify(source, project), Source::Blocked, "{source}");
+        }
+        assert_eq!(
+            classify("data:image/png;base64,iVBO", None),
+            Source::Data(ImageFormat::Png, vec![0x89, 0x50, 0x4e])
+        );
+    }
+}

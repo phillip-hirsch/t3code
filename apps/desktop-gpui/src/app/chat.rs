@@ -1,0 +1,3362 @@
+//! The chat timeline: the virtualized message list and its rows. Geometry and
+//! colors follow `apps/web/src/components/chat/MessagesTimeline.tsx`, `WorkLog.tsx`
+//! and `index.css` (`.chat-markdown`).
+
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
+use std::sync::{Arc, LazyLock};
+use std::time::Duration;
+
+use gpui_kit::component::button::Button;
+use gpui_kit::component::highlighter::HighlightTheme;
+use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
+use gpui_kit::component::notification::Notification;
+use gpui_kit::component::text::{TextView, TextViewState, TextViewStyle};
+use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::component::{Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::{
+    AnyElement, App, AppContext as _, ClickEvent, Context, ElementId, Entity, Font, FontWeight, HighlightStyle, Hsla,
+    InteractiveElement as _, IntoElement, ListOffset, ParentElement as _, SharedString,
+    StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription, Task, TextRun, WeakEntity, Window,
+    div, linear_color_stop, linear_gradient, prelude::FluentBuilder as _, px, relative, rems, rgb,
+};
+
+use gpui_kit::assets::IconName;
+
+use super::side_chat::ChatPane;
+use super::{Target, Workspace, message_actions, timeline_anchor};
+use crate::model::ThreadProjection;
+use crate::theme::{self, Tokens};
+use crate::timeline::{self, DetailEntry, Row, Steer, WorkRow, WorkRowKind};
+use crate::work_log::{self, Activity, Entry, Status, WorkIcon};
+
+/// Prose: `text-sm` at `leading-relaxed`.
+const TEXT: f32 = 14.;
+const LINE: f32 = 22.75;
+/// `--guest`: fuchsia-500.
+const GUEST: u32 = 0xe12afb;
+/// A user message longer than this collapses (`shouldCollapseUserMessage`).
+const COLLAPSE_CHARS: usize = 600;
+const COLLAPSE_LINES: usize = 8;
+
+/// `shouldCollapseUserMessage`, measuring the text as it reads: links and citations as their labels.
+pub(super) fn should_collapse(text: &str) -> bool {
+    let visible = crate::assistant_citations::visible_prompt_text(text);
+    !visible.trim().is_empty()
+        && (crate::assistant_citations::js_len(&visible) > COLLAPSE_CHARS
+            || visible.split('\n').nth(COLLAPSE_LINES).is_some())
+}
+
+impl Workspace {
+    pub(super) fn render_body(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let t = *theme::tokens(cx);
+        let (lane, _) = self.chat_layout(window);
+        match (&self.target, &self.thread) {
+            // Home stays empty until the first-run gate decides (`FirstRunGate`'s pending state).
+            (None, _) if self.onboarding.pending() => div().into_any_element(),
+            // `IndexDraftLanding`: with no project the home asks what to work on, once every
+            // environment's shell has loaded, since a pending one can't prove there is none.
+            (None, _) if !self.shell.projects.iter().any(|p| p.archived_at.is_none()) => {
+                if self.shells_bootstrapped(cx) { self.no_projects_hero(window, cx) } else { div().into_any_element() }
+            }
+            (None, _) => no_thread(&t),
+            // The draft stage (`render_draft_stage`) draws drafts; nothing else does.
+            (Some(Target::Draft { .. }), _) => div().into_any_element(),
+            // `emptyPlaceholderInset`: the notes center in the space the composer leaves.
+            (Some(Target::Thread { .. }), Some(thread)) if thread.state.projection.is_none() => v_flex()
+                .size_full()
+                .pb(px(self.composer_height))
+                .child(centered_note("Loading thread…", &t))
+                .into_any_element(),
+            (Some(Target::Thread { .. }), _) if self.rows.is_empty() => v_flex()
+                .size_full()
+                .pb(px(self.composer_height))
+                .child(centered_note("Send a message to start the conversation.", &t))
+                .into_any_element(),
+            (Some(Target::Thread { .. }), _) => {
+                let rows = self.rows.clone();
+                let this = cx.weak_entity();
+                let minimap = self.render_minimap(lane.left, window, cx);
+                let lane_width = lane.width;
+                // The list keeps its top row's pixel offset across a width change, so reflowed text
+                // would slide under it; anchor that row proportionally instead, as the browser keeps
+                // what was in view.
+                let previous = self.timeline_lane_width.replace(lane_width);
+                if previous > 0. && (previous - lane_width).abs() >= 0.5 {
+                    self.scroller.update(cx, gpui_kit::component::message_scroller::MessageScrollerState::remeasure);
+                }
+                let composer = self.composer_height;
+                let (end_space, anchored) = self.settle_timeline_anchor(window, cx);
+                // `.chat-scroll-to-bottom` spans the lane, not the canvas, and clears the composer.
+                let pill_offset = lane.left - lane.right;
+                let mut jump_style = StyleRefinement::default().mb(px(composer - 6.));
+                if pill_offset > 0. {
+                    jump_style = jump_style.ml(px(pill_offset));
+                } else if pill_offset < 0. {
+                    jump_style = jump_style.mr(px(-pill_offset));
+                }
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .relative()
+                    .child(
+                        self.embeds.clip_scope(
+                            MessageScroller::new(
+                                "timeline",
+                                self.scroller.clone(),
+                                move |index, window, cx| match rows.get(index) {
+                                    Some(row) => render_row(row, ChatPane::Main, &this, lane_width, window, cx),
+                                    None => div().into_any_element(),
+                                },
+                            )
+                            // Top spacer `h-4`; rows carry their own bottom space.
+                            // The list's side padding becomes every row's inset: that is the lane.
+                            .with_list_style(
+                                StyleRefinement::default()
+                                    .pt(px(16.))
+                                    .pb(px(16. + composer + end_space))
+                                    .pl(px(lane.left))
+                                    .pr(px(lane.right)),
+                            )
+                            .with_row_style(StyleRefinement::default().pb(px(0.)))
+                            // Pinned to an anchored message, the list is at its live end.
+                            .jump_button(!anchored)
+                            .with_jump_button_label("Scroll to end")
+                            .with_jump_button_style(jump_style)
+                            .with_jump_button_renderer(move |button| scroll_to_end_button(button, &t)),
+                            // Embeds stop at the composer floating over the timeline's bottom.
+                            px(composer),
+                        ),
+                    )
+                    .children(minimap)
+                    .into_any_element()
+            }
+        }
+    }
+
+    /// The parsed markdown for `key`, kept across frames; see [`MarkdownStates`].
+    fn markdown_state(
+        &mut self,
+        key: SharedString,
+        text: &SharedString,
+        cx: &mut Context<Self>,
+    ) -> Entity<TextViewState> {
+        self.sync_side_markdown();
+        let chips = self.markdown.1;
+        let cached = self.markdown.0.get(&key).map(|state| (&*state.text, state.chips));
+        let reuse = markdown_reuse(cached, text, chips);
+        if reuse == Reuse::Keep {
+            return self.markdown.0[&key].view.clone();
+        }
+        let source: SharedString = self.with_skill_links(text).into();
+        let source_hash = hash_source(&source);
+        self.load_markdown_images(&key, &source, cx);
+        if let Some(state) = self.markdown.0.get_mut(&key) {
+            state.chips = chips;
+            if reuse == Reuse::Rebuild || state.source_hash != source_hash {
+                state.text = text.clone();
+                state.source = source.clone();
+                state.source_hash = source_hash;
+                state.view.update(cx, |view, cx| view.set_text(&source, cx));
+            }
+            return state.view.clone();
+        }
+        let view = cx.new(|cx| TextViewState::markdown(&source, cx));
+        let row_key = key.clone();
+        let _changed = cx.observe(&view, move |this, _, cx| {
+            this.remeasure_markdown_row(&row_key, cx);
+            this.paint_find(&row_key, cx);
+            this.paint_citation(&row_key, cx);
+        });
+        let state = MarkdownState {
+            view: view.clone(),
+            text: text.clone(),
+            source,
+            source_hash,
+            chips,
+            nowrap: false,
+            _changed,
+        };
+        self.markdown.0.insert(key.clone(), state);
+        self.paint_find(&key, cx);
+        view
+    }
+
+    /// Expands the image at `url` in the message `key` into the viewer, with the message's other
+    /// images as its gallery.
+    fn open_markdown_image(&mut self, key: &str, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = self.markdown.0.get(key).map(|state| state.text.clone()) else { return };
+        if let Some((items, index)) = self.markdown_gallery(&text, url) {
+            let owner = self.pane_owner(view_pane(key).0);
+            self.open_owned_image_viewer(owner, items, index, window, cx);
+        }
+    }
+
+    /// The markdown view kept under the view key `key`, if it has rendered.
+    pub(super) fn markdown_view(&self, key: &str) -> Option<Entity<TextViewState>> {
+        self.markdown.0.get(key).map(|state| state.view.clone())
+    }
+
+    /// Re-lays out `key`'s markdown, whose row remeasures (see [`Self::markdown_state`]). What
+    /// loads for an item under its main view key re-lays out its side chat view too.
+    pub(super) fn relayout_markdown(&mut self, key: &str, cx: &mut Context<Self>) {
+        let side = (view_pane(key).0 == ChatPane::Main).then(|| view_key(ChatPane::Side, key));
+        for key in std::iter::once(key).chain(side.as_deref()) {
+            if let Some(state) = self.markdown.0.get(key) {
+                state.view.update(cx, |_, cx| cx.notify());
+            }
+        }
+    }
+
+    /// The view keys of `pane`'s markdown.
+    pub(super) fn markdown_keys(&self, pane: ChatPane) -> Vec<SharedString> {
+        self.markdown.0.keys().filter(|key| view_pane(key).0 == pane).cloned().collect()
+    }
+
+    /// The side chat's markdown goes once the tab shows another thread or none, as its timeline
+    /// unmounts; the main pane's goes with its thread (`reset_timeline`).
+    pub(super) fn sync_side_markdown(&mut self) {
+        let shown = self.pane_thread(ChatPane::Side);
+        if self.markdown.2 != shown {
+            self.markdown.0.retain(|key, _| view_pane(key).0 == ChatPane::Main);
+            self.markdown.2 = shown;
+        }
+    }
+
+    /// Remeasures the row showing the view key `key`, in its pane.
+    fn remeasure_markdown_row(&self, key: &str, cx: &mut Context<Self>) {
+        let (pane, item) = view_pane(key);
+        let (rows, scroller) = match (pane, &self.side_chat.view) {
+            (ChatPane::Main, _) => (&self.rows, &self.scroller),
+            (ChatPane::Side, Some(side)) => (&side.rows, &side.scroller),
+            (ChatPane::Side, None) => return,
+        };
+        // The streaming message is near the end.
+        if let Some(index) = rows.iter().rposition(|row| shows_markdown(row, item)) {
+            scroller.update(cx, |scroller, cx| scroller.remeasure_items(index..index + 1, cx));
+        }
+    }
+
+    /// Remeasures the rows showing the view key `key`'s item in either pane: an image one pane
+    /// loaded draws in the other's copy of the item too, which found it already claimed.
+    pub(super) fn remeasure_item_rows(&self, key: &str, cx: &mut Context<Self>) {
+        let item = view_pane(key).1;
+        for pane in [ChatPane::Main, ChatPane::Side] {
+            self.remeasure_markdown_row(&view_key(pane, item), cx);
+        }
+    }
+
+    fn toggle_code_wrap(&mut self, key: &str, cx: &mut Context<Self>) {
+        if let Some(state) = self.markdown.0.get_mut(key) {
+            state.nowrap = !state.nowrap;
+            self.remeasure_markdown_row(key, cx);
+            cx.notify();
+        }
+    }
+
+    /// The work groups, turn folds and entries open in `pane`'s timeline.
+    fn pane_expanded(&mut self, pane: ChatPane) -> Option<&mut HashSet<SharedString>> {
+        match pane {
+            ChatPane::Main => Some(&mut self.expanded),
+            ChatPane::Side => self.side_chat.view.as_mut().map(|view| &mut view.expanded),
+        }
+    }
+
+    pub(super) fn is_expanded(&self, pane: ChatPane, key: &str) -> bool {
+        match pane {
+            ChatPane::Main => self.expanded.contains(key),
+            ChatPane::Side => self.side_chat.view.as_ref().is_some_and(|view| view.expanded.contains(key)),
+        }
+    }
+
+    /// Opens or closes a work group, turn fold or entry in `pane`, holding the toggled heading
+    /// where it is on screen (`preserveDisclosurePosition`).
+    pub(super) fn toggle_expanded(&mut self, pane: ChatPane, key: SharedString, cx: &mut Context<Self>) {
+        let Some(expanded) = self.pane_expanded(pane) else { return };
+        if !expanded.remove(&key) {
+            expanded.insert(key);
+        }
+        let running = |projection: Option<&ThreadProjection>| projection.is_some_and(ThreadProjection::is_running);
+        let main_rows = Rc::clone(&self.rows);
+        let main_top = disclosure_anchor(&self.scroller, running(self.open_projection()), cx);
+        let side_running = running(self.side_chat_projection());
+        let side = self.side_chat.view.as_ref().map(|view| {
+            (view.scroller.clone(), Rc::clone(&view.rows), disclosure_anchor(&view.scroller, side_running, cx))
+        });
+        self.refresh_rows(cx);
+        self.refresh_side_chat_rows(cx);
+        hold_top(&self.scroller, &main_rows, &self.rows, main_top, cx);
+        if let (Some((scroller, rows, top)), Some(view)) = (side, self.side_chat.view.as_ref()) {
+            hold_top(&scroller, &rows, &view.rows, top, cx);
+        }
+        cx.notify();
+    }
+
+    /// Keeps a once-a-second repaint alive while a "Working for …" row shows.
+    pub(super) fn sync_working_tick(&mut self, rows: &[Row], cx: &mut Context<Self>) {
+        sync_tick(&mut self._working_tick, rows, cx);
+    }
+
+    /// `anchorNewTurn`: sending returns the timeline to its end, and holds the thread's first
+    /// message near the top while its reply streams in.
+    pub(super) fn anchor_new_turn(&mut self, message_id: SharedString, cx: &mut Context<Self>) {
+        self.timeline_anchor.get_mut().arm(message_id);
+        self.scroller.update(cx, gpui_kit::component::message_scroller::MessageScrollerState::scroll_to_end);
+    }
+
+    /// Anchors a run another client started while the end was followed, and lets the anchor go
+    /// once its run works or finishes.
+    pub(super) fn sync_timeline_anchor(&mut self, cx: &mut Context<Self>) {
+        let Some(thread) = self.thread.as_ref() else { return };
+        let projection = thread.state.projection.as_ref();
+        let following = self.scroller.read(cx).is_following_tail();
+        let anchor = self.timeline_anchor.get_mut();
+        let run =
+            projection.and_then(|p| p.runs.iter().rev().find(|run| crate::model::is_active_run_status(&run.status)));
+        let observation = timeline_anchor::RunObservation {
+            thread: thread.id.clone(),
+            hydrated: projection.is_some(),
+            run: run.map(|run| run.id.clone()),
+        };
+        let queued = run.is_some_and(|run| run.status == "queued");
+        let message = run.and_then(|run| run.user_message_id.as_deref());
+        anchor.observe(observation, queued, message, following || anchor.is_pinned());
+        if projection.is_some_and(|projection| anchor.run_moved_on(projection)) {
+            let pinned = anchor.is_pinned();
+            anchor.release();
+            let last = self.rows.len().saturating_sub(1);
+            self.scroller.update(cx, |scroller, cx| {
+                scroller.remeasure_items(last..last + 1, cx);
+                if pinned {
+                    scroller.scroll_to_end(cx);
+                }
+            });
+        }
+    }
+
+    /// Places the anchored message from the list's last layout: the end space under the last
+    /// row, and whether the list is pinned to the message.
+    fn settle_timeline_anchor(&self, window: &mut Window, cx: &mut Context<Self>) -> (f32, bool) {
+        use timeline_anchor::{AnchorRow, Layout, Settle};
+        let mut anchor = self.timeline_anchor.borrow_mut();
+        let Some(message) = anchor.message() else { return (0., false) };
+        let row = timeline_anchor::anchor_row(&self.rows, &timeline_anchor::row_id(self.open_projection(), message));
+        let layout = match row {
+            AnchorRow::First(index) => {
+                let scroller = self.scroller.read(cx);
+                let bounds = |ix: usize| scroller.bounds_for_item(ix);
+                Some(Layout {
+                    index,
+                    rows: self.rows.len(),
+                    top: scroller.logical_scroll_top(),
+                    viewport_height: scroller.viewport_bounds().size.height,
+                    anchor_top: bounds(index).map(|b| b.top()),
+                    previous_height: index.checked_sub(1).and_then(bounds).map(|b| b.size.height),
+                    last_bottom: self.rows.len().checked_sub(1).and_then(bounds).map(|b| b.bottom()),
+                })
+            }
+            AnchorRow::Missing | AnchorRow::NotFirst => None,
+        };
+        let last = self.rows.len().saturating_sub(1);
+        match anchor.settle(row, layout) {
+            Settle::Idle => {}
+            Settle::Wait => window.request_animation_frame(),
+            Settle::Released { to_end } => self.scroller.update(cx, |scroller, cx| {
+                scroller.remeasure_items(last..last + 1, cx);
+                if to_end {
+                    scroller.scroll_to_end(cx);
+                }
+            }),
+            Settle::Placed { remeasure, pin } => self.scroller.update(cx, |scroller, cx| {
+                if remeasure {
+                    scroller.remeasure_items(last..last + 1, cx);
+                }
+                if let Some(pin) = pin {
+                    scroller.scroll_to_offset(pin, cx);
+                }
+            }),
+        }
+        (anchor.end_space(), anchor.is_pinned())
+    }
+}
+
+/// The top a disclosure toggle holds, so rows opening or closing below it don't move it. Holding
+/// ends tail following until the reader scrolls back to the end, so a running turn that follows
+/// its tail keeps following; a jump to the end that has not landed yet holds nothing.
+fn held_top(running: bool, following: bool, top: ListOffset, rows: usize) -> Option<ListOffset> {
+    (!(running && following) && top.item_ix < rows).then_some(top)
+}
+
+fn disclosure_anchor(scroller: &Entity<MessageScrollerState>, running: bool, cx: &App) -> Option<ListOffset> {
+    let scroller = scroller.read(cx);
+    held_top(running, scroller.is_following_tail(), scroller.logical_scroll_top(), scroller.item_count())
+}
+
+/// Puts a timeline whose rows the toggle changed back at `top`; one it left alone keeps following.
+fn hold_top(
+    scroller: &Entity<MessageScrollerState>,
+    before: &Rc<[Row]>,
+    after: &Rc<[Row]>,
+    top: Option<ListOffset>,
+    cx: &mut App,
+) {
+    if let Some(top) = top.filter(|_| !Rc::ptr_eq(before, after)) {
+        scroller.update(cx, |scroller, cx| scroller.scroll_to_offset(top, cx));
+    }
+}
+
+/// Each message's markdown, owned here instead of in GPUI's per-frame element
+/// state. That state drops when a row leaves the list's rendered range, and a
+/// document over 4 KiB parses on a background thread, so a row measured off
+/// screen reported a near-empty height that the list kept: the scroll extent
+/// came up short, the tail never resumed and "Scroll to end" stuck. Owned, a
+/// parse survives scrolling, and a landed parse remeasures its row.
+///
+/// The second field counts changes to the skills and models chips resolve against, so a
+/// message that names one rebuilds once they change and other messages stay parsed. Views are
+/// kept by view key ([`view_key`]); the third field is the side chat thread the side ones show.
+#[derive(Default)]
+pub(super) struct MarkdownStates(HashMap<SharedString, MarkdownState>, u64, Option<(SharedString, String)>);
+
+impl MarkdownStates {
+    pub(super) fn chips_changed(&mut self) {
+        self.1 = self.1.wrapping_add(1);
+    }
+}
+
+struct MarkdownState {
+    view: Entity<TextViewState>,
+    text: SharedString,
+    /// The markdown the view parsed, which its source spans index.
+    source: SharedString,
+    /// The chip-linked source it parsed, hashed.
+    source_hash: u64,
+    /// [`MarkdownStates`]' chip count when it parsed.
+    chips: u64,
+    /// The code-block wrap toggle is off (`wordWrap` defaults on).
+    nowrap: bool,
+    _changed: Subscription,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Reuse {
+    Keep,
+    /// The chip lists changed under text that can name a skill or model.
+    Recheck,
+    Rebuild,
+}
+
+/// What a cached message's markdown needs before it shows `text` with chip count `chips`.
+fn markdown_reuse(cached: Option<(&str, u64)>, text: &str, chips: u64) -> Reuse {
+    match cached {
+        Some((cached, _)) if cached != text => Reuse::Rebuild,
+        None => Reuse::Rebuild,
+        Some((_, seen)) if seen != chips && super::markdown_ui::may_hold_chips(text) => Reuse::Recheck,
+        Some(_) => Reuse::Keep,
+    }
+}
+
+fn hash_source(source: &str) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    source.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The key an open entry's markdown and images load under, so its row remeasures when they land.
+pub(super) fn thought_key(entry_id: &str) -> SharedString {
+    format!("thought:{entry_id}").into()
+}
+
+const SIDE_VIEW: &str = "side:";
+
+/// What a pane's view of an item (a message id, `thought:{entry}`, ...) and the state drawn for
+/// it are kept under: the main timeline's under the item's key, the side chat's apart, so a
+/// message both show (a fork inherits it) has its own view, selection and media in each.
+pub(super) fn view_key(pane: ChatPane, key: &str) -> SharedString {
+    match pane {
+        ChatPane::Main => SharedString::from(key.to_owned()),
+        ChatPane::Side => format!("{SIDE_VIEW}{key}").into(),
+    }
+}
+
+/// The pane and item key of a view key.
+pub(super) fn view_pane(key: &str) -> (ChatPane, &str) {
+    match key.strip_prefix(SIDE_VIEW) {
+        Some(item) => (ChatPane::Side, item),
+        None => (ChatPane::Main, key),
+    }
+}
+
+pub(super) fn shows_markdown(row: &Row, key: &str) -> bool {
+    let thought = key.strip_prefix("thought:");
+    match row {
+        Row::User { id, .. } | Row::Assistant { id, .. } | Row::Plan { id, .. } => id == key,
+        Row::Workflow { row, .. } => key.strip_prefix("workflow-script:") == Some(row.opening.message_id.as_str()),
+        Row::Work(WorkRow { kind: WorkRowKind::Single { entry, .. }, .. }) => thought == Some(&*entry.id),
+        Row::Work(WorkRow { kind: WorkRowKind::Details { entries }, .. }) => {
+            thought.is_some_and(|id| entries.iter().any(|detail| *detail.entry.id == *id))
+        }
+        _ => false,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum MarkdownKind {
+    Assistant {
+        streaming: bool,
+    },
+    /// `lineBreaks` and `headingLevelOffset={3}`: a typed newline is a line break.
+    User,
+}
+
+/// `ChatMarkdown` for `text` in `pane`, parsed once per item `key` while the pane shows the thread.
+pub(super) fn markdown(
+    this: &WeakEntity<Workspace>,
+    pane: ChatPane,
+    key: &str,
+    text: &SharedString,
+    streaming: bool,
+    t: &Tokens,
+    cx: &mut App,
+) -> AnyElement {
+    markdown_with(this, view_key(pane, key), text, MarkdownKind::Assistant { streaming }, None, None, t, cx)
+}
+
+/// `key` is the view key ([`view_key`]).
+fn markdown_with(
+    this: &WeakEntity<Workspace>,
+    key: SharedString,
+    text: &SharedString,
+    kind: MarkdownKind,
+    width: Option<f32>,
+    content: Option<&Arc<timeline::UserContent>>,
+    t: &Tokens,
+    cx: &mut App,
+) -> AnyElement {
+    let key_for_view = key.clone();
+    match this.update(cx, |workspace, cx| {
+        let wrap = !workspace.markdown.0.get(&key).is_some_and(|state| state.nowrap);
+        let math = workspace.client_settings.values.get("mathRenderingEnabled") == &serde_json::Value::Bool(true);
+        let chips = (workspace.git_cwd(), workspace.entry_kinds.clone());
+        let state = workspace.markdown_state(key.clone(), text, cx);
+        let source = workspace.markdown.0.get(&key).map(|state| state.source.clone()).unwrap_or_default();
+        (state, source, wrap, workspace.markdown_images.clone(), math, chips)
+    }) {
+        Ok((state, source, wrap, images, math, chips)) => {
+            // A user message sits on its bubble; the media chip's page paints that around it.
+            let background = if kind == MarkdownKind::User { t.message_surface } else { t.background };
+            markdown_view(&state, &source, kind, key_for_view.clone(), wrap, width, math, this, chips, content, t)
+                .image_source(images.resolver())
+                .plugin(super::markdown_media::MarkdownMedia {
+                    workspace: this.clone(),
+                    key: key_for_view.clone(),
+                    background,
+                })
+                .when(math, |view| {
+                    let key = key_for_view;
+                    view.plugin(super::markdown_ui::InlineMath { workspace: this.clone(), key: key.clone() })
+                        .plugin(super::markdown_ui::DisplayMath { workspace: this.clone(), key })
+                })
+                .into_any_element()
+        }
+        Err(_) => div().into_any_element(),
+    }
+}
+
+fn scroll_to_end_button(
+    button: gpui_kit::component::button::Button,
+    t: &Tokens,
+) -> gpui_kit::component::button::Button {
+    use gpui_kit::component::IconName as ComponentIcon;
+    button
+        .xsmall()
+        .icon(Icon::new(ComponentIcon::ChevronDown).size(px(14.)))
+        .label("Scroll to end")
+        .h(px(24.))
+        .px(px(7.))
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .border_color(Hsla { a: t.border.a * 0.6, ..t.border })
+        // `surface-glass` blurs what it covers; with no backdrop blur, an opaque fill stands in.
+        .bg(t.background)
+        .text_color(t.foreground)
+}
+
+impl Workspace {
+    /// `NoProjectsHero`: what to work on, with Add project and, where an environment offers a
+    /// "No project" home, Start without a project.
+    fn no_projects_hero(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        use gpui_kit::component::Sizable as _;
+        use gpui_kit::component::button::{Button, ButtonVariants as _};
+        let t = *theme::tokens(cx);
+        let scratch = self.scratch_environment();
+        // `text-2xl sm:text-3xl`.
+        let (size, line) = if window.viewport_size().width >= px(640.) { (30., 36.) } else { (24., 32.) };
+        let add = Button::new("no-projects-add").primary().small().icon(IconName::Plus).label("Add project").on_click(
+            cx.listener(|this, _, window, cx| this.open_palette(super::palette::View::AddProject, window, cx)),
+        );
+        let without = scratch.clone().map(|environment| {
+            Button::new("no-projects-scratch")
+                .outline()
+                .small()
+                .icon(IconName::MessageSquareDashed)
+                .label("Start without a project")
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.start_scratch_thread(environment.clone(), None, window, cx);
+                }))
+        });
+        div()
+            .flex_1()
+            .flex()
+            .items_center()
+            .justify_center()
+            .p(px(48.))
+            .child(
+                v_flex()
+                    .w_full()
+                    .max_w(px(512.))
+                    .px(px(32.))
+                    .py(px(48.))
+                    .items_center()
+                    .text_center()
+                    .child(
+                        div()
+                            .text_size(px(size))
+                            .line_height(px(line))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(t.foreground)
+                            .child("What should we work on?"),
+                    )
+                    .child(div().mt(px(4.)).text_sm().text_color(t.muted_foreground).child(if scratch.is_none() {
+                        "Add a project to start your first thread."
+                    } else {
+                        "Add a project, or start without one."
+                    }))
+                    .child(h_flex().mt(px(24.)).justify_center().gap(px(8.)).child(add).children(without)),
+            )
+            .into_any_element()
+    }
+}
+
+fn no_thread(t: &Tokens) -> AnyElement {
+    div()
+        .flex_1()
+        .flex()
+        .items_center()
+        .justify_center()
+        .p(px(48.))
+        .child(
+            v_flex()
+                .w(px(512.))
+                .max_w_full()
+                .px(px(48.))
+                .py(px(32.))
+                .items_center()
+                .child(
+                    div()
+                        .text_xl()
+                        .line_height(px(28.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(t.foreground)
+                        .child("Pick a thread to continue"),
+                )
+                .child(
+                    div()
+                        .mt(px(4.))
+                        .text_size(px(TEXT))
+                        .line_height(px(20.))
+                        .text_color(t.muted_foreground)
+                        .child("Select an existing thread or create a new one to get started."),
+                ),
+        )
+        .into_any_element()
+}
+
+/// `DraftHeroProjectHeading`'s fit check: the one-line heading, measured at `text-3xl`, is
+/// no wider than the lane.
+fn heading_fits_inline(project: &str, width: f32, window: &Window) -> bool {
+    let font = window.text_style().font();
+    let size = rems(1.875).to_pixels(window.rem_size());
+    let gap = f32::from(rems(0.5).to_pixels(window.rem_size()));
+    let measure = |text: String, weight: FontWeight| {
+        let run = TextRun {
+            len: text.len(),
+            font: Font { weight, ..font.clone() },
+            color: Hsla::default(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        f32::from(window.text_system().shape_line(text.into(), size, &[run], None).width)
+    };
+    measure("What should we build in".into(), FontWeight::NORMAL)
+        + gap
+        + measure(format!("{project}?"), FontWeight::MEDIUM)
+        <= width
+}
+
+/// `InlineButton` text: medium weight, underlined on hover.
+fn inline_button(id: &'static str, label: SharedString, color: Hsla, hover: Hsla) -> gpui_kit::Stateful<gpui_kit::Div> {
+    div()
+        .id(id)
+        .min_w_0()
+        .max_w_full()
+        .truncate()
+        .cursor_pointer()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(color)
+        .hover(move |s| s.text_color(hover).underline())
+        .child(label)
+}
+
+fn headline_tooltip(text: SharedString) -> impl Fn(&mut Window, &mut App) -> gpui_kit::AnyView + 'static {
+    move |window, cx| Tooltip::new(text.clone()).build(window, cx)
+}
+
+impl Workspace {
+    /// A draft centers its composer in the chat area and hangs the headline
+    /// above it, out of flow like `ChatView`'s draft hero, so the composer sits
+    /// in the middle however tall the headline wraps.
+    pub(super) fn render_draft_stage(
+        &mut self,
+        project: &crate::model::ScopedId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (lane, _) = self.chat_layout(window);
+        let headline = self.render_draft_headline(project, lane.width, window, cx);
+        // `[@media(max-height:34rem)]:items-end`: short windows pin the composer to the bottom.
+        let short = f32::from(window.viewport_size().height) <= 544.;
+        div()
+            .size_full()
+            .flex()
+            .map(|el| if short { el.items_end() } else { el.items_center() })
+            .child(
+                div()
+                    .relative()
+                    .w_full()
+                    .child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .right_0()
+                            .bottom_full()
+                            .pl(px(lane.left))
+                            .pr(px(lane.right))
+                            .pb(px(16.))
+                            .child(headline),
+                    )
+                    .child(self.render_composer(window, cx)),
+            )
+            .into_any_element()
+    }
+
+    /// `DraftHeroHeadline`: "What should we build in **project**?" on one line when the
+    /// window is `lg` and it fits, else "What should we build?" over the project; then
+    /// "or start without a project". A "No project" draft asks "What should we work on?".
+    fn render_draft_headline(
+        &self,
+        project: &crate::model::ScopedId,
+        width: f32,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let t = *theme::tokens(cx);
+        let project = self.shell.project(project);
+        let is_scratch = self.draft_is_scratch();
+        let scratch_env = self.scratch_environment();
+        let viewport = f32::from(window.viewport_size().width);
+        // Tailwind's `sm` and `lg` breakpoints, in CSS px.
+        let title_size = if viewport >= 640. { rems(1.875) } else { rems(1.5) };
+        let lg = viewport >= 1024.;
+        if is_scratch && self.composer_triage {
+            return self.render_triage_hero(title_size, &t, cx);
+        }
+        // `[@media(max-height:28rem)]`: very short windows keep only the project name.
+        let terse = f32::from(window.viewport_size().height) <= 448.;
+        let open = self.draft_picker_open();
+        let focus = &self.draft_picker.trigger;
+        // `focus-visible:outline-2 outline-ring`, drawn outside the text as an outline is.
+        let ring = focus.is_focused(window) && window.last_input_was_keyboard();
+        let picker = |label: SharedString, tooltip: Option<SharedString>, cx: &mut Context<Self>| {
+            // `InlineButton tone="picker"`: underlined while its popup is open.
+            let trigger = inline_button("draft-project-picker", label, t.foreground, t.foreground)
+                .track_focus(focus)
+                .when(open, gpui_kit::Styled::underline)
+                .when_some(tooltip, |el, text| el.tooltip(headline_tooltip(text)))
+                .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
+                    this.toggle_draft_picker(!event.is_keyboard(), window, cx);
+                }))
+                .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
+                    let key = event.keystroke.key.as_str();
+                    if matches!(key, "down" | "up") && !event.keystroke.modifiers.modified() {
+                        cx.stop_propagation();
+                        this.open_draft_picker_from_key(key == "down", window, cx);
+                    }
+                }));
+            div()
+                .relative()
+                .min_w_0()
+                .max_w_full()
+                .child(trigger)
+                .when(ring, |el| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .top(px(-2.))
+                            .bottom(px(-2.))
+                            .left(px(-2.))
+                            .right(px(-2.))
+                            .border_2()
+                            .border_color(t.ring),
+                    )
+                })
+                .children(self.render_draft_picker(&t, window, cx))
+        };
+        let title = |el: gpui_kit::Div| {
+            el.w_full().text_size(title_size).line_height(rems(2.25)).text_color(t.foreground).justify_center()
+        };
+        let heading = match project.filter(|_| !is_scratch) {
+            Some(project) => {
+                let name = project.title.clone();
+                if terse {
+                    let size = if lg && heading_fits_inline(&name, width, window) { title_size } else { rems(1.) };
+                    title(h_flex()).text_size(size).child(picker(name.clone().into(), Some(name.into()), cx))
+                } else if lg && heading_fits_inline(&name, width, window) {
+                    title(h_flex().gap(rems(0.5))).child(div().flex_none().child("What should we build in")).child(
+                        h_flex()
+                            .min_w_0()
+                            .child(picker(name.clone().into(), Some(name.into()), cx))
+                            .child(div().flex_none().child("?")),
+                    )
+                } else {
+                    title(v_flex().items_center().gap(rems(0.5)))
+                        .child(div().text_center().child("What should we build?"))
+                        .child(
+                            h_flex()
+                                .max_w_full()
+                                .justify_center()
+                                .text_size(rems(1.))
+                                .line_height(rems(1.5))
+                                .child(picker(name.clone().into(), Some(name.into()), cx)),
+                        )
+                }
+            }
+            None if is_scratch => title(h_flex()).child("What should we work on?"),
+            None if !self.shell.projects.is_empty() => {
+                title(h_flex()).child(picker("Choose a project".into(), None, cx)).child("\u{a0}to start")
+            }
+            None => title(h_flex()).child("Add a project to start"),
+        };
+        let can_start_without = !is_scratch && !self.shell.projects.is_empty();
+        let subline = scratch_env.map(|scratch_env| {
+            let action = if is_scratch {
+                Some(picker("No project".into(), None, cx).into_any_element())
+            } else {
+                can_start_without.then(|| {
+                    let shortcut = self.shortcut_label("chat.newWithoutProject");
+                    inline_button(
+                        "start-without-project",
+                        "or start without a project".into(),
+                        t.muted_foreground,
+                        t.foreground,
+                    )
+                    .when_some(shortcut, |el, shortcut| el.tooltip(headline_tooltip(shortcut.into())))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.start_draft_without_project(scratch_env.clone(), window, cx);
+                    }))
+                    .into_any_element()
+                })
+            };
+            h_flex()
+                .mt(rems(0.5))
+                .h(rems(1.5))
+                .w_full()
+                .justify_center()
+                .text_size(rems(0.875))
+                .line_height(rems(1.25))
+                .children(action)
+        });
+        v_flex().w_full().items_center().child(heading).children(subline).into_any_element()
+    }
+
+    /// `TriageDraftHero`: "What went wrong?" over the machine and server version, and the
+    /// terminal command to copy.
+    fn render_triage_hero(&self, title_size: gpui_kit::Rems, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+        const COPY_ID: &str = "triage-command";
+        const ABOUT: &str =
+            "The agent reads T3 Code's logs and source here, and asks before it applies a fix or posts anything.";
+        let info = self.server_info();
+        let machine: SharedString =
+            info.environment_label.clone().map_or_else(|| "This machine".into(), SharedString::from);
+        let version = info.config.pointer("/environment/serverVersion").and_then(|v| v.as_str()).map(str::to_owned);
+        let copied = self.copy_feedback.id.as_deref() == Some(COPY_ID);
+        let machine = h_flex()
+            .id("triage-machine")
+            .min_w_0()
+            .child(div().truncate().font_weight(FontWeight::MEDIUM).text_color(t.foreground).child(machine))
+            .children(version.map(|version| {
+                div().flex_none().ml(rems(0.375)).text_color(t.muted_foreground).child(format!("v{version}"))
+            }))
+            .tooltip(headline_tooltip(ABOUT.into()));
+        let label: SharedString = if copied { "Copied".into() } else { "or run".into() };
+        let command = inline_button("triage-copy", label, t.muted_foreground, t.foreground)
+            .flex_none()
+            .when(!copied, |el| {
+                el.child(
+                    div()
+                        .ml(rems(0.25))
+                        .font_family(t.fonts.mono)
+                        .text_size(rems(0.75))
+                        .child(super::palette_actions::TRIAGE_CLI),
+                )
+            })
+            .tooltip(headline_tooltip("Copy command, for a terminal".into()))
+            .on_click(cx.listener(|this, _, _, cx| {
+                let command = super::palette_actions::TRIAGE_CLI.to_owned();
+                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(command));
+                this.copied(COPY_ID.into(), Duration::from_millis(1500), cx);
+            }));
+        v_flex()
+            .w_full()
+            .items_center()
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_center()
+                    .text_size(title_size)
+                    .line_height(rems(2.25))
+                    .text_color(t.foreground)
+                    .child("What went wrong?"),
+            )
+            .child(
+                h_flex()
+                    .mt(rems(0.5))
+                    .h(rems(1.5))
+                    .w_full()
+                    .justify_center()
+                    .gap(rems(0.375))
+                    .text_size(rems(0.875))
+                    .line_height(rems(1.25))
+                    .child(machine)
+                    .child(div().flex_none().text_color(t.muted_foreground).child("·"))
+                    .child(command),
+            )
+            .into_any_element()
+    }
+
+    /// `startScratch`: an empty draft opens the "No project" draft; one with content moves there.
+    fn start_draft_without_project(&mut self, env: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(client) = self.env_client(&env) else { return };
+        let origin = self.target.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = client.request("projects.ensureScratch", serde_json::json!({})).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let project_id = match result {
+                    Ok(value) => value["projectId"].as_str().map(str::to_owned),
+                    Err(error) => {
+                        window.push_notification(
+                            Notification::error(error.to_string()).title("Could not start without a project"),
+                            cx,
+                        );
+                        return;
+                    }
+                };
+                // A draft that moved on meanwhile stays where it is.
+                let Some(project_id) = project_id.filter(|_| this.target == origin) else { return };
+                let empty = this.composer.read(cx).value().trim().is_empty() && this.attachments.is_empty();
+                if empty || this.target_sending() {
+                    this.start_draft_in(env, project_id, window, cx);
+                } else {
+                    this.move_draft_to_project(env, project_id, cx);
+                }
+            });
+        })
+        .detach();
+    }
+}
+
+fn centered_note(text: &'static str, t: &Tokens) -> AnyElement {
+    div()
+        .flex_1()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(TEXT))
+        .line_height(px(20.))
+        .text_color(t.muted_foreground)
+        .child(text)
+        .into_any_element()
+}
+
+/// Keeps `tick` repainting once a second while `rows` show a running clock.
+pub(super) fn sync_tick(tick: &mut Option<Task<()>>, rows: &[Row], cx: &mut Context<Workspace>) {
+    let working = rows.iter().any(|row| match row {
+        Row::Working { started_at: Some(_) } => true,
+        Row::Now(line) => line.ticks(),
+        Row::Workflow { row, .. } => row.phases.iter().flat_map(|p| &p.2).chain(&row.unphased).any(|c| c.live),
+        Row::SubagentGroup { cards, .. } => cards.iter().any(|c| c.live),
+        Row::WorktreeSetup { snapshot, .. } => snapshot.phase == "running",
+        _ => false,
+    });
+    if !working {
+        *tick = None;
+    } else if tick.is_none() {
+        *tick = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+}
+
+/// A row in the lane (the scroller insets rows to it); owns its bottom space.
+pub(super) fn lane(bottom: f32, child: impl IntoElement) -> gpui_kit::Div {
+    div().w_full().pb(px(bottom)).child(child)
+}
+
+fn alpha(color: Hsla, factor: f32) -> Hsla {
+    Hsla { a: color.a * factor, ..color }
+}
+
+/// A `<button>`, or a `role="button"` row: a tab stop that Enter and Space click, with
+/// `focus-visible:ring-2 ring-inset ring-ring/70`, an inset shadow so nothing moves.
+pub(super) fn focusable(element: gpui_kit::Stateful<gpui_kit::Div>, t: &Tokens) -> gpui_kit::Stateful<gpui_kit::Div> {
+    ringed_tab_stop(element, alpha(t.ring, 0.7))
+}
+
+pub(super) fn focus_ring(t: &Tokens) -> gpui_kit::BoxShadow {
+    inset_ring(alpha(t.ring, 0.7))
+}
+
+/// [`focusable`] with `ring` as the ring's color (`focus-visible:ring-2 ring-inset`).
+pub(super) fn ringed_tab_stop(
+    element: gpui_kit::Stateful<gpui_kit::Div>,
+    ring: Hsla,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
+    let ring = inset_ring(ring);
+    element.tab_index(0).focus_visible(move |style| style.shadow(vec![ring]))
+}
+
+/// `ring-2 ring-inset` in `ring`: an inset shadow, so nothing moves.
+pub(super) fn inset_ring(ring: Hsla) -> gpui_kit::BoxShadow {
+    gpui_kit::BoxShadow::new(px(0.), px(0.), ring).spread_radius(px(2.)).inset()
+}
+
+fn toggle(
+    this: &WeakEntity<Workspace>,
+    pane: ChatPane,
+    key: SharedString,
+) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
+    let this = this.clone();
+    move |_, _, cx| {
+        let _ = this.update(cx, |workspace, cx| workspace.toggle_expanded(pane, key.clone(), cx));
+    }
+}
+
+/// A response's fork source, which a side chat never offers: a fork would promote it.
+fn main_fork(pane: ChatPane, fork: Option<&(SharedString, SharedString)>) -> Option<&(SharedString, SharedString)> {
+    fork.filter(|_| pane == ChatPane::Main)
+}
+
+pub(super) fn render_row(
+    row: &Row,
+    pane: ChatPane,
+    this: &WeakEntity<Workspace>,
+    lane_width: f32,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let t = *theme::tokens(cx);
+    match row {
+        Row::User {
+            id,
+            text,
+            steer,
+            grouped_with_previous,
+            grouped_with_next,
+            continues_steer,
+            created_at,
+            revert,
+            attribution,
+            content,
+        } => {
+            use super::user_message as attachments;
+            let expanded =
+                this.upgrade().is_some_and(|workspace| workspace.read(cx).is_expanded(pane, &timeline::entry_key(id)));
+            let fold = folded_message(attribution.as_ref(), &crate::user_message::plain_text(text), this, cx);
+            let actions = message_actions::user_actions(
+                this,
+                id,
+                text,
+                created_at,
+                revert.as_ref(),
+                Some("timeline-row"),
+                &t,
+                cx,
+            );
+            // A folded agent message and a guest's keep their attachments inside the bubble.
+            let guest = matches!(attribution, Some(timeline::Attribution::Guest { .. }));
+            let layout = crate::user_message::layout(content, text, fold.is_none() && !guest);
+            let corners = attachments::Corners {
+                top_right: *grouped_with_previous,
+                bottom_right: layout.media_above_text || *grouped_with_next,
+            };
+            let view = view_key(pane, id);
+            let media = attachments::media_block(&view, &layout, corners, this, &t, window, cx);
+            let (media_above, media_inside) = if layout.media_above_text { (media, None) } else { (None, media) };
+            let inside: Vec<AnyElement> = media_inside
+                .into_iter()
+                .chain(attachments::audio_block(&view, &layout, this, &t))
+                .chain(layout.file_cards_only.then(|| attachments::file_cards(&view, &layout, this, &t)))
+                .chain(attachments::file_list(&view, &layout, this, &t).filter(|_| !layout.file_cards_only))
+                .collect();
+            let body = (!layout.file_cards_only && !layout.audio_only && !text.trim().is_empty())
+                .then(|| markdown_with(this, view.clone(), text, MarkdownKind::User, None, Some(content), &t, cx));
+            let bare = layout.media_only || layout.file_cards_only || layout.audio_only;
+            user_row(
+                id,
+                text,
+                UserBody { media_above, attachments: inside, body, bare },
+                actions,
+                steer.filter(|_| !*continues_steer),
+                UserRowLook {
+                    pane,
+                    grouped_with_previous: *grouped_with_previous,
+                    grouped_with_next: *grouped_with_next,
+                    expanded,
+                    attribution: attribution.as_ref(),
+                    fold,
+                    probe: super::theme_inspect::probe(&["messageSurface", "messageForeground"], cx),
+                },
+                this,
+                &t,
+            )
+        }
+        Row::AssistantMeta { id, text, updated_at, status, fork } => {
+            let meta = message_actions::assistant_meta(
+                this,
+                id,
+                text,
+                false,
+                updated_at,
+                status,
+                main_fork(pane, fork.as_ref()),
+                Some("timeline-meta"),
+                &t,
+                cx,
+            );
+            lane(16., v_flex().group("timeline-meta").child(meta)).into_any_element()
+        }
+        Row::Assistant { id, text, streaming, terminal, updated_at, status, fork, changes, .. } => {
+            let body =
+                div().px(px(4.)).py(px(2.)).text_size(px(TEXT)).line_height(px(LINE)).text_color(t.chat_text()).child(
+                    markdown_with(
+                        this,
+                        view_key(pane, id),
+                        text,
+                        MarkdownKind::Assistant { streaming: *streaming },
+                        Some(lane_width - 8.),
+                        None,
+                        &t,
+                        cx,
+                    ),
+                );
+            // The finished reply's actions (`AssistantMessageMeta`) hold their space while hidden.
+            let meta = terminal.then(|| {
+                message_actions::assistant_meta(
+                    this,
+                    id,
+                    text,
+                    *streaming,
+                    updated_at,
+                    status,
+                    main_fork(pane, fork.as_ref()),
+                    Some("timeline-row"),
+                    &t,
+                    cx,
+                )
+            });
+            let changes = changes.as_ref().map(|c| super::changed_files::card(c, this, lane_width - 8., &t, cx));
+            lane(
+                if *terminal { 16. } else { 8. },
+                v_flex()
+                    .group("timeline-row")
+                    .child(body)
+                    .children(changes.map(|card| div().px(px(4.)).child(card)))
+                    .children(meta),
+            )
+            .into_any_element()
+        }
+        Row::Plan { id, plan } => plan_card(id, plan, pane, this, lane_width, cx, &t),
+        Row::Work(work) => work_row(work, pane, this, &t, cx),
+        Row::Working { started_at } => {
+            let label = match started_at.as_deref().and_then(crate::timestamp::parse_ms) {
+                Some(start) => format!("Working for {}", working_duration(now_ms() - start)),
+                None => "Working...".into(),
+            };
+            lane(6., rule_row(&t).child(h_flex().h(px(24.)).px(px(4.)).text_color(t.muted_foreground).child(label)))
+                .into_any_element()
+        }
+        Row::TurnFold { key, label, expanded, created_at } => {
+            let chevron = if *expanded { IconName::ChevronDown } else { IconName::ChevronRight };
+            let button = focusable(h_flex().id(ElementId::Name(key.clone())), &t)
+                .h(px(24.))
+                .px(px(4.))
+                .gap(px(4.))
+                .rounded(px(6.))
+                .cursor_pointer()
+                .text_color(t.muted_foreground)
+                .hover(|style| style.text_color(t.foreground))
+                .child(label.clone())
+                .child(Icon::new(chevron).size(px(14.)))
+                .on_click(toggle(this, pane, key.clone()));
+            let time = hover_timestamp(this, format!("time:{key}"), created_at, &t, cx);
+            lane(6., rule_row(&t).group("timeline-row").flex().items_center().child(button).children(time))
+                .into_any_element()
+        }
+        Row::Divider { label, failed, failure, .. } => {
+            let color = if *failed { t.error } else { t.muted_foreground };
+            let line_color = if *failed { alpha(t.error, 0.3) } else { alpha(t.border, 0.7) };
+            let line = || div().flex_1().h(px(1.)).bg(line_color);
+            let content = h_flex()
+                .gap(px(12.))
+                .py(px(6.))
+                .text_xs()
+                .text_color(color)
+                .child(line())
+                .child(
+                    h_flex()
+                        .min_w_0()
+                        .gap(px(6.))
+                        .child(
+                            Icon::new(if *failed { IconName::CircleAlert } else { IconName::Minimize2 }).size(px(12.)),
+                        )
+                        .children(compaction_label(label))
+                        .children(
+                            failure
+                                .as_ref()
+                                .map(|failure| div().min_w_0().truncate().opacity(0.8).child(format!("· {failure}"))),
+                        ),
+                )
+                .child(line());
+            lane(16., content).into_any_element()
+        }
+        Row::Event { label, .. } => {
+            let line = work_line(WorkIcon::Bot, icon_color(&t), label.clone(), t.muted_foreground, None);
+            lane(8., div().px(px(2.)).py(px(2.)).child(line)).into_any_element()
+        }
+        // Subagent rows carry no bottom space of their own.
+        Row::Subagent(card) => lane(0., subagent_card(card, this, &t, cx)).into_any_element(),
+        Row::SubagentGroup { key, cards, expanded } => {
+            lane(0., subagent_group(key, cards, *expanded, pane, this, &t, cx)).into_any_element()
+        }
+        // `HtmlRenderTimelineRow` and `McpAppTimelineRow`: the page or the app, inline.
+        Row::Embed(embed) => {
+            let body = this
+                .update(cx, |workspace, cx| match &embed.page {
+                    Some(size) => workspace.render_html_page(embed, pane, size, lane_width - 8., window, cx),
+                    None => workspace.render_mcp_app(embed, pane, lane_width - 8., window, cx),
+                })
+                .unwrap_or_else(|_| div().into_any_element());
+            lane(8., div().px(px(4.)).child(body)).into_any_element()
+        }
+        Row::CreatedThread { id, title, thread_id, .. } => {
+            lane(8., created_thread_card(id, title.as_ref(), thread_id.as_ref(), this, &t)).into_any_element()
+        }
+        Row::AttemptFold { key, expanded } => {
+            let chevron = if *expanded { IconName::ChevronDown } else { IconName::ChevronRight };
+            let button = focusable(h_flex().id(ElementId::Name(key.clone())), &t)
+                .w_full()
+                .gap(px(8.))
+                .px(px(10.))
+                .py(px(8.))
+                .rounded(px(6.))
+                .border_1()
+                .border_color(alpha(t.border, 0.6))
+                .bg(alpha(t.muted, 0.2))
+                .hover(|style| style.bg(alpha(t.muted, 0.35)))
+                .cursor_pointer()
+                .child(Icon::new(chevron).size(px(14.)).text_color(t.muted_foreground))
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(alpha(t.foreground, 0.8))
+                        .child("Superseded attempt"),
+                )
+                .child(div().text_size(px(11.)).text_color(t.muted_foreground).child("Cut off by a steer"))
+                .on_click(toggle(this, pane, key.clone()));
+            lane(8., button).into_any_element()
+        }
+        Row::Queued { message, last } => super::queue::queued_row(message, *last, pane, this, &t, cx),
+        Row::QueueToggle { total, expanded } => super::queue::toggle_row(*total, *expanded, pane, this, &t),
+        Row::Now(line) => super::thread_now::now_row(line, pane, this, lane_width, &t, window, cx),
+        Row::Workflow { row, expanded } => {
+            lane(16., super::workflow::workflow_row(row, *expanded, pane, this, lane_width, &t, cx)).into_any_element()
+        }
+        Row::WorktreeSetup { snapshot, embedded } => {
+            super::worktree_setup::setup_row(snapshot, *embedded, this, &t, cx)
+        }
+        Row::System(divider) => lane(8., system_divider(divider, this, &t)).into_any_element(),
+        Row::Request(card) => super::request_cards::request_row(card, pane, this, &t, window, cx),
+        Row::ModelSwitch { switch, .. } => {
+            let label = this.upgrade().and_then(|workspace| {
+                crate::handoff::model_switch_label(&switch.0, &switch.1, &workspace.read(cx).server_info().providers)
+            });
+            match label {
+                Some(label) => {
+                    let center = div().px(px(8.)).py(px(4.)).font_weight(FontWeight::MEDIUM).child(label);
+                    lane(8., divider_frame(center.into_any_element(), t.muted_foreground, &t)).into_any_element()
+                }
+                None => div().into_any_element(),
+            }
+        }
+        Row::Handoff(handoff) => lane(8., handoff_divider(handoff, this, &t, cx)).into_any_element(),
+        Row::Approval { request_id, .. } => this
+            .update(cx, |workspace, cx| {
+                let approvals = workspace.pane_projection(pane).map(|p| p.pending_approvals()).unwrap_or_default();
+                let (request, item) = approvals.into_iter().find(|(request, _)| request.id == request_id.as_ref())?;
+                Some(workspace.render_approval(pane, request, item, &t, cx))
+            })
+            .ok()
+            .flatten()
+            .map_or_else(|| div().into_any_element(), |approval| lane(0., approval).into_any_element()),
+    }
+}
+
+/// `TimelineSystemDivider`'s frame: `center` between hairlines, in `text-2xs`.
+fn divider_frame(center: AnyElement, color: Hsla, t: &Tokens) -> gpui_kit::Div {
+    let line = || div().flex_1().h(px(1.)).bg(alpha(t.border, 0.7));
+    h_flex()
+        .min_w_0()
+        .gap(px(8.))
+        .py(px(8.))
+        .text_size(px(11.))
+        .text_color(color)
+        .child(line())
+        .child(center)
+        .child(line())
+}
+
+/// `providerTextColor`: the provider's brand color for its name, where it has one.
+fn provider_text_color(driver: &str, t: &Tokens) -> Option<Hsla> {
+    match driver {
+        "codex" => Some(t.foreground),
+        "antigravity" => Some(rgb(0x5b87bf).into()),
+        _ => crate::assets::provider_icon(driver).and_then(|(_, tint)| tint),
+    }
+}
+
+/// `HandoffRow`: "Context handoff", then where it came from and went, each provider's icon and
+/// model; red when the handoff failed.
+fn handoff_divider(handoff: &timeline::HandoffRow, this: &WeakEntity<Workspace>, t: &Tokens, cx: &App) -> AnyElement {
+    let workspace = this.upgrade();
+    let providers = workspace.as_ref().map_or(&[][..], |w| w.read(cx).server_info().providers.as_slice());
+    let endpoint = |index: usize, endpoint: &crate::handoff::Endpoint| {
+        let (label, display) = crate::handoff::endpoint_label(endpoint, providers);
+        let driver = providers
+            .iter()
+            .find(|provider| provider.instance_id == endpoint.instance_id)
+            .map_or(endpoint.instance_id.as_str(), |provider| provider.driver.as_str());
+        let icon = match crate::assets::provider_icon(driver) {
+            Some((path, tint)) => Icon::empty().path(path).size(px(14.)).text_color(tint.unwrap_or(t.foreground)),
+            None => Icon::new(IconName::Bot).size(px(14.)),
+        };
+        let tooltip: SharedString = format!("{display} · {label}").into();
+        h_flex()
+            .id(ElementId::Name(format!("handoff:{}:{index}", handoff.id).into()))
+            .min_w_0()
+            .gap(px(6.))
+            .child(icon.flex_none())
+            .child(
+                div()
+                    .truncate()
+                    .font_weight(FontWeight::MEDIUM)
+                    .when_some(provider_text_color(driver, t), gpui_kit::Styled::text_color)
+                    .child(label),
+            )
+            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+    };
+    let count = handoff.endpoints.from.len();
+    let mut detail = h_flex().min_w_0().flex_wrap().justify_center().gap(px(6.)).opacity(0.7);
+    for (index, from) in handoff.endpoints.from.iter().enumerate() {
+        detail =
+            detail.child(endpoint(index, from).when(index + 1 < count, |el| el.child(div().ml(px(-4.)).child(","))));
+    }
+    if count > 0 {
+        detail = detail.child(Icon::new(IconName::ArrowRight).size(px(12.)).flex_none());
+    }
+    detail = detail.child(endpoint(count, &handoff.endpoints.to));
+    let center = h_flex()
+        .min_w_0()
+        .flex_wrap()
+        .justify_center()
+        .gap(px(6.))
+        .px(px(8.))
+        .py(px(4.))
+        .child(Icon::new(IconName::ArrowRightLeft).size(px(12.)).flex_none())
+        .child(div().font_weight(FontWeight::MEDIUM).child(if handoff.pending {
+            "Context handoff pending"
+        } else {
+            "Context handoff"
+        }))
+        .child(detail);
+    let color = if handoff.failed { t.error } else { t.muted_foreground };
+    divider_frame(center.into_any_element(), color, t).into_any_element()
+}
+
+/// `TimelineSystemDivider`: icon, label and detail between hairlines; a pill when it opens a thread.
+fn system_divider(divider: &timeline::SystemDivider, this: &WeakEntity<Workspace>, t: &Tokens) -> AnyElement {
+    let icon = match divider.icon {
+        timeline::DividerIcon::Stop => IconName::CircleStop,
+        timeline::DividerIcon::Fork => IconName::GitFork,
+        timeline::DividerIcon::Eraser => IconName::Eraser,
+    };
+    let content = |el: gpui_kit::Stateful<gpui_kit::Div>| {
+        el.flex()
+            .min_w_0()
+            .items_center()
+            .gap(px(6.))
+            .child(Icon::new(icon).size(px(12.)).flex_none())
+            .child(div().font_weight(FontWeight::MEDIUM).child(divider.label.clone()))
+            .children(
+                divider
+                    .detail
+                    .clone()
+                    .map(|d| div().min_w_0().max_w(px(320.)).opacity(0.7).child(format!("·\u{a0}{d}"))),
+            )
+    };
+    let center = match &divider.action {
+        Some((label, thread_id)) => {
+            let (this, thread_id, label) = (this.clone(), thread_id.clone(), label.clone());
+            focusable(content(div().id(ElementId::Name(format!("divider:{}", divider.id).into()))), t)
+                .px(px(10.))
+                .py(px(4.))
+                .rounded_full()
+                .border_1()
+                .border_color(alpha(t.border, 0.7))
+                .bg(t.background)
+                .cursor_pointer()
+                .hover(|style| style.bg(t.accent).text_color(t.foreground))
+                .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+                .on_click(move |_, window, cx| {
+                    let thread_id = thread_id.to_string();
+                    let _ = this.update(cx, |w, cx| w.select_thread_beside(thread_id, window, cx));
+                })
+                .into_any_element()
+        }
+        None => content(div().id(ElementId::Name(format!("divider:{}", divider.id).into())))
+            .flex_wrap()
+            .justify_center()
+            .px(px(8.))
+            .py(px(4.))
+            .into_any_element(),
+    };
+    divider_frame(center, t.muted_foreground, t).into_any_element()
+}
+
+/// "Open chat" on a created thread, "Open subagent" on a subagent's notification (`WorkEntryLogRow`).
+fn entry_open_link(entry: &Entry, this: &WeakEntity<Workspace>, t: &Tokens) -> Option<AnyElement> {
+    let raw = &entry.item.0.raw;
+    let text = |pointer: &str| raw.pointer(pointer).and_then(serde_json::Value::as_str).filter(|v| !v.is_empty());
+    let (label, thread_id, color) = match entry.item_type.as_ref() {
+        "thread_created" => ("Open chat", text("/targetThreadId")?, t.primary),
+        "notification" if matches!(text("/source/kind"), Some("subagent" | "delegated_task")) => {
+            ("Open subagent", text("/source/childThreadId")?, t.foreground)
+        }
+        _ => return None,
+    };
+    let (this, thread_id) = (this.clone(), thread_id.to_owned());
+    Some(
+        focusable(div().id(ElementId::Name(format!("open-thread:{}", entry.id).into())), t)
+            .flex_none()
+            .rounded(px(4.))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(color)
+            .cursor_pointer()
+            .hover(gpui_kit::Styled::underline)
+            .child(label)
+            .on_click(move |_, window, cx| {
+                cx.stop_propagation();
+                let thread_id = thread_id.clone();
+                let _ = this.update(cx, |w, cx| w.select_thread_beside(thread_id, window, cx));
+            })
+            .into_any_element(),
+    )
+}
+
+/// `SubagentTimelineLink`: avatar, title and detail, status, elapsed time, and a
+/// chevron when the subagent's thread can open.
+pub(super) fn subagent_card(
+    card: &timeline::SubagentCard,
+    this: &WeakEntity<Workspace>,
+    t: &Tokens,
+    cx: &App,
+) -> AnyElement {
+    let muted = t.muted_foreground;
+    let detail_color = if card.failed { t.error } else { muted };
+    let dot = match card.dot {
+        timeline::Dot::Info => t.info,
+        timeline::Dot::Muted => alpha(muted, 0.6),
+        timeline::Dot::Success => t.success_foreground,
+        timeline::Dot::Destructive => t.error,
+    };
+    let logo = crate::assets::provider_icon(&card.driver);
+    let avatar = div()
+        .relative()
+        .size(px(24.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .bg(t.secondary)
+        .child(match logo {
+            Some((path, tint)) => Icon::empty().path(path).size(px(14.)).text_color(tint.unwrap_or(t.foreground)),
+            None => Icon::new(IconName::Bot).size(px(14.)).text_color(muted),
+        })
+        .child(
+            div()
+                .absolute()
+                .right(px(-1.))
+                .bottom(px(-1.))
+                .size(px(8.))
+                .rounded_full()
+                .border_2()
+                .border_color(t.background)
+                .bg(dot),
+        );
+    let elapsed = card.started_at.as_deref().and_then(crate::timestamp::parse_ms).and_then(|start| {
+        let end = match card.completed_at.as_deref().and_then(crate::timestamp::parse_ms) {
+            Some(end) => end,
+            None if card.live => now_ms(),
+            None => return None,
+        };
+        Some(timeline::agent_elapsed(end - start))
+    });
+    let title = div().min_w_0().truncate().font_weight(FontWeight::MEDIUM).text_color(t.foreground);
+    let text = v_flex()
+        .flex_1()
+        .min_w_0()
+        .child(
+            h_flex().min_w_0().gap(px(8.)).text_xs().child(title.child(card.title.clone())).children(
+                card.remote
+                    .as_ref()
+                    .map(|remote| div().flex_none().text_color(muted).child(format!("on {}", remote.label))),
+            ),
+        )
+        .child(
+            div()
+                .truncate()
+                .text_size(px(11.))
+                .line_height(relative(1.625))
+                .text_color(detail_color)
+                .child(card.detail.clone().unwrap_or_else(|| card.status_label.into())),
+        );
+    let row = h_flex()
+        .id(ElementId::Name(format!("subagent:{}", card.id).into()))
+        .w_full()
+        .min_w_0()
+        .gap(px(10.))
+        .px(px(8.))
+        .py(px(6.))
+        .rounded(px(6.))
+        .child(avatar)
+        .child(text)
+        .children(
+            card.status_beside_detail
+                .then(|| div().flex_none().text_xs().text_color(detail_color).child(card.status_label)),
+        )
+        .children(elapsed.map(|elapsed| div().flex_none().text_xs().text_color(muted).child(elapsed)));
+    // A task in a linked environment opens there, if this client is connected to it.
+    let connected = |env: &str| this.upgrade().is_some_and(|workspace| workspace.read(cx).session(env).is_some());
+    let target = card.target(connected).map(|target| match target {
+        timeline::SubagentTarget::Local(child) => (None, child.to_string()),
+        timeline::SubagentTarget::Remote(remote) => (Some(remote.environment_id.clone()), remote.thread_id.to_string()),
+    });
+    match target {
+        Some((env, thread_id)) => {
+            let this = this.clone();
+            focusable(row, t)
+                .cursor_pointer()
+                .hover(|style| style.bg(alpha(t.accent, 0.2)))
+                .child(Icon::new(IconName::ChevronRight).size(px(14.)).text_color(alpha(muted, 0.6)))
+                .on_click(move |_, window, cx| {
+                    let (env, thread_id) = (env.clone(), thread_id.clone());
+                    let _ = this.update(cx, |workspace, cx| match env {
+                        Some(env) => workspace.select_thread_in(env, thread_id, window, cx),
+                        None => workspace.select_thread_beside(thread_id, window, cx),
+                    });
+                })
+                .into_any_element()
+        }
+        None => row.into_any_element(),
+    }
+}
+
+/// `V2SubagentGroup`: stacked avatars, "3 subagents" with their statuses, the batch's time,
+/// and the members' cards when open.
+fn subagent_group(
+    key: &SharedString,
+    cards: &[Rc<timeline::SubagentCard>],
+    expanded: bool,
+    pane: ChatPane,
+    this: &WeakEntity<Workspace>,
+    t: &Tokens,
+    cx: &App,
+) -> AnyElement {
+    let muted = t.muted_foreground;
+    let (summary, active, failed) = timeline::subagent_group_status(cards);
+    let (start, end, live) = timeline::subagent_group_timing(cards);
+    let elapsed = start.and_then(|start| {
+        let end = end.or(live.then(now_ms))?;
+        Some(timeline::agent_elapsed(end - start))
+    });
+    let avatar = |card: &timeline::SubagentCard| {
+        div()
+            .size(px(24.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .bg(t.secondary)
+            .border_2()
+            .border_color(t.background)
+            .child(match crate::assets::provider_icon(&card.driver) {
+                Some((path, tint)) => Icon::empty().path(path).size(px(14.)).text_color(tint.unwrap_or(t.foreground)),
+                None => Icon::new(IconName::Bot).size(px(14.)).text_color(muted),
+            })
+    };
+    let more = cards.len().saturating_sub(3);
+    let header = focusable(h_flex().id(ElementId::Name(key.clone())), t)
+        .w_full()
+        .min_w_0()
+        .gap(px(10.))
+        .py(px(8.))
+        .pr(px(13.))
+        .cursor_pointer()
+        .text_color(if expanded || active { t.foreground } else { muted })
+        .when(!expanded && !active, |el| el.opacity(0.55))
+        .hover(|style| style.opacity(1.))
+        .child(
+            h_flex()
+                .flex_none()
+                .children(
+                    cards.iter().take(3).enumerate().map(|(i, card)| avatar(card).when(i > 0, |el| el.ml(px(-6.)))),
+                )
+                .when(more > 0, |el| {
+                    el.child(
+                        div()
+                            .ml(px(-6.))
+                            .size(px(24.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .bg(t.muted)
+                            .border_2()
+                            .border_color(t.background)
+                            .text_size(px(9.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(muted)
+                            .child(format!("+{more}")),
+                    )
+                }),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).child(format!("{} subagents", cards.len())))
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(10.))
+                        .text_color(if active {
+                            t.info
+                        } else if failed {
+                            t.error
+                        } else {
+                            muted
+                        })
+                        .child(summary),
+                ),
+        )
+        .children(elapsed.map(|e| div().flex_none().text_xs().text_color(muted).child(e)))
+        .child(
+            Icon::new(if expanded { IconName::ChevronUp } else { IconName::ChevronDown })
+                .size(px(14.))
+                .text_color(muted),
+        )
+        .on_click(toggle(this, pane, key.clone()));
+    v_flex()
+        .w_full()
+        .pb(px(8.))
+        .child(header)
+        .when(expanded, |el| {
+            el.child(
+                v_flex()
+                    .mt(px(4.))
+                    .mb(px(4.))
+                    .p(px(4.))
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(alpha(t.border, 0.6))
+                    .bg(alpha(t.card, 0.3))
+                    .children(cards.iter().map(|card| subagent_card(card, this, t, cx))),
+            )
+        })
+        .into_any_element()
+}
+
+/// `V2LifecycleRow`'s `resourceSummary` card: a thread the turn created, with Open chat.
+fn created_thread_card(
+    id: &SharedString,
+    title: Option<&SharedString>,
+    thread_id: Option<&SharedString>,
+    this: &WeakEntity<Workspace>,
+    t: &Tokens,
+) -> AnyElement {
+    let open = thread_id.cloned().map(|thread_id| {
+        let this = this.clone();
+        move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+            let thread_id = thread_id.to_string();
+            let _ = this.update(cx, |workspace, cx| workspace.select_thread_beside(thread_id, window, cx));
+        }
+    });
+    h_flex()
+        .w_full()
+        .min_w_0()
+        .gap(px(12.))
+        .p(px(12.))
+        .rounded(px(8.))
+        .border_1()
+        .border_color(alpha(t.border, 0.6))
+        .child(
+            div()
+                .size(px(36.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(8.))
+                .bg(alpha(t.muted, 0.6))
+                .child(Icon::new(IconName::MessageSquare).size(px(16.)).text_color(t.muted_foreground)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_sm()
+                .font_weight(FontWeight::MEDIUM)
+                .child(title.cloned().unwrap_or_else(|| "Created thread".into())),
+        )
+        .child(
+            Button::new(ElementId::Name(format!("open-created:{id}").into()))
+                .outline()
+                .xsmall()
+                .label("Open chat")
+                .when_some(open, |button, open| button.on_click(open)),
+        )
+        .into_any_element()
+}
+
+impl Workspace {
+    /// Opens a file sent with an answer through a signed URL, as its link does on the web.
+    fn open_answer_attachment(&mut self, attachment_id: &str, cx: &mut Context<Self>) {
+        let (Some(client), Some(base)) = (self.client(), self.http_base().map(str::to_owned)) else { return };
+        let resource = serde_json::json!({"_tag": "attachment", "attachmentId": attachment_id});
+        cx.spawn(async move |_, cx| {
+            match client.request("assets.createUrl", serde_json::json!({"resource": resource})).await {
+                Ok(signed) => match signed["relativeUrl"].as_str() {
+                    Some(url) => cx.update(|cx| cx.open_url(&format!("{base}{url}"))),
+                    None => log::debug!("assets.createUrl for an answer attachment returned no URL"),
+                },
+                Err(error) => log::debug!("assets.createUrl for an answer attachment: {error}"),
+            }
+        })
+        .detach();
+    }
+}
+
+/// "Context compacted 120K → 40K tokens", with the arrow drawn as `ArrowRight`.
+fn compaction_label(label: &SharedString) -> Vec<AnyElement> {
+    match label.split_once(" → ") {
+        Some((before, after)) => vec![
+            div().child(before.to_owned()).into_any_element(),
+            Icon::new(IconName::ArrowRight).size(px(12.)).into_any_element(),
+            div().child(after.to_owned()).into_any_element(),
+        ],
+        None => vec![div().child(label.clone()).into_any_element()],
+    }
+}
+
+/// The working row and turn folds: a hairline under a 24px label line.
+/// `TimelineRowTimestamp`: the row's time at its end, shown while the row is hovered.
+fn hover_timestamp(
+    this: &WeakEntity<Workspace>,
+    id: String,
+    iso: &SharedString,
+    t: &Tokens,
+    cx: &App,
+) -> Option<AnyElement> {
+    let time = message_actions::timestamp(this, id.into(), iso, t, cx)?;
+    Some(
+        div()
+            .flex_none()
+            .ml_auto()
+            .mr(px(4.))
+            .opacity(0.)
+            .group_hover("timeline-row", |s| s.opacity(1.))
+            .child(time)
+            .into_any_element(),
+    )
+}
+
+fn rule_row(t: &Tokens) -> gpui_kit::Div {
+    div()
+        .pt(px(4.))
+        .pb(px(8.))
+        .border_b_1()
+        .border_color(alpha(t.border, 0.6))
+        .text_size(px(TEXT))
+        .line_height(px(LINE))
+}
+
+use super::sidebar::now_ms;
+
+/// `formatWorkingTimer`: whole seconds, then `formatDuration`.
+fn working_duration(ms: i64) -> String {
+    let seconds = ms.max(0) / 1000;
+    if seconds < 60 { format!("{seconds}s") } else { work_log::format_duration(seconds * 1000) }
+}
+
+// ---------------------------------------------------------------------------
+// Messages
+
+/// What a user message bubble holds.
+struct UserBody {
+    /// Media sent with words, standing above the bubble as its own shape.
+    media_above: Option<AnyElement>,
+    /// Attachments inside the bubble, above the words.
+    attachments: Vec<AnyElement>,
+    body: Option<AnyElement>,
+    /// Only media, cards or a recording, each with its own shape: no surface around them.
+    bare: bool,
+}
+
+/// How a user message bubble sits among its neighbours, and how much of it shows.
+struct UserRowLook<'a> {
+    pane: ChatPane,
+    grouped_with_previous: bool,
+    grouped_with_next: bool,
+    expanded: bool,
+    attribution: Option<&'a timeline::Attribution>,
+    fold: Option<FoldedMessage>,
+    /// The theme inspector's mark for the bubble.
+    probe: Option<AnyElement>,
+}
+
+/// An agent's or an automation's message folds to one line: who sent it, then a summary
+/// (`FoldedMessageHeader`).
+struct FoldedMessage {
+    icon: IconName,
+    label: SharedString,
+    summary: SharedString,
+    link: Option<FoldLink>,
+    /// An agent's message keeps its actions while folded; an automation's show once it opens.
+    actions_when_folded: bool,
+}
+
+/// "Open thread" on an agent's message, "Open automation" on a scheduled task's.
+enum FoldLink {
+    Thread(SharedString),
+    /// The task, on the open thread's environment (`?environmentId&taskId`).
+    Automation {
+        environment: Option<SharedString>,
+        task_id: String,
+    },
+}
+
+/// `UserTimelineRow`'s "agent" fold and `AutomationMessageRow`, for the attributions that fold.
+fn folded_message(
+    attribution: Option<&timeline::Attribution>,
+    text: &str,
+    this: &WeakEntity<Workspace>,
+    cx: &App,
+) -> Option<FoldedMessage> {
+    let workspace = this.upgrade();
+    let workspace = workspace.as_ref().map(|workspace| workspace.read(cx));
+    match attribution? {
+        timeline::Attribution::Agent { sender_thread } => {
+            // `senderShell?.title || "Agent"`.
+            let title = sender_thread.as_ref().and_then(|sender| {
+                // The sender is a thread beside this timeline's, on the open target's environment.
+                let workspace = workspace?;
+                let key = crate::model::ScopedId::new(workspace.active_environment()?.clone(), sender.as_ref());
+                let title = workspace.shell.thread(&key)?.title.trim().to_owned();
+                (!title.is_empty()).then_some(title)
+            });
+            Some(FoldedMessage {
+                icon: IconName::MessagesSquare,
+                label: title.unwrap_or_else(|| "Agent".into()).into(),
+                summary: text
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .unwrap_or_default()
+                    .to_owned()
+                    .into(),
+                link: sender_thread.clone().map(FoldLink::Thread),
+                actions_when_folded: true,
+            })
+        }
+        timeline::Attribution::Automation { scheduled_task_id } => {
+            // The task's title, else the prompt's first line (`useScheduledTaskTitle`).
+            let title = scheduled_task_id
+                .as_ref()
+                .and_then(|task| workspace?.scheduled_task_title(task))
+                .map(SharedString::from);
+            Some(FoldedMessage {
+                icon: IconName::CalendarClock,
+                label: "Automation".into(),
+                summary: title.unwrap_or_else(|| text.trim().lines().next().unwrap_or_default().to_owned().into()),
+                link: scheduled_task_id.as_ref().map(|task| FoldLink::Automation {
+                    environment: workspace.and_then(|workspace| workspace.active_environment().cloned()),
+                    task_id: task.to_string(),
+                }),
+                actions_when_folded: false,
+            })
+        }
+        timeline::Attribution::T3Code | timeline::Attribution::Guest { .. } => None,
+    }
+}
+
+fn user_row(
+    id: &SharedString,
+    text: &SharedString,
+    contents: UserBody,
+    actions: gpui_kit::Div,
+    steer: Option<Steer>,
+    look: UserRowLook,
+    this: &WeakEntity<Workspace>,
+    t: &Tokens,
+) -> AnyElement {
+    let UserRowLook { pane, grouped_with_previous, grouped_with_next, expanded, attribution, fold, probe } = look;
+    let steer_label = steer.map(|_| {
+        h_flex()
+            .mr(px(4.))
+            .gap(px(4.))
+            .text_xs()
+            .line_height(px(12.))
+            .text_color(t.muted_foreground)
+            .child(Icon::new(IconName::Redo2).size(px(12.)))
+            .child("Steer")
+    });
+    let UserBody { media_above, attachments, body, bare } = contents;
+    if let Some(fold) = fold {
+        let body = v_flex().children(attachments).children(body).into_any_element();
+        return folded_row(id, body, actions, steer_label, fold, (pane, expanded), this, t);
+    }
+    let guest = match attribution {
+        Some(timeline::Attribution::Guest { name }) => Some(name.clone()),
+        _ => None,
+    };
+    // `bg-guest-surface`: `color-mix(in srgb, var(--guest) 14%, var(--message-surface))`.
+    let surface =
+        if guest.is_some() { theme::mix_srgb(t.message_surface, rgb(GUEST).into(), 0.14) } else { t.message_surface };
+    let collapsible = body.is_some() && should_collapse(text);
+    let collapsed = collapsible && !expanded;
+    let mut bubble = div()
+        .relative()
+        .min_w_0()
+        .max_w(relative(0.8))
+        .rounded(px(16.))
+        .when(!bare, |el| el.p(px(12.)).bg(surface))
+        .text_color(t.message_foreground)
+        .children(probe)
+        .text_size(px(TEXT))
+        .line_height(px(LINE))
+        .when(grouped_with_previous || media_above.is_some(), |this| this.rounded_tr(px(6.)))
+        .when(grouped_with_next, |this| this.rounded_br(px(6.)))
+        .children(attachments)
+        .children(body.map(|body| div().when(collapsed, |this| this.max_h(px(176.)).overflow_hidden()).child(body)));
+    if collapsed {
+        bubble = bubble.child(div().absolute().left_0().right_0().bottom(px(12.)).h(px(28.)).bg(linear_gradient(
+            180.,
+            linear_color_stop(alpha(surface, 0.), 0.),
+            linear_color_stop(surface, 1.),
+        )));
+    }
+    let toggle_button = collapsible.then(|| {
+        focusable(h_flex().id(ElementId::Name(format!("user-collapse:{id}").into())), t)
+            .mt(px(6.))
+            .h(px(24.))
+            .px(px(7.))
+            .rounded(px(8.))
+            .cursor_pointer()
+            .text_xs()
+            .text_color(t.muted_foreground)
+            .hover(|style| style.bg(t.accent).text_color(t.foreground))
+            .child(if expanded { "Show less" } else { "Show full message" })
+            .on_click(toggle(this, pane, timeline::entry_key(id)))
+    });
+    // Hover actions under the bubble keep their 24px row while hidden.
+    let actions = h_flex().w_full().max_w(relative(0.8)).justify_end().pr(px(4.)).child(actions);
+    // `text-2xs`: 0.6875rem.
+    let attribution = match (attribution, guest) {
+        (Some(timeline::Attribution::T3Code), _) => Some(
+            div()
+                .mr(px(4.))
+                .text_size(rems(0.6875))
+                .text_color(alpha(t.muted_foreground, 0.7))
+                .child("Sent by T3 Code"),
+        ),
+        // `GuestMessageName`.
+        (_, Some(name)) => {
+            Some(div().mr(px(4.)).text_size(rems(0.6875)).text_color(super::sidebar::guest_foreground(t)).child(name))
+        }
+        _ => None,
+    };
+    let column = v_flex()
+        .group("timeline-row")
+        .items_end()
+        .gap(px(4.))
+        .children(attribution)
+        .children(steer_label)
+        .children(media_above.map(|media| h_flex().max_w(relative(0.8)).justify_end().child(media)))
+        .child(bubble)
+        .children(toggle_button)
+        .child(actions);
+    lane(if grouped_with_next { 4. } else { 16. }, column).into_any_element()
+}
+
+/// `UserTimelineRow` with `attribution === "agent"`, and `AutomationMessageRow`: a one-line header
+/// (`FoldedMessageHeader`) that opens to the message, capped at `max-h-96`, plus "Open thread" when
+/// a thread sent it or "Open automation" for a scheduled task.
+fn folded_row(
+    id: &SharedString,
+    body: AnyElement,
+    actions: gpui_kit::Div,
+    steer_label: Option<gpui_kit::Div>,
+    fold: FoldedMessage,
+    (pane, expanded): (ChatPane, bool),
+    this: &WeakEntity<Workspace>,
+    t: &Tokens,
+) -> AnyElement {
+    let muted = t.muted_foreground;
+    let header = focusable(h_flex().id(ElementId::Name(format!("agent-fold:{id}").into())), t)
+        .w_full()
+        .min_w_0()
+        .gap(px(6.))
+        .px(px(12.))
+        .py(px(8.))
+        .rounded(px(16.))
+        .line_height(px(20.))
+        .cursor_pointer()
+        .child(Icon::new(fold.icon).size(px(16.)).flex_none().text_color(muted))
+        .child(div().flex_none().max_w(relative(0.5)).truncate().text_color(muted).child(fold.label))
+        .child(div().flex_1().min_w_0().truncate().child(fold.summary))
+        .child(
+            Icon::new(if expanded { IconName::ChevronUp } else { IconName::ChevronDown })
+                .size(px(14.))
+                .flex_none()
+                .text_color(muted),
+        )
+        .on_click(toggle(this, pane, timeline::entry_key(id)));
+    let bubble = v_flex()
+        .min_w_0()
+        .max_w(relative(0.8))
+        .rounded(px(16.))
+        .bg(t.message_surface)
+        .text_color(t.message_foreground)
+        .text_size(px(TEXT))
+        .line_height(px(LINE))
+        .when(expanded, gpui_kit::Styled::w_full)
+        .child(header)
+        .when(expanded, |el| {
+            el.child(
+                div()
+                    .id(ElementId::Name(format!("agent-fold-body:{id}").into()))
+                    .px(px(12.))
+                    .pb(px(12.))
+                    .max_h(px(384.))
+                    .overflow_y_scroll()
+                    .child(body),
+            )
+        });
+    let link = fold.link.map(|link| {
+        let this = this.clone();
+        let label = match link {
+            FoldLink::Thread(_) => "Open thread",
+            FoldLink::Automation { .. } => "Open automation",
+        };
+        message_actions::control(
+            div().id(ElementId::Name(format!("agent-open-thread:{id}").into())),
+            Some("timeline-row"),
+            t,
+        )
+        .rounded(px(4.))
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(muted)
+        .cursor_pointer()
+        .hover(|s| s.text_color(t.foreground).underline())
+        .child(label)
+        .on_click(move |_, window, cx| {
+            let _ = this.update(cx, |workspace, cx| match &link {
+                FoldLink::Thread(sender) => workspace.select_thread_beside(sender.to_string(), window, cx),
+                FoldLink::Automation { environment: Some(environment), task_id } => {
+                    workspace.open_scheduled_task(environment.clone(), task_id.clone(), cx);
+                }
+                FoldLink::Automation { environment: None, .. } => workspace.open_settings("scheduled-tasks", cx),
+            });
+        })
+    });
+    let actions = (fold.actions_when_folded || expanded).then(|| {
+        h_flex().w_full().max_w(relative(0.8)).justify_end().gap(px(8.)).pr(px(4.)).children(link).child(actions)
+    });
+    let column =
+        v_flex().group("timeline-row").items_end().gap(px(4.)).children(steer_label).child(bubble).children(actions);
+    lane(16., column).into_any_element()
+}
+
+fn markdown_view(
+    state: &Entity<TextViewState>,
+    source: &SharedString,
+    kind: MarkdownKind,
+    key: SharedString,
+    wrap: bool,
+    width: Option<f32>,
+    math: bool,
+    this: &WeakEntity<Workspace>,
+    (cwd, kinds): (Option<String>, Arc<super::markdown_ui::EntryKinds>),
+    content: Option<&Arc<timeline::UserContent>>,
+    t: &Tokens,
+) -> TextView {
+    let streaming = matches!(kind, MarkdownKind::Assistant { streaming: true });
+    let inline_code = inline_code_style(t);
+    let t = *t;
+    let (header_this, link_this, table_this, hover_this) = (this.clone(), this.clone(), this.clone(), this.clone());
+    // The view key names the pane whose timeline shows it, which owns what its links open.
+    let pane = view_pane(&key).0;
+    let (table_key, message_key) = (key.clone(), key.clone());
+    let templates = super::markdown_ui::ArtifactTemplates {
+        workspace: this.clone(),
+        key: key.clone(),
+        usable: kind != MarkdownKind::User,
+    };
+    let image_this = this.clone();
+    let (image_key, diagram_key) = (key.clone(), key.clone());
+    let (diagram_this, diagram_source) = (this.clone(), source.clone());
+    let header_source = source.clone();
+    TextView::new(state)
+        .style(markdown_style(&t, kind == MarkdownKind::User, wrap))
+        .inline_code_style(inline_code)
+        // `.chat-markdown a`: links show by color, with no underline.
+        .link_underline(false)
+        .selectable(true)
+        .stream_fade(streaming)
+        // The user's typed newlines break lines (`lineBreaks`, remark-breaks).
+        .when(kind == MarkdownKind::User, TextView::markdown_line_breaks)
+        .code_block_actions(move |block, _, cx| {
+            let wrap_key = key.clone();
+            // A Mermaid fence counts as streaming only while it is still open.
+            let (streaming, toggle) = match mermaid_fence(block, &header_source, streaming) {
+                Some(MermaidFence { at, open: false }) => {
+                    let showing = header_this.upgrade().is_some_and(|w| w.read(cx).diagrams.shows_source(&key, at));
+                    (false, Some(super::mermaid::view_toggle(&header_this, &key, at, showing, &t)))
+                }
+                Some(MermaidFence { open: true, .. }) => (true, None),
+                None => (streaming, None),
+            };
+            code_block_header(
+                &header_this,
+                &key,
+                block,
+                wrap,
+                streaming,
+                true,
+                width,
+                toggle,
+                &t,
+                cx,
+                move |workspace, cx| {
+                    workspace.toggle_code_wrap(&wrap_key, cx);
+                },
+            )
+        })
+        // `MarkdownMermaidCodeBlock`: a closed Mermaid fence draws its diagram.
+        // A `math` fence is display math once it closes (`MarkdownMath`), when Render math is on.
+        .code_block_renderer(move |block, window, cx| {
+            if math && block.lang().as_deref() == Some("math") {
+                let span = block.span.as_ref()?;
+                let closed = !streaming
+                    || diagram_source
+                        .get(span.start..span.end)
+                        .is_some_and(|fence| super::mermaid::fence_closed(fence, &block.code()));
+                return closed.then(|| {
+                    super::math::display_formula(&diagram_this, &diagram_key, &block.code(), span.start, window, cx)
+                });
+            }
+            let fence = mermaid_fence(block, &diagram_source, streaming).filter(|fence| !fence.open)?;
+            let code = block.code();
+            if code.trim().is_empty() {
+                return None;
+            }
+            super::mermaid::chat_diagram(&diagram_this, &diagram_key, fence.at, code, &t, window, cx)
+        })
+        .table_actions(move |table, _, cx| super::markdown_ui::table_actions(table, &table_this, &table_key, &t, cx))
+        .on_image_click(move |url, window, cx| {
+            let _ = image_this
+                .update(cx, |workspace, cx| workspace.open_markdown_image(&image_key, url.as_ref(), window, cx));
+        })
+        // A sent message's context chips, ahead of the plugins that read other links.
+        .when_some(content, |view, content| {
+            view.plugin(super::user_message::ContextChips {
+                workspace: this.clone(),
+                content: content.clone(),
+                message: message_key,
+            })
+        })
+        .plugin(super::markdown_ui::SkillChips { workspace: this.clone(), pane })
+        .plugin(super::markdown_ui::CitationChips { workspace: this.clone(), pane })
+        .plugin(super::markdown_ui::ModelChips { workspace: this.clone(), pane })
+        .plugin(super::markdown_ui::ThreadChips { workspace: this.clone() })
+        .plugin(templates)
+        .plugin(super::markdown_ui::FileChips {
+            pane,
+            workspace: this.clone(),
+            dark: t.dark,
+            folder_color: t.sidebar.icon,
+            cwd,
+            kinds,
+            suffixes: Default::default(),
+        })
+        .plugin(super::external_links::LinkMarks { workspace: this.clone() })
+        .on_link_hover(move |hover, _, cx| {
+            let _ = hover_this.update(cx, |workspace, cx| workspace.link_hovered(hover, pane, cx));
+        })
+        .on_link_click(move |url, event, window, cx| {
+            let _ = link_this.update(cx, Workspace::close_link_hover);
+            // A right click opens the link menu (`externalLinkContextMenu`), and only for web links.
+            let right = matches!(event, ClickEvent::Mouse(click) if click.up.button == gpui_kit::MouseButton::Right);
+            // A link to a file opens in the editor, or its file menu (`MarkdownFileLink`).
+            if crate::thread_links::parse(url).is_none() {
+                let target = link_this
+                    .upgrade()
+                    .and_then(|w| super::markdown_ui::file_link_target(url, w.read(cx).git_cwd().as_deref()));
+                if let Some(target) = target {
+                    let position = event.position();
+                    let secondary = event.modifiers().secondary(cx);
+                    // A relative link may name a file by its basename alone (`findWorkspaceFileMatch`).
+                    let authored = url.split(['?', '#']).next().unwrap_or_default().replace("%20", " ");
+                    let _ = link_this.update(cx, |workspace, cx| {
+                        workspace.with_workspace_match(
+                            pane,
+                            &authored,
+                            target,
+                            window,
+                            cx,
+                            move |workspace, target, window, cx| {
+                                if right {
+                                    workspace.open_file_menu(target, Some(pane), position, window, cx);
+                                } else if workspace.opens_file_link_in_browser(&target, secondary) {
+                                    let path = super::markdown_ui::without_position(&target).to_owned();
+                                    workspace.open_host_file_in_browser(&path, window, cx);
+                                } else {
+                                    workspace.open_file_link(&target, window, cx);
+                                }
+                            },
+                        );
+                    });
+                    return;
+                }
+            }
+            if right {
+                let _ = link_this.update(cx, |workspace, cx| {
+                    workspace.open_link_menu(url, Some(pane), event.position(), window, cx)
+                });
+                return;
+            }
+            let _ = link_this.update(cx, |workspace, cx| match crate::thread_links::parse(url) {
+                // A thread no longer here opens nothing, as its chip shows.
+                Some(_) => {
+                    let message_environment = workspace.active_environment().map(ToString::to_string);
+                    let destination =
+                        super::markdown_ui::thread_link_destination(url, message_environment.as_deref(), workspace);
+                    if let Some((env, thread_id)) = destination {
+                        workspace.select_thread_in(env, thread_id, window, cx);
+                    }
+                }
+                // A project's pull request opens in its panel (`pullRequestLinksOpenInApp`); Ctrl-click and
+                // every other link follow `browserLinkTarget`.
+                None if !event.modifiers().secondary(cx) && workspace.open_change_request_link(url, cx) => {}
+                None => workspace.open_link(url, event, window, cx),
+            });
+        })
+}
+
+/// `MarkdownCodeBlock`'s header: the language on the left; wrap and copy on the right, with
+/// "Run in terminal" for a shell block when `run` (`onRunCommand`) is set.
+/// `TextView` lays the actions over the block's top row, 8px from its top-right corner, so the
+/// row spans that (or the given `width`) and paints the block's color.
+pub(super) fn code_block_header(
+    this: &WeakEntity<Workspace>,
+    key: &SharedString,
+    block: &gpui_kit::base::text::CodeBlock,
+    wrap: bool,
+    streaming: bool,
+    run: bool,
+    width: Option<f32>,
+    view_toggle: Option<AnyElement>,
+    t: &Tokens,
+    cx: &App,
+    toggle_wrap: impl Fn(&mut Workspace, &mut Context<Workspace>) + 'static,
+) -> AnyElement {
+    let label_color = alpha(if t.themed { t.code_foreground } else { t.foreground }, 0.72);
+    let code: SharedString = block.code();
+    // Its place in the source keeps two identical blocks apart and skips hashing every frame.
+    let at = block.span.as_ref().map_or_else(|| fnv1a(&code), |span| span.start as u64);
+    let id: SharedString = format!("code:{key}:{at:x}").into();
+    let wrap_this = this.clone();
+    let wrap_button = focusable(div().id("wrap"), t)
+        .size(px(24.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(8.))
+        .cursor_pointer()
+        .text_color(label_color)
+        .when(wrap, |button| button.bg(t.secondary).text_color(t.foreground))
+        .hover(|style| style.bg(t.accent).text_color(t.foreground))
+        .child(Icon::new(IconName::TextWrap).size(px(12.)))
+        .tooltip(move |window, cx| {
+            gpui_kit::component::tooltip::Tooltip::new(if wrap { "Disable line wrap" } else { "Wrap lines" })
+                .build(window, cx)
+        })
+        .on_click(move |_, _, cx| {
+            let _ = wrap_this.update(cx, |workspace, cx| toggle_wrap(workspace, cx));
+        });
+    let lang = block.lang();
+    let run = runnable_command(lang.as_deref().unwrap_or_default(), &code)
+        .filter(|_| run && !streaming && this.upgrade().is_some_and(|w| w.read(cx).git_cwd().is_some()))
+        .map(|command| {
+            let this = this.clone();
+            focusable(div().id("run"), t)
+                .size(px(24.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(8.))
+                .cursor_pointer()
+                .text_color(label_color)
+                .hover(|style| style.bg(t.accent).text_color(t.foreground))
+                .child(Icon::new(IconName::Play).size(px(12.)))
+                .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Run in terminal").build(window, cx))
+                .on_click(move |_, window, cx| {
+                    if let Some(cwd) = this.upgrade().and_then(|w| w.read(cx).git_cwd()) {
+                        let command = command.clone();
+                        window.dispatch_action(
+                            Box::new(super::RunInTerminal { cwd, command, stop_on_settle: false, preview_url: None }),
+                            cx,
+                        );
+                    }
+                })
+        });
+    let copy = message_actions::code_copy_button(this, id, code, t, cx);
+    let fill = t.background.blend(code_background(t));
+    h_flex()
+        .relative()
+        .children(super::theme_inspect::probe(&["codeBackground", "codeForeground"], cx))
+        .map(|row| match width {
+            Some(width) => row.w(px(width - 8.)),
+            None => row.w_full(),
+        })
+        .pl(px(10.))
+        .justify_between()
+        .mt(px(-2.))
+        .mr(px(-2.))
+        .rounded(px(6.))
+        .bg(fill)
+        .gap(px(8.))
+        .child(
+            div()
+                .font_family(t.fonts.mono)
+                .text_size(px(11.))
+                .text_color(label_color)
+                .children(block.lang().filter(|lang| !lang.is_empty())),
+        )
+        .child(
+            h_flex()
+                .gap(px(2.))
+                .child(wrap_button)
+                .children(run)
+                .children(view_toggle)
+                .children((!streaming).then_some(copy)),
+        )
+        .into_any_element()
+}
+
+/// A Mermaid fence: its place in the message, and whether it is still streaming open.
+struct MermaidFence {
+    at: usize,
+    open: bool,
+}
+
+fn mermaid_fence(block: &gpui_kit::base::text::CodeBlock, source: &str, streaming: bool) -> Option<MermaidFence> {
+    if block.lang().as_deref() != Some("mermaid") {
+        return None;
+    }
+    let span = block.span.as_ref()?;
+    let open = streaming
+        && !source.get(span.start..span.end).is_some_and(|fence| super::mermaid::fence_closed(fence, &block.code()));
+    Some(MermaidFence { at: span.start, open })
+}
+
+/// `MarkdownCodeBlock`'s `canRun`: a shell block whose command reads the same in the terminal.
+fn runnable_command(lang: &str, code: &str) -> Option<String> {
+    let shell = matches!(lang, "sh" | "bash" | "zsh" | "fish" | "shell" | "powershell" | "pwsh");
+    let command = code.trim();
+    // Control and invisible format characters (`\p{Cc}\p{Cf}`) can make the shown command
+    // differ from what the terminal receives.
+    let hidden = |c: char| {
+        c.is_control()
+            || matches!(c, '\u{00ad}' | '\u{061c}' | '\u{180e}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}')
+            || matches!(c, '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206f}' | '\u{feff}')
+    };
+    let body = code.strip_suffix('\n').unwrap_or(code);
+    (shell && !command.is_empty() && !command.ends_with('\\') && !body.chars().any(hidden)).then(|| command.to_owned())
+}
+
+/// FNV-1a, to tell apart code blocks that carry no source span.
+fn fnv1a(text: &str) -> u64 {
+    text.bytes().fold(0xcbf29ce484222325, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3))
+}
+
+/// `.chat-markdown code`: inline code's chip.
+pub(super) fn inline_code_style(t: &Tokens) -> StyleRefinement {
+    StyleRefinement::default().bg(alpha(t.foreground, 0.1)).rounded(px(4.)).px(px(4.9)).py(px(1.4)).text_size(px(11.9))
+}
+
+/// `.chat-markdown` (`index.css:1866-2280`) and `MarkdownCodeBlock.tsx`.
+/// The code block fill: `input/32` in dark mode, `secondary` in light; a theme's code surface.
+pub(super) fn code_background(t: &Tokens) -> Hsla {
+    match (t.themed, t.dark) {
+        (true, _) => t.code_background,
+        (false, true) => alpha(t.input, 0.32),
+        (false, false) => t.secondary,
+    }
+}
+
+pub(super) fn markdown_style(t: &Tokens, user: bool, wrap: bool) -> TextViewStyle {
+    let code_background = code_background(t);
+    let code_border = match (t.themed, t.dark) {
+        (true, _) => t.border,
+        (false, true) => gpui_kit::transparent_black(),
+        (false, false) => alpha(t.border, 0.7),
+    };
+    // The web's header row (6px + 24px toolbar) sits above the code's own 12.8px.
+    let mut code_block = StyleRefinement::default()
+        .pt(px(42.8))
+        .pb(px(12.8))
+        .px(px(14.4))
+        .rounded(px(8.))
+        .bg(code_background)
+        .border_color(code_border)
+        .text_size(px(t.fonts.code_size))
+        .line_height(relative(1.375));
+    if t.themed {
+        code_block = code_block.text_color(t.code_foreground);
+    }
+    if !wrap {
+        code_block = code_block.whitespace_nowrap();
+        code_block.overflow.x = Some(gpui_kit::Overflow::Scroll);
+    }
+    let mut style = TextViewStyle::default()
+        // User bubbles pass `text-foreground` to the web's ChatMarkdown, which overrides its 90% rule.
+        .foreground(if user { t.foreground } else { t.chat_text() })
+        .paragraph_gap(rems(0.65))
+        .heading_font_size(move |level, _| {
+            px(match level {
+                _ if user => 14.,
+                1 => 20.,
+                2 => 18.,
+                3 => 16.,
+                _ => 14.,
+            })
+        })
+        .code_block(code_block)
+        .inline_code(HighlightStyle { background_color: Some(alpha(t.foreground, 0.1)), ..Default::default() })
+        // The web draws only row hairlines: no frame, no column rules, no header fill.
+        .table(StyleRefinement::default().border_0().rounded(px(0.)).bg(gpui_kit::transparent_black()))
+        .table_cell(StyleRefinement::default().border_color(gpui_kit::transparent_black()))
+        .table_head(
+            StyleRefinement::default()
+                .bg(gpui_kit::transparent_black())
+                .text_color(t.foreground)
+                .font_weight(FontWeight::SEMIBOLD),
+        );
+    style.highlight_theme = if t.dark { PIERRE_DARK.clone() } else { PIERRE_LIGHT.clone() };
+    style.is_dark = t.dark;
+    style
+}
+
+/// Shiki's `pierre-dark` / `pierre-light` token colors on tree-sitter scopes.
+/// The web's light theme is `t3-light`, pierre-light darkened to 4.5:1; these
+/// pierre-light colors already sit close to it.
+fn pierre_theme(dark: bool) -> Arc<HighlightTheme> {
+    let [
+        fg,
+        comment,
+        string,
+        number,
+        keyword,
+        variable,
+        parameter,
+        function,
+        type_,
+        punctuation,
+        tag,
+        attribute,
+        bold,
+        regex,
+        escape,
+    ] = if dark {
+        [
+            "#fafafa", "#737373", "#5ecc71", "#68cdf2", "#ff678d", "#ffa359", "#a3a3a3", "#9d6afb", "#d568ea",
+            "#636363", "#ff855e", "#60d199", "#ffd452", "#64d1db", "#61d5c0",
+        ]
+    } else {
+        [
+            "#0a0a0a", "#737373", "#199f43", "#1ca1c7", "#d32a61", "#d47628", "#636363", "#693acf", "#a631be",
+            "#636363", "#d5512f", "#18a46c", "#d5a910", "#17a5af", "#16a994",
+        ]
+    };
+    let mut syntax = serde_json::Map::new();
+    for (scope, hex) in [
+        ("attribute", attribute),
+        ("boolean", number),
+        ("comment", comment),
+        ("comment.doc", comment),
+        ("constant", number),
+        ("constructor", type_),
+        ("emphasis.strong", bold),
+        ("enum", type_),
+        ("function", function),
+        ("keyword", keyword),
+        ("label", variable),
+        ("link_text", tag),
+        ("link_uri", string),
+        ("number", number),
+        ("operator", punctuation),
+        ("property", fg),
+        ("punctuation", punctuation),
+        ("punctuation.bracket", punctuation),
+        ("punctuation.delimiter", punctuation),
+        ("punctuation.list_marker", punctuation),
+        ("punctuation.special", punctuation),
+        ("string", string),
+        ("string.escape", escape),
+        ("string.regex", regex),
+        ("string.special", string),
+        ("string.special.symbol", number),
+        ("tag", tag),
+        ("text.literal", string),
+        ("title", tag),
+        ("type", type_),
+        ("variable", fg),
+        ("variable.special", variable),
+        ("variant", type_),
+        ("preproc", keyword),
+        ("embedded", fg),
+        ("primary", fg),
+        ("hint", parameter),
+    ] {
+        syntax.insert(scope.into(), serde_json::json!({ "color": hex }));
+    }
+    syntax.insert("emphasis".into(), serde_json::json!({ "color": keyword, "font_style": "italic" }));
+    let theme = serde_json::json!({
+        "name": if dark { "pierre-dark" } else { "pierre-light" },
+        "appearance": if dark { "dark" } else { "light" },
+        "style": { "editor.foreground": fg, "syntax": syntax },
+    });
+    Arc::new(serde_json::from_value(theme).expect("valid highlight theme"))
+}
+
+/// The Pierre highlight theme for the appearance, which the composer's code blocks use too.
+pub(super) fn highlight_theme(dark: bool) -> Arc<HighlightTheme> {
+    if dark { PIERRE_DARK.clone() } else { PIERRE_LIGHT.clone() }
+}
+
+/// Shared so every text view reuses one highlighter cache.
+static PIERRE_DARK: LazyLock<Arc<HighlightTheme>> = LazyLock::new(|| pierre_theme(true));
+static PIERRE_LIGHT: LazyLock<Arc<HighlightTheme>> = LazyLock::new(|| pierre_theme(false));
+
+/// `ProposedPlanCard.tsx`.
+fn plan_card(
+    id: &SharedString,
+    plan: &timeline::PlanText,
+    pane: ChatPane,
+    this: &WeakEntity<Workspace>,
+    lane_width: f32,
+    cx: &mut App,
+    t: &Tokens,
+) -> AnyElement {
+    let key = timeline::entry_key(id);
+    let expanded = this.upgrade().is_some_and(|workspace| workspace.read(cx).is_expanded(pane, &key));
+    let collapsible = plan.preview.is_some();
+    let (body_key, body_text): (SharedString, &SharedString) = match &plan.preview {
+        Some(preview) if !expanded => (view_key(pane, &format!("{id}:preview")), preview),
+        _ => (view_key(pane, id), &plan.displayed),
+    };
+    let collapsed = collapsible && !expanded;
+    let card_background = alpha(t.card, 0.7);
+    let badge = div()
+        .h(px(18.))
+        .px(px(3.))
+        .flex()
+        .items_center()
+        .rounded(px(4.))
+        .bg(t.secondary)
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .child("Plan");
+    let mut body =
+        div().relative().mt(px(16.)).text_size(px(TEXT)).line_height(px(LINE)).text_color(t.chat_text()).child(
+            markdown_with(
+                this,
+                body_key,
+                body_text,
+                MarkdownKind::Assistant { streaming: false },
+                Some(lane_width - 42.),
+                None,
+                t,
+                cx,
+            ),
+        );
+    if collapsed {
+        body = body.max_h(px(416.)).overflow_hidden().child(
+            div().absolute().left_0().right_0().bottom_0().h(px(96.)).bg(linear_gradient(
+                180.,
+                linear_color_stop(alpha(card_background, 0.), 0.),
+                linear_color_stop(alpha(t.card, 0.95), 1.),
+            )),
+        );
+    }
+    let toggle_button = collapsible.then(|| {
+        h_flex().w_full().justify_center().mt(px(16.)).child(
+            focusable(div().id(ElementId::Name(format!("plan-toggle:{id}").into())), t)
+                .h(px(32.))
+                .px(px(12.))
+                .flex()
+                .items_center()
+                .rounded(px(8.))
+                .border_1()
+                .border_color(t.input)
+                .cursor_pointer()
+                .text_size(px(TEXT))
+                .hover(|style| style.bg(t.accent))
+                .child(if expanded { "Collapse plan" } else { "Expand plan" })
+                .on_click(toggle(this, pane, key.clone())),
+        )
+    });
+    let card = v_flex()
+        .p(px(20.))
+        .rounded(px(16.))
+        .border_1()
+        .border_color(alpha(t.border, 0.8))
+        .bg(card_background)
+        .child(
+            h_flex()
+                .gap(px(12.))
+                .justify_between()
+                .child(
+                    h_flex().min_w_0().gap(px(8.)).child(badge).child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(TEXT))
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(plan.title.clone()),
+                    ),
+                )
+                .child(super::plan_actions::plan_actions_button(this, id, &plan.markdown, cx)),
+        )
+        .child(body)
+        .children(toggle_button);
+    lane(16., card).into_any_element()
+}
+
+// ---------------------------------------------------------------------------
+// Work log
+
+fn icon_path(icon: WorkIcon) -> Icon {
+    let name = match icon {
+        WorkIcon::T3 => return Icon::empty().path("icons/app/t3.svg"),
+        WorkIcon::Browser => return Icon::empty().path("icons/app/browser.svg"),
+        WorkIcon::Terminal => IconName::Terminal,
+        WorkIcon::SquarePen => IconName::SquarePen,
+        WorkIcon::Eye => IconName::Eye,
+        WorkIcon::Search => IconName::Search,
+        WorkIcon::Globe => IconName::Globe,
+        WorkIcon::Device => IconName::Smartphone,
+        WorkIcon::PullRequest => IconName::GitPullRequestArrow,
+        WorkIcon::Wrench => IconName::Wrench,
+        WorkIcon::Hammer => IconName::Hammer,
+        WorkIcon::Brain => IconName::Brain,
+        WorkIcon::Bot => IconName::Bot,
+        WorkIcon::Zap => IconName::Zap,
+        WorkIcon::MessageCircle => IconName::MessageCircle,
+        WorkIcon::ListTodo => IconName::ListTodo,
+        WorkIcon::Code => IconName::CodeXml,
+        WorkIcon::CircleAlert => IconName::CircleAlert,
+        WorkIcon::Check => IconName::Check,
+    };
+    Icon::new(name)
+}
+
+/// `text-icon-muted` with the svg's `opacity-70` (and `brightness(0.6)` in light mode).
+fn icon_color(t: &Tokens) -> Hsla {
+    if t.dark { alpha(t.muted_foreground, 0.7) } else { alpha(gpui_kit::rgb(0x44444a).into(), 0.7) }
+}
+
+/// `text-tool-error-icon/40` under the same 70% opacity.
+fn failed_icon_color(t: &Tokens) -> Hsla {
+    let base: Hsla = if t.dark { gpui_kit::rgb(0xfca5a5).into() } else { t.error };
+    alpha(base, 0.4 * 0.7)
+}
+
+/// `WorkLogLine`: a 24px icon slot, then a truncated label.
+fn work_line(
+    icon: WorkIcon,
+    icon_color: Hsla,
+    label: impl IntoElement,
+    label_color: Hsla,
+    trailing: Option<AnyElement>,
+) -> gpui_kit::Div {
+    h_flex()
+        .min_h(px(24.))
+        .w_full()
+        .min_w_0()
+        .gap(px(6.))
+        .text_size(px(TEXT))
+        .line_height(px(LINE))
+        .child(
+            div()
+                .w(px(24.))
+                .h(px(24.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(icon_path(icon).size(px(16.)).text_color(icon_color)),
+        )
+        .child(div().flex_1().min_w_0().truncate().text_color(label_color).child(label))
+        .children(trailing)
+}
+
+/// The space under a work row (`WorkLogBlock`).
+fn work_bottom(work: &WorkRow) -> f32 {
+    let header = match &work.kind {
+        WorkRowKind::Toggle { expanded, .. } | WorkRowKind::Live { expanded, .. } => *expanded,
+        WorkRowKind::Thinking { group, expanded, .. } => group.is_some() && *expanded,
+        _ => false,
+    };
+    if matches!(work.kind, WorkRowKind::Details { .. }) {
+        4.
+    } else if work.continues || header {
+        0.
+    } else {
+        8.
+    }
+}
+
+fn work_row(work: &WorkRow, pane: ChatPane, this: &WeakEntity<Workspace>, t: &Tokens, cx: &mut App) -> AnyElement {
+    let muted = t.muted_foreground;
+    let row = div().w_full().min_w_0().rounded(px(6.)).px(px(2.)).py(px(2.));
+    let content: AnyElement = match &work.kind {
+        WorkRowKind::Single { entry, label, expanded } => single_entry(entry, label, *expanded, pane, this, t, cx),
+        WorkRowKind::Toggle { group, summary, icon, created_at, .. } => {
+            focusable(row.id(ElementId::Name(work.id.clone())), t)
+                .group("timeline-row")
+                .cursor_pointer()
+                .child(work_line(
+                    *icon,
+                    icon_color(t),
+                    summary.clone(),
+                    muted,
+                    hover_timestamp(this, format!("time:{}", work.id), created_at, t, cx),
+                ))
+                .on_click(toggle(this, pane, group.clone()))
+                .into_any_element()
+        }
+        WorkRowKind::Details { entries } => v_flex()
+            .id(ElementId::Name(work.id.clone()))
+            .max_h(px(288.))
+            .overflow_y_scroll()
+            // `scrollbar-gutter-stable`: the 6px scrollbar's lane stays reserved.
+            .pr(px(6.))
+            .rounded(px(6.))
+            .children(entries.iter().map(|detail| detail_entry(detail, pane, this, t, cx)).collect::<Vec<_>>())
+            .into_any_element(),
+        WorkRowKind::Live { group, entry, label, thought, expanded, .. } => {
+            let failed = entry.failed();
+            let color = if failed { failed_icon_color(t) } else { icon_color(t) };
+            let thought_line = thought.as_ref().filter(|_| !*expanded).map(|thought| {
+                h_flex()
+                    .items_start()
+                    .gap(px(6.))
+                    .text_size(px(TEXT))
+                    .line_height(px(LINE))
+                    .child(
+                        div()
+                            .w(px(24.))
+                            .h(px(24.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(icon_path(WorkIcon::Brain).size(px(16.)).text_color(icon_color(t))),
+                    )
+                    .child(div().flex_1().min_w_0().line_clamp(4).text_color(muted).child(thought.clone()))
+            });
+            v_flex()
+                .children(thought_line)
+                .child(
+                    focusable(row.id(ElementId::Name(work.id.clone())), t)
+                        .cursor_pointer()
+                        .child(work_line(
+                            entry.icon(),
+                            color,
+                            entry_label(entry, label.clone(), (*expanded, false), this, t, cx),
+                            muted,
+                            None,
+                        ))
+                        .on_click(toggle(this, pane, group.clone())),
+                )
+                .into_any_element()
+        }
+        WorkRowKind::Thinking { group, preview, .. } => {
+            let label = preview.clone().unwrap_or_else(|| "Thinking".into());
+            let line = work_line(WorkIcon::Brain, icon_color(t), label, muted, None);
+            match group {
+                Some(group) => focusable(row.id(ElementId::Name(work.id.clone())), t)
+                    .cursor_pointer()
+                    .child(line)
+                    .on_click(toggle(this, pane, group.clone()))
+                    .into_any_element(),
+                None => row.child(line).into_any_element(),
+            }
+        }
+    };
+    lane(work_bottom(work), content).into_any_element()
+}
+
+/// What an entry shows when opened (`buildToolCallExpandedBody`), besides reasoning.
+fn entry_body(entry: &Entry, label: &str) -> Option<String> {
+    let mut blocks: Vec<String> = Vec::new();
+    let mut add = |text: &str| {
+        let text = text.trim();
+        if !text.is_empty() && text != label.trim() && !blocks.iter().any(|b| b == text) {
+            blocks.push(text.to_owned());
+        }
+    };
+    if let Some(command) = &entry.command {
+        add(command);
+    }
+    if let Some(detail) = &entry.detail {
+        add(detail);
+    }
+    let files: Vec<String> = entry.changed_files.iter().map(|f| f.replace('\\', "/")).collect();
+    if !files.is_empty() {
+        add(&files.join("\n"));
+    }
+    (!blocks.is_empty()).then(|| blocks.join("\n\n"))
+}
+
+/// Whether [`entry_body`] has anything, without building it.
+fn has_body(entry: &Entry, label: &str) -> bool {
+    let label = label.trim();
+    let shows = |text: &str| {
+        let text = text.trim();
+        !text.is_empty() && text != label
+    };
+    let slash = |c: char| if c == '\\' { '/' } else { c };
+    let files_show = match entry.changed_files.as_slice() {
+        [] => false,
+        [file] => {
+            let file = file.trim();
+            !file.is_empty() && !file.chars().map(slash).eq(label.chars())
+        }
+        _ => true,
+    };
+    entry.command.as_deref().is_some_and(shows) || entry.detail.as_deref().is_some_and(shows) || files_show
+}
+
+fn expandable(entry: &Entry, label: &str, this: &WeakEntity<Workspace>, cx: &App) -> bool {
+    if entry.question.is_some() || this.upgrade().is_some_and(|w| w.read(cx).viewed_image(entry).is_some()) {
+        true
+    } else if entry.is_reasoning() {
+        entry.detail.is_some()
+    } else {
+        super::inspector::has_inspector(entry) || has_body(entry, label)
+    }
+}
+
+fn chevron(expandable: bool, expanded: bool, t: &Tokens) -> AnyElement {
+    let icon = Icon::new(if expanded { IconName::ChevronDown } else { IconName::ChevronRight })
+        .size(px(12.))
+        .text_color(alpha(t.muted_foreground, 0.7));
+    div()
+        .size(px(16.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .when(expandable, |this| this.child(icon))
+        .into_any_element()
+}
+
+/// The image a tool viewed, once it loads (`WorkLogDetails kind="media"`).
+fn viewed_image(entry: &Entry, pane: ChatPane, this: &WeakEntity<Workspace>, cx: &App) -> Option<AnyElement> {
+    use gpui_kit::StyledImage as _;
+    let workspace = this.upgrade()?;
+    let workspace = workspace.read(cx);
+    let path = workspace.viewed_image(entry)?;
+    let image = workspace.markdown_images.get(&path)?;
+    let root = workspace.git_cwd();
+    let full = match super::markdown_images::classify(&path, root.as_deref()) {
+        super::markdown_images::Source::WorkspaceFile(full) => full,
+        _ => path.clone(),
+    };
+    // A click expands it (`ChatMarkdownAssetImage`'s `onImageExpand`).
+    let item = super::image_viewer::ViewerImage {
+        image: image.clone(),
+        name: path.rsplit(['/', '\\']).next().unwrap_or("image").to_owned().into(),
+        reference: Some(super::image_viewer::file_reference(&full, root.as_deref())),
+    };
+    let (this, ring) = (this.clone(), crate::theme::tokens(cx).ring);
+    Some(
+        div()
+            .mt(px(4.))
+            .child(
+                gpui_kit::img(image)
+                    .id(ElementId::Name(format!("viewed-image:{}", entry.id).into()))
+                    .max_w_full()
+                    .max_h(px(256.))
+                    .object_fit(gpui_kit::ObjectFit::Contain)
+                    .tab_index(0)
+                    .cursor_pointer()
+                    .focus_visible(move |style| style.border_2().border_color(ring))
+                    .on_click(move |_, window, cx| {
+                        cx.stop_propagation();
+                        let item = item.clone();
+                        let _ = this.update(cx, |w, cx| {
+                            let owner = w.pane_owner(pane);
+                            w.open_owned_image_viewer(owner, vec![item], 0, window, cx);
+                        });
+                    }),
+            )
+            .into_any_element(),
+    )
+}
+
+fn entry_details(
+    entry: &Entry,
+    label: &str,
+    pane: ChatPane,
+    this: &WeakEntity<Workspace>,
+    t: &Tokens,
+    cx: &mut App,
+) -> Option<AnyElement> {
+    let image = viewed_image(entry, pane, this, cx);
+    let details = entry_text_details(entry, label, pane, this, t, cx);
+    match (image, details) {
+        (Some(image), Some(details)) => Some(v_flex().child(image).child(details).into_any_element()),
+        (image, details) => image.or(details),
+    }
+}
+
+fn entry_text_details(
+    entry: &Entry,
+    label: &str,
+    pane: ChatPane,
+    this: &WeakEntity<Workspace>,
+    t: &Tokens,
+    cx: &mut App,
+) -> Option<AnyElement> {
+    if entry.is_reasoning() {
+        let text = entry.detail.clone()?;
+        return Some(
+            div()
+                .id(ElementId::Name(format!("thought:{}", entry.id).into()))
+                .ml(px(28.))
+                .max_h(px(384.))
+                .overflow_y_scroll()
+                .px(px(2.))
+                .py(px(4.))
+                .text_size(px(TEXT))
+                .line_height(px(LINE))
+                .text_color(t.foreground)
+                .child(markdown(this, pane, &thought_key(&entry.id), &text, false, t, cx))
+                .into_any_element(),
+        );
+    }
+    if let Some(question) = &entry.question {
+        return Some(question_history(&entry.id, question, this, t, cx));
+    }
+    // `WorkLogDetails`: a click or a text selection inside leaves the row open.
+    if let Some(inspector) = super::inspector::inspector(entry, this, t, cx) {
+        return Some(
+            div()
+                .id(ElementId::Name(format!("inspector:{}", entry.id).into()))
+                .mt(px(2.))
+                .mb(px(6.))
+                .pb(px(8.))
+                .cursor_default()
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .child(inspector)
+                .into_any_element(),
+        );
+    }
+    let body = entry_body(entry, label)?;
+    Some(
+        div()
+            .id(ElementId::Name(format!("detail:{}", entry.id).into()))
+            .mt(px(2.))
+            .mb(px(6.))
+            .pb(px(8.))
+            .max_h(px(256.))
+            .overflow_y_scroll()
+            .cursor_text()
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .font_family(t.fonts.mono)
+            .text_size(px(13.))
+            .line_height(relative(1.625))
+            .text_color(alpha(t.foreground, 0.85))
+            .child(gpui_kit::base::SelectableText::new("text", body))
+            .into_any_element(),
+    )
+}
+
+/// A row's label: an answered request names its questions, then what was answered, which
+/// reads muted once the answers show below; a thread read names the thread, linked to it.
+fn entry_label(
+    entry: &Entry,
+    label: SharedString,
+    (expanded, linked): (bool, bool),
+    this: &WeakEntity<Workspace>,
+    t: &Tokens,
+    cx: &App,
+) -> AnyElement {
+    if let Some(read) = thread_read_label(entry, &label, linked, this, t, cx) {
+        return read;
+    }
+    let Some(question) = &entry.question else { return label.into_any_element() };
+    let heading = if question.heading.is_empty() { label } else { question.heading.clone() };
+    let Some(preview) = &question.preview else { return heading.into_any_element() };
+    h_flex()
+        .min_w_0()
+        .gap(px(6.))
+        .child(div().min_w_0().truncate().child(heading))
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .text_color(if expanded { t.muted_foreground } else { t.foreground })
+                .child(preview.clone()),
+        )
+        .into_any_element()
+}
+
+/// `ThreadReadLabel`: `Read thread “Title”` for a thread of this environment that is still listed.
+fn thread_read_label(
+    entry: &Entry,
+    label: &str,
+    linked: bool,
+    this: &WeakEntity<Workspace>,
+    t: &Tokens,
+    cx: &App,
+) -> Option<AnyElement> {
+    let thread_id = entry.thread_read_target()?;
+    let prefix = work_log::thread_read_prefix(label)?;
+    let workspace = this.upgrade()?;
+    let workspace = workspace.read(cx);
+    let environment = workspace.active_environment()?;
+    let thread = workspace.shell.threads.iter().find(|t| t.id == thread_id && t.environment_id == *environment)?;
+    let title = thread.title.trim();
+    if title.is_empty() || thread.archived_at.is_some() || thread.deleted_at.is_some() {
+        return None;
+    }
+    let title = div().min_w_0().truncate().child(SharedString::from(title.to_owned()));
+    let title = if linked {
+        let (this, env, id) = (this.clone(), thread.environment_id.clone(), thread.id.clone());
+        focusable(title.id(ElementId::Name(format!("read-thread:{}", entry.id).into())), t)
+            .rounded(px(4.))
+            .text_color(t.foreground)
+            .cursor_pointer()
+            .hover(gpui_kit::Styled::underline)
+            .on_click(move |_, window, cx| {
+                cx.stop_propagation();
+                let (env, id) = (env.clone(), id.clone());
+                let _ = this.update(cx, |w, cx| w.select_thread_in(env, id, window, cx));
+            })
+            .into_any_element()
+    } else {
+        title.into_any_element()
+    };
+    Some(
+        h_flex()
+            .min_w_0()
+            .child(div().flex_none().child(format!("{prefix} “")))
+            .child(title)
+            .child(div().flex_none().child("”"))
+            .into_any_element(),
+    )
+}
+
+/// `QuestionAnswerHistory`: each question, its answer, and the files sent with it.
+fn question_history(
+    id: &str,
+    question: &work_log::QuestionAnswer,
+    this: &WeakEntity<Workspace>,
+    t: &Tokens,
+    cx: &App,
+) -> AnyElement {
+    use gpui_kit::StyledImage as _;
+    let text = || div().text_size(px(TEXT)).line_height(px(LINE)).text_color(t.muted_foreground);
+    let workspace = this.upgrade();
+    let workspace = workspace.as_ref().map(|workspace| workspace.read(cx));
+    let attachment = |nth: usize, index: usize, file: &work_log::AnswerAttachment| {
+        let image = file.id.as_deref().filter(|_| file.image).and_then(|id| workspace?.attachment_image(id));
+        let link = text()
+            .id(ElementId::Name(format!("answer-file:{id}:{nth}:{index}").into()))
+            .text_color(t.foreground)
+            .underline()
+            .child(match image {
+                Some(image) => gpui_kit::img(image)
+                    .h(px(80.))
+                    .max_w(px(128.))
+                    .rounded(px(4.))
+                    .object_fit(gpui_kit::ObjectFit::Contain)
+                    .into_any_element(),
+                None => file.name.clone().into_any_element(),
+            });
+        match file.id.clone() {
+            Some(attachment_id) => {
+                let this = this.clone();
+                focusable(link, t)
+                    .cursor_pointer()
+                    .on_click(move |_, _, cx| {
+                        let _ = this.update(cx, |workspace, cx| workspace.open_answer_attachment(&attachment_id, cx));
+                    })
+                    .into_any_element()
+            }
+            None => link.into_any_element(),
+        }
+    };
+    v_flex()
+        .id(ElementId::Name(format!("answers:{id}").into()))
+        .ml(px(28.))
+        .mt(px(8.))
+        .gap(px(8.))
+        .cursor_default()
+        .on_click(|_, _, cx| cx.stop_propagation())
+        .children(question.questions.iter().enumerate().map(|(nth, q)| {
+            v_flex()
+                .gap(px(4.))
+                .children(q.text.clone().map(|question| text().child(question)))
+                .children(q.answer.clone().map(|answer| text().ml(px(12.)).child(answer)))
+                .when(!q.attachments.is_empty(), |el| {
+                    el.child(
+                        h_flex().flex_wrap().gap(px(8.)).children(
+                            q.attachments.iter().enumerate().map(|(index, file)| attachment(nth, index, file)),
+                        ),
+                    )
+                })
+        }))
+        .into_any_element()
+}
+
+fn single_entry(
+    entry: &Rc<Entry>,
+    label: &SharedString,
+    expanded: bool,
+    pane: ChatPane,
+    this: &WeakEntity<Workspace>,
+    t: &Tokens,
+    cx: &mut App,
+) -> AnyElement {
+    let muted = t.muted_foreground;
+    let row = div().w_full().min_w_0().rounded(px(6.)).px(px(2.)).py(px(2.));
+    let severe = entry.item_type == "error" || entry.activity == Some(Activity::Error);
+    if severe || entry.activity == Some(Activity::Warning) {
+        let color = if entry.activity == Some(Activity::Warning) { t.warning } else { t.error };
+        let title = div().flex_1().min_w_0().font_weight(FontWeight::MEDIUM).text_color(color).child(label.clone());
+        let message = entry.detail.clone().filter(|d| !d.trim().is_empty() && d != label);
+        return row
+            .child(
+                h_flex()
+                    .items_start()
+                    .gap(px(6.))
+                    .text_size(px(TEXT))
+                    .line_height(px(LINE))
+                    .child(
+                        div()
+                            .w(px(24.))
+                            .h(px(24.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(Icon::new(IconName::CircleAlert).size(px(16.)).text_color(color)),
+                    )
+                    .child(title),
+            )
+            .children(message.map(|message| {
+                div()
+                    .ml(px(28.))
+                    .py(px(4.))
+                    .text_size(px(TEXT))
+                    .line_height(px(LINE))
+                    .text_color(alpha(t.foreground, 0.8))
+                    .child(message)
+            }))
+            .into_any_element();
+    }
+    let failed = entry.failed() && entry.status != Some(Status::Declined);
+    let color = if failed { failed_icon_color(t) } else { icon_color(t) };
+    let label_text: SharedString = if expanded && entry.is_reasoning() {
+        if entry.status == Some(Status::InProgress) { "Thinking".into() } else { "Thought".into() }
+    } else {
+        label.clone()
+    };
+    let label_text = entry_label(entry, label_text, (expanded, true), this, t, cx);
+    let label_color = if entry.is_tool_like() { muted } else { alpha(t.foreground, 0.8) };
+    let details = if expanded { entry_details(entry, label, pane, this, t, cx) } else { None };
+    let expandable = expandable(entry, label, this, cx);
+    let trailing =
+        h_flex().gap(px(6.)).children(entry_open_link(entry, this, t)).child(chevron(expandable, expanded, t));
+    let line = work_line(entry.icon(), color, label_text, label_color, Some(trailing.into_any_element()));
+    let row = row.id(ElementId::Name(entry.id.clone())).child(line).children(details);
+    if expandable {
+        focusable(row, t)
+            .cursor_pointer()
+            .on_click(toggle(this, pane, timeline::entry_key(&entry.id)))
+            .into_any_element()
+    } else {
+        row.into_any_element()
+    }
+}
+
+/// An entry inside an open group (`WorkEntryLogRow`): no vertical padding.
+fn detail_entry(
+    detail: &DetailEntry,
+    pane: ChatPane,
+    this: &WeakEntity<Workspace>,
+    t: &Tokens,
+    cx: &mut App,
+) -> AnyElement {
+    let DetailEntry { entry, label, expanded } = detail;
+    let expanded = *expanded;
+    let failed = entry.failed() && entry.status != Some(Status::Declined);
+    let color = if failed { failed_icon_color(t) } else { icon_color(t) };
+    let label_color = if entry.is_tool_like() { t.muted_foreground } else { alpha(t.foreground, 0.8) };
+    let expandable = expandable(entry, label, this, cx);
+    let shown: SharedString = if expanded && entry.is_reasoning() { "Thought".into() } else { label.clone() };
+    let shown = entry_label(entry, shown, (expanded, true), this, t, cx);
+    let details = if expanded { entry_details(entry, label, pane, this, t, cx) } else { None };
+    div()
+        .id(ElementId::Name(format!("group-entry:{}", entry.id).into()))
+        .w_full()
+        .min_w_0()
+        .px(px(2.))
+        .rounded(px(6.))
+        .when(expandable, gpui_kit::Styled::cursor_pointer)
+        .child(work_line(
+            entry.icon(),
+            color,
+            shown,
+            label_color,
+            Some(
+                h_flex()
+                    .gap(px(6.))
+                    .children(entry_open_link(entry, this, t))
+                    .child(chevron(expandable, expanded, t))
+                    .into_any_element(),
+            ),
+        ))
+        .children(details)
+        .when(expandable, |row| focusable(row, t).on_click(toggle(this, pane, timeline::entry_key(&entry.id))))
+        .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn only_messages_that_can_name_a_chip_recheck_when_the_lists_change() {
+        use super::{Reuse, markdown_reuse};
+        let mention = "Try model:codex/gpt-6.1 next";
+        assert_eq!(markdown_reuse(None, mention, 0), Reuse::Rebuild);
+        assert_eq!(markdown_reuse(Some((mention, 0)), mention, 0), Reuse::Keep);
+        assert_eq!(markdown_reuse(Some((mention, 0)), mention, 1), Reuse::Recheck, "models arrived");
+        assert_eq!(markdown_reuse(Some(("Use $design", 0)), "Use $design", 1), Reuse::Recheck);
+        assert_eq!(markdown_reuse(Some(("plain", 0)), "plain", 1), Reuse::Keep, "nothing to chip");
+        assert_eq!(markdown_reuse(Some(("plain", 1)), "plain more", 1), Reuse::Rebuild);
+    }
+
+    use super::*;
+
+    #[test]
+    fn each_pane_keeps_its_own_view_of_an_item() {
+        for item in ["msg-1", "thought:entry-1", "workflow-script:msg-1", "msg-1:preview"] {
+            let (main, side) = (view_key(ChatPane::Main, item), view_key(ChatPane::Side, item));
+            assert_ne!(main, side, "an inherited {item} must not share its selection across panes");
+            assert_eq!(view_pane(&main), (ChatPane::Main, item));
+            assert_eq!(view_pane(&side), (ChatPane::Side, item));
+        }
+    }
+
+    #[test]
+    fn user_messages_fold_by_the_text_they_show() {
+        assert!(should_collapse(&"a".repeat(601)));
+        assert!(!should_collapse(&"a".repeat(600)));
+        assert!(should_collapse(&"a\n".repeat(8)));
+        assert!(!should_collapse(&"a\n".repeat(7)));
+        assert!(!should_collapse(&" \n".repeat(20)));
+        // A long link destination reads as its short label.
+        let link = format!("[file]({})", "a/".repeat(400));
+        assert!(!should_collapse(&link));
+    }
+
+    #[test]
+    fn only_single_visible_shell_commands_run() {
+        assert_eq!(runnable_command("bash", "ls -la\n").as_deref(), Some("ls -la"));
+        assert_eq!(runnable_command("pwsh", "Get-Item .").as_deref(), Some("Get-Item ."));
+        assert_eq!(runnable_command("rust", "fn main() {}\n"), None);
+        assert_eq!(runnable_command("sh", "echo a \\\n"), None);
+        assert_eq!(runnable_command("sh", "  \n"), None);
+        assert_eq!(runnable_command("sh", "rm -rf \u{202e}/ tmp\n"), None);
+        // A newline or tab inside the block is a control character too, as on the web.
+        assert_eq!(runnable_command("sh", "a\nb\n"), None);
+    }
+
+    #[test]
+    fn a_disclosure_holds_its_place_unless_a_running_turn_follows_the_tail() {
+        let top = ListOffset { item_ix: 3, offset_in_item: px(12.) };
+        // A finished turn at the bottom stops following, so the opened heading stays put.
+        assert_eq!(held_top(false, true, top, 10), Some(top));
+        assert_eq!(held_top(true, false, top, 10), Some(top), "a reader scrolled up stays put");
+        assert_eq!(held_top(true, true, top, 10), None, "the live end keeps streaming into view");
+        let pending_end = ListOffset { item_ix: 10, offset_in_item: px(0.) };
+        assert_eq!(held_top(false, true, pending_end, 10), None);
+    }
+}
