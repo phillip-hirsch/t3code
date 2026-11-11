@@ -207,13 +207,14 @@ while all are paused, waking once a second to check for a lost device; opening a
 Direct Manipulation only advances on the per-paint `Update`, so frames keep running while its
 viewport is `RUNNING` or in `INERTIA`, in a paint that delivered touchpad events (the final Ended
 event comes after `READY`), and for 500 ms after a touchpad contact, before DM reports `RUNNING`.
-No new `unsafe` operations (the DM handler's constructor call, inside an existing `unsafe` block,
+A manipulation DM recognizes after that grace sends `WM_POINTERCAPTURECHANGED`, which wakes the
+window. No new `unsafe` operations (the DM handler's constructor call, inside an existing `unsafe` block,
 gains one safe argument). Files:
 
 - `src/frame_pause.rs`: `WindowFrames` and the vsync thread handle, with tests.
 - `src/window.rs`: `WindowsWindowState::frames`; `draw`, `frame_waker` and `schedule_frame`.
 - `src/events.rs`: `draw_window` begins and ends the frame and wakes on a deferred draw;
-  `handle_dm_pointer_hit_test` records the contact.
+  `handle_dm_pointer_hit_test` records the contact; `handle_pointer_capture_changed` wakes.
 - `src/direct_manipulation.rs`: `DirectManipulationHandler::manipulating`, set from
   `OnViewportStatusChanged`.
 - `src/platform.rs`: `TrackedWindow::paused`, the vsync loop, and unparking it on open and stop.

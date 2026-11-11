@@ -161,6 +161,12 @@ mod tests {
 
         frames.begin_frame();
         assert!(frames.end_frame(false, now + CONTACT_GRACE));
+
+        frames.wake();
+        assert!(
+            !is_paused(&frames),
+            "recognizing the manipulation later (WM_POINTERCAPTURECHANGED) resumes frames"
+        );
     }
 
     #[test]
