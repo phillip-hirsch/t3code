@@ -20,6 +20,16 @@
     "enableProviderUpdateChecks": true,
     "continueThreadsAfterServerUpdate": true,
     "enableAgentBrowserAccess": true,
+    "cloudSpeechCredentials": {
+      "openai": "",
+      "xai": "",
+      "openrouter": ""
+    },
+    "speechModelId": "handy-computer/parakeet-unified-en-0.6b-gguf",
+    "speechAcceleration": "auto",
+    "speechModelUnloadTimeout": "min_15",
+    "speechProjectCustomWords": [],
+    "speechPostProcessingModelSelection": null,
     "projectAgentBrowserAccessOverrides": {},
     "defaultAutoPull": false,
     "defaultProjectScripts": [],
@@ -190,6 +200,18 @@
     "sidebarProjectSortOrder": "updated_at",
     "sidebarThreadSortOrder": "updated_at",
     "timestampFormat": "locale",
+    "voiceMicrophone": "",
+    "voiceShortcutMode": "auto",
+    "speechLanguage": "auto",
+    "speechTranslateToEnglish": false,
+    "speechCustomWords": [],
+    "speechSilenceFiltering": true,
+    "speechRemoveFillerWords": true,
+    "speechPostProcessingPrompt": {
+      "mode": "default",
+      "customInstructions": ""
+    },
+    "speechCorrectionWord": "",
     "snapShotEnabled": false,
     "snapShotIncludeAccessibility": true,
     "snapShotShortcut": {
@@ -228,7 +250,8 @@
     "sidebarAutoSettleAfterDays",
     "sidebarAutoSettleKeepPullRequests",
     "continueThreadsAfterServerUpdate",
-    "responseStreamingMode"
+    "responseStreamingMode",
+    "speechProjectCustomWords"
   ],
   "nullableOverrideKeys": [
     "defaultModelSelection",
@@ -535,6 +558,104 @@
       "scope": "environment",
       "fastWorktreeCheckoutOnly": true,
       "searchTerms": ["beta fast worktree checkout clone apfs copy-on-write cache macos speed"]
+    },
+    {
+      "id": "voice-transcription-destination",
+      "title": "Transcribe with",
+      "to": "voice",
+      "searchTerms": [
+        "send microphone audio dictation destination speech voice stt transcription environment machine consent privacy cloud OpenAI Grok OpenRouter"
+      ]
+    },
+    {
+      "id": "voice-microphone",
+      "title": "Microphone",
+      "to": "voice",
+      "searchTerms": ["mic input audio device"]
+    },
+    {
+      "id": "dictation-shortcut-mode",
+      "title": "Dictation shortcut",
+      "to": "voice",
+      "searchTerms": ["speech voice keyboard hotkey hold toggle auto"]
+    },
+    {
+      "id": "speech-language",
+      "title": "Transcription language",
+      "to": "voice",
+      "searchTerms": ["speech voice translate english auto detect"]
+    },
+    {
+      "id": "speech-dictionary",
+      "title": "Dictionary",
+      "to": "voice",
+      "searchTerms": ["speech voice transcription vocabulary names glossary alias"]
+    },
+    {
+      "id": "speech-project-dictionary",
+      "title": "Project dictionary",
+      "to": "voice",
+      "scope": "project-defaults",
+      "searchTerms": [
+        "speech voice transcription vocabulary shared dictionary team environment glossary"
+      ]
+    },
+    {
+      "id": "speech-post-processing-model",
+      "title": "Cleanup model",
+      "to": "voice",
+      "scope": "environment",
+      "searchTerms": ["speech voice transcript cleanup provider model post-processing"]
+    },
+    {
+      "id": "speech-correction-word",
+      "title": "Correction cue",
+      "to": "voice",
+      "searchTerms": ["speech voice cleanup sorry scratch that fix mistake"]
+    },
+    {
+      "id": "speech-silence-filtering",
+      "title": "Silence filtering",
+      "to": "voice",
+      "searchTerms": ["voice speech vad silero pauses noise"]
+    },
+    {
+      "id": "remove-filler-words",
+      "title": "Remove filler words",
+      "to": "voice",
+      "searchTerms": ["voice speech transcription hesitation um uh cleanup"]
+    },
+    {
+      "id": "speech-post-processing",
+      "title": "Clean up transcripts",
+      "to": "voice",
+      "searchTerms": ["speech transcription polish clean provider prompt post-processing"]
+    },
+    {
+      "id": "speech-models",
+      "title": "Transcription models",
+      "to": "voice",
+      "searchTerms": [
+        "speech voice stt download whisper parakeet canary moonshine accuracy speed benchmark languages"
+      ]
+    },
+    {
+      "id": "speech-hardware",
+      "title": "Transcription hardware and model unloading",
+      "to": "voice",
+      "searchTerms": ["speech voice stt advanced gpu cpu acceleration memory unload idle"]
+    },
+    {
+      "id": "microphone-test",
+      "title": "Test microphone",
+      "to": "voice",
+      "searchTerms": ["test mic audio playback loopback record input level"]
+    },
+    {
+      "id": "transcription-test",
+      "title": "Test model",
+      "to": "voice",
+      "searchTerms": ["test voice speech model transcription recognition"]
     },
     {
       "id": "auto-settle-inactive-threads",
@@ -937,6 +1058,13 @@
       "title": "Composer: Start in Background",
       "to": "keybindings",
       "searchTerms": ["composer.sendBackground", "mod+enter", "mod+alt+enter"],
+      "secondary": true
+    },
+    {
+      "id": "keybinding-composer.dictation",
+      "title": "Composer: Start or Finish Dictation",
+      "to": "keybindings",
+      "searchTerms": ["composer.dictation", "mod+shift+d"],
       "secondary": true
     },
     {
@@ -1599,7 +1727,7 @@
       "title": "Open pull requests in T3 Code",
       "to": "diffs",
       "searchTerms": [
-        "pr commit links GitHub GitLab GitCafe Forgejo Bitbucket Azure DevOps browser external click default pull request view panel"
+        "pr commit links GitHub Cursor Origin GitLab GitCafe Forgejo Bitbucket Azure DevOps browser external click default pull request view panel"
       ]
     },
     {
@@ -1621,7 +1749,7 @@
       "to": "source-control",
       "scope": "project-defaults",
       "searchTerms": [
-        "pull request GitHub GitLab GitCafe Forgejo Bitbucket Azure DevOps squash co-authored-by attribution claude codex generated"
+        "pull request GitHub Cursor Origin GitLab GitCafe Forgejo Bitbucket Azure DevOps squash co-authored-by attribution claude codex generated"
       ]
     },
     {
@@ -1637,7 +1765,7 @@
       "to": "source-control",
       "scope": "environment-defaults",
       "searchTerms": [
-        "version control git GitHub ghes enterprise GitLab GitCafe Forgejo gitea tea codeberg Bitbucket Azure DevOps hosting integrations credentials scan server environment"
+        "version control git GitHub ghes enterprise Cursor Origin cursor origin GitLab GitCafe Forgejo gitea tea codeberg Bitbucket Azure DevOps hosting integrations credentials scan server environment"
       ]
     },
     {
@@ -1849,7 +1977,7 @@
       "title": "Pull request sharing",
       "to": "connections",
       "searchTerms": [
-        "pull request routing trusted environments shared credentials permissions read actions source control GitHub GitLab GitCafe Forgejo Bitbucket Azure DevOps"
+        "pull request routing trusted environments shared credentials permissions read actions source control GitHub Cursor Origin GitLab GitCafe Forgejo Bitbucket Azure DevOps"
       ]
     },
     {
