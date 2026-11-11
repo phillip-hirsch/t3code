@@ -1346,6 +1346,7 @@ impl WindowsWindowInner {
 
     fn handle_dm_pointer_hit_test(&self, wparam: WPARAM) -> Option<isize> {
         self.state.direct_manipulation.on_pointer_hit_test(wparam);
+        self.state.frames.contact(std::time::Instant::now());
         None
     }
 
@@ -1362,14 +1363,18 @@ impl WindowsWindowInner {
             // re-invalidates every window on each vsync (see
             // `begin_vsync_thread`), so the deferred frame still gets drawn,
             // at most one vsync late.
+            self.state.frames.wake();
             unsafe { ValidateRect(Some(handle), None).ok().log_err() };
             return Some(0);
         };
         let mut request_frame = self.state.callbacks.request_frame.take()?;
+        self.state.frames.begin_frame();
 
         self.state.direct_manipulation.update();
 
         let events = self.state.direct_manipulation.drain_events();
+        // A running touchpad gesture or its inertia only advances on these per-frame updates.
+        let gesture = !events.is_empty();
         if !events.is_empty() {
             if let Some(mut func) = self.state.callbacks.input.take() {
                 for event in events {
@@ -1397,6 +1402,9 @@ impl WindowsWindowInner {
         });
 
         self.state.callbacks.request_frame.set(Some(request_frame));
+        self.state
+            .frames
+            .end_frame(gesture, std::time::Instant::now());
         self.update_ime_enabled(handle);
         unsafe { ValidateRect(Some(handle), None).ok().log_err() };
 
