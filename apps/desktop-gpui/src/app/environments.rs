@@ -884,6 +884,13 @@ fn descriptor_failure(environment_id: &str, descriptor: &environments::Descripto
     descriptor.compatibility_error()
 }
 
+/// The primary connection's identity check, before every attempt: the id to connect as, or why
+/// the server at its address gets no token. `known` is the id an earlier attempt established.
+pub(super) fn primary_identity(known: Option<&str>, descriptor: &environments::Descriptor) -> Result<String, Failure> {
+    let expected = known.unwrap_or(&descriptor.environment_id);
+    descriptor_failure(expected, descriptor).map_or_else(|| Ok(expected.to_owned()), Err)
+}
+
 /// `prepareDesktopSshEnvironment`: starts or reuses the server over SSH and forwards to it. The
 /// saved token is reused while the host still grants it every standard scope; otherwise this
 /// pairs again, so a reconnect adds no session on the host. Returns the forward's address,
@@ -1226,6 +1233,22 @@ mod tests {
         assert_eq!(other, Failure::environment_mismatch("env-a", "env-b"));
         assert!(other.reason.blocks(), "its routes stay blocked until the user acts");
         let outdated = descriptor_failure("env-a", &descriptor("env-a", 1)).expect("an outdated server is refused");
+        assert_eq!(outdated.reason, environments::Reason::Unsupported);
+    }
+
+    #[test]
+    fn the_primary_address_answering_as_another_environment_is_refused_before_its_token_is_sent() {
+        let descriptor = |id: &str, protocol: u64| -> environments::Descriptor {
+            let json =
+                serde_json::json!({"environmentId": id, "label": "Box", "orchestrationProtocolVersion": protocol});
+            serde_json::from_value(json).unwrap()
+        };
+        assert_eq!(primary_identity(None, &descriptor("env-a", 2)), Ok("env-a".to_owned()));
+        assert_eq!(primary_identity(Some("env-a"), &descriptor("env-a", 2)), Ok("env-a".to_owned()));
+        let other = primary_identity(Some("env-a"), &descriptor("env-b", 2)).expect_err("another environment");
+        assert_eq!(other, Failure::environment_mismatch("env-a", "env-b"));
+        assert!(other.reason.blocks(), "the primary stops retrying, like a saved environment");
+        let outdated = primary_identity(None, &descriptor("env-a", 1)).expect_err("an outdated server is refused");
         assert_eq!(outdated.reason, environments::Reason::Unsupported);
     }
 

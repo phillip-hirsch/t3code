@@ -144,6 +144,12 @@ GPUI-only metadata. The patch, in `src/platform.rs`: a `ClipboardString::html` f
 `with_html`, and `ClipboardItem::html`, the first string entry's HTML. Each platform below writes
 and reads it as the system's HTML flavor.
 
+**Next-frame callbacks survive a frame that can't borrow the App.** On Windows a nested message
+loop (WebView2 setup, for one) can deliver a frame request while the App is borrowed; 0.3.11 took
+the window's next-frame callbacks first and dropped them when `handle.update` failed, so anything
+waiting on them stalled until an unrelated repaint. The patch, in `src/window.rs`'s frame request
+handler, puts them back ahead of any added since, so the next frame runs them.
+
 The crate's tests need `--features test-support`; run them from a scratch copy outside this
 repository (`cargo test --features test-support --lib`). The copy needs the published crate's
 missing pieces: put it two levels below a folder whose `assets/fonts/ibm-plex-sans` and

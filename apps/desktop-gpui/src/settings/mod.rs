@@ -8,6 +8,7 @@
 pub mod scope;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use serde::Deserialize;
@@ -412,13 +413,34 @@ fn read_stored(path: &Path) -> Result<Value, ()> {
     stored.is_object().then_some(stored).ok_or(())
 }
 
+/// Replaces `path` whole: a crash or power loss leaves the old file or the new one, never a torn
+/// one, and concurrent writers never share a temp file.
 pub(crate) fn write_atomically(path: &Path, document: &Value) -> std::io::Result<()> {
+    use std::io::Write as _;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
-    std::fs::write(&temp, format!("{}\n", serde_json::to_string_pretty(document)?))?;
-    std::fs::rename(&temp, path)
+    let temp = temp_path(path);
+    let written = (|| {
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(format!("{}\n", serde_json::to_string_pretty(document)?).as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    written
+}
+
+/// A temp file beside `path`, unique per process and per call.
+fn temp_path(path: &Path) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let call = NEXT.fetch_add(1, Ordering::Relaxed);
+    let mut name = path.file_name().unwrap_or_default().to_owned();
+    name.push(format!(".{}.{call}.tmp", std::process::id()));
+    path.with_file_name(name)
 }
 
 /// The T3 home: `T3CODE_HOME`, else `~/.t3-gpui`, apart from the Electron app's `~/.t3` until
@@ -445,6 +467,15 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn each_atomic_write_gets_its_own_temp_file_beside_the_target() {
+        let path = Path::new("dir").join("environments.json");
+        let (first, second) = (temp_path(&path), temp_path(&path));
+        assert_ne!(first, second, "two writers must not share a temp file");
+        assert_eq!(first.parent(), path.parent());
+        assert!(first.file_name().unwrap().to_string_lossy().starts_with("environments.json."));
+    }
 
     #[test]
     fn stored_fields_layer_over_defaults_and_unknown_fields_survive() {
