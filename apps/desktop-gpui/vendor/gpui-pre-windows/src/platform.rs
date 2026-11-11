@@ -42,6 +42,8 @@ use gpui::*;
 struct TrackedWindow {
     handle: SafeHwnd,
     frame_signal: Arc<PlatformFrameSignal>,
+    /// The window's [`crate::frame_pause::WindowFrames`] flag: set while it wants no frames.
+    paused: Arc<AtomicBool>,
 }
 
 impl TrackedWindow {
@@ -446,6 +448,7 @@ impl WindowsPlatform {
             // Not joined: the thread can be sending this thread a message. It exits after its
             // next vsync, and drops its reference to the devices then.
             stop.store(true, Ordering::Release);
+            crate::frame_pause::unpark_vsync_thread();
         }
         if let Some(text_system) = &self.direct_write_text_system {
             text_system.release_gpu();
@@ -469,11 +472,21 @@ impl WindowsPlatform {
         let text_system = Arc::downgrade(direct_write_text_system);
         let invalidate_devices = self.invalidate_devices.clone();
 
-        std::thread::Builder::new()
+        let vsync_thread = std::thread::Builder::new()
             .name("VSyncProvider".to_owned())
             .spawn(move || {
                 let vsync_provider = VSyncProvider::new();
                 loop {
+                    // T3 patch: while no window wants frames, park instead of waking every vblank.
+                    // A window's frame waker unparks the thread.
+                    let idle = all_windows.upgrade().is_some_and(|windows| {
+                        crate::frame_pause::all_paused(
+                            windows.read().iter().map(|window| &*window.paused),
+                        )
+                    });
+                    if idle {
+                        std::thread::park_timeout(crate::frame_pause::PARKED_VSYNC_RECHECK);
+                    }
                     let signal_source = vsync_provider.wait_for_vsync();
                     let signal_at = PlatformFrameSignal::capture(scheduler::Instant::now);
                     if stop.load(Ordering::Acquire) {
@@ -496,6 +509,10 @@ impl WindowsPlatform {
                         break;
                     };
                     for hwnd in all_windows.read().iter() {
+                        if hwnd.paused.load(Ordering::Acquire) {
+                            hwnd.frame_signal.take();
+                            continue;
+                        }
                         unsafe {
                             if let Some(signal_at) = signal_at {
                                 if IsWindowVisible(hwnd.as_raw()).as_bool()
@@ -515,6 +532,7 @@ impl WindowsPlatform {
                 }
             })
             .unwrap();
+        crate::frame_pause::set_vsync_thread(vsync_thread.thread().clone());
     }
 }
 
@@ -784,6 +802,7 @@ impl Platform for WindowsPlatform {
         self.raw_window_handles.write().push(TrackedWindow {
             handle: handle.into(),
             frame_signal: window.state.frame_signal.clone(),
+            paused: window.state.frames.paused_flag(),
         });
 
         Ok(Box::new(window))
@@ -1487,6 +1506,7 @@ impl Drop for WindowsPlatform {
     fn drop(&mut self) {
         if let Some(stop) = self.vsync_stop.borrow_mut().take() {
             stop.store(true, Ordering::Release);
+            crate::frame_pause::unpark_vsync_thread();
         }
         unsafe {
             if let Some(notification) = self.suspend_resume_notification.borrow_mut().take() {

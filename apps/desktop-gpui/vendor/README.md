@@ -150,6 +150,11 @@ the window's next-frame callbacks first and dropped them when `handle.update` fa
 waiting on them stalled until an unrelated repaint. The patch, in `src/window.rs`'s frame request
 handler, puts them back ahead of any added since, so the next frame runs them.
 
+**A skipped re-entrant frame request wakes the platform.** The frame request handler skips a
+request that arrives while a draw is on the stack (only Windows does this, from a nested message
+loop) and relied on the platform asking again. With gpui-pre-windows' idle pause below, a paused
+window would never ask again, so the skip now calls `wake_platform()`. File: `src/window.rs`.
+
 The crate's tests need `--features test-support`; run them from a scratch copy outside this
 repository (`cargo test --features test-support --lib`). The copy needs the published crate's
 missing pieces: put it two levels below a folder whose `assets/fonts/ibm-plex-sans` and
@@ -190,6 +195,21 @@ markup, which Chromium parses), and reading text also reads that format's markup
 to `EndHTML` (or the fragment). It goes through the file's existing `register_clipboard_format`,
 `set_clipboard_bytes` and `get_clipboard_data`; no new `unsafe`. File: `src/clipboard.rs`
 (`to_cf_html`, `from_cf_html`, test `cf_html_offsets_frame_the_markup`).
+
+**Idle windows stop requesting frames.** 0.3.11's vsync thread invalidates every window on every
+vblank, so an idle window wakes the UI thread for nothing at the display's refresh rate (about 1.5%
+of a core at 144 Hz). The patch ports macOS's `MetalFrames` pause: after a paint in which GPUI
+neither drew nor asked for another frame, the window's frames pause; GPUI's frame waker
+(`frame_waker`, `schedule_frame`) resumes them. The vsync thread skips paused windows and parks
+while all are paused, waking once a second to check for a lost device. Direct Manipulation only
+advances on the per-paint `Update`, so a paint that delivered touchpad events, or a touchpad
+contact in the last 500 ms, keeps frames running. No new `unsafe`. Files:
+
+- `src/frame_pause.rs`: `WindowFrames` and the vsync thread handle, with tests.
+- `src/window.rs`: `WindowsWindowState::frames`; `draw`, `frame_waker` and `schedule_frame`.
+- `src/events.rs`: `draw_window` begins and ends the frame and wakes on a deferred draw;
+  `handle_dm_pointer_hit_test` records the contact.
+- `src/platform.rs`: `TrackedWindow::paused`, the vsync loop, and unparking it on stop.
 
 ## gpui-pre-linux 0.3.11
 

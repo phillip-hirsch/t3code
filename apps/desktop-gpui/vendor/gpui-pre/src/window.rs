@@ -1937,6 +1937,8 @@ impl Window {
                 if draw_in_progress() {
                     log::debug!("deferring re-entrant window draw request");
                     deferred_force_render |= request_frame_options.force_render;
+                    // T3 patch: platforms that pause idle windows' frames need a wakeup to retry.
+                    invalidator.wake_platform();
                     #[cfg(feature = "profiler")]
                     profiler::journal::record_reentrant_frame_skipped(window_id, Instant::now());
                     return;
