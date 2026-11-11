@@ -1,0 +1,269 @@
+[package]
+name = "t3-desktop-gpui"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "t3-desktop"
+path = "src/main.rs"
+
+[dependencies]
+# Seals saved secrets on macOS and Linux under a key kept in the OS keyring (`secure_storage`); it
+# also opens Chromium's Windows cookies when importing them (`browser_import`).
+aes-gcm = "0.10"
+# Chromium's macOS and Linux cookies are AES-128-CBC (`browser_import`); aes-gcm already builds both.
+aes = "0.8"
+cbc = "0.1"
+anyhow = "1"
+async-channel = "2"
+# Decodes the user PATH the `t3` command installer reads through PowerShell.
+base64 = "0.22"
+# Attachment bytes: clones share one buffer, and reqwest uploads it without a copy.
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+env_logger = "0.11"
+# Inflates Open VSX theme packages and gzip archives in file previews; GPUI already builds this crate.
+flate2 = "1"
+futures = "0.3"
+getrandom = "0.3"
+# The preview browser: a native WebView2 / WKWebView child of the GPUI window.
+gpui-webview = "0.9.0"
+# Code-block highlighting in chat markdown, for the languages agents use most.
+gpui-kit = { version = "0.9.0", features = [
+  "tree-sitter-bash",
+  "tree-sitter-css",
+  "tree-sitter-diff",
+  "tree-sitter-go",
+  "tree-sitter-html",
+  "tree-sitter-javascript",
+  "tree-sitter-markdown",
+  "tree-sitter-python",
+  "tree-sitter-rust",
+  "tree-sitter-toml",
+  "tree-sitter-tsx",
+  "tree-sitter-typescript",
+  "tree-sitter-yaml",
+] }
+# SnapShots: the window's app icon.
+file_icon_provider = "1"
+# SnapShots: the global capture shortcut.
+global-hotkey = "0.9"
+hmac = "0.12"
+# The system zone's IANA name, which usage reads send so the server buckets days locally.
+iana-time-zone = "0.1"
+# Agent browser tabs stream JPEG frames, SnapShots encode PNG, and attached images are
+# downscaled and re-encoded. The image viewer reads every format GPUI draws for its natural
+# size; GPUI already builds all these codecs.
+image = { version = "0.25", default-features = false, features = [
+  "bmp",
+  "gif",
+  "ico",
+  "jpeg",
+  "png",
+  "pnm",
+  "tiff",
+  "webp",
+] }
+# The terminal emulator (Ghostty's VT core, as the web uses it); its build script needs Zig 0.15.2.
+libghostty-vt = "0.2.2"
+log = "0.4"
+# Notebook Markdown is made inert on the tree the chat renderer parses; gpui-base already builds it.
+markdown = "1"
+# Notebook HTML outputs are sanitized before they render; gpui-base's HTML view already builds both.
+html5ever = "0.27"
+markup5ever_rcdom = "0.3"
+# Browser recordings' AV1 video: pure Rust without its assembly (no nasm); xcap's image already builds it.
+rav1e = { version = "0.8", default-features = false, features = ["threading"] }
+# The types of files sent to an agent browser page's file picker; GPUI already builds this crate.
+mime_guess = "2"
+# Pairing links' QR codes, drawn as quads (no image or SVG renderer).
+qrcode = { version = "0.14", default-features = false }
+raw-window-handle = "0.6"
+rodio = { version = "0.23", default-features = false, features = ["playback", "mp3"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "form", "rustls"] }
+serde = { version = "1", features = ["derive", "rc"] }
+# Objects keep the server's key order, e.g. provider instances in the order they were added.
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+# Chromium's cookie key is PBKDF2-HMAC-SHA1 (`browser_import`); a dependency already builds it.
+sha1_smol = "1"
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "net",
+  "time",
+  "process",
+  "signal",
+  "sync",
+  "io-util",
+] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
+# Emoji and monogram graphemes in the project icon picker.
+unicode-segmentation = "1"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+# File previews: zip archives and the Office Open XML packages inside them (read only).
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+# Office documents' XML parts; GPUI's SVG renderer already builds it.
+roxmltree = "0.21"
+# An SVG's natural size in the image viewer; GPUI's SVG renderer already builds it.
+usvg = { version = "0.46", default-features = false }
+# SQLite databases read from bytes, read only (`sqlite`). The bundled SQLite builds from source with the
+# platform's C compiler, so no system library is needed.
+rusqlite = { version = "0.41", features = ["bundled", "serialize"] }
+wry = { version = "0.53.3", package = "lb-wry", features = ["devtools"] }
+# SnapShots: the screen capture.
+xcap = "0.9"
+
+[build-dependencies]
+serde_json = "1"
+
+[dev-dependencies]
+# Paused time for the backend supervisor's restart backoff tests.
+tokio = { version = "1", features = ["test-util"] }
+# The Markdown parser chat text views run (gpui-kit already builds it), for plugin tests.
+gpui-base = "=0.9.0"
+
+[target.'cfg(windows)'.dependencies]
+# GPUI's Windows platform (gpui-kit already builds it, at this exact version): turns off
+# DirectComposition, which would draw over the WebView2 child window. Patched; see vendor/README.md.
+gpui-pre-windows = { version = "=0.3.11", default-features = false }
+# Saved environments' bearer tokens, DPAPI-encrypted for the current user.
+windows-dpapi = "0.2"
+# Safe Win32 wrappers: foreground handoff, the taskbar badge, SnapShots' window details and the
+# caret's blink settings.
+winsafe = { version = "0.0.29", features = ["advapi", "dwm", "shell"] }
+# SnapShots: the window's UI Automation text.
+uiautomation = { version = "0.25", default-features = false, features = ["input"] }
+# Reduced motion for SnapShots' flash, through WinRT's safe projection; WebView2 already builds this crate.
+windows = { version = "0.61", features = ["UI_ViewManagement"] }
+win32job = "2"
+# The taskbar badge's overlay icon is drawn with resvg; gpui already builds it with these features.
+resvg = { version = "0.46", default-features = false, features = ["text", "system-fonts"] }
+
+[target.'cfg(unix)'.dependencies]
+# SIGTERM for the local server on quit (`backend::LocalServer::stop`), through nix's safe `kill`;
+# the hostname a browser's profile lock names (`browser_import`); `getuid` for the app control
+# socket's folder (`desktop::app_control`).
+nix = { version = "0.31", default-features = false, features = ["hostname", "signal", "user"] }
+
+[target.'cfg(not(windows))'.dependencies]
+# The OS keyring that holds `secure_storage`'s key.
+keyring-core = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1", features = ["keychain"] }
+# The Dock badge and SnapShots' reduced motion through AppKit's safe bindings; GPUI already builds these crates.
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+  "std",
+  "NSAccessibility",
+  "NSApplication",
+  "NSDockTile",
+  "NSResponder",
+  "NSWorkspace",
+] }
+# The system locale and forced 12/24-hour clock (`timestamp::system_locale`) read through it too,
+# and the macOS version that decides whether browser profiles get stores of their own.
+objc2-foundation = { version = "0.3", default-features = false, features = [
+  "std",
+  "NSLocale",
+  "NSProcessInfo",
+  "NSString",
+  "NSUserDefaults",
+] }
+# SnapShots' modifier-pair shortcut reads the modifier keys' state, and setup checks and asks
+# for Screen Recording.
+objc2-core-graphics = { version = "0.3", default-features = false, features = [
+  "std",
+  "CGEventSource",
+  "CGEventTypes",
+  "CGWindow",
+] }
+# SnapShots' setup checks and asks for Accessibility (`AXIsProcessTrusted`), through safe wrappers.
+macos-accessibility-client = "0.0.2"
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+zbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
+# The launcher badge (Unity's LauncherEntry signal); the keyring store already builds it.
+zbus = "5"
+# SnapShots on Wayland: the Screenshot and GlobalShortcuts portals; GPUI already builds it.
+ashpd = { version = "0.13", default-features = false, features = [
+  "async-io",
+  "screenshot",
+  "global_shortcuts",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Browser captures read WebKitGTK's own page snapshot (`capture/snapshot.rs`); wry already builds both.
+webkit2gtk = "=2.0.1"
+cairo-rs = { version = "0.18", default-features = false }
+
+# Vendored crates.io copies with small patches; see vendor/README.md.
+[patch.crates-io]
+# gpui-base 0.9.0: text decorations on the textarea.
+gpui-base = { path = "vendor/gpui-base" }
+# gpui-component 0.9.0: the diff view draws like the web's Pierre diffs.
+gpui-component = { path = "vendor/gpui-component" }
+# gpui-pre 0.3.11: a shown tooltip follows its element's bounds.
+gpui-pre = { path = "vendor/gpui-pre" }
+# gpui-pre-windows 0.3.11: a setter that turns off DirectComposition.
+gpui-pre-windows = { path = "vendor/gpui-pre-windows" }
+# gpui-pre-linux 0.3.11: X11 client-side decorations without a compositor.
+gpui-pre-linux = { path = "vendor/gpui-pre-linux" }
+# gpui-webview 0.9.0: native views follow the interface scale.
+gpui-webview = { path = "vendor/gpui-webview" }
+# lb-wry 0.53.3: a handler for failed navigations (Linux); a child webview can move to another
+# window (Windows).
+lb-wry = { path = "vendor/lb-wry" }
+# gpui-pre-macos 0.3.11: key events carry their physical key code.
+gpui-pre-macos = { path = "vendor/gpui-pre-macos" }
+
+# BeautifulRust's lint set (github.com/morganlinton/BeautifulRust), trimmed for an application:
+# no library-API lints (missing_docs, missing_*_doc, exhaustive_enums, unreachable_pub, print_*).
+[lints.rust]
+unsafe_code = "forbid"
+rust_2018_idioms = { level = "warn", priority = -1 }
+# GPUI's `Context<'_, Self>` is in nearly every method signature; the elided form reads better.
+elided_lifetimes_in_paths = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+unwrap_used = "warn"
+panic_in_result_fn = "warn"
+missing_assert_message = "warn"
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+redundant_clone = "warn"
+rc_buffer = "warn"
+string_add = "warn"
+wildcard_imports = "warn"
+dbg_macro = "warn"
+todo = "warn"
+
+# Noise for GPUI view code.
+too_many_lines = "allow" # render builders are long by nature
+too_many_arguments = "allow" # render helpers take their render context
+needless_pass_by_value = "allow" # GPUI listener and callback signatures
+unused_self = "allow" # view methods keep `&self` for a uniform call shape
+used_underscore_binding = "allow" # `_task` / `_subscription` keep-alive fields are reassigned
+struct_excessive_bools = "allow" # view state and wire-format mirrors are flag sets
+cast_precision_loss = "allow" # layout and display math
+unreadable_literal = "allow" # `rgb(0x252525)` colour constants
+similar_names = "allow" # `state` / `stale`, `stats` / `state`
+single_match_else = "allow" # a `match` with a fallback arm reads as well as `if let … else`
+option_option = "allow" # tri-state patches: absent, cleared, set
+assert_is_empty = "allow" # its fix, `assert_eq!(x, [] as [T; 0])`, reads worse
+default_trait_access = "allow" # `field: Default::default()` in struct literals, whose types are declared
+assigning_clones = "allow" # `x = y.clone()` reads plainer than `x.clone_from(&y)` off hot paths
+many_single_char_names = "allow" # colour math names its channels: r, g, b, h, s, l
+struct_field_names = "allow" # fields mirror the wire format: `Question::question`, `checkpoint_id`
+case_sensitive_file_extension_comparisons = "allow" # fires on names already lowercased
+maybe_infinite_iter = "allow" # `(2..).find(..)` and `take_while` end
+match_same_arms = "allow" # explicit arms document cases a wildcard also covers
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+module_inception = "allow"
+enum_glob_use = "allow"

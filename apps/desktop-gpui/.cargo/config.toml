@@ -1,0 +1,4 @@
+# The debug binary's unwind info outgrows ld64's compact unwind table, which makes every macOS
+# link warn; without that table the unwinder reads the DWARF unwind info, as it would anyway.
+[target.'cfg(target_os = "macos")']
+rustflags = ["-C", "link-arg=-Wl,-no_compact_unwind"]
