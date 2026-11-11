@@ -1763,6 +1763,9 @@ pub struct ThreadProjection {
     pub runtime_requests: Vec<RuntimeRequest>,
     #[serde(default, deserialize_with = "lossy")]
     pub turn_items: Vec<Rc<TurnItem>>,
+    /// The user's `messages`: a queued run's message is only here until the run starts.
+    #[serde(default, deserialize_with = "user_messages")]
+    pub messages: Vec<TurnItem>,
     /// The timeline, in render order.
     #[serde(default, deserialize_with = "lossy")]
     pub visible_turn_items: Vec<VisibleRow>,
@@ -1963,6 +1966,18 @@ impl ThreadProjection {
         })
     }
 
+    /// A user message by id: from `messages`, like the web, else from its `user_message` item.
+    pub fn user_message(&self, message_id: &str) -> Option<&TurnItem> {
+        self.messages.iter().rev().find(|message| message.id == message_id).or_else(|| {
+            let item = self
+                .turn_items
+                .iter()
+                .rev()
+                .find(|item| item.item_type == "user_message" && item.str("messageId") == Some(message_id));
+            item.map(Rc::as_ref)
+        })
+    }
+
     /// `resolveThreadProviderSession` in `packages/client-runtime/src/state/threadWorkflows.ts`.
     pub fn provider_session(&self) -> Option<&ProviderSession> {
         let active = self.runs.iter().rev().find(|run| is_active_run_status(&run.status));
@@ -2081,6 +2096,11 @@ impl ThreadProjection {
             }
             "runtime-request.updated" => {
                 upsert(&mut self.runtime_requests, RuntimeRequest::deserialize(payload)?, |r| &r.id);
+            }
+            "message.updated" => {
+                if let Some(message) = user_message_record(payload.clone()) {
+                    upsert(&mut self.messages, message, |m| &m.id);
+                }
             }
             "turn-item.updated" => {
                 let mut item = TurnItem::deserialize(payload)?;
@@ -2210,6 +2230,21 @@ impl ThreadProjection {
         };
         rows.insert(insertion, row);
     }
+}
+
+/// A `messages` record the projection keeps: a user's, read like its `user_message` item, so
+/// `messageId` is its `id`. Assistant messages stream, and their turn items already hold them.
+fn user_message_record(mut raw: Value) -> Option<TurnItem> {
+    if raw.get("role").and_then(Value::as_str) != Some("user") {
+        return None;
+    }
+    let id = raw.get("id")?.clone();
+    raw.as_object_mut()?.insert("messageId".to_owned(), id);
+    TurnItem::deserialize(raw).map_err(|error| log::warn!("skipping undecodable message: {error}")).ok()
+}
+
+fn user_messages<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<TurnItem>, D::Error> {
+    Ok(Vec::<Value>::deserialize(deserializer)?.into_iter().filter_map(user_message_record).collect())
 }
 
 fn upsert<T>(items: &mut Vec<T>, item: T, id: impl Fn(&T) -> &String) {

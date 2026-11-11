@@ -1,8 +1,7 @@
 //! The thread's queued follow-ups: `deriveThreadQueueWorkflowState` in
-//! `packages/client-runtime/src/state/threadWorkflows.ts`, joined to each run's
-//! `user_message` turn item instead of the projection's message table.
+//! `packages/client-runtime/src/state/threadWorkflows.ts`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use gpui_kit::SharedString;
 use serde_json::Value;
@@ -18,7 +17,8 @@ pub struct QueuedMessage {
     pub text: SharedString,
     /// The text as the queue shows it: context chips as their labels.
     pub preview: SharedString,
-    /// A guest's message keeps the guest's words; the owner can cancel it, not rewrite it.
+    /// A guest's message keeps the guest's words; the owner can cancel it, not rewrite it. An
+    /// unknown message can't be opened either, so its placeholder is never sent as its text.
     pub editable: bool,
     pub created_at: Option<SharedString>,
     /// "Sent by T3 Code" above the bubble.
@@ -76,19 +76,20 @@ pub fn active_run(projection: &ThreadProjection) -> Option<&Run> {
 
 pub fn derive(projection: &ThreadProjection, archived: bool) -> QueueState {
     let active = active_run(projection);
-    // One pass: the latest user message per message id, and which messages are notifications.
-    let mut user_messages: HashMap<&str, &TurnItem> = HashMap::new();
-    let mut notifications: HashSet<Option<&str>> = HashSet::new();
-    for item in &projection.turn_items {
-        match item.item_type.as_str() {
-            "user_message" => user_messages.extend(item.str("messageId").map(|id| (id, item.as_ref()))),
-            "notification" => {
-                notifications.insert(item.str("messageId"));
-            }
-            _ => {}
-        }
-    }
-    let message_item = |message_id: &str| user_messages.get(message_id).copied();
+    let notifications: HashSet<Option<&str>> = projection
+        .turn_items
+        .iter()
+        .filter(|item| item.item_type == "notification")
+        .map(|item| item.str("messageId"))
+        .chain(
+            projection
+                .messages
+                .iter()
+                .filter(|m| m.raw.get("notification").is_some_and(|n| !n.is_null()))
+                .map(|m| Some(m.id.as_str())),
+        )
+        .collect();
+    let message_item = |message_id: &str| projection.user_message(message_id);
     let promote_skips_compaction =
         active.and_then(|run| run.user_message_id.as_deref()).and_then(message_item).is_some_and(is_compaction_command);
     let steerable_turn = active.is_some_and(|run| {
@@ -141,7 +142,7 @@ pub fn derive(projection: &ThreadProjection, archived: bool) -> QueueState {
                 message_id: message_id.into(),
                 preview: preview_text(&text, !images.is_empty()).into(),
                 text: text.into(),
-                editable: guest.is_none(),
+                editable: item.is_some() && guest.is_none(),
                 created_at: item
                     .and_then(|item| item.str("createdAt").or(item.str("startedAt")))
                     .map(|at| at.to_owned().into()),
@@ -319,13 +320,15 @@ mod tests {
             {"id": "r3", "status": "queued", "ordinal": 3, "queuePosition": 1, "userMessageId": "m3"},
             {"id": "r4", "status": "queued", "ordinal": 4, "userMessageId": "m4", "delegatedCompletion": {}},
             {"id": "r5", "status": "queued", "ordinal": 5, "userMessageId": "m5"},
+            {"id": "r6", "status": "queued", "ordinal": 6, "userMessageId": "m6"},
         ]);
         let items = vec![
             message("m2", "second"),
             message("m3", "first"),
             json!({"id": "n", "type": "notification", "messageId": "m5"}),
         ];
-        let state = derive(&projection(runs, items, json!({})), false);
+        let notice = json!({"id": "m6", "role": "user", "text": "done", "notification": {"kind": "x"}});
+        let state = derive(&projection(runs, items, json!({"messages": [notice]})), false);
         let ids: Vec<&str> = state.queued.iter().map(|q| q.run_id.as_ref()).collect();
         assert_eq!(ids, ["r3", "r2"]);
         assert_eq!(state.queued[0].text.as_ref(), "first");
@@ -388,6 +391,38 @@ mod tests {
 run it";
         assert!(!sent_by_user(&item(json!({"text": legacy, "messageId": "scheduled-task-message:t1:3:manual"}))));
         assert!(sent_by_user(&item(json!({"text": legacy, "messageId": "m"}))));
+    }
+
+    #[test]
+    fn a_queued_message_reads_from_the_messages_the_server_sends_it_as() {
+        // A newly queued message is only a `message.updated`: its user_message item comes when the run starts.
+        let mut state = crate::model::ThreadState::default();
+        let runs = json!([{"id": "q", "status": "queued", "ordinal": 1, "userMessageId": "m"}]);
+        let snapshot = json!({"thread": {"id": "t", "title": "T"}, "runs": runs});
+        state.apply(&json!({"kind": "snapshot", "snapshotSequence": 1, "projection": snapshot})).unwrap();
+        let queued = |state: &crate::model::ThreadState| derive(state.projection.as_ref().unwrap(), false).queued;
+        // Its message isn't known, so the shown placeholder can't be opened and sent as its text.
+        assert_eq!(queued(&state)[0].text.as_ref(), "Queued message");
+        assert!(!queued(&state)[0].editable);
+
+        let message = |sequence: u64, text: &str, role: &str| {
+            json!({"kind": "event", "sequence": sequence, "event": {"type": "message.updated", "threadId": "t", "payload": {
+                "id": "m", "threadId": "t", "runId": "q", "nodeId": null, "role": role, "text": text,
+                "attachments": [{"type": "image", "id": "att-1", "name": "a.png"}], "streaming": false,
+                "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z"}}})
+        };
+        state.apply(&message(2, "queued three", "user")).unwrap();
+        let shown = &queued(&state)[0];
+        assert_eq!((shown.text.as_ref(), shown.editable), ("queued three", true));
+        assert_eq!(shown.images, [QueuedImage { id: "att-1".into(), name: "a.png".into() }]);
+        let projection = state.projection.as_ref().unwrap();
+        assert_eq!(projection.user_message("m").and_then(|m| m.str("text")), Some("queued three"));
+        // A save's `message.updated` is what the queue shows next.
+        state.apply(&message(3, "queued three, edited", "user")).unwrap();
+        assert_eq!(queued(&state)[0].text.as_ref(), "queued three, edited");
+        // Assistant messages stream through the same event and aren't kept.
+        state.apply(&message(4, "reply", "assistant")).unwrap();
+        assert_eq!(queued(&state)[0].text.as_ref(), "queued three, edited");
     }
 
     #[test]
