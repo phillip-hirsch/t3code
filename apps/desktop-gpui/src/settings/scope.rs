@@ -1298,6 +1298,21 @@ mod tests {
         assert_eq!(overriding_projects(&s, &["defaultRuntimeMode"]), ["p1"]);
         assert!(overriding_projects(&s, &["enableDeviceSupport"]).is_empty());
 
+        // An override this client has no page for (the web's per-project dictionary) survives writes.
+        let s = settings(json!({"projectSettingsOverrides": {"p1": {"speechProjectCustomWords": ["Ghostty"]}}}));
+        let e = env(&s);
+        let scope = resolve(&search(Some("p1"), None), &projects, &[e]);
+        let plan = plan_patch(&scope, &[e], json!({"defaultRuntimeMode": "approval-required"}).as_object().unwrap());
+        assert_eq!(
+            patch_of(&plan).unwrap()["projectSettingsOverrides"]["p1"],
+            json!({"speechProjectCustomWords": ["Ghostty"], "defaultRuntimeMode": "approval-required"})
+        );
+        let clear = plan_clear(&scope, &[e], &["defaultRuntimeMode"]);
+        assert_eq!(
+            patch_of(&clear).unwrap()["projectSettingsOverrides"]["p1"],
+            json!({"speechProjectCustomWords": ["Ghostty"]})
+        );
+
         // A project's first custom worktree rule starts from the rules it inherited.
         let s = settings(json!({"storageCleanup": {"worktreeOnDelete": true, "worktreeAfterDays": 14}}));
         let e = env(&s);

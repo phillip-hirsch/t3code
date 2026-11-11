@@ -59,6 +59,9 @@ pub(super) fn available(item: &SearchItem) -> bool {
         && !item.wsl_available_only
         && !item.managed_tunnel_only
         && !item.peer_links_only
+        // The web's pages and commands this client lacks (the Voice page, the dictation shortcut).
+        && super::section_label(&item.to).is_some()
+        && item.id.strip_prefix("keybinding-").is_none_or(|command| crate::keybindings::STATIC_COMMANDS.contains(&command))
 }
 
 /// Matches every query token somewhere in the title, section label or search terms, and

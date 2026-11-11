@@ -1300,10 +1300,17 @@ mod tests {
     }
 
     #[test]
-    fn every_section_has_a_label_and_the_index_points_at_sections() {
+    fn every_section_has_a_label_and_search_skips_pages_and_commands_this_client_lacks() {
         assert_eq!(section_label("diffs"), Some("Diffs & pull requests"));
-        let unknown: Vec<_> =
-            contract().search.iter().filter(|i| section_label(&i.to).is_none()).map(|i| &i.to).collect();
-        assert!(unknown.is_empty(), "{unknown:?}");
+        let mut missing: Vec<_> =
+            contract().search.iter().filter(|i| section_label(&i.to).is_none()).map(|i| i.to.as_str()).collect();
+        missing.sort_unstable();
+        missing.dedup();
+        assert_eq!(missing, ["voice"], "web pages this client has no section for");
+
+        let shipped = |id: &str| search::shipped().iter().any(|(item, _)| item.id == id);
+        assert!(shipped("delete-confirmation") && shipped("keybinding-composer.stash"));
+        assert!(!shipped("voice-microphone") && !shipped("keybinding-composer.dictation"));
+        assert!(searchable_settings().all(|(item, _)| item.to != "voice"));
     }
 }

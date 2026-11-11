@@ -1,0 +1,129 @@
+name: Desktop GPUI
+
+on:
+  pull_request:
+    paths: &paths
+      - .github/workflows/desktop-gpui.yml
+      - apps/desktop-gpui/**
+      - packages/contracts/**
+      # Read by the crate: include_str! in src/ssh/tunnel.rs and the license notice in build.rs.
+      - apps/server/package.json
+      - native/libghostty-vt/LICENSE
+      # Sources of src/settings/contract.json besides packages/contracts.
+      - apps/web/src/components/settings/settingsSearch.ts
+      - apps/web/src/components/settings/KeybindingsSettings.logic.ts
+      - packages/shared/src/keybindings.ts
+  push:
+    paths: *paths
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-gpui-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  rust:
+    name: Rust
+    # Pinned rather than ubuntu-latest: the apt list below names Ubuntu 24.04 packages.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: apps/desktop-gpui
+    env:
+      # Debug info would roughly double the target dir on a runner with limited disk.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            /*
+            !/.repos/
+            !/apps/mobile/modules/t3-terminal/Vendor/**/*.a
+          sparse-checkout-cone-mode: false
+
+      # GTK 3 and WebKitGTK 4.1 back the wry webview; xkbcommon-x11 and libxcb back GPUI's X11
+      # window; EGL, GBM and PipeWire (with libclang for its bindgen) back xcap's screen capture;
+      # ALSA backs rodio; fontconfig backs GPUI's text system. The secret service is pure-Rust zbus.
+      - name: Install system libraries
+        working-directory: .
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libxkbcommon-x11-dev \
+            libxcb1-dev \
+            libegl-dev \
+            libgbm-dev \
+            libpipewire-0.3-dev \
+            libclang-dev \
+            libasound2-dev \
+            libfontconfig-dev
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # libghostty-vt-sys clones Ghostty and builds it with `zig build`; see vendor/README.md.
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop-gpui
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+  settings-contract:
+    name: Settings contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            /*
+            !/.repos/
+            !/apps/mobile/modules/t3-terminal/Vendor/**/*.a
+          sparse-checkout-cone-mode: false
+
+      - name: Setup Vite+
+        uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --filter=@t3tools/web...
+
+      - name: Regenerate settings contract
+        working-directory: apps/web
+        env:
+          SETTINGS_CONTRACT_OUT: ${{ github.workspace }}/apps/desktop-gpui/src/settings/contract.json
+        run: |
+          cp ../desktop-gpui/tools/settings_data.test.ts src/
+          vp test run src/settings_data.test.ts
+
+      # The generator indents by one space; the committed file is in `vp fmt` shape.
+      - name: Format settings contract
+        run: vp fmt apps/desktop-gpui/src/settings/contract.json
+
+      - name: Check settings contract is current
+        run: |
+          if ! git diff --exit-code apps/desktop-gpui/src/settings/contract.json; then
+            echo "::error file=apps/desktop-gpui/src/settings/contract.json::contract.json is stale. Regenerate it as the header of apps/desktop-gpui/tools/settings_data.test.ts says, then commit it."
+            exit 1
+          fi
